@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import shutil
 import subprocess
 import sys
 import time
@@ -11,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from rich.console import Console
+from rich.panel import Panel
 from rich.table import Table
 
 from lastlib_swarm import json_codec as json
@@ -33,6 +35,27 @@ from lastlib_swarm.models import Chapter, PipelineConfig, Stage
 from lastlib_swarm.scheduler import Orchestrator
 from lastlib_swarm.state import StateStore, TaskStatus
 from lastlib_swarm.tui import format_count, format_usage, run_tui
+
+RIPGREP_WARNING = (
+    "ripgrep (`rg`) was not found on PATH. Swarm agents rely on fast source search and may be "
+    "substantially slower. Install ripgrep and ensure `rg` is on PATH before launching a large run."
+)
+
+
+def _starts_workers(args: argparse.Namespace) -> bool:
+    return args.command in {"stage", "pipeline", "corpus"} or (
+        args.command == "agent" and args.agent_command in {"start", "serve"}
+    )
+
+
+def _warn_missing_ripgrep() -> None:
+    Console(stderr=True).print(
+        Panel(
+            RIPGREP_WARNING,
+            title="[bold]⚠ MISSING RECOMMENDED TOOL[/bold]",
+            border_style="bold red",
+        )
+    )
 
 
 def _add_source(parser: argparse.ArgumentParser) -> None:
@@ -377,7 +400,12 @@ def _run(args: argparse.Namespace, config: PipelineConfig, console: Console) -> 
     if args.no_tui:
         succeeded = asyncio.run(_headless(orchestrator, operation))
     else:
-        succeeded = run_tui(orchestrator, operation, label=label)
+        succeeded = run_tui(
+            orchestrator,
+            operation,
+            label=label,
+            startup_warning=getattr(args, "startup_warning", ""),
+        )
     usage = state.invocation_usage()
     lifetime_usage = state.total_usage()
     console.print(format_usage(usage, label="This invocation"))
@@ -719,6 +747,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     arguments = parser().parse_args(raw_arguments)
     console = Console()
     try:
+        missing_ripgrep = _starts_workers(arguments) and shutil.which("rg") is None
+        arguments.startup_warning = RIPGREP_WARNING if missing_ripgrep else ""
+        if missing_ripgrep and getattr(arguments, "no_tui", True):
+            _warn_missing_ripgrep()
         config = _config_from_args(arguments)
         if arguments.command == "agent":
             return _agent_command(arguments, config)

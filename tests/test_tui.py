@@ -49,6 +49,27 @@ async def test_dashboard_runs_an_operation_and_exits(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_dashboard_keeps_startup_warning_visible(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    orchestrator = Orchestrator(config, StateStore(config))
+
+    async def operation() -> bool:
+        return True
+
+    app = SwarmApp(
+        orchestrator,
+        operation,
+        label="test",
+        startup_warning="ripgrep (`rg`) was not found on PATH",
+    )
+    async with app.run_test() as pilot:
+        await pilot.pause(0.2)
+        warning = app.query_one("#startup-warning", Static).content
+
+    assert "ripgrep (`rg`) was not found" in str(warning)
+
+
+@pytest.mark.asyncio
 async def test_quit_drains_pipeline_before_app_exit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

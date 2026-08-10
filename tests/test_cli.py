@@ -31,6 +31,24 @@ def test_plan_command(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> Non
     assert "Lean MCP: enabled" in output
 
 
+def test_worker_startup_warns_prominently_when_ripgrep_is_missing(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = write_project(tmp_path)
+    monkeypatch.setattr(cli_module.shutil, "which", lambda _name: None)
+    monkeypatch.setattr(cli_module, "_run", lambda *_args, **_kwargs: 0)
+
+    assert main(["pipeline", "--config", str(path), "--no-tui"]) == 0
+
+    captured = capsys.readouterr()
+    assert "MISSING RECOMMENDED TOOL" in captured.err
+    assert "ripgrep" in captured.err
+    assert "substantially slower" in captured.err
+    assert captured.out == ""
+
+
 def test_plan_can_disable_lean_mcp(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     path = write_project(tmp_path)
 

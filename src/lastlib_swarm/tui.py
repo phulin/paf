@@ -314,6 +314,14 @@ class SwarmApp(App[bool]):
         color: $text;
         text-style: bold;
     }
+    #startup-warning {
+        height: auto;
+        max-height: 4;
+        padding: 1 2;
+        background: $warning;
+        color: $text;
+        text-style: bold;
+    }
     #stages { height: 5; }
     #alerts { height: auto; max-height: 3; padding: 0 2; color: $error; }
     .stage-card {
@@ -332,12 +340,14 @@ class SwarmApp(App[bool]):
         operation: Callable[[], Awaitable[bool]],
         *,
         label: str,
+        startup_warning: str = "",
     ) -> None:
         super().__init__()
         self.orchestrator = orchestrator
         self.state = orchestrator.state
         self.operation = operation
         self.label = label
+        self.startup_warning = startup_warning
         self.result = False
         self._rows_added: set[str] = set()
         self._row_cache: dict[str, tuple[str, ...]] = {}
@@ -354,6 +364,8 @@ class SwarmApp(App[bool]):
 
     def compose(self) -> ComposeResult:
         yield Header()
+        if self.startup_warning:
+            yield Static(f"⚠ {self.startup_warning}", id="startup-warning", markup=False)
         yield Static("Preparing swarm…", id="usage")
         yield Static(id="alerts", markup=False)
         with Horizontal(id="stages"):
@@ -537,6 +549,12 @@ def run_tui(
     operation: Callable[[], Awaitable[bool]],
     *,
     label: str,
+    startup_warning: str = "",
 ) -> bool:
-    result = SwarmApp(orchestrator, operation, label=label).run()
+    result = SwarmApp(
+        orchestrator,
+        operation,
+        label=label,
+        startup_warning=startup_warning,
+    ).run()
     return bool(result)

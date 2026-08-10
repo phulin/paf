@@ -4,6 +4,11 @@
 mathematics corpus and its Lean translation. It can run one stage from the command line or drive a
 resumable, fixed-point pipeline with a live terminal dashboard.
 
+Install `ripgrep` and ensure its `rg` executable is on `PATH` before starting a large swarm. Agents
+use it for fast source and declaration searches. Worker-launching commands continue without it, but
+print a prominent warning in headless/background mode or retain a warning banner in the TUI because
+fallback searches can be substantially slower.
+
 ```mermaid
 flowchart LR
     F[Formalize chapter] --> R[Review statements]
