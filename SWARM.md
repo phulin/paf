@@ -210,17 +210,27 @@ next invocation, interrupted `running` records become `pending` and can resume. 
 remain skipped unless `--force` is given.
 
 Agents never commit. With the default `auto` backend, supported Linux systems run each attempt in a
-private `fuse-overlayfs` view. The lower generation is an immutable hard-linked snapshot; only files
-changed by that attempt occupy its writable upper layer. Codex and validation both run in the merged
-view. The coordinator rejects every out-of-scope path, checks that the assigned canonical scope has
-not changed since launch, and imports accepted regular files with atomic replacement. A stale writer
-is discarded and retried by the normal stage loop.
+private `fuse-overlayfs` view. Each view has two immutable lower generations: a source snapshot that
+excludes `.lake`, and a Lake-cache snapshot that contains only `.lake`. Only files changed by that
+attempt occupy its writable upper layer. Codex and validation both run in the merged view. The
+coordinator rejects every out-of-scope source path, checks that the assigned canonical scope has not
+changed since launch, and imports accepted regular files with atomic replacement. A stale writer is
+discarded and retried by the normal stage loop.
 
 The number of mounted workspaces is bounded by `max_agents`; slots and upper layers are removed after
 each attempt. Generations share unchanged file data through hard links and are removed when their last
 reader exits. Temporary mounts live outside the repository so Git discovery and the Codex workspace
-sandbox cannot escape through the parent worktree. Package/build trees under `.lake` remain private
-overlay writes and are never imported as source changes.
+sandbox cannot escape through the parent worktree.
+
+All agents pinned to a cache generation share the same Lake artifact inodes and OS page-cache pages;
+the cache is never copied once per agent. After a successful validation, the coordinator scans only
+that attempt's private `.lake` upper-layer delta and promotes its regular artifacts into a new
+immutable cache generation. Unchanged artifacts are hard-linked from the preceding generation.
+Already-running agents remain pinned to their old cache, while newly launched agents immediately see
+the promoted artifacts. Concurrent promotions merge unrelated paths; a same-path cache conflict is
+skipped rather than overwriting a newer artifact. Cache deletions are not promoted, and `.lake` is
+never imported into the canonical source worktree. Source imports preserve mtimes so valid Lake
+traces are not invalidated merely by publication.
 
 FUSE isolation requires `fuse-overlayfs`, `fusermount3`, `rsync`, an accessible `/dev/fuse`, and the
 Codex `workspace-write` sandbox. It deliberately refuses `bypass_approvals_and_sandbox`. `auto`

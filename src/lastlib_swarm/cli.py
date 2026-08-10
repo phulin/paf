@@ -82,7 +82,7 @@ def _add_run_options(parser: argparse.ArgumentParser) -> None:
 
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(prog="lastlib-swarm", description=__doc__)
-    root.add_argument("--version", action="version", version="lastlib-swarm 0.4.0")
+    root.add_argument("--version", action="version", version="lastlib-swarm 0.5.0")
     commands = root.add_subparsers(dest="command", required=True)
 
     plan = commands.add_parser("plan", help="show discovered books, chapters, and stage settings")

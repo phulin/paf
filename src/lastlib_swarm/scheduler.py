@@ -138,6 +138,11 @@ class Orchestrator:
         self.state.isolation = {
             "configured": config.settings.isolation,
             "backend": self.isolation.name,
+            "lake_cache": (
+                "immutable-generations"
+                if self.isolation.name == "fuse-overlay"
+                else "shared-worktree"
+            ),
         }
         selected_books = {chapter.book_id for chapter in self.chapters}
         self.statement_schedule = build_corpus_schedule(

@@ -225,6 +225,7 @@ async def test_fuse_overlay_supports_a_large_concurrent_slot_pool(tmp_path: Path
 
     assert len({workspace.root for workspace in workspaces}) == slot_count
     assert len({workspace.base for workspace in workspaces}) == 1
+    assert len({workspace.cache for workspace in workspaces}) == 1
 
     await asyncio.gather(*(workspace.close() for workspace in workspaces))
     await manager.close()
