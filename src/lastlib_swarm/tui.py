@@ -414,6 +414,11 @@ class SwarmApp(App[bool]):
         if 0 <= row < len(self.chapters):
             self.push_screen(AgentDetailScreen(self.state, self.chapters[row]))
 
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        if action == "inspect_agent" and isinstance(self.screen, AgentDetailScreen):
+            return False
+        return super().check_action(action, parameters)
+
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         if event.data_table.id != "tasks":
             return

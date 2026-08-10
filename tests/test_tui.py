@@ -8,7 +8,7 @@ from textual.widgets import DataTable, RichLog, Static
 from lastlib_swarm.config import load_config
 from lastlib_swarm.models import Stage
 from lastlib_swarm.scheduler import Orchestrator
-from lastlib_swarm.state import StateStore, TokenUsage
+from lastlib_swarm.state import StateStore, TaskStatus, TokenUsage
 from lastlib_swarm.tui import AgentDetailScreen, SwarmApp, format_count, format_usage
 from tests.support import write_project
 
@@ -114,7 +114,22 @@ async def test_selected_chapter_opens_live_agent_detail(tmp_path: Path) -> None:
     finish = asyncio.Event()
 
     async def operation() -> bool:
+        old_run = await state.start_run(config.chapters[0].id, Stage.REVIEW)
+        await state.finish_run(
+            old_run,
+            status=TaskStatus.SUCCEEDED,
+            usage=TokenUsage(input_tokens=1_000_000, output_tokens=100_000, measured=True),
+        )
         run = await state.start_run(config.chapters[0].id, Stage.FORMALIZE)
+        await state.update_run(
+            run,
+            usage=TokenUsage(
+                input_tokens=1_000,
+                cached_input_tokens=200,
+                output_tokens=50,
+                measured=True,
+            ),
+        )
         activity = state.activities.start(run.id, run.chapter_id, run.stage)
         activity.consume(
             {
@@ -153,13 +168,19 @@ async def test_selected_chapter_opens_live_agent_detail(tmp_path: Path) -> None:
         await pilot.pause(0.6)
 
         assert isinstance(app.screen, AgentDetailScreen)
+        assert app.check_action("inspect_agent", ()) is False
         assert "✗ 1" in str(app.screen.query_one("#agent-heading", Static).content)
         assert "diagnostic failed" in str(app.screen.query_one("#agent-error", Static).content)
+        spend = str(app.screen.query_one("#agent-spend", Static).content)
+        assert "tokens 1.1k" in spend
+        assert "API-equivalent cost $0.0002" in spend
+        assert "1.10m" not in spend
         summary = app.screen.query_one("#agent-summary", RichLog)
         assert summary.max_lines is None
         assert "END OF UPDATE" in "".join(line.text for line in summary.lines)
 
         await pilot.press("escape")
+        assert app.check_action("inspect_agent", ()) is True
         finish.set()
         await pilot.pause(1.2)
 
