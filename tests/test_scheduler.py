@@ -146,3 +146,28 @@ async def test_chapter_failure_cancels_and_drains_siblings(
     with pytest.raises(RuntimeError, match="primary failure"):
         await orchestrator._statement_book("book")
     assert sibling_cleaned.is_set()
+
+
+@pytest.mark.asyncio
+async def test_workspace_acquisition_failure_finishes_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await orchestrator.prepare()
+
+    async def fail_acquire(_run_id: str) -> object:
+        raise RuntimeError("workspace unavailable")
+
+    monkeypatch.setattr(orchestrator.isolation, "acquire", fail_acquire)
+
+    with pytest.raises(RuntimeError, match="workspace unavailable"):
+        await orchestrator._attempt(config.chapters[0], Stage.FORMALIZE)
+
+    run = state.task(config.chapters[0].id, Stage.FORMALIZE).runs[-1]
+    assert run.status == TaskStatus.FAILED
+    assert run.finished_at is not None
+    assert run.isolation is not None
+    assert "workspace unavailable" in run.isolation["error"]
+    await orchestrator.shutdown()

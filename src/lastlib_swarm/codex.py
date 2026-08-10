@@ -343,12 +343,14 @@ the final acceptance check, not as the interactive edit/check loop.
         async def consume() -> None:
             nonlocal usage, report, thread_id
             with log_path.open("wb", buffering=0) as log:
-                while line := await stdout.readline():
-                    log.write(line)
+                pending = bytearray()
+
+                async def consume_line(line: bytes) -> None:
+                    nonlocal usage, report, thread_id
                     try:
                         event = json.loads(line)
                     except (json.JSONDecodeError, UnicodeDecodeError):
-                        continue
+                        return
                     if found := _find_thread_id(event):
                         thread_id = found
                         await self.state.update_run(run, thread_id=found)
@@ -357,6 +359,20 @@ the final acceptance check, not as the interactive edit/check loop.
                         await self.state.update_run(run, usage=usage)
                     if found_report := _find_report(event):
                         report = found_report
+
+                # Codex command events can contain multi-megabyte aggregated output.
+                # StreamReader.readline() has a 64 KiB default limit and stops draining
+                # the child when one such JSONL record exceeds it. Frame records from
+                # fixed-size chunks instead, without imposing an artificial line cap.
+                while chunk := await stdout.read(64 * 1024):
+                    log.write(chunk)
+                    pending.extend(chunk)
+                    while (newline := pending.find(b"\n")) >= 0:
+                        line = bytes(pending[:newline])
+                        del pending[: newline + 1]
+                        await consume_line(line)
+                if pending:
+                    await consume_line(bytes(pending))
 
         consumer = asyncio.create_task(consume())
         timed_out = False

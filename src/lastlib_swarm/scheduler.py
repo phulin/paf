@@ -211,8 +211,9 @@ class Orchestrator:
         async with self.agent_slots.slot(schedule.priority(chapter.book_id)):
             await self.control.checkpoint()
             run = await self.state.start_run(chapter.id, stage)
-            workspace = await self.isolation.acquire(run.id)
+            workspace = None
             try:
+                workspace = await self.isolation.acquire(run.id)
                 agent = await self.executor.run(
                     chapter,
                     stage,
@@ -245,8 +246,21 @@ class Orchestrator:
                     isolation=isolated.as_dict(),
                     validation=validation.as_dict(),
                 )
+            except BaseException as error:
+                if run.status == TaskStatus.RUNNING:
+                    detail = str(error) or type(error).__name__
+                    await self.state.finish_run(
+                        run,
+                        status=TaskStatus.FAILED,
+                        isolation={
+                            "accepted": False,
+                            "error": f"orchestration failed before completion: {detail}",
+                        },
+                    )
+                raise
             finally:
-                await workspace.close()
+                if workspace is not None:
+                    await workspace.close()
             return Attempt(agent=agent, validation=validation, run=run)
 
     async def _formalize(self, chapter: Chapter) -> bool:
