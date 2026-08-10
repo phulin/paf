@@ -1,4 +1,6 @@
+import asyncio
 import json
+import os
 from dataclasses import replace
 from pathlib import Path
 
@@ -36,6 +38,7 @@ async def test_fuse_overlay_rejects_out_of_scope_changes(tmp_path: Path) -> None
         result = await workspace.collect(chapter)
     finally:
         await workspace.close()
+        await manager.close()
 
     assert not result.accepted
     assert result.out_of_scope_paths == ("unexpected.txt",)
@@ -61,6 +64,7 @@ async def test_fuse_overlay_imports_scope_and_rejects_a_stale_writer(tmp_path: P
     finally:
         await first.close()
         await stale.close()
+        await manager.close()
 
     assert accepted.accepted
     assert not rejected.accepted
@@ -117,3 +121,23 @@ print(json.dumps({"type": "item.completed", "item": {
     assert run.isolation["accepted"] is True
     assert json.loads((config.settings.state_dir / "state.json").read_text())["tasks"]
     await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_fuse_overlay_supports_a_large_concurrent_slot_pool(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    slot_count = int(os.environ.get("LASTLIB_SWARM_STRESS_SLOTS", "12"))
+    manager = FuseOverlayIsolation(
+        replace(config.settings, isolation="fuse-overlay", max_agents=slot_count)
+    )
+    await manager.prepare()
+    workspaces = await asyncio.gather(
+        *(manager.acquire(f"stress-{index:03d}") for index in range(slot_count))
+    )
+
+    assert len({workspace.root for workspace in workspaces}) == slot_count
+    assert len({workspace.base for workspace in workspaces}) == 1
+
+    await asyncio.gather(*(workspace.close() for workspace in workspaces))
+    await manager.close()
+    assert not manager.root.exists()

@@ -60,6 +60,8 @@ def test_executor_uses_machine_readable_codex_mode(tmp_path: Path) -> None:
     assert "--output-schema" in command
     assert "--approve-for-me" in command
     assert "--dangerously-bypass-approvals-and-sandbox" not in command
+    assert "--skip-git-repo-check" not in command
+    assert "--skip-git-repo-check" in executor.command(tmp_path / "isolated")
     assert render_prompt(
         "Chapter {chapter_number_padded}: {chapter_title}", config.chapters[0]
     ) == ("Chapter 01: First chapter")

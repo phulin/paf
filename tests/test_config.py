@@ -41,6 +41,17 @@ def test_loads_phase_specific_book_effort(tmp_path: Path) -> None:
     assert book.proof_effort == 9
 
 
+def test_rejects_unknown_isolation_backend(tmp_path: Path) -> None:
+    path = write_project(tmp_path)
+    path.write_text(
+        path.read_text(encoding="utf-8").replace('isolation = "shared"', 'isolation = "telepathy"'),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match=r"swarm\.isolation"):
+        load_config(path)
+
+
 def test_rejects_unknown_book_dependency(tmp_path: Path) -> None:
     path = write_project(tmp_path)
     text = path.read_text(encoding="utf-8").replace(
@@ -68,6 +79,7 @@ def test_infers_zero_config_project_from_markdown(tmp_path: Path) -> None:
     assert config.settings.repo == tmp_path
     assert config.settings.model == "gpt-5.6-luna"
     assert config.settings.reasoning_effort == "max"
+    assert config.settings.isolation == "auto"
     assert config.settings.state_dir == tmp_path / ".swarm" / "book07"
     assert config.books[0].module == "LastLib.Book07ExistingAPI"
     assert [chapter.number for chapter in config.chapters] == [1, 2]

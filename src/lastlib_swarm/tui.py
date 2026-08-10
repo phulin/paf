@@ -154,7 +154,7 @@ class SwarmApp(App[bool]):
         critical = " → ".join(self.orchestrator.statement_schedule.critical_path) or "—"
         self.query_one("#usage", Static).update(
             f"{format_usage(usage)}    active stage records: {active}  concurrency cap: {maximum}\n"
-            f"Statement critical path: {critical}"
+            f"Statement critical path: {critical}    isolation: {self.orchestrator.isolation.name}"
         )
         for stage in Stage:
             counts = stage_counts(self.state, stage)

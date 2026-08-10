@@ -9,6 +9,7 @@ sandbox = "workspace-write"
 approve_for_me = true
 agent_timeout_seconds = 7200
 validation_timeout_seconds = 1800
+isolation = "auto"
 
 [stages.formalize]
 max_rounds = 3

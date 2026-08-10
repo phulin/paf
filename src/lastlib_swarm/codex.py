@@ -193,6 +193,7 @@ Your exclusive edit scope is:
 {scope}
 
 Do not edit orchestration state under `.swarm`, do not commit, and do not wait for another worker.
+When isolation is enabled, all out-of-scope changes are rejected rather than merged.
 Return the required structured final report. Set `needs_repair` only when a statement or declaration
 interface must change; ordinary unfinished or broken proof code is not statement repair. The
 orchestrator independently checks scoped file hashes, placeholders, and `{chapter.build_command}`.

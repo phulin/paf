@@ -54,6 +54,7 @@ def state_summary(
         "state_path": str(orchestrator.state.path),
         "updated_at": snapshot["updated_at"],
         "usage": snapshot["usage"],
+        "isolation": snapshot["isolation"],
         "scheduling": scheduling_summary(snapshot["scheduling"]),
         "tasks": _task_counts(snapshot),
     }
@@ -258,6 +259,7 @@ def offline_status(state_dir: Path) -> dict[str, Any]:
                 "state_path": str(state_path),
                 "updated_at": snapshot.get("updated_at"),
                 "usage": snapshot.get("usage", {}),
+                "isolation": snapshot.get("isolation", {}),
                 "scheduling": scheduling_summary(snapshot.get("scheduling", {})),
                 "tasks": _task_counts(snapshot),
             }
@@ -275,5 +277,6 @@ def offline_status(state_dir: Path) -> dict[str, Any]:
             "api_tokens": 0,
         },
         "scheduling": {},
+        "isolation": {},
         "tasks": {status.value: 0 for status in TaskStatus},
     }

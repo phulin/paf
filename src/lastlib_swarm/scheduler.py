@@ -135,6 +135,10 @@ class Orchestrator:
         self.control = control or RunControl()
         self.executor = CodexExecutor(config, state)
         self.isolation = create_isolation(config.settings)
+        self.state.isolation = {
+            "configured": config.settings.isolation,
+            "backend": self.isolation.name,
+        }
         selected_books = {chapter.book_id for chapter in self.chapters}
         self.statement_schedule = build_corpus_schedule(
             config.books,

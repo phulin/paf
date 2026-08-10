@@ -27,6 +27,7 @@ from lastlib_swarm.corpus import (
     scheduling_snapshot,
     scheduling_summary,
 )
+from lastlib_swarm.isolation import fuse_overlay_available
 from lastlib_swarm.models import Chapter, PipelineConfig, Stage
 from lastlib_swarm.scheduler import Orchestrator
 from lastlib_swarm.state import StateStore, TaskStatus
@@ -81,7 +82,7 @@ def _add_run_options(parser: argparse.ArgumentParser) -> None:
 
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(prog="lastlib-swarm", description=__doc__)
-    root.add_argument("--version", action="version", version="lastlib-swarm 0.3.0")
+    root.add_argument("--version", action="version", version="lastlib-swarm 0.4.0")
     commands = root.add_subparsers(dest="command", required=True)
 
     plan = commands.add_parser("plan", help="show discovered books, chapters, and stage settings")
@@ -221,6 +222,9 @@ def select_chapters(
 
 
 def print_plan(config: PipelineConfig, console: Console) -> None:
+    isolation = config.settings.isolation
+    if isolation == "auto":
+        isolation = "fuse-overlay" if fuse_overlay_available() else "shared"
     console.print(f"[bold]Repository:[/bold] {config.settings.repo}")
     console.print(
         f"[bold]Concurrency:[/bold] {config.settings.max_agents} agents/builds  "
@@ -229,7 +233,7 @@ def print_plan(config: PipelineConfig, console: Console) -> None:
     console.print(
         f"[bold]Model:[/bold] {config.settings.model}  "
         f"[bold]Reasoning:[/bold] {config.settings.reasoning_effort}  "
-        f"[bold]Isolation:[/bold] {config.settings.isolation}"
+        f"[bold]Isolation:[/bold] {config.settings.isolation} → {isolation}"
     )
     stages = Table(title="Stages")
     stages.add_column("Stage")

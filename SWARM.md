@@ -46,7 +46,8 @@ uv run lastlib-swarm books/02-finite-extensions-of-local-fields.md
 
 Passing a `.md` as the first argument is shorthand for `pipeline <target>`. Zero-config runs default
 to `gpt-5.6-luna`, reasoning effort `max`, the packaged generic prompt library under
-`src/lastlib_swarm/prompts/`, and a state directory at `.swarm/<inferred-book-id>/`. Use
+`src/lastlib_swarm/prompts/`, automatic execution isolation, and a state directory at
+`.swarm/<inferred-book-id>/`. Use
 `swarm.example.toml` when the inferred layout is not appropriate or when coordinating multiple books.
 
 Any stage may point at a specialized prompt template. Supported replacement fields include
@@ -99,7 +100,7 @@ uv run lastlib-swarm status --config swarm.toml --json
 number would be ambiguous.
 
 CLI overrides such as `--model`, `--reasoning-effort`, and `--max-agents` work with both inferred and
-configured runs.
+configured runs. `--isolation auto|fuse-overlay|shared` selects the execution backend.
 
 ## Agent-managed background mode
 
@@ -208,9 +209,25 @@ Press `q` in the TUI or interrupt a headless run to terminate the active child p
 next invocation, interrupted `running` records become `pending` and can resume. Successful records
 remain skipped unless `--force` is given.
 
-Agents never commit. They share the orchestrator's worktree, so chapter scopes must be disjoint for
-safe parallel writes. Validation occupies the same global concurrency slot as its agent, which keeps
-large Lean builds within `max_agents` rather than creating an unbounded second swarm.
+Agents never commit. With the default `auto` backend, supported Linux systems run each attempt in a
+private `fuse-overlayfs` view. The lower generation is an immutable hard-linked snapshot; only files
+changed by that attempt occupy its writable upper layer. Codex and validation both run in the merged
+view. The coordinator rejects every out-of-scope path, checks that the assigned canonical scope has
+not changed since launch, and imports accepted regular files with atomic replacement. A stale writer
+is discarded and retried by the normal stage loop.
+
+The number of mounted workspaces is bounded by `max_agents`; slots and upper layers are removed after
+each attempt. Generations share unchanged file data through hard links and are removed when their last
+reader exits. Temporary mounts live outside the repository so Git discovery and the Codex workspace
+sandbox cannot escape through the parent worktree. Package/build trees under `.lake` remain private
+overlay writes and are never imported as source changes.
+
+FUSE isolation requires `fuse-overlayfs`, `fusermount3`, `rsync`, an accessible `/dev/fuse`, and the
+Codex `workspace-write` sandbox. It deliberately refuses `bypass_approvals_and_sandbox`. `auto`
+selects FUSE when these primitives are present and otherwise uses the explicitly visible `shared`
+backend; production runs can require isolation with `--isolation fuse-overlay` so missing support is
+a hard error. Validation occupies the same global concurrency slot as its agent, keeping large Lean
+builds within `max_agents`.
 
 ## Configuration
 
@@ -230,6 +247,7 @@ sandbox = "workspace-write"
 approve_for_me = true
 agent_timeout_seconds = 7200
 validation_timeout_seconds = 1800
+isolation = "auto" # auto, fuse-overlay, or shared
 ```
 
 Every stage automatically uses its packaged standard prompt and default retry bound. A stage table

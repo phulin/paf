@@ -127,6 +127,7 @@ class StateStore:
         self._lock = asyncio.Lock()
         self.tasks: dict[str, TaskRecord] = {}
         self.scheduling: dict[str, Any] = {}
+        self.isolation: dict[str, Any] = {}
         self.created_at = timestamp()
         self.updated_at = self.created_at
 
@@ -193,6 +194,7 @@ class StateStore:
             "updated_at": self.updated_at,
             "usage": asdict(usage) | {"api_tokens": usage.api_tokens},
             "scheduling": self.scheduling,
+            "isolation": self.isolation,
             "tasks": {key: asdict(value) for key, value in sorted(self.tasks.items())},
         }
 
