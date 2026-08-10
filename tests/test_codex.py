@@ -14,6 +14,8 @@ from lastlib_swarm.codex import (
     lean_mcp_executable,
     lean_mcp_path,
     render_prompt,
+    unexpected_lean_warnings,
+    validate,
 )
 from lastlib_swarm.config import load_config
 from lastlib_swarm.models import Stage
@@ -168,7 +170,57 @@ def test_proof_prompt_requires_whole_file_pass_before_diagnostics(tmp_path: Path
     assert whole_pass < diagnostics
     assert "Iterate only over the proofs and dependent declarations that fail" in prompt
     assert "Do not invoke Lake" in prompt
-    assert "coordinator performs the post-merge acceptance build" in prompt
+    assert "coordinator performs the post-merge acceptance build" in " ".join(prompt.split())
+    assert "Treat every warning as an error" in prompt
+    assert "Fix the cause of other warnings" in prompt
+
+
+def test_warning_filter_allows_only_declaration_uses_sorry() -> None:
+    output = """warning: Book/Chapter.lean:12:8: declaration uses `sorry`
+warning: Book/Chapter.lean:18:5: Variable name `h` is not explicitly referenced.
+warning: declaration uses 'sorry'
+warning: Book/Chapter.lean:24:2: a warning that merely mentions sorry
+"""
+
+    assert unexpected_lean_warnings(output) == (
+        "warning: Book/Chapter.lean:18:5: Variable name `h` is not explicitly referenced.",
+        "warning: Book/Chapter.lean:24:2: a warning that merely mentions sorry",
+    )
+
+
+@pytest.mark.asyncio
+async def test_validation_rejects_non_sorry_warnings(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = replace(
+        config.chapters[0],
+        build_command=(
+            "printf '%s\\n' 'warning: Book/Chapter.lean:1:1: declaration uses `sorry`' "
+            "'warning: Book/Chapter.lean:2:1: unused variable'"
+        ),
+    )
+
+    validation = await validate(config, chapter)
+
+    assert not validation.succeeded
+    assert validation.exit_code == 1
+    assert "Coordinator rejected 1 non-sorry Lean warning(s)" in validation.output
+    assert "unused variable" in validation.output
+
+
+@pytest.mark.asyncio
+async def test_validation_accepts_sorry_warnings(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = replace(
+        config.chapters[0],
+        build_command=(
+            "printf '%s\\n' 'warning: Book/Chapter.lean:1:1: declaration uses `sorry`'"
+        ),
+    )
+
+    validation = await validate(config, chapter)
+
+    assert validation.succeeded
+    assert validation.exit_code == 0
 
 
 @pytest.mark.asyncio

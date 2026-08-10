@@ -60,6 +60,9 @@ Any stage may point at a specialized prompt template. Supported replacement fiel
 `{book_title}`, `{chapter_number}`, `{chapter_number_padded}`, `{chapter_title}`, `{source}`,
 `{lean_root}`, `{chapter_path}`, `{chapter_module}`, and `{build_command}`.
 
+Proof agents must clear every MCP warning except “declaration uses `sorry`” for a theorem they
+attempted but could not prove. Disabling a linter or warning option is not an acceptable fix.
+
 Codex is invoked in its documented noninteractive JSONL mode with a strict final-report schema.
 Swarm workers default to `--dangerously-bypass-approvals-and-sandbox`, giving them full host access
 for unattended formalization. Set `bypass_approvals_and_sandbox = false` and
@@ -126,7 +129,9 @@ proof separately. They then request whole-file diagnostics and iterate only over
 their dependent declarations. Agents never invoke a compiler. After an agent exits, the coordinator
 terminates its MCP/LSP process group, merges accepted scoped changes into the main worktree, and
 enqueues one targeted `lake build +Module`. Merge and build form one serialized transaction, and the
-main worktree's `.lake` is the only writable build cache.
+main worktree's `.lake` is the only writable build cache. The coordinator rejects a successful
+compiler exit if its captured output contains any warning other than the exact “declaration uses
+`sorry`” diagnostic. This check reuses the targeted build and does not launch a second compiler.
 
 An MCP/LSP process exists per active attempt, not per queued agent. Its imported `.olean` files come
 from a read-only snapshot of the coordinator cache taken when the attempt starts, while its document
@@ -185,7 +190,8 @@ After the daemon exits, `status`, `snapshot`, and `wait` fall back to the persis
   review, up to `max_rounds`.
 - **Prove** sends the whole chapter to one agent, asks for one complete proof-writing pass, and then
   uses whole-file LSP diagnostics to focus iterations on failed proofs. It succeeds only when the
-  scoped Lean code has no `sorry` or `admit` tokens and final Lake validation succeeds.
+  scoped Lean code has no `sorry` or `admit` tokens and final Lake validation succeeds without any
+  warning other than “declaration uses `sorry`”.
 - **Repair** is entered when a proof report identifies a statement/API problem, or when a proof
   agent makes no progress with placeholders remaining. Repair feedback includes the proof report,
   placeholder count, and the tail of the Lean validation output. The pipeline then returns to proof.

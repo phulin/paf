@@ -23,6 +23,12 @@ Without the MCP, make a coherent source pass and report that diagnostics are def
 coordinator. Confirm exact theorem signatures from source rather than guessing names.
 One hard declaration must not prevent independent later proofs.
 
+Eliminate every warning in the assigned files. The sole exception is the exact “declaration uses
+`sorry`” warning for a theorem whose proof you attempted but could not complete. Fix warning causes
+in the source; never hide them with `set_option` or by disabling a linter. Before finishing, request
+fresh whole-file MCP diagnostics for every assigned file and account for each remaining warning
+explicitly.
+
 If a target is mathematically inaccurate or cannot follow from its stated assumptions, leave its
 placeholder, avoid changing the statement, and report a precise statement/API repair request. Do not
 run Lake, raw Lean, or another compiler. After you finish, the coordinator merges accepted changes

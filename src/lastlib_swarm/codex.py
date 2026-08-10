@@ -51,6 +51,10 @@ LEAN_MCP_PROOF_TOOLS = (
 
 USAGE_POLL_SECONDS = 0.25
 PROCESS_GROUP_GRACE_SECONDS = 1.0
+LEAN_WARNING_RE = re.compile(r"(?m)^[ \t]*warning:[ \t]*(?P<message>.*)$")
+LEAN_SORRY_WARNING_RE = re.compile(
+    r"(?:^|:\d+:\d+:[ \t]+)declaration uses [`']sorry[`'][ \t]*$"
+)
 
 
 def lean_mcp_executable() -> Path:
@@ -99,6 +103,23 @@ class AgentResult:
     report: dict[str, Any] = field(default_factory=dict)
     thread_id: str | None = None
     error: str = ""
+
+
+def unexpected_lean_warnings(output: str) -> tuple[str, ...]:
+    """Return Lean warning headers other than declarations that use ``sorry``.
+
+    Lake renders cached and freshly built Lean diagnostics in the same
+    ``warning: <location>: <message>`` form. Keep the exception intentionally
+    narrow so warnings cannot disappear merely because their text mentions a
+    sorry elsewhere in the diagnostic body.
+    """
+
+    warnings: list[str] = []
+    for match in LEAN_WARNING_RE.finditer(output):
+        message = match.group("message")
+        if not LEAN_SORRY_WARNING_RE.search(message):
+            warnings.append(match.group(0).strip())
+    return tuple(warnings)
 
 
 def render_prompt(template: str, chapter: Chapter) -> str:
@@ -305,7 +326,9 @@ interface must change; ordinary unfinished or broken proof code is not statement
 orchestrator independently checks scoped file hashes, placeholders, and `{chapter.build_command}`.
 Do not run `lake build`, `lake env lean`, raw `lean`, or another compiler command. Builds belong to
 the coordinator: after you exit, it merges accepted scoped changes into the main worktree and
-serially runs the configured build there against the single writable build cache.
+serially runs the configured build there against the single writable build cache. That validation
+fails on every warning except the exact “declaration uses `sorry`” warning for an unfinished proof.
+Fix the cause of other warnings; do not suppress them by disabling a linter or warning option.
 """
         if self.config.settings.lean_mcp:
             contract += """
@@ -324,7 +347,9 @@ proof-writing pass over the entire assigned file set: attempt every mathematical
 without stopping to check each proof separately. Then request whole-file diagnostics for every
 assigned file. Iterate only over the proofs and dependent declarations that fail, using proof goals,
 batched tactic attempts, code actions, and fresh whole-file diagnostics until no unexpected
-diagnostics remain. Do not invoke Lake; the coordinator performs the post-merge acceptance build.
+diagnostics remain. Treat every warning as an error unless it is the “declaration uses `sorry`”
+warning for a theorem you attempted but could not prove. Do not invoke Lake; coordinator performs
+the post-merge acceptance build.
 """
             else:
                 contract += """
@@ -562,8 +587,18 @@ async def validate(
     except asyncio.CancelledError:
         await _terminate(process)
         raise
-    output = output_bytes.decode(errors="replace")[-20000:]
-    return ValidationResult(exit_code == 0, exit_code, output, timed_out)
+    complete_output = output_bytes.decode(errors="replace")
+    warnings = unexpected_lean_warnings(complete_output)
+    output = complete_output[-20000:]
+    if warnings:
+        warning_summary = "\n".join(warnings[-50:])
+        output = (
+            f"{output}\n\nCoordinator rejected {len(warnings)} non-sorry Lean warning(s):\n"
+            f"{warning_summary}"
+        )[-20000:]
+        if exit_code == 0:
+            exit_code = 1
+    return ValidationResult(exit_code == 0 and not warnings, exit_code, output, timed_out)
 
 
 async def _wait_for_parent_exit(process: asyncio.subprocess.Process) -> int:
