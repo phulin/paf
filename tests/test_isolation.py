@@ -1,11 +1,13 @@
 import asyncio
 import json
 import os
+import threading
 from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
+import lastlib_swarm.isolation as isolation_module
 import lastlib_swarm.scheduler as scheduler_module
 from lastlib_swarm.codex import ValidationResult
 from lastlib_swarm.config import load_config
@@ -24,6 +26,33 @@ def fuse_manager(config_path: Path) -> tuple[FuseOverlayIsolation, Chapter]:
     config = load_config(config_path)
     settings = replace(config.settings, isolation="fuse-overlay", max_agents=2)
     return FuseOverlayIsolation(settings), config.chapters[0]
+
+
+@pytest.mark.asyncio
+async def test_fuse_overlay_manifest_scans_do_not_block_event_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager, chapter = fuse_manager(write_project(tmp_path, chapters="chapters = [1]"))
+    await manager.prepare()
+    workspace = await manager.acquire("responsive-collect")
+    event_loop_thread = threading.get_ident()
+    manifest_threads: list[int] = []
+
+    def tracked_manifest(root: Path, *, excluded: tuple[str, ...]) -> dict[object, object]:
+        del root, excluded
+        manifest_threads.append(threading.get_ident())
+        return {}
+
+    monkeypatch.setattr(isolation_module, "tree_manifest", tracked_manifest)
+    try:
+        result = await workspace.collect(chapter)
+    finally:
+        await workspace.close()
+        await manager.close()
+
+    assert result.accepted
+    assert len(manifest_threads) == 2
+    assert all(thread != event_loop_thread for thread in manifest_threads)
 
 
 @pytest.mark.asyncio

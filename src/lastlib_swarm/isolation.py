@@ -178,8 +178,12 @@ class FuseWorkspace:
         self.closed = False
 
     async def collect(self, chapter: Chapter) -> IsolationResult:
-        base = tree_manifest(self.base, excluded=self.manager.excluded)
-        merged = tree_manifest(self.root, excluded=self.manager.excluded)
+        # Hashing walks the entire source tree. On a large corpus it can
+        # otherwise starve the TUI refresh timer just as the agent finishes.
+        base, merged = await asyncio.gather(
+            asyncio.to_thread(tree_manifest, self.base, excluded=self.manager.excluded),
+            asyncio.to_thread(tree_manifest, self.root, excluded=self.manager.excluded),
+        )
         changed = tuple(
             sorted(path for path in set(base) | set(merged) if base.get(path) != merged.get(path))
         )
@@ -442,7 +446,11 @@ class FuseOverlayIsolation:
     ) -> IsolationResult:
         async with self._lock:
             if changed:
-                current = tree_manifest(self.settings.repo, excluded=self.excluded)
+                current = await asyncio.to_thread(
+                    tree_manifest,
+                    self.settings.repo,
+                    excluded=self.excluded,
+                )
                 base_scope = {
                     path: value
                     for path, value in base_manifest.items()
