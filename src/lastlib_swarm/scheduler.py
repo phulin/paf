@@ -199,7 +199,10 @@ class Orchestrator:
                     chapter,
                     workspace_root=workspace.root,
                 )
-                isolated = await workspace.collect(chapter)
+                isolated = await workspace.collect(
+                    chapter,
+                    promote_cache=validation.succeeded,
+                )
                 if not isolated.accepted:
                     detail = isolated.error
                     if isolated.out_of_scope_paths:

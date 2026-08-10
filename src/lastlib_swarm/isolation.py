@@ -25,7 +25,9 @@ class FileFingerprint:
 class IsolationResult:
     accepted: bool
     generation: int
+    cache_generation: int = 0
     changed_paths: tuple[str, ...] = ()
+    promoted_cache_paths: tuple[str, ...] = ()
     out_of_scope_paths: tuple[str, ...] = ()
     error: str = ""
 
@@ -33,7 +35,9 @@ class IsolationResult:
         return {
             "accepted": self.accepted,
             "generation": self.generation,
+            "cache_generation": self.cache_generation,
             "changed_paths": list(self.changed_paths),
+            "promoted_cache_paths": list(self.promoted_cache_paths),
             "out_of_scope_paths": list(self.out_of_scope_paths),
             "error": self.error,
         }
@@ -90,11 +94,38 @@ def _matches_scope(relative: str, chapter: Chapter) -> bool:
     return any(fnmatch.fnmatchcase(relative, pattern) for pattern in chapter.scope)
 
 
+def _is_cache_path(relative: str) -> bool:
+    return _excluded(relative, (".lake", "lean/.lake"))
+
+
+def _is_overlay_marker(relative: str) -> bool:
+    return any(part.startswith(".wh.") for part in Path(relative).parts)
+
+
+def cache_manifest(root: Path) -> dict[str, FileFingerprint]:
+    return {
+        path: fingerprint
+        for path, fingerprint in tree_manifest(
+            root,
+            excluded=(".git", ".swarm", ".venv", ".pytest_cache"),
+        ).items()
+        if _is_cache_path(path) and not _is_overlay_marker(path)
+    }
+
+
+def _path_fingerprint(root: Path, relative: str) -> FileFingerprint | None:
+    try:
+        return _fingerprint(root / relative)
+    except FileNotFoundError:
+        return None
+
+
 class SharedWorkspace:
     def __init__(self, repo: Path) -> None:
         self.root = repo
 
-    async def collect(self, _chapter: Chapter) -> IsolationResult:
+    async def collect(self, _chapter: Chapter, *, promote_cache: bool = False) -> IsolationResult:
+        del promote_cache
         return IsolationResult(accepted=True, generation=0)
 
     async def close(self) -> None:
@@ -124,7 +155,9 @@ class FuseWorkspace:
         *,
         slot: int,
         generation: int,
+        cache_generation: int,
         base: Path,
+        cache: Path,
         upper: Path,
         work: Path,
         merged: Path,
@@ -132,13 +165,15 @@ class FuseWorkspace:
         self.manager = manager
         self.slot = slot
         self.generation = generation
+        self.cache_generation = cache_generation
         self.base = base
+        self.cache = cache
         self.upper = upper
         self.work = work
         self.root = merged
         self.closed = False
 
-    async def collect(self, chapter: Chapter) -> IsolationResult:
+    async def collect(self, chapter: Chapter, *, promote_cache: bool = False) -> IsolationResult:
         base = tree_manifest(self.base, excluded=self.manager.excluded)
         merged = tree_manifest(self.root, excluded=self.manager.excluded)
         changed = tuple(
@@ -149,6 +184,7 @@ class FuseWorkspace:
             return IsolationResult(
                 accepted=False,
                 generation=self.generation,
+                cache_generation=self.cache_generation,
                 changed_paths=changed,
                 out_of_scope_paths=outside,
                 error="agent changed files outside its exclusive scope",
@@ -156,10 +192,14 @@ class FuseWorkspace:
         return await self.manager.import_changes(
             chapter,
             generation=self.generation,
+            cache_generation=self.cache_generation,
+            cache_root=self.cache,
+            upper_root=self.upper,
             base_manifest=base,
             merged_manifest=merged,
             merged_root=self.root,
             changed=changed,
+            promote_cache=promote_cache,
         )
 
     async def close(self) -> None:
@@ -179,7 +219,8 @@ class FuseOverlayIsolation:
             / f"lastlib-swarm-{os.getuid()}"
             / f"{identity}-{os.getpid()}"
         )
-        self.generations = self.root / "generations"
+        self.generations = self.root / "source-generations"
+        self.cache_generations = self.root / "cache-generations"
         self.slots = self.root / "slots"
         excluded = {
             ".git",
@@ -199,6 +240,9 @@ class FuseOverlayIsolation:
         self._revision = 0
         self._generation_paths: dict[int, Path] = {}
         self._generation_references: dict[int, int] = {}
+        self._cache_revision = 0
+        self._cache_paths: dict[int, Path] = {}
+        self._cache_references: dict[int, int] = {}
 
     async def prepare(self) -> None:
         if not fuse_overlay_available():
@@ -216,6 +260,7 @@ class FuseOverlayIsolation:
                 "to confine Codex to the mounted workspace"
             )
         self.generations.mkdir(parents=True, exist_ok=True)
+        self.cache_generations.mkdir(parents=True, exist_ok=True)
         self.slots.mkdir(parents=True, exist_ok=True)
 
     async def _run(self, *command: str) -> None:
@@ -239,7 +284,7 @@ class FuseOverlayIsolation:
         destination = self.generations / f"{generation:08d}"
         destination.mkdir(parents=True, exist_ok=False)
         command = ["rsync", "-a"]
-        command.extend(f"--exclude=/{path}" for path in self.excluded if ".lake" not in path)
+        command.extend(f"--exclude=/{path}" for path in self.excluded)
         command.extend(
             (
                 f"--link-dest={self.settings.repo}",
@@ -252,15 +297,55 @@ class FuseOverlayIsolation:
         self._generation_references[generation] = 0
         return generation, destination
 
+    async def _copy_cache(
+        self,
+        source: Path,
+        destination: Path,
+        *,
+        link_destination: Path | None,
+    ) -> None:
+        command = [
+            "rsync",
+            "-a",
+            "--prune-empty-dirs",
+            "--include=*/",
+            "--include=/.lake/***",
+            "--include=/lean/.lake/***",
+            "--exclude=*",
+        ]
+        if link_destination is not None:
+            command.append(f"--link-dest={link_destination}")
+        command.extend((f"{source}/", f"{destination}/"))
+        await self._run(*command)
+
+    async def _cache_generation(self) -> tuple[int, Path]:
+        generation = self._cache_revision
+        existing = self._cache_paths.get(generation)
+        if existing is not None:
+            return generation, existing
+        destination = self.cache_generations / f"{generation:08d}"
+        destination.mkdir(parents=True, exist_ok=False)
+        await self._copy_cache(
+            self.settings.repo,
+            destination,
+            link_destination=self.settings.repo,
+        )
+        self._cache_paths[generation] = destination
+        self._cache_references[generation] = 0
+        return generation, destination
+
     async def acquire(self, run_id: str) -> FuseWorkspace:
         slot = await self._available.get()
         generation: int | None = None
+        cache_generation: int | None = None
         slot_root = self.slots / f"{slot:04d}-{run_id}"
         merged = slot_root / "merged"
         try:
             async with self._lock:
                 generation, base = await self._generation()
+                cache_generation, cache = await self._cache_generation()
                 self._generation_references[generation] += 1
+                self._cache_references[cache_generation] += 1
             upper = slot_root / "upper"
             work = slot_root / "work"
             for path in (upper, work, merged):
@@ -268,7 +353,7 @@ class FuseOverlayIsolation:
             await self._run(
                 "fuse-overlayfs",
                 "-o",
-                f"lowerdir={base},upperdir={upper},workdir={work}",
+                f"lowerdir={base}:{cache},upperdir={upper},workdir={work}",
                 str(merged),
             )
             if not os.path.ismount(merged):
@@ -277,7 +362,9 @@ class FuseOverlayIsolation:
                 self,
                 slot=slot,
                 generation=generation,
+                cache_generation=cache_generation,
                 base=base,
+                cache=cache,
                 upper=upper,
                 work=work,
                 merged=merged,
@@ -290,6 +377,8 @@ class FuseOverlayIsolation:
             if generation is not None:
                 async with self._lock:
                     self._generation_references[generation] -= 1
+                    if cache_generation is not None:
+                        self._cache_references[cache_generation] -= 1
             self._available.put_nowait(slot)
             raise
 
@@ -298,33 +387,37 @@ class FuseOverlayIsolation:
         chapter: Chapter,
         *,
         generation: int,
+        cache_generation: int,
+        cache_root: Path,
+        upper_root: Path,
         base_manifest: dict[str, FileFingerprint],
         merged_manifest: dict[str, FileFingerprint],
         merged_root: Path,
         changed: tuple[str, ...],
+        promote_cache: bool,
     ) -> IsolationResult:
-        if not changed:
-            return IsolationResult(accepted=True, generation=generation)
         async with self._lock:
-            current = tree_manifest(self.settings.repo, excluded=self.excluded)
-            base_scope = {
-                path: value
-                for path, value in base_manifest.items()
-                if _matches_scope(path, chapter)
-            }
-            current_scope = {
-                path: value for path, value in current.items() if _matches_scope(path, chapter)
-            }
-            if base_scope != current_scope:
-                return IsolationResult(
-                    accepted=False,
-                    generation=generation,
-                    changed_paths=changed,
-                    error=(
-                        "assigned scope changed after this agent started; "
-                        "retry on a fresh generation"
-                    ),
-                )
+            if changed:
+                current = tree_manifest(self.settings.repo, excluded=self.excluded)
+                base_scope = {
+                    path: value
+                    for path, value in base_manifest.items()
+                    if _matches_scope(path, chapter)
+                }
+                current_scope = {
+                    path: value for path, value in current.items() if _matches_scope(path, chapter)
+                }
+                if base_scope != current_scope:
+                    return IsolationResult(
+                        accepted=False,
+                        generation=generation,
+                        cache_generation=cache_generation,
+                        changed_paths=changed,
+                        error=(
+                            "assigned scope changed after this agent started; "
+                            "retry on a fresh generation"
+                        ),
+                    )
             unsupported = [
                 relative
                 for relative in changed
@@ -335,6 +428,7 @@ class FuseOverlayIsolation:
                 return IsolationResult(
                     accepted=False,
                     generation=generation,
+                    cache_generation=cache_generation,
                     changed_paths=changed,
                     error=f"unsupported changed file type: {unsupported[0]}",
                 )
@@ -346,15 +440,77 @@ class FuseOverlayIsolation:
                     continue
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 temporary = destination.with_name(f".{destination.name}.swarm-{os.getpid()}")
-                shutil.copyfile(merged_root / relative, temporary)
-                temporary.chmod(fingerprint.mode)
+                shutil.copy2(merged_root / relative, temporary)
                 os.replace(temporary, destination)
-            self._revision += 1
+            if changed:
+                self._revision += 1
+            promoted = (
+                await self._promote_cache_locked(
+                    base_root=cache_root,
+                    merged_root=merged_root,
+                    upper_root=upper_root,
+                )
+                if promote_cache
+                else ()
+            )
             return IsolationResult(
                 accepted=True,
                 generation=generation,
+                cache_generation=cache_generation,
                 changed_paths=changed,
+                promoted_cache_paths=promoted,
             )
+
+    async def _promote_cache_locked(
+        self,
+        *,
+        base_root: Path,
+        merged_root: Path,
+        upper_root: Path,
+    ) -> tuple[str, ...]:
+        delta = cache_manifest(upper_root)
+        candidates = tuple(
+            sorted(
+                path
+                for path, fingerprint in delta.items()
+                if fingerprint.kind == "file" and _path_fingerprint(base_root, path) != fingerprint
+            )
+        )
+        if not candidates:
+            return ()
+
+        current_generation, current_root = await self._cache_generation()
+        promotable = tuple(
+            path
+            for path in candidates
+            if _path_fingerprint(current_root, path)
+            in {
+                _path_fingerprint(base_root, path),
+                _path_fingerprint(merged_root, path),
+            }
+        )
+        if not promotable:
+            return ()
+
+        next_generation = current_generation + 1
+        destination = self.cache_generations / f"{next_generation:08d}"
+        destination.mkdir(parents=True, exist_ok=False)
+        await self._copy_cache(
+            current_root,
+            destination,
+            link_destination=current_root,
+        )
+        for relative in promotable:
+            target = destination / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            temporary = target.with_name(f".{target.name}.cache-{os.getpid()}")
+            shutil.copy2(merged_root / relative, temporary)
+            os.replace(temporary, target)
+
+        self._cache_revision = next_generation
+        self._cache_paths[next_generation] = destination
+        self._cache_references[next_generation] = 0
+        return promotable
 
     async def release(self, workspace: FuseWorkspace) -> None:
         try:
@@ -372,6 +528,14 @@ class FuseOverlayIsolation:
                     path = self._generation_paths.pop(workspace.generation)
                     self._generation_references.pop(workspace.generation)
                     shutil.rmtree(path)
+                self._cache_references[workspace.cache_generation] -= 1
+                if (
+                    workspace.cache_generation != self._cache_revision
+                    and self._cache_references[workspace.cache_generation] == 0
+                ):
+                    cache_path = self._cache_paths.pop(workspace.cache_generation)
+                    self._cache_references.pop(workspace.cache_generation)
+                    shutil.rmtree(cache_path)
             self._available.put_nowait(workspace.slot)
 
     async def close(self) -> None:

@@ -57,6 +57,8 @@ async def test_fuse_overlay_imports_scope_and_rejects_a_stale_writer(tmp_path: P
     first_file.parent.mkdir(parents=True)
     stale_file.parent.mkdir(parents=True)
     first_file.write_text("theorem first : True := by trivial\n", encoding="utf-8")
+    expected_mtime = 1_700_000_000_123_456_789
+    os.utime(first_file, ns=(expected_mtime, expected_mtime))
     stale_file.write_text("theorem stale : True := by trivial\n", encoding="utf-8")
     try:
         accepted = await first.collect(chapter)
@@ -74,6 +76,85 @@ async def test_fuse_overlay_imports_scope_and_rejects_a_stale_writer(tmp_path: P
         .read_text(encoding="utf-8")
         .startswith("theorem first")
     )
+    assert (tmp_path / "lean" / "Book" / "Chapter01.lean").stat().st_mtime_ns == expected_mtime
+
+
+@pytest.mark.asyncio
+async def test_lake_cache_is_shared_pinned_and_promoted_without_copying(tmp_path: Path) -> None:
+    config_path = write_project(tmp_path, chapters="chapters = [1]")
+    seed = tmp_path / "lean" / ".lake" / "packages" / "dependency.olean"
+    seed.parent.mkdir(parents=True)
+    seed.write_bytes(b"shared dependency")
+    manager, chapter = fuse_manager(config_path)
+    await manager.prepare()
+    writer = await manager.acquire("cache-writer")
+    pinned = await manager.acquire("cache-pinned")
+    fresh = None
+    try:
+        artifact = "lean/.lake/build/lib/lean/Book/Chapter01.olean"
+        writer_artifact = writer.root / artifact
+        writer_artifact.parent.mkdir(parents=True)
+        writer_artifact.write_bytes(b"new chapter artifact")
+
+        assert (writer.root / seed.relative_to(tmp_path)).read_bytes() == b"shared dependency"
+        assert (pinned.root / seed.relative_to(tmp_path)).read_bytes() == b"shared dependency"
+        result = await writer.collect(chapter, promote_cache=True)
+        await writer.close()
+        fresh = await manager.acquire("cache-fresh")
+        assert result.accepted
+        assert result.promoted_cache_paths == (artifact,)
+        assert not (pinned.root / artifact).exists()
+        assert (fresh.root / artifact).read_bytes() == b"new chapter artifact"
+        assert (pinned.cache / seed.relative_to(tmp_path)).stat().st_ino == (
+            fresh.cache / seed.relative_to(tmp_path)
+        ).stat().st_ino
+        assert not (tmp_path / artifact).exists()
+        assert writer.cache_generation == pinned.cache_generation == 0
+        assert fresh.cache_generation == 1
+    finally:
+        await writer.close()
+        await pinned.close()
+        if fresh is not None:
+            await fresh.close()
+        await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_cache_promotions_merge_unrelated_artifacts(tmp_path: Path) -> None:
+    manager, chapter = fuse_manager(write_project(tmp_path, chapters="chapters = [1]"))
+    await manager.prepare()
+    first = await manager.acquire("cache-first")
+    second = await manager.acquire("cache-second")
+    fresh = None
+    try:
+        first_only = "lean/.lake/build/first.olean"
+        second_only = "lean/.lake/build/second.olean"
+        conflict = "lean/.lake/build/shared.trace"
+        for workspace, relative, contents in (
+            (first, first_only, b"first"),
+            (first, conflict, b"first wins"),
+            (second, second_only, b"second"),
+            (second, conflict, b"stale second"),
+        ):
+            target = workspace.root / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(contents)
+
+        first_result = await first.collect(chapter, promote_cache=True)
+        second_result = await second.collect(chapter, promote_cache=True)
+        await first.close()
+        fresh = await manager.acquire("cache-merged")
+        assert set(first_result.promoted_cache_paths) == {first_only, conflict}
+        assert second_result.promoted_cache_paths == (second_only,)
+        assert (fresh.root / first_only).read_bytes() == b"first"
+        assert (fresh.root / second_only).read_bytes() == b"second"
+        assert (fresh.root / conflict).read_bytes() == b"first wins"
+    finally:
+        await first.close()
+        await second.close()
+        if fresh is not None:
+            await fresh.close()
+        await manager.close()
 
 
 @pytest.mark.asyncio
@@ -90,6 +171,9 @@ sys.stdin.read()
 target = pathlib.Path("lean/Book/Chapter01.lean")
 target.parent.mkdir(parents=True, exist_ok=True)
 target.write_text("theorem isolated : True := by trivial\\n", encoding="utf-8")
+artifact = pathlib.Path("lean/.lake/build/lib/lean/Book/Chapter01.olean")
+artifact.parent.mkdir(parents=True, exist_ok=True)
+artifact.write_bytes(b"compiled")
 report = {"changed": True, "complete": True, "needs_repair": False,
           "summary": "isolated", "issues": []}
 print(json.dumps({"type": "item.completed", "item": {
@@ -119,6 +203,10 @@ print(json.dumps({"type": "item.completed", "item": {
     run = state.task(config.chapters[0].id, Stage.FORMALIZE).runs[0]
     assert run.isolation is not None
     assert run.isolation["accepted"] is True
+    assert run.isolation["promoted_cache_paths"] == [
+        "lean/.lake/build/lib/lean/Book/Chapter01.olean"
+    ]
+    assert not (tmp_path / "lean" / ".lake" / "build").exists()
     assert json.loads((config.settings.state_dir / "state.json").read_text())["tasks"]
     await orchestrator.shutdown()
 
