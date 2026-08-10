@@ -2,7 +2,13 @@ from pathlib import Path
 
 import pytest
 
-from lastlib_swarm.config import infer_config, infer_corpus, load_config, parse_book_dependencies
+from lastlib_swarm.config import (
+    infer_config,
+    infer_corpus,
+    load_config,
+    parse_book_dependencies,
+    standard_prompt_path,
+)
 from lastlib_swarm.models import Stage
 from tests.support import write_project
 
@@ -96,6 +102,16 @@ def test_config_stage_prompts_are_optional(tmp_path: Path) -> None:
     config = load_config(path)
 
     assert config.stages[Stage.FORMALIZE].prompt.name == "formalize.md"
+
+
+def test_standard_prompts_require_clean_lake_builds() -> None:
+    for stage in Stage:
+        prompt = standard_prompt_path(stage).read_text(encoding="utf-8")
+        assert "lake build" in prompt
+        assert "lake env lean" in prompt
+        assert "no warnings except" in prompt
+        assert "`sorry`" in prompt
+        assert "placeholder" in prompt
 
 
 def test_infers_multiple_books_and_chained_mermaid_dependencies(tmp_path: Path) -> None:

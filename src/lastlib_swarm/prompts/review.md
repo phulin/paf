@@ -14,6 +14,10 @@ inaccurate, circular, vacuous, or unprovable. Do not weaken correct mathematics 
 proof is difficult. Existing proof placeholders may remain. Never add the conclusion as a hypothesis,
 contradictory assumptions, axioms, unsafe code, or other proof loopholes.
 
-Run `{build_command}` and fix all elaboration errors caused by the review. Edit only the assigned
-chapter scope and do not commit. If the complete formalization is already faithful and well-typed,
-make no changes; a no-change pass is the success signal used by the orchestrator.
+For compilation and testing, prefer the project target through `lake build`; do not use
+`lake env lean` when a Lake build target is available. Run `{build_command}` and fix all elaboration
+errors and all warnings except the expected warnings for deliberate `sorry` placeholders. Edit only
+the assigned chapter scope and do not commit. If the complete formalization is already faithful,
+well-typed, and warning-free under that exception, make no changes; a no-change pass is the success
+signal used by the orchestrator. The final build must emit no warnings except the expected warnings
+for deliberate `sorry` placeholders.
