@@ -37,6 +37,9 @@ class SwarmSettings:
     agent_timeout_seconds: float = 7200.0
     validation_timeout_seconds: float = 1800.0
     isolation: str = "auto"
+    lean_mcp: bool = True
+    lean_project: Path = Path("lean")
+    lean_mcp_tool_timeout_seconds: float = 300.0
 
 
 @dataclass(frozen=True)

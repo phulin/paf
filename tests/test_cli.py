@@ -24,7 +24,17 @@ def test_plan_command(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> Non
     path = write_project(tmp_path)
 
     assert main(["plan", "--config", str(path)]) == 0
-    assert "critical-path rank" in capsys.readouterr().out
+    output = capsys.readouterr().out
+    assert "critical-path rank" in output
+    assert "Lean MCP: enabled" in output
+
+
+def test_plan_can_disable_lean_mcp(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    path = write_project(tmp_path)
+
+    assert main(["plan", "--config", str(path), "--no-lean-mcp"]) == 0
+
+    assert "Lean MCP: disabled" in capsys.readouterr().out
 
 
 def test_plan_accepts_just_a_markdown_target(

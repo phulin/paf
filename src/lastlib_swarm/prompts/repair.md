@@ -13,9 +13,14 @@ Do not solve proof difficulty by weakening conclusions, adding results as assump
 contradictions, or using tautologies, axioms, unsafe declarations, or proof-checking loopholes. Mark a
 genuine defect in the informal source with a precise `SOURCE_ISSUE` comment.
 
-For compilation and testing, prefer the project target through `lake build`; do not use
-`lake env lean` when a Lake build target is available. Run `{build_command}`, fix all elaboration
-errors and all warnings except the expected warnings for deliberate `sorry` placeholders, edit only
-the assigned chapter scope, remove scratch files and exploratory commands, and do not commit. Clearly
-report what was repaired so the next proof pass can proceed efficiently. The final build must emit
-no warnings except the expected warnings for deliberate `sorry` placeholders.
+When available, use the attached Lean MCP to diagnose every assigned file before editing, then make a
+coherent repair pass and iterate only over declarations whose diagnostics remain. Use goals,
+declaration lookup, code actions, and fresh whole-file diagnostics instead of invoking Lake after
+each edit. For the final compilation and acceptance check, prefer the project target through
+`lake build`; do not use `lake env lean` when a Lake build target is available. Run `{build_command}`,
+fix all remaining elaboration errors and all warnings except the expected warnings for deliberate
+`sorry`
+placeholders, edit only the assigned chapter scope, remove scratch files and exploratory commands,
+and do not commit. Clearly report what was repaired so the next proof pass can proceed efficiently.
+The final build must emit no warnings except the expected warnings for deliberate `sorry`
+placeholders.

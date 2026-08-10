@@ -47,7 +47,8 @@ uv run lastlib-swarm books/02-finite-extensions-of-local-fields.md
 Passing a `.md` as the first argument is shorthand for `pipeline <target>`. Zero-config runs default
 to `gpt-5.6-luna`, reasoning effort `max`, the packaged generic prompt library under
 `src/lastlib_swarm/prompts/`, automatic execution isolation, and a state directory at
-`.swarm/<inferred-book-id>/`. Use
+`.swarm/<inferred-book-id>/`. They also attach a private Lean LSP MCP server to every active agent.
+Use
 `swarm.example.toml` when the inferred layout is not appropriate or when coordinating multiple books.
 
 Any stage may point at a specialized prompt template. Supported replacement fields include
@@ -102,6 +103,29 @@ number would be ambiguous.
 CLI overrides such as `--model`, `--reasoning-effort`, and `--max-agents` work with both inferred and
 configured runs. `--isolation auto|fuse-overlay|shared` selects the execution backend.
 
+Use `--no-lean-mcp` for a diagnostic fallback run without the Lean MCP integration.
+
+## Lean LSP MCP proof loop
+
+Every active Codex attempt receives its own locked
+[`lean-lsp-mcp`](https://github.com/oOo0oOo/lean-lsp-mcp) stdio server, rooted inside the same private
+FUSE overlay as the agent and final validator. Statement stages receive whole-file diagnostics,
+outlines, hover/declaration lookup, and local source search. Proof and repair stages also receive
+proof goals, completions, code actions, and batched tactic trials. Remote search, local Loogle, and
+the MCP's `lean_build` tool are deliberately absent from the allowlist: this avoids shared-service
+rate limits, large indexing memory, and builds outside orchestrator control.
+
+Proof agents first read and attempt the entire assigned file set without checking each speculative
+proof separately. They then request whole-file diagnostics and iterate only over failing proofs and
+their dependent declarations. The orchestrator still runs one targeted `lake build +Module` after
+the agent exits. That build is the authoritative warning-free acceptance check and the source of
+promotable Lake-cache artifacts.
+
+An MCP/LSP process exists per active attempt, not per queued agent. Its imported `.olean` files come
+from the attempt's shared immutable Lake-cache generation, while its document state remains private
+to that attempt. Consequently `max_agents` also bounds the number of concurrent Lean language
+servers.
+
 ## Agent-managed background mode
 
 Managing agents do not need to hold open a TUI or manipulate a background process's stdin. Start a
@@ -147,9 +171,9 @@ After the daemon exits, `status`, `snapshot`, and `wait` fall back to the persis
 - **Review** always uses a fresh agent. It succeeds only when an agent makes no changes inside the
   chapter scope and Lean validation succeeds. A modifying review triggers another independent
   review, up to `max_rounds`.
-- **Prove** sends the whole chapter to one agent and explicitly asks for whole-section proof passes
-  before batched builds. It succeeds only when the scoped Lean code has no `sorry` or `admit` tokens
-  and validation succeeds.
+- **Prove** sends the whole chapter to one agent, asks for one complete proof-writing pass, and then
+  uses whole-file LSP diagnostics to focus iterations on failed proofs. It succeeds only when the
+  scoped Lean code has no `sorry` or `admit` tokens and final Lake validation succeeds.
 - **Repair** is entered when a proof report identifies a statement/API problem, or when a proof
   agent makes no progress with placeholders remaining. Repair feedback includes the proof report,
   placeholder count, and the tail of the Lean validation output. The pipeline then returns to proof.
@@ -258,6 +282,9 @@ approve_for_me = true
 agent_timeout_seconds = 7200
 validation_timeout_seconds = 1800
 isolation = "auto" # auto, fuse-overlay, or shared
+lean_mcp = true
+lean_project = "lean" # relative to swarm.repo; contains lakefile and lean-toolchain
+lean_mcp_tool_timeout_seconds = 300
 ```
 
 Every stage automatically uses its packaged standard prompt and default retry bound. A stage table

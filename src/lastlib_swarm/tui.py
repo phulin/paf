@@ -151,10 +151,13 @@ class SwarmApp(App[bool]):
         usage = self.state.total_usage()
         active = sum(task.status == TaskStatus.RUNNING for task in self.state.tasks.values())
         maximum = self.orchestrator.config.settings.max_agents
+        lean_mcp = "on" if self.orchestrator.config.settings.lean_mcp else "off"
+        isolation = self.orchestrator.isolation.name
         critical = " → ".join(self.orchestrator.statement_schedule.critical_path) or "—"
         self.query_one("#usage", Static).update(
             f"{format_usage(usage)}    active stage records: {active}  concurrency cap: {maximum}\n"
-            f"Statement critical path: {critical}    isolation: {self.orchestrator.isolation.name}"
+            f"Statement critical path: {critical}    isolation: {isolation}  "
+            f"Lean MCP: {lean_mcp}"
         )
         for stage in Stage:
             counts = stage_counts(self.state, stage)

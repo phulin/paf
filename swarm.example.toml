@@ -10,6 +10,9 @@ approve_for_me = true
 agent_timeout_seconds = 7200
 validation_timeout_seconds = 1800
 isolation = "auto"
+lean_mcp = true
+lean_project = "lean"
+lean_mcp_tool_timeout_seconds = 300
 
 [stages.formalize]
 max_rounds = 3

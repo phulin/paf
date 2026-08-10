@@ -3,7 +3,12 @@ from pathlib import Path
 
 import pytest
 
-from lastlib_swarm.codex import CodexExecutor, count_placeholders, render_prompt
+from lastlib_swarm.codex import (
+    CodexExecutor,
+    count_placeholders,
+    lean_mcp_executable,
+    render_prompt,
+)
 from lastlib_swarm.config import load_config
 from lastlib_swarm.models import Stage
 from lastlib_swarm.state import StateStore, TokenUsage
@@ -53,7 +58,7 @@ def test_executor_uses_machine_readable_codex_mode(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
     executor = CodexExecutor(config, StateStore(config))
 
-    command = executor.command()
+    command = executor.command(Stage.REVIEW)
 
     assert command[:2] == ["codex", "exec"]
     assert "--json" in command
@@ -61,10 +66,47 @@ def test_executor_uses_machine_readable_codex_mode(tmp_path: Path) -> None:
     assert "--approve-for-me" in command
     assert "--dangerously-bypass-approvals-and-sandbox" not in command
     assert "--skip-git-repo-check" not in command
-    assert "--skip-git-repo-check" in executor.command(tmp_path / "isolated")
+    isolated = tmp_path / "isolated"
+    isolated_command = executor.command(Stage.PROVE, isolated)
+    assert "--skip-git-repo-check" in isolated_command
+    overrides = {
+        isolated_command[index + 1].split("=", 1)[0]: isolated_command[index + 1].split("=", 1)[1]
+        for index, item in enumerate(isolated_command[:-1])
+        if item == "--config"
+    }
+    assert overrides["mcp_servers.lastlib_lean.command"] == f'"{lean_mcp_executable()}"'
+    assert overrides["mcp_servers.lastlib_lean.cwd"] == f'"{isolated / "lean"}"'
+    assert "lean_diagnostic_messages" in overrides["mcp_servers.lastlib_lean.enabled_tools"]
+    assert "lean_multi_attempt" in overrides["mcp_servers.lastlib_lean.enabled_tools"]
+    assert "lean_build" not in overrides["mcp_servers.lastlib_lean.enabled_tools"]
     assert render_prompt(
         "Chapter {chapter_number_padded}: {chapter_title}", config.chapters[0]
     ) == ("Chapter 01: First chapter")
+
+
+def test_executor_can_disable_lean_mcp(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    config = replace(config, settings=replace(config.settings, lean_mcp=False))
+    executor = CodexExecutor(config, StateStore(config))
+
+    command = executor.command(Stage.PROVE)
+    prompt = executor.build_prompt(config.chapters[0], Stage.PROVE)
+
+    assert not any("mcp_servers.lastlib_lean" in item for item in command)
+    assert "Lean MCP workflow" not in prompt
+
+
+def test_proof_prompt_requires_whole_file_pass_before_diagnostics(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    executor = CodexExecutor(config, StateStore(config))
+
+    prompt = executor.build_prompt(config.chapters[0], Stage.PROVE)
+
+    whole_pass = prompt.index("one coherent\nproof-writing pass over the entire assigned file set")
+    diagnostics = prompt.index("Then request whole-file diagnostics")
+    assert whole_pass < diagnostics
+    assert "Iterate only over the proofs and dependent declarations that fail" in prompt
+    assert "Lake build only as the final acceptance check" in prompt
 
 
 @pytest.mark.asyncio

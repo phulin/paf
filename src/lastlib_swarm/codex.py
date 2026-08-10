@@ -6,6 +6,7 @@ import json
 import os
 import re
 import signal
+import sys
 from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -27,6 +28,29 @@ REPORT_SCHEMA: dict[str, Any] = {
     },
     "required": ["changed", "complete", "needs_repair", "summary", "issues"],
 }
+
+LEAN_MCP_BASE_TOOLS = (
+    "lean_file_outline",
+    "lean_diagnostic_messages",
+    "lean_hover_info",
+    "lean_declaration_file",
+    "lean_local_search",
+)
+
+LEAN_MCP_PROOF_TOOLS = (
+    *LEAN_MCP_BASE_TOOLS,
+    "lean_goal",
+    "lean_term_goal",
+    "lean_completions",
+    "lean_multi_attempt",
+    "lean_code_actions",
+)
+
+
+def lean_mcp_executable() -> Path:
+    """Return the console script installed beside this package's Python interpreter."""
+
+    return Path(sys.executable).with_name("lean-lsp-mcp")
 
 
 @dataclass(frozen=True)
@@ -198,13 +222,37 @@ Return the required structured final report. Set `needs_repair` only when a stat
 interface must change; ordinary unfinished or broken proof code is not statement repair. The
 orchestrator independently checks scoped file hashes, placeholders, and `{chapter.build_command}`.
 """
+        if self.config.settings.lean_mcp:
+            contract += """
+
+## Lean MCP workflow
+
+A private `lastlib_lean` MCP server is attached to this attempt. It points at the attempt's private
+Lean project. Prefer its diagnostics, goals, hover, declaration lookup, code actions, and local
+search tools for interactive checking. The MCP intentionally does not expose `lean_build` or remote
+search. Do not start another language server.
+"""
+            if stage == Stage.PROVE:
+                contract += """
+Before editing, inspect every assigned Lean file and inventory all placeholders. Make one coherent
+proof-writing pass over the entire assigned file set: attempt every mathematically sound proof once,
+without stopping to check each proof separately. Then request whole-file diagnostics for every
+assigned file. Iterate only over the proofs and dependent declarations that fail, using proof goals,
+batched tactic attempts, code actions, and fresh whole-file diagnostics until no unexpected
+diagnostics remain. Run the configured Lake build only as the final acceptance check.
+"""
+            else:
+                contract += """
+Use whole-file diagnostics after each coherent batch of edits. Run the configured Lake build only as
+the final acceptance check, not as the interactive edit/check loop.
+"""
         if feedback:
             contract += (
                 f"\n## Feedback from the preceding attempt\n\n```text\n{feedback[-12000:]}\n```\n"
             )
         return base + contract
 
-    def command(self, workspace_root: Path | None = None) -> list[str]:
+    def command(self, stage: Stage, workspace_root: Path | None = None) -> list[str]:
         settings = self.config.settings
         root = workspace_root or settings.repo
         command = [
@@ -230,6 +278,29 @@ orchestrator independently checks scoped file hashes, placeholders, and `{chapte
             command.extend(["--model", settings.model])
         if settings.reasoning_effort:
             command.extend(["--config", f'model_reasoning_effort="{settings.reasoning_effort}"'])
+        if settings.lean_mcp:
+            lean_project = (root / settings.lean_project).resolve()
+            tools = (
+                LEAN_MCP_PROOF_TOOLS
+                if stage in (Stage.PROVE, Stage.REPAIR)
+                else LEAN_MCP_BASE_TOOLS
+            )
+            mcp_config = {
+                "mcp_servers.lastlib_lean.command": str(lean_mcp_executable()),
+                "mcp_servers.lastlib_lean.cwd": str(lean_project),
+                "mcp_servers.lastlib_lean.required": True,
+                "mcp_servers.lastlib_lean.startup_timeout_sec": 60,
+                "mcp_servers.lastlib_lean.tool_timeout_sec": (
+                    settings.lean_mcp_tool_timeout_seconds
+                ),
+                "mcp_servers.lastlib_lean.default_tools_approval_mode": "auto",
+                "mcp_servers.lastlib_lean.enabled_tools": list(tools),
+                "mcp_servers.lastlib_lean.env.LEAN_PROJECT_PATH": str(lean_project),
+                "mcp_servers.lastlib_lean.env.LEAN_LOG_LEVEL": "NONE",
+                "mcp_servers.lastlib_lean.env.PYTHONWARNINGS": "ignore",
+            }
+            for key, value in mcp_config.items():
+                command.extend(["--config", f"{key}={json.dumps(value)}"])
         command.append("-")
         return command
 
@@ -247,7 +318,7 @@ orchestrator independently checks scoped file hashes, placeholders, and `{chapte
         before = scope_digest(root, chapter)
         log_path = self.state.logs_dir / f"{run.id}.jsonl"
         process = await asyncio.create_subprocess_exec(
-            *self.command(root),
+            *self.command(stage, root),
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,

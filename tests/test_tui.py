@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import pytest
+from textual.widgets import Static
 
 from lastlib_swarm.config import load_config
 from lastlib_swarm.scheduler import Orchestrator
@@ -37,5 +38,7 @@ async def test_dashboard_runs_an_operation_and_exits(tmp_path: Path) -> None:
     app = SwarmApp(orchestrator, operation, label="test")
     async with app.run_test() as pilot:
         await pilot.pause(1.2)
+        usage = app.query_one("#usage", Static).content
 
     assert app.result
+    assert "Lean MCP: on" in str(usage)

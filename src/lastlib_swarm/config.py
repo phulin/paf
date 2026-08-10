@@ -26,6 +26,15 @@ def _resolve(base: Path, value: str) -> Path:
     return path if path.is_absolute() else (base / path).resolve()
 
 
+def _repo_relative(repo: Path, value: str, *, name: str) -> Path:
+    path = Path(value)
+    resolved = path.resolve() if path.is_absolute() else (repo / path).resolve()
+    try:
+        return resolved.relative_to(repo)
+    except ValueError as error:
+        raise ValueError(f"{name} must be inside swarm.repo") from error
+
+
 def _table(data: dict[str, Any], key: str) -> dict[str, Any]:
     value = data.get(key, {})
     if not isinstance(value, dict):
@@ -219,11 +228,20 @@ def load_config(path: str | Path) -> PipelineConfig:
         agent_timeout_seconds=float(swarm.get("agent_timeout_seconds", 7200)),
         validation_timeout_seconds=float(swarm.get("validation_timeout_seconds", 1800)),
         isolation=str(swarm.get("isolation", "auto")),
+        lean_mcp=bool(swarm.get("lean_mcp", True)),
+        lean_project=_repo_relative(
+            repo,
+            str(swarm.get("lean_project", "lean")),
+            name="swarm.lean_project",
+        ),
+        lean_mcp_tool_timeout_seconds=float(swarm.get("lean_mcp_tool_timeout_seconds", 300)),
     )
     if settings.max_agents < 1:
         raise ValueError("swarm.max_agents must be positive")
     if settings.isolation not in {"auto", "fuse-overlay", "shared"}:
         raise ValueError("swarm.isolation must be auto, fuse-overlay, or shared")
+    if settings.lean_mcp_tool_timeout_seconds <= 0:
+        raise ValueError("swarm.lean_mcp_tool_timeout_seconds must be positive")
 
     stages = _stage_configs(_table(data, "stages"), base)
 

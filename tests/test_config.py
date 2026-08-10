@@ -25,6 +25,9 @@ def test_discovers_chapters_and_renders_paths(tmp_path: Path) -> None:
     assert first.scope == ("lean/Book/Chapter01.lean", "lean/Book/Chapter01/**/*.lean")
     assert config.stages[Stage.REVIEW].max_rounds == 5
     assert config.settings.state_dir == tmp_path / ".swarm"
+    assert config.settings.lean_mcp
+    assert config.settings.lean_project == Path("lean")
+    assert config.settings.lean_mcp_tool_timeout_seconds == 300
 
 
 def test_selects_configured_chapters(tmp_path: Path) -> None:
@@ -55,6 +58,37 @@ def test_rejects_unknown_isolation_backend(tmp_path: Path) -> None:
     )
 
     with pytest.raises(ValueError, match=r"swarm\.isolation"):
+        load_config(path)
+
+
+def test_loads_lean_mcp_settings(tmp_path: Path) -> None:
+    path = write_project(tmp_path)
+    path.write_text(
+        path.read_text(encoding="utf-8").replace(
+            'isolation = "shared"',
+            'isolation = "shared"\nlean_mcp = false\nlean_project = "lean-project"\n'
+            "lean_mcp_tool_timeout_seconds = 45",
+        ),
+        encoding="utf-8",
+    )
+
+    settings = load_config(path).settings
+
+    assert not settings.lean_mcp
+    assert settings.lean_project == Path("lean-project")
+    assert settings.lean_mcp_tool_timeout_seconds == 45
+
+
+def test_rejects_lean_project_outside_repository(tmp_path: Path) -> None:
+    path = write_project(tmp_path)
+    path.write_text(
+        path.read_text(encoding="utf-8").replace(
+            'isolation = "shared"', 'isolation = "shared"\nlean_project = "../outside"'
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match=r"swarm\.lean_project"):
         load_config(path)
 
 
@@ -112,6 +146,17 @@ def test_standard_prompts_require_clean_lake_builds() -> None:
         assert "no warnings except" in prompt
         assert "`sorry`" in prompt
         assert "placeholder" in prompt
+        assert "Lean MCP" in prompt
+
+
+def test_standard_proof_prompt_uses_whole_file_then_failed_proof_loop() -> None:
+    prompt = standard_prompt_path(Stage.PROVE).read_text(encoding="utf-8")
+
+    whole_pass = prompt.index("proof-writing pass over the entire assigned file set")
+    diagnostics = prompt.index("After that whole-file pass")
+    failed_proofs = prompt.index("Iterate only over proofs and dependent declarations that fail")
+
+    assert whole_pass < diagnostics < failed_proofs
 
 
 def test_infers_multiple_books_and_chained_mermaid_dependencies(tmp_path: Path) -> None:

@@ -1,10 +1,11 @@
 [project]
 name = "lastlib-swarm"
-version = "0.5.0"
+version = "0.6.0"
 description = "Massively parallel Codex orchestration for Lean formalization"
 readme = "SWARM.md"
 requires-python = ">=3.12"
 dependencies = [
+  "lean-lsp-mcp==0.29.0",
   "textual>=6.0.0",
 ]
 

@@ -14,10 +14,13 @@ inaccurate, circular, vacuous, or unprovable. Do not weaken correct mathematics 
 proof is difficult. Existing proof placeholders may remain. Never add the conclusion as a hypothesis,
 contradictory assumptions, axioms, unsafe code, or other proof loopholes.
 
-For compilation and testing, prefer the project target through `lake build`; do not use
-`lake env lean` when a Lake build target is available. Run `{build_command}` and fix all elaboration
-errors and all warnings except the expected warnings for deliberate `sorry` placeholders. Edit only
-the assigned chapter scope and do not commit. If the complete formalization is already faithful,
-well-typed, and warning-free under that exception, make no changes; a no-change pass is the success
-signal used by the orchestrator. The final build must emit no warnings except the expected warnings
-for deliberate `sorry` placeholders.
+After the complete mathematical comparison, when available, use the attached Lean MCP to request
+whole-file diagnostics for every assigned Lean file and repair diagnostics in coherent batches. Do
+not start another language server or invoke Lake after every edit. For the final compilation and
+acceptance check, prefer the project target through `lake build`; do not use `lake env lean` when a
+Lake build target is available. Run `{build_command}` once the MCP diagnostics are clean and fix all
+remaining elaboration errors and all warnings except the expected warnings for deliberate `sorry`
+placeholders. Edit only the assigned chapter scope and do not commit. If the complete formalization
+is already faithful, well-typed, and warning-free under that exception, make no changes; a no-change
+pass is the success signal used by the orchestrator. The final build must emit no warnings except the
+expected warnings for deliberate `sorry` placeholders.
