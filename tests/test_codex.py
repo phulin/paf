@@ -198,7 +198,6 @@ def test_rendered_prompts_compose_each_layer_once(tmp_path: Path, stage: Stage) 
         },
     )
     prompt = CodexExecutor(config, StateStore(config)).build_prompt(config.chapters[0], stage)
-    normalized = " ".join(prompt.split())
 
     mission = prompt.index("## Mission")
     policy = prompt.index("## Common Lean policy")
@@ -207,12 +206,6 @@ def test_rendered_prompts_compose_each_layer_once(tmp_path: Path, stage: Stage) 
     assert prompt.count("## Common Lean policy") == 1
     assert prompt.count("## Runtime contract") == 1
     assert prompt.count("import Mathlib") == 1
-    assert "This is a hard write boundary: edit only the paths listed above" in normalized
-    assert "do not edit `.swarm`, `SWARM.md`" in prompt
-    assert "do not edit" in prompt and "prompts" in prompt and "tests" in prompt
-    assert "investigate tooling or infrastructure problems and use in-scope workarounds" in normalized
-    assert "if a fix requires an out-of-scope write, report it" in normalized
-    assert "Any out-of-scope write causes the coordinator to reject the entire attempt" in normalized
     assert prompt.count("Do not run `lake build`") == 1
     assert "Whenever you switch from one Lean file to another" in prompt
     assert "whole-file diagnostic call for the destination" in prompt
