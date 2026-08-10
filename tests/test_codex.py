@@ -108,6 +108,10 @@ def test_executor_uses_machine_readable_codex_mode(tmp_path: Path) -> None:
         if item == "--config"
     }
     assert overrides["mcp_servers.lastlib_lean.command"] == f'"{lean_mcp_executable()}"'
+    assert json.loads(overrides["mcp_servers.lastlib_lean.args"]) == [
+        "-m",
+        "lastlib_swarm.lean_mcp",
+    ]
     assert overrides["mcp_servers.lastlib_lean.cwd"] == f'"{isolated / "lean"}"'
     assert json.loads(overrides["mcp_servers.lastlib_lean.env.PATH"]) == lean_mcp_path()
     assert "lean_diagnostic_messages" in overrides["mcp_servers.lastlib_lean.enabled_tools"]
@@ -202,11 +206,12 @@ def test_rendered_prompts_compose_each_layer_once(tmp_path: Path, stage: Stage) 
     assert prompt.count("## Common Lean policy") == 1
     assert prompt.count("## Runtime contract") == 1
     assert prompt.count("import Mathlib") == 1
-    assert "Do not run raw `lean`" in prompt
-    assert "cd lean && lake build +Book.Chapter01" in prompt
-    assert "disposable COW upper layer" in prompt
-    assert "Do not run `lake clean`" in prompt
-    assert prompt.count("single writable authoritative cache") == 1
+    assert prompt.count("Do not run `lake build`") == 1
+    assert "Whenever you switch from one Lean file to another" in prompt
+    assert "whole-file diagnostic call for the destination" in prompt
+    assert "same when switching back" in prompt
+    assert "one dependency-build pass" in prompt
+    assert prompt.count("single writable build cache") == 1
     assert prompt.count("declaration uses `sorry`") == 1
 
 

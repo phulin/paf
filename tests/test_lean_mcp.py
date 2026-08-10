@@ -25,6 +25,7 @@ async def test_real_lean_mcp_advertises_required_tools() -> None:
     }
     parameters = StdioServerParameters(
         command=str(lean_mcp_executable()),
+        args=["-m", "lastlib_swarm.lean_mcp"],
         cwd=project,
         env=environment,
     )
