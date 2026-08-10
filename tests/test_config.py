@@ -139,13 +139,13 @@ def test_config_stage_prompts_are_optional(tmp_path: Path) -> None:
     assert config.stages[Stage.FORMALIZE].prompt.name == "formalize.md"
 
 
-def test_standard_prompts_delegate_builds_to_coordinator() -> None:
+def test_standard_prompts_have_consistent_stage_structure() -> None:
     for stage in Stage:
         prompt = standard_prompt_path(stage).read_text(encoding="utf-8")
-        assert "coordinator" in prompt
-        assert "{build_command}" in prompt
-        assert "raw Lean" in prompt
-        assert "Lean MCP" in prompt
+        assert "## Mission" in prompt
+        assert "## Workflow" in prompt
+        assert "## Definition of done" in prompt
+        assert "## Runtime contract" not in prompt
 
 
 def test_standard_proof_prompt_uses_whole_file_then_failed_proof_loop() -> None:
@@ -153,7 +153,7 @@ def test_standard_proof_prompt_uses_whole_file_then_failed_proof_loop() -> None:
 
     whole_pass = prompt.index("proof-writing pass over the entire assigned file set")
     diagnostics = prompt.index("After that whole-file pass")
-    failed_proofs = prompt.index("Iterate only over proofs and dependent declarations that fail")
+    failed_proofs = prompt.index("iterate only over proofs and dependent declarations that fail")
 
     assert whole_pass < diagnostics < failed_proofs
 
@@ -162,21 +162,16 @@ def test_statement_prompts_require_proof_support_interfaces() -> None:
     for stage in (Stage.FORMALIZE, Stage.REVIEW):
         prompt = standard_prompt_path(stage).read_text(encoding="utf-8")
         normalized = " ".join(prompt.split())
-        assert "proof-readiness" in prompt or "proof dependency route" in prompt
-        assert "basic `↔` lemmas and equivalences" in prompt
+        assert "proof readiness" in prompt or "proof dependency route" in prompt
+        assert "basic `↔` lemmas" in normalized
         assert "weakest natural assumptions" in normalized
-        assert "circular" in prompt
+        assert "independently provable" in prompt
 
 
-def test_standard_prompts_enforce_narrow_imports() -> None:
-    for stage in Stage:
-        prompt = standard_prompt_path(stage).read_text(encoding="utf-8")
-        assert "import Mathlib" in prompt
-        assert "aggregator" in prompt
-
+def test_standard_review_prompt_keeps_import_audit_as_step_five() -> None:
     review = standard_prompt_path(Stage.REVIEW).read_text(encoding="utf-8")
     assert "5. Audit imports" in review
-    assert "do not need to be minimized" in review
+    assert "common focused-import policy" in review
 
 
 def test_infers_multiple_books_and_chained_mermaid_dependencies(tmp_path: Path) -> None:

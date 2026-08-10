@@ -60,6 +60,12 @@ Any stage may point at a specialized prompt template. Supported replacement fiel
 `{book_title}`, `{chapter_number}`, `{chapter_number_padded}`, `{chapter_title}`, `{source}`,
 `{lean_root}`, `{chapter_path}`, `{chapter_module}`, and `{build_command}`.
 
+The final agent prompt is composed from three deliberately separate layers: the selected stage
+template defines its mission and workflow, packaged `prompts/common.md` defines shared mathematical
+and import policy, and the generated runtime contract supplies the exact scope, MCP availability,
+coordinator-owned build behavior, and structured-report requirements. Shared policy belongs in the
+common layer rather than being copied into every stage template.
+
 Proof agents must clear every MCP warning except “declaration uses `sorry`” for a theorem they
 attempted but could not prove. Disabling a linter or warning option is not an acceptable fix.
 

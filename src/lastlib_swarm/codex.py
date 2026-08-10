@@ -51,6 +51,7 @@ LEAN_MCP_PROOF_TOOLS = (
 
 USAGE_POLL_SECONDS = 0.25
 PROCESS_GROUP_GRACE_SECONDS = 1.0
+COMMON_PROMPT_PATH = Path(__file__).with_name("prompts") / "common.md"
 LEAN_WARNING_RE = re.compile(r"(?m)^[ \t]*warning:[ \t]*(?P<message>.*)$")
 LEAN_SORRY_WARNING_RE = re.compile(
     r"(?:^|:\d+:\d+:[ \t]+)declaration uses [`']sorry[`'][ \t]*$"
@@ -311,56 +312,47 @@ class CodexExecutor:
     ) -> str:
         template = self.config.stages[stage].prompt.read_text(encoding="utf-8")
         base = render_prompt(template, chapter)
+        common = render_prompt(COMMON_PROMPT_PATH.read_text(encoding="utf-8"), chapter)
         scope = "\n".join(f"- `{item}`" for item in chapter.scope)
         contract = f"""
 
-## Orchestrator contract
+## Runtime contract
+
+### Scope and lifecycle
 
 Your exclusive edit scope is:
 {scope}
 
 Do not edit orchestration state under `.swarm`, do not commit, and do not wait for another worker.
 When isolation is enabled, all out-of-scope changes are rejected rather than merged.
-Return the required structured final report. Set `needs_repair` only when a statement or declaration
-interface must change; ordinary unfinished or broken proof code is not statement repair. The
-orchestrator independently checks scoped file hashes, placeholders, and `{chapter.build_command}`.
 Do not run `lake build`, `lake env lean`, raw `lean`, or another compiler command. Builds belong to
 the coordinator: after you exit, it merges accepted scoped changes into the main worktree and
 serially runs the configured build there against the single writable build cache. That validation
 fails on every warning except the exact “declaration uses `sorry`” warning for an unfinished proof.
-Fix the cause of other warnings; do not suppress them by disabling a linter or warning option.
+
+### Final response
+
+Return the required structured report. Set `changed` from the actual scoped diff and `complete` from
+the stage's definition of done. Set `needs_repair` only when a statement or declaration interface
+must change; ordinary unfinished or broken proof code is not statement repair. Summarize the work
+concisely and list every unresolved issue. The coordinator independently checks scoped hashes,
+placeholders, diagnostics, and `{chapter.build_command}`.
 """
         if self.config.settings.lean_mcp:
             contract += """
 
-## Lean MCP workflow
+### Attached Lean MCP
 
 A private `lastlib_lean` MCP server is attached to this attempt. It points at the attempt's private
-Lean project. Prefer its diagnostics, goals, hover, declaration lookup, code actions, and local
-search tools for interactive checking. The MCP intentionally does not expose `lean_build` or remote
-search. Do not start another language server.
-"""
-            if stage == Stage.PROVE:
-                contract += """
-Before editing, inspect every assigned Lean file and inventory all placeholders. Make one coherent
-proof-writing pass over the entire assigned file set: attempt every mathematically sound proof once,
-without stopping to check each proof separately. Then request whole-file diagnostics for every
-assigned file. Iterate only over the proofs and dependent declarations that fail, using proof goals,
-batched tactic attempts, code actions, and fresh whole-file diagnostics until no unexpected
-diagnostics remain. Treat every warning as an error unless it is the “declaration uses `sorry`”
-warning for a theorem you attempted but could not prove. Do not invoke Lake; coordinator performs
-the post-merge acceptance build.
-"""
-            else:
-                contract += """
-Use whole-file diagnostics after each coherent batch of edits. Do not invoke Lake; the coordinator
-performs the post-merge acceptance build.
+Lean project. Use its whole-file diagnostics and, where available for the stage, goals, hover,
+declaration lookup, code actions, completions, tactic trials, and local search. It intentionally
+does not expose `lean_build` or remote search. Do not start another language server.
 """
         if feedback:
             contract += (
                 f"\n## Feedback from the preceding attempt\n\n```text\n{feedback[-12000:]}\n```\n"
             )
-        return base + contract
+        return f"{base.rstrip()}\n\n{common.rstrip()}\n{contract}"
 
     def command(self, stage: Stage, workspace_root: Path | None = None) -> list[str]:
         settings = self.config.settings

@@ -1,30 +1,34 @@
 # Repair statements after proof feedback: {book_title}, chapter {chapter_number}
 
-Read chapter {chapter_number}, “{chapter_title},” in `{source}`, the complete assigned Lean chapter,
-and the proof/build feedback appended by the orchestrator.
+## Mission
 
-Diagnose whether each reported obstruction is an inaccurate source translation, a missing necessary
-hypothesis, a circular or divergent local API, or merely an unfinished proof. Change statements only
-for genuine statement/interface defects. Preserve the intended mathematical strength and make the
-smallest correction supported by the source and earlier theory. Update dependent declarations inside
-this chapter consistently and reconcile guessed APIs with canonical earlier interfaces.
+Read chapter {chapter_number}, “{chapter_title},” in `{source}`, every assigned Lean file, and the
+proof/build feedback appended below. Repair only genuine statement or interface defects so the next
+proof pass can proceed against faithful mathematics.
 
-Do not solve proof difficulty by weakening conclusions, adding results as assumptions, inventing
-contradictions, or using tautologies, axioms, unsafe declarations, or proof-checking loopholes. Mark a
-genuine defect in the informal source with a precise `SOURCE_ISSUE` comment.
+## Repair standard
 
-Keep repairs within an acyclic import graph. Add focused imports freely when repairs need them; do
-not optimize for the fewest imports. Never
-introduce the exact umbrella imports `import Mathlib` or `import LastLib`, or a book/chapter
-aggregator into a production section when a focused module exists. Prefer a focused Mathlib module or stable
-LastLib API, and do not add a section-to-section edge unless the repaired declarations genuinely use
-it.
+Classify each obstruction as an inaccurate source translation, a missing necessary hypothesis, a
+circular or divergent local API, or merely an unfinished proof. Preserve the intended mathematical
+strength and make the smallest correction supported by the source and earlier theory. Update
+dependent declarations inside the assigned scope consistently and reconcile provisional APIs with
+canonical earlier interfaces.
 
-When available, use the attached Lean MCP to diagnose every assigned file before editing, then make a
-coherent repair pass and iterate only over declarations whose diagnostics remain. Use goals,
-declaration lookup, code actions, and fresh whole-file diagnostics. Do not run Lake, raw Lean, or
-another compiler. After you finish, the coordinator merges accepted changes and serially runs
-`{build_command}` in the main worktree against its single writable cache. Fix all diagnostics
-available through the MCP, edit only the assigned chapter scope, remove scratch files and
-exploratory commands, and do not commit. Clearly report what was repaired so the next proof pass can
-proceed efficiently.
+Do not weaken a correct conclusion because its proof is difficult or add the result as an assumption.
+Mark a substantive defect in the informal source with a precise `SOURCE_ISSUE` comment. Ordinary
+formalization details—such as a necessary typeclass, finiteness, positivity, or nonzero assumption—are
+interface repairs rather than source issues.
+
+## Workflow
+
+1. Reproduce each reported obstruction using whole-file diagnostics.
+2. Separate statement defects from proof and API-lookup failures.
+3. Make one coherent batch of minimal statement/interface repairs.
+4. Update dependent declarations within the assigned scope without creating cyclic imports.
+5. Request fresh whole-file diagnostics and repair every message caused by the changes.
+
+## Definition of done
+
+Every accepted repair is minimal, mathematically justified, and reported clearly; ordinary proof
+difficulty remains a proof task. The assigned files have fresh diagnostics with no unexplained
+messages, and the next proof agent has an exact account of every interface change.

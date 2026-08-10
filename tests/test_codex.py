@@ -17,7 +17,7 @@ from lastlib_swarm.codex import (
     unexpected_lean_warnings,
     validate,
 )
-from lastlib_swarm.config import load_config
+from lastlib_swarm.config import load_config, standard_prompt_path
 from lastlib_swarm.models import Stage
 from lastlib_swarm.state import StateStore, TokenUsage
 from tests.support import write_project
@@ -156,23 +156,55 @@ def test_executor_can_disable_lean_mcp(tmp_path: Path) -> None:
     prompt = executor.build_prompt(config.chapters[0], Stage.PROVE)
 
     assert not any("mcp_servers.lastlib_lean" in item for item in command)
-    assert "Lean MCP workflow" not in prompt
+    assert "Attached Lean MCP" not in prompt
 
 
 def test_proof_prompt_requires_whole_file_pass_before_diagnostics(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    config = replace(
+        config,
+        stages={
+            **config.stages,
+            Stage.PROVE: replace(
+                config.stages[Stage.PROVE], prompt=standard_prompt_path(Stage.PROVE)
+            ),
+        },
+    )
     executor = CodexExecutor(config, StateStore(config))
 
     prompt = executor.build_prompt(config.chapters[0], Stage.PROVE)
 
-    whole_pass = prompt.index("one coherent\nproof-writing pass over the entire assigned file set")
-    diagnostics = prompt.index("Then request whole-file diagnostics")
+    normalized = " ".join(prompt.split())
+    whole_pass = normalized.index(
+        "one coherent proof-writing pass over the entire assigned file set"
+    )
+    diagnostics = normalized.index("After that whole-file pass")
     assert whole_pass < diagnostics
-    assert "Iterate only over the proofs and dependent declarations that fail" in prompt
-    assert "Do not invoke Lake" in prompt
-    assert "coordinator performs the post-merge acceptance build" in " ".join(prompt.split())
-    assert "Treat every warning as an error" in prompt
-    assert "Fix the cause of other warnings" in prompt
+    assert "iterate only over proofs and dependent declarations that fail" in prompt
+
+
+@pytest.mark.parametrize("stage", list(Stage))
+def test_rendered_prompts_compose_each_layer_once(tmp_path: Path, stage: Stage) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    config = replace(
+        config,
+        stages={
+            **config.stages,
+            stage: replace(config.stages[stage], prompt=standard_prompt_path(stage)),
+        },
+    )
+    prompt = CodexExecutor(config, StateStore(config)).build_prompt(config.chapters[0], stage)
+
+    mission = prompt.index("## Mission")
+    policy = prompt.index("## Common Lean policy")
+    runtime = prompt.index("## Runtime contract")
+    assert mission < policy < runtime
+    assert prompt.count("## Common Lean policy") == 1
+    assert prompt.count("## Runtime contract") == 1
+    assert prompt.count("import Mathlib") == 1
+    assert prompt.count("Do not run `lake build`") == 1
+    assert prompt.count("single writable build cache") == 1
+    assert prompt.count("declaration uses `sorry`") == 1
 
 
 def test_warning_filter_allows_only_declaration_uses_sorry() -> None:

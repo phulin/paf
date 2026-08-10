@@ -1,52 +1,39 @@
 # Independent statement review: {book_title}, chapter {chapter_number}
 
+## Mission
+
 Read chapter {chapter_number}, “{chapter_title},” in `{source}` and every assigned Lean file under
-`{lean_root}/{chapter_path}/` plus `{lean_root}/{chapter_path}.lean`.
+`{lean_root}/{chapter_path}/` plus `{lean_root}/{chapter_path}.lean`. Independently determine whether
+the formalization is source-faithful, mathematically provable, proof-ready, and acyclic.
 
-Independently inventory the source and compare it declaration-by-declaration with Lean. Check
-coverage, quantifier scope, implication direction, hypotheses, domains and codomains, indexing,
-normalizations, mathematical strength, and source/import order. Verify that each result is genuinely
-provable from earlier material and canonical pinned APIs. Reconcile provisional dependency guesses
-with real earlier interfaces when available.
+## Review standard
 
-Also perform a proof-readiness audit, not only a source-coverage audit. For every principal result,
-read the informal proof or proof sketch, locate the exact earlier project and Mathlib APIs, and trace
-a plausible proof dependency route. Add every genuine intermediate declaration that route requires
-when it is missing, even if the prose treats it as obvious or mentions it only inside a proof. Check
-especially for basic `↔` lemmas and equivalences between book-facing and canonical Lean
-formulations; constructor/eliminator and extensionality facts; membership, coercion, map,
-restriction, and normalization lemmas; closure and functoriality results; and short bridges between
-successive proof steps. Do not leave every proof agent to recreate a missing chapter API locally.
+Compare source and Lean declaration by declaration. Check coverage, quantifier scope, implication
+direction, hypotheses, domains and codomains, coercions, indexing, normalization, mathematical
+strength, and dependency order. Correct inaccurate, circular, vacuous, or unprovable interfaces
+minimally; do not weaken correct mathematics merely because its proof is difficult. Existing proof
+placeholders may remain.
 
-Search for a canonical theorem first. A new proof-support lemma must provide a genuinely missing or
-materially more usable interface, use the weakest natural assumptions, occur before its users, and
-be independently provable from earlier declarations. Reject helpers that restate the target, assume
-its conclusion, depend on later results, or otherwise conceal circularity. Preserve accurate support
-lemmas merely omitted from the informal exposition.
+For every principal result, read the informal proof and trace a plausible dependency route through
+canonical earlier LastLib and pinned Mathlib APIs. Add a missing proof-support declaration only when
+it supplies a genuinely absent or materially more usable interface. Pay special attention to basic
+`↔` lemmas and equivalences between book-facing and canonical formulations; constructor, eliminator,
+and extensionality facts; membership, coercion, map, restriction, and normalization lemmas; and
+closure or functoriality bridges. Each addition must use the weakest natural assumptions, precede its
+users, and be independently provable from earlier declarations.
 
-Add missing substantive assertions and make the smallest principled correction to anything
-inaccurate, circular, vacuous, or unprovable. Do not weaken correct mathematics merely because its
-proof is difficult. Existing proof placeholders may remain. Never add the conclusion as a hypothesis,
-contradictory assumptions, axioms, unsafe code, or other proof loopholes.
-
-Perform the review in this order:
+## Workflow
 
 1. Audit source coverage and the mathematical fidelity of every declaration.
 2. Audit proof readiness, dependency routes, and missing reusable interfaces.
 3. Repair inaccurate, circular, vacuous, or unprovable statements minimally.
 4. Obtain clean whole-file diagnostics for the assigned scope.
-5. Audit imports in every production Lean file changed or reviewed. Focused imports may be added
-   freely and do not need to be minimized. Replace the exact umbrella imports `import Mathlib` and
-   `import LastLib`, book/chapter aggregators in leaf modules, and prose-order section chains that are
-   not genuine declaration dependencies. Prefer focused Mathlib modules and stable LastLib
-   `Dependencies.lean`, `Core.lean`, API, or precise section modules. Aggregators may import leaves;
-   leaves must not import aggregators.
-6. Finish the source review; the coordinator will run the post-merge targeted build.
+5. Audit imports in every file reviewed or changed against the common focused-import policy.
+6. Recheck the complete chapter. If it is already faithful and diagnostic-clean, make no changes;
+   that no-change pass is the review fixed-point signal.
 
-After the complete mathematical comparison, when available, use the attached Lean MCP to request
-whole-file diagnostics for every assigned Lean file and repair diagnostics in coherent batches. Do
-not start another language server or run Lake, raw Lean, or another compiler. After you finish, the
-coordinator merges accepted changes and serially runs `{build_command}` in the main worktree against
-its single writable cache. Edit only the assigned chapter scope and do not commit. If the complete
-formalization is already faithful and well-typed under MCP diagnostics, make no changes; a no-change
-pass is the success signal used by the orchestrator.
+## Definition of done
+
+Every source assertion and principal proof route has been accounted for, all repairs and added support
+lemmas are justified, imports are acyclic and focused, and fresh diagnostics contain no unexpected
+messages. Report omissions, source issues, dependency-order problems, and all interface changes.

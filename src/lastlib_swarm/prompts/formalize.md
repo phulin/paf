@@ -1,58 +1,47 @@
 # Formalize statements: {book_title}, chapter {chapter_number}
 
-You own the complete statement-formalization pass for chapter {chapter_number},
-“{chapter_title},” of `{source}`. Work from the repository root and read the full source chapter from
-its numbered heading through the next heading of the same level.
+## Mission
 
-Create or update the Lean chapter at `{lean_root}/{chapter_path}/` and its aggregator
-`{lean_root}/{chapter_path}.lean`. Preserve the source order and represent every substantive,
-mathematically precise assertion: labeled declarations, displayed identities and diagrams, exact
-sequences, compatibility results, hypotheses embedded in prose, examples, and precise warnings.
-Skip motivation, proof sketches, history, and redundant paraphrases.
+Read chapter {chapter_number}, “{chapter_title},” in `{source}` from its numbered heading through the
+next heading of the same level. Create or update `{lean_root}/{chapter_path}/` and its aggregator
+`{lean_root}/{chapter_path}.lean` so the chapter exposes an accurate, proof-ready Lean API in source
+order.
 
-This is a statement pass, not a proof pass. Proofs may use `by sorry`; definitions should have real
-bodies whenever the canonical construction is clear. Every declaration type must expose the exact
-informal mathematics so later proof agents do not have to redesign the API.
+This is a statement pass. Proofs may use `by sorry`; definitions should have genuine bodies whenever
+the canonical construction is clear. Do not translate motivation, history, proof narration, or
+redundant paraphrases into declarations.
 
-Source coverage alone is not sufficient. Read the informal proofs and proof sketches and outline a
-plausible proof dependency route for every principal result. Include every genuine intermediate
-lemma that route needs and that is not already available from earlier project modules or pinned
-Mathlib, even when the source calls it obvious, uses it only inside a proof, or silently switches
-between equivalent formulations. In particular, look for basic `↔` lemmas and equivalences between
-book-facing and canonical Lean formulations; constructor/eliminator and extensionality facts;
-membership, coercion, map, restriction, and normalization lemmas; closure and functoriality facts;
-and short bridges between adjacent proof steps.
+## Coverage and proof readiness
 
-Search for canonical declarations before adding proof support. When the existing interface is
-adequate, use it directly; otherwise add a meaningful chapter-facing bridge with the weakest natural
-assumptions and place it before its first user. Such lemmas may contain `by sorry` in this pass, but
-must themselves be accurate and provable from earlier material. Do not introduce a helper that
-merely restates its target, assumes the target's conclusion, depends on a later declaration, or hides
-circularity. Keep elaboration-only scaffolding private, but expose reusable equivalences and bridges
-that downstream chapter proofs need.
+Represent every precise assertion: labeled declarations, displayed identities and diagrams, exact
+sequences, compatibility results, hypotheses embedded in prose, examples, and mathematically precise
+warnings. Read informal proofs for dependency planning even though their narration is not itself
+formalized.
 
-Before inventing an interface, search pinned Mathlib and already-established project modules. Reuse
-canonical definitions. Match all finiteness, separation, completeness, characteristic, normalization,
-and typeclass assumptions precisely. Never use `True`, contradictory hypotheses, axioms, unsafe code,
-or tautological definitions as stand-ins. Mark a false or underspecified source assertion with a
-`SOURCE_ISSUE` comment and make only the minimal principled correction.
+For every principal result, trace a plausible route through earlier project declarations and pinned
+Mathlib. Add genuinely missing intermediate interfaces, especially basic `↔` lemmas; equivalences
+between book-facing and canonical formulations; constructor, eliminator, and extensionality facts;
+membership, coercion, map, restriction, and normalization lemmas; and closure or functoriality
+bridges. Search for a canonical declaration first. A new bridge must use the weakest natural
+assumptions, precede its users, and be independently provable from earlier material.
 
-Other chapters may be processed concurrently. Do not inspect or edit another in-progress chapter.
-If an unavailable earlier result is genuinely required, use a clearly marked, mathematically natural
-dependency guess local to this chapter; do not engineer it to imply the desired conclusion.
+Match finiteness, separation, completeness, characteristic, normalization, and typeclass assumptions
+exactly. Mark a genuine false or underspecified source assertion with a precise `SOURCE_ISSUE` comment
+and make only the minimal principled correction. If an unavailable earlier result is essential, add
+only a clearly marked, mathematically natural local dependency guess—not one engineered to imply the
+desired conclusion.
 
-Maintain an acyclic import graph. Add as many focused Mathlib or stable LastLib imports as the file
-needs; do not optimize for the fewest imports. Never use the exact umbrella imports `import Mathlib` or `import LastLib`, and
-never import a whole book or chapter aggregator from a section when a focused module exists. Do not mirror prose order with a linear
-section-to-section import chain unless declarations are genuinely used downstream. Put shared
-interfaces in the chapter's `Dependencies.lean` or `Core.lean` when those files exist; aggregators
-may import sections, but sections must not import aggregators. Preserve this policy when creating
-new files.
+## Workflow
 
-Cover the entire source chapter before beginning the check-and-repair loop. When available, use the
-attached Lean MCP to request whole-file diagnostics for every assigned Lean file, fix diagnostics in
-coherent batches, and request fresh diagnostics after each batch. Do not start another language
-server or run Lake, raw Lean, or another compiler. After you finish, the coordinator merges accepted
-changes and serially runs `{build_command}` in the main worktree against its single writable cache.
-Fix every diagnostic available through the MCP, remove scratch files and exploratory commands, edit
-only the assigned chapter scope, and do not commit.
+1. Inventory the complete source chapter and the existing assigned Lean files.
+2. Inspect canonical earlier LastLib and pinned Mathlib interfaces.
+3. Complete the statement and definition pass across the entire chapter.
+4. Audit proof readiness and add only genuinely missing reusable bridges.
+5. Request whole-file diagnostics for every assigned file and repair them in coherent batches.
+
+## Definition of done
+
+Every substantive source assertion is represented or explicitly accounted for, every declaration is
+accurately typed and ordered, definitions have real bodies where practical, and fresh whole-file
+diagnostics contain no unexpected messages. Report coverage gaps, dependency guesses, source issues,
+and important interface choices.
