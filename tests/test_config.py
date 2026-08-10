@@ -139,14 +139,12 @@ def test_config_stage_prompts_are_optional(tmp_path: Path) -> None:
     assert config.stages[Stage.FORMALIZE].prompt.name == "formalize.md"
 
 
-def test_standard_prompts_require_clean_lake_builds() -> None:
+def test_standard_prompts_delegate_builds_to_coordinator() -> None:
     for stage in Stage:
         prompt = standard_prompt_path(stage).read_text(encoding="utf-8")
-        assert "lake build" in prompt
-        assert "lake env lean" in prompt
-        assert "no warnings except" in prompt
-        assert "`sorry`" in prompt
-        assert "placeholder" in prompt
+        assert "coordinator" in prompt
+        assert "{build_command}" in prompt
+        assert "raw Lean" in prompt
         assert "Lean MCP" in prompt
 
 

@@ -133,6 +133,19 @@ class PriorityLimiter:
             self.release()
 
 
+class CoordinatorBuildQueue:
+    """Fair gate for source integration and main-worktree builds."""
+
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+
+    async def acquire(self) -> None:
+        await self._lock.acquire()
+
+    def release(self) -> None:
+        self._lock.release()
+
+
 class Orchestrator:
     def __init__(
         self,
@@ -160,9 +173,9 @@ class Orchestrator:
                 "best-effort" if config.settings.bypass_approvals_and_sandbox else "sandboxed"
             ),
             "lake_cache": (
-                "immutable-generations"
+                "coordinator-owned-main-cache-with-read-only-snapshots"
                 if self.isolation.name == "fuse-overlay"
-                else "shared-worktree"
+                else "coordinator-owned-shared-worktree"
             ),
         }
         selected_books = {chapter.book_id for chapter in self.chapters}
@@ -180,6 +193,7 @@ class Orchestrator:
         )
         self.state.scheduling = self.scheduling_snapshot()
         self.agent_slots = PriorityLimiter(config.settings.max_agents)
+        self.build_queue = CoordinatorBuildQueue()
 
     def scheduling_snapshot(self) -> dict[str, object]:
         return scheduling_snapshot(self.statement_schedule, self.proof_schedule)
@@ -212,8 +226,21 @@ class Orchestrator:
             await self.control.checkpoint()
             run = await self.state.start_run(chapter.id, stage)
             workspace = None
+            queue_held = False
             try:
-                workspace = await self.isolation.acquire(run.id)
+                # Snapshot acquisition shares the build gate. A new overlay can
+                # therefore never observe merged sources paired with a stale cache.
+                await self.build_queue.acquire()
+                queue_held = True
+                try:
+                    workspace = await self.isolation.acquire(run.id)
+                finally:
+                    # Shared worktrees cannot isolate edits from builds, so they
+                    # serialize the whole attempt. Overlay agents release the gate
+                    # immediately and remain concurrent while they edit.
+                    if self.isolation.name != "shared":
+                        self.build_queue.release()
+                        queue_held = False
                 agent = await self.executor.run(
                     chapter,
                     stage,
@@ -221,15 +248,28 @@ class Orchestrator:
                     feedback=feedback,
                     workspace_root=workspace.root,
                 )
-                validation = await validate(
-                    self.config,
-                    chapter,
-                    workspace_root=workspace.root,
-                )
-                isolated = await workspace.collect(
-                    chapter,
-                    promote_cache=validation.succeeded,
-                )
+                if not queue_held:
+                    await self.build_queue.acquire()
+                    queue_held = True
+                # The agent is finished before this transaction begins. Merge its
+                # scoped source changes, unmount its workspace, and only then build
+                # from the main worktree against the coordinator-owned cache.
+                isolated = await workspace.collect(chapter)
+                await workspace.close()
+                workspace = None
+                if isolated.accepted:
+                    validation = await validate(
+                        self.config,
+                        chapter,
+                        workspace_root=self.config.settings.repo,
+                    )
+                    await self.isolation.refresh_cache()
+                else:
+                    validation = ValidationResult(
+                        False,
+                        1,
+                        f"Isolation rejected the agent result: {isolated.error}",
+                    )
                 if not isolated.accepted:
                     detail = isolated.error
                     if isolated.out_of_scope_paths:
@@ -261,6 +301,8 @@ class Orchestrator:
             finally:
                 if workspace is not None:
                     await workspace.close()
+                if queue_held:
+                    self.build_queue.release()
             return Attempt(agent=agent, validation=validation, run=run)
 
     async def _formalize(self, chapter: Chapter) -> bool:

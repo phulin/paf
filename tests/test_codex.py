@@ -167,7 +167,8 @@ def test_proof_prompt_requires_whole_file_pass_before_diagnostics(tmp_path: Path
     diagnostics = prompt.index("Then request whole-file diagnostics")
     assert whole_pass < diagnostics
     assert "Iterate only over the proofs and dependent declarations that fail" in prompt
-    assert "Lake build only as the final acceptance check" in prompt
+    assert "Do not invoke Lake" in prompt
+    assert "coordinator performs the post-merge acceptance build" in prompt
 
 
 @pytest.mark.asyncio
@@ -367,6 +368,67 @@ time.sleep(60)
         assert not _process_is_running(child_pid)
     finally:
         task.cancel()
+        if child_pid and _process_is_running(child_pid):
+            os.kill(child_pid, signal.SIGKILL)
+
+
+@pytest.mark.asyncio
+async def test_successful_agent_exit_kills_surviving_mcp_descendants(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    child_pid_path = tmp_path / "successful-child.pid"
+    child = tmp_path / "successful-term-resistant-child"
+    child.write_text(
+        """#!/usr/bin/env python3
+import os
+import signal
+import sys
+import time
+from pathlib import Path
+
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+Path(sys.argv[1]).write_text(str(os.getpid()))
+time.sleep(60)
+""",
+        encoding="utf-8",
+    )
+    child.chmod(0o755)
+    fake_codex = tmp_path / "successful-codex-with-mcp-child"
+    fake_codex.write_text(
+        f"""#!/usr/bin/env python3
+import json
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+sys.stdin.read()
+subprocess.Popen([{str(child)!r}, {str(child_pid_path)!r}])
+for _ in range(200):
+    if Path({str(child_pid_path)!r}).is_file():
+        break
+    time.sleep(0.01)
+report = {{"changed": False, "complete": True, "needs_repair": False,
+          "summary": "done", "issues": []}}
+print(json.dumps({{"type": "item.completed", "item": {{
+    "type": "agent_message", "text": json.dumps(report)}}}}), flush=True)
+""",
+        encoding="utf-8",
+    )
+    fake_codex.chmod(0o755)
+    config = replace(config, settings=replace(config.settings, codex_bin=str(fake_codex)))
+    state = StateStore(config)
+    await state.load_or_create()
+    executor = CodexExecutor(config, state)
+    await executor.prepare()
+    run = await state.start_run(config.chapters[0].id, Stage.REVIEW)
+
+    child_pid = 0
+    try:
+        result = await executor.run(config.chapters[0], Stage.REVIEW, run)
+        child_pid = int(child_pid_path.read_text(encoding="utf-8"))
+        assert result.succeeded
+        assert not _process_is_running(child_pid)
+    finally:
         if child_pid and _process_is_running(child_pid):
             os.kill(child_pid, signal.SIGKILL)
 

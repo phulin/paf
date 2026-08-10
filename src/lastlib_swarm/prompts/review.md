@@ -41,15 +41,12 @@ Perform the review in this order:
    not genuine declaration dependencies. Prefer focused Mathlib modules and stable LastLib
    `Dependencies.lean`, `Core.lean`, API, or precise section modules. Aggregators may import leaves;
    leaves must not import aggregators.
-6. Run the final targeted Lake build and leave only expected deliberate-`sorry` warnings.
+6. Finish the source review; the coordinator will run the post-merge targeted build.
 
 After the complete mathematical comparison, when available, use the attached Lean MCP to request
 whole-file diagnostics for every assigned Lean file and repair diagnostics in coherent batches. Do
-not start another language server or invoke Lake after every edit. For the final compilation and
-acceptance check, prefer the project target through `lake build`; do not use `lake env lean` when a
-Lake build target is available. Run `{build_command}` once the MCP diagnostics are clean and fix all
-remaining elaboration errors and all warnings except the expected warnings for deliberate `sorry`
-placeholders. Edit only the assigned chapter scope and do not commit. If the complete formalization
-is already faithful, well-typed, and warning-free under that exception, make no changes; a no-change
-pass is the success signal used by the orchestrator. The final build must emit no warnings except the
-expected warnings for deliberate `sorry` placeholders.
+not start another language server or run Lake, raw Lean, or another compiler. After you finish, the
+coordinator merges accepted changes and serially runs `{build_command}` in the main worktree against
+its single writable cache. Edit only the assigned chapter scope and do not commit. If the complete
+formalization is already faithful and well-typed under MCP diagnostics, make no changes; a no-change
+pass is the success signal used by the orchestrator.

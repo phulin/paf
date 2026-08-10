@@ -122,38 +122,11 @@ def _matches_scope(relative: str, chapter: Chapter) -> bool:
     )
 
 
-def _is_cache_path(relative: str) -> bool:
-    return _excluded(relative, (".lake", "lean/.lake"))
-
-
-def _is_overlay_marker(relative: str) -> bool:
-    return any(part.startswith(".wh.") for part in Path(relative).parts)
-
-
-def cache_manifest(root: Path) -> dict[str, FileFingerprint]:
-    return {
-        path: fingerprint
-        for path, fingerprint in tree_manifest(
-            root,
-            excluded=(".git", ".swarm", ".venv", ".pytest_cache"),
-        ).items()
-        if _is_cache_path(path) and not _is_overlay_marker(path)
-    }
-
-
-def _path_fingerprint(root: Path, relative: str) -> FileFingerprint | None:
-    try:
-        return _fingerprint(root / relative)
-    except FileNotFoundError:
-        return None
-
-
 class SharedWorkspace:
     def __init__(self, repo: Path) -> None:
         self.root = repo
 
-    async def collect(self, _chapter: Chapter, *, promote_cache: bool = False) -> IsolationResult:
-        del promote_cache
+    async def collect(self, _chapter: Chapter) -> IsolationResult:
         return IsolationResult(accepted=True, generation=0)
 
     async def close(self) -> None:
@@ -171,6 +144,9 @@ class SharedIsolation:
 
     async def acquire(self, _run_id: str) -> SharedWorkspace:
         return SharedWorkspace(self.settings.repo)
+
+    async def refresh_cache(self) -> None:
+        return
 
     async def close(self) -> None:
         return
@@ -201,7 +177,7 @@ class FuseWorkspace:
         self.root = merged
         self.closed = False
 
-    async def collect(self, chapter: Chapter, *, promote_cache: bool = False) -> IsolationResult:
+    async def collect(self, chapter: Chapter) -> IsolationResult:
         base = tree_manifest(self.base, excluded=self.manager.excluded)
         merged = tree_manifest(self.root, excluded=self.manager.excluded)
         changed = tuple(
@@ -221,13 +197,10 @@ class FuseWorkspace:
             chapter,
             generation=self.generation,
             cache_generation=self.cache_generation,
-            cache_root=self.cache,
-            upper_root=self.upper,
             base_manifest=base,
             merged_manifest=merged,
             merged_root=self.root,
             changed=changed,
-            promote_cache=promote_cache,
         )
 
     async def close(self) -> None:
@@ -382,6 +355,32 @@ class FuseOverlayIsolation:
         self._cache_references[generation] = 0
         return generation, destination
 
+    async def refresh_cache(self) -> None:
+        """Publish a read-only snapshot of the coordinator-owned main cache.
+
+        Agents can read these immutable snapshots but their overlay writes are
+        never promoted. The main worktree remains the only writable build cache.
+        """
+
+        async with self._lock:
+            previous = self._cache_paths.get(self._cache_revision)
+            next_generation = self._cache_revision + 1
+            destination = self.cache_generations / f"{next_generation:08d}"
+            destination.mkdir(parents=True, exist_ok=False)
+            await self._copy_cache(
+                self.settings.repo,
+                destination,
+                link_destination=previous or self.settings.repo,
+            )
+            self._cache_revision = next_generation
+            self._cache_paths[next_generation] = destination
+            self._cache_references[next_generation] = 0
+            previous_generation = next_generation - 1
+            if previous is not None and self._cache_references[previous_generation] == 0:
+                self._cache_paths.pop(previous_generation)
+                self._cache_references.pop(previous_generation)
+                shutil.rmtree(previous)
+
     async def acquire(self, run_id: str) -> FuseWorkspace:
         slot = await self._available.get()
         generation: int | None = None
@@ -436,13 +435,10 @@ class FuseOverlayIsolation:
         *,
         generation: int,
         cache_generation: int,
-        cache_root: Path,
-        upper_root: Path,
         base_manifest: dict[str, FileFingerprint],
         merged_manifest: dict[str, FileFingerprint],
         merged_root: Path,
         changed: tuple[str, ...],
-        promote_cache: bool,
     ) -> IsolationResult:
         async with self._lock:
             if changed:
@@ -492,73 +488,12 @@ class FuseOverlayIsolation:
                 os.replace(temporary, destination)
             if changed:
                 self._revision += 1
-            promoted = (
-                await self._promote_cache_locked(
-                    base_root=cache_root,
-                    merged_root=merged_root,
-                    upper_root=upper_root,
-                )
-                if promote_cache
-                else ()
-            )
             return IsolationResult(
                 accepted=True,
                 generation=generation,
                 cache_generation=cache_generation,
                 changed_paths=changed,
-                promoted_cache_paths=promoted,
             )
-
-    async def _promote_cache_locked(
-        self,
-        *,
-        base_root: Path,
-        merged_root: Path,
-        upper_root: Path,
-    ) -> tuple[str, ...]:
-        delta = cache_manifest(upper_root)
-        candidates = tuple(
-            sorted(
-                path
-                for path, fingerprint in delta.items()
-                if fingerprint.kind == "file" and _path_fingerprint(base_root, path) != fingerprint
-            )
-        )
-        if not candidates:
-            return ()
-
-        current_generation, current_root = await self._cache_generation()
-        promotable = tuple(
-            path
-            for path in candidates
-            if _path_fingerprint(current_root, path)
-            in {
-                _path_fingerprint(base_root, path),
-                _path_fingerprint(merged_root, path),
-            }
-        )
-        if not promotable:
-            return ()
-
-        next_generation = current_generation + 1
-        destination = self.cache_generations / f"{next_generation:08d}"
-        destination.mkdir(parents=True, exist_ok=False)
-        await self._copy_cache(
-            current_root,
-            destination,
-            link_destination=current_root,
-        )
-        for relative in promotable:
-            target = destination / relative
-            target.parent.mkdir(parents=True, exist_ok=True)
-            temporary = target.with_name(f".{target.name}.cache-{os.getpid()}")
-            shutil.copy2(merged_root / relative, temporary)
-            os.replace(temporary, target)
-
-        self._cache_revision = next_generation
-        self._cache_paths[next_generation] = destination
-        self._cache_references[next_generation] = 0
-        return promotable
 
     async def release(self, workspace: FuseWorkspace) -> None:
         try:

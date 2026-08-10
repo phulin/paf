@@ -22,12 +22,9 @@ it.
 
 When available, use the attached Lean MCP to diagnose every assigned file before editing, then make a
 coherent repair pass and iterate only over declarations whose diagnostics remain. Use goals,
-declaration lookup, code actions, and fresh whole-file diagnostics instead of invoking Lake after
-each edit. For the final compilation and acceptance check, prefer the project target through
-`lake build`; do not use `lake env lean` when a Lake build target is available. Run `{build_command}`,
-fix all remaining elaboration errors and all warnings except the expected warnings for deliberate
-`sorry`
-placeholders, edit only the assigned chapter scope, remove scratch files and exploratory commands,
-and do not commit. Clearly report what was repaired so the next proof pass can proceed efficiently.
-The final build must emit no warnings except the expected warnings for deliberate `sorry`
-placeholders.
+declaration lookup, code actions, and fresh whole-file diagnostics. Do not run Lake, raw Lean, or
+another compiler. After you finish, the coordinator merges accepted changes and serially runs
+`{build_command}` in the main worktree against its single writable cache. Fix all diagnostics
+available through the MCP, edit only the assigned chapter scope, remove scratch files and
+exploratory commands, and do not commit. Clearly report what was repaired so the next proof pass can
+proceed efficiently.

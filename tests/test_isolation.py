@@ -6,6 +6,8 @@ from pathlib import Path
 
 import pytest
 
+import lastlib_swarm.scheduler as scheduler_module
+from lastlib_swarm.codex import ValidationResult
 from lastlib_swarm.config import load_config
 from lastlib_swarm.isolation import FuseOverlayIsolation, fuse_overlay_available
 from lastlib_swarm.models import Chapter, Stage
@@ -132,7 +134,9 @@ async def test_fuse_overlay_imports_scope_and_rejects_a_stale_writer(tmp_path: P
 
 
 @pytest.mark.asyncio
-async def test_lake_cache_is_shared_pinned_and_promoted_without_copying(tmp_path: Path) -> None:
+async def test_agent_cache_writes_are_discarded_and_coordinator_refreshes_snapshots(
+    tmp_path: Path,
+) -> None:
     config_path = write_project(tmp_path, chapters="chapters = [1]")
     seed = tmp_path / "lean" / ".lake" / "packages" / "dependency.olean"
     seed.parent.mkdir(parents=True)
@@ -150,17 +154,21 @@ async def test_lake_cache_is_shared_pinned_and_promoted_without_copying(tmp_path
 
         assert (writer.root / seed.relative_to(tmp_path)).read_bytes() == b"shared dependency"
         assert (pinned.root / seed.relative_to(tmp_path)).read_bytes() == b"shared dependency"
-        result = await writer.collect(chapter, promote_cache=True)
+        result = await writer.collect(chapter)
         await writer.close()
+        coordinator_artifact = tmp_path / artifact
+        coordinator_artifact.parent.mkdir(parents=True, exist_ok=True)
+        coordinator_artifact.write_bytes(b"coordinator artifact")
+        await manager.refresh_cache()
         fresh = await manager.acquire("cache-fresh")
         assert result.accepted
-        assert result.promoted_cache_paths == (artifact,)
+        assert result.promoted_cache_paths == ()
         assert not (pinned.root / artifact).exists()
-        assert (fresh.root / artifact).read_bytes() == b"new chapter artifact"
+        assert (fresh.root / artifact).read_bytes() == b"coordinator artifact"
         assert (pinned.cache / seed.relative_to(tmp_path)).stat().st_ino == (
             fresh.cache / seed.relative_to(tmp_path)
         ).stat().st_ino
-        assert not (tmp_path / artifact).exists()
+        assert (tmp_path / artifact).read_bytes() == b"coordinator artifact"
         assert writer.cache_generation == pinned.cache_generation == 0
         assert fresh.cache_generation == 1
     finally:
@@ -172,45 +180,48 @@ async def test_lake_cache_is_shared_pinned_and_promoted_without_copying(tmp_path
 
 
 @pytest.mark.asyncio
-async def test_concurrent_cache_promotions_merge_unrelated_artifacts(tmp_path: Path) -> None:
-    manager, chapter = fuse_manager(write_project(tmp_path, chapters="chapters = [1]"))
+async def test_cache_refresh_keeps_active_agent_snapshots_immutable(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    manager = FuseOverlayIsolation(
+        replace(config.settings, isolation="fuse-overlay", max_agents=3)
+    )
     await manager.prepare()
-    first = await manager.acquire("cache-first")
-    second = await manager.acquire("cache-second")
-    fresh = None
+    pinned = await manager.acquire("cache-pinned")
+    first_fresh = None
+    second_fresh = None
     try:
         first_only = "lean/.lake/build/first.olean"
         second_only = "lean/.lake/build/second.olean"
-        conflict = "lean/.lake/build/shared.trace"
-        for workspace, relative, contents in (
-            (first, first_only, b"first"),
-            (first, conflict, b"first wins"),
-            (second, second_only, b"second"),
-            (second, conflict, b"stale second"),
-        ):
-            target = workspace.root / relative
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(contents)
+        first_target = tmp_path / first_only
+        first_target.parent.mkdir(parents=True, exist_ok=True)
+        first_target.write_bytes(b"first")
+        await manager.refresh_cache()
+        first_fresh = await manager.acquire("cache-first-fresh")
 
-        first_result = await first.collect(chapter, promote_cache=True)
-        second_result = await second.collect(chapter, promote_cache=True)
-        await first.close()
-        fresh = await manager.acquire("cache-merged")
-        assert set(first_result.promoted_cache_paths) == {first_only, conflict}
-        assert second_result.promoted_cache_paths == (second_only,)
-        assert (fresh.root / first_only).read_bytes() == b"first"
-        assert (fresh.root / second_only).read_bytes() == b"second"
-        assert (fresh.root / conflict).read_bytes() == b"first wins"
+        second_target = tmp_path / second_only
+        second_target.write_bytes(b"second")
+        await manager.refresh_cache()
+        second_fresh = await manager.acquire("cache-second-fresh")
+
+        assert not (pinned.root / first_only).exists()
+        assert not (pinned.root / second_only).exists()
+        assert (first_fresh.root / first_only).read_bytes() == b"first"
+        assert not (first_fresh.root / second_only).exists()
+        assert (second_fresh.root / first_only).read_bytes() == b"first"
+        assert (second_fresh.root / second_only).read_bytes() == b"second"
     finally:
-        await first.close()
-        await second.close()
-        if fresh is not None:
-            await fresh.close()
+        await pinned.close()
+        if first_fresh is not None:
+            await first_fresh.close()
+        if second_fresh is not None:
+            await second_fresh.close()
         await manager.close()
 
 
 @pytest.mark.asyncio
-async def test_orchestrator_runs_agent_and_build_inside_fuse_overlay(tmp_path: Path) -> None:
+async def test_orchestrator_merges_then_builds_in_main_worktree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     config_path = write_project(tmp_path, chapters="chapters = [1]")
     fake_codex = tmp_path / "fake-codex"
     fake_codex.write_text(
@@ -248,6 +259,20 @@ print(json.dumps({"type": "item.completed", "item": {
     orchestrator = Orchestrator(config, state)
     await orchestrator.prepare()
 
+    async def coordinator_validation(
+        _config: object, _chapter: object, *, workspace_root: Path | None = None
+    ) -> ValidationResult:
+        assert workspace_root == tmp_path
+        assert (tmp_path / "lean" / "Book" / "Chapter01.lean").read_text(
+            encoding="utf-8"
+        ) == "theorem isolated : True := by trivial\n"
+        artifact = tmp_path / "lean" / ".lake" / "build" / "coordinator.marker"
+        artifact.parent.mkdir(parents=True, exist_ok=True)
+        artifact.write_bytes(b"built in main")
+        return ValidationResult(True, 0, "ok")
+
+    monkeypatch.setattr(scheduler_module, "validate", coordinator_validation)
+
     assert await orchestrator.run_stage(Stage.FORMALIZE)
     assert (tmp_path / "lean" / "Book" / "Chapter01.lean").read_text(
         encoding="utf-8"
@@ -255,10 +280,10 @@ print(json.dumps({"type": "item.completed", "item": {
     run = state.task(config.chapters[0].id, Stage.FORMALIZE).runs[0]
     assert run.isolation is not None
     assert run.isolation["accepted"] is True
-    assert run.isolation["promoted_cache_paths"] == [
-        "lean/.lake/build/lib/lean/Book/Chapter01.olean"
-    ]
-    assert not (tmp_path / "lean" / ".lake" / "build").exists()
+    assert run.isolation["promoted_cache_paths"] == []
+    assert (tmp_path / "lean" / ".lake" / "build" / "coordinator.marker").read_bytes() == (
+        b"built in main"
+    )
     assert json.loads((config.settings.state_dir / "state.json").read_text())["tasks"]
     await orchestrator.shutdown()
 

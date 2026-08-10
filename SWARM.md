@@ -114,8 +114,8 @@ Use `--no-lean-mcp` for a diagnostic fallback run without the Lean MCP integrati
 ## Lean LSP MCP proof loop
 
 Every active Codex attempt receives its own locked
-[`lean-lsp-mcp`](https://github.com/oOo0oOo/lean-lsp-mcp) stdio server, rooted inside the same private
-FUSE overlay as the agent and final validator. Statement stages receive whole-file diagnostics,
+[`lean-lsp-mcp`](https://github.com/oOo0oOo/lean-lsp-mcp) stdio server, rooted inside the agent's
+private FUSE overlay. Statement stages receive whole-file diagnostics,
 outlines, hover/declaration lookup, and local source search. Proof and repair stages also receive
 proof goals, completions, code actions, and batched tactic trials. Remote search, local Loogle, and
 the MCP's `lean_build` tool are deliberately absent from the allowlist: this avoids shared-service
@@ -123,14 +123,16 @@ rate limits, large indexing memory, and builds outside orchestrator control.
 
 Proof agents first read and attempt the entire assigned file set without checking each speculative
 proof separately. They then request whole-file diagnostics and iterate only over failing proofs and
-their dependent declarations. The orchestrator still runs one targeted `lake build +Module` after
-the agent exits. That build is the authoritative warning-free acceptance check and the source of
-promotable Lake-cache artifacts.
+their dependent declarations. Agents never invoke a compiler. After an agent exits, the coordinator
+terminates its MCP/LSP process group, merges accepted scoped changes into the main worktree, and
+enqueues one targeted `lake build +Module`. Merge and build form one serialized transaction, and the
+main worktree's `.lake` is the only writable build cache.
 
 An MCP/LSP process exists per active attempt, not per queued agent. Its imported `.olean` files come
-from the attempt's shared immutable Lake-cache generation, while its document state remains private
-to that attempt. Consequently `max_agents` also bounds the number of concurrent Lean language
-servers.
+from a read-only snapshot of the coordinator cache taken when the attempt starts, while its document
+state remains private. No new attempt snapshot is created during a merge/build transaction, so it
+cannot pair newly merged sources with stale artifacts. Consequently `max_agents` also bounds the
+number of concurrent Lean language servers.
 
 ## Agent-managed background mode
 
@@ -274,10 +276,11 @@ by a hard-killed orchestrator.
 
 Agents never commit. With the default `auto` backend, supported Linux systems run each attempt in a
 private `fuse-overlayfs` view. Each view has two immutable lower generations: a source snapshot that
-excludes `.lake`, and a Lake-cache snapshot that contains only `.lake`. Only files changed by that
-attempt occupy its writable upper layer. Codex and validation both run in the merged view. The
-coordinator rejects every out-of-scope source path, checks that the assigned canonical scope has not
-changed since launch, and imports accepted regular files with atomic replacement. A stale writer is
+excludes `.lake`, and a read-only snapshot of the coordinator's `.lake`. Only files changed by that
+attempt occupy its writable upper layer. Codex and its private LSP run in the merged view; validation
+never does. The coordinator rejects every out-of-scope source path, checks that the assigned
+canonical scope has not changed since launch, and imports accepted regular files with atomic
+replacement. A stale writer is
 discarded and retried by the normal stage loop.
 
 The number of mounted workspaces is bounded by `max_agents`; slots and upper layers are removed after
@@ -286,23 +289,22 @@ reader exits. Temporary mounts live outside the repository so Git discovery star
 view.
 
 All agents pinned to a cache generation share the same Lake artifact inodes and OS page-cache pages;
-the cache is never copied once per agent. After a successful validation, the coordinator scans only
-that attempt's private `.lake` upper-layer delta and promotes its regular artifacts into a new
-immutable cache generation. Unchanged artifacts are hard-linked from the preceding generation.
-Already-running agents remain pinned to their old cache, while newly launched agents immediately see
-the promoted artifacts. Concurrent promotions merge unrelated paths; a same-path cache conflict is
-skipped rather than overwriting a newer artifact. Cache deletions are not promoted, and `.lake` is
-never imported into the canonical source worktree. Source imports preserve mtimes so valid Lake
-traces are not invalidated merely by publication.
+the snapshot is never copied once per agent. Agent overlay cache writes are discarded and can never
+be promoted. After every serialized coordinator build, a new read-only snapshot is published from
+the main cache. Already-running agents remain pinned to their old snapshot, while newly launched
+agents see the rebuilt artifacts. Old snapshots are reclaimed as soon as their last agent exits.
+Source imports preserve mtimes so valid Lake traces are not invalidated merely by publication.
 
 FUSE isolation requires `fuse-overlayfs`, `fusermount3`, `rsync`, and an accessible `/dev/fuse`.
 `auto` selects FUSE when these primitives are present and otherwise uses the explicitly visible
 `shared` backend; production runs can require isolation with `--isolation fuse-overlay` so missing
-support is a hard error. With full-access Codex workers, overlays prevent ordinary cwd-relative
+support is a hard error. The fallback `shared` backend serializes complete attempts because source
+edits cannot otherwise be isolated from coordinator builds. With full-access Codex workers,
+overlays prevent ordinary cwd-relative
 collisions and still gate imported changes, but they are not a security boundary: a worker can use
 absolute paths to reach the canonical repository or other host files. Enable the Codex sandbox when
-that boundary must be enforced. Validation occupies the same global concurrency slot as its agent,
-keeping large Lean builds within `max_agents`.
+that boundary must be enforced. Validation remains associated with the completed agent's global
+slot, while the independent build queue guarantees that at most one Lake build runs at a time.
 
 ## Configuration
 

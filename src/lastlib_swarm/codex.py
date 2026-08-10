@@ -303,6 +303,9 @@ When isolation is enabled, all out-of-scope changes are rejected rather than mer
 Return the required structured final report. Set `needs_repair` only when a statement or declaration
 interface must change; ordinary unfinished or broken proof code is not statement repair. The
 orchestrator independently checks scoped file hashes, placeholders, and `{chapter.build_command}`.
+Do not run `lake build`, `lake env lean`, raw `lean`, or another compiler command. Builds belong to
+the coordinator: after you exit, it merges accepted scoped changes into the main worktree and
+serially runs the configured build there against the single writable build cache.
 """
         if self.config.settings.lean_mcp:
             contract += """
@@ -321,12 +324,12 @@ proof-writing pass over the entire assigned file set: attempt every mathematical
 without stopping to check each proof separately. Then request whole-file diagnostics for every
 assigned file. Iterate only over the proofs and dependent declarations that fail, using proof goals,
 batched tactic attempts, code actions, and fresh whole-file diagnostics until no unexpected
-diagnostics remain. Run the configured Lake build only as the final acceptance check.
+diagnostics remain. Do not invoke Lake; the coordinator performs the post-merge acceptance build.
 """
             else:
                 contract += """
-Use whole-file diagnostics after each coherent batch of edits. Run the configured Lake build only as
-the final acceptance check, not as the interactive edit/check loop.
+Use whole-file diagnostics after each coherent batch of edits. Do not invoke Lake; the coordinator
+performs the post-merge acceptance build.
 """
         if feedback:
             contract += (
@@ -480,7 +483,7 @@ the final acceptance check, not as the interactive edit/check loop.
         timed_out = False
         try:
             async with asyncio.timeout(self.config.settings.agent_timeout_seconds):
-                exit_code = await process.wait()
+                exit_code = await _wait_for_parent_exit(process)
         except TimeoutError:
             timed_out = True
             await _terminate(process)
@@ -494,6 +497,11 @@ the final acceptance check, not as the interactive edit/check loop.
             activity.finish("cancelled", "agent cancelled by orchestrator")
             self.state.activities.save(activity)
             raise
+        if not timed_out:
+            # Codex can exit before its MCP/LSP descendants. Reap the complete
+            # process group before integration so no language server retains the
+            # overlay or races the coordinator-owned build.
+            await _terminate(process)
         try:
             await consumer
         finally:
@@ -556,6 +564,19 @@ async def validate(
         raise
     output = output_bytes.decode(errors="replace")[-20000:]
     return ValidationResult(exit_code == 0, exit_code, output, timed_out)
+
+
+async def _wait_for_parent_exit(process: asyncio.subprocess.Process) -> int:
+    """Wait for the direct child without waiting for descendant-held pipes.
+
+    ``Process.wait`` may not resolve until inherited stdout descriptors close.
+    Polling ``returncode`` observes the child watcher immediately, allowing the
+    caller to reap an exited Codex process's surviving MCP/LSP process group.
+    """
+
+    while process.returncode is None:
+        await asyncio.sleep(0.05)
+    return process.returncode
 
 
 async def _terminate(process: asyncio.subprocess.Process) -> None:

@@ -127,7 +127,7 @@ async def test_review_requires_a_no_change_round(
     async def successful_validation(
         _config: object, _chapter: object, *, workspace_root: Path | None = None
     ) -> ValidationResult:
-        del workspace_root
+        assert workspace_root == config.settings.repo
         return ValidationResult(True, 0, "ok")
 
     monkeypatch.setattr(scheduler_module, "validate", successful_validation)
@@ -137,6 +137,61 @@ async def test_review_requires_a_no_change_round(
     assert task.status == TaskStatus.SUCCEEDED
     assert task.rounds == 2
     assert state.total_usage().total_tokens == 30
+
+
+@pytest.mark.asyncio
+async def test_prove_builds_run_after_agents_and_are_serialized_in_main_worktree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await orchestrator.prepare()
+    orchestrator.executor = FakeExecutor(
+        state,
+        [result(changed=True, placeholders=0), result(changed=True, placeholders=0)],
+    )
+    completed_agents: set[str] = set()
+    original_run = orchestrator.executor.run
+    active_builds = 0
+    maximum_active_builds = 0
+
+    async def tracked_run(
+        chapter: Chapter,
+        stage: Stage,
+        run: RunRecord,
+        *,
+        feedback: str = "",
+        workspace_root: Path | None = None,
+    ) -> AgentResult:
+        agent = await original_run(
+            chapter,
+            stage,
+            run,
+            feedback=feedback,
+            workspace_root=workspace_root,
+        )
+        completed_agents.add(chapter.id)
+        return agent
+
+    async def tracked_validation(
+        _config: object, chapter: Chapter, *, workspace_root: Path | None = None
+    ) -> ValidationResult:
+        nonlocal active_builds, maximum_active_builds
+        assert chapter.id in completed_agents
+        assert workspace_root == config.settings.repo
+        active_builds += 1
+        maximum_active_builds = max(maximum_active_builds, active_builds)
+        await asyncio.sleep(0)
+        active_builds -= 1
+        return ValidationResult(True, 0, "ok")
+
+    monkeypatch.setattr(orchestrator.executor, "run", tracked_run)
+    monkeypatch.setattr(scheduler_module, "validate", tracked_validation)
+
+    assert await orchestrator.run_stage(Stage.PROVE)
+    assert maximum_active_builds == 1
+    await orchestrator.shutdown()
 
 
 @pytest.mark.asyncio
