@@ -165,6 +165,7 @@ def load_config(path: str | Path) -> PipelineConfig:
         sandbox=str(swarm.get("sandbox", "workspace-write")),
         approve_for_me=bool(swarm.get("approve_for_me", True)),
         bypass_approvals_and_sandbox=bool(swarm.get("bypass_approvals_and_sandbox", False)),
+        agent_timeout_seconds=float(swarm.get("agent_timeout_seconds", 7200)),
         validation_timeout_seconds=float(swarm.get("validation_timeout_seconds", 1800)),
     )
     if settings.max_agents < 1:
