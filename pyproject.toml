@@ -1,0 +1,42 @@
+[project]
+name = "lastlib-swarm"
+version = "0.1.0"
+description = "Massively parallel Codex orchestration for Lean formalization"
+readme = "SWARM.md"
+requires-python = ">=3.12"
+dependencies = [
+  "textual>=6.0.0",
+]
+
+[project.scripts]
+lastlib-swarm = "lastlib_swarm.cli:main"
+
+[dependency-groups]
+dev = [
+  "pytest>=8.4.0",
+  "pytest-asyncio>=1.1.0",
+  "ruff>=0.12.0",
+  "ty>=0.0.1a16",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/lastlib_swarm"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.ty.src]
+include = ["src", "tests"]

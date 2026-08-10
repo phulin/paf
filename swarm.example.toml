@@ -1,0 +1,41 @@
+[swarm]
+repo = "."
+state_dir = ".swarm"
+max_agents = 24
+codex_bin = "codex"
+model = "gpt-5.6-luna"
+reasoning_effort = "max"
+sandbox = "workspace-write"
+approve_for_me = true
+validation_timeout_seconds = 1800
+
+[stages.formalize]
+prompt = "swarm/prompts/formalize.md"
+max_rounds = 3
+
+[stages.review]
+prompt = "swarm/prompts/review.md"
+max_rounds = 6
+
+[stages.prove]
+prompt = "swarm/prompts/prove.md"
+max_rounds = 12
+
+[stages.repair]
+prompt = "swarm/prompts/repair.md"
+max_rounds = 12
+
+[[books]]
+id = "book02"
+title = "Finite Extensions of Local Fields"
+source = "books/02-finite-extensions-of-local-fields.md"
+lean_root = "lean/LastLib/Book02FiniteExtensionsOfLocalFields"
+module = "LastLib.Book02FiniteExtensionsOfLocalFields"
+chapters = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+chapter_path = "Chapter{chapter_number_padded}"
+chapter_module = "{module}.Chapter{chapter_number_padded}"
+build_command = "cd lean && lake build +{chapter_module}"
+scope = [
+  "{lean_root}/{chapter_path}.lean",
+  "{lean_root}/{chapter_path}/**/*.lean",
+]
