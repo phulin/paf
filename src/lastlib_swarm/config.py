@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import tomllib
+from importlib.resources import files
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +33,44 @@ def _render(value: str, variables: dict[str, str]) -> str:
     for key, replacement in variables.items():
         value = value.replace("{" + key + "}", replacement)
     return value
+
+
+STAGE_ROUNDS = {
+    Stage.FORMALIZE: 3,
+    Stage.REVIEW: 5,
+    Stage.PROVE: 10,
+    Stage.REPAIR: 10,
+}
+
+
+def standard_prompt_path(stage: Stage) -> Path:
+    resource = files("lastlib_swarm.prompts").joinpath(f"{stage.value}.md")
+    path = Path(str(resource))
+    if not path.is_file():
+        raise ValueError(f"packaged standard prompt is missing: {stage.value}")
+    return path
+
+
+def _stage_configs(raw_stages: dict[str, Any], base: Path) -> dict[Stage, StageConfig]:
+    stages: dict[Stage, StageConfig] = {}
+    for stage in Stage:
+        raw = raw_stages.get(stage.value, {})
+        if not isinstance(raw, dict):
+            raise ValueError(f"[stages.{stage.value}] must be a table")
+        prompt_value = raw.get("prompt")
+        if prompt_value is None:
+            prompt = standard_prompt_path(stage)
+        elif isinstance(prompt_value, str):
+            prompt = _resolve(base, prompt_value)
+        else:
+            raise ValueError(f"stages.{stage.value}.prompt must be a string")
+        max_rounds = int(raw.get("max_rounds", STAGE_ROUNDS[stage]))
+        if max_rounds < 1:
+            raise ValueError(f"stages.{stage.value}.max_rounds must be positive")
+        if not prompt.is_file():
+            raise ValueError(f"prompt does not exist: {prompt}")
+        stages[stage] = StageConfig(prompt=prompt, max_rounds=max_rounds)
+    return stages
 
 
 def _read_books(raw_books: Any) -> tuple[BookConfig, ...]:
@@ -160,8 +199,8 @@ def load_config(path: str | Path) -> PipelineConfig:
         state_dir=state_dir,
         max_agents=int(swarm.get("max_agents", 16)),
         codex_bin=str(swarm.get("codex_bin", "codex")),
-        model=str(swarm["model"]) if "model" in swarm else None,
-        reasoning_effort=(str(swarm["reasoning_effort"]) if "reasoning_effort" in swarm else None),
+        model=str(swarm.get("model", "gpt-5.6-luna")),
+        reasoning_effort=str(swarm.get("reasoning_effort", "max")),
         sandbox=str(swarm.get("sandbox", "workspace-write")),
         approve_for_me=bool(swarm.get("approve_for_me", True)),
         bypass_approvals_and_sandbox=bool(swarm.get("bypass_approvals_and_sandbox", False)),
@@ -171,25 +210,7 @@ def load_config(path: str | Path) -> PipelineConfig:
     if settings.max_agents < 1:
         raise ValueError("swarm.max_agents must be positive")
 
-    raw_stages = _table(data, "stages")
-    stages: dict[Stage, StageConfig] = {}
-    defaults = {
-        Stage.FORMALIZE: 3,
-        Stage.REVIEW: 5,
-        Stage.PROVE: 10,
-        Stage.REPAIR: 10,
-    }
-    for stage in Stage:
-        raw = raw_stages.get(stage.value)
-        if not isinstance(raw, dict) or not isinstance(raw.get("prompt"), str):
-            raise ValueError(f"[stages.{stage.value}] must define prompt")
-        max_rounds = int(raw.get("max_rounds", defaults[stage]))
-        if max_rounds < 1:
-            raise ValueError(f"stages.{stage.value}.max_rounds must be positive")
-        prompt = _resolve(base, raw["prompt"])
-        if not prompt.is_file():
-            raise ValueError(f"prompt does not exist: {prompt}")
-        stages[stage] = StageConfig(prompt=prompt, max_rounds=max_rounds)
+    stages = _stage_configs(_table(data, "stages"), base)
 
     books = _read_books(data.get("books"))
     chapters = tuple(chapter for book in books for chapter in _discover_chapters(repo, book))
@@ -200,3 +221,88 @@ def load_config(path: str | Path) -> PipelineConfig:
         books=books,
         chapters=chapters,
     )
+
+
+def _repository_root(target: Path) -> Path:
+    for candidate in (target.parent, *target.parents):
+        if (candidate / ".git").exists():
+            return candidate
+    current = Path.cwd().resolve()
+    for candidate in (current, *current.parents):
+        if (candidate / ".git").exists():
+            return candidate
+    return current
+
+
+def _pascal_case(value: str) -> str:
+    words = re.findall(r"[A-Za-z0-9]+", value)
+    return "".join(word[:1].upper() + word[1:] for word in words) or "Formalization"
+
+
+def _source_title(target: Path) -> str:
+    text = target.read_text(encoding="utf-8")
+    match = re.search(r"^#\s+(.+?)\s*$", text, re.MULTILINE)
+    if match:
+        return match.group(1).strip()
+    name = re.sub(r"^\d+[-_]", "", target.stem)
+    return name.replace("-", " ").replace("_", " ").title()
+
+
+def _existing_lean_stem(repo: Path, number: int) -> str | None:
+    root = repo / "lean" / "LastLib"
+    stems = {path.stem if path.is_file() else path.name for path in root.glob(f"Book{number:02d}*")}
+    return next(iter(stems)) if len(stems) == 1 else None
+
+
+def infer_config(target: str | Path) -> PipelineConfig:
+    source_path = Path(target).resolve()
+    if not source_path.is_file() or source_path.suffix.lower() != ".md":
+        raise ValueError(f"target must be an existing Markdown file: {source_path}")
+    repo = _repository_root(source_path)
+    try:
+        source = source_path.relative_to(repo)
+    except ValueError:
+        source = source_path
+    title = _source_title(source_path)
+    prefix = re.match(r"^(?P<number>\d+)[-_]", source_path.name)
+    if prefix:
+        number = int(prefix.group("number"))
+        book_id = f"book{number:02d}"
+        lean_stem = _existing_lean_stem(repo, number) or f"Book{number:02d}{_pascal_case(title)}"
+    else:
+        book_id = re.sub(r"[^a-z0-9]+", "-", source_path.stem.lower()).strip("-")
+        lean_stem = f"Book{_pascal_case(title)}"
+    book = BookConfig(
+        id=book_id,
+        title=title,
+        source=source,
+        lean_root=Path("lean") / "LastLib" / lean_stem,
+        module=f"LastLib.{lean_stem}",
+    )
+    settings = SwarmSettings(
+        repo=repo,
+        state_dir=repo / ".swarm" / book_id,
+        model="gpt-5.6-luna",
+        reasoning_effort="max",
+    )
+    chapters = tuple(_discover_chapters(repo, book))
+    return PipelineConfig(
+        path=source_path,
+        settings=settings,
+        stages=_stage_configs({}, repo),
+        books=(book,),
+        chapters=chapters,
+    )
+
+
+def resolve_config(*, config: str | Path | None, target: str | Path | None) -> PipelineConfig:
+    if config is not None and target is not None:
+        raise ValueError("pass either --config or a Markdown target, not both")
+    if config is not None:
+        return load_config(config)
+    if target is not None:
+        return infer_config(target)
+    default = Path("swarm.toml")
+    if default.is_file():
+        return load_config(default)
+    raise ValueError("pass a target .md or --config; no swarm.toml was found")

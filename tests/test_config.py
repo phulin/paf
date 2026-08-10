@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from lastlib_swarm.config import load_config
+from lastlib_swarm.config import infer_config, load_config
 from lastlib_swarm.models import Stage
 from tests.support import write_project
 
@@ -36,3 +36,37 @@ def test_rejects_unknown_book_dependency(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="unconfigured books"):
         load_config(path)
+
+
+def test_infers_zero_config_project_from_markdown(tmp_path: Path) -> None:
+    (tmp_path / ".git").mkdir()
+    books = tmp_path / "books"
+    books.mkdir()
+    target = books / "07-example-theory.md"
+    target.write_text(
+        "# Example Theory\n\n## 1. Foundations\n\n## 2. Main result\n", encoding="utf-8"
+    )
+    existing = tmp_path / "lean" / "LastLib" / "Book07ExistingAPI"
+    existing.mkdir(parents=True)
+
+    config = infer_config(target)
+
+    assert config.settings.repo == tmp_path
+    assert config.settings.model == "gpt-5.6-luna"
+    assert config.settings.reasoning_effort == "max"
+    assert config.settings.state_dir == tmp_path / ".swarm" / "book07"
+    assert config.books[0].module == "LastLib.Book07ExistingAPI"
+    assert [chapter.number for chapter in config.chapters] == [1, 2]
+    assert all(stage.prompt.is_file() for stage in config.stages.values())
+
+
+def test_config_stage_prompts_are_optional(tmp_path: Path) -> None:
+    path = write_project(tmp_path)
+    text = path.read_text(encoding="utf-8")
+    start = text.index("[stages.formalize]")
+    end = text.index("[[books]]")
+    path.write_text(text[:start] + text[end:], encoding="utf-8")
+
+    config = load_config(path)
+
+    assert config.stages[Stage.FORMALIZE].prompt.name == "formalize.md"

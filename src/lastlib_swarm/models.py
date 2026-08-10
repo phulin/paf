@@ -29,8 +29,8 @@ class SwarmSettings:
     state_dir: Path
     max_agents: int = 16
     codex_bin: str = "codex"
-    model: str | None = None
-    reasoning_effort: str | None = None
+    model: str | None = "gpt-5.6-luna"
+    reasoning_effort: str | None = "max"
     sandbox: str = "workspace-write"
     approve_for_me: bool = True
     bypass_approvals_and_sandbox: bool = False
