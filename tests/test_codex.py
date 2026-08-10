@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import signal
 from dataclasses import replace
 from pathlib import Path
 
@@ -306,3 +307,73 @@ time.sleep(60)
     persisted = reloaded["tasks"][f"{run.chapter_id}:review"]["runs"][-1]["usage"]
     assert persisted["input_tokens"] == 100
     assert persisted["output_tokens"] == 25
+
+
+@pytest.mark.asyncio
+async def test_cancellation_kills_surviving_mcp_descendants(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    child_pid_path = tmp_path / "child.pid"
+    child = tmp_path / "term-resistant-child"
+    child.write_text(
+        """#!/usr/bin/env python3
+import os
+import signal
+import sys
+import time
+from pathlib import Path
+
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+Path(sys.argv[1]).write_text(str(os.getpid()))
+time.sleep(60)
+""",
+        encoding="utf-8",
+    )
+    child.chmod(0o755)
+    fake_codex = tmp_path / "codex-with-mcp-child"
+    fake_codex.write_text(
+        f"""#!/usr/bin/env python3
+import json
+import subprocess
+import sys
+import time
+
+sys.stdin.read()
+subprocess.Popen([{str(child)!r}, {str(child_pid_path)!r}])
+print(json.dumps({{"type": "thread.started", "thread_id": "descendant-test"}}), flush=True)
+time.sleep(60)
+""",
+        encoding="utf-8",
+    )
+    fake_codex.chmod(0o755)
+    config = replace(config, settings=replace(config.settings, codex_bin=str(fake_codex)))
+    state = StateStore(config)
+    await state.load_or_create()
+    executor = CodexExecutor(config, state)
+    await executor.prepare()
+    run = await state.start_run(config.chapters[0].id, Stage.REVIEW)
+    task = asyncio.create_task(executor.run(config.chapters[0], Stage.REVIEW, run))
+
+    child_pid = 0
+    try:
+        for _ in range(200):
+            if child_pid_path.is_file():
+                child_pid = int(child_pid_path.read_text(encoding="utf-8"))
+                break
+            await asyncio.sleep(0.01)
+        assert child_pid
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert not _process_is_running(child_pid)
+    finally:
+        task.cancel()
+        if child_pid and _process_is_running(child_pid):
+            os.kill(child_pid, signal.SIGKILL)
+
+
+def _process_is_running(pid: int) -> bool:
+    try:
+        state = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").split()[2]
+    except (FileNotFoundError, IndexError):
+        return False
+    return state != "Z"

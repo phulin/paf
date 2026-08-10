@@ -50,6 +50,7 @@ LEAN_MCP_PROOF_TOOLS = (
 )
 
 USAGE_POLL_SECONDS = 0.25
+PROCESS_GROUP_GRACE_SECONDS = 1.0
 
 
 def lean_mcp_executable() -> Path:
@@ -558,12 +559,35 @@ async def validate(
 
 
 async def _terminate(process: asyncio.subprocess.Process) -> None:
+    process_group = process.pid
     with suppress(ProcessLookupError):
-        os.killpg(process.pid, signal.SIGTERM)
+        os.killpg(process_group, signal.SIGTERM)
     try:
         async with asyncio.timeout(10):
             await process.wait()
     except TimeoutError:
         with suppress(ProcessLookupError):
-            os.killpg(process.pid, signal.SIGKILL)
+            os.killpg(process_group, signal.SIGKILL)
         await process.wait()
+        return
+
+    # Codex may exit before its MCP/LSP grandchildren. Those descendants keep the
+    # private overlay busy even after reparenting to PID 1, so wait for the entire
+    # process group—not only its original leader—then force-kill any survivors.
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + PROCESS_GROUP_GRACE_SECONDS
+    while _process_group_exists(process_group) and loop.time() < deadline:
+        await asyncio.sleep(0.05)
+    if _process_group_exists(process_group):
+        with suppress(ProcessLookupError):
+            os.killpg(process_group, signal.SIGKILL)
+
+
+def _process_group_exists(process_group: int) -> bool:
+    try:
+        os.killpg(process_group, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True

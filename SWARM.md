@@ -268,7 +268,9 @@ final report, validation tail, and incrementally checkpointed usage. Writes are 
 Press `q` in the TUI or interrupt a headless run to terminate the active child process group. On the
 next invocation, interrupted `running` records become `pending` and can resume. Successful records
 remain skipped unless `--force` is given. The TUI drains its workers and unmounts their overlays
-before exiting; the next invocation also reclaims any mounts left by a hard-killed orchestrator.
+before exiting. Shutdown waits briefly for the complete Codex process group and force-terminates
+surviving MCP/LSP descendants before unmounting; the next invocation also reclaims any mounts left
+by a hard-killed orchestrator.
 
 Agents never commit. With the default `auto` backend, supported Linux systems run each attempt in a
 private `fuse-overlayfs` view. Each view has two immutable lower generations: a source snapshot that
