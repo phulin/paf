@@ -319,8 +319,8 @@ async def _headless(
     orchestrator: Orchestrator,
     operation: Callable[[], Awaitable[bool]],
 ) -> bool:
-    await orchestrator.prepare()
     try:
+        await orchestrator.prepare()
         return await operation()
     finally:
         await orchestrator.shutdown()

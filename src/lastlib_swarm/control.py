@@ -81,10 +81,12 @@ class ControlServer:
         self._server: asyncio.Server | None = None
 
     async def run(self) -> bool:
-        await self.orchestrator.prepare()
-        self.state_dir.mkdir(parents=True, exist_ok=True)
-        self._claim_pid()
+        claimed_pid = False
         try:
+            await self.orchestrator.prepare()
+            self.state_dir.mkdir(parents=True, exist_ok=True)
+            self._claim_pid()
+            claimed_pid = True
             self._remove_stale_socket()
             self.result_path.unlink(missing_ok=True)
             self._server = await asyncio.start_unix_server(self._handle, path=self.socket_path)
@@ -111,7 +113,8 @@ class ControlServer:
                 self.socket_path.unlink(missing_ok=True)
         finally:
             await self.orchestrator.shutdown()
-            self.pid_path.unlink(missing_ok=True)
+            if claimed_pid:
+                self.pid_path.unlink(missing_ok=True)
         return bool(self.result)
 
     def request_stop(self) -> None:
