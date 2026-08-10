@@ -31,10 +31,11 @@ uv run lastlib-swarm pipeline --config swarm.toml
 ```
 
 The checked-in example discovers Book 2's twelve chapter headings and maps them to the existing
-LastLib module layout. It uses the generic prompts under `swarm/prompts/`. A stage may instead point
-at an existing specialized template such as `FORMALIZATION_PROMPT.md`; supported replacement fields
-include `{book_title}`, `{chapter_number}`, `{chapter_number_padded}`, `{chapter_title}`, `{source}`,
-`{lean_root}`, `{chapter_path}`, `{chapter_module}`, and `{build_command}`.
+LastLib module layout. It reuses `FORMALIZATION_PROMPT.md` for the statement pass and uses the generic
+review/prove/repair prompts under `swarm/prompts/`. Any stage may point at a specialized template;
+supported replacement fields include `{book_title}`, `{chapter_number}`, `{chapter_number_padded}`,
+`{chapter_title}`, `{source}`, `{lean_root}`, `{chapter_path}`, `{chapter_module}`, and
+`{build_command}`.
 
 Codex is invoked in its documented noninteractive JSONL mode with a strict final-report schema. The
 default uses the `workspace-write` sandbox and automatic approval review. The much less safe
