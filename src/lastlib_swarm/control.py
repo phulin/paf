@@ -109,6 +109,7 @@ class ControlServer:
                     loop.remove_signal_handler(item)
                 self.socket_path.unlink(missing_ok=True)
         finally:
+            await self.orchestrator.shutdown()
             self.pid_path.unlink(missing_ok=True)
         return bool(self.result)
 

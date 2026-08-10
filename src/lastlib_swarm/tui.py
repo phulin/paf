@@ -142,6 +142,8 @@ class SwarmApp(App[bool]):
         except Exception as error:
             self.query_one("#status", Static).update(f"Fatal orchestrator error: {error}")
             self.set_timer(2.0, lambda: self.exit(False))
+        finally:
+            await self.orchestrator.shutdown()
 
     def refresh_dashboard(self) -> None:
         if not self.state.tasks:

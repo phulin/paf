@@ -218,9 +218,12 @@ def load_config(path: str | Path) -> PipelineConfig:
         bypass_approvals_and_sandbox=bool(swarm.get("bypass_approvals_and_sandbox", False)),
         agent_timeout_seconds=float(swarm.get("agent_timeout_seconds", 7200)),
         validation_timeout_seconds=float(swarm.get("validation_timeout_seconds", 1800)),
+        isolation=str(swarm.get("isolation", "auto")),
     )
     if settings.max_agents < 1:
         raise ValueError("swarm.max_agents must be positive")
+    if settings.isolation not in {"auto", "fuse-overlay", "shared"}:
+        raise ValueError("swarm.isolation must be auto, fuse-overlay, or shared")
 
     stages = _stage_configs(_table(data, "stages"), base)
 

@@ -24,8 +24,9 @@ class FakeExecutor(CodexExecutor):
         run: RunRecord,
         *,
         feedback: str = "",
+        workspace_root: Path | None = None,
     ) -> AgentResult:
-        del chapter, stage, feedback
+        del chapter, stage, feedback, workspace_root
         result = self.results.pop(0)
         await self.state.finish_run(
             run,
@@ -66,7 +67,10 @@ async def test_review_requires_a_no_change_round(
     await orchestrator.prepare()
     orchestrator.executor = FakeExecutor(state, [result(changed=True), result(changed=False)])
 
-    async def successful_validation(_config: object, _chapter: object) -> ValidationResult:
+    async def successful_validation(
+        _config: object, _chapter: object, *, workspace_root: Path | None = None
+    ) -> ValidationResult:
+        del workspace_root
         return ValidationResult(True, 0, "ok")
 
     monkeypatch.setattr(scheduler_module, "validate", successful_validation)

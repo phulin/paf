@@ -203,8 +203,9 @@ orchestrator independently checks scoped file hashes, placeholders, and `{chapte
             )
         return base + contract
 
-    def command(self) -> list[str]:
+    def command(self, workspace_root: Path | None = None) -> list[str]:
         settings = self.config.settings
+        root = workspace_root or settings.repo
         command = [
             settings.codex_bin,
             "exec",
@@ -212,10 +213,12 @@ orchestrator independently checks scoped file hashes, placeholders, and `{chapte
             "--color",
             "never",
             "--cd",
-            str(settings.repo),
+            str(root),
             "--output-schema",
             str(self.schema_path),
         ]
+        if root != settings.repo:
+            command.append("--skip-git-repo-check")
         if settings.bypass_approvals_and_sandbox:
             command.append("--dangerously-bypass-approvals-and-sandbox")
         else:
@@ -236,16 +239,18 @@ orchestrator independently checks scoped file hashes, placeholders, and `{chapte
         run: RunRecord,
         *,
         feedback: str = "",
+        workspace_root: Path | None = None,
     ) -> AgentResult:
+        root = workspace_root or self.config.settings.repo
         prompt = self.build_prompt(chapter, stage, feedback=feedback)
-        before = scope_digest(self.config.settings.repo, chapter)
+        before = scope_digest(root, chapter)
         log_path = self.state.logs_dir / f"{run.id}.jsonl"
         process = await asyncio.create_subprocess_exec(
-            *self.command(),
+            *self.command(root),
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
-            cwd=self.config.settings.repo,
+            cwd=root,
             start_new_session=True,
         )
         await self.state.update_run(run, pid=process.pid, log_path=str(log_path))
@@ -294,8 +299,8 @@ orchestrator independently checks scoped file hashes, placeholders, and `{chapte
                 await consumer
             raise
         await consumer
-        changed = before != scope_digest(self.config.settings.repo, chapter)
-        placeholders = count_placeholders(self.config.settings.repo, chapter)
+        changed = before != scope_digest(root, chapter)
+        placeholders = count_placeholders(root, chapter)
         error = "agent timed out" if timed_out else ""
         if exit_code == 0 and not report:
             error = "Codex returned no structured final report"
@@ -322,12 +327,15 @@ orchestrator independently checks scoped file hashes, placeholders, and `{chapte
         )
 
 
-async def validate(config: PipelineConfig, chapter: Chapter) -> ValidationResult:
+async def validate(
+    config: PipelineConfig, chapter: Chapter, *, workspace_root: Path | None = None
+) -> ValidationResult:
+    root = workspace_root or config.settings.repo
     process = await asyncio.create_subprocess_exec(
         "bash",
         "-lc",
         chapter.build_command,
-        cwd=config.settings.repo,
+        cwd=root,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
         start_new_session=True,

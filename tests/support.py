@@ -20,6 +20,7 @@ def write_project(tmp_path: Path, *, chapters: str = "") -> Path:
 [swarm]
 repo = "."
 max_agents = 4
+isolation = "shared"
 
 [stages.formalize]
 prompt = "prompts/formalize.md"

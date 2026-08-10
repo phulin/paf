@@ -4,11 +4,12 @@ import asyncio
 import heapq
 from collections.abc import AsyncIterator, Callable, Coroutine, Iterable
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from lastlib_swarm.codex import AgentResult, CodexExecutor, ValidationResult, validate
 from lastlib_swarm.corpus import CorpusSchedule, build_corpus_schedule, scheduling_snapshot
+from lastlib_swarm.isolation import create_isolation
 from lastlib_swarm.models import Chapter, PipelineConfig, Stage
 from lastlib_swarm.state import RunRecord, StateStore, TaskStatus
 
@@ -133,6 +134,7 @@ class Orchestrator:
         self.force = force
         self.control = control or RunControl()
         self.executor = CodexExecutor(config, state)
+        self.isolation = create_isolation(config.settings)
         selected_books = {chapter.book_id for chapter in self.chapters}
         self.statement_schedule = build_corpus_schedule(
             config.books,
@@ -155,6 +157,10 @@ class Orchestrator:
     async def prepare(self) -> None:
         await self.state.load_or_create()
         await self.executor.prepare()
+        await self.isolation.prepare()
+
+    async def shutdown(self) -> None:
+        await self.isolation.close()
 
     def _already_done(self, chapter: Chapter, stage: Stage) -> bool:
         return not self.force and self.state.task(chapter.id, stage).status == TaskStatus.SUCCEEDED
@@ -175,9 +181,39 @@ class Orchestrator:
         async with self.agent_slots.slot(schedule.priority(chapter.book_id)):
             await self.control.checkpoint()
             run = await self.state.start_run(chapter.id, stage)
-            agent = await self.executor.run(chapter, stage, run, feedback=feedback)
-            validation = await validate(self.config, chapter)
-            await self.state.update_run(run, validation=validation.as_dict())
+            workspace = await self.isolation.acquire(run.id)
+            try:
+                agent = await self.executor.run(
+                    chapter,
+                    stage,
+                    run,
+                    feedback=feedback,
+                    workspace_root=workspace.root,
+                )
+                validation = await validate(
+                    self.config,
+                    chapter,
+                    workspace_root=workspace.root,
+                )
+                isolated = await workspace.collect(chapter)
+                if not isolated.accepted:
+                    detail = isolated.error
+                    if isolated.out_of_scope_paths:
+                        detail += ": " + ", ".join(isolated.out_of_scope_paths)
+                    agent = replace(agent, succeeded=False, error=detail)
+                    validation = ValidationResult(
+                        False,
+                        1,
+                        f"Isolation rejected the agent result: {detail}\n\n{validation.output}",
+                    )
+                    await self.state.update_run(run, status=TaskStatus.FAILED)
+                await self.state.update_run(
+                    run,
+                    isolation=isolated.as_dict(),
+                    validation=validation.as_dict(),
+                )
+            finally:
+                await workspace.close()
             return Attempt(agent=agent, validation=validation, run=run)
 
     async def _formalize(self, chapter: Chapter) -> bool:

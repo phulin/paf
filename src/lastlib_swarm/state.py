@@ -100,6 +100,7 @@ class RunRecord:
     placeholders: int | None = None
     report: dict[str, Any] | None = None
     validation: dict[str, Any] | None = None
+    isolation: dict[str, Any] | None = None
     usage: TokenUsage = field(default_factory=TokenUsage)
     log_path: str | None = None
 

@@ -54,6 +54,11 @@ def _add_overrides(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--model", help="override the configured Codex model")
     parser.add_argument("--reasoning-effort", help="override the configured reasoning effort")
     parser.add_argument("--max-agents", type=int, help="override the concurrency cap")
+    parser.add_argument(
+        "--isolation",
+        choices=("auto", "fuse-overlay", "shared"),
+        help="execution isolation backend",
+    )
 
 
 def _add_run_options(parser: argparse.ArgumentParser) -> None:
@@ -167,14 +172,21 @@ def _config_from_args(args: argparse.Namespace) -> PipelineConfig:
     model = getattr(args, "model", None)
     reasoning_effort = getattr(args, "reasoning_effort", None)
     max_agents = getattr(args, "max_agents", None)
+    isolation = getattr(args, "isolation", None)
     if max_agents is not None and max_agents < 1:
         raise ValueError("--max-agents must be positive")
-    if model is not None or reasoning_effort is not None or max_agents is not None:
+    if (
+        model is not None
+        or reasoning_effort is not None
+        or max_agents is not None
+        or isolation is not None
+    ):
         settings = replace(
             config.settings,
             model=model or config.settings.model,
             reasoning_effort=reasoning_effort or config.settings.reasoning_effort,
             max_agents=max_agents or config.settings.max_agents,
+            isolation=isolation or config.settings.isolation,
         )
         config = replace(config, settings=settings)
     return config
@@ -216,7 +228,8 @@ def print_plan(config: PipelineConfig, console: Console) -> None:
     )
     console.print(
         f"[bold]Model:[/bold] {config.settings.model}  "
-        f"[bold]Reasoning:[/bold] {config.settings.reasoning_effort}"
+        f"[bold]Reasoning:[/bold] {config.settings.reasoning_effort}  "
+        f"[bold]Isolation:[/bold] {config.settings.isolation}"
     )
     stages = Table(title="Stages")
     stages.add_column("Stage")
@@ -303,7 +316,10 @@ async def _headless(
     operation: Callable[[], Awaitable[bool]],
 ) -> bool:
     await orchestrator.prepare()
-    return await operation()
+    try:
+        return await operation()
+    finally:
+        await orchestrator.shutdown()
 
 
 def _run(args: argparse.Namespace, config: PipelineConfig, console: Console) -> int:
@@ -371,6 +387,8 @@ def _agent_source_args(args: argparse.Namespace) -> list[str]:
         values.extend(["--reasoning-effort", args.reasoning_effort])
     if args.max_agents is not None:
         values.extend(["--max-agents", str(args.max_agents)])
+    if args.isolation is not None:
+        values.extend(["--isolation", args.isolation])
     return values
 
 

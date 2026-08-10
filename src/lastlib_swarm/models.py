@@ -36,6 +36,7 @@ class SwarmSettings:
     bypass_approvals_and_sandbox: bool = False
     agent_timeout_seconds: float = 7200.0
     validation_timeout_seconds: float = 1800.0
+    isolation: str = "auto"
 
 
 @dataclass(frozen=True)
