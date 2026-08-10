@@ -170,6 +170,17 @@ def test_statement_prompts_require_proof_support_interfaces() -> None:
         assert "circular" in prompt
 
 
+def test_standard_prompts_enforce_narrow_imports() -> None:
+    for stage in Stage:
+        prompt = standard_prompt_path(stage).read_text(encoding="utf-8")
+        assert "import Mathlib" in prompt
+        assert "aggregator" in prompt
+
+    review = standard_prompt_path(Stage.REVIEW).read_text(encoding="utf-8")
+    assert "5. Audit imports" in review
+    assert "do not need to be minimized" in review
+
+
 def test_infers_multiple_books_and_chained_mermaid_dependencies(tmp_path: Path) -> None:
     (tmp_path / ".git").mkdir()
     books = tmp_path / "books"

@@ -1,0 +1,9 @@
+repos:
+  - repo: local
+    hooks:
+      - id: lastlib-lean-import-policy
+        name: LastLib Lean import policy
+        entry: uv run python scripts/check_lean_import_policy.py
+        language: system
+        files: ^lean/LastLib(?:/.*)?\.lean$
+        pass_filenames: true

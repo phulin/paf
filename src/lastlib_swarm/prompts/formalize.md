@@ -41,6 +41,14 @@ Other chapters may be processed concurrently. Do not inspect or edit another in-
 If an unavailable earlier result is genuinely required, use a clearly marked, mathematically natural
 dependency guess local to this chapter; do not engineer it to imply the desired conclusion.
 
+Maintain an acyclic import graph. Add as many focused Mathlib or stable LastLib imports as the file
+needs; do not optimize for the fewest imports. Never use the exact umbrella imports `import Mathlib` or `import LastLib`, and
+never import a whole book or chapter aggregator from a section when a focused module exists. Do not mirror prose order with a linear
+section-to-section import chain unless declarations are genuinely used downstream. Put shared
+interfaces in the chapter's `Dependencies.lean` or `Core.lean` when those files exist; aggregators
+may import sections, but sections must not import aggregators. Preserve this policy when creating
+new files.
+
 Cover the entire source chapter before beginning the check-and-repair loop. When available, use the
 attached Lean MCP to request whole-file diagnostics for every assigned Lean file, fix diagnostics in
 coherent batches, and request fresh diagnostics after each batch. Do not start another language

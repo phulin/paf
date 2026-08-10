@@ -13,6 +13,13 @@ Do not solve proof difficulty by weakening conclusions, adding results as assump
 contradictions, or using tautologies, axioms, unsafe declarations, or proof-checking loopholes. Mark a
 genuine defect in the informal source with a precise `SOURCE_ISSUE` comment.
 
+Keep repairs within an acyclic import graph. Add focused imports freely when repairs need them; do
+not optimize for the fewest imports. Never
+introduce the exact umbrella imports `import Mathlib` or `import LastLib`, or a book/chapter
+aggregator into a production section when a focused module exists. Prefer a focused Mathlib module or stable
+LastLib API, and do not add a section-to-section edge unless the repaired declarations genuinely use
+it.
+
 When available, use the attached Lean MCP to diagnose every assigned file before editing, then make a
 coherent repair pass and iterate only over declarations whose diagnostics remain. Use goals,
 declaration lookup, code actions, and fresh whole-file diagnostics instead of invoking Lake after

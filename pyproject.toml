@@ -15,6 +15,7 @@ lastlib-swarm = "lastlib_swarm.cli:main"
 
 [dependency-groups]
 dev = [
+  "pre-commit>=4.0.0",
   "pytest>=8.4.0",
   "pytest-asyncio>=1.1.0",
   "ruff>=0.12.0",

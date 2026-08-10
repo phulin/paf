@@ -29,6 +29,20 @@ inaccurate, circular, vacuous, or unprovable. Do not weaken correct mathematics 
 proof is difficult. Existing proof placeholders may remain. Never add the conclusion as a hypothesis,
 contradictory assumptions, axioms, unsafe code, or other proof loopholes.
 
+Perform the review in this order:
+
+1. Audit source coverage and the mathematical fidelity of every declaration.
+2. Audit proof readiness, dependency routes, and missing reusable interfaces.
+3. Repair inaccurate, circular, vacuous, or unprovable statements minimally.
+4. Obtain clean whole-file diagnostics for the assigned scope.
+5. Audit imports in every production Lean file changed or reviewed. Focused imports may be added
+   freely and do not need to be minimized. Replace the exact umbrella imports `import Mathlib` and
+   `import LastLib`, book/chapter aggregators in leaf modules, and prose-order section chains that are
+   not genuine declaration dependencies. Prefer focused Mathlib modules and stable LastLib
+   `Dependencies.lean`, `Core.lean`, API, or precise section modules. Aggregators may import leaves;
+   leaves must not import aggregators.
+6. Run the final targeted Lake build and leave only expected deliberate-`sorry` warnings.
+
 After the complete mathematical comparison, when available, use the attached Lean MCP to request
 whole-file diagnostics for every assigned Lean file and repair diagnostics in coherent batches. Do
 not start another language server or invoke Lake after every edit. For the final compilation and
