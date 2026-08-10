@@ -301,11 +301,15 @@ reader exits. Temporary mounts live outside the repository so Git discovery star
 view.
 
 All agents pinned to a cache generation share the same Lake artifact inodes and OS page-cache pages;
-the snapshot is never copied once per agent. Agent overlay cache writes are discarded and can never
-be promoted. After every serialized coordinator build, a new read-only snapshot is published from
-the main cache. Already-running agents remain pinned to their old snapshot, while newly launched
-agents see the rebuilt artifacts. Old snapshots are reclaimed as soon as their last agent exits.
-Source imports preserve mtimes so valid Lake traces are not invalidated merely by publication.
+the snapshot is never copied once per agent. If an agent changes an imported source and Lean reports
+that imports are out of date, it may run its configured chapter-targeted build. Those new cache
+files occupy only that agent's writable upper layer, are discarded at teardown, and can never be
+promoted. The generic MCP build remains hidden because it builds the entire default project rather
+than the assigned chapter. After every serialized coordinator build, a new read-only snapshot is
+published from the main cache. Already-running agents remain pinned to their old snapshot, while
+newly launched agents see the rebuilt artifacts. Old snapshots are reclaimed as soon as their last
+agent exits. Source imports preserve mtimes so valid Lake traces are not invalidated merely by
+publication.
 
 FUSE isolation requires `fuse-overlayfs`, `fusermount3`, `rsync`, and an accessible `/dev/fuse`.
 `auto` selects FUSE when these primitives are present and otherwise uses the explicitly visible

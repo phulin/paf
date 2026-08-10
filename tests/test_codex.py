@@ -202,8 +202,11 @@ def test_rendered_prompts_compose_each_layer_once(tmp_path: Path, stage: Stage) 
     assert prompt.count("## Common Lean policy") == 1
     assert prompt.count("## Runtime contract") == 1
     assert prompt.count("import Mathlib") == 1
-    assert prompt.count("Do not run `lake build`") == 1
-    assert prompt.count("single writable build cache") == 1
+    assert "Do not run raw `lean`" in prompt
+    assert "cd lean && lake build +Book.Chapter01" in prompt
+    assert "disposable COW upper layer" in prompt
+    assert "Do not run `lake clean`" in prompt
+    assert prompt.count("single writable authoritative cache") == 1
     assert prompt.count("declaration uses `sorry`") == 1
 
 

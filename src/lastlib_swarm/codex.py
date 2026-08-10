@@ -325,10 +325,16 @@ Your exclusive edit scope is:
 
 Do not edit orchestration state under `.swarm`, do not commit, and do not wait for another worker.
 When isolation is enabled, all out-of-scope changes are rejected rather than merged.
-Do not run `lake build`, `lake env lean`, raw `lean`, or another compiler command. Builds belong to
-the coordinator: after you exit, it merges accepted scoped changes into the main worktree and
-serially runs the configured build there against the single writable build cache. That validation
-fails on every warning except the exact “declaration uses `sorry`” warning for an unfinished proof.
+Do not run raw `lean`, `lake env lean`, an unrestricted `lake build`, or another ad hoc compiler
+command. If the Lean MCP reports that imports are out of date after you edit an imported file, run
+the configured targeted build `{chapter.build_command}` once, then retry the MCP diagnostic. Under
+isolation that build writes only to your disposable COW upper layer; it cannot modify the
+coordinator cache or another agent's view. Do not run `lake clean` or fetch caches.
+
+After you exit, the coordinator merges accepted scoped source changes into the main worktree and
+serially runs the same configured build there against the single writable authoritative cache.
+That validation fails on every warning except the exact “declaration uses `sorry`” warning for an
+unfinished proof.
 
 ### Final response
 
@@ -346,7 +352,9 @@ placeholders, diagnostics, and `{chapter.build_command}`.
 A private `lastlib_lean` MCP server is attached to this attempt. It points at the attempt's private
 Lean project. Use its whole-file diagnostics and, where available for the stage, goals, hover,
 declaration lookup, code actions, completions, tactic trials, and local search. It intentionally
-does not expose `lean_build` or remote search. Do not start another language server.
+does not expose `lean_build` or remote search. Its generic build tool would compile the entire
+default project, so use only the targeted build from the runtime contract when imports need to be
+refreshed. Do not start another language server.
 """
         if feedback:
             contract += (
