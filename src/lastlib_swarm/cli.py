@@ -173,6 +173,7 @@ def parser() -> argparse.ArgumentParser:
         ("snapshot", "return status plus the complete persisted state"),
         ("pause", "pause before new chapter attempts"),
         ("resume", "release paused chapter attempts"),
+        ("unblock", "reset blocked tasks to pending"),
         ("stop", "cancel the pipeline and active subprocesses"),
         ("wait", "block until the managed pipeline exits"),
     ):
@@ -702,6 +703,30 @@ def _control_response(command: str, config: PipelineConfig) -> dict[str, object]
     except OSError:
         if command == "snapshot":
             response = _offline_snapshot(config)
+        elif command == "unblock":
+            state_path = config.settings.state_dir / "state.json"
+            if not state_path.is_file():
+                response = offline_status(config.settings.state_dir) | {
+                    "unblocked": 0,
+                    "unblocked_tasks": [],
+                }
+            else:
+                state = StateStore(config)
+
+                async def unblock() -> list[str]:
+                    await state.load_or_create()
+                    return await state.unblock()
+
+                tasks = asyncio.run(unblock())
+                counts = {status.value: 0 for status in TaskStatus}
+                for task in state.tasks.values():
+                    counts[str(task.status)] += 1
+                response = offline_status(config.settings.state_dir) | {
+                    "unblocked": len(tasks),
+                    "unblocked_tasks": tasks,
+                    "updated_at": state.updated_at,
+                    "tasks": counts,
+                }
         elif command in {"status", "wait"}:
             response = offline_status(config.settings.state_dir)
         else:
@@ -717,7 +742,16 @@ def _control_response(command: str, config: PipelineConfig) -> dict[str, object]
 
 
 def _agent_rpc(config: PipelineConfig) -> int:
-    allowed = {"status", "snapshot", "pause", "resume", "stop", "wait", "inspect"}
+    allowed = {
+        "status",
+        "snapshot",
+        "pause",
+        "resume",
+        "unblock",
+        "stop",
+        "wait",
+        "inspect",
+    }
     failed = False
     for line in sys.stdin:
         try:

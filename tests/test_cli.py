@@ -10,7 +10,7 @@ import lastlib_swarm.cli as cli_module
 from lastlib_swarm.cli import main, select_chapters
 from lastlib_swarm.config import load_config
 from lastlib_swarm.models import PipelineConfig, Stage
-from lastlib_swarm.state import StateStore
+from lastlib_swarm.state import StateStore, TaskStatus
 from tests.support import write_project
 
 
@@ -122,6 +122,44 @@ def test_agent_rpc_reads_jsonl_from_stdin(
     response = json.loads(capsys.readouterr().out)
     assert response["status"] == "not-started"
     assert response["scheduling"]["algorithm"] == "weighted-critical-path-list-scheduling"
+
+
+def test_agent_unblock_updates_offline_state(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config_path = write_project(tmp_path, chapters="chapters = [1]")
+    config = load_config(config_path)
+    state = StateStore(config)
+
+    async def populate() -> None:
+        await state.load_or_create()
+        state.scheduling = {"algorithm": "saved-schedule"}
+        state.isolation = {"backend": "saved-isolation"}
+        run = await state.start_run(config.chapters[0].id, Stage.REVIEW)
+        await state.finish_run(run, status=TaskStatus.FAILED)
+        await state.set_task(
+            config.chapters[0].id,
+            Stage.REVIEW,
+            TaskStatus.BLOCKED,
+            "formalization failed",
+        )
+
+    asyncio.run(populate())
+
+    assert main(["agent", "unblock", "--config", str(config_path)]) == 0
+    response = json.loads(capsys.readouterr().out)
+    assert response["status"] == "offline"
+    assert response["unblocked"] == 1
+    assert response["unblocked_tasks"] == ["book/chapter-01:review"]
+    assert response["tasks"]["blocked"] == 0
+
+    snapshot = json.loads(state.path.read_text(encoding="utf-8"))
+    task = snapshot["tasks"]["book/chapter-01:review"]
+    assert task["status"] == "pending"
+    assert task["detail"] == "manually unblocked"
+    assert len(task["runs"]) == 1
+    assert snapshot["scheduling"] == {"algorithm": "saved-schedule"}
+    assert snapshot["isolation"] == {"backend": "saved-isolation"}
 
 
 def test_agent_inspect_reports_compact_live_activity(

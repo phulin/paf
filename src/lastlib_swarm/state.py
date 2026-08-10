@@ -146,6 +146,10 @@ class StateStore:
             raw = json.loads(self.path.read_text(encoding="utf-8"))
             self.created_at = str(raw.get("created_at", timestamp()))
             self.updated_at = str(raw.get("updated_at", self.created_at))
+            if not self.scheduling and isinstance(raw.get("scheduling"), dict):
+                self.scheduling = raw["scheduling"]
+            if not self.isolation and isinstance(raw.get("isolation"), dict):
+                self.isolation = raw["isolation"]
             for key, value in raw.get("tasks", {}).items():
                 runs = []
                 for item in value.get("runs", []):
@@ -270,6 +274,20 @@ class StateStore:
         task.detail = detail
         task.updated_at = timestamp()
         await self.save()
+
+    async def unblock(self) -> list[str]:
+        """Reset blocked tasks to pending without discarding attempt history."""
+        changed: list[str] = []
+        for key, task in self.tasks.items():
+            if task.status != TaskStatus.BLOCKED:
+                continue
+            task.status = TaskStatus.PENDING
+            task.detail = "manually unblocked"
+            task.updated_at = timestamp()
+            changed.append(key)
+        if changed:
+            await self.save()
+        return changed
 
     async def start_run(self, chapter_id: str, stage: Stage) -> RunRecord:
         task = self.task(chapter_id, stage)

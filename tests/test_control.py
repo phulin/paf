@@ -5,8 +5,9 @@ import pytest
 
 from lastlib_swarm.config import load_config
 from lastlib_swarm.control import ControlServer, control_socket, offline_status, send_command
+from lastlib_swarm.models import Stage
 from lastlib_swarm.scheduler import Orchestrator, RunControl
-from lastlib_swarm.state import StateStore
+from lastlib_swarm.state import StateStore, TaskStatus
 from tests.support import write_project
 
 
@@ -48,6 +49,17 @@ async def test_control_server_accepts_bash_friendly_commands(tmp_path: Path) -> 
 
     status = await asyncio.to_thread(send_command, config.settings.state_dir, "status")
     assert status["status"] == "running"
+    await state.set_task(
+        config.chapters[0].id,
+        Stage.REVIEW,
+        TaskStatus.BLOCKED,
+        "formalization failed",
+    )
+    unblocked = await asyncio.to_thread(send_command, config.settings.state_dir, "unblock")
+    assert unblocked["unblocked"] == 1
+    assert unblocked["unblocked_tasks"] == ["book/chapter-01:review"]
+    assert unblocked["tasks"]["blocked"] == 0
+    assert state.task(config.chapters[0].id, Stage.REVIEW).status == TaskStatus.PENDING
     paused = await asyncio.to_thread(send_command, config.settings.state_dir, "pause")
     assert paused["status"] == "paused"
     resumed = await asyncio.to_thread(send_command, config.settings.state_dir, "resume")

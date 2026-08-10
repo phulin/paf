@@ -156,6 +156,7 @@ uv run lastlib-swarm agent start "$TARGET"
 uv run lastlib-swarm agent status "$TARGET"
 uv run lastlib-swarm agent pause "$TARGET"
 uv run lastlib-swarm agent resume "$TARGET"
+uv run lastlib-swarm agent unblock "$TARGET"
 uv run lastlib-swarm agent snapshot "$TARGET"
 uv run lastlib-swarm agent inspect "$TARGET" --chapter 8
 uv run lastlib-swarm agent inspect "$TARGET" --chapter book02/chapter-08 --follow
@@ -171,6 +172,9 @@ Use `agent stop` to cancel the scheduler and terminate active Codex/build subpro
 
 Pause is cooperative: already-running chapter attempts finish, while new agent/build attempts wait at
 a checkpoint. This preserves coherent edits and build results. Resume releases all queued work.
+`unblock` resets every persisted `blocked` task to `pending` without deleting its run history. It can
+be issued against either a live daemon or offline state; pending tasks are eligible the next time the
+corresponding stage is scheduled.
 
 For a long-lived managing agent, the `rpc` facade accepts newline-delimited JSON commands on stdin and
 returns one JSON response per line:
@@ -180,7 +184,8 @@ printf '%s\n' '{"command":"status"}' '{"command":"snapshot"}' \
   | uv run lastlib-swarm agent rpc "$TARGET"
 ```
 
-Accepted RPC commands are `status`, `snapshot`, `pause`, `resume`, `stop`, `wait`, and `inspect`.
+Accepted RPC commands are `status`, `snapshot`, `pause`, `resume`, `unblock`, `stop`, `wait`, and
+`inspect`.
 Inspection requests may include `chapter` or `run`, for example
 `{"command":"inspect","chapter":"book02/chapter-08"}`. The daemon
 stores its socket, PID, JSON result, and combined stdout/stderr log under the inferred state directory.

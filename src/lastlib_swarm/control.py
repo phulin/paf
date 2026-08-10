@@ -180,6 +180,12 @@ class ControlServer:
             elif command == "resume":
                 self.orchestrator.control.resume()
                 response = self._status()
+            elif command == "unblock":
+                tasks = await self.orchestrator.state.unblock()
+                response = self._status() | {
+                    "unblocked": len(tasks),
+                    "unblocked_tasks": tasks,
+                }
             elif command == "stop":
                 self.request_stop()
                 response = self._status() | {"accepted": True}
