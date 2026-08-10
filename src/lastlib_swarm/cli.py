@@ -32,6 +32,7 @@ from lastlib_swarm.corpus import (
 )
 from lastlib_swarm.isolation import fuse_overlay_available
 from lastlib_swarm.models import Chapter, PipelineConfig, Stage
+from lastlib_swarm.pricing import LEGACY_MODEL, CostEstimate, estimate_cost, format_usd
 from lastlib_swarm.scheduler import Orchestrator
 from lastlib_swarm.state import StateStore, TaskStatus
 from lastlib_swarm.tui import format_count, format_usage, run_tui
@@ -357,6 +358,11 @@ def print_status(config: PipelineConfig, console: Console, *, raw_json: bool) ->
             measured=measured,
         )
         console.print(f"[bold]{format_usage(token_usage)}[/bold]")
+    cost = snapshot.get("cost")
+    if isinstance(cost, dict) and cost.get("measured"):
+        console.print(
+            f"[bold]API-equivalent cost: {format_usd(CostEstimate.from_dict(cost))}[/bold]"
+        )
     tasks = snapshot.get("tasks", {})
     counts = {status.value: 0 for status in TaskStatus}
     if isinstance(tasks, dict):
@@ -408,8 +414,12 @@ def _run(args: argparse.Namespace, config: PipelineConfig, console: Console) -> 
         )
     usage = state.invocation_usage()
     lifetime_usage = state.total_usage()
+    cost = state.invocation_cost()
+    lifetime_cost = state.total_cost()
     console.print(format_usage(usage, label="This invocation"))
-    console.print(f"Lifetime API-equivalent tokens: {format_count(lifetime_usage.api_tokens)}")
+    console.print(f"API-equivalent cost: {format_usd(cost)}")
+    console.print(f"Lifetime tokens: {format_count(lifetime_usage.total_tokens)}")
+    console.print(f"Lifetime API-equivalent cost: {format_usd(lifetime_cost)}")
     console.print("Completed successfully" if succeeded else "Finished with failures")
     return 0 if succeeded else 1
 
@@ -586,7 +596,15 @@ def _inspect_snapshot(
         )
     raw_usage = run.get("usage")
     usage: dict[str, Any] = dict(raw_usage) if isinstance(raw_usage, dict) else {}
-    usage["api_tokens"] = int(usage.get("input_tokens", 0)) + int(usage.get("output_tokens", 0))
+    usage["total_tokens"] = int(usage.get("input_tokens", 0)) + int(usage.get("output_tokens", 0))
+    model = str(run.get("model") or LEGACY_MODEL)
+    cost = estimate_cost(
+        model=model,
+        input_tokens=int(usage.get("input_tokens", 0)),
+        cached_input_tokens=int(usage.get("cached_input_tokens", 0)),
+        output_tokens=int(usage.get("output_tokens", 0)),
+        inferred=run.get("model") is None,
+    )
     return {
         "chapter_id": task.get("chapter_id"),
         "chapter_title": task.get("chapter_title"),
@@ -601,6 +619,7 @@ def _inspect_snapshot(
         "started_at": run.get("started_at"),
         "finished_at": run.get("finished_at"),
         "usage": usage,
+        "cost": cost.as_dict(),
         "log_path": str(log_path),
         "activity": activity.as_dict() if activity else None,
     }
@@ -623,9 +642,12 @@ def _print_inspection(value: dict[str, Any], console: Console) -> None:
     )
     usage = value.get("usage")
     if isinstance(usage, dict) and usage.get("measured"):
-        console.print(f"API-equivalent tokens: {int(usage.get('api_tokens', 0)):,}")
+        console.print(f"Tokens: {int(usage.get('total_tokens', 0)):,}")
     else:
-        console.print("API-equivalent tokens: pending final measured usage")
+        console.print("Tokens: pending measured usage")
+    cost = value.get("cost")
+    if isinstance(cost, dict) and cost.get("measured"):
+        console.print(f"API-equivalent cost: {format_usd(CostEstimate.from_dict(cost))}")
     if summary := activity.get("latest_summary"):
         console.print(f"Latest update: {summary}")
     if error := activity.get("latest_error"):

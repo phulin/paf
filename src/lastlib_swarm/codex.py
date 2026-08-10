@@ -426,7 +426,7 @@ the final acceptance check, not as the interactive edit/check loop.
 
         async def update_usage(found: TokenUsage) -> None:
             nonlocal usage
-            if found.api_tokens < usage.api_tokens:
+            if found.total_tokens < usage.total_tokens:
                 return
             usage = found
             await self.state.update_run(run, usage=usage)

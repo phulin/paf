@@ -34,7 +34,7 @@ def test_extracts_api_equivalent_usage() -> None:
     )
 
     assert usage is not None
-    assert usage.api_tokens == 150
+    assert usage.total_tokens == 150
     assert usage.cached_input_tokens == 40
     assert usage.reasoning_output_tokens == 12
     assert usage.measured
@@ -60,7 +60,7 @@ def test_extracts_live_rollout_usage() -> None:
     )
 
     assert usage is not None
-    assert usage.api_tokens == 425
+    assert usage.total_tokens == 425
     assert usage.cached_input_tokens == 300
 
 
@@ -202,7 +202,7 @@ print(json.dumps({"type": "item.completed", "item": {
 
     assert result.succeeded
     assert result.thread_id == "thread-123"
-    assert result.usage.api_tokens == 125
+    assert result.usage.total_tokens == 125
     assert result.report["summary"] == "done"
     activity = state.activities.get(run.id)
     assert activity is not None
@@ -243,7 +243,7 @@ print(json.dumps({"type": "item.completed", "item": {
     result = await executor.run(config.chapters[0], Stage.REVIEW, run)
 
     assert result.succeeded
-    assert result.usage.api_tokens == 125
+    assert result.usage.total_tokens == 125
     assert result.report["summary"] == "large event drained"
     assert (state.logs_dir / f"{run.id}.jsonl").stat().st_size > 2 * 1024 * 1024
 
@@ -294,7 +294,7 @@ time.sleep(60)
                 break
             await asyncio.sleep(0.01)
         assert "visible-now" in log_path.read_text(encoding="utf-8")
-        assert run.usage.api_tokens == 125
+        assert run.usage.total_tokens == 125
     finally:
         task.cancel()
         with pytest.raises(asyncio.CancelledError):

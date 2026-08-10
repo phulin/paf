@@ -106,7 +106,8 @@ print(json.dumps({"type": "item.completed", "item": {
     assert main(["agent", "wait", "--config", str(config_path)]) == 0
     finished = json.loads(capsys.readouterr().out)
     assert finished["status"] == "completed"
-    assert finished["usage"]["api_tokens"] == 36
+    assert finished["usage"]["total_tokens"] == 36
+    assert finished["cost"]["estimated_usd"] == pytest.approx(0.0000105)
 
 
 def test_agent_rpc_reads_jsonl_from_stdin(

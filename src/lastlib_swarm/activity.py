@@ -133,7 +133,7 @@ class AgentActivity:
             if isinstance(usage, dict):
                 input_tokens = int(usage.get("input_tokens", 0))
                 output_tokens = int(usage.get("output_tokens", 0))
-                detail = f"{input_tokens + output_tokens:,} API-equivalent tokens"
+                detail = f"{input_tokens + output_tokens:,} tokens"
             self._append("usage", "completed", "turn completed", detail)
             self._set_current()
             return

@@ -15,7 +15,7 @@ from lastlib_swarm.corpus import scheduling_summary
 from lastlib_swarm.scheduler import Orchestrator
 from lastlib_swarm.state import TaskStatus, timestamp
 
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 SOCKET_NAME = "control.sock"
 PID_NAME = "daemon.pid"
 RESULT_NAME = "daemon-result.json"
@@ -55,6 +55,8 @@ def state_summary(
         "updated_at": snapshot["updated_at"],
         "usage": snapshot["invocation_usage"],
         "lifetime_usage": snapshot["usage"],
+        "cost": snapshot["invocation_cost"],
+        "lifetime_cost": snapshot["cost"],
         "isolation": snapshot["isolation"],
         "scheduling": scheduling_summary(snapshot["scheduling"]),
         "tasks": _task_counts(snapshot),
@@ -264,6 +266,8 @@ def offline_status(state_dir: Path) -> dict[str, Any]:
                 "updated_at": snapshot.get("updated_at"),
                 "usage": snapshot.get("invocation_usage", snapshot.get("usage", {})),
                 "lifetime_usage": snapshot.get("usage", {}),
+                "cost": snapshot.get("invocation_cost", {}),
+                "lifetime_cost": snapshot.get("cost", {}),
                 "isolation": snapshot.get("isolation", {}),
                 "scheduling": scheduling_summary(snapshot.get("scheduling", {})),
                 "tasks": _task_counts(snapshot),
@@ -279,7 +283,31 @@ def offline_status(state_dir: Path) -> dict[str, Any]:
             "output_tokens": 0,
             "reasoning_output_tokens": 0,
             "measured": False,
-            "api_tokens": 0,
+            "total_tokens": 0,
+        },
+        "cost": {
+            "estimated_usd": 0.0,
+            "priced_tokens": 0,
+            "unpriced_tokens": 0,
+            "inferred_runs": 0,
+            "unknown_models": [],
+            "measured": False,
+        },
+        "lifetime_usage": {
+            "input_tokens": 0,
+            "cached_input_tokens": 0,
+            "output_tokens": 0,
+            "reasoning_output_tokens": 0,
+            "measured": False,
+            "total_tokens": 0,
+        },
+        "lifetime_cost": {
+            "estimated_usd": 0.0,
+            "priced_tokens": 0,
+            "unpriced_tokens": 0,
+            "inferred_runs": 0,
+            "unknown_models": [],
+            "measured": False,
         },
         "scheduling": {},
         "isolation": {},

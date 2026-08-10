@@ -236,9 +236,11 @@ framed incrementally rather than loaded as a whole file. Dashboard cells and sta
 only when their values change, and the raw-event tab tails newly appended bytes instead of reparsing
 the log on every refresh.
 
-“API-equivalent tokens” means `input_tokens + output_tokens`. The primary dashboard and CLI total is
-for attempts started by the current swarm invocation; a separately labelled lifetime total includes
-every persisted attempt in this state directory, including failed and cancelled attempts.
+The token count means `input_tokens + output_tokens`. The primary dashboard and CLI total is for
+attempts started by the current swarm invocation; a separately labelled lifetime total includes
+every persisted attempt in this state directory, including failed and cancelled attempts. Both views
+also show the corresponding API-equivalent dollar cost for the model recorded on each attempt.
+Legacy attempts created before model persistence are priced as `gpt-5.6-luna`.
 `cached_input_tokens` is displayed separately but is already a subset of input, so it is not added a
 second time. Reasoning output is also shown separately and is not double-counted.
 
@@ -247,9 +249,7 @@ reports a thread id, the orchestrator also tails that thread's local rollout tok
 atomically checkpoints its latest cumulative usage into the run record. Cancellation stops the
 process, drains the rollout once more, and preserves that partial spend. The final stdout usage, when
 available, updates the same record. If a Codex version does not emit recognized usage fields in
-either stream, the TUI says usage is awaiting measurement rather than inventing an estimate. This is
-token accounting, not a currency estimate; model prices and account billing arrangements are
-deliberately outside the state model.
+either stream, the TUI says usage is awaiting measurement rather than inventing an estimate.
 
 ## State, logs, and interruption
 

@@ -16,6 +16,7 @@ from textual.worker import WorkerCancelled
 from lastlib_swarm import json_codec as json
 from lastlib_swarm.activity import AgentActivity, systemic_errors
 from lastlib_swarm.models import Chapter, Stage
+from lastlib_swarm.pricing import format_usd
 from lastlib_swarm.scheduler import Orchestrator
 from lastlib_swarm.state import RunRecord, StateStore, TaskStatus, TokenUsage
 
@@ -38,11 +39,11 @@ def format_count(value: int) -> str:
     return f"{value / 1_000_000_000:.2f}b"
 
 
-def format_usage(usage: TokenUsage, *, label: str = "API-equivalent tokens") -> str:
+def format_usage(usage: TokenUsage, *, label: str = "Tokens") -> str:
     if not usage.measured:
         return f"{label}: awaiting measured usage"
     return (
-        f"{label}: {format_count(usage.api_tokens)}  "
+        f"{label}: {format_count(usage.total_tokens)}  "
         f"input {format_count(usage.input_tokens)} "
         f"(cached {format_count(usage.cached_input_tokens)})  "
         f"output {format_count(usage.output_tokens)}  "
@@ -212,11 +213,12 @@ class AgentDetailScreen(Screen[None]):
         else:
             work = "WORK\nAwaiting compact events"
         self._update_static("#agent-work", work)
-        usage = format_count(run.usage.api_tokens) if run.usage.measured else "pending"
+        usage = format_count(run.usage.total_tokens) if run.usage.measured else "pending"
+        cost = format_usd(self.state.run_cost(run))
         self._update_static(
             "#agent-spend",
             f"TIME / SPEND\nelapsed {format_duration(elapsed)} · last event {last_event}\n"
-            f"API-equivalent tokens {usage}",
+            f"tokens {usage} · API-equivalent cost {cost}",
         )
         summary = (
             activity.latest_summary if activity and activity.latest_summary else "No update yet."
@@ -308,7 +310,9 @@ class SwarmApp(App[bool]):
     BINDINGS: ClassVar = [("q", "quit", "Stop and quit"), ("i", "inspect_agent", "Inspect")]
     CSS = """
     #usage {
-        height: 4;
+        height: auto;
+        min-height: 4;
+        max-height: 7;
         padding: 1 2;
         background: $primary-background;
         color: $text;
@@ -383,7 +387,7 @@ class SwarmApp(App[bool]):
         for stage in Stage:
             table.add_column(stage.value.title(), key=stage.value)
         table.add_column("Current agent activity", key="activity")
-        table.add_column("Tokens", key="tokens")
+        table.add_column("Tokens · API $", key="tokens")
         self.set_interval(1.0, self.refresh_dashboard)
         self.run_worker(self.execute(), exclusive=True, group="pipeline")
 
@@ -445,6 +449,8 @@ class SwarmApp(App[bool]):
             return
         usage = self.state.invocation_usage()
         lifetime_usage = self.state.total_usage()
+        cost = self.state.invocation_cost()
+        lifetime_cost = self.state.total_cost()
         active = sum(task.status == TaskStatus.RUNNING for task in self.state.tasks.values())
         maximum = self.orchestrator.config.settings.max_agents
         lean_mcp = "on" if self.orchestrator.config.settings.lean_mcp else "off"
@@ -458,7 +464,9 @@ class SwarmApp(App[bool]):
         self._update_static(
             "#usage",
             f"{format_usage(usage, label='This invocation')}    "
-            f"lifetime API-equivalent tokens: {format_count(lifetime_usage.api_tokens)}    "
+            f"API-equivalent cost: {format_usd(cost)}    "
+            f"lifetime tokens: {format_count(lifetime_usage.total_tokens)}    "
+            f"lifetime API-equivalent cost: {format_usd(lifetime_cost)}    "
             f"active stage records: {active}  concurrency cap: {maximum}\n"
             f"Statement critical path: {critical}    isolation: {isolation}  "
             f"Lean MCP: {lean_mcp}    Codex access: {codex_access}",
@@ -527,7 +535,8 @@ class SwarmApp(App[bool]):
             mark = STATUS_MARKS[TaskStatus(task.status)]
             statuses.append(f"{mark} ({task.rounds})" if task.rounds else mark)
         usage = chapter_usage(self.state, chapter)
-        tokens = format_count(usage.api_tokens) if usage.measured else "—"
+        tokens = format_count(usage.total_tokens) if usage.measured else "—"
+        cost = format_usd(self.state.invocation_cost(chapter.id))
         run = latest_run(self.state, chapter)
         activity = self.state.activities.get(run.id) if run is not None else None
         statement_rank = self.orchestrator.statement_schedule.rank[chapter.book_id]
@@ -540,7 +549,7 @@ class SwarmApp(App[bool]):
             f"{chapter.number:02d} {chapter.title}",
             *statuses,
             activity_label(activity, run),
-            tokens,
+            f"{tokens} · {cost}",
         )
 
 

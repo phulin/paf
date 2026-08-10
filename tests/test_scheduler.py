@@ -1,4 +1,5 @@
 import asyncio
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -72,8 +73,8 @@ async def test_invocation_usage_excludes_persisted_attempts(tmp_path: Path) -> N
     second = StateStore(config)
     await second.load_or_create()
 
-    assert second.total_usage().api_tokens == 120
-    assert second.invocation_usage().api_tokens == 0
+    assert second.total_usage().total_tokens == 120
+    assert second.invocation_usage().total_tokens == 0
     assert not second.invocation_usage().measured
 
     new_run = await second.start_run(config.chapters[0].id, Stage.REVIEW)
@@ -82,9 +83,35 @@ async def test_invocation_usage_excludes_persisted_attempts(tmp_path: Path) -> N
         usage=TokenUsage(input_tokens=30, output_tokens=5, measured=True),
     )
 
-    assert second.total_usage().api_tokens == 155
-    assert second.invocation_usage().api_tokens == 35
-    assert second.invocation_usage(config.chapters[0].id).api_tokens == 35
+    assert second.total_usage().total_tokens == 155
+    assert second.invocation_usage().total_tokens == 35
+    assert second.invocation_usage(config.chapters[0].id).total_tokens == 35
+    assert old_run.model == "gpt-5.6-luna"
+    assert new_run.model == "gpt-5.6-luna"
+    assert second.total_cost().estimated_usd == pytest.approx(0.000056)
+    assert second.invocation_cost().estimated_usd == pytest.approx(0.000012)
+    snapshot = second.snapshot()
+    assert snapshot["cost"]["estimated_usd"] == pytest.approx(0.000056)
+    assert snapshot["invocation_cost"]["estimated_usd"] == pytest.approx(0.000012)
+
+
+def test_legacy_attempt_cost_is_always_luna(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    config = replace(config, settings=replace(config.settings, model="gpt-5.6-sol"))
+    state = StateStore(config)
+    legacy = RunRecord(
+        id="legacy",
+        chapter_id=config.chapters[0].id,
+        stage=Stage.FORMALIZE,
+        round=1,
+        model=None,
+        usage=TokenUsage(input_tokens=100, output_tokens=20, measured=True),
+    )
+
+    cost = state.run_cost(legacy)
+
+    assert cost.estimated_usd == pytest.approx(0.000044)
+    assert cost.inferred_runs == 1
 
 
 @pytest.mark.asyncio
@@ -109,7 +136,7 @@ async def test_review_requires_a_no_change_round(
     task = state.task(config.chapters[0].id, Stage.REVIEW)
     assert task.status == TaskStatus.SUCCEEDED
     assert task.rounds == 2
-    assert state.total_usage().api_tokens == 30
+    assert state.total_usage().total_tokens == 30
 
 
 @pytest.mark.asyncio
