@@ -127,23 +127,30 @@ class SwarmApp(App[bool]):
         self.run_worker(self.execute(), exclusive=True, group="pipeline")
 
     async def execute(self) -> None:
+        error: Exception | None = None
         try:
             await self.orchestrator.prepare()
             self.refresh_dashboard()
             self.result = await self.operation()
-            message = (
-                "Pipeline completed successfully"
-                if self.result
-                else "Pipeline finished with failures"
-            )
-            self.query_one("#status", Static).update(message + " — returning to the shell")
-            self.refresh_dashboard()
-            self.set_timer(1.0, lambda: self.exit(self.result))
-        except Exception as error:
+        except Exception as caught:
+            error = caught
+        finally:
+            try:
+                await self.orchestrator.shutdown()
+            except Exception as shutdown_error:
+                if error is None:
+                    error = shutdown_error
+
+        if error is not None:
             self.query_one("#status", Static).update(f"Fatal orchestrator error: {error}")
             self.set_timer(2.0, lambda: self.exit(False))
-        finally:
-            await self.orchestrator.shutdown()
+            return
+        message = (
+            "Pipeline completed successfully" if self.result else "Pipeline finished with failures"
+        )
+        self.query_one("#status", Static).update(message + " — returning to the shell")
+        self.refresh_dashboard()
+        self.set_timer(1.0, lambda: self.exit(self.result))
 
     def refresh_dashboard(self) -> None:
         if not self.state.tasks:
@@ -152,12 +159,17 @@ class SwarmApp(App[bool]):
         active = sum(task.status == TaskStatus.RUNNING for task in self.state.tasks.values())
         maximum = self.orchestrator.config.settings.max_agents
         lean_mcp = "on" if self.orchestrator.config.settings.lean_mcp else "off"
+        codex_access = (
+            "full"
+            if self.orchestrator.config.settings.bypass_approvals_and_sandbox
+            else self.orchestrator.config.settings.sandbox
+        )
         isolation = self.orchestrator.isolation.name
         critical = " → ".join(self.orchestrator.statement_schedule.critical_path) or "—"
         self.query_one("#usage", Static).update(
             f"{format_usage(usage)}    active stage records: {active}  concurrency cap: {maximum}\n"
             f"Statement critical path: {critical}    isolation: {isolation}  "
-            f"Lean MCP: {lean_mcp}"
+            f"Lean MCP: {lean_mcp}    Codex access: {codex_access}"
         )
         for stage in Stage:
             counts = stage_counts(self.state, stage)

@@ -119,3 +119,30 @@ chapters = [1]
 
     assert await orchestrator.run_stage(Stage.FORMALIZE)
     assert events == ["start:book", "end:book", "start:second", "end:second"]
+
+
+@pytest.mark.asyncio
+async def test_chapter_failure_cancels_and_drains_siblings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    orchestrator = Orchestrator(config, StateStore(config))
+    sibling_started = asyncio.Event()
+    sibling_cleaned = asyncio.Event()
+
+    async def statement(chapter: Chapter) -> bool:
+        if chapter.number == 1:
+            await sibling_started.wait()
+            raise RuntimeError("primary failure")
+        sibling_started.set()
+        try:
+            await asyncio.Future()
+        finally:
+            sibling_cleaned.set()
+        raise AssertionError("unreachable")
+
+    monkeypatch.setattr(orchestrator, "_statement_chapter", statement)
+
+    with pytest.raises(RuntimeError, match="primary failure"):
+        await orchestrator._statement_book("book")
+    assert sibling_cleaned.is_set()

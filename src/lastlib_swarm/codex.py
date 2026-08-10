@@ -270,10 +270,12 @@ the final acceptance check, not as the interactive edit/check loop.
             command.append("--skip-git-repo-check")
         if settings.bypass_approvals_and_sandbox:
             command.append("--dangerously-bypass-approvals-and-sandbox")
+        elif settings.approve_for_me:
+            # Current Codex versions make --approve-for-me mutually exclusive
+            # with --sandbox; approve-for-me itself selects workspace-write.
+            command.append("--approve-for-me")
         else:
             command.extend(["--sandbox", settings.sandbox])
-            if settings.approve_for_me:
-                command.append("--approve-for-me")
         if settings.model:
             command.extend(["--model", settings.model])
         if settings.reasoning_effort:

@@ -244,7 +244,13 @@ def print_plan(config: PipelineConfig, console: Console) -> None:
         f"[bold]Reasoning:[/bold] {config.settings.reasoning_effort}  "
         f"[bold]Isolation:[/bold] {config.settings.isolation} → {isolation}"
     )
+    access = (
+        "full (approval and sandbox bypass)"
+        if config.settings.bypass_approvals_and_sandbox
+        else config.settings.sandbox
+    )
     console.print(
+        f"[bold]Codex access:[/bold] {access}  "
         f"[bold]Lean MCP:[/bold] {'enabled' if config.settings.lean_mcp else 'disabled'}  "
         f"[bold]Project:[/bold] {config.settings.lean_project}  "
         f"[bold]Tool timeout:[/bold] {config.settings.lean_mcp_tool_timeout_seconds:g}s"

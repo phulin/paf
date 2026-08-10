@@ -14,6 +14,21 @@ from lastlib_swarm.models import Chapter, PipelineConfig, Stage
 from lastlib_swarm.state import RunRecord, StateStore, TaskStatus
 
 
+async def _gather_cancel_on_error(
+    operations: Iterable[Coroutine[Any, Any, bool]],
+) -> list[bool]:
+    """Cancel and drain sibling operations when any one raises."""
+
+    tasks = [asyncio.create_task(operation) for operation in operations]
+    try:
+        return list(await asyncio.gather(*tasks))
+    except BaseException:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
+
+
 @dataclass(frozen=True)
 class Attempt:
     agent: AgentResult
@@ -138,6 +153,12 @@ class Orchestrator:
         self.state.isolation = {
             "configured": config.settings.isolation,
             "backend": self.isolation.name,
+            "codex_access": (
+                "full" if config.settings.bypass_approvals_and_sandbox else config.settings.sandbox
+            ),
+            "enforcement": (
+                "best-effort" if config.settings.bypass_approvals_and_sandbox else "sandboxed"
+            ),
             "lake_cache": (
                 "immutable-generations"
                 if self.isolation.name == "fuse-overlay"
@@ -403,7 +424,9 @@ class Orchestrator:
 
         async def run_book(book_id: str) -> bool:
             chapters = [chapter for chapter in self.chapters if chapter.book_id == book_id]
-            results = await asyncio.gather(*(operations[stage](chapter) for chapter in chapters))
+            results = await _gather_cancel_on_error(
+                operations[stage](chapter) for chapter in chapters
+            )
             return all(results)
 
         schedule = (
@@ -427,13 +450,15 @@ class Orchestrator:
 
     async def _statement_book(self, book_id: str) -> bool:
         chapters = [chapter for chapter in self.chapters if chapter.book_id == book_id]
-        results = await asyncio.gather(*(self._statement_chapter(chapter) for chapter in chapters))
+        results = await _gather_cancel_on_error(
+            self._statement_chapter(chapter) for chapter in chapters
+        )
         return all(results)
 
     async def _proof_book(self, book_id: str) -> bool:
         chapters = [chapter for chapter in self.chapters if chapter.book_id == book_id]
-        results = await asyncio.gather(
-            *(self._prove(chapter, allow_repair=True) for chapter in chapters)
+        results = await _gather_cancel_on_error(
+            self._prove(chapter, allow_repair=True) for chapter in chapters
         )
         return all(results)
 
@@ -447,29 +472,35 @@ class Orchestrator:
         pending = set(schedule.order)
         succeeded: set[str] = set()
         running: dict[asyncio.Task[bool], str] = {}
-        while pending or running:
-            for book_id in schedule.order:
-                if book_id in pending and schedule.dependencies[book_id] <= succeeded:
-                    running[asyncio.create_task(operation(book_id))] = book_id
-                    pending.remove(book_id)
-            if not running:
-                if pending:
-                    for chapter in self.chapters:
-                        if chapter.book_id in pending:
-                            for stage in stages:
-                                await self.state.set_task(
-                                    chapter.id,
-                                    stage,
-                                    TaskStatus.BLOCKED,
-                                    "upstream book did not complete successfully",
-                                )
-                    pending.clear()
-                break
-            done, _ = await asyncio.wait(running, return_when=asyncio.FIRST_COMPLETED)
-            for task in done:
-                book_id = running.pop(task)
-                if task.result():
-                    succeeded.add(book_id)
+        try:
+            while pending or running:
+                for book_id in schedule.order:
+                    if book_id in pending and schedule.dependencies[book_id] <= succeeded:
+                        running[asyncio.create_task(operation(book_id))] = book_id
+                        pending.remove(book_id)
+                if not running:
+                    if pending:
+                        for chapter in self.chapters:
+                            if chapter.book_id in pending:
+                                for stage in stages:
+                                    await self.state.set_task(
+                                        chapter.id,
+                                        stage,
+                                        TaskStatus.BLOCKED,
+                                        "upstream book did not complete successfully",
+                                    )
+                        pending.clear()
+                    break
+                done, _ = await asyncio.wait(running, return_when=asyncio.FIRST_COMPLETED)
+                for task in done:
+                    book_id = running.pop(task)
+                    if task.result():
+                        succeeded.add(book_id)
+        except BaseException:
+            for task in running:
+                task.cancel()
+            await asyncio.gather(*running, return_exceptions=True)
+            raise
         return succeeded
 
     async def _run_statements(self) -> set[str]:

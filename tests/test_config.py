@@ -119,6 +119,7 @@ def test_infers_zero_config_project_from_markdown(tmp_path: Path) -> None:
     assert config.settings.repo == tmp_path
     assert config.settings.model == "gpt-5.6-luna"
     assert config.settings.reasoning_effort == "max"
+    assert config.settings.bypass_approvals_and_sandbox
     assert config.settings.isolation == "auto"
     assert config.settings.state_dir == tmp_path / ".swarm" / "book07"
     assert config.books[0].module == "LastLib.Book07ExistingAPI"

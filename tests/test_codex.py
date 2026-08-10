@@ -63,8 +63,9 @@ def test_executor_uses_machine_readable_codex_mode(tmp_path: Path) -> None:
     assert command[:2] == ["codex", "exec"]
     assert "--json" in command
     assert "--output-schema" in command
-    assert "--approve-for-me" in command
-    assert "--dangerously-bypass-approvals-and-sandbox" not in command
+    assert "--dangerously-bypass-approvals-and-sandbox" in command
+    assert "--approve-for-me" not in command
+    assert "--sandbox" not in command
     assert "--skip-git-repo-check" not in command
     isolated = tmp_path / "isolated"
     isolated_command = executor.command(Stage.PROVE, isolated)
@@ -82,6 +83,23 @@ def test_executor_uses_machine_readable_codex_mode(tmp_path: Path) -> None:
     assert render_prompt(
         "Chapter {chapter_number_padded}: {chapter_title}", config.chapters[0]
     ) == ("Chapter 01: First chapter")
+
+
+def test_approve_for_me_is_not_combined_with_explicit_sandbox(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    config = replace(
+        config,
+        settings=replace(
+            config.settings,
+            bypass_approvals_and_sandbox=False,
+            approve_for_me=True,
+        ),
+    )
+    command = CodexExecutor(config, StateStore(config)).command(Stage.REVIEW)
+
+    assert "--approve-for-me" in command
+    assert "--sandbox" not in command
+    assert "--dangerously-bypass-approvals-and-sandbox" not in command
 
 
 def test_executor_can_disable_lean_mcp(tmp_path: Path) -> None:

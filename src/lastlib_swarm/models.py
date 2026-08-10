@@ -32,8 +32,8 @@ class SwarmSettings:
     model: str | None = "gpt-5.6-luna"
     reasoning_effort: str | None = "max"
     sandbox: str = "workspace-write"
-    approve_for_me: bool = True
-    bypass_approvals_and_sandbox: bool = False
+    approve_for_me: bool = False
+    bypass_approvals_and_sandbox: bool = True
     agent_timeout_seconds: float = 7200.0
     validation_timeout_seconds: float = 1800.0
     isolation: str = "auto"

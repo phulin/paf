@@ -249,16 +249,6 @@ class FuseOverlayIsolation:
             raise ValueError(
                 "fuse-overlay isolation requires fuse-overlayfs, fusermount3, rsync, and /dev/fuse"
             )
-        if self.settings.bypass_approvals_and_sandbox:
-            raise ValueError(
-                "fuse-overlay isolation requires the Codex workspace sandbox; "
-                "disable bypass_approvals_and_sandbox"
-            )
-        if self.settings.sandbox != "workspace-write":
-            raise ValueError(
-                "fuse-overlay isolation requires sandbox = 'workspace-write' "
-                "to confine Codex to the mounted workspace"
-            )
         self.generations.mkdir(parents=True, exist_ok=True)
         self.cache_generations.mkdir(parents=True, exist_ok=True)
         self.slots.mkdir(parents=True, exist_ok=True)

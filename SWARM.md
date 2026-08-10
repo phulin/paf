@@ -55,10 +55,11 @@ Any stage may point at a specialized prompt template. Supported replacement fiel
 `{book_title}`, `{chapter_number}`, `{chapter_number_padded}`, `{chapter_title}`, `{source}`,
 `{lean_root}`, `{chapter_path}`, `{chapter_module}`, and `{build_command}`.
 
-Codex is invoked in its documented noninteractive JSONL mode with a strict final-report schema. The
-default uses the `workspace-write` sandbox and automatic approval review. The much less safe
-`bypass_approvals_and_sandbox = true` must be explicitly configured; it is never inferred from the
-selected agent count. See OpenAI's official
+Codex is invoked in its documented noninteractive JSONL mode with a strict final-report schema.
+Swarm workers default to `--dangerously-bypass-approvals-and-sandbox`, giving them full host access
+for unattended formalization. Set `bypass_approvals_and_sandbox = false` and
+`approve_for_me = true` to restore automatic review with Codex's workspace-write sandbox. See
+OpenAI's official
 [Codex non-interactive guidance](https://developers.openai.com/codex/noninteractive).
 
 ## Commands
@@ -243,8 +244,8 @@ discarded and retried by the normal stage loop.
 
 The number of mounted workspaces is bounded by `max_agents`; slots and upper layers are removed after
 each attempt. Generations share unchanged file data through hard links and are removed when their last
-reader exits. Temporary mounts live outside the repository so Git discovery and the Codex workspace
-sandbox cannot escape through the parent worktree.
+reader exits. Temporary mounts live outside the repository so Git discovery starts from the private
+view.
 
 All agents pinned to a cache generation share the same Lake artifact inodes and OS page-cache pages;
 the cache is never copied once per agent. After a successful validation, the coordinator scans only
@@ -256,12 +257,14 @@ skipped rather than overwriting a newer artifact. Cache deletions are not promot
 never imported into the canonical source worktree. Source imports preserve mtimes so valid Lake
 traces are not invalidated merely by publication.
 
-FUSE isolation requires `fuse-overlayfs`, `fusermount3`, `rsync`, an accessible `/dev/fuse`, and the
-Codex `workspace-write` sandbox. It deliberately refuses `bypass_approvals_and_sandbox`. `auto`
-selects FUSE when these primitives are present and otherwise uses the explicitly visible `shared`
-backend; production runs can require isolation with `--isolation fuse-overlay` so missing support is
-a hard error. Validation occupies the same global concurrency slot as its agent, keeping large Lean
-builds within `max_agents`.
+FUSE isolation requires `fuse-overlayfs`, `fusermount3`, `rsync`, and an accessible `/dev/fuse`.
+`auto` selects FUSE when these primitives are present and otherwise uses the explicitly visible
+`shared` backend; production runs can require isolation with `--isolation fuse-overlay` so missing
+support is a hard error. With full-access Codex workers, overlays prevent ordinary cwd-relative
+collisions and still gate imported changes, but they are not a security boundary: a worker can use
+absolute paths to reach the canonical repository or other host files. Enable the Codex sandbox when
+that boundary must be enforced. Validation occupies the same global concurrency slot as its agent,
+keeping large Lean builds within `max_agents`.
 
 ## Configuration
 
@@ -278,7 +281,8 @@ codex_bin = "codex"
 model = "gpt-5.6-luna"
 reasoning_effort = "max"
 sandbox = "workspace-write"
-approve_for_me = true
+approve_for_me = false
+bypass_approvals_and_sandbox = true
 agent_timeout_seconds = 7200
 validation_timeout_seconds = 1800
 isolation = "auto" # auto, fuse-overlay, or shared
