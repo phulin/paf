@@ -298,8 +298,18 @@ class FuseOverlayIsolation:
                 continue
             for merged in stale.glob("slots/*/merged"):
                 if os.path.ismount(merged):
-                    await self._run("fusermount3", "-u", str(merged))
+                    await self._unmount(merged)
             shutil.rmtree(stale)
+
+    async def _unmount(self, path: Path) -> None:
+        """Unmount normally, then detach a busy mount left by a dead worker."""
+
+        try:
+            await self._run("fusermount3", "-u", str(path))
+        except RuntimeError as error:
+            if "device or resource busy" not in str(error).casefold():
+                raise
+            await self._run("fusermount3", "-uz", str(path))
 
     async def _run(self, *command: str) -> None:
         process = await asyncio.create_subprocess_exec(
@@ -409,7 +419,7 @@ class FuseOverlayIsolation:
             )
         except Exception:
             if os.path.ismount(merged):
-                await self._run("fusermount3", "-u", str(merged))
+                await self._unmount(merged)
             if slot_root.exists():
                 shutil.rmtree(slot_root)
             if generation is not None:
@@ -553,7 +563,7 @@ class FuseOverlayIsolation:
     async def release(self, workspace: FuseWorkspace) -> None:
         try:
             if os.path.ismount(workspace.root):
-                await self._run("fusermount3", "-u", str(workspace.root))
+                await self._unmount(workspace.root)
             slot_root = workspace.root.parent
             shutil.rmtree(slot_root, ignore_errors=False)
         finally:

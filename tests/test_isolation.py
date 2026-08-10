@@ -67,6 +67,38 @@ async def test_fuse_overlay_reclaims_dead_orchestrator_roots(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
+async def test_fuse_overlay_lazily_detaches_busy_stale_mount(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager, _ = fuse_manager(write_project(tmp_path, chapters="chapters = [1]"))
+    stale = manager.parent / f"{manager.identity}-999999999"
+    merged = stale / "slots" / "0000-dead" / "merged"
+    merged.mkdir(parents=True)
+    commands: list[tuple[str, ...]] = []
+
+    async def fake_run(*command: str) -> None:
+        commands.append(command)
+        if command[1] == "-u":
+            raise RuntimeError("fusermount3 failed (1): Device or resource busy")
+
+    original_ismount = os.path.ismount
+    monkeypatch.setattr(
+        os.path,
+        "ismount",
+        lambda path: Path(path) == merged or original_ismount(path),
+    )
+    monkeypatch.setattr(manager, "_run", fake_run)
+
+    await manager._clean_stale_roots()
+
+    assert commands == [
+        ("fusermount3", "-u", str(merged)),
+        ("fusermount3", "-uz", str(merged)),
+    ]
+    assert not stale.exists()
+
+
+@pytest.mark.asyncio
 async def test_fuse_overlay_imports_scope_and_rejects_a_stale_writer(tmp_path: Path) -> None:
     manager, chapter = fuse_manager(write_project(tmp_path, chapters="chapters = [1]"))
     await manager.prepare()
