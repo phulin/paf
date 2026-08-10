@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
@@ -9,6 +8,7 @@ from enum import StrEnum
 from typing import Any
 from uuid import uuid4
 
+from lastlib_swarm import json_codec as json
 from lastlib_swarm.activity import ActivityStore
 from lastlib_swarm.models import Chapter, PipelineConfig, Stage
 
@@ -184,7 +184,7 @@ class StateStore:
             payload = self.snapshot()
             self.path.parent.mkdir(parents=True, exist_ok=True)
             temporary = self.path.with_name(f".{self.path.name}.{os.getpid()}.tmp")
-            temporary.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+            temporary.write_bytes(json.dumpb(payload, indent=True, sort_keys=True))
             os.replace(temporary, self.path)
 
     def snapshot(self) -> dict[str, Any]:

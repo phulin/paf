@@ -1,8 +1,9 @@
 import asyncio
 from pathlib import Path
+from typing import Any
 
 import pytest
-from textual.widgets import Static
+from textual.widgets import DataTable, Static
 
 from lastlib_swarm.config import load_config
 from lastlib_swarm.models import Stage
@@ -121,5 +122,42 @@ async def test_selected_chapter_opens_live_agent_detail(tmp_path: Path) -> None:
         assert "diagnostic failed" in str(app.screen.query_one("#agent-error", Static).content)
 
         await pilot.press("escape")
+        finish.set()
+        await pilot.pause(1.2)
+
+
+@pytest.mark.asyncio
+async def test_unchanged_dashboard_does_not_update_table_cells(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    orchestrator = Orchestrator(config, StateStore(config))
+    ready = asyncio.Event()
+    finish = asyncio.Event()
+
+    async def operation() -> bool:
+        ready.set()
+        await finish.wait()
+        return True
+
+    app = SwarmApp(orchestrator, operation, label="test")
+    async with app.run_test() as pilot:
+        await ready.wait()
+        app.refresh_dashboard()
+        table = app.query_one("#tasks", DataTable)
+        original = table.update_cell
+        updates = 0
+
+        def update_cell(*args: Any, **kwargs: Any) -> None:
+            nonlocal updates
+            updates += 1
+            original(*args, **kwargs)
+
+        monkeypatch.setattr(table, "update_cell", update_cell)
+
+        app.refresh_dashboard()
+        app.refresh_dashboard()
+
+        assert updates == 0
         finish.set()
         await pilot.pause(1.2)

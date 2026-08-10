@@ -226,6 +226,11 @@ latest agent update, latest error, and measured per-run spend. Press Escape or `
 swarm overview. Repeated equivalent failures across agents produce a deduplicated systemic alert in
 the overview instead of requiring inspection of every chapter.
 
+Codex JSONL, state, activity, and control messages are decoded with `orjson`. Live JSONL is still
+framed incrementally rather than loaded as a whole file. Dashboard cells and static cards are updated
+only when their values change, and the raw-event tab tails newly appended bytes instead of reparsing
+the log on every refresh.
+
 “API-equivalent tokens” means `input_tokens + output_tokens` from Codex JSONL usage snapshots.
 `cached_input_tokens` is displayed separately but is already a subset of input, so it is not added a
 second time. Reasoning output is also shown separately and is not double-counted. If a Codex version

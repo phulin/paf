@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import json
 import subprocess
 import sys
 import time
@@ -14,6 +13,7 @@ from typing import Any
 from rich.console import Console
 from rich.table import Table
 
+from lastlib_swarm import json_codec as json
 from lastlib_swarm.activity import ActivityStore
 from lastlib_swarm.config import infer_corpus, resolve_config
 from lastlib_swarm.control import (

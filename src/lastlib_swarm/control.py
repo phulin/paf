@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 import signal
 import socket
@@ -11,6 +10,7 @@ from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
+from lastlib_swarm import json_codec as json
 from lastlib_swarm.corpus import scheduling_summary
 from lastlib_swarm.scheduler import Orchestrator
 from lastlib_swarm.state import TaskStatus, timestamp
@@ -162,7 +162,7 @@ class ControlServer:
             result=self.result,
         )
         payload["finished_at"] = timestamp()
-        self.result_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+        self.result_path.write_bytes(json.dumpb(payload, indent=True, sort_keys=True))
 
     async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
@@ -191,7 +191,7 @@ class ControlServer:
                 raise ValueError(f"unknown command: {command}")
         except (json.JSONDecodeError, ValueError) as error:
             response = {"protocol_version": PROTOCOL_VERSION, "error": str(error)}
-        writer.write(json.dumps(response, sort_keys=True).encode() + b"\n")
+        writer.write(json.dumpb(response, sort_keys=True) + b"\n")
         with suppress(ConnectionError):
             await writer.drain()
         writer.close()
@@ -220,7 +220,7 @@ def send_command(state_dir: Path, command: str, *, timeout: float | None = 10.0)
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
         client.settimeout(timeout)
         client.connect(str(path))
-        client.sendall(json.dumps({"command": command}).encode() + b"\n")
+        client.sendall(json.dumpb({"command": command}) + b"\n")
         chunks = bytearray()
         while not chunks.endswith(b"\n"):
             block = client.recv(65536)

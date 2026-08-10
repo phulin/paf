@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-import json
 import os
 import re
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+
+from lastlib_swarm import json_codec as json
 
 MAX_RECENT_EVENTS = 80
 MAX_DETAIL_CHARS = 800
@@ -281,9 +282,7 @@ class ActivityStore:
         self.logs_dir.mkdir(parents=True, exist_ok=True)
         path = self.path(activity.run_id)
         temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-        temporary.write_text(
-            json.dumps(activity.as_dict(), indent=2, sort_keys=True), encoding="utf-8"
-        )
+        temporary.write_bytes(json.dumpb(activity.as_dict(), sort_keys=True))
         os.replace(temporary, path)
         self._cache[activity.run_id] = activity
 

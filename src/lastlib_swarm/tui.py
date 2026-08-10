@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import json
+from collections import deque
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from datetime import UTC, datetime
@@ -13,6 +13,7 @@ from textual.screen import Screen
 from textual.widgets import DataTable, Footer, Header, RichLog, Static, TabbedContent, TabPane
 from textual.worker import WorkerCancelled
 
+from lastlib_swarm import json_codec as json
 from lastlib_swarm.activity import AgentActivity, systemic_errors
 from lastlib_swarm.models import Chapter, Stage
 from lastlib_swarm.scheduler import Orchestrator
@@ -98,9 +99,7 @@ def activity_label(activity: AgentActivity | None, run: RunRecord | None) -> str
         return "awaiting events" if run.status == TaskStatus.RUNNING else "no activity summary"
     age = seconds_since(activity.updated_at)
     prefix = f"✗ {activity.failures}  " if activity.failures else ""
-    idle = (
-        f"  idle {format_duration(age)}" if run.status == TaskStatus.RUNNING and age >= 60 else ""
-    )
+    idle = f"  idle {int(age // 60)}m" if run.status == TaskStatus.RUNNING and age >= 60 else ""
     return f"{prefix}{activity.current}{idle}"
 
 
@@ -154,6 +153,11 @@ class AgentDetailScreen(Screen[None]):
         self.state = state
         self.chapter = chapter
         self._rendered_sequence = -1
+        self._static_cache: dict[str, str] = {}
+        self._raw_path: Path | None = None
+        self._raw_offset = 0
+        self._raw_pending = bytearray()
+        self._raw_lines: deque[str] = deque(maxlen=30)
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -178,7 +182,7 @@ class AgentDetailScreen(Screen[None]):
 
     def on_mount(self) -> None:
         self.refresh_agent()
-        self.set_interval(0.5, self.refresh_agent)
+        self.set_interval(1.0, self.refresh_agent)
 
     def action_close(self) -> None:
         self.app.pop_screen()
@@ -186,9 +190,7 @@ class AgentDetailScreen(Screen[None]):
     def refresh_agent(self) -> None:
         run = latest_run(self.state, self.chapter)
         if run is None:
-            self.query_one("#agent-heading", Static).update(
-                f"{self.chapter.id} — no agent run recorded"
-            )
+            self._update_static("#agent-heading", f"{self.chapter.id} — no agent run recorded")
             return
         activity = self.state.activities.get(run.id)
         elapsed = seconds_since(run.started_at)
@@ -198,12 +200,13 @@ class AgentDetailScreen(Screen[None]):
                     datetime.fromisoformat(run.finished_at) - datetime.fromisoformat(run.started_at)
                 ).total_seconds()
         last_event = format_duration(seconds_since(activity.updated_at)) if activity else "—"
-        self.query_one("#agent-heading", Static).update(
+        self._update_static(
+            "#agent-heading",
             f"{self.chapter.id} · {run.stage} round {run.round} · {run.status}\n"
-            f"{activity_label(activity, run)}"
+            f"{activity_label(activity, run)}",
         )
         thread = run.thread_id or "awaiting thread id"
-        self.query_one("#agent-state", Static).update(f"PROCESS\nPID {run.pid or '—'}\n{thread}")
+        self._update_static("#agent-state", f"PROCESS\nPID {run.pid or '—'}\n{thread}")
         if activity:
             done, total = activity.todo_progress
             work = (
@@ -212,29 +215,69 @@ class AgentDetailScreen(Screen[None]):
             )
         else:
             work = "WORK\nAwaiting compact events"
-        self.query_one("#agent-work", Static).update(work)
+        self._update_static("#agent-work", work)
         usage = format_count(run.usage.api_tokens) if run.usage.measured else "pending"
-        self.query_one("#agent-spend", Static).update(
+        self._update_static(
+            "#agent-spend",
             f"TIME / SPEND\nelapsed {format_duration(elapsed)} · last event {last_event}\n"
-            f"API-equivalent tokens {usage}"
+            f"API-equivalent tokens {usage}",
         )
         summary = (
             activity.latest_summary if activity and activity.latest_summary else "No update yet."
         )
-        self.query_one("#agent-summary", Static).update(f"LATEST AGENT UPDATE\n{summary}")
+        self._update_static("#agent-summary", f"LATEST AGENT UPDATE\n{summary}")
         error = activity.latest_error if activity else ""
-        self.query_one("#agent-error", Static).update(f"LATEST ERROR\n{error}" if error else "")
+        self._update_static("#agent-error", f"LATEST ERROR\n{error}" if error else "")
         path = Path(run.log_path) if run.log_path else self.state.logs_dir / f"{run.id}.jsonl"
-        self.query_one("#agent-path", Static).update(f"Raw JSONL: {path}")
+        self._update_static("#agent-path", f"Raw JSONL: {path}")
         if activity and activity.sequence != self._rendered_sequence:
             self._render_activity(activity)
             self._rendered_sequence = activity.sequence
         tabs = self.query_one("#agent-tabs", TabbedContent)
         if tabs.active == "raw-pane":
-            raw = self.query_one("#agent-raw", RichLog)
-            raw.clear()
-            for line in recent_raw_events(path):
-                raw.write(line)
+            self._refresh_raw_events(path)
+
+    def _update_static(self, selector: str, content: str) -> None:
+        if self._static_cache.get(selector) == content:
+            return
+        self._static_cache[selector] = content
+        self.query_one(selector, Static).update(content)
+
+    def _refresh_raw_events(self, path: Path) -> None:
+        if not path.is_file():
+            return
+        size = path.stat().st_size
+        reset = path != self._raw_path or size < self._raw_offset
+        if reset:
+            self._raw_path = path
+            self._raw_pending.clear()
+            self._raw_lines.clear()
+            self._raw_offset = max(0, size - 8 * 1024 * 1024)
+        if size == self._raw_offset:
+            return
+        with path.open("rb") as handle:
+            handle.seek(self._raw_offset)
+            data = handle.read()
+            self._raw_offset = handle.tell()
+        if reset and self._raw_offset - len(data) > 0:
+            _, _, data = data.partition(b"\n")
+        self._raw_pending.extend(data)
+        changed = False
+        while (newline := self._raw_pending.find(b"\n")) >= 0:
+            line = bytes(self._raw_pending[:newline])
+            del self._raw_pending[: newline + 1]
+            try:
+                value = json.loads(line)
+            except (ValueError, UnicodeDecodeError):
+                continue
+            self._raw_lines.append(json.dumps(_compact_json(value), sort_keys=True))
+            changed = True
+        if not changed:
+            return
+        raw = self.query_one("#agent-raw", RichLog)
+        raw.clear()
+        for line in self._raw_lines:
+            raw.write(line)
 
     def _render_activity(self, activity: AgentActivity) -> None:
         timeline = self.query_one("#agent-timeline", RichLog)
@@ -301,6 +344,8 @@ class SwarmApp(App[bool]):
         self.label = label
         self.result = False
         self._rows_added: set[str] = set()
+        self._row_cache: dict[str, tuple[str, ...]] = {}
+        self._static_cache: dict[str, str] = {}
         position = {
             book_id: index for index, book_id in enumerate(orchestrator.statement_schedule.order)
         }
@@ -331,7 +376,7 @@ class SwarmApp(App[bool]):
             table.add_column(stage.value.title(), key=stage.value)
         table.add_column("Current agent activity", key="activity")
         table.add_column("Tokens", key="tokens")
-        self.set_interval(0.5, self.refresh_dashboard)
+        self.set_interval(1.0, self.refresh_dashboard)
         self.run_worker(self.execute(), exclusive=True, group="pipeline")
 
     def action_inspect_agent(self) -> None:
@@ -400,10 +445,11 @@ class SwarmApp(App[bool]):
         )
         isolation = self.orchestrator.isolation.name
         critical = " → ".join(self.orchestrator.statement_schedule.critical_path) or "—"
-        self.query_one("#usage", Static).update(
+        self._update_static(
+            "#usage",
             f"{format_usage(usage)}    active stage records: {active}  concurrency cap: {maximum}\n"
             f"Statement critical path: {critical}    isolation: {isolation}  "
-            f"Lean MCP: {lean_mcp}    Codex access: {codex_access}"
+            f"Lean MCP: {lean_mcp}    Codex access: {codex_access}",
         )
         activities: list[AgentActivity] = []
         for chapter in self.chapters:
@@ -421,13 +467,14 @@ class SwarmApp(App[bool]):
         if systemic:
             count, message = systemic[0]
             alert = f"SYSTEMIC AGENT ALERT · {count} agents · {message}"
-        self.query_one("#alerts", Static).update(alert)
+        self._update_static("#alerts", alert)
         for stage in Stage:
             counts = stage_counts(self.state, stage)
-            self.query_one(f"#stage-{stage.value}", Static).update(
+            self._update_static(
+                f"#stage-{stage.value}",
                 f"[b]{stage.value.title()}[/b]\n"
                 f"▶ {counts['running']}  ✓ {counts['succeeded']}  "
-                f"✗ {counts['failed']}  · {counts['pending']}  ! {counts['blocked']}"
+                f"✗ {counts['failed']}  · {counts['pending']}  ! {counts['blocked']}",
             )
         table: DataTable[Any] = self.query_one("#tasks", DataTable)
         for chapter in self.chapters:
@@ -435,8 +482,10 @@ class SwarmApp(App[bool]):
             if chapter.id not in self._rows_added:
                 table.add_row(*values, key=chapter.id)
                 self._rows_added.add(chapter.id)
+                self._row_cache[chapter.id] = values
             else:
-                for column, value in zip(
+                previous = self._row_cache[chapter.id]
+                for column, old_value, value in zip(
                     (
                         "book",
                         "rank",
@@ -445,10 +494,19 @@ class SwarmApp(App[bool]):
                         "activity",
                         "tokens",
                     ),
+                    previous,
                     values,
                     strict=True,
                 ):
-                    table.update_cell(chapter.id, column, value)
+                    if old_value != value:
+                        table.update_cell(chapter.id, column, value)
+                self._row_cache[chapter.id] = values
+
+    def _update_static(self, selector: str, content: str) -> None:
+        if self._static_cache.get(selector) == content:
+            return
+        self._static_cache[selector] = content
+        self.query_one(selector, Static).update(content)
 
     def _row_values(self, chapter: Chapter) -> tuple[str, ...]:
         statuses = []

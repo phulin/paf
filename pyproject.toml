@@ -6,6 +6,7 @@ readme = "SWARM.md"
 requires-python = ">=3.12"
 dependencies = [
   "lean-lsp-mcp==0.29.0",
+  "orjson>=3.11.0",
   "textual>=6.0.0",
 ]
 
