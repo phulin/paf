@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
+from contextlib import suppress
 from typing import Any, ClassVar
 
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal
 from textual.widgets import DataTable, Footer, Header, Static
+from textual.worker import WorkerCancelled
 
 from lastlib_swarm.models import Chapter, Stage
 from lastlib_swarm.scheduler import Orchestrator
@@ -125,6 +127,16 @@ class SwarmApp(App[bool]):
         table.add_column("Tokens", key="tokens")
         self.set_interval(0.5, self.refresh_dashboard)
         self.run_worker(self.execute(), exclusive=True, group="pipeline")
+
+    async def action_quit(self) -> None:
+        """Cancel and drain the pipeline before closing the terminal app."""
+
+        self.orchestrator.control.stop()
+        self.query_one("#status", Static).update("Stopping workers and cleaning workspaces…")
+        workers = self.workers.cancel_group(self, "pipeline")
+        with suppress(WorkerCancelled):
+            await self.workers.wait_for_complete(workers)
+        self.exit(False)
 
     async def execute(self) -> None:
         error: Exception | None = None

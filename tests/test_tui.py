@@ -1,3 +1,4 @@
+import asyncio
 from pathlib import Path
 
 import pytest
@@ -43,3 +44,36 @@ async def test_dashboard_runs_an_operation_and_exits(tmp_path: Path) -> None:
     assert app.result
     assert "Lean MCP: on" in str(usage)
     assert "Codex access: full" in str(usage)
+
+
+@pytest.mark.asyncio
+async def test_quit_drains_pipeline_before_app_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    orchestrator = Orchestrator(config, StateStore(config))
+    started = asyncio.Event()
+    operation_cleaned = asyncio.Event()
+    shutdown_finished = asyncio.Event()
+    original_shutdown = orchestrator.shutdown
+
+    async def operation() -> bool:
+        started.set()
+        try:
+            await asyncio.Future()
+        finally:
+            operation_cleaned.set()
+        return False
+
+    async def shutdown() -> None:
+        await original_shutdown()
+        shutdown_finished.set()
+
+    monkeypatch.setattr(orchestrator, "shutdown", shutdown)
+    app = SwarmApp(orchestrator, operation, label="test")
+    async with app.run_test() as pilot:
+        await started.wait()
+        await pilot.press("q")
+
+    assert operation_cleaned.is_set()
+    assert shutdown_finished.is_set()

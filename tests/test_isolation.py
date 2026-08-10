@@ -33,6 +33,12 @@ async def test_fuse_overlay_rejects_out_of_scope_changes(tmp_path: Path) -> None
         allowed = workspace.root / "lean" / "Book" / "Chapter01.lean"
         allowed.parent.mkdir(parents=True)
         allowed.write_text("theorem allowed : True := by trivial\n", encoding="utf-8")
+        direct = workspace.root / "lean" / "Book" / "Chapter01" / "Section01.lean"
+        direct.parent.mkdir(parents=True)
+        direct.write_text("theorem direct : True := by trivial\n", encoding="utf-8")
+        nested = workspace.root / "lean" / "Book" / "Chapter01" / "Part" / "Section02.lean"
+        nested.parent.mkdir(parents=True)
+        nested.write_text("theorem nested : True := by trivial\n", encoding="utf-8")
         (workspace.root / "unexpected.txt").write_text("not allowed\n", encoding="utf-8")
 
         result = await workspace.collect(chapter)
@@ -44,6 +50,20 @@ async def test_fuse_overlay_rejects_out_of_scope_changes(tmp_path: Path) -> None
     assert result.out_of_scope_paths == ("unexpected.txt",)
     assert not (tmp_path / "lean" / "Book" / "Chapter01.lean").exists()
     assert not (tmp_path / "unexpected.txt").exists()
+
+
+@pytest.mark.asyncio
+async def test_fuse_overlay_reclaims_dead_orchestrator_roots(tmp_path: Path) -> None:
+    manager, _ = fuse_manager(write_project(tmp_path, chapters="chapters = [1]"))
+    stale = manager.parent / f"{manager.identity}-999999999"
+    (stale / "slots" / "0000-dead" / "merged").mkdir(parents=True)
+    (stale / "marker").write_text("stale\n", encoding="utf-8")
+
+    await manager.prepare()
+    try:
+        assert not stale.exists()
+    finally:
+        await manager.close()
 
 
 @pytest.mark.asyncio

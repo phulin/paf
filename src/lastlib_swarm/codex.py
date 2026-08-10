@@ -297,6 +297,7 @@ the final acceptance check, not as the interactive edit/check loop.
                 ),
                 "mcp_servers.lastlib_lean.default_tools_approval_mode": "auto",
                 "mcp_servers.lastlib_lean.enabled_tools": list(tools),
+                "mcp_servers.lastlib_lean.env.PATH": os.environ.get("PATH", ""),
                 "mcp_servers.lastlib_lean.env.LEAN_PROJECT_PATH": str(lean_project),
                 "mcp_servers.lastlib_lean.env.LEAN_LOG_LEVEL": "NONE",
                 "mcp_servers.lastlib_lean.env.PYTHONWARNINGS": "ignore",
@@ -341,7 +342,7 @@ the final acceptance check, not as the interactive edit/check loop.
 
         async def consume() -> None:
             nonlocal usage, report, thread_id
-            with log_path.open("wb") as log:
+            with log_path.open("wb", buffering=0) as log:
                 while line := await stdout.readline():
                     log.write(line)
                     try:

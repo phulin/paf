@@ -1,3 +1,6 @@
+import asyncio
+import json
+import os
 from dataclasses import replace
 from pathlib import Path
 
@@ -77,6 +80,7 @@ def test_executor_uses_machine_readable_codex_mode(tmp_path: Path) -> None:
     }
     assert overrides["mcp_servers.lastlib_lean.command"] == f'"{lean_mcp_executable()}"'
     assert overrides["mcp_servers.lastlib_lean.cwd"] == f'"{isolated / "lean"}"'
+    assert json.loads(overrides["mcp_servers.lastlib_lean.env.PATH"]) == os.environ.get("PATH", "")
     assert "lean_diagnostic_messages" in overrides["mcp_servers.lastlib_lean.enabled_tools"]
     assert "lean_multi_attempt" in overrides["mcp_servers.lastlib_lean.enabled_tools"]
     assert "lean_build" not in overrides["mcp_servers.lastlib_lean.enabled_tools"]
@@ -162,3 +166,40 @@ print(json.dumps({"type": "item.completed", "item": {
     assert result.thread_id == "thread-123"
     assert result.usage.api_tokens == 125
     assert result.report["summary"] == "done"
+
+
+@pytest.mark.asyncio
+async def test_executor_flushes_jsonl_while_agent_is_running(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    fake_codex = tmp_path / "slow-codex"
+    fake_codex.write_text(
+        """#!/usr/bin/env python3
+import json
+import sys
+import time
+
+sys.stdin.read()
+print(json.dumps({"type": "thread.started", "thread_id": "visible-now"}), flush=True)
+time.sleep(60)
+""",
+        encoding="utf-8",
+    )
+    fake_codex.chmod(0o755)
+    config = replace(config, settings=replace(config.settings, codex_bin=str(fake_codex)))
+    state = StateStore(config)
+    await state.load_or_create()
+    executor = CodexExecutor(config, state)
+    await executor.prepare()
+    run = await state.start_run(config.chapters[0].id, Stage.REVIEW)
+    task = asyncio.create_task(executor.run(config.chapters[0], Stage.REVIEW, run))
+    log_path = state.logs_dir / f"{run.id}.jsonl"
+    try:
+        for _ in range(100):
+            if log_path.is_file() and log_path.stat().st_size:
+                break
+            await asyncio.sleep(0.01)
+        assert "visible-now" in log_path.read_text(encoding="utf-8")
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task

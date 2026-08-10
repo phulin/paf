@@ -9,6 +9,7 @@ import stat
 import tempfile
 from contextlib import suppress
 from dataclasses import dataclass
+from functools import cache
 from pathlib import Path
 
 from lastlib_swarm.models import Chapter, SwarmSettings
@@ -90,8 +91,35 @@ def tree_manifest(root: Path, *, excluded: tuple[str, ...]) -> dict[str, FileFin
     return result
 
 
+@cache
+def _globstar_variants(pattern: str) -> tuple[str, ...]:
+    """Expand `**/` as either zero or one-or-more path components.
+
+    `fnmatch` treats `**` like an ordinary `*`, so its spelling with a
+    following slash accidentally requires at least one child directory. Git
+    and pathlib glob semantics allow zero directories as well.
+    """
+
+    variants = {pattern}
+    pending = [pattern]
+    while pending:
+        candidate = pending.pop()
+        start = 0
+        while (index := candidate.find("**/", start)) >= 0:
+            collapsed = candidate[:index] + candidate[index + 3 :]
+            if collapsed not in variants:
+                variants.add(collapsed)
+                pending.append(collapsed)
+            start = index + 3
+    return tuple(sorted(variants))
+
+
 def _matches_scope(relative: str, chapter: Chapter) -> bool:
-    return any(fnmatch.fnmatchcase(relative, pattern) for pattern in chapter.scope)
+    return any(
+        fnmatch.fnmatchcase(relative, variant)
+        for pattern in chapter.scope
+        for variant in _globstar_variants(pattern)
+    )
 
 
 def _is_cache_path(relative: str) -> bool:
@@ -213,12 +241,9 @@ class FuseOverlayIsolation:
 
     def __init__(self, settings: SwarmSettings) -> None:
         self.settings = settings
-        identity = hashlib.sha256(str(settings.state_dir).encode()).hexdigest()[:12]
-        self.root = (
-            Path(tempfile.gettempdir())
-            / f"lastlib-swarm-{os.getuid()}"
-            / f"{identity}-{os.getpid()}"
-        )
+        self.identity = hashlib.sha256(str(settings.state_dir).encode()).hexdigest()[:12]
+        self.parent = Path(tempfile.gettempdir()) / f"lastlib-swarm-{os.getuid()}"
+        self.root = self.parent / f"{self.identity}-{os.getpid()}"
         self.generations = self.root / "source-generations"
         self.cache_generations = self.root / "cache-generations"
         self.slots = self.root / "slots"
@@ -249,9 +274,32 @@ class FuseOverlayIsolation:
             raise ValueError(
                 "fuse-overlay isolation requires fuse-overlayfs, fusermount3, rsync, and /dev/fuse"
             )
+        await self._clean_stale_roots()
         self.generations.mkdir(parents=True, exist_ok=True)
         self.cache_generations.mkdir(parents=True, exist_ok=True)
         self.slots.mkdir(parents=True, exist_ok=True)
+
+    async def _clean_stale_roots(self) -> None:
+        """Reclaim mounts left by dead orchestrators for this state directory."""
+
+        if not self.parent.exists():
+            return
+        for stale in self.parent.glob(f"{self.identity}-*"):
+            if stale == self.root:
+                continue
+            try:
+                pid = int(stale.name.rsplit("-", 1)[1])
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                pass
+            except (PermissionError, ValueError):
+                continue
+            else:
+                continue
+            for merged in stale.glob("slots/*/merged"):
+                if os.path.ismount(merged):
+                    await self._run("fusermount3", "-u", str(merged))
+            shutil.rmtree(stale)
 
     async def _run(self, *command: str) -> None:
         process = await asyncio.create_subprocess_exec(
