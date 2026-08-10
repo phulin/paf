@@ -9,6 +9,21 @@ normalizations, mathematical strength, and source/import order. Verify that each
 provable from earlier material and canonical pinned APIs. Reconcile provisional dependency guesses
 with real earlier interfaces when available.
 
+Also perform a proof-readiness audit, not only a source-coverage audit. For every principal result,
+read the informal proof or proof sketch, locate the exact earlier project and Mathlib APIs, and trace
+a plausible proof dependency route. Add every genuine intermediate declaration that route requires
+when it is missing, even if the prose treats it as obvious or mentions it only inside a proof. Check
+especially for basic `↔` lemmas and equivalences between book-facing and canonical Lean
+formulations; constructor/eliminator and extensionality facts; membership, coercion, map,
+restriction, and normalization lemmas; closure and functoriality results; and short bridges between
+successive proof steps. Do not leave every proof agent to recreate a missing chapter API locally.
+
+Search for a canonical theorem first. A new proof-support lemma must provide a genuinely missing or
+materially more usable interface, use the weakest natural assumptions, occur before its users, and
+be independently provable from earlier declarations. Reject helpers that restate the target, assume
+its conclusion, depend on later results, or otherwise conceal circularity. Preserve accurate support
+lemmas merely omitted from the informal exposition.
+
 Add missing substantive assertions and make the smallest principled correction to anything
 inaccurate, circular, vacuous, or unprovable. Do not weaken correct mathematics merely because its
 proof is difficult. Existing proof placeholders may remain. Never add the conclusion as a hypothesis,

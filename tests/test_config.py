@@ -160,6 +160,16 @@ def test_standard_proof_prompt_uses_whole_file_then_failed_proof_loop() -> None:
     assert whole_pass < diagnostics < failed_proofs
 
 
+def test_statement_prompts_require_proof_support_interfaces() -> None:
+    for stage in (Stage.FORMALIZE, Stage.REVIEW):
+        prompt = standard_prompt_path(stage).read_text(encoding="utf-8")
+        normalized = " ".join(prompt.split())
+        assert "proof-readiness" in prompt or "proof dependency route" in prompt
+        assert "basic `↔` lemmas and equivalences" in prompt
+        assert "weakest natural assumptions" in normalized
+        assert "circular" in prompt
+
+
 def test_infers_multiple_books_and_chained_mermaid_dependencies(tmp_path: Path) -> None:
     (tmp_path / ".git").mkdir()
     books = tmp_path / "books"

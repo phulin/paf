@@ -14,6 +14,23 @@ This is a statement pass, not a proof pass. Proofs may use `by sorry`; definitio
 bodies whenever the canonical construction is clear. Every declaration type must expose the exact
 informal mathematics so later proof agents do not have to redesign the API.
 
+Source coverage alone is not sufficient. Read the informal proofs and proof sketches and outline a
+plausible proof dependency route for every principal result. Include every genuine intermediate
+lemma that route needs and that is not already available from earlier project modules or pinned
+Mathlib, even when the source calls it obvious, uses it only inside a proof, or silently switches
+between equivalent formulations. In particular, look for basic `↔` lemmas and equivalences between
+book-facing and canonical Lean formulations; constructor/eliminator and extensionality facts;
+membership, coercion, map, restriction, and normalization lemmas; closure and functoriality facts;
+and short bridges between adjacent proof steps.
+
+Search for canonical declarations before adding proof support. When the existing interface is
+adequate, use it directly; otherwise add a meaningful chapter-facing bridge with the weakest natural
+assumptions and place it before its first user. Such lemmas may contain `by sorry` in this pass, but
+must themselves be accurate and provable from earlier material. Do not introduce a helper that
+merely restates its target, assumes the target's conclusion, depends on a later declaration, or hides
+circularity. Keep elaboration-only scaffolding private, but expose reusable equivalences and bridges
+that downstream chapter proofs need.
+
 Before inventing an interface, search pinned Mathlib and already-established project modules. Reuse
 canonical definitions. Match all finiteness, separation, completeness, characteristic, normalization,
 and typeclass assumptions precisely. Never use `True`, contradictory hypotheses, axioms, unsafe code,
