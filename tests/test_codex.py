@@ -206,6 +206,10 @@ def test_rendered_prompts_compose_each_layer_once(tmp_path: Path, stage: Stage) 
     assert prompt.count("## Common Lean policy") == 1
     assert prompt.count("## Runtime contract") == 1
     assert prompt.count("import Mathlib") == 1
+    assert "This is a hard write boundary: edit only the paths listed above" in prompt
+    assert "do not edit `.swarm`, `SWARM.md`" in prompt
+    assert "do not edit" in prompt and "prompts" in prompt and "tests" in prompt
+    assert "Any out-of-scope write causes the coordinator to reject the entire attempt" in prompt
     assert prompt.count("Do not run `lake build`") == 1
     assert "Whenever you switch from one Lean file to another" in prompt
     assert "whole-file diagnostic call for the destination" in prompt

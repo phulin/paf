@@ -323,8 +323,15 @@ class CodexExecutor:
 Your exclusive edit scope is:
 {scope}
 
-Do not edit orchestration state under `.swarm`, do not commit, and do not wait for another worker.
-When isolation is enabled, all out-of-scope changes are rejected rather than merged.
+This is a hard write boundary: edit only the paths listed above. You may read files elsewhere for
+context, but do not create, modify, move, delete, format, or otherwise write any path outside this
+scope. In particular, do not edit `.swarm`, `SWARM.md`, repository-level documentation, prompts,
+scripts, orchestration code, configuration, or tests, even if changing them seems useful for this
+task. Do not fix tooling or infrastructure problems yourself; report them in `issues` and continue
+with work that stays inside your scope. Before every edit, verify that its target matches one of the
+listed scope paths. Any out-of-scope write causes the coordinator to reject the entire attempt.
+
+Do not commit and do not wait for another worker.
 Do not run `lake build`, `lake env lean`, raw `lean`, or another compiler command. Builds belong to
 the coordinator: after you exit, it merges accepted scoped changes into the main worktree and
 serially runs the configured build there against the single writable build cache. That validation
