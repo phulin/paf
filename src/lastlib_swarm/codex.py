@@ -6,6 +6,7 @@ import json
 import os
 import re
 import signal
+from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -284,18 +285,13 @@ orchestrator independently checks scoped file hashes, placeholders, and `{chapte
                 exit_code = await process.wait()
         except TimeoutError:
             timed_out = True
-            os.killpg(process.pid, signal.SIGTERM)
-            try:
-                async with asyncio.timeout(10):
-                    await process.wait()
-            except TimeoutError:
-                os.killpg(process.pid, signal.SIGKILL)
-                await process.wait()
+            await _terminate(process)
             exit_code = 124
         except asyncio.CancelledError:
-            os.killpg(process.pid, signal.SIGTERM)
-            await process.wait()
+            await _terminate(process)
             consumer.cancel()
+            with suppress(asyncio.CancelledError):
+                await consumer
             raise
         await consumer
         changed = before != scope_digest(self.config.settings.repo, chapter)
@@ -342,10 +338,24 @@ async def validate(config: PipelineConfig, chapter: Chapter) -> ValidationResult
         exit_code = process.returncode or 0
         timed_out = False
     except TimeoutError:
-        os.killpg(process.pid, signal.SIGTERM)
-        await process.wait()
+        await _terminate(process)
         output_bytes = b"validation timed out"
         exit_code = 124
         timed_out = True
+    except asyncio.CancelledError:
+        await _terminate(process)
+        raise
     output = output_bytes.decode(errors="replace")[-20000:]
     return ValidationResult(exit_code == 0, exit_code, output, timed_out)
+
+
+async def _terminate(process: asyncio.subprocess.Process) -> None:
+    with suppress(ProcessLookupError):
+        os.killpg(process.pid, signal.SIGTERM)
+    try:
+        async with asyncio.timeout(10):
+            await process.wait()
+    except TimeoutError:
+        with suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGKILL)
+        await process.wait()

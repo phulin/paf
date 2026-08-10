@@ -144,7 +144,7 @@ class Orchestrator:
             chapter.id,
             Stage.REPAIR,
             TaskStatus.RUNNING,
-            f"statement repair {next_round}/{maximum}",
+            f"statement repair attempt {next_round} (run cap {maximum})",
         )
         attempt = await self._attempt(chapter, Stage.REPAIR, feedback=feedback)
         status = TaskStatus.SUCCEEDED if attempt.agent.succeeded else TaskStatus.FAILED
