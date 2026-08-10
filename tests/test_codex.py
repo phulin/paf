@@ -10,6 +10,7 @@ from lastlib_swarm.codex import (
     CodexExecutor,
     count_placeholders,
     lean_mcp_executable,
+    lean_mcp_path,
     render_prompt,
 )
 from lastlib_swarm.config import load_config
@@ -80,13 +81,25 @@ def test_executor_uses_machine_readable_codex_mode(tmp_path: Path) -> None:
     }
     assert overrides["mcp_servers.lastlib_lean.command"] == f'"{lean_mcp_executable()}"'
     assert overrides["mcp_servers.lastlib_lean.cwd"] == f'"{isolated / "lean"}"'
-    assert json.loads(overrides["mcp_servers.lastlib_lean.env.PATH"]) == os.environ.get("PATH", "")
+    assert json.loads(overrides["mcp_servers.lastlib_lean.env.PATH"]) == lean_mcp_path()
     assert "lean_diagnostic_messages" in overrides["mcp_servers.lastlib_lean.enabled_tools"]
     assert "lean_multi_attempt" in overrides["mcp_servers.lastlib_lean.enabled_tools"]
     assert "lean_build" not in overrides["mcp_servers.lastlib_lean.enabled_tools"]
     assert render_prompt(
         "Chapter {chapter_number_padded}: {chapter_title}", config.chapters[0]
     ) == ("Chapter 01: First chapter")
+
+
+def test_lean_mcp_path_finds_elan_outside_inherited_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    elan_bin = tmp_path / "elan" / "bin"
+    elan_bin.mkdir(parents=True)
+    (elan_bin / "lake").touch()
+    monkeypatch.setenv("ELAN_HOME", str(tmp_path / "elan"))
+    monkeypatch.setenv("PATH", "/usr/bin")
+
+    assert lean_mcp_path().split(os.pathsep)[0] == str(elan_bin)
 
 
 def test_approve_for_me_is_not_combined_with_explicit_sandbox(tmp_path: Path) -> None:
@@ -166,6 +179,10 @@ print(json.dumps({"type": "item.completed", "item": {
     assert result.thread_id == "thread-123"
     assert result.usage.api_tokens == 125
     assert result.report["summary"] == "done"
+    activity = state.activities.get(run.id)
+    assert activity is not None
+    assert activity.current == "agent succeeded"
+    assert activity.latest_summary == "done"
 
 
 @pytest.mark.asyncio

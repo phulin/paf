@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import signal
 import sys
 from contextlib import suppress
@@ -51,6 +52,20 @@ def lean_mcp_executable() -> Path:
     """Return the console script installed beside this package's Python interpreter."""
 
     return Path(sys.executable).with_name("lean-lsp-mcp")
+
+
+def lean_mcp_path() -> str:
+    """Include elan even when the orchestrator was launched outside a login shell."""
+
+    current = os.environ.get("PATH", "").split(os.pathsep)
+    candidates = [lean_mcp_executable().parent]
+    if elan_home := os.environ.get("ELAN_HOME"):
+        candidates.append(Path(elan_home) / "bin")
+    candidates.append(Path.home() / ".elan" / "bin")
+    if lake := shutil.which("lake"):
+        candidates.append(Path(lake).parent)
+    prefixes = [str(path) for path in candidates if (path / "lake").is_file()]
+    return os.pathsep.join(dict.fromkeys([*prefixes, *current]))
 
 
 @dataclass(frozen=True)
@@ -297,7 +312,7 @@ the final acceptance check, not as the interactive edit/check loop.
                 ),
                 "mcp_servers.lastlib_lean.default_tools_approval_mode": "auto",
                 "mcp_servers.lastlib_lean.enabled_tools": list(tools),
-                "mcp_servers.lastlib_lean.env.PATH": os.environ.get("PATH", ""),
+                "mcp_servers.lastlib_lean.env.PATH": lean_mcp_path(),
                 "mcp_servers.lastlib_lean.env.LEAN_PROJECT_PATH": str(lean_project),
                 "mcp_servers.lastlib_lean.env.LEAN_LOG_LEVEL": "NONE",
                 "mcp_servers.lastlib_lean.env.PYTHONWARNINGS": "ignore",
@@ -339,6 +354,7 @@ the final acceptance check, not as the interactive edit/check loop.
         usage = TokenUsage()
         report: dict[str, Any] = {}
         thread_id: str | None = None
+        activity = self.state.activities.start(run.id, chapter.id, stage.value)
 
         async def consume() -> None:
             nonlocal usage, report, thread_id
@@ -351,6 +367,8 @@ the final acceptance check, not as the interactive edit/check loop.
                         event = json.loads(line)
                     except (json.JSONDecodeError, UnicodeDecodeError):
                         return
+                    activity.consume(event, workspace_root=root)
+                    self.state.activities.save(activity)
                     if found := _find_thread_id(event):
                         thread_id = found
                         await self.state.update_run(run, thread_id=found)
@@ -396,6 +414,8 @@ the final acceptance check, not as the interactive edit/check loop.
         if exit_code == 0 and not report:
             error = "Codex returned no structured final report"
         succeeded = exit_code == 0 and bool(report)
+        activity.finish("succeeded" if succeeded else "failed", error)
+        self.state.activities.save(activity)
         await self.state.finish_run(
             run,
             status=TaskStatus.SUCCEEDED if succeeded else TaskStatus.FAILED,

@@ -9,6 +9,7 @@ from enum import StrEnum
 from typing import Any
 from uuid import uuid4
 
+from lastlib_swarm.activity import ActivityStore
 from lastlib_swarm.models import Chapter, PipelineConfig, Stage
 
 
@@ -124,6 +125,7 @@ class StateStore:
         self.config = config
         self.path = config.settings.state_dir / "state.json"
         self.logs_dir = config.settings.state_dir / "logs"
+        self.activities = ActivityStore(self.logs_dir)
         self._lock = asyncio.Lock()
         self.tasks: dict[str, TaskRecord] = {}
         self.scheduling: dict[str, Any] = {}
