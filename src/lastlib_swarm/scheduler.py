@@ -34,6 +34,36 @@ class Attempt:
         return "\n\n".join(parts)
 
 
+class RunControl:
+    """Cooperative pause/stop control checked between chapter attempts."""
+
+    def __init__(self) -> None:
+        self._gate = asyncio.Event()
+        self._gate.set()
+        self.paused = False
+        self.stopping = False
+
+    async def checkpoint(self) -> None:
+        await self._gate.wait()
+        if self.stopping:
+            raise asyncio.CancelledError
+
+    def pause(self) -> None:
+        if not self.stopping:
+            self.paused = True
+            self._gate.clear()
+
+    def resume(self) -> None:
+        if not self.stopping:
+            self.paused = False
+            self._gate.set()
+
+    def stop(self) -> None:
+        self.stopping = True
+        self.paused = False
+        self._gate.set()
+
+
 class Orchestrator:
     def __init__(
         self,
@@ -42,11 +72,13 @@ class Orchestrator:
         *,
         chapters: Iterable[Chapter] | None = None,
         force: bool = False,
+        control: RunControl | None = None,
     ) -> None:
         self.config = config
         self.state = state
         self.chapters = tuple(chapters if chapters is not None else config.chapters)
         self.force = force
+        self.control = control or RunControl()
         self.executor = CodexExecutor(config, state)
         self.agent_slots = asyncio.Semaphore(config.settings.max_agents)
 
@@ -64,7 +96,9 @@ class Orchestrator:
         *,
         feedback: str = "",
     ) -> Attempt:
+        await self.control.checkpoint()
         async with self.agent_slots:
+            await self.control.checkpoint()
             run = await self.state.start_run(chapter.id, stage)
             agent = await self.executor.run(chapter, stage, run, feedback=feedback)
             validation = await validate(self.config, chapter)

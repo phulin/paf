@@ -21,39 +21,44 @@ after the selected corpus finishes statement review, then runs chapter-by-chapte
 
 ## Quick start
 
-The project is managed with [uv](https://docs.astral.sh/uv/):
+The project is managed with [uv](https://docs.astral.sh/uv/). A config file is optional: pass one
+informal book Markdown file and LastLib Swarm infers its title, numbered chapters, existing matching
+Lean book module, validation commands, and isolated state directory.
 
 ```console
 uv sync --all-groups
-cp swarm.example.toml swarm.toml
-uv run lastlib-swarm plan --config swarm.toml
-uv run lastlib-swarm pipeline --config swarm.toml
+uv run lastlib-swarm plan books/02-finite-extensions-of-local-fields.md
+uv run lastlib-swarm books/02-finite-extensions-of-local-fields.md
 ```
 
-The checked-in example discovers Book 2's twelve chapter headings and maps them to the existing
-LastLib module layout. It reuses `FORMALIZATION_PROMPT.md` for the statement pass and uses the generic
-review/prove/repair prompts under `swarm/prompts/`. Any stage may point at a specialized template;
-supported replacement fields include `{book_title}`, `{chapter_number}`, `{chapter_number_padded}`,
-`{chapter_title}`, `{source}`, `{lean_root}`, `{chapter_path}`, `{chapter_module}`, and
-`{build_command}`.
+Passing a `.md` as the first argument is shorthand for `pipeline <target>`. Zero-config runs default
+to `gpt-5.6-luna`, reasoning effort `max`, the packaged generic prompt library under
+`src/lastlib_swarm/prompts/`, and a state directory at `.swarm/<inferred-book-id>/`. Use
+`swarm.example.toml` when the inferred layout is not appropriate or when coordinating multiple books.
+
+Any stage may point at a specialized prompt template. Supported replacement fields include
+`{book_title}`, `{chapter_number}`, `{chapter_number_padded}`, `{chapter_title}`, `{source}`,
+`{lean_root}`, `{chapter_path}`, `{chapter_module}`, and `{build_command}`.
 
 Codex is invoked in its documented noninteractive JSONL mode with a strict final-report schema. The
 default uses the `workspace-write` sandbox and automatic approval review. The much less safe
 `bypass_approvals_and_sandbox = true` must be explicitly configured; it is never inferred from the
-selected agent count. See the official [Codex CLI command reference](https://developers.openai.com/codex/cli/reference).
+selected agent count. See OpenAI's official
+[Codex non-interactive guidance](https://developers.openai.com/codex/noninteractive).
 
 ## Commands
 
 Inspect discovery and configuration without launching agents:
 
 ```console
+uv run lastlib-swarm plan books/02-finite-extensions-of-local-fields.md
 uv run lastlib-swarm plan --config swarm.toml
 ```
 
 Run an individual stage over the whole configured corpus or a selection:
 
 ```console
-uv run lastlib-swarm stage formalize --config swarm.toml
+uv run lastlib-swarm stage formalize books/02-finite-extensions-of-local-fields.md
 uv run lastlib-swarm stage review --config swarm.toml --book book02
 uv run lastlib-swarm stage prove --config swarm.toml --book book02 --chapter 3
 uv run lastlib-swarm stage repair --config swarm.toml --chapter book02/chapter-03
@@ -62,7 +67,7 @@ uv run lastlib-swarm stage repair --config swarm.toml --chapter book02/chapter-0
 Run the complete pipeline:
 
 ```console
-uv run lastlib-swarm pipeline --config swarm.toml
+uv run lastlib-swarm pipeline books/02-finite-extensions-of-local-fields.md
 ```
 
 The TUI is the default for stage and pipeline runs. Add `--no-tui` for CI, a process supervisor, or
@@ -72,12 +77,50 @@ successful stages are resumable and skipped.
 Inspect durable status without starting or mutating a run:
 
 ```console
-uv run lastlib-swarm status --config swarm.toml
+uv run lastlib-swarm status books/02-finite-extensions-of-local-fields.md
 uv run lastlib-swarm status --config swarm.toml --json
 ```
 
 `--chapter N` selects that chapter number in every selected book. Use the full chapter id when a
 number would be ambiguous.
+
+CLI overrides such as `--model`, `--reasoning-effort`, and `--max-agents` work with both inferred and
+configured runs.
+
+## Agent-managed background mode
+
+Managing agents do not need to hold open a TUI or manipulate a background process's stdin. Start a
+detached pipeline, then issue one-shot Bash commands over its Unix control socket:
+
+```console
+TARGET=books/02-finite-extensions-of-local-fields.md
+uv run lastlib-swarm agent start "$TARGET"
+uv run lastlib-swarm agent status "$TARGET"
+uv run lastlib-swarm agent pause "$TARGET"
+uv run lastlib-swarm agent resume "$TARGET"
+uv run lastlib-swarm agent snapshot "$TARGET"
+uv run lastlib-swarm agent wait "$TARGET"
+```
+
+Every command prints one JSON object. `wait` blocks until completion and exits with the pipeline's
+success/failure code. `snapshot` includes the complete persisted task/run state; `status` is compact.
+Use `agent stop` to cancel the scheduler and terminate active Codex/build subprocess groups.
+
+Pause is cooperative: already-running chapter attempts finish, while new agent/build attempts wait at
+a checkpoint. This preserves coherent edits and build results. Resume releases all queued work.
+
+For a long-lived managing agent, the `rpc` facade accepts newline-delimited JSON commands on stdin and
+returns one JSON response per line:
+
+```console
+printf '%s\n' '{"command":"status"}' '{"command":"snapshot"}' \
+  | uv run lastlib-swarm agent rpc "$TARGET"
+```
+
+Accepted RPC commands are `status`, `snapshot`, `pause`, `resume`, `stop`, and `wait`. The daemon
+stores its socket, PID, JSON result, and combined stdout/stderr log under the inferred state directory.
+After the daemon exits, `status`, `snapshot`, and `wait` fall back to the persisted offline result.
+`agent serve` exposes the same protocol in the foreground for an external process supervisor.
 
 ## Fixed-point semantics
 
@@ -115,10 +158,11 @@ billing arrangements are deliberately outside the state model.
 
 ## State, logs, and interruption
 
-State defaults to `.swarm/state.json`, with raw JSONL agent logs in `.swarm/logs/` and the generated
-final-report schema alongside them. Each run records its PID, Codex thread id when emitted, stage,
-round, timestamps, scoped-change result, placeholder count, final report, validation tail, and usage.
-Writes are atomic.
+Configured state defaults to `.swarm/state.json`; inferred single-target state uses
+`.swarm/<book-id>/state.json`. Raw JSONL agent logs live below `logs/`, with the generated final-report
+schema alongside them. Each run records its PID, Codex thread id when emitted, stage, round,
+timestamps, scoped-change result, placeholder count, final report, validation tail, and usage. Writes
+are atomic.
 
 Press `q` in the TUI or interrupt a headless run to terminate the active child process group. On the
 next invocation, interrupted `running` records become `pending` and can resume. Successful records
@@ -130,7 +174,9 @@ large Lean builds within `max_agents` rather than creating an unbounded second s
 
 ## Configuration
 
-Top-level settings:
+No configuration is required for a conventional numbered LastLib Markdown book. If `swarm.toml`
+exists and no target or `--config` is supplied, it is loaded automatically. Explicit top-level
+settings override these defaults:
 
 ```toml
 [swarm]
@@ -146,11 +192,12 @@ agent_timeout_seconds = 7200
 validation_timeout_seconds = 1800
 ```
 
-Every stage needs a prompt and may set its own retry bound:
+Every stage automatically uses its packaged standard prompt and default retry bound. A stage table
+may override either setting independently:
 
 ```toml
 [stages.review]
-prompt = "swarm/prompts/review.md"
+prompt = "my-prompts/strict-review.md"
 max_rounds = 6
 ```
 

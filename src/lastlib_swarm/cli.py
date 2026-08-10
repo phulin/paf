@@ -3,27 +3,53 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-from collections.abc import Awaitable, Callable, Sequence
+import subprocess
+import sys
+import time
+from collections.abc import Awaitable, Callable, Coroutine, Sequence
+from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
 from rich.console import Console
 from rich.table import Table
 
-from lastlib_swarm.config import load_config
+from lastlib_swarm.config import resolve_config
+from lastlib_swarm.control import (
+    LOG_NAME,
+    ControlServer,
+    control_socket,
+    offline_status,
+    send_command,
+)
 from lastlib_swarm.models import Chapter, PipelineConfig, Stage
 from lastlib_swarm.scheduler import Orchestrator
 from lastlib_swarm.state import StateStore, TaskStatus
 from lastlib_swarm.tui import format_usage, run_tui
 
 
-def _add_config(parser: argparse.ArgumentParser) -> None:
+def _add_source(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
-        "--config", default="swarm.toml", help="pipeline TOML (default: swarm.toml)"
+        "target",
+        nargs="?",
+        help="informal book Markdown file; inferred when --config is omitted",
+    )
+    parser.add_argument(
+        "--config",
+        default=None,
+        help="optional pipeline TOML; defaults to target inference or ./swarm.toml",
     )
 
 
+def _add_overrides(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--model", help="override the configured Codex model")
+    parser.add_argument("--reasoning-effort", help="override the configured reasoning effort")
+    parser.add_argument("--max-agents", type=int, help="override the concurrency cap")
+
+
 def _add_run_options(parser: argparse.ArgumentParser) -> None:
-    _add_config(parser)
+    _add_source(parser)
+    _add_overrides(parser)
     parser.add_argument(
         "--book", action="append", default=[], help="book id; repeat to select several"
     )
@@ -41,14 +67,15 @@ def _add_run_options(parser: argparse.ArgumentParser) -> None:
 
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(prog="lastlib-swarm", description=__doc__)
-    root.add_argument("--version", action="version", version="lastlib-swarm 0.1.0")
+    root.add_argument("--version", action="version", version="lastlib-swarm 0.2.0")
     commands = root.add_subparsers(dest="command", required=True)
 
     plan = commands.add_parser("plan", help="show discovered books, chapters, and stage settings")
-    _add_config(plan)
+    _add_source(plan)
+    _add_overrides(plan)
 
     status = commands.add_parser("status", help="show persisted pipeline state and token usage")
-    _add_config(status)
+    _add_source(status)
     status.add_argument("--json", action="store_true", help="print the raw persisted state")
 
     stage = commands.add_parser("stage", help="run one stage across selected chapters")
@@ -59,7 +86,54 @@ def parser() -> argparse.ArgumentParser:
         "pipeline", help="run the full formalize/review/prove/repair flow"
     )
     _add_run_options(pipeline)
+
+    agent = commands.add_parser("agent", help="machine-friendly background pipeline control")
+    agent_commands = agent.add_subparsers(dest="agent_command", required=True)
+    for name, help_text in (
+        ("start", "start a detached managed pipeline"),
+        ("serve", "run the managed pipeline server in the foreground"),
+    ):
+        command = agent_commands.add_parser(name, help=help_text)
+        _add_source(command)
+        _add_overrides(command)
+        command.add_argument(
+            "--stage",
+            choices=["pipeline", *(stage.value for stage in Stage)],
+            default="pipeline",
+            help="managed operation (default: pipeline)",
+        )
+        command.add_argument("--force", action="store_true")
+    for name, help_text in (
+        ("status", "return a compact JSON status"),
+        ("snapshot", "return status plus the complete persisted state"),
+        ("pause", "pause before new chapter attempts"),
+        ("resume", "release paused chapter attempts"),
+        ("stop", "cancel the pipeline and active subprocesses"),
+        ("wait", "block until the managed pipeline exits"),
+    ):
+        command = agent_commands.add_parser(name, help=help_text)
+        _add_source(command)
+    rpc = agent_commands.add_parser("rpc", help="read control commands as JSONL from stdin")
+    _add_source(rpc)
     return root
+
+
+def _config_from_args(args: argparse.Namespace) -> PipelineConfig:
+    config = resolve_config(config=args.config, target=args.target)
+    model = getattr(args, "model", None)
+    reasoning_effort = getattr(args, "reasoning_effort", None)
+    max_agents = getattr(args, "max_agents", None)
+    if max_agents is not None and max_agents < 1:
+        raise ValueError("--max-agents must be positive")
+    if model is not None or reasoning_effort is not None or max_agents is not None:
+        settings = replace(
+            config.settings,
+            model=model or config.settings.model,
+            reasoning_effort=reasoning_effort or config.settings.reasoning_effort,
+            max_agents=max_agents or config.settings.max_agents,
+        )
+        config = replace(config, settings=settings)
+    return config
 
 
 def select_chapters(
@@ -95,6 +169,10 @@ def print_plan(config: PipelineConfig, console: Console) -> None:
     console.print(
         f"[bold]Concurrency:[/bold] {config.settings.max_agents} agents/builds  "
         f"[bold]State:[/bold] {config.settings.state_dir}"
+    )
+    console.print(
+        f"[bold]Model:[/bold] {config.settings.model}  "
+        f"[bold]Reasoning:[/bold] {config.settings.reasoning_effort}"
     )
     stages = Table(title="Stages")
     stages.add_column("Stage")
@@ -197,11 +275,173 @@ def _run(args: argparse.Namespace, config: PipelineConfig, console: Console) -> 
     return 0 if succeeded else 1
 
 
+def _managed_operation(
+    orchestrator: Orchestrator, stage_name: str
+) -> Callable[[], Coroutine[Any, Any, bool]]:
+    if stage_name == "pipeline":
+        return orchestrator.run_pipeline
+    stage = Stage(stage_name)
+
+    async def operation() -> bool:
+        return await orchestrator.run_stage(stage)
+
+    return operation
+
+
+def _serve_agent(args: argparse.Namespace, config: PipelineConfig) -> int:
+    chapters = select_chapters(config, books=[], chapter_selectors=[])
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state, chapters=chapters, force=args.force)
+    operation = _managed_operation(orchestrator, args.stage)
+    succeeded = asyncio.run(ControlServer(orchestrator, operation).run())
+    return 0 if succeeded else 1
+
+
+def _agent_source_args(args: argparse.Namespace) -> list[str]:
+    if args.config is not None:
+        values = ["--config", str(Path(args.config).resolve())]
+    elif args.target is not None:
+        values = [str(Path(args.target).resolve())]
+    else:
+        values = []
+    if args.model is not None:
+        values.extend(["--model", args.model])
+    if args.reasoning_effort is not None:
+        values.extend(["--reasoning-effort", args.reasoning_effort])
+    if args.max_agents is not None:
+        values.extend(["--max-agents", str(args.max_agents)])
+    return values
+
+
+def _start_agent(args: argparse.Namespace, config: PipelineConfig) -> int:
+    state_dir = config.settings.state_dir
+    try:
+        running = send_command(state_dir, "status", timeout=0.5)
+    except OSError:
+        running = None
+    if running is not None:
+        raise ValueError(f"a managed pipeline is already {running.get('status')}: {state_dir}")
+    state_dir.mkdir(parents=True, exist_ok=True)
+    command = [
+        sys.executable,
+        "-m",
+        "lastlib_swarm.cli",
+        "agent",
+        "serve",
+        *_agent_source_args(args),
+        "--stage",
+        args.stage,
+    ]
+    if args.force:
+        command.append("--force")
+    log_path = state_dir / LOG_NAME
+    log_handle = log_path.open("ab")
+    try:
+        process = subprocess.Popen(
+            command,
+            cwd=config.settings.repo,
+            stdin=subprocess.DEVNULL,
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+            close_fds=True,
+        )
+    finally:
+        log_handle.close()
+    deadline = time.monotonic() + 10
+    response: dict[str, object] | None = None
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            completed = offline_status(state_dir)
+            if completed.get("status") in {"completed", "failed"}:
+                completed["log_path"] = str(log_path)
+                print(json.dumps(completed, sort_keys=True))
+                return 0 if completed.get("result") else 1
+            raise ValueError(f"managed pipeline exited during startup; inspect {log_path}")
+        if control_socket(state_dir).exists():
+            try:
+                response = send_command(state_dir, "status", timeout=0.5)
+                break
+            except OSError:
+                pass
+        time.sleep(0.05)
+    if response is None:
+        process.terminate()
+        raise ValueError(f"managed pipeline did not become ready; inspect {log_path}")
+    response["log_path"] = str(log_path)
+    print(json.dumps(response, sort_keys=True))
+    return 0
+
+
+def _offline_snapshot(config: PipelineConfig) -> dict[str, object]:
+    response = offline_status(config.settings.state_dir)
+    state_path = config.settings.state_dir / "state.json"
+    if state_path.is_file():
+        value = json.loads(state_path.read_text(encoding="utf-8"))
+        if isinstance(value, dict):
+            response["snapshot"] = value
+    return response
+
+
+def _control_response(command: str, config: PipelineConfig) -> dict[str, object]:
+    timeout = None if command == "wait" else 10.0
+    try:
+        response = send_command(config.settings.state_dir, command, timeout=timeout)
+    except OSError:
+        if command == "snapshot":
+            response = _offline_snapshot(config)
+        elif command in {"status", "wait"}:
+            response = offline_status(config.settings.state_dir)
+        else:
+            raise ValueError(
+                f"no managed pipeline is running at {config.settings.state_dir}"
+            ) from None
+    return response
+
+
+def _agent_rpc(config: PipelineConfig) -> int:
+    allowed = {"status", "snapshot", "pause", "resume", "stop", "wait"}
+    failed = False
+    for line in sys.stdin:
+        try:
+            request = json.loads(line)
+            if not isinstance(request, dict) or request.get("command") not in allowed:
+                raise ValueError(f"command must be one of: {', '.join(sorted(allowed))}")
+            response = _control_response(str(request["command"]), config)
+        except (json.JSONDecodeError, ValueError) as error:
+            response = {"error": str(error)}
+            failed = True
+        print(json.dumps(response, sort_keys=True), flush=True)
+    return 1 if failed else 0
+
+
+def _agent_command(args: argparse.Namespace, config: PipelineConfig) -> int:
+    command = args.agent_command
+    if command == "start":
+        return _start_agent(args, config)
+    if command == "serve":
+        return _serve_agent(args, config)
+    if command == "rpc":
+        return _agent_rpc(config)
+    response = _control_response(command, config)
+    print(json.dumps(response, sort_keys=True))
+    if command == "wait":
+        if response.get("result") is None:
+            return 2
+        return 0 if response["result"] else 1
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
-    arguments = parser().parse_args(argv)
+    raw_arguments = list(argv) if argv is not None else sys.argv[1:]
+    if raw_arguments and raw_arguments[0].lower().endswith(".md"):
+        raw_arguments.insert(0, "pipeline")
+    arguments = parser().parse_args(raw_arguments)
     console = Console()
     try:
-        config = load_config(Path(arguments.config))
+        config = _config_from_args(arguments)
+        if arguments.command == "agent":
+            return _agent_command(arguments, config)
         if arguments.command == "plan":
             print_plan(config, console)
             return 0

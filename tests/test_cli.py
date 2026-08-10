@@ -1,7 +1,11 @@
+import json
+import sys
+from io import StringIO
 from pathlib import Path
 
 import pytest
 
+import lastlib_swarm.cli as cli_module
 from lastlib_swarm.cli import main, select_chapters
 from lastlib_swarm.config import load_config
 from tests.support import write_project
@@ -20,3 +24,83 @@ def test_plan_command(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> Non
 
     assert main(["plan", "--config", str(path)]) == 0
     assert "Statement work is chapter-pipelined" in capsys.readouterr().out
+
+
+def test_plan_accepts_just_a_markdown_target(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    (tmp_path / ".git").mkdir()
+    target = tmp_path / "04-sample-book.md"
+    target.write_text("# Sample Book\n\n## 1. Start\n", encoding="utf-8")
+
+    assert main(["plan", str(target)]) == 0
+    output = capsys.readouterr().out
+    assert "gpt-5.6-luna" in output
+    assert "book04" in output
+
+
+def test_agent_can_start_and_wait_for_detached_pipeline(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config_path = write_project(tmp_path, chapters="chapters = [1]")
+    fake_codex = tmp_path / "fake-codex"
+    fake_codex.write_text(
+        """#!/usr/bin/env python3
+import json
+import sys
+import time
+
+sys.stdin.read()
+time.sleep(0.15)
+print(json.dumps({"type": "thread.started", "thread_id": "managed-thread"}))
+print(json.dumps({"type": "turn.completed", "usage": {
+    "input_tokens": 10, "cached_input_tokens": 5, "output_tokens": 2}}))
+report = {"changed": False, "complete": True, "needs_repair": False,
+          "summary": "done", "issues": []}
+print(json.dumps({"type": "item.completed", "item": {
+    "type": "agent_message", "text": json.dumps(report)}}))
+""",
+        encoding="utf-8",
+    )
+    fake_codex.chmod(0o755)
+    config_text = config_path.read_text(encoding="utf-8")
+    config_text = config_text.replace(
+        "max_agents = 4", f'max_agents = 4\ncodex_bin = "{fake_codex}"'
+    ).replace('module = "Book"', 'module = "Book"\nbuild_command = "true"')
+    config_path.write_text(config_text, encoding="utf-8")
+
+    assert main(["agent", "start", "--config", str(config_path)]) == 0
+    started = json.loads(capsys.readouterr().out)
+    assert started["status"] == "running"
+    assert main(["agent", "wait", "--config", str(config_path)]) == 0
+    finished = json.loads(capsys.readouterr().out)
+    assert finished["status"] == "completed"
+    assert finished["usage"]["api_tokens"] == 36
+
+
+def test_agent_rpc_reads_jsonl_from_stdin(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = write_project(tmp_path, chapters="chapters = [1]")
+    monkeypatch.setattr(sys, "stdin", StringIO('{"command":"status"}\n'))
+
+    assert main(["agent", "rpc", "--config", str(config_path)]) == 0
+    response = json.loads(capsys.readouterr().out)
+    assert response["status"] == "not-started"
+
+
+def test_markdown_as_first_argument_is_pipeline_shorthand(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / ".git").mkdir()
+    target = tmp_path / "08-shortcut.md"
+    target.write_text("# Shortcut\n\n## 1. Start\n", encoding="utf-8")
+
+    def fake_run(*_args: object, **_kwargs: object) -> int:
+        return 0
+
+    monkeypatch.setattr(cli_module, "_run", fake_run)
+
+    assert main([str(target)]) == 0
