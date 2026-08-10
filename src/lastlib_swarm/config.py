@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import re
 import tomllib
+from dataclasses import replace
+from hashlib import sha256
 from importlib.resources import files
+from itertools import pairwise
 from pathlib import Path
 from typing import Any
 
@@ -265,11 +268,7 @@ def _existing_lean_stem(repo: Path, number: int) -> str | None:
     return next(iter(stems)) if len(stems) == 1 else None
 
 
-def infer_config(target: str | Path) -> PipelineConfig:
-    source_path = Path(target).resolve()
-    if not source_path.is_file() or source_path.suffix.lower() != ".md":
-        raise ValueError(f"target must be an existing Markdown file: {source_path}")
-    repo = _repository_root(source_path)
+def _infer_book(repo: Path, source_path: Path) -> BookConfig:
     try:
         source = source_path.relative_to(repo)
     except ValueError:
@@ -283,16 +282,26 @@ def infer_config(target: str | Path) -> PipelineConfig:
     else:
         book_id = re.sub(r"[^a-z0-9]+", "-", source_path.stem.lower()).strip("-")
         lean_stem = f"Book{_pascal_case(title)}"
-    book = BookConfig(
+    return BookConfig(
         id=book_id,
         title=title,
         source=source,
         lean_root=Path("lean") / "LastLib" / lean_stem,
         module=f"LastLib.{lean_stem}",
     )
+
+
+def infer_config(target: str | Path) -> PipelineConfig:
+    source_path = Path(target).resolve()
+    if source_path.is_dir():
+        return infer_corpus((source_path,))
+    if not source_path.is_file() or source_path.suffix.lower() != ".md":
+        raise ValueError(f"target must be an existing Markdown file or directory: {source_path}")
+    repo = _repository_root(source_path)
+    book = _infer_book(repo, source_path)
     settings = SwarmSettings(
         repo=repo,
-        state_dir=repo / ".swarm" / book_id,
+        state_dir=repo / ".swarm" / book.id,
         model="gpt-5.6-luna",
         reasoning_effort="max",
     )
@@ -306,13 +315,107 @@ def infer_config(target: str | Path) -> PipelineConfig:
     )
 
 
-def resolve_config(*, config: str | Path | None, target: str | Path | None) -> PipelineConfig:
+def _expand_markdown_targets(targets: tuple[str | Path, ...]) -> tuple[Path, ...]:
+    expanded: list[Path] = []
+    for target in targets:
+        path = Path(target).resolve()
+        if path.is_dir():
+            matches = sorted(item for item in path.glob("*.md") if item.is_file())
+            if not matches:
+                raise ValueError(f"directory contains no Markdown books: {path}")
+            expanded.extend(matches)
+        elif path.is_file() and path.suffix.lower() == ".md":
+            expanded.append(path)
+        else:
+            raise ValueError(f"target must be an existing Markdown file or directory: {path}")
+    unique = tuple(dict.fromkeys(expanded))
+    if not unique:
+        raise ValueError("corpus requires at least one Markdown target")
+    return unique
+
+
+def parse_book_dependencies(path: str | Path) -> dict[str, tuple[str, ...]]:
+    """Read Mermaid `B01 --> B02 --> ...` edges from a dependency document."""
+
+    dependency_path = Path(path).resolve()
+    try:
+        text = dependency_path.read_text(encoding="utf-8")
+    except OSError as error:
+        raise ValueError(f"cannot read book dependency graph: {dependency_path}") from error
+    dependencies: dict[str, set[str]] = {}
+    for line in text.splitlines():
+        if "-->" not in line:
+            continue
+        nodes = re.findall(r"\bB(?P<number>\d+)\b", line, re.IGNORECASE)
+        for prerequisite, dependent in pairwise(nodes):
+            dependent_id = f"book{int(dependent):02d}"
+            dependencies.setdefault(dependent_id, set()).add(f"book{int(prerequisite):02d}")
+    return {key: tuple(sorted(value)) for key, value in dependencies.items()}
+
+
+def infer_corpus(
+    targets: tuple[str | Path, ...],
+    *,
+    dependency_file: str | Path | None = None,
+) -> PipelineConfig:
+    source_paths = _expand_markdown_targets(targets)
+    repo = _repository_root(source_paths[0])
+    for source_path in source_paths[1:]:
+        if _repository_root(source_path) != repo:
+            raise ValueError("all corpus targets must belong to the same repository")
+
+    books = tuple(_infer_book(repo, source_path) for source_path in source_paths)
+    ids = [book.id for book in books]
+    if len(ids) != len(set(ids)):
+        raise ValueError("inferred book ids must be unique; use a TOML config to disambiguate")
+
+    graph_path = Path(dependency_file).resolve() if dependency_file is not None else None
+    if graph_path is None and (repo / "BOOK_DEPENDENCIES.md").is_file():
+        graph_path = repo / "BOOK_DEPENDENCIES.md"
+    graph = parse_book_dependencies(graph_path) if graph_path is not None else {}
+    selected = set(ids)
+    books = tuple(
+        replace(book, depends_on=tuple(item for item in graph.get(book.id, ()) if item in selected))
+        for book in books
+    )
+    chapters = tuple(chapter for book in books for chapter in _discover_chapters(repo, book))
+    build_corpus_schedule(books, chapters, phase="statements")
+    identity = "\n".join(sorted(source_path.as_posix() for source_path in source_paths))
+    corpus_id = sha256(identity.encode()).hexdigest()[:10]
+    settings = SwarmSettings(
+        repo=repo,
+        state_dir=repo / ".swarm" / f"corpus-{corpus_id}",
+        model="gpt-5.6-luna",
+        reasoning_effort="max",
+    )
+    return PipelineConfig(
+        path=graph_path or repo,
+        settings=settings,
+        stages=_stage_configs({}, repo),
+        books=books,
+        chapters=chapters,
+    )
+
+
+def resolve_config(
+    *,
+    config: str | Path | None,
+    target: str | Path | None,
+    dependency_file: str | Path | None = None,
+) -> PipelineConfig:
     if config is not None and target is not None:
         raise ValueError("pass either --config or a Markdown target, not both")
     if config is not None:
+        if dependency_file is not None:
+            raise ValueError("--dependencies is only used with inferred Markdown targets")
         return load_config(config)
     if target is not None:
-        return infer_config(target)
+        path = Path(target)
+        if path.is_dir():
+            return infer_corpus((path,), dependency_file=dependency_file)
+        if dependency_file is not None:
+            return infer_corpus((path,), dependency_file=dependency_file)
+        return infer_config(path)
     default = Path("swarm.toml")
     if default.is_file():
         return load_config(default)

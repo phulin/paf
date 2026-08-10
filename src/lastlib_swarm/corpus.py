@@ -24,6 +24,31 @@ class CorpusSchedule:
     def priority(self, book_id: str) -> float:
         return self.rank[book_id]
 
+    def snapshot(self) -> dict[str, object]:
+        return {
+            "order": list(self.order),
+            "critical_path": list(self.critical_path),
+            "rank": self.rank,
+            "effort": self.effort,
+        }
+
+
+def scheduling_snapshot(statements: CorpusSchedule, proofs: CorpusSchedule) -> dict[str, object]:
+    return {
+        "algorithm": "weighted-critical-path-list-scheduling",
+        "statements": statements.snapshot(),
+        "proofs": proofs.snapshot(),
+    }
+
+
+def scheduling_summary(snapshot: dict[str, object]) -> dict[str, object]:
+    summary: dict[str, object] = {"algorithm": snapshot.get("algorithm", "unknown")}
+    for phase in ("statements", "proofs"):
+        value = snapshot.get(phase)
+        if isinstance(value, dict):
+            summary[phase] = {"critical_path": value.get("critical_path", [])}
+    return summary
+
 
 def _cycle_path(dependencies: dict[str, set[str]]) -> tuple[str, ...]:
     visiting: set[str] = set()

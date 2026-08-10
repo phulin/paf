@@ -64,7 +64,7 @@ class SwarmApp(App[bool]):
     BINDINGS: ClassVar = [("q", "quit", "Stop and quit")]
     CSS = """
     #usage {
-        height: 3;
+        height: 4;
         padding: 1 2;
         background: $primary-background;
         color: $text;
@@ -95,6 +95,15 @@ class SwarmApp(App[bool]):
         self.label = label
         self.result = False
         self._rows_added: set[str] = set()
+        position = {
+            book_id: index for index, book_id in enumerate(orchestrator.statement_schedule.order)
+        }
+        self.chapters = tuple(
+            sorted(
+                orchestrator.chapters,
+                key=lambda chapter: (position[chapter.book_id], chapter.number),
+            )
+        )
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -109,6 +118,7 @@ class SwarmApp(App[bool]):
     def on_mount(self) -> None:
         table: DataTable[Any] = self.query_one("#tasks", DataTable)
         table.add_column("Book", key="book")
+        table.add_column("S/P rank", key="rank")
         table.add_column("Chapter", key="chapter")
         for stage in Stage:
             table.add_column(stage.value.title(), key=stage.value)
@@ -139,8 +149,10 @@ class SwarmApp(App[bool]):
         usage = self.state.total_usage()
         active = sum(task.status == TaskStatus.RUNNING for task in self.state.tasks.values())
         maximum = self.orchestrator.config.settings.max_agents
+        critical = " → ".join(self.orchestrator.statement_schedule.critical_path) or "—"
         self.query_one("#usage", Static).update(
-            f"{format_usage(usage)}    active stage records: {active}  concurrency cap: {maximum}"
+            f"{format_usage(usage)}    active stage records: {active}  concurrency cap: {maximum}\n"
+            f"Statement critical path: {critical}"
         )
         for stage in Stage:
             counts = stage_counts(self.state, stage)
@@ -150,14 +162,14 @@ class SwarmApp(App[bool]):
                 f"✗ {counts['failed']}  · {counts['pending']}  ! {counts['blocked']}"
             )
         table: DataTable[Any] = self.query_one("#tasks", DataTable)
-        for chapter in self.orchestrator.chapters:
+        for chapter in self.chapters:
             values = self._row_values(chapter)
             if chapter.id not in self._rows_added:
                 table.add_row(*values, key=chapter.id)
                 self._rows_added.add(chapter.id)
             else:
                 for column, value in zip(
-                    ("book", "chapter", *(stage.value for stage in Stage), "tokens"),
+                    ("book", "rank", "chapter", *(stage.value for stage in Stage), "tokens"),
                     values,
                     strict=True,
                 ):
@@ -171,7 +183,17 @@ class SwarmApp(App[bool]):
             statuses.append(f"{mark} ({task.rounds})" if task.rounds else mark)
         usage = chapter_usage(self.state, chapter)
         tokens = format_count(usage.api_tokens) if usage.measured else "—"
-        return (chapter.book_id, f"{chapter.number:02d} {chapter.title}", *statuses, tokens)
+        statement_rank = self.orchestrator.statement_schedule.rank[chapter.book_id]
+        proof_rank = self.orchestrator.proof_schedule.rank[chapter.book_id]
+        critical = chapter.book_id in self.orchestrator.statement_schedule.critical_path
+        book = f"★ {chapter.book_id}" if critical else chapter.book_id
+        return (
+            book,
+            f"{statement_rank:g}/{proof_rank:g}",
+            f"{chapter.number:02d} {chapter.title}",
+            *statuses,
+            tokens,
+        )
 
 
 def run_tui(

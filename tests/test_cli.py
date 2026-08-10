@@ -8,6 +8,7 @@ import pytest
 import lastlib_swarm.cli as cli_module
 from lastlib_swarm.cli import main, select_chapters
 from lastlib_swarm.config import load_config
+from lastlib_swarm.models import PipelineConfig
 from tests.support import write_project
 
 
@@ -23,7 +24,7 @@ def test_plan_command(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> Non
     path = write_project(tmp_path)
 
     assert main(["plan", "--config", str(path)]) == 0
-    assert "Statement work is chapter-pipelined" in capsys.readouterr().out
+    assert "critical-path rank" in capsys.readouterr().out
 
 
 def test_plan_accepts_just_a_markdown_target(
@@ -89,6 +90,7 @@ def test_agent_rpc_reads_jsonl_from_stdin(
     assert main(["agent", "rpc", "--config", str(config_path)]) == 0
     response = json.loads(capsys.readouterr().out)
     assert response["status"] == "not-started"
+    assert response["scheduling"]["algorithm"] == "weighted-critical-path-list-scheduling"
 
 
 def test_markdown_as_first_argument_is_pipeline_shorthand(
@@ -104,3 +106,28 @@ def test_markdown_as_first_argument_is_pipeline_shorthand(
     monkeypatch.setattr(cli_module, "_run", fake_run)
 
     assert main([str(target)]) == 0
+
+
+def test_corpus_command_infers_a_directory_and_dependency_graph(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / ".git").mkdir()
+    books = tmp_path / "books"
+    books.mkdir()
+    (books / "01-foundation.md").write_text("# Foundation\n\n## 1. Start\n", encoding="utf-8")
+    (books / "02-consequence.md").write_text("# Consequence\n\n## 1. Finish\n", encoding="utf-8")
+    (tmp_path / "BOOK_DEPENDENCIES.md").write_text(
+        "```mermaid\nflowchart LR\nB01 --> B02\n```\n", encoding="utf-8"
+    )
+    captured: dict[str, object] = {}
+
+    def fake_run(_args: object, config: object, _console: object) -> int:
+        captured["config"] = config
+        return 0
+
+    monkeypatch.setattr(cli_module, "_run", fake_run)
+
+    assert main(["corpus", str(books), "--no-tui"]) == 0
+    config = captured["config"]
+    assert isinstance(config, PipelineConfig)
+    assert config.books[1].depends_on == ("book01",)

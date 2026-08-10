@@ -14,13 +14,18 @@ from typing import Any
 from rich.console import Console
 from rich.table import Table
 
-from lastlib_swarm.config import resolve_config
+from lastlib_swarm.config import infer_corpus, resolve_config
 from lastlib_swarm.control import (
     LOG_NAME,
     ControlServer,
     control_socket,
     offline_status,
     send_command,
+)
+from lastlib_swarm.corpus import (
+    build_corpus_schedule,
+    scheduling_snapshot,
+    scheduling_summary,
 )
 from lastlib_swarm.models import Chapter, PipelineConfig, Stage
 from lastlib_swarm.scheduler import Orchestrator
@@ -32,12 +37,16 @@ def _add_source(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "target",
         nargs="?",
-        help="informal book Markdown file; inferred when --config is omitted",
+        help="informal book Markdown file or corpus directory; inferred without --config",
     )
     parser.add_argument(
         "--config",
         default=None,
         help="optional pipeline TOML; defaults to target inference or ./swarm.toml",
+    )
+    parser.add_argument(
+        "--dependencies",
+        help="Mermaid book DAG; defaults to BOOK_DEPENDENCIES.md for inferred corpora",
     )
 
 
@@ -67,7 +76,7 @@ def _add_run_options(parser: argparse.ArgumentParser) -> None:
 
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(prog="lastlib-swarm", description=__doc__)
-    root.add_argument("--version", action="version", version="lastlib-swarm 0.2.0")
+    root.add_argument("--version", action="version", version="lastlib-swarm 0.3.0")
     commands = root.add_subparsers(dest="command", required=True)
 
     plan = commands.add_parser("plan", help="show discovered books, chapters, and stage settings")
@@ -86,6 +95,25 @@ def parser() -> argparse.ArgumentParser:
         "pipeline", help="run the full formalize/review/prove/repair flow"
     )
     _add_run_options(pipeline)
+
+    corpus = commands.add_parser(
+        "corpus", help="run a dependency-scheduled collection of Markdown books"
+    )
+    corpus.add_argument(
+        "targets",
+        nargs="*",
+        help="Markdown files and/or directories (directories expand to their direct *.md files)",
+    )
+    corpus.add_argument("--config", help="use an explicit multi-book TOML configuration")
+    corpus.add_argument(
+        "--dependencies",
+        help="Mermaid book DAG; defaults to BOOK_DEPENDENCIES.md in the repository",
+    )
+    _add_overrides(corpus)
+    corpus.add_argument("--book", action="append", default=[])
+    corpus.add_argument("--chapter", action="append", default=[])
+    corpus.add_argument("--force", action="store_true")
+    corpus.add_argument("--no-tui", action="store_true")
 
     agent = commands.add_parser("agent", help="machine-friendly background pipeline control")
     agent_commands = agent.add_subparsers(dest="agent_command", required=True)
@@ -119,7 +147,23 @@ def parser() -> argparse.ArgumentParser:
 
 
 def _config_from_args(args: argparse.Namespace) -> PipelineConfig:
-    config = resolve_config(config=args.config, target=args.target)
+    if args.command == "corpus":
+        if args.config is not None:
+            if args.targets:
+                raise ValueError("pass either --config or corpus targets, not both")
+            config = resolve_config(
+                config=args.config,
+                target=None,
+                dependency_file=args.dependencies,
+            )
+        else:
+            config = infer_corpus(tuple(args.targets), dependency_file=args.dependencies)
+    else:
+        config = resolve_config(
+            config=args.config,
+            target=args.target,
+            dependency_file=getattr(args, "dependencies", None),
+        )
     model = getattr(args, "model", None)
     reasoning_effort = getattr(args, "reasoning_effort", None)
     max_agents = getattr(args, "max_agents", None)
@@ -182,18 +226,33 @@ def print_plan(config: PipelineConfig, console: Console) -> None:
         settings = config.stages[stage]
         stages.add_row(stage.value, str(settings.prompt), str(settings.max_rounds))
     console.print(stages)
-    books = Table(title="Corpus")
+    statement_schedule = build_corpus_schedule(config.books, config.chapters, phase="statements")
+    proof_schedule = build_corpus_schedule(config.books, config.chapters, phase="proofs")
+    books = Table(title="Corpus (critical-path priority order)")
     books.add_column("Book")
     books.add_column("Chapters", justify="right")
     books.add_column("Depends on")
+    books.add_column("Statement rank", justify="right")
+    books.add_column("Proof rank", justify="right")
     books.add_column("Source")
-    for book in config.books:
+    by_id = {book.id: book for book in config.books}
+    critical = set(statement_schedule.critical_path) | set(proof_schedule.critical_path)
+    for book_id in statement_schedule.order:
+        book = by_id[book_id]
         count = sum(chapter.book_id == book.id for chapter in config.chapters)
-        books.add_row(book.id, str(count), ", ".join(book.depends_on) or "—", str(book.source))
+        label = f"★ {book.id}" if book.id in critical else book.id
+        books.add_row(
+            label,
+            str(count),
+            ", ".join(book.depends_on) or "—",
+            f"{statement_schedule.rank[book.id]:g}",
+            f"{proof_schedule.rank[book.id]:g}",
+            str(book.source),
+        )
     console.print(books)
     console.print(
-        "Statement work is chapter-pipelined (formalize → review fixed point); proof work begins "
-        "after the selected corpus reaches statement review fixed points."
+        "Books are dependency-gated in both phases. Ready books compete by weighted downstream "
+        "critical-path rank; chapters pipeline formalize → review and prove ↔ repair."
     )
 
 
@@ -304,6 +363,8 @@ def _agent_source_args(args: argparse.Namespace) -> list[str]:
         values = [str(Path(args.target).resolve())]
     else:
         values = []
+    if args.dependencies is not None:
+        values.extend(["--dependencies", str(Path(args.dependencies).resolve())])
     if args.model is not None:
         values.extend(["--model", args.model])
     if args.reasoning_effort is not None:
@@ -396,6 +457,11 @@ def _control_response(command: str, config: PipelineConfig) -> dict[str, object]
             raise ValueError(
                 f"no managed pipeline is running at {config.settings.state_dir}"
             ) from None
+    if not response.get("scheduling"):
+        statements = build_corpus_schedule(config.books, config.chapters, phase="statements")
+        proofs = build_corpus_schedule(config.books, config.chapters, phase="proofs")
+        schedule = scheduling_snapshot(statements, proofs)
+        response["scheduling"] = schedule if command == "snapshot" else scheduling_summary(schedule)
     return response
 
 
@@ -434,7 +500,9 @@ def _agent_command(args: argparse.Namespace, config: PipelineConfig) -> int:
 
 def main(argv: Sequence[str] | None = None) -> int:
     raw_arguments = list(argv) if argv is not None else sys.argv[1:]
-    if raw_arguments and raw_arguments[0].lower().endswith(".md"):
+    if raw_arguments and (
+        raw_arguments[0].lower().endswith(".md") or Path(raw_arguments[0]).is_dir()
+    ):
         raw_arguments.insert(0, "pipeline")
     arguments = parser().parse_args(raw_arguments)
     console = Console()

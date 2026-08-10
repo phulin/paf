@@ -11,6 +11,7 @@ from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
+from lastlib_swarm.corpus import scheduling_summary
 from lastlib_swarm.scheduler import Orchestrator
 from lastlib_swarm.state import TaskStatus, timestamp
 
@@ -53,6 +54,7 @@ def state_summary(
         "state_path": str(orchestrator.state.path),
         "updated_at": snapshot["updated_at"],
         "usage": snapshot["usage"],
+        "scheduling": scheduling_summary(snapshot["scheduling"]),
         "tasks": _task_counts(snapshot),
     }
     if full:
@@ -255,6 +257,7 @@ def offline_status(state_dir: Path) -> dict[str, Any]:
                 "state_path": str(state_path),
                 "updated_at": snapshot.get("updated_at"),
                 "usage": snapshot.get("usage", {}),
+                "scheduling": scheduling_summary(snapshot.get("scheduling", {})),
                 "tasks": _task_counts(snapshot),
             }
     return {
@@ -270,5 +273,6 @@ def offline_status(state_dir: Path) -> dict[str, Any]:
             "measured": False,
             "api_tokens": 0,
         },
+        "scheduling": {},
         "tasks": {status.value: 0 for status in TaskStatus},
     }

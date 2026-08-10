@@ -17,7 +17,20 @@ flowchart LR
 Formalization and review are pipelined per chapter: a chapter can enter review while other chapters
 are still being translated. Every chapter in an eligible book can run concurrently. `depends_on`
 orders books at statement-review boundaries; independent books run concurrently. Proof work starts
-after the selected corpus finishes statement review, then runs chapter-by-chapter in parallel.
+after the selected corpus finishes statement review, then follows the same book DAG while running
+each eligible book's chapters in parallel.
+
+For a conventional numbered corpus, point the CLI at the book directory. It discovers all direct
+Markdown children and automatically reads `BOOK_DEPENDENCIES.md` from the repository root:
+
+```console
+uv run lastlib-swarm plan books/
+uv run lastlib-swarm corpus books/
+```
+
+Dependency documents use Mermaid edges such as `B01 --> B02 --> B03`; chained edges are expanded.
+Pass `--dependencies path/to/graph.md` to select another graph. Dependencies whose books are outside
+the selected target set are treated as already satisfied.
 
 ## Quick start
 
@@ -68,6 +81,7 @@ Run the complete pipeline:
 
 ```console
 uv run lastlib-swarm pipeline books/02-finite-extensions-of-local-fields.md
+uv run lastlib-swarm corpus books/ --max-agents 24
 ```
 
 The TUI is the default for stage and pipeline runs. Add `--no-tui` for CI, a process supervisor, or
@@ -101,6 +115,9 @@ uv run lastlib-swarm agent resume "$TARGET"
 uv run lastlib-swarm agent snapshot "$TARGET"
 uv run lastlib-swarm agent wait "$TARGET"
 ```
+
+`TARGET=books` manages the inferred corpus through the same detached protocol; the directory and
+auto-discovered dependency graph deterministically select a corpus-specific state directory.
 
 Every command prints one JSON object. `wait` blocks until completion and exits with the pipeline's
 success/failure code. `snapshot` includes the complete persisted task/run state; `status` is compact.
@@ -140,6 +157,27 @@ The orchestrator independently hashes every configured chapter scope. Agent clai
 not control review convergence. Lean placeholder scanning ignores comments and strings. The strict
 agent report is used chiefly to distinguish proof errors from genuine statement repair.
 
+## Multi-book scheduling
+
+The corpus layer validates the book graph as a DAG before launching any agent and reports an explicit
+cycle path on failure. It computes a weighted **bottom level** for every book:
+
+```text
+rank(book) = effort(book) + max(rank(successor), default=0)
+```
+
+Whenever several dependency-ready books compete for a limited agent slot, the scheduler chooses the
+largest rank first. This is critical-path list scheduling: it directs capacity toward the longest
+remaining dependency chain while still filling spare slots with independent work. It is a heuristic
+for parallel machines—not a claim of an optimal schedule for arbitrary runtimes—but it directly
+targets critical-path completion and adapts as dependencies unlock.
+
+Effort defaults to the number of selected chapters. Configured corpora can supply positive
+`statement_effort` and `proof_effort` values based on historical wall time or expected agent work.
+The statement and proof/repair phases have separate ranks, and both enforce book dependencies. The
+plan, TUI, persisted snapshot, and agent-control JSON expose the priority order, ranks, and critical
+path.
+
 ## TUI and token accounting
 
 The dashboard shows:
@@ -147,6 +185,7 @@ The dashboard shows:
 - aggregate counts for formalize, review, prove, and repair;
 - each chapter's status and attempt count in every stage;
 - per-chapter cumulative tokens;
+- statement/proof critical-path ranks and the current statement critical path;
 - measured cumulative input, cached input, output, and reasoning-output tokens.
 
 “API-equivalent tokens” means `input_tokens + output_tokens` from Codex JSONL usage snapshots.
@@ -159,7 +198,8 @@ billing arrangements are deliberately outside the state model.
 ## State, logs, and interruption
 
 Configured state defaults to `.swarm/state.json`; inferred single-target state uses
-`.swarm/<book-id>/state.json`. Raw JSONL agent logs live below `logs/`, with the generated final-report
+`.swarm/<book-id>/state.json`; inferred corpora use a deterministic
+`.swarm/corpus-<id>/state.json`. Raw JSONL agent logs live below `logs/`, with the generated final-report
 schema alongside them. Each run records its PID, Codex thread id when emitted, stage, round,
 timestamps, scoped-change result, placeholder count, final report, validation tail, and usage. Writes
 are atomic.
@@ -212,6 +252,8 @@ source = "books/03-ramification-theory.md"
 lean_root = "lean/LastLib/Book03RamificationTheory"
 module = "LastLib.Book03RamificationTheory"
 depends_on = ["book01", "book02"]
+statement_effort = 18.5
+proof_effort = 42
 chapters = [1, 2, 3]
 chapter_path = "Chapter{chapter_number_padded}"
 chapter_module = "{module}.Chapter{chapter_number_padded}"

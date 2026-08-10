@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from lastlib_swarm.codex import AgentResult, CodexExecutor, ValidationResult, validate
-from lastlib_swarm.corpus import CorpusSchedule, build_corpus_schedule
+from lastlib_swarm.corpus import CorpusSchedule, build_corpus_schedule, scheduling_snapshot
 from lastlib_swarm.models import Chapter, PipelineConfig, Stage
 from lastlib_swarm.state import RunRecord, StateStore, TaskStatus
 
@@ -146,7 +146,11 @@ class Orchestrator:
             phase="proofs",
             selected_books=selected_books,
         )
+        self.state.scheduling = self.scheduling_snapshot()
         self.agent_slots = PriorityLimiter(config.settings.max_agents)
+
+    def scheduling_snapshot(self) -> dict[str, object]:
+        return scheduling_snapshot(self.statement_schedule, self.proof_schedule)
 
     async def prepare(self) -> None:
         await self.state.load_or_create()
@@ -348,8 +352,19 @@ class Orchestrator:
             Stage.PROVE: lambda chapter: self._prove(chapter, allow_repair=False),
             Stage.REPAIR: self._repair_to_fixed_point,
         }
-        results = await asyncio.gather(*(operations[stage](chapter) for chapter in self.chapters))
-        return all(results)
+
+        async def run_book(book_id: str) -> bool:
+            chapters = [chapter for chapter in self.chapters if chapter.book_id == book_id]
+            results = await asyncio.gather(*(operations[stage](chapter) for chapter in chapters))
+            return all(results)
+
+        schedule = (
+            self.statement_schedule
+            if stage in (Stage.FORMALIZE, Stage.REVIEW)
+            else self.proof_schedule
+        )
+        succeeded = await self._run_book_graph(schedule, run_book, stages=(stage,))
+        return succeeded == set(schedule.order)
 
     async def _statement_chapter(self, chapter: Chapter) -> bool:
         if not await self._formalize(chapter):
@@ -418,6 +433,16 @@ class Orchestrator:
 
     async def run_pipeline(self) -> bool:
         statement_books = await self._run_statements()
+        selected_books = {chapter.book_id for chapter in self.chapters}
+        for chapter in self.chapters:
+            if chapter.book_id not in statement_books:
+                for stage in (Stage.PROVE, Stage.REPAIR):
+                    await self.state.set_task(
+                        chapter.id,
+                        stage,
+                        TaskStatus.BLOCKED,
+                        "book did not complete statement review",
+                    )
         proof_schedule = build_corpus_schedule(
             self.config.books,
             self.chapters,
@@ -429,5 +454,4 @@ class Orchestrator:
             self._proof_book,
             stages=(Stage.PROVE, Stage.REPAIR),
         )
-        selected_books = {chapter.book_id for chapter in self.chapters}
         return statement_books == selected_books and proof_books == selected_books

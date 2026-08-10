@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from lastlib_swarm.config import infer_config, load_config
+from lastlib_swarm.config import infer_config, infer_corpus, load_config, parse_book_dependencies
 from lastlib_swarm.models import Stage
 from tests.support import write_project
 
@@ -25,6 +25,20 @@ def test_selects_configured_chapters(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [2]"))
 
     assert [chapter.number for chapter in config.chapters] == [2]
+
+
+def test_loads_phase_specific_book_effort(tmp_path: Path) -> None:
+    path = write_project(tmp_path)
+    text = path.read_text(encoding="utf-8").replace(
+        'module = "Book"',
+        'module = "Book"\nstatement_effort = 2.5\nproof_effort = 9',
+    )
+    path.write_text(text, encoding="utf-8")
+
+    book = load_config(path).books[0]
+
+    assert book.statement_effort == 2.5
+    assert book.proof_effort == 9
 
 
 def test_rejects_unknown_book_dependency(tmp_path: Path) -> None:
@@ -70,3 +84,25 @@ def test_config_stage_prompts_are_optional(tmp_path: Path) -> None:
     config = load_config(path)
 
     assert config.stages[Stage.FORMALIZE].prompt.name == "formalize.md"
+
+
+def test_infers_multiple_books_and_chained_mermaid_dependencies(tmp_path: Path) -> None:
+    (tmp_path / ".git").mkdir()
+    books = tmp_path / "books"
+    books.mkdir()
+    for number in range(1, 4):
+        (books / f"{number:02d}-book.md").write_text(
+            f"# Book {number}\n\n## 1. Chapter\n", encoding="utf-8"
+        )
+    graph = tmp_path / "BOOK_DEPENDENCIES.md"
+    graph.write_text("B01 --> B02 --> B03\n", encoding="utf-8")
+
+    assert parse_book_dependencies(graph) == {
+        "book02": ("book01",),
+        "book03": ("book02",),
+    }
+    config = infer_corpus((books,))
+
+    assert [book.id for book in config.books] == ["book01", "book02", "book03"]
+    assert config.books[2].depends_on == ("book02",)
+    assert config.settings.state_dir.parent == tmp_path / ".swarm"
