@@ -169,6 +169,7 @@ async def test_selected_chapter_opens_live_agent_detail(tmp_path: Path) -> None:
 
         assert isinstance(app.screen, AgentDetailScreen)
         assert app.check_action("inspect_agent", ()) is False
+        assert not app.screen.query("#agent-state")
         assert "✗ 1" in str(app.screen.query_one("#agent-heading", Static).content)
         assert "diagnostic failed" in str(app.screen.query_one("#agent-error", Static).content)
         spend = str(app.screen.query_one("#agent-spend", Static).content)

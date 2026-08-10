@@ -160,7 +160,6 @@ class AgentDetailScreen(Screen[None]):
         yield Header()
         yield Static("Loading agent activity…", id="agent-heading", markup=False)
         with Horizontal(id="agent-metrics"):
-            yield Static(id="agent-state", classes="agent-card", markup=False)
             yield Static(id="agent-work", classes="agent-card", markup=False)
             yield Static(id="agent-spend", classes="agent-card", markup=False)
         yield RichLog(
@@ -208,8 +207,6 @@ class AgentDetailScreen(Screen[None]):
             f"{self.chapter.id} · {run.stage} round {run.round} · {run.status}\n"
             f"{activity_label(activity, run)}",
         )
-        thread = run.thread_id or "awaiting thread id"
-        self._update_static("#agent-state", f"PROCESS\nPID {run.pid or '—'}\n{thread}")
         if activity:
             done, total = activity.todo_progress
             work = (
