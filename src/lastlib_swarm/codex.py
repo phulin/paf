@@ -354,7 +354,9 @@ placeholders, diagnostics, and `{chapter.build_command}`.
 A private `lastlib_lean` MCP server is attached to this attempt. It points at the attempt's private
 Lean project. Use its whole-file diagnostics and, where available for the stage, goals, hover,
 declaration lookup, code actions, completions, tactic trials, and local search. It intentionally
-does not expose `lean_build` or remote search. Whenever you switch from one Lean file to another,
+does not expose `lean_build` or remote search. Paths passed to its tools are relative to the Lean
+project root: use `LastLib/...`, not `lean/LastLib/...`.
+Whenever you switch from one Lean file to another,
 make a whole-file diagnostic call for the destination before using other Lean tools. The MCP treats
 that switch as a reopen with one dependency-build pass. Do the same when switching back, especially
 after editing a file that it imports. Do not start another language server or work around stale
