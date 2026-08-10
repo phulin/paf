@@ -80,31 +80,33 @@ class ControlServer:
     async def run(self) -> bool:
         await self.orchestrator.prepare()
         self.state_dir.mkdir(parents=True, exist_ok=True)
-        self._remove_stale_socket()
-        self.result_path.unlink(missing_ok=True)
-        self._server = await asyncio.start_unix_server(self._handle, path=self.socket_path)
-        self.socket_path.chmod(0o600)
-        self.pid_path.write_text(f"{os.getpid()}\n", encoding="utf-8")
-        self.pipeline_task = asyncio.create_task(self.operation())
-        loop = asyncio.get_running_loop()
-        installed_signals: list[signal.Signals] = []
-        for item in (signal.SIGINT, signal.SIGTERM):
-            with suppress(NotImplementedError):
-                loop.add_signal_handler(item, self.request_stop)
-                installed_signals.append(item)
+        self._claim_pid()
         try:
-            self.result = await self.pipeline_task
-        except asyncio.CancelledError:
-            self.result = False
+            self._remove_stale_socket()
+            self.result_path.unlink(missing_ok=True)
+            self._server = await asyncio.start_unix_server(self._handle, path=self.socket_path)
+            self.socket_path.chmod(0o600)
+            self.pipeline_task = asyncio.create_task(self.operation())
+            loop = asyncio.get_running_loop()
+            installed_signals: list[signal.Signals] = []
+            for item in (signal.SIGINT, signal.SIGTERM):
+                with suppress(NotImplementedError):
+                    loop.add_signal_handler(item, self.request_stop)
+                    installed_signals.append(item)
+            try:
+                self.result = await self.pipeline_task
+            except asyncio.CancelledError:
+                self.result = False
+            finally:
+                self.done.set()
+                self._write_result()
+                await asyncio.sleep(0.1)
+                self._server.close()
+                await self._server.wait_closed()
+                for item in installed_signals:
+                    loop.remove_signal_handler(item)
+                self.socket_path.unlink(missing_ok=True)
         finally:
-            self.done.set()
-            self._write_result()
-            await asyncio.sleep(0.1)
-            self._server.close()
-            await self._server.wait_closed()
-            for item in installed_signals:
-                loop.remove_signal_handler(item)
-            self.socket_path.unlink(missing_ok=True)
             self.pid_path.unlink(missing_ok=True)
         return bool(self.result)
 
@@ -121,6 +123,30 @@ class ControlServer:
         if not stat.S_ISSOCK(mode):
             raise ValueError(f"refusing to replace non-socket control path: {self.socket_path}")
         self.socket_path.unlink()
+
+    def _claim_pid(self) -> None:
+        for _ in range(2):
+            try:
+                descriptor = os.open(
+                    self.pid_path,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                )
+            except FileExistsError:
+                try:
+                    existing_pid = int(self.pid_path.read_text(encoding="utf-8").strip())
+                except (OSError, ValueError):
+                    existing_pid = -1
+                if _pid_is_alive(existing_pid):
+                    raise ValueError(
+                        f"a managed pipeline already owns {self.state_dir} (pid {existing_pid})"
+                    ) from None
+                self.pid_path.unlink(missing_ok=True)
+                continue
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                handle.write(f"{os.getpid()}\n")
+            return
+        raise ValueError(f"could not claim managed pipeline state: {self.state_dir}")
 
     def _write_result(self) -> None:
         payload = state_summary(
@@ -198,6 +224,18 @@ def send_command(state_dir: Path, command: str, *, timeout: float | None = 10.0)
     if not isinstance(response, dict):
         raise ValueError("control server returned a non-object response")
     return response
+
+
+def _pid_is_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
 
 
 def offline_status(state_dir: Path) -> dict[str, Any]:
