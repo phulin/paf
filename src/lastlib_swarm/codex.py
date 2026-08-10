@@ -327,9 +327,10 @@ This is a hard write boundary: edit only the paths listed above. You may read fi
 context, but do not create, modify, move, delete, format, or otherwise write any path outside this
 scope. In particular, do not edit `.swarm`, `SWARM.md`, repository-level documentation, prompts,
 scripts, orchestration code, configuration, or tests, even if changing them seems useful for this
-task. Do not fix tooling or infrastructure problems yourself; report them in `issues` and continue
-with work that stays inside your scope. Before every edit, verify that its target matches one of the
-listed scope paths. Any out-of-scope write causes the coordinator to reject the entire attempt.
+task. You may investigate tooling or infrastructure problems and use in-scope workarounds, but if a
+fix requires an out-of-scope write, report it in `issues` instead of making that write. Before every
+edit, verify that its target matches one of the listed scope paths. Any out-of-scope write causes the
+coordinator to reject the entire attempt.
 
 Do not commit and do not wait for another worker.
 Do not run `lake build`, `lake env lean`, raw `lean`, or another compiler command. Builds belong to
