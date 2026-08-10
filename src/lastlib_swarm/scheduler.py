@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Iterable
+import heapq
+from collections.abc import AsyncIterator, Callable, Coroutine, Iterable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from typing import Any
 
 from lastlib_swarm.codex import AgentResult, CodexExecutor, ValidationResult, validate
+from lastlib_swarm.corpus import CorpusSchedule, build_corpus_schedule
 from lastlib_swarm.models import Chapter, PipelineConfig, Stage
 from lastlib_swarm.state import RunRecord, StateStore, TaskStatus
 
@@ -64,6 +68,55 @@ class RunControl:
         self._gate.set()
 
 
+class PriorityLimiter:
+    """A concurrency limiter that grants slots to the highest-priority waiter."""
+
+    def __init__(self, capacity: int) -> None:
+        self.capacity = capacity
+        self.available = capacity
+        self._sequence = 0
+        self._waiters: list[tuple[float, int, asyncio.Future[None]]] = []
+
+    def _wake(self) -> None:
+        while self.available and self._waiters:
+            _, _, waiter = heapq.heappop(self._waiters)
+            if waiter.done():
+                continue
+            self.available -= 1
+            waiter.set_result(None)
+
+    async def acquire(self, priority: float) -> None:
+        loop = asyncio.get_running_loop()
+        waiter: asyncio.Future[None] = loop.create_future()
+        self._sequence += 1
+        heapq.heappush(self._waiters, (-priority, self._sequence, waiter))
+        self._wake()
+        try:
+            await waiter
+        except asyncio.CancelledError:
+            # Cancellation can race with a grant. Return a granted slot; otherwise
+            # leave a cancelled future for _wake to discard lazily.
+            if waiter.done() and not waiter.cancelled():
+                self.release()
+            else:
+                waiter.cancel()
+            raise
+
+    def release(self) -> None:
+        if self.available >= self.capacity:
+            raise RuntimeError("priority limiter released without an acquired slot")
+        self.available += 1
+        self._wake()
+
+    @asynccontextmanager
+    async def slot(self, priority: float) -> AsyncIterator[None]:
+        await self.acquire(priority)
+        try:
+            yield
+        finally:
+            self.release()
+
+
 class Orchestrator:
     def __init__(
         self,
@@ -80,7 +133,20 @@ class Orchestrator:
         self.force = force
         self.control = control or RunControl()
         self.executor = CodexExecutor(config, state)
-        self.agent_slots = asyncio.Semaphore(config.settings.max_agents)
+        selected_books = {chapter.book_id for chapter in self.chapters}
+        self.statement_schedule = build_corpus_schedule(
+            config.books,
+            self.chapters,
+            phase="statements",
+            selected_books=selected_books,
+        )
+        self.proof_schedule = build_corpus_schedule(
+            config.books,
+            self.chapters,
+            phase="proofs",
+            selected_books=selected_books,
+        )
+        self.agent_slots = PriorityLimiter(config.settings.max_agents)
 
     async def prepare(self) -> None:
         await self.state.load_or_create()
@@ -97,7 +163,12 @@ class Orchestrator:
         feedback: str = "",
     ) -> Attempt:
         await self.control.checkpoint()
-        async with self.agent_slots:
+        schedule = (
+            self.statement_schedule
+            if stage in (Stage.FORMALIZE, Stage.REVIEW)
+            else self.proof_schedule
+        )
+        async with self.agent_slots.slot(schedule.priority(chapter.book_id)):
             await self.control.checkpoint()
             run = await self.state.start_run(chapter.id, stage)
             agent = await self.executor.run(chapter, stage, run, feedback=feedback)
@@ -296,57 +367,67 @@ class Orchestrator:
         results = await asyncio.gather(*(self._statement_chapter(chapter) for chapter in chapters))
         return all(results)
 
-    async def _run_statements(self) -> set[str]:
-        selected_books = {chapter.book_id for chapter in self.chapters}
-        dependencies = {
-            book.id: set(book.depends_on) & selected_books
-            for book in self.config.books
-            if book.id in selected_books
-        }
-        pending = set(selected_books)
+    async def _proof_book(self, book_id: str) -> bool:
+        chapters = [chapter for chapter in self.chapters if chapter.book_id == book_id]
+        results = await asyncio.gather(
+            *(self._prove(chapter, allow_repair=True) for chapter in chapters)
+        )
+        return all(results)
+
+    async def _run_book_graph(
+        self,
+        schedule: CorpusSchedule,
+        operation: Callable[[str], Coroutine[Any, Any, bool]],
+        *,
+        stages: tuple[Stage, ...],
+    ) -> set[str]:
+        pending = set(schedule.order)
         succeeded: set[str] = set()
-        failed: set[str] = set()
         running: dict[asyncio.Task[bool], str] = {}
         while pending or running:
-            launched = False
-            for book_id in sorted(pending):
-                if dependencies[book_id] <= succeeded:
-                    running[asyncio.create_task(self._statement_book(book_id))] = book_id
+            for book_id in schedule.order:
+                if book_id in pending and schedule.dependencies[book_id] <= succeeded:
+                    running[asyncio.create_task(operation(book_id))] = book_id
                     pending.remove(book_id)
-                    launched = True
             if not running:
                 if pending:
                     for chapter in self.chapters:
                         if chapter.book_id in pending:
-                            for stage in (Stage.FORMALIZE, Stage.REVIEW):
+                            for stage in stages:
                                 await self.state.set_task(
                                     chapter.id,
                                     stage,
                                     TaskStatus.BLOCKED,
-                                    "book dependency failed or is cyclic",
+                                    "upstream book did not complete successfully",
                                 )
-                    failed.update(pending)
                     pending.clear()
                 break
-            if launched and len(running) < len(selected_books):
-                await asyncio.sleep(0)
             done, _ = await asyncio.wait(running, return_when=asyncio.FIRST_COMPLETED)
             for task in done:
                 book_id = running.pop(task)
                 if task.result():
                     succeeded.add(book_id)
-                else:
-                    failed.add(book_id)
         return succeeded
+
+    async def _run_statements(self) -> set[str]:
+        return await self._run_book_graph(
+            self.statement_schedule,
+            self._statement_book,
+            stages=(Stage.FORMALIZE, Stage.REVIEW),
+        )
 
     async def run_pipeline(self) -> bool:
         statement_books = await self._run_statements()
-        proof_chapters = [
-            chapter for chapter in self.chapters if chapter.book_id in statement_books
-        ]
-        proof_results = await asyncio.gather(
-            *(self._prove(chapter, allow_repair=True) for chapter in proof_chapters)
+        proof_schedule = build_corpus_schedule(
+            self.config.books,
+            self.chapters,
+            phase="proofs",
+            selected_books=statement_books,
         )
-        return len(statement_books) == len({chapter.book_id for chapter in self.chapters}) and all(
-            proof_results
+        proof_books = await self._run_book_graph(
+            proof_schedule,
+            self._proof_book,
+            stages=(Stage.PROVE, Stage.REPAIR),
         )
+        selected_books = {chapter.book_id for chapter in self.chapters}
+        return statement_books == selected_books and proof_books == selected_books

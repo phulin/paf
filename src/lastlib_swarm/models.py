@@ -46,6 +46,8 @@ class BookConfig:
     lean_root: Path
     module: str
     depends_on: tuple[str, ...] = ()
+    statement_effort: float | None = None
+    proof_effort: float | None = None
     chapters: tuple[int, ...] = ()
     heading_pattern: str = r"^##\s+(?P<number>\d+)\.\s+(?P<title>.+?)\s*$"
     chapter_path: str = "Chapter{chapter_number_padded}"

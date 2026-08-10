@@ -6,6 +6,7 @@ from importlib.resources import files
 from pathlib import Path
 from typing import Any
 
+from lastlib_swarm.corpus import build_corpus_schedule
 from lastlib_swarm.models import (
     BookConfig,
     Chapter,
@@ -99,6 +100,12 @@ def _read_books(raw_books: Any) -> tuple[BookConfig, ...]:
             isinstance(item, str) for item in depends_on
         ):
             raise ValueError("books.depends_on must be a list of book ids")
+        efforts: dict[str, float | None] = {}
+        for name in ("statement_effort", "proof_effort"):
+            value = raw.get(name)
+            if value is not None and (not isinstance(value, (int, float)) or value <= 0):
+                raise ValueError(f"books.{name} must be a positive number")
+            efforts[name] = float(value) if value is not None else None
         books.append(
             BookConfig(
                 id=raw["id"],
@@ -107,6 +114,8 @@ def _read_books(raw_books: Any) -> tuple[BookConfig, ...]:
                 lean_root=Path(raw["lean_root"]),
                 module=raw["module"],
                 depends_on=tuple(depends_on),
+                statement_effort=efforts["statement_effort"],
+                proof_effort=efforts["proof_effort"],
                 chapters=tuple(chapter_numbers),
                 heading_pattern=str(raw.get("heading_pattern", BookConfig.heading_pattern)),
                 chapter_path=str(raw.get("chapter_path", "Chapter{chapter_number_padded}")),
@@ -214,6 +223,8 @@ def load_config(path: str | Path) -> PipelineConfig:
 
     books = _read_books(data.get("books"))
     chapters = tuple(chapter for book in books for chapter in _discover_chapters(repo, book))
+    # Validate the complete graph while loading, before any agents are launched.
+    build_corpus_schedule(books, chapters, phase="statements")
     return PipelineConfig(
         path=config_path,
         settings=settings,
