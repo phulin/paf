@@ -75,6 +75,7 @@ async def test_quit_drains_pipeline_before_app_exit(
     app = SwarmApp(orchestrator, operation, label="test")
     async with app.run_test() as pilot:
         await started.wait()
+        assert str(app.query_one("#status", Static).content) == "Running test…"
         await pilot.press("q")
 
     assert operation_cleaned.is_set()

@@ -409,6 +409,7 @@ class SwarmApp(App[bool]):
         error: Exception | None = None
         try:
             await self.orchestrator.prepare()
+            self.query_one("#status", Static).update(f"Running {self.label}…")
             self.refresh_dashboard()
             self.result = await self.operation()
         except Exception as caught:
