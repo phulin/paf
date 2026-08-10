@@ -207,7 +207,7 @@ print(json.dumps({"type": "item.completed", "item": {
     activity = state.activities.get(run.id)
     assert activity is not None
     assert activity.current == "agent succeeded"
-    assert activity.latest_summary == "done"
+    assert json.loads(activity.latest_summary)["summary"] == "done"
 
 
 @pytest.mark.asyncio

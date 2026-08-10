@@ -14,7 +14,7 @@ from textual.widgets import DataTable, Footer, Header, RichLog, Static, TabbedCo
 from textual.worker import WorkerCancelled
 
 from lastlib_swarm import json_codec as json
-from lastlib_swarm.activity import AgentActivity, systemic_errors
+from lastlib_swarm.activity import AgentActivity, reportable_error, systemic_errors
 from lastlib_swarm.models import Chapter, Stage
 from lastlib_swarm.pricing import format_usd
 from lastlib_swarm.scheduler import Orchestrator
@@ -138,7 +138,7 @@ class AgentDetailScreen(Screen[None]):
     #agent-heading { height: 4; padding: 1 2; background: $primary-background; text-style: bold; }
     #agent-metrics { height: 5; }
     .agent-card { width: 1fr; height: 5; border: round $primary; padding: 0 1; }
-    #agent-summary { height: 5; padding: 1 2; }
+    #agent-summary { height: 8; padding: 1 2; border: round $primary; }
     #agent-error { height: auto; max-height: 5; padding: 0 2; color: $error; }
     #agent-tabs { height: 1fr; }
     RichLog { height: 1fr; }
@@ -163,7 +163,13 @@ class AgentDetailScreen(Screen[None]):
             yield Static(id="agent-state", classes="agent-card", markup=False)
             yield Static(id="agent-work", classes="agent-card", markup=False)
             yield Static(id="agent-spend", classes="agent-card", markup=False)
-        yield Static(id="agent-summary", markup=False)
+        yield RichLog(
+            id="agent-summary",
+            wrap=True,
+            markup=False,
+            auto_scroll=False,
+            max_lines=None,
+        )
         yield Static(id="agent-error", markup=False)
         with TabbedContent(id="agent-tabs"):
             with TabPane("Timeline", id="timeline-pane"):
@@ -223,8 +229,8 @@ class AgentDetailScreen(Screen[None]):
         summary = (
             activity.latest_summary if activity and activity.latest_summary else "No update yet."
         )
-        self._update_static("#agent-summary", f"LATEST AGENT UPDATE\n{summary}")
-        error = activity.latest_error if activity else ""
+        self._update_log("#agent-summary", f"LATEST AGENT UPDATE\n{summary}")
+        error = reportable_error(activity.latest_error) if activity else ""
         self._update_static("#agent-error", f"LATEST ERROR\n{error}" if error else "")
         path = Path(run.log_path) if run.log_path else self.state.logs_dir / f"{run.id}.jsonl"
         self._update_static("#agent-path", f"Raw JSONL: {path}")
@@ -240,6 +246,15 @@ class AgentDetailScreen(Screen[None]):
             return
         self._static_cache[selector] = content
         self.query_one(selector, Static).update(content)
+
+    def _update_log(self, selector: str, content: str) -> None:
+        if self._static_cache.get(selector) == content:
+            return
+        self._static_cache[selector] = content
+        log = self.query_one(selector, RichLog)
+        log.clear()
+        log.write(content)
+        log.scroll_home(animate=False)
 
     def _refresh_raw_events(self, path: Path) -> None:
         if not path.is_file():

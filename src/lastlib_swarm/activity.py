@@ -11,6 +11,7 @@ from lastlib_swarm import json_codec as json
 
 MAX_RECENT_EVENTS = 80
 MAX_DETAIL_CHARS = 800
+EXIT_STATUS_ONLY = re.compile(r"^exit\s+\d+$", re.IGNORECASE)
 
 
 def activity_timestamp() -> str:
@@ -47,6 +48,13 @@ def error_signature(message: str) -> str:
         return "Lean MCP cannot find lake"
     message = re.sub(r"/tmp/lastlib-swarm-[^\s:'\"]+", "<workspace>", message)
     return _compact(message, limit=180)
+
+
+def reportable_error(message: str) -> str:
+    """Return meaningful diagnostic text, excluding a bare process exit status."""
+
+    stripped = message.strip()
+    return "" if not stripped or EXIT_STATUS_ONLY.fullmatch(stripped) else stripped
 
 
 @dataclass
@@ -155,14 +163,7 @@ class AgentActivity:
 
         if item_type == "agent_message":
             text = item.get("text")
-            summary = str(text) if isinstance(text, str) else ""
-            try:
-                report = json.loads(summary)
-            except json.JSONDecodeError:
-                report = None
-            if isinstance(report, dict) and isinstance(report.get("summary"), str):
-                summary = report["summary"]
-            self.latest_summary = _compact(summary)
+            self.latest_summary = text.strip() if isinstance(text, str) else ""
             self._append("message", "completed", "agent update", self.latest_summary)
             self._set_current()
             return
@@ -179,18 +180,22 @@ class AgentActivity:
 
         self.active_items.pop(item_id, None)
         failed = status == "failed"
+        error_detail = detail
         if item_type == "command_execution":
             self.commands += 1
             failed = failed or item.get("exit_code") not in (None, 0)
             self.command_failures += int(failed)
-            if failed and not detail:
-                detail = _compact(str(item.get("aggregated_output", "")))
+            output = item.get("aggregated_output")
+            error_detail = _compact(output) if failed and isinstance(output, str) else ""
+            if error_detail:
+                detail = f"{detail} · {error_detail}" if detail else error_detail
         elif item_type == "mcp_tool_call":
             self.mcp_calls += 1
             failed = failed or bool(item.get("error"))
             self.mcp_failures += int(failed)
             if failed:
                 detail = _result_text(item.get("result")) or _compact(str(item.get("error", "")))
+                error_detail = detail
         elif item_type == "file_change":
             changes = item.get("changes")
             if isinstance(changes, list):
@@ -202,8 +207,8 @@ class AgentActivity:
                             self.files.append(path)
 
         result_status = "failed" if failed else "completed"
-        if failed and detail:
-            self.latest_error = detail
+        if failed and (candidate := reportable_error(error_detail)):
+            self.latest_error = candidate
         self._append(item_type, result_status, title, detail)
         self._set_current()
 
@@ -242,8 +247,8 @@ class AgentActivity:
         self.finished_at = activity_timestamp()
         self.current = f"agent {status}"
         self.current_kind = "agent"
-        if error:
-            self.latest_error = _compact(error)
+        if candidate := reportable_error(error):
+            self.latest_error = _compact(candidate)
         self._append("agent", status, self.current, error)
         self.finished_at = self.updated_at
 
@@ -330,7 +335,7 @@ class ActivityStore:
 def systemic_errors(activities: list[AgentActivity]) -> list[tuple[int, str]]:
     counts: dict[str, int] = {}
     for activity in activities:
-        if activity.latest_error:
-            signature = error_signature(activity.latest_error)
+        if message := reportable_error(activity.latest_error):
+            signature = error_signature(message)
             counts[signature] = counts.get(signature, 0) + 1
     return sorted(((count, message) for message, count in counts.items()), reverse=True)

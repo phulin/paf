@@ -16,7 +16,7 @@ from rich.panel import Panel
 from rich.table import Table
 
 from lastlib_swarm import json_codec as json
-from lastlib_swarm.activity import ActivityStore
+from lastlib_swarm.activity import ActivityStore, reportable_error
 from lastlib_swarm.config import infer_corpus, resolve_config
 from lastlib_swarm.control import (
     LOG_NAME,
@@ -650,7 +650,7 @@ def _print_inspection(value: dict[str, Any], console: Console) -> None:
         console.print(f"API-equivalent cost: {format_usd(CostEstimate.from_dict(cost))}")
     if summary := activity.get("latest_summary"):
         console.print(f"Latest update: {summary}")
-    if error := activity.get("latest_error"):
+    if error := reportable_error(str(activity.get("latest_error", ""))):
         console.print(f"[red]Latest error: {error}[/red]")
     recent = activity.get("recent")
     if isinstance(recent, list):

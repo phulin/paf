@@ -227,7 +227,9 @@ The dashboard shows:
 Select a chapter row and press Enter (or `i`) to open its agent detail screen. It updates while the
 agent runs and has tabs for the compact event timeline, Codex todo plan, touched files, and bounded
 raw JSONL events. The header includes PID/thread id, elapsed and idle time, shell/MCP/edit counts,
-latest agent update, latest error, and measured per-run spend. Press Escape or `q` to return to the
+complete latest agent update in a scrollable pane, latest substantive error, and measured per-run
+spend. Bare process statuses such as `exit 2` are retained in the event timeline but are not promoted
+to latest or systemic errors. Press Escape or `q` to return to the
 swarm overview. Repeated equivalent failures across agents produce a deduplicated systemic alert in
 the overview instead of requiring inspection of every chapter.
 

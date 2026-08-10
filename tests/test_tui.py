@@ -3,7 +3,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from textual.widgets import DataTable, Static
+from textual.widgets import DataTable, RichLog, Static
 
 from lastlib_swarm.config import load_config
 from lastlib_swarm.models import Stage
@@ -130,6 +130,17 @@ async def test_selected_chapter_opens_live_agent_detail(tmp_path: Path) -> None:
             },
             workspace_root=tmp_path,
         )
+        activity.consume(
+            {
+                "type": "item.completed",
+                "item": {
+                    "id": "message",
+                    "type": "agent_message",
+                    "text": "complete update\n" + "x" * 1_200 + "\nEND OF UPDATE",
+                },
+            },
+            workspace_root=tmp_path,
+        )
         state.activities.save(activity)
         ready.set()
         await finish.wait()
@@ -144,6 +155,9 @@ async def test_selected_chapter_opens_live_agent_detail(tmp_path: Path) -> None:
         assert isinstance(app.screen, AgentDetailScreen)
         assert "✗ 1" in str(app.screen.query_one("#agent-heading", Static).content)
         assert "diagnostic failed" in str(app.screen.query_one("#agent-error", Static).content)
+        summary = app.screen.query_one("#agent-summary", RichLog)
+        assert summary.max_lines is None
+        assert "END OF UPDATE" in "".join(line.text for line in summary.lines)
 
         await pilot.press("escape")
         finish.set()
