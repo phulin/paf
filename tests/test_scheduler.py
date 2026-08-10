@@ -1,3 +1,4 @@
+import asyncio
 from pathlib import Path
 
 import pytest
@@ -75,3 +76,42 @@ async def test_review_requires_a_no_change_round(
     assert task.status == TaskStatus.SUCCEEDED
     assert task.rounds == 2
     assert state.total_usage().api_tokens == 30
+
+
+@pytest.mark.asyncio
+async def test_individual_stage_waits_for_upstream_book(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = write_project(tmp_path, chapters="chapters = [1]")
+    (tmp_path / "books" / "second.md").write_text(
+        "# Second\n\n## 1. Consequence\n", encoding="utf-8"
+    )
+    with config_path.open("a", encoding="utf-8") as handle:
+        handle.write(
+            """
+[[books]]
+id = "second"
+title = "Second"
+source = "books/second.md"
+lean_root = "lean/Second"
+module = "Second"
+depends_on = ["book"]
+chapters = [1]
+"""
+        )
+    config = load_config(config_path)
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await orchestrator.prepare()
+    events: list[str] = []
+
+    async def formalize(chapter: Chapter) -> bool:
+        events.append(f"start:{chapter.book_id}")
+        await asyncio.sleep(0)
+        events.append(f"end:{chapter.book_id}")
+        return True
+
+    monkeypatch.setattr(orchestrator, "_formalize", formalize)
+
+    assert await orchestrator.run_stage(Stage.FORMALIZE)
+    assert events == ["start:book", "end:book", "start:second", "end:second"]
