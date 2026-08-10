@@ -406,6 +406,8 @@ the final acceptance check, not as the interactive edit/check loop.
             consumer.cancel()
             with suppress(asyncio.CancelledError):
                 await consumer
+            activity.finish("cancelled", "agent cancelled by orchestrator")
+            self.state.activities.save(activity)
             raise
         await consumer
         changed = before != scope_digest(root, chapter)

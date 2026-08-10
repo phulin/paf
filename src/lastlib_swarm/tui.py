@@ -1,17 +1,22 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any, ClassVar
 
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal
-from textual.widgets import DataTable, Footer, Header, Static
+from textual.screen import Screen
+from textual.widgets import DataTable, Footer, Header, RichLog, Static, TabbedContent, TabPane
 from textual.worker import WorkerCancelled
 
+from lastlib_swarm.activity import AgentActivity, systemic_errors
 from lastlib_swarm.models import Chapter, Stage
 from lastlib_swarm.scheduler import Orchestrator
-from lastlib_swarm.state import StateStore, TaskStatus, TokenUsage
+from lastlib_swarm.state import RunRecord, StateStore, TaskStatus, TokenUsage
 
 STATUS_MARKS = {
     TaskStatus.PENDING: "· pending",
@@ -60,10 +65,208 @@ def stage_counts(state: StateStore, stage: Stage) -> dict[str, int]:
     return counts
 
 
+def format_duration(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h {minutes:02d}m"
+    if minutes:
+        return f"{minutes}m {seconds:02d}s"
+    return f"{seconds}s"
+
+
+def seconds_since(value: str) -> float:
+    try:
+        return (datetime.now(UTC) - datetime.fromisoformat(value)).total_seconds()
+    except ValueError:
+        return 0
+
+
+def latest_run(state: StateStore, chapter: Chapter) -> RunRecord | None:
+    runs = [run for stage in Stage for run in state.task(chapter.id, stage).runs]
+    if not runs:
+        return None
+    running = [run for run in runs if run.status == TaskStatus.RUNNING]
+    return max(running or runs, key=lambda run: run.started_at)
+
+
+def activity_label(activity: AgentActivity | None, run: RunRecord | None) -> str:
+    if run is None:
+        return "—"
+    if activity is None:
+        return "awaiting events" if run.status == TaskStatus.RUNNING else "no activity summary"
+    age = seconds_since(activity.updated_at)
+    prefix = f"✗ {activity.failures}  " if activity.failures else ""
+    idle = (
+        f"  idle {format_duration(age)}" if run.status == TaskStatus.RUNNING and age >= 60 else ""
+    )
+    return f"{prefix}{activity.current}{idle}"
+
+
+def _compact_json(value: Any, *, limit: int = 400) -> Any:
+    if isinstance(value, str):
+        return value if len(value) <= limit else value[: limit - 1] + "…"
+    if isinstance(value, list):
+        return [_compact_json(item, limit=limit) for item in value]
+    if isinstance(value, dict):
+        return {key: _compact_json(item, limit=limit) for key, item in value.items()}
+    return value
+
+
+def recent_raw_events(path: Path, *, maximum: int = 30) -> list[str]:
+    if not path.is_file():
+        return []
+    # A single Codex command result may span several MiB. Read enough for useful
+    # recent context but never feed its unbounded output to Textual.
+    size = path.stat().st_size
+    with path.open("rb") as handle:
+        handle.seek(max(0, size - 8 * 1024 * 1024))
+        data = handle.read()
+    lines = data.splitlines()
+    if size > len(data) and lines:
+        lines = lines[1:]
+    rendered: list[str] = []
+    for line in lines[-maximum:]:
+        try:
+            value = json.loads(line)
+        except (ValueError, UnicodeDecodeError):
+            continue
+        rendered.append(json.dumps(_compact_json(value), sort_keys=True))
+    return rendered
+
+
+class AgentDetailScreen(Screen[None]):
+    BINDINGS: ClassVar = [("escape", "close", "Back to swarm"), ("q", "close", "Back to swarm")]
+    CSS = """
+    #agent-heading { height: 4; padding: 1 2; background: $primary-background; text-style: bold; }
+    #agent-metrics { height: 5; }
+    .agent-card { width: 1fr; height: 5; border: round $primary; padding: 0 1; }
+    #agent-summary { height: 5; padding: 1 2; }
+    #agent-error { height: auto; max-height: 5; padding: 0 2; color: $error; }
+    #agent-tabs { height: 1fr; }
+    RichLog { height: 1fr; }
+    #agent-path { height: 3; padding: 1 2; }
+    """
+
+    def __init__(self, state: StateStore, chapter: Chapter) -> None:
+        super().__init__()
+        self.state = state
+        self.chapter = chapter
+        self._rendered_sequence = -1
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        yield Static("Loading agent activity…", id="agent-heading", markup=False)
+        with Horizontal(id="agent-metrics"):
+            yield Static(id="agent-state", classes="agent-card", markup=False)
+            yield Static(id="agent-work", classes="agent-card", markup=False)
+            yield Static(id="agent-spend", classes="agent-card", markup=False)
+        yield Static(id="agent-summary", markup=False)
+        yield Static(id="agent-error", markup=False)
+        with TabbedContent(id="agent-tabs"):
+            with TabPane("Timeline", id="timeline-pane"):
+                yield RichLog(id="agent-timeline", wrap=True, markup=False)
+            with TabPane("Plan", id="plan-pane"):
+                yield RichLog(id="agent-plan", wrap=True, markup=False)
+            with TabPane("Files", id="files-pane"):
+                yield RichLog(id="agent-files", wrap=True, markup=False)
+            with TabPane("Raw events", id="raw-pane"):
+                yield RichLog(id="agent-raw", wrap=True, markup=False)
+        yield Static(id="agent-path", markup=False)
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self.refresh_agent()
+        self.set_interval(0.5, self.refresh_agent)
+
+    def action_close(self) -> None:
+        self.app.pop_screen()
+
+    def refresh_agent(self) -> None:
+        run = latest_run(self.state, self.chapter)
+        if run is None:
+            self.query_one("#agent-heading", Static).update(
+                f"{self.chapter.id} — no agent run recorded"
+            )
+            return
+        activity = self.state.activities.get(run.id)
+        elapsed = seconds_since(run.started_at)
+        if run.finished_at is not None:
+            with suppress(ValueError):
+                elapsed = (
+                    datetime.fromisoformat(run.finished_at) - datetime.fromisoformat(run.started_at)
+                ).total_seconds()
+        last_event = format_duration(seconds_since(activity.updated_at)) if activity else "—"
+        self.query_one("#agent-heading", Static).update(
+            f"{self.chapter.id} · {run.stage} round {run.round} · {run.status}\n"
+            f"{activity_label(activity, run)}"
+        )
+        thread = run.thread_id or "awaiting thread id"
+        self.query_one("#agent-state", Static).update(f"PROCESS\nPID {run.pid or '—'}\n{thread}")
+        if activity:
+            done, total = activity.todo_progress
+            work = (
+                f"WORK\n{activity.commands} shell · {activity.mcp_calls} MCP · "
+                f"{activity.file_changes} edits\nplan {done}/{total} · {activity.failures} failures"
+            )
+        else:
+            work = "WORK\nAwaiting compact events"
+        self.query_one("#agent-work", Static).update(work)
+        usage = format_count(run.usage.api_tokens) if run.usage.measured else "pending"
+        self.query_one("#agent-spend", Static).update(
+            f"TIME / SPEND\nelapsed {format_duration(elapsed)} · last event {last_event}\n"
+            f"API-equivalent tokens {usage}"
+        )
+        summary = (
+            activity.latest_summary if activity and activity.latest_summary else "No update yet."
+        )
+        self.query_one("#agent-summary", Static).update(f"LATEST AGENT UPDATE\n{summary}")
+        error = activity.latest_error if activity else ""
+        self.query_one("#agent-error", Static).update(f"LATEST ERROR\n{error}" if error else "")
+        path = Path(run.log_path) if run.log_path else self.state.logs_dir / f"{run.id}.jsonl"
+        self.query_one("#agent-path", Static).update(f"Raw JSONL: {path}")
+        if activity and activity.sequence != self._rendered_sequence:
+            self._render_activity(activity)
+            self._rendered_sequence = activity.sequence
+        tabs = self.query_one("#agent-tabs", TabbedContent)
+        if tabs.active == "raw-pane":
+            raw = self.query_one("#agent-raw", RichLog)
+            raw.clear()
+            for line in recent_raw_events(path):
+                raw.write(line)
+
+    def _render_activity(self, activity: AgentActivity) -> None:
+        timeline = self.query_one("#agent-timeline", RichLog)
+        timeline.clear()
+        marks = {"started": "▶", "completed": "✓", "failed": "✗", "updated": "•"}
+        for entry in activity.recent:
+            clock = entry.at[11:19] if len(entry.at) >= 19 else entry.at
+            line = f"{clock} {marks.get(entry.status, '•')} [{entry.kind}] {entry.title}"
+            if entry.detail:
+                line += f"\n    {entry.detail}"
+            timeline.write(line)
+
+        plan = self.query_one("#agent-plan", RichLog)
+        plan.clear()
+        for item in activity.todos:
+            mark = "✓" if item.get("completed") else "·"
+            plan.write(f"{mark} {item.get('text', '')}")
+        if not activity.todos:
+            plan.write("No todo list emitted yet.")
+
+        files = self.query_one("#agent-files", RichLog)
+        files.clear()
+        for path in activity.files:
+            files.write(path)
+        if not activity.files:
+            files.write("No file-change event emitted yet.")
+
+
 class SwarmApp(App[bool]):
     TITLE = "LastLib Formalization Swarm"
     SUB_TITLE = "Codex agent pipeline"
-    BINDINGS: ClassVar = [("q", "quit", "Stop and quit")]
+    BINDINGS: ClassVar = [("q", "quit", "Stop and quit"), ("i", "inspect_agent", "Inspect")]
     CSS = """
     #usage {
         height: 4;
@@ -73,6 +276,7 @@ class SwarmApp(App[bool]):
         text-style: bold;
     }
     #stages { height: 5; }
+    #alerts { height: auto; max-height: 3; padding: 0 2; color: $error; }
     .stage-card {
         width: 1fr;
         height: 5;
@@ -110,6 +314,7 @@ class SwarmApp(App[bool]):
     def compose(self) -> ComposeResult:
         yield Header()
         yield Static("Preparing swarm…", id="usage")
+        yield Static(id="alerts", markup=False)
         with Horizontal(id="stages"):
             for stage in Stage:
                 yield Static(stage.value.title(), id=f"stage-{stage.value}", classes="stage-card")
@@ -124,9 +329,26 @@ class SwarmApp(App[bool]):
         table.add_column("Chapter", key="chapter")
         for stage in Stage:
             table.add_column(stage.value.title(), key=stage.value)
+        table.add_column("Current agent activity", key="activity")
         table.add_column("Tokens", key="tokens")
         self.set_interval(0.5, self.refresh_dashboard)
         self.run_worker(self.execute(), exclusive=True, group="pipeline")
+
+    def action_inspect_agent(self) -> None:
+        table: DataTable[Any] = self.query_one("#tasks", DataTable)
+        if not self.chapters or not table.row_count:
+            return
+        row = table.cursor_row
+        if 0 <= row < len(self.chapters):
+            self.push_screen(AgentDetailScreen(self.state, self.chapters[row]))
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        if event.data_table.id != "tasks":
+            return
+        chapter_id = str(event.row_key.value)
+        chapter = next((item for item in self.chapters if item.id == chapter_id), None)
+        if chapter is not None:
+            self.push_screen(AgentDetailScreen(self.state, chapter))
 
     async def action_quit(self) -> None:
         """Cancel and drain the pipeline before closing the terminal app."""
@@ -183,6 +405,23 @@ class SwarmApp(App[bool]):
             f"Statement critical path: {critical}    isolation: {isolation}  "
             f"Lean MCP: {lean_mcp}    Codex access: {codex_access}"
         )
+        activities: list[AgentActivity] = []
+        for chapter in self.chapters:
+            run = latest_run(self.state, chapter)
+            if (
+                run is not None
+                and run.status == TaskStatus.RUNNING
+                and (activity := self.state.activities.get(run.id)) is not None
+            ):
+                activities.append(activity)
+        systemic = [
+            (count, message) for count, message in systemic_errors(activities) if count >= 2
+        ]
+        alert = ""
+        if systemic:
+            count, message = systemic[0]
+            alert = f"SYSTEMIC AGENT ALERT · {count} agents · {message}"
+        self.query_one("#alerts", Static).update(alert)
         for stage in Stage:
             counts = stage_counts(self.state, stage)
             self.query_one(f"#stage-{stage.value}", Static).update(
@@ -198,7 +437,14 @@ class SwarmApp(App[bool]):
                 self._rows_added.add(chapter.id)
             else:
                 for column, value in zip(
-                    ("book", "rank", "chapter", *(stage.value for stage in Stage), "tokens"),
+                    (
+                        "book",
+                        "rank",
+                        "chapter",
+                        *(stage.value for stage in Stage),
+                        "activity",
+                        "tokens",
+                    ),
                     values,
                     strict=True,
                 ):
@@ -212,6 +458,8 @@ class SwarmApp(App[bool]):
             statuses.append(f"{mark} ({task.rounds})" if task.rounds else mark)
         usage = chapter_usage(self.state, chapter)
         tokens = format_count(usage.api_tokens) if usage.measured else "—"
+        run = latest_run(self.state, chapter)
+        activity = self.state.activities.get(run.id) if run is not None else None
         statement_rank = self.orchestrator.statement_schedule.rank[chapter.book_id]
         proof_rank = self.orchestrator.proof_schedule.rank[chapter.book_id]
         critical = chapter.book_id in self.orchestrator.statement_schedule.critical_path
@@ -221,6 +469,7 @@ class SwarmApp(App[bool]):
             f"{statement_rank:g}/{proof_rank:g}",
             f"{chapter.number:02d} {chapter.title}",
             *statuses,
+            activity_label(activity, run),
             tokens,
         )
 

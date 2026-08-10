@@ -139,6 +139,8 @@ uv run lastlib-swarm agent status "$TARGET"
 uv run lastlib-swarm agent pause "$TARGET"
 uv run lastlib-swarm agent resume "$TARGET"
 uv run lastlib-swarm agent snapshot "$TARGET"
+uv run lastlib-swarm agent inspect "$TARGET" --chapter 8
+uv run lastlib-swarm agent inspect "$TARGET" --chapter book02/chapter-08 --follow
 uv run lastlib-swarm agent wait "$TARGET"
 ```
 
@@ -160,7 +162,9 @@ printf '%s\n' '{"command":"status"}' '{"command":"snapshot"}' \
   | uv run lastlib-swarm agent rpc "$TARGET"
 ```
 
-Accepted RPC commands are `status`, `snapshot`, `pause`, `resume`, `stop`, and `wait`. The daemon
+Accepted RPC commands are `status`, `snapshot`, `pause`, `resume`, `stop`, `wait`, and `inspect`.
+Inspection requests may include `chapter` or `run`, for example
+`{"command":"inspect","chapter":"book02/chapter-08"}`. The daemon
 stores its socket, PID, JSON result, and combined stdout/stderr log under the inferred state directory.
 After the daemon exits, `status`, `snapshot`, and `wait` fall back to the persisted offline result.
 `agent serve` exposes the same protocol in the foreground for an external process supervisor.
@@ -212,7 +216,15 @@ The dashboard shows:
 - each chapter's status and attempt count in every stage;
 - per-chapter cumulative tokens;
 - statement/proof critical-path ranks and the current statement critical path;
+- each running agent's current command, MCP call, edit, or reasoning state and failure count;
 - measured cumulative input, cached input, output, and reasoning-output tokens.
+
+Select a chapter row and press Enter (or `i`) to open its agent detail screen. It updates while the
+agent runs and has tabs for the compact event timeline, Codex todo plan, touched files, and bounded
+raw JSONL events. The header includes PID/thread id, elapsed and idle time, shell/MCP/edit counts,
+latest agent update, latest error, and measured per-run spend. Press Escape or `q` to return to the
+swarm overview. Repeated equivalent failures across agents produce a deduplicated systemic alert in
+the overview instead of requiring inspection of every chapter.
 
 “API-equivalent tokens” means `input_tokens + output_tokens` from Codex JSONL usage snapshots.
 `cached_input_tokens` is displayed separately but is already a subset of input, so it is not added a
@@ -226,7 +238,9 @@ billing arrangements are deliberately outside the state model.
 Configured state defaults to `.swarm/state.json`; inferred single-target state uses
 `.swarm/<book-id>/state.json`; inferred corpora use a deterministic
 `.swarm/corpus-<id>/state.json`. Raw JSONL agent logs live below `logs/`, with the generated final-report
-schema alongside them. Each run records its PID, Codex thread id when emitted, stage, round,
+schema alongside them. Compact `*.activity.json` sidecars retain the most recent event timeline and
+health counters without copying large command output into pipeline state. Each run records its PID,
+Codex thread id when emitted, stage, round,
 timestamps, scoped-change result, placeholder count, final report, validation tail, and usage. Writes
 are atomic.
 

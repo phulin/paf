@@ -5,9 +5,10 @@ import pytest
 from textual.widgets import Static
 
 from lastlib_swarm.config import load_config
+from lastlib_swarm.models import Stage
 from lastlib_swarm.scheduler import Orchestrator
 from lastlib_swarm.state import StateStore, TokenUsage
-from lastlib_swarm.tui import SwarmApp, format_count, format_usage
+from lastlib_swarm.tui import AgentDetailScreen, SwarmApp, format_count, format_usage
 from tests.support import write_project
 
 
@@ -77,3 +78,48 @@ async def test_quit_drains_pipeline_before_app_exit(
 
     assert operation_cleaned.is_set()
     assert shutdown_finished.is_set()
+
+
+@pytest.mark.asyncio
+async def test_selected_chapter_opens_live_agent_detail(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    ready = asyncio.Event()
+    finish = asyncio.Event()
+
+    async def operation() -> bool:
+        run = await state.start_run(config.chapters[0].id, Stage.FORMALIZE)
+        activity = state.activities.start(run.id, run.chapter_id, run.stage)
+        activity.consume(
+            {
+                "type": "item.completed",
+                "item": {
+                    "id": "mcp",
+                    "type": "mcp_tool_call",
+                    "server": "lastlib_lean",
+                    "tool": "lean_goal",
+                    "status": "failed",
+                    "result": {"content": [{"type": "text", "text": "diagnostic failed"}]},
+                },
+            },
+            workspace_root=tmp_path,
+        )
+        state.activities.save(activity)
+        ready.set()
+        await finish.wait()
+        return True
+
+    app = SwarmApp(orchestrator, operation, label="test")
+    async with app.run_test(size=(160, 50)) as pilot:
+        await ready.wait()
+        app.action_inspect_agent()
+        await pilot.pause(0.6)
+
+        assert isinstance(app.screen, AgentDetailScreen)
+        assert "✗ 1" in str(app.screen.query_one("#agent-heading", Static).content)
+        assert "diagnostic failed" in str(app.screen.query_one("#agent-error", Static).content)
+
+        await pilot.press("escape")
+        finish.set()
+        await pilot.pause(1.2)

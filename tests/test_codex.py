@@ -258,3 +258,6 @@ time.sleep(60)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
+    activity = state.activities.get(run.id)
+    assert activity is not None
+    assert activity.current == "agent cancelled"

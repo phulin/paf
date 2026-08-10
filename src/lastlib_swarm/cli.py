@@ -14,6 +14,7 @@ from typing import Any
 from rich.console import Console
 from rich.table import Table
 
+from lastlib_swarm.activity import ActivityStore
 from lastlib_swarm.config import infer_corpus, resolve_config
 from lastlib_swarm.control import (
     LOG_NAME,
@@ -155,6 +156,15 @@ def parser() -> argparse.ArgumentParser:
         _add_source(command)
     rpc = agent_commands.add_parser("rpc", help="read control commands as JSONL from stdin")
     _add_source(rpc)
+    inspect = agent_commands.add_parser("inspect", help="show one agent's live activity")
+    _add_source(inspect)
+    inspect.add_argument(
+        "--chapter", help="chapter id or number; defaults to the most recent active agent"
+    )
+    inspect.add_argument("--run", help="exact run id")
+    inspect.add_argument("--follow", action="store_true", help="refresh until the run finishes")
+    inspect.add_argument("--json", action="store_true", help="emit JSON (JSONL with --follow)")
+    inspect.add_argument("--interval", type=float, default=0.5, help="follow refresh interval")
     return root
 
 
@@ -486,6 +496,153 @@ def _offline_snapshot(config: PipelineConfig) -> dict[str, object]:
     return response
 
 
+def _inspect_snapshot(
+    config: PipelineConfig, *, chapter_selector: str | None, run_id: str | None
+) -> dict[str, Any]:
+    snapshot = _read_status(config)
+    if snapshot is None:
+        raise ValueError(f"no swarm state exists at {config.settings.state_dir}")
+    raw_tasks = snapshot.get("tasks")
+    if not isinstance(raw_tasks, dict):
+        raise ValueError("swarm state contains no task records")
+
+    candidates: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    matched_chapters: set[str] = set()
+    for value in raw_tasks.values():
+        if not isinstance(value, dict):
+            continue
+        chapter_id = str(value.get("chapter_id", ""))
+        chapter_number = str(value.get("chapter_number", ""))
+        if chapter_selector and chapter_selector not in (chapter_id, chapter_number):
+            continue
+        matched_chapters.add(chapter_id)
+        runs = value.get("runs")
+        if not isinstance(runs, list):
+            continue
+        for run in runs:
+            if isinstance(run, dict) and (run_id is None or run.get("id") == run_id):
+                candidates.append((value, run))
+    if chapter_selector and len(matched_chapters) > 1:
+        raise ValueError(
+            f"chapter number {chapter_selector} is ambiguous; pass a complete book/chapter-NN id"
+        )
+    if not candidates:
+        requested = run_id or chapter_selector or "any chapter"
+        raise ValueError(f"no agent run matches {requested}")
+
+    task, run = max(
+        candidates,
+        key=lambda pair: (
+            pair[1].get("status") == TaskStatus.RUNNING,
+            str(pair[1].get("started_at", "")),
+        ),
+    )
+    selected_run_id = str(run.get("id"))
+    activities = ActivityStore(config.settings.state_dir / "logs")
+    activity = activities.read_fresh(selected_run_id)
+    raw_log_path = run.get("log_path")
+    log_path = (
+        Path(raw_log_path)
+        if isinstance(raw_log_path, str)
+        else activities.logs_dir / f"{selected_run_id}.jsonl"
+    )
+    if activity is None:
+        activity = activities.replay(
+            selected_run_id,
+            str(task.get("chapter_id", "")),
+            str(run.get("stage", task.get("stage", ""))),
+            log_path,
+            workspace_root=config.settings.repo,
+        )
+    raw_usage = run.get("usage")
+    usage: dict[str, Any] = dict(raw_usage) if isinstance(raw_usage, dict) else {}
+    usage["api_tokens"] = int(usage.get("input_tokens", 0)) + int(usage.get("output_tokens", 0))
+    return {
+        "chapter_id": task.get("chapter_id"),
+        "chapter_title": task.get("chapter_title"),
+        "stage": run.get("stage", task.get("stage")),
+        "round": run.get("round"),
+        "task_status": task.get("status"),
+        "task_detail": task.get("detail"),
+        "run_id": selected_run_id,
+        "run_status": run.get("status"),
+        "pid": run.get("pid"),
+        "thread_id": run.get("thread_id"),
+        "started_at": run.get("started_at"),
+        "finished_at": run.get("finished_at"),
+        "usage": usage,
+        "log_path": str(log_path),
+        "activity": activity.as_dict() if activity else None,
+    }
+
+
+def _print_inspection(value: dict[str, Any], console: Console) -> None:
+    activity = value.get("activity")
+    activity = activity if isinstance(activity, dict) else {}
+    current = str(activity.get("current", "no compact activity available"))
+    failures = int(activity.get("failures", 0))
+    console.print(
+        f"[bold]{value['chapter_id']}[/bold] · {value['stage']} round {value['round']} · "
+        f"{value['run_status']}"
+    )
+    console.print(f"Current: {current}")
+    console.print(
+        f"PID {value['pid'] or '—'} · thread {value['thread_id'] or '—'} · "
+        f"commands {activity.get('commands', 0)} · MCP {activity.get('mcp_calls', 0)} · "
+        f"edits {activity.get('file_changes', 0)} · failures {failures}"
+    )
+    usage = value.get("usage")
+    if isinstance(usage, dict) and usage.get("measured"):
+        console.print(f"API-equivalent tokens: {int(usage.get('api_tokens', 0)):,}")
+    else:
+        console.print("API-equivalent tokens: pending final measured usage")
+    if summary := activity.get("latest_summary"):
+        console.print(f"Latest update: {summary}")
+    if error := activity.get("latest_error"):
+        console.print(f"[red]Latest error: {error}[/red]")
+    recent = activity.get("recent")
+    if isinstance(recent, list):
+        console.print("\n[bold]Recent timeline[/bold]")
+        for entry in recent[-20:]:
+            if not isinstance(entry, dict):
+                continue
+            detail = f" — {entry.get('detail')}" if entry.get("detail") else ""
+            console.print(
+                f"{str(entry.get('at', ''))[11:19]} {entry.get('status', '•')} "
+                f"[{entry.get('kind', 'event')}] {entry.get('title', '')}{detail}"
+            )
+    console.print(f"Raw JSONL: {value['log_path']}")
+
+
+def _inspect_agent(args: argparse.Namespace, config: PipelineConfig) -> int:
+    if args.interval <= 0:
+        raise ValueError("--interval must be positive")
+    console = Console()
+    last_marker: tuple[object, object] | None = None
+    while True:
+        value = _inspect_snapshot(
+            config,
+            chapter_selector=args.chapter,
+            run_id=args.run,
+        )
+        activity = value.get("activity")
+        sequence = activity.get("sequence") if isinstance(activity, dict) else None
+        marker = (value.get("run_status"), sequence)
+        if marker != last_marker:
+            if args.json:
+                print(json.dumps(value, sort_keys=True), flush=True)
+            else:
+                if args.follow and last_marker is not None:
+                    console.clear()
+                _print_inspection(value, console)
+            last_marker = marker
+        if not args.follow:
+            return 0
+        if value.get("run_status") != TaskStatus.RUNNING:
+            return 0 if value.get("run_status") == TaskStatus.SUCCEEDED else 1
+        time.sleep(args.interval)
+
+
 def _control_response(command: str, config: PipelineConfig) -> dict[str, object]:
     timeout = None if command == "wait" else 10.0
     try:
@@ -508,14 +665,23 @@ def _control_response(command: str, config: PipelineConfig) -> dict[str, object]
 
 
 def _agent_rpc(config: PipelineConfig) -> int:
-    allowed = {"status", "snapshot", "pause", "resume", "stop", "wait"}
+    allowed = {"status", "snapshot", "pause", "resume", "stop", "wait", "inspect"}
     failed = False
     for line in sys.stdin:
         try:
             request = json.loads(line)
             if not isinstance(request, dict) or request.get("command") not in allowed:
                 raise ValueError(f"command must be one of: {', '.join(sorted(allowed))}")
-            response = _control_response(str(request["command"]), config)
+            if request["command"] == "inspect":
+                response = _inspect_snapshot(
+                    config,
+                    chapter_selector=(
+                        str(request["chapter"]) if request.get("chapter") is not None else None
+                    ),
+                    run_id=str(request["run"]) if request.get("run") is not None else None,
+                )
+            else:
+                response = _control_response(str(request["command"]), config)
         except (json.JSONDecodeError, ValueError) as error:
             response = {"error": str(error)}
             failed = True
@@ -531,6 +697,8 @@ def _agent_command(args: argparse.Namespace, config: PipelineConfig) -> int:
         return _serve_agent(args, config)
     if command == "rpc":
         return _agent_rpc(config)
+    if command == "inspect":
+        return _inspect_agent(args, config)
     response = _control_response(command, config)
     print(json.dumps(response, sort_keys=True))
     if command == "wait":

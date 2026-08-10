@@ -1,3 +1,4 @@
+import asyncio
 import json
 import sys
 from io import StringIO
@@ -8,7 +9,8 @@ import pytest
 import lastlib_swarm.cli as cli_module
 from lastlib_swarm.cli import main, select_chapters
 from lastlib_swarm.config import load_config
-from lastlib_swarm.models import PipelineConfig
+from lastlib_swarm.models import PipelineConfig, Stage
+from lastlib_swarm.state import StateStore
 from tests.support import write_project
 
 
@@ -101,6 +103,87 @@ def test_agent_rpc_reads_jsonl_from_stdin(
     response = json.loads(capsys.readouterr().out)
     assert response["status"] == "not-started"
     assert response["scheduling"]["algorithm"] == "weighted-critical-path-list-scheduling"
+
+
+def test_agent_inspect_reports_compact_live_activity(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config_path = write_project(tmp_path, chapters="chapters = [1]")
+    config = load_config(config_path)
+    state = StateStore(config)
+
+    async def populate() -> None:
+        await state.load_or_create()
+        run = await state.start_run(config.chapters[0].id, Stage.PROVE)
+        activity = state.activities.start(run.id, run.chapter_id, run.stage)
+        activity.consume(
+            {
+                "type": "item.started",
+                "item": {
+                    "id": "command",
+                    "type": "command_execution",
+                    "command": "cd lean && lake build +Book.Chapter01",
+                    "status": "in_progress",
+                },
+            },
+            workspace_root=tmp_path,
+        )
+        state.activities.save(activity)
+
+    asyncio.run(populate())
+
+    assert (
+        main(
+            [
+                "agent",
+                "inspect",
+                "--config",
+                str(config_path),
+                "--chapter",
+                "1",
+                "--json",
+            ]
+        )
+        == 0
+    )
+    response = json.loads(capsys.readouterr().out)
+    assert response["chapter_id"] == "book/chapter-01"
+    assert response["activity"]["current"] == "shell: cd lean && lake build +Book.Chapter01"
+    assert response["run_status"] == "running"
+
+
+def test_agent_inspect_replays_legacy_jsonl_without_sidecar(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config_path = write_project(tmp_path, chapters="chapters = [1]")
+    config = load_config(config_path)
+    state = StateStore(config)
+
+    async def populate() -> None:
+        await state.load_or_create()
+        run = await state.start_run(config.chapters[0].id, Stage.FORMALIZE)
+        log_path = state.logs_dir / f"{run.id}.jsonl"
+        log_path.write_text(
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "id": "message",
+                        "type": "agent_message",
+                        "text": "working through declarations",
+                    },
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        await state.update_run(run, log_path=str(log_path))
+
+    asyncio.run(populate())
+
+    assert main(["agent", "inspect", "--config", str(config_path), "--chapter", "1", "--json"]) == 0
+    response = json.loads(capsys.readouterr().out)
+    assert response["activity"]["latest_summary"] == "working through declarations"
 
 
 def test_markdown_as_first_argument_is_pipeline_shorthand(

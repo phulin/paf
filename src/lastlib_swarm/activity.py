@@ -305,6 +305,28 @@ class ActivityStore:
         self._cache.pop(run_id, None)
         return self.get(run_id)
 
+    def replay(
+        self,
+        run_id: str,
+        chapter_id: str,
+        stage: str,
+        log_path: Path,
+        *,
+        workspace_root: Path,
+    ) -> AgentActivity | None:
+        if not log_path.is_file():
+            return None
+        activity = AgentActivity(run_id=run_id, chapter_id=chapter_id, stage=stage)
+        with log_path.open("rb") as log:
+            for line in log:
+                try:
+                    event = json.loads(line)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                activity.consume(event, workspace_root=workspace_root)
+        self._cache[run_id] = activity
+        return activity
+
 
 def systemic_errors(activities: list[AgentActivity]) -> list[tuple[int, str]]:
     counts: dict[str, int] = {}
