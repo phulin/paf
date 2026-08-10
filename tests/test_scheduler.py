@@ -58,6 +58,36 @@ def result(*, changed: bool, placeholders: int = 2) -> AgentResult:
 
 
 @pytest.mark.asyncio
+async def test_invocation_usage_excludes_persisted_attempts(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    first = StateStore(config)
+    await first.load_or_create()
+    old_run = await first.start_run(config.chapters[0].id, Stage.FORMALIZE)
+    await first.finish_run(
+        old_run,
+        status=TaskStatus.SUCCEEDED,
+        usage=TokenUsage(input_tokens=100, output_tokens=20, measured=True),
+    )
+
+    second = StateStore(config)
+    await second.load_or_create()
+
+    assert second.total_usage().api_tokens == 120
+    assert second.invocation_usage().api_tokens == 0
+    assert not second.invocation_usage().measured
+
+    new_run = await second.start_run(config.chapters[0].id, Stage.REVIEW)
+    await second.update_run(
+        new_run,
+        usage=TokenUsage(input_tokens=30, output_tokens=5, measured=True),
+    )
+
+    assert second.total_usage().api_tokens == 155
+    assert second.invocation_usage().api_tokens == 35
+    assert second.invocation_usage(config.chapters[0].id).api_tokens == 35
+
+
+@pytest.mark.asyncio
 async def test_review_requires_a_no_change_round(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

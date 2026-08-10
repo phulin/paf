@@ -38,11 +38,11 @@ def format_count(value: int) -> str:
     return f"{value / 1_000_000_000:.2f}b"
 
 
-def format_usage(usage: TokenUsage) -> str:
+def format_usage(usage: TokenUsage, *, label: str = "API-equivalent tokens") -> str:
     if not usage.measured:
-        return "API-equivalent tokens: awaiting measured usage"
+        return f"{label}: awaiting measured usage"
     return (
-        f"API-equivalent tokens: {format_count(usage.api_tokens)}  "
+        f"{label}: {format_count(usage.api_tokens)}  "
         f"input {format_count(usage.input_tokens)} "
         f"(cached {format_count(usage.cached_input_tokens)})  "
         f"output {format_count(usage.output_tokens)}  "
@@ -51,11 +51,7 @@ def format_usage(usage: TokenUsage) -> str:
 
 
 def chapter_usage(state: StateStore, chapter: Chapter) -> TokenUsage:
-    usage = TokenUsage()
-    for stage in Stage:
-        for run in state.task(chapter.id, stage).runs:
-            usage += run.usage
-    return usage
+    return state.invocation_usage(chapter.id)
 
 
 def stage_counts(state: StateStore, stage: Stage) -> dict[str, int]:
@@ -435,7 +431,8 @@ class SwarmApp(App[bool]):
     def refresh_dashboard(self) -> None:
         if not self.state.tasks:
             return
-        usage = self.state.total_usage()
+        usage = self.state.invocation_usage()
+        lifetime_usage = self.state.total_usage()
         active = sum(task.status == TaskStatus.RUNNING for task in self.state.tasks.values())
         maximum = self.orchestrator.config.settings.max_agents
         lean_mcp = "on" if self.orchestrator.config.settings.lean_mcp else "off"
@@ -448,7 +445,9 @@ class SwarmApp(App[bool]):
         critical = " → ".join(self.orchestrator.statement_schedule.critical_path) or "—"
         self._update_static(
             "#usage",
-            f"{format_usage(usage)}    active stage records: {active}  concurrency cap: {maximum}\n"
+            f"{format_usage(usage, label='This invocation')}    "
+            f"lifetime API-equivalent tokens: {format_count(lifetime_usage.api_tokens)}    "
+            f"active stage records: {active}  concurrency cap: {maximum}\n"
             f"Statement critical path: {critical}    isolation: {isolation}  "
             f"Lean MCP: {lean_mcp}    Codex access: {codex_access}",
         )

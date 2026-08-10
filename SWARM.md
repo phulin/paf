@@ -214,7 +214,7 @@ The dashboard shows:
 
 - aggregate counts for formalize, review, prove, and repair;
 - each chapter's status and attempt count in every stage;
-- per-chapter cumulative tokens;
+- per-chapter tokens for the current invocation;
 - statement/proof critical-path ranks and the current statement critical path;
 - each running agent's current command, MCP call, edit, or reasoning state and failure count;
 - measured cumulative input, cached input, output, and reasoning-output tokens.
@@ -231,12 +231,20 @@ framed incrementally rather than loaded as a whole file. Dashboard cells and sta
 only when their values change, and the raw-event tab tails newly appended bytes instead of reparsing
 the log on every refresh.
 
-“API-equivalent tokens” means `input_tokens + output_tokens` from Codex JSONL usage snapshots.
+“API-equivalent tokens” means `input_tokens + output_tokens`. The primary dashboard and CLI total is
+for attempts started by the current swarm invocation; a separately labelled lifetime total includes
+every persisted attempt in this state directory, including failed and cancelled attempts.
 `cached_input_tokens` is displayed separately but is already a subset of input, so it is not added a
-second time. Reasoning output is also shown separately and is not double-counted. If a Codex version
-does not emit recognized usage fields, the TUI says usage is awaiting measurement rather than
-inventing an estimate. This is token accounting, not a currency estimate; model prices and account
-billing arrangements are deliberately outside the state model.
+second time. Reasoning output is also shown separately and is not double-counted.
+
+Codex's stdout JSONL normally reports authoritative usage only when a turn completes. Once Codex
+reports a thread id, the orchestrator also tails that thread's local rollout token-count events and
+atomically checkpoints its latest cumulative usage into the run record. Cancellation stops the
+process, drains the rollout once more, and preserves that partial spend. The final stdout usage, when
+available, updates the same record. If a Codex version does not emit recognized usage fields in
+either stream, the TUI says usage is awaiting measurement rather than inventing an estimate. This is
+token accounting, not a currency estimate; model prices and account billing arrangements are
+deliberately outside the state model.
 
 ## State, logs, and interruption
 
@@ -244,10 +252,10 @@ Configured state defaults to `.swarm/state.json`; inferred single-target state u
 `.swarm/<book-id>/state.json`; inferred corpora use a deterministic
 `.swarm/corpus-<id>/state.json`. Raw JSONL agent logs live below `logs/`, with the generated final-report
 schema alongside them. Compact `*.activity.json` sidecars retain the most recent event timeline and
-health counters without copying large command output into pipeline state. Each run records its PID,
-Codex thread id when emitted, stage, round,
-timestamps, scoped-change result, placeholder count, final report, validation tail, and usage. Writes
-are atomic.
+health counters without copying large command output into pipeline state. An attempt record is
+written atomically before its workspace is acquired or Codex is launched. Each run records its PID,
+Codex thread id when emitted, stage, round, timestamps, scoped-change result, placeholder count,
+final report, validation tail, and incrementally checkpointed usage. Writes are atomic.
 
 Press `q` in the TUI or interrupt a headless run to terminate the active child process group. On the
 next invocation, interrupted `running` records become `pending` and can resume. Successful records

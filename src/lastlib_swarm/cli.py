@@ -32,7 +32,7 @@ from lastlib_swarm.isolation import fuse_overlay_available
 from lastlib_swarm.models import Chapter, PipelineConfig, Stage
 from lastlib_swarm.scheduler import Orchestrator
 from lastlib_swarm.state import StateStore, TaskStatus
-from lastlib_swarm.tui import format_usage, run_tui
+from lastlib_swarm.tui import format_count, format_usage, run_tui
 
 
 def _add_source(parser: argparse.ArgumentParser) -> None:
@@ -378,8 +378,10 @@ def _run(args: argparse.Namespace, config: PipelineConfig, console: Console) -> 
         succeeded = asyncio.run(_headless(orchestrator, operation))
     else:
         succeeded = run_tui(orchestrator, operation, label=label)
-    usage = state.total_usage()
-    console.print(format_usage(usage))
+    usage = state.invocation_usage()
+    lifetime_usage = state.total_usage()
+    console.print(format_usage(usage, label="This invocation"))
+    console.print(f"Lifetime API-equivalent tokens: {format_count(lifetime_usage.api_tokens)}")
     console.print("Completed successfully" if succeeded else "Finished with failures")
     return 0 if succeeded else 1
 

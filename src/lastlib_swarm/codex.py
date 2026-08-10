@@ -7,8 +7,10 @@ import re
 import shutil
 import signal
 import sys
+from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -46,6 +48,8 @@ LEAN_MCP_PROOF_TOOLS = (
     "lean_multi_attempt",
     "lean_code_actions",
 )
+
+USAGE_POLL_SECONDS = 0.25
 
 
 def lean_mcp_executable() -> Path:
@@ -204,6 +208,68 @@ def _find_report(event: Any) -> dict[str, Any] | None:
     return None
 
 
+def _rollout_usage(event: Any) -> TokenUsage | None:
+    if not isinstance(event, dict) or event.get("type") != "event_msg":
+        return None
+    payload = event.get("payload")
+    if not isinstance(payload, dict) or payload.get("type") != "token_count":
+        return None
+    info = payload.get("info")
+    if not isinstance(info, dict):
+        return None
+    return TokenUsage.from_event(info.get("total_token_usage"))
+
+
+def _codex_rollout(thread_id: str) -> Path | None:
+    codex_home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
+    sessions = codex_home / "sessions"
+    now = datetime.now(UTC)
+    for offset in (0, -1):
+        day = now + timedelta(days=offset)
+        directory = sessions / day.strftime("%Y/%m/%d")
+        if matches := tuple(directory.glob(f"rollout-*{thread_id}.jsonl")):
+            return max(matches, key=lambda path: path.stat().st_mtime_ns)
+    return None
+
+
+async def _tail_rollout_usage(
+    thread_id: str,
+    stop: asyncio.Event,
+    update: Callable[[TokenUsage], Awaitable[None]],
+) -> None:
+    path: Path | None = None
+    offset = 0
+    pending = bytearray()
+    while True:
+        if path is None:
+            path = await asyncio.to_thread(_codex_rollout, thread_id)
+        if path is not None:
+            try:
+                with path.open("rb") as handle:
+                    handle.seek(offset)
+                    chunk = handle.read()
+                    offset = handle.tell()
+            except (FileNotFoundError, OSError):
+                path = None
+                offset = 0
+                pending.clear()
+            else:
+                pending.extend(chunk)
+                while (newline := pending.find(b"\n")) >= 0:
+                    line = bytes(pending[:newline])
+                    del pending[: newline + 1]
+                    try:
+                        event = json.loads(line)
+                    except (json.JSONDecodeError, UnicodeDecodeError):
+                        continue
+                    if usage := _rollout_usage(event):
+                        await update(usage)
+        if stop.is_set():
+            return
+        with suppress(TimeoutError):
+            await asyncio.wait_for(stop.wait(), timeout=USAGE_POLL_SECONDS)
+
+
 class CodexExecutor:
     def __init__(self, config: PipelineConfig, state: StateStore) -> None:
         self.config = config
@@ -355,14 +421,28 @@ the final acceptance check, not as the interactive edit/check loop.
         report: dict[str, Any] = {}
         thread_id: str | None = None
         activity = self.state.activities.start(run.id, chapter.id, stage.value)
+        usage_stop = asyncio.Event()
+        usage_monitor: asyncio.Task[None] | None = None
+
+        async def update_usage(found: TokenUsage) -> None:
+            nonlocal usage
+            if found.api_tokens < usage.api_tokens:
+                return
+            usage = found
+            await self.state.update_run(run, usage=usage)
+
+        async def stop_usage_monitor() -> None:
+            usage_stop.set()
+            if usage_monitor is not None:
+                await usage_monitor
 
         async def consume() -> None:
-            nonlocal usage, report, thread_id
+            nonlocal usage, report, thread_id, usage_monitor
             with log_path.open("wb", buffering=0) as log:
                 pending = bytearray()
 
                 async def consume_line(line: bytes) -> None:
-                    nonlocal usage, report, thread_id
+                    nonlocal usage, report, thread_id, usage_monitor
                     try:
                         event = json.loads(line)
                     except (json.JSONDecodeError, UnicodeDecodeError):
@@ -372,9 +452,12 @@ the final acceptance check, not as the interactive edit/check loop.
                     if found := _find_thread_id(event):
                         thread_id = found
                         await self.state.update_run(run, thread_id=found)
+                        if usage_monitor is None:
+                            usage_monitor = asyncio.create_task(
+                                _tail_rollout_usage(found, usage_stop, update_usage)
+                            )
                     if found_usage := TokenUsage.from_event(event):
-                        usage = found_usage
-                        await self.state.update_run(run, usage=usage)
+                        await update_usage(found_usage)
                     if found_report := _find_report(event):
                         report = found_report
 
@@ -406,10 +489,14 @@ the final acceptance check, not as the interactive edit/check loop.
             consumer.cancel()
             with suppress(asyncio.CancelledError):
                 await consumer
+            await stop_usage_monitor()
             activity.finish("cancelled", "agent cancelled by orchestrator")
             self.state.activities.save(activity)
             raise
-        await consumer
+        try:
+            await consumer
+        finally:
+            await stop_usage_monitor()
         changed = before != scope_digest(root, chapter)
         placeholders = count_placeholders(root, chapter)
         error = "agent timed out" if timed_out else ""

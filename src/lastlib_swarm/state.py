@@ -127,6 +127,7 @@ class StateStore:
         self.logs_dir = config.settings.state_dir / "logs"
         self.activities = ActivityStore(self.logs_dir)
         self._lock = asyncio.Lock()
+        self._prior_run_ids: set[str] = set()
         self.tasks: dict[str, TaskRecord] = {}
         self.scheduling: dict[str, Any] = {}
         self.isolation: dict[str, Any] = {}
@@ -159,6 +160,7 @@ class StateStore:
             for stage in Stage:
                 key = self.key(chapter.id, stage)
                 self.tasks.setdefault(key, self._new_task(chapter, stage))
+        self._prior_run_ids = {run.id for task in self.tasks.values() for run in task.runs}
         for task in self.tasks.values():
             if task.status == TaskStatus.RUNNING:
                 task.status = TaskStatus.PENDING
@@ -189,12 +191,15 @@ class StateStore:
 
     def snapshot(self) -> dict[str, Any]:
         usage = self.total_usage()
+        invocation_usage = self.invocation_usage()
         return {
             "version": 1,
             "config": str(self.config.path),
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "usage": asdict(usage) | {"api_tokens": usage.api_tokens},
+            "invocation_usage": asdict(invocation_usage)
+            | {"api_tokens": invocation_usage.api_tokens},
             "scheduling": self.scheduling,
             "isolation": self.isolation,
             "tasks": {key: asdict(value) for key, value in sorted(self.tasks.items())},
@@ -205,6 +210,18 @@ class StateStore:
         for task in self.tasks.values():
             for run in task.runs:
                 total += run.usage
+        return total
+
+    def invocation_usage(self, chapter_id: str | None = None) -> TokenUsage:
+        """Usage from attempts created by this orchestrator invocation."""
+
+        total = TokenUsage()
+        for task in self.tasks.values():
+            if chapter_id is not None and task.chapter_id != chapter_id:
+                continue
+            for run in task.runs:
+                if run.id not in self._prior_run_ids:
+                    total += run.usage
         return total
 
     def task(self, chapter_id: str, stage: Stage) -> TaskRecord:

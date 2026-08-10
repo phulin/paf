@@ -8,6 +8,7 @@ import pytest
 
 from lastlib_swarm.codex import (
     CodexExecutor,
+    _rollout_usage,
     count_placeholders,
     lean_mcp_executable,
     lean_mcp_path,
@@ -37,6 +38,30 @@ def test_extracts_api_equivalent_usage() -> None:
     assert usage.cached_input_tokens == 40
     assert usage.reasoning_output_tokens == 12
     assert usage.measured
+
+
+def test_extracts_live_rollout_usage() -> None:
+    usage = _rollout_usage(
+        {
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "total_token_usage": {
+                        "input_tokens": 400,
+                        "cached_input_tokens": 300,
+                        "output_tokens": 25,
+                        "reasoning_output_tokens": 10,
+                        "total_tokens": 425,
+                    }
+                },
+            },
+        }
+    )
+
+    assert usage is not None
+    assert usage.api_tokens == 425
+    assert usage.cached_input_tokens == 300
 
 
 def test_counts_only_lean_code_placeholders(tmp_path: Path) -> None:
@@ -224,22 +249,37 @@ print(json.dumps({"type": "item.completed", "item": {
 
 
 @pytest.mark.asyncio
-async def test_executor_flushes_jsonl_while_agent_is_running(tmp_path: Path) -> None:
+async def test_executor_flushes_jsonl_while_agent_is_running(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
     fake_codex = tmp_path / "slow-codex"
+    codex_home = tmp_path / "codex-home"
     fake_codex.write_text(
         """#!/usr/bin/env python3
 import json
+import os
 import sys
 import time
+from datetime import UTC, datetime
+from pathlib import Path
 
 sys.stdin.read()
-print(json.dumps({"type": "thread.started", "thread_id": "visible-now"}), flush=True)
+thread_id = "visible-now"
+session = Path(os.environ["CODEX_HOME"]) / "sessions" / datetime.now(UTC).strftime("%Y/%m/%d")
+session.mkdir(parents=True)
+rollout = session / f"rollout-test-{thread_id}.jsonl"
+rollout.write_text(json.dumps({"type": "event_msg", "payload": {
+    "type": "token_count", "info": {"total_token_usage": {
+        "input_tokens": 100, "cached_input_tokens": 80, "output_tokens": 25,
+        "reasoning_output_tokens": 10, "total_tokens": 125}}}}) + "\\n")
+print(json.dumps({"type": "thread.started", "thread_id": thread_id}), flush=True)
 time.sleep(60)
 """,
         encoding="utf-8",
     )
     fake_codex.chmod(0o755)
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
     config = replace(config, settings=replace(config.settings, codex_bin=str(fake_codex)))
     state = StateStore(config)
     await state.load_or_create()
@@ -250,10 +290,11 @@ time.sleep(60)
     log_path = state.logs_dir / f"{run.id}.jsonl"
     try:
         for _ in range(100):
-            if log_path.is_file() and log_path.stat().st_size:
+            if log_path.is_file() and log_path.stat().st_size and run.usage.measured:
                 break
             await asyncio.sleep(0.01)
         assert "visible-now" in log_path.read_text(encoding="utf-8")
+        assert run.usage.api_tokens == 125
     finally:
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -261,3 +302,7 @@ time.sleep(60)
     activity = state.activities.get(run.id)
     assert activity is not None
     assert activity.current == "agent cancelled"
+    reloaded = json.loads(state.path.read_text(encoding="utf-8"))
+    persisted = reloaded["tasks"][f"{run.chapter_id}:review"]["runs"][-1]["usage"]
+    assert persisted["input_tokens"] == 100
+    assert persisted["output_tokens"] == 25
