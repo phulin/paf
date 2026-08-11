@@ -1,15 +1,27 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import heapq
 import re
-from collections.abc import AsyncIterator, Callable, Coroutine, Iterable
+from collections.abc import AsyncIterator, Coroutine, Iterable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from typing import Any
 
-from lastlib_swarm.codex import AgentResult, CodexExecutor, ValidationResult, validate
-from lastlib_swarm.corpus import build_corpus_schedule, scheduling_snapshot
+from lastlib_swarm.codex import (
+    AgentResult,
+    CodexExecutor,
+    ValidationResult,
+    scope_digest,
+    validate,
+)
+from lastlib_swarm.corpus import (
+    ChapterImportGraph,
+    build_chapter_import_graph,
+    build_corpus_schedule,
+    scheduling_snapshot,
+)
 from lastlib_swarm.diagnostics import unexpected_lean_warnings
 from lastlib_swarm.isolation import IsolationResult, create_isolation
 from lastlib_swarm.models import Chapter, PipelineConfig, Stage
@@ -322,6 +334,84 @@ class Orchestrator:
         """Create configured chapter directories without creating Lean files."""
 
         scaffold_directories(self.config, self.chapters)
+
+    def _observed_chapter_graph(self) -> ChapterImportGraph:
+        return build_chapter_import_graph(self.config.settings.repo, self.chapters)
+
+    @staticmethod
+    def _fixup_certificate(
+        source: str,
+        dependencies: frozenset[str],
+        clean: dict[str, dict[str, Any]],
+    ) -> str:
+        digest = hashlib.sha256()
+        digest.update(source.encode())
+        for dependency in sorted(dependencies):
+            digest.update(b"\0")
+            digest.update(dependency.encode())
+            digest.update(b"\0")
+            digest.update(str(clean[dependency]["certificate"]).encode())
+        return digest.hexdigest()
+
+    def _retain_fixup_clean(
+        self,
+        graph: ChapterImportGraph,
+        records: dict[str, Any],
+    ) -> dict[str, dict[str, Any]]:
+        """Retain build certificates whose sources and observed prerequisites still match."""
+
+        by_id = {chapter.id: chapter for chapter in self.chapters}
+        retained: dict[str, dict[str, Any]] = {}
+        for chapter_id in graph.order:
+            required = graph.dependencies[chapter_id]
+            if not required.issubset(retained):
+                continue
+            record = records.get(chapter_id)
+            if not isinstance(record, dict):
+                continue
+            source = scope_digest(self.config.settings.repo, by_id[chapter_id])
+            certificate = self._fixup_certificate(source, required, retained)
+            if record.get("source_digest") == source and record.get("certificate") == certificate:
+                retained[chapter_id] = dict(record)
+        return retained
+
+    @staticmethod
+    def _invalidate_fixup_descendants(
+        graph: ChapterImportGraph,
+        clean: dict[str, dict[str, Any]],
+        chapter_ids: Iterable[str],
+    ) -> None:
+        pending = list(chapter_ids)
+        invalidated: set[str] = set()
+        while pending:
+            chapter_id = pending.pop()
+            if chapter_id in invalidated:
+                continue
+            invalidated.add(chapter_id)
+            pending.extend(graph.successors.get(chapter_id, ()))
+        for chapter_id in invalidated:
+            clean.pop(chapter_id, None)
+
+    async def _save_fixup_graph(
+        self,
+        graph: ChapterImportGraph,
+        clean: dict[str, dict[str, Any]],
+        *,
+        build_generation: int,
+    ) -> int:
+        previous = self.state.fixup_graph
+        previous_edges = previous.get("edges") if isinstance(previous, dict) else None
+        edges = [list(edge) for edge in graph.edges]
+        revision = int(previous.get("revision", 0)) if isinstance(previous, dict) else 0
+        if previous.get("algorithm") != "observed-lean-imports" or previous_edges != edges:
+            revision += 1
+        self.state.fixup_graph = graph.snapshot() | {
+            "revision": revision,
+            "build_generation": build_generation,
+            "clean": clean,
+        }
+        await self.state.save()
+        return revision
 
     def _scope_exists(self, chapter: Chapter) -> bool:
         repo = self.config.settings.repo
@@ -687,7 +777,7 @@ class Orchestrator:
             deferred_owner_ids=deferred,
         )
 
-    async def _fixup_agent(self, chapter: Chapter, feedback: str) -> bool:
+    async def _fixup_agent(self, chapter: Chapter, feedback: str) -> Attempt | None:
         maximum = self.config.stages[Stage.FIXUP].max_rounds
         task = self.state.task(chapter.id, Stage.FIXUP)
         attempt = await self._attempt(
@@ -704,106 +794,203 @@ class Orchestrator:
                 "fixup complete; awaiting coordinator rebuild",
                 phase=TaskPhase.AWAITING_REBUILD,
             )
-            return True
+            return attempt
         await self.state.set_task(
             chapter.id,
             Stage.FIXUP,
             TaskStatus.FAILED,
             "fixup agent failed",
         )
-        return False
+        return None
 
     async def _fixup_to_clean(self, feedback: dict[str, str] | None = None) -> bool:
-        pending = dict(feedback or {})
+        pending_feedback = dict(feedback or {})
         by_id = {chapter.id: chapter for chapter in self.chapters}
         maximum = self.config.stages[Stage.FIXUP].max_rounds
-        for iteration in range(1, maximum + 1):
-            if pending:
-                outcomes = await _gather_cancel_on_error(
-                    self._fixup_agent(by_id[chapter_id], diagnostic)
-                    for chapter_id, diagnostic in pending.items()
-                    if chapter_id in by_id
-                )
-                if not all(outcomes):
-                    return False
-            results = await self._build_all(
-                iteration=iteration,
-                maximum_iterations=maximum,
-            )
-            if all(result.succeeded for result in results.values()):
-                for chapter in self.chapters:
-                    await self.state.set_task(
-                        chapter.id,
-                        Stage.FIXUP,
-                        TaskStatus.SUCCEEDED,
-                        f"clean coordinator build after {iteration} iteration(s)",
+        attempts = {chapter_id: 0 for chapter_id in by_id}
+        persisted_clean = self.state.fixup_graph.get("clean", {})
+        clean_records = persisted_clean if isinstance(persisted_clean, dict) else {}
+        build_generation = int(self.state.fixup_graph.get("build_generation", 0))
+
+        def merge_feedback(items: dict[str, str]) -> None:
+            for chapter_id, diagnostic in items.items():
+                if chapter_id not in by_id:
+                    continue
+                existing = pending_feedback.get(chapter_id, "")
+                if diagnostic not in existing:
+                    pending_feedback[chapter_id] = (
+                        f"{existing}\n\n{diagnostic}" if existing else diagnostic
                     )
-                return True
-            pending = self._build_feedback(results).actionable
-            if not pending:
-                break
-        for chapter in self.chapters:
-            await self.state.set_task(
-                chapter.id,
+
+        try:
+            graph = self._observed_chapter_graph()
+        except ValueError as error:
+            self.state.fixup_graph = {"algorithm": "observed-lean-imports", "error": str(error)}
+            await self.state.save()
+            await self.state.set_tasks(
+                by_id,
                 Stage.FIXUP,
                 TaskStatus.FAILED,
-                f"global build did not become clean in {maximum} iterations",
+                str(error),
             )
+            return False
+
+        clean = self._retain_fixup_clean(graph, clean_records)
+        self._invalidate_fixup_descendants(graph, clean, pending_feedback)
+        await self._save_fixup_graph(
+            graph,
+            clean,
+            build_generation=build_generation,
+        )
+
+        while True:
+            await self.control.checkpoint()
+            try:
+                rescanned = self._observed_chapter_graph()
+            except ValueError as error:
+                self.state.fixup_graph = {
+                    "algorithm": "observed-lean-imports",
+                    "error": str(error),
+                }
+                await self.state.save()
+                await self.state.set_tasks(
+                    by_id,
+                    Stage.FIXUP,
+                    TaskStatus.FAILED,
+                    str(error),
+                )
+                return False
+
+            graph_changed = rescanned.edges != graph.edges
+            graph = rescanned
+            clean = self._retain_fixup_clean(graph, clean)
+            await self._save_fixup_graph(
+                graph,
+                clean,
+                build_generation=build_generation,
+            )
+
+            if len(clean) == len(by_id) and not pending_feedback:
+                ordered = tuple(by_id[chapter_id] for chapter_id in graph.order)
+                results = await self._build_chapters(
+                    ordered,
+                    publish_if_clean=True,
+                    mode="stable-topological",
+                    iteration=1,
+                    maximum_iterations=1,
+                )
+                verified = self._observed_chapter_graph()
+                clean = self._retain_fixup_clean(verified, clean)
+                if (
+                    all(result.succeeded for result in results.values())
+                    and verified.edges == graph.edges
+                    and len(clean) == len(by_id)
+                ):
+                    build_generation += 1
+                    for record in clean.values():
+                        record["build_generation"] = build_generation
+                    await self._save_fixup_graph(
+                        verified,
+                        clean,
+                        build_generation=build_generation,
+                    )
+                    await self.state.set_tasks(
+                        by_id,
+                        Stage.FIXUP,
+                        TaskStatus.SUCCEEDED,
+                        "stable clean build in observed import order",
+                    )
+                    return True
+                graph = verified
+                diagnostics = self._build_feedback(results).actionable
+                merge_feedback(diagnostics)
+                self._invalidate_fixup_descendants(graph, clean, diagnostics)
+                if not diagnostics and not graph_changed:
+                    break
+                continue
+
+            actionable = [
+                chapter_id
+                for chapter_id in graph.order
+                if chapter_id in pending_feedback and graph.dependencies[chapter_id].issubset(clean)
+            ]
+            ready = [
+                chapter_id
+                for chapter_id in graph.order
+                if chapter_id not in clean and graph.dependencies[chapter_id].issubset(clean)
+            ]
+            if not actionable and not ready:
+                break
+            chapter_id = actionable[0] if actionable else ready[0]
+            chapter = by_id[chapter_id]
+
+            if chapter_id in pending_feedback:
+                if attempts[chapter_id] >= maximum:
+                    await self.state.set_task(
+                        chapter_id,
+                        Stage.FIXUP,
+                        TaskStatus.FAILED,
+                        f"fixup did not converge in {maximum} attempts",
+                    )
+                    return False
+                attempts[chapter_id] += 1
+                attempt = await self._fixup_agent(
+                    chapter,
+                    pending_feedback.pop(chapter_id),
+                )
+                if attempt is None:
+                    return False
+                if attempt.agent.changed:
+                    clean.pop(chapter_id, None)
+                    continue
+
+            result = (
+                await self._build_chapters(
+                    (chapter,),
+                    publish_if_clean=True,
+                    mode="topological",
+                    iteration=self.state.task(chapter_id, Stage.FIXUP).rounds + 1,
+                    maximum_iterations=maximum,
+                )
+            )[chapter_id]
+            if result.succeeded:
+                source = scope_digest(self.config.settings.repo, chapter)
+                certificate = self._fixup_certificate(
+                    source,
+                    graph.dependencies[chapter_id],
+                    clean,
+                )
+                build_generation += 1
+                clean[chapter_id] = {
+                    "source_digest": source,
+                    "certificate": certificate,
+                    "build_generation": build_generation,
+                }
+                await self._save_fixup_graph(
+                    graph,
+                    clean,
+                    build_generation=build_generation,
+                )
+                continue
+
+            diagnostics = self._build_feedback({chapter_id: result}).actionable
+            merge_feedback(diagnostics)
+            self._invalidate_fixup_descendants(graph, clean, diagnostics or (chapter_id,))
+
+        await self.state.set_tasks(
+            by_id,
+            Stage.FIXUP,
+            TaskStatus.FAILED,
+            "observed-import fixup could not select a dependency-ready chapter",
+        )
         return False
 
-    async def _opportunistic_fixup(
-        self,
-        completed_ids: set[str],
-        active_formalizer_ids: set[str],
-        *,
-        newer_drafts_ready: Callable[[], bool],
-    ) -> bool:
-        """Build and fix completed drafts while unrelated formalizers keep running."""
-
-        completed = tuple(chapter for chapter in self.chapters if chapter.id in completed_ids)
-        if not completed:
-            return True
-        maximum = self.config.stages[Stage.FIXUP].max_rounds
-        deferred = False
-        for iteration in range(1, maximum + 1):
-            results = await self._build_chapters(
-                completed,
-                publish_if_clean=False,
-                mode="streaming",
-                iteration=iteration,
-                maximum_iterations=maximum,
-            )
-            if all(result.succeeded for result in results.values()):
-                return True
-
-            diagnostics = self._build_feedback(
-                results,
-                blocked_owner_ids=active_formalizer_ids,
-            )
-            deferred = bool(diagnostics.deferred_owner_ids)
-            if newer_drafts_ready():
-                return True
-            if not diagnostics.actionable:
-                return deferred
-            by_id = {chapter.id: chapter for chapter in completed}
-            outcomes = await _gather_cancel_on_error(
-                self._fixup_agent(by_id[chapter_id], feedback)
-                for chapter_id, feedback in diagnostics.actionable.items()
-                if chapter_id in by_id
-            )
-            if not all(outcomes):
-                return False
-            if newer_drafts_ready():
-                return True
-        return deferred
-
-    async def _formalize_all(self, *, streaming_fixup: bool) -> bool:
+    async def _formalize_all(self) -> bool:
         """Run every formalizer, requeueing capacity-deferred chapters at the back."""
 
         running = {
             asyncio.create_task(self._formalize(chapter)): chapter for chapter in self.chapters
         }
-        completed_ids: set[str] = set()
         had_failure = False
         try:
             while running:
@@ -811,33 +998,17 @@ class Orchestrator:
                 for task in done:
                     chapter = running.pop(task)
                     outcome = task.result()
-                    if outcome.succeeded:
-                        completed_ids.add(chapter.id)
-                    elif outcome.capacity_deferred:
+                    if outcome.capacity_deferred:
                         retry = asyncio.create_task(self._formalize(chapter, rerun=True))
                         running[retry] = chapter
-                    else:
+                    elif not outcome.succeeded:
                         had_failure = True
-                if not streaming_fixup:
-                    continue
-                active_ids = {chapter.id for chapter in running.values()}
-                if not await self._opportunistic_fixup(
-                    completed_ids,
-                    active_ids,
-                    newer_drafts_ready=lambda: any(task.done() for task in running),
-                ):
-                    had_failure = True
         except BaseException:
             for task in running:
                 task.cancel()
             await asyncio.gather(*running, return_exceptions=True)
             raise
         return not had_failure
-
-    async def _formalize_with_streaming_fixup(self) -> bool:
-        """Stream completed formalizations through targeted build/fixup batches."""
-
-        return await self._formalize_all(streaming_fixup=True)
 
     async def _review_once(self, chapter: Chapter, *, rerun: bool = False) -> ReviewOutcome:
         if not rerun and self._already_done(chapter, Stage.REVIEW):
@@ -939,11 +1110,11 @@ class Orchestrator:
             )
             return all(outcome.succeeded and not outcome.needs_fixup for outcome in outcomes)
         if stage is Stage.FORMALIZE:
-            return await self._formalize_all(streaming_fixup=False)
+            return await self._formalize_all()
         return all(await _gather_cancel_on_error(self._prove(chapter) for chapter in self.chapters))
 
     async def run_pipeline(self) -> bool:
-        if not await self._formalize_with_streaming_fixup():
+        if not await self._formalize_all():
             return False
         if not await self._fixup_to_clean():
             return False

@@ -185,6 +185,7 @@ class StateStore:
         self.tasks: dict[str, TaskRecord] = {}
         self.source_issues: dict[str, SourceIssueRecord] = {}
         self.scheduling: dict[str, Any] = {}
+        self.fixup_graph: dict[str, Any] = {}
         self.isolation: dict[str, Any] = {}
         self.coordinator_build = CoordinatorBuildRecord()
         self.created_at = timestamp()
@@ -208,6 +209,8 @@ class StateStore:
             self.updated_at = str(raw.get("updated_at", self.created_at))
             if not self.scheduling and isinstance(raw.get("scheduling"), dict):
                 self.scheduling = raw["scheduling"]
+            if not self.fixup_graph and isinstance(raw.get("fixup_graph"), dict):
+                self.fixup_graph = raw["fixup_graph"]
             if not self.isolation and isinstance(raw.get("isolation"), dict):
                 self.isolation = raw["isolation"]
             raw_build = raw.get("coordinator_build")
@@ -302,7 +305,7 @@ class StateStore:
         cost = self.total_cost()
         invocation_cost = self.invocation_cost()
         return {
-            "version": 5,
+            "version": 6,
             "config": str(self.config.path),
             "created_at": self.created_at,
             "updated_at": self.updated_at,
@@ -313,6 +316,7 @@ class StateStore:
             "invocation_cost": invocation_cost.as_dict(),
             "agents": self.agent_summary(),
             "scheduling": self.scheduling,
+            "fixup_graph": self.fixup_graph,
             "isolation": self.isolation,
             "coordinator_build": asdict(self.coordinator_build),
             "source_issues": [asdict(issue) for _, issue in sorted(self.source_issues.items())],

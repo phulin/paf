@@ -9,7 +9,7 @@ import pytest
 import lastlib_swarm.scheduler as scheduler_module
 from lastlib_swarm.codex import AgentResult, CodexExecutor, ValidationResult
 from lastlib_swarm.config import load_config
-from lastlib_swarm.models import Chapter, Stage
+from lastlib_swarm.models import Chapter, PipelineConfig, Stage
 from lastlib_swarm.scheduler import FormalizeOutcome, Orchestrator
 from lastlib_swarm.state import RunRecord, StateStore, TaskPhase, TaskStatus, TokenUsage
 from tests.support import write_project
@@ -58,8 +58,7 @@ def test_coordinator_build_output_shortens_diagnostic_paths(tmp_path: Path) -> N
 
     assert state.coordinator_build.output_tail == [
         "error: [Book 5 Chap 7 Sec 7: Why Frobenius Is Canonical]:12:3: broken",
-        "warning: [Book 5 Chap 7 Sec 7: Why Frobenius Is Canonical]:13:3: "
-        "declaration uses `sorry`",
+        "warning: [Book 5 Chap 7 Sec 7: Why Frobenius Is Canonical]:13:3: declaration uses `sorry`",
         "warning: [Book 5 Chap 7 Sec 7: Why Frobenius Is Canonical]:14:3: unused variable",
     ]
     assert state.coordinator_build.error_count == 1
@@ -152,6 +151,26 @@ async def test_state_migrates_legacy_repair_tasks_to_fixup(tmp_path: Path) -> No
     assert migrated.phase == TaskPhase.IDLE
     assert migrated.runs[0].stage == "fixup"
     assert not reloaded.coordinator_build.active
+
+
+@pytest.mark.asyncio
+async def test_state_persists_fixup_graph(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    state = StateStore(config)
+    await state.load_or_create()
+    state.fixup_graph = {
+        "algorithm": "observed-lean-imports",
+        "revision": 3,
+        "edges": [],
+        "clean": {config.chapters[0].id: {"certificate": "abc"}},
+    }
+    await state.save()
+
+    reloaded = StateStore(config)
+    await reloaded.load_or_create()
+
+    assert reloaded.fixup_graph == state.fixup_graph
+    assert reloaded.snapshot()["version"] == 6
 
 
 @pytest.mark.asyncio
@@ -302,6 +321,7 @@ async def test_fixup_repeats_coordinator_build_and_hands_back_diagnostics(
         (
             ValidationResult(False, 1, "error: Book/Chapter01/Section.lean:4:1: broken"),
             ValidationResult(True, 0, "ok"),
+            ValidationResult(True, 0, "ok"),
         )
     )
 
@@ -316,6 +336,262 @@ async def test_fixup_repeats_coordinator_build_and_hands_back_diagnostics(
     assert "Book/Chapter01/Section.lean:4:1: broken" in feedback_seen[0]
     assert state.task(config.chapters[0].id, Stage.FIXUP).rounds == 1
     await orchestrator.shutdown()
+
+
+def with_lastlib_modules(config: PipelineConfig) -> PipelineConfig:
+    return replace(
+        config,
+        chapters=tuple(
+            replace(
+                chapter,
+                chapter_module=f"LastLib.Book.Chapter{chapter.number:02d}",
+            )
+            for chapter in config.chapters
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_fixup_builds_in_observed_chapter_import_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = with_lastlib_modules(
+        load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    )
+    first, second = config.chapters
+    (tmp_path / "lean" / "Book").mkdir(parents=True)
+    (tmp_path / "lean" / "Book" / "Chapter01.lean").write_text(
+        "import LastLib.Book.Chapter02\n",
+        encoding="utf-8",
+    )
+    for chapter in (second,):
+        (tmp_path / "lean" / "Book" / f"Chapter{chapter.number:02d}.lean").write_text(
+            f"def chapter{chapter.number} := {chapter.number}\n",
+            encoding="utf-8",
+        )
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await orchestrator.prepare()
+    builds: list[str] = []
+
+    async def successful_validation(
+        _config: object,
+        chapter: Chapter,
+        **_kwargs: object,
+    ) -> ValidationResult:
+        builds.append(chapter.id)
+        return ValidationResult(True, 0, "ok")
+
+    monkeypatch.setattr(scheduler_module, "validate", successful_validation)
+
+    assert await orchestrator.run_stage(Stage.FIXUP)
+    assert builds == [
+        second.id,
+        first.id,
+        second.id,
+        first.id,
+    ]
+    assert state.fixup_graph["edges"] == [[second.id, first.id]]
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_fixup_rescans_new_import_before_rebuilding_edited_chapter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = with_lastlib_modules(
+        load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    )
+    first, second = config.chapters
+    source_root = tmp_path / "lean" / "Book"
+    source_root.mkdir(parents=True)
+    for chapter in config.chapters:
+        (source_root / f"Chapter{chapter.number:02d}.lean").write_text(
+            f"def chapter{chapter.number} := {chapter.number}\n",
+            encoding="utf-8",
+        )
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await orchestrator.prepare()
+    events: list[str] = []
+    first_failed = False
+
+    class ImportingExecutor(FakeExecutor):
+        async def run(
+            self,
+            chapter: Chapter,
+            stage: Stage,
+            run: RunRecord,
+            *,
+            feedback: str = "",
+            workspace_root: Path | None = None,
+        ) -> AgentResult:
+            assert chapter.id == first.id
+            assert stage is Stage.FIXUP
+            assert workspace_root is not None
+            assert "broken" in feedback
+            events.append(f"agent:{chapter.id}")
+            (workspace_root / "lean" / "Book" / "Chapter01.lean").write_text(
+                "import LastLib.Book.Chapter02\ndef chapter1 := 1\n",
+                encoding="utf-8",
+            )
+            agent = result(changed=True)
+            await state.finish_run(
+                run,
+                status=TaskStatus.SUCCEEDED,
+                changed=True,
+                placeholders=agent.placeholders,
+                report=agent.report,
+                usage=agent.usage,
+            )
+            return agent
+
+    orchestrator.executor = ImportingExecutor(state, [])
+
+    async def validation(
+        _config: object,
+        chapter: Chapter,
+        **_kwargs: object,
+    ) -> ValidationResult:
+        nonlocal first_failed
+        events.append(f"build:{chapter.id}")
+        if chapter.id == first.id and not first_failed:
+            first_failed = True
+            return ValidationResult(
+                False,
+                1,
+                "error: Book/Chapter01.lean:1:1: broken",
+            )
+        return ValidationResult(True, 0, "ok")
+
+    monkeypatch.setattr(scheduler_module, "validate", validation)
+
+    assert await orchestrator.run_stage(Stage.FIXUP)
+    assert events[:4] == [
+        f"build:{first.id}",
+        f"agent:{first.id}",
+        f"build:{second.id}",
+        f"build:{first.id}",
+    ]
+    assert state.fixup_graph["edges"] == [[second.id, first.id]]
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_fixup_builds_each_patch_before_starting_the_next_agent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    source_root = tmp_path / "lean" / "Book"
+    source_root.mkdir(parents=True)
+    for chapter in config.chapters:
+        (source_root / f"Chapter{chapter.number:02d}.lean").write_text(
+            f"def chapter{chapter.number} := {chapter.number}\n",
+            encoding="utf-8",
+        )
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await orchestrator.prepare()
+    fixed: set[str] = set()
+    events: list[str] = []
+
+    class FixingExecutor(FakeExecutor):
+        async def run(
+            self,
+            chapter: Chapter,
+            stage: Stage,
+            run: RunRecord,
+            *,
+            feedback: str = "",
+            workspace_root: Path | None = None,
+        ) -> AgentResult:
+            assert stage is Stage.FIXUP
+            assert workspace_root is not None
+            assert "broken" in feedback
+            events.append(f"agent:{chapter.id}")
+            fixed.add(chapter.id)
+            path = workspace_root / "lean" / "Book" / f"Chapter{chapter.number:02d}.lean"
+            path.write_text(path.read_text(encoding="utf-8") + "-- fixed\n", encoding="utf-8")
+            agent = result(changed=True)
+            await state.finish_run(
+                run,
+                status=TaskStatus.SUCCEEDED,
+                changed=True,
+                placeholders=agent.placeholders,
+                report=agent.report,
+                usage=agent.usage,
+            )
+            return agent
+
+    orchestrator.executor = FixingExecutor(state, [])
+
+    async def validation(
+        _config: object,
+        chapter: Chapter,
+        **_kwargs: object,
+    ) -> ValidationResult:
+        events.append(f"build:{chapter.id}")
+        if chapter.id not in fixed:
+            return ValidationResult(
+                False,
+                1,
+                f"error: Book/Chapter{chapter.number:02d}.lean:1:1: broken",
+            )
+        return ValidationResult(True, 0, "ok")
+
+    monkeypatch.setattr(scheduler_module, "validate", validation)
+
+    assert await orchestrator.run_stage(Stage.FIXUP)
+    first, second = config.chapters
+    assert events[:6] == [
+        f"build:{first.id}",
+        f"agent:{first.id}",
+        f"build:{first.id}",
+        f"build:{second.id}",
+        f"agent:{second.id}",
+        f"build:{second.id}",
+    ]
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_fixup_reuses_valid_persisted_build_certificates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    source_root = tmp_path / "lean" / "Book"
+    source_root.mkdir(parents=True)
+    for chapter in config.chapters:
+        (source_root / f"Chapter{chapter.number:02d}.lean").write_text(
+            f"def chapter{chapter.number} := {chapter.number}\n",
+            encoding="utf-8",
+        )
+    builds: list[str] = []
+
+    async def successful_validation(
+        _config: object,
+        chapter: Chapter,
+        **_kwargs: object,
+    ) -> ValidationResult:
+        builds.append(chapter.id)
+        return ValidationResult(True, 0, "ok")
+
+    monkeypatch.setattr(scheduler_module, "validate", successful_validation)
+    first_state = StateStore(config)
+    first = Orchestrator(config, first_state)
+    await first.prepare()
+    assert await first.run_stage(Stage.FIXUP)
+    await first.shutdown()
+    assert len(builds) == 4
+
+    builds.clear()
+    second_state = StateStore(config)
+    second = Orchestrator(config, second_state)
+    await second.prepare()
+    assert await second.run_stage(Stage.FIXUP)
+
+    assert builds == [chapter.id for chapter in config.chapters]
+    await second.shutdown()
 
 
 def test_build_feedback_routes_only_source_located_non_sorry_diagnostics(
@@ -417,45 +693,6 @@ def test_build_feedback_falls_back_to_build_target_for_unlocated_failure(
 
 
 @pytest.mark.asyncio
-async def test_completed_drafts_enter_fixup_before_all_formalizers_finish(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
-    orchestrator = Orchestrator(config, StateStore(config))
-    release_second = asyncio.Event()
-    events: list[str] = []
-
-    async def formalize(chapter: Chapter, *, rerun: bool = False) -> FormalizeOutcome:
-        assert not rerun
-        if chapter.number == 2:
-            events.append("formalize-2-waiting")
-            await release_second.wait()
-            events.append("formalize-2-finished")
-            return FormalizeOutcome(True)
-        events.append("formalize-1-finished")
-        return FormalizeOutcome(True)
-
-    async def opportunistic_fixup(
-        completed_ids: set[str],
-        active_formalizer_ids: set[str],
-        *,
-        newer_drafts_ready: object,
-    ) -> bool:
-        del newer_drafts_ready
-        events.append("fixup-wave")
-        assert config.chapters[0].id in completed_ids
-        if config.chapters[1].id in active_formalizer_ids:
-            release_second.set()
-        return True
-
-    monkeypatch.setattr(orchestrator, "_formalize", formalize)
-    monkeypatch.setattr(orchestrator, "_opportunistic_fixup", opportunistic_fixup)
-
-    assert await orchestrator._formalize_with_streaming_fixup()
-    assert events.index("fixup-wave") < events.index("formalize-2-finished")
-
-
-@pytest.mark.asyncio
 async def test_capacity_exhaustion_requeues_formalizer_at_back(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -473,7 +710,7 @@ async def test_capacity_exhaustion_requeues_formalizer_at_back(
 
     monkeypatch.setattr(orchestrator, "_formalize", formalize)
 
-    assert await orchestrator._formalize_all(streaming_fixup=False)
+    assert await orchestrator._formalize_all()
     assert attempts == {1: 2, 2: 1}
     assert order == [(1, False), (2, False), (1, True)]
 
@@ -497,47 +734,8 @@ async def test_formalizer_failure_does_not_cancel_healthy_workers(
 
     monkeypatch.setattr(orchestrator, "_formalize", formalize)
 
-    assert not await orchestrator._formalize_all(streaming_fixup=False)
+    assert not await orchestrator._formalize_all()
     assert healthy_finished
-
-
-@pytest.mark.asyncio
-async def test_streaming_fixup_defers_diagnostics_owned_by_active_formalizer(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
-    state = StateStore(config)
-    orchestrator = Orchestrator(config, state)
-    await orchestrator.prepare()
-    orchestrator.executor = FakeExecutor(state, [])
-    built: list[str] = []
-
-    async def blocked_validation(
-        _config: object,
-        chapter: Chapter,
-        *,
-        workspace_root: Path | None = None,
-        **_kwargs: object,
-    ) -> ValidationResult:
-        assert workspace_root == config.settings.repo
-        built.append(chapter.id)
-        return ValidationResult(
-            False,
-            1,
-            "error: Book/Chapter02.lean:1:1: draft is still incomplete",
-        )
-
-    monkeypatch.setattr(scheduler_module, "validate", blocked_validation)
-
-    assert await orchestrator._opportunistic_fixup(
-        {config.chapters[0].id},
-        {config.chapters[1].id},
-        newer_drafts_ready=lambda: False,
-    )
-    assert built == [config.chapters[0].id]
-    assert state.task(config.chapters[0].id, Stage.FIXUP).rounds == 0
-    assert state.task(config.chapters[1].id, Stage.FIXUP).rounds == 0
-    await orchestrator.shutdown()
 
 
 @pytest.mark.asyncio
