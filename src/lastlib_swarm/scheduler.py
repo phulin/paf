@@ -153,6 +153,18 @@ class CoordinatorBuildQueue:
         self._lock.release()
 
 
+def scaffold_directories(config: PipelineConfig, chapters: Iterable[Chapter]) -> tuple[str, ...]:
+    """Create chapter directories deterministically without creating Lean files."""
+
+    created: list[str] = []
+    for chapter in chapters:
+        directory = config.settings.repo / chapter.lean_root / chapter.chapter_path
+        if not directory.is_dir():
+            directory.mkdir(parents=True, exist_ok=True)
+            created.append(directory.relative_to(config.settings.repo).as_posix())
+    return tuple(created)
+
+
 class Orchestrator:
     def __init__(
         self,
@@ -220,9 +232,7 @@ class Orchestrator:
     def scaffold(self) -> None:
         """Create configured chapter directories without creating Lean files."""
 
-        for chapter in self.chapters:
-            directory = self.config.settings.repo / chapter.lean_root / chapter.chapter_path
-            directory.mkdir(parents=True, exist_ok=True)
+        scaffold_directories(self.config, self.chapters)
 
     def _scope_exists(self, chapter: Chapter) -> bool:
         repo = self.config.settings.repo

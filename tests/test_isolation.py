@@ -211,9 +211,7 @@ async def test_agent_cache_writes_are_discarded_and_coordinator_refreshes_snapsh
 @pytest.mark.asyncio
 async def test_cache_refresh_keeps_active_agent_snapshots_immutable(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
-    manager = FuseOverlayIsolation(
-        replace(config.settings, isolation="fuse-overlay", max_agents=3)
-    )
+    manager = FuseOverlayIsolation(replace(config.settings, isolation="fuse-overlay", max_agents=3))
     await manager.prepare()
     pinned = await manager.acquire("cache-pinned")
     first_fresh = None
@@ -248,7 +246,7 @@ async def test_cache_refresh_keeps_active_agent_snapshots_immutable(tmp_path: Pa
 
 
 @pytest.mark.asyncio
-async def test_orchestrator_merges_then_builds_in_main_worktree(
+async def test_orchestrator_merges_then_fixup_builds_in_main_worktree(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config_path = write_project(tmp_path, chapters="chapters = [1]")
@@ -310,6 +308,9 @@ print(json.dumps({"type": "item.completed", "item": {
     assert run.isolation is not None
     assert run.isolation["accepted"] is True
     assert run.isolation["promoted_cache_paths"] == []
+    assert not (tmp_path / "lean" / ".lake" / "build" / "coordinator.marker").exists()
+
+    assert await orchestrator.run_stage(Stage.FIXUP)
     assert (tmp_path / "lean" / ".lake" / "build" / "coordinator.marker").read_bytes() == (
         b"built in main"
     )

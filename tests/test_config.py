@@ -22,6 +22,8 @@ def test_discovers_chapters_and_renders_paths(tmp_path: Path) -> None:
     first = config.chapters[0]
     assert first.chapter_module == "Book.Chapter01"
     assert first.scope == ("lean/Book/Chapter01.lean", "lean/Book/Chapter01/**/*.lean")
+    assert config.stages[Stage.FORMALIZE].max_rounds == 1
+    assert config.stages[Stage.FIXUP].max_rounds == 10
     assert config.stages[Stage.REVIEW].max_rounds == 5
     assert config.settings.state_dir == tmp_path / ".swarm"
     assert config.settings.lean_mcp
@@ -136,6 +138,16 @@ def test_config_stage_prompts_are_optional(tmp_path: Path) -> None:
     config = load_config(path)
 
     assert config.stages[Stage.FORMALIZE].prompt.name == "formalize.md"
+
+
+def test_legacy_repair_stage_config_maps_to_fixup(tmp_path: Path) -> None:
+    path = write_project(tmp_path)
+    text = path.read_text(encoding="utf-8").replace("[stages.fixup]", "[stages.repair]")
+    path.write_text(text, encoding="utf-8")
+
+    config = load_config(path)
+
+    assert config.stages[Stage.FIXUP].prompt.name == "fixup.md"
 
 
 def test_infers_multiple_books_and_chained_mermaid_dependencies(tmp_path: Path) -> None:

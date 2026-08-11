@@ -33,7 +33,7 @@ from lastlib_swarm.corpus import (
 from lastlib_swarm.isolation import fuse_overlay_available
 from lastlib_swarm.models import Chapter, PipelineConfig, Stage
 from lastlib_swarm.pricing import LEGACY_MODEL, CostEstimate, estimate_cost, format_usd
-from lastlib_swarm.scheduler import Orchestrator
+from lastlib_swarm.scheduler import Orchestrator, scaffold_directories
 from lastlib_swarm.state import StateStore, TaskStatus
 from lastlib_swarm.tui import format_count, format_usage, run_tui
 
@@ -89,7 +89,7 @@ def _add_overrides(parser: argparse.ArgumentParser) -> None:
         "--lean-mcp",
         action=argparse.BooleanOptionalAction,
         default=None,
-        help="provide each Codex attempt with an isolated Lean LSP MCP (default: enabled)",
+        help="provide proof attempts with an isolated Lean LSP MCP (default: enabled)",
     )
 
 
@@ -113,7 +113,7 @@ def _add_run_options(parser: argparse.ArgumentParser) -> None:
 
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(prog="lastlib-swarm", description=__doc__)
-    root.add_argument("--version", action="version", version="lastlib-swarm 0.6.0")
+    root.add_argument("--version", action="version", version="lastlib-swarm 0.7.0")
     commands = root.add_subparsers(dest="command", required=True)
 
     plan = commands.add_parser("plan", help="show discovered books, chapters, and stage settings")
@@ -124,12 +124,19 @@ def parser() -> argparse.ArgumentParser:
     _add_source(status)
     status.add_argument("--json", action="store_true", help="print the raw persisted state")
 
+    scaffold = commands.add_parser(
+        "scaffold", help="deterministically create configured chapter directories"
+    )
+    _add_source(scaffold)
+    scaffold.add_argument("--book", action="append", default=[], help="book id")
+    scaffold.add_argument("--chapter", action="append", default=[], help="chapter id or number")
+
     stage = commands.add_parser("stage", help="run one stage across selected chapters")
     stage.add_argument("stage", choices=[item.value for item in Stage])
     _add_run_options(stage)
 
     pipeline = commands.add_parser(
-        "pipeline", help="run the full formalize/review/prove/repair flow"
+        "pipeline", help="run scaffold/draft/fixup/review/prove to convergence"
     )
     _add_run_options(pipeline)
 
@@ -286,7 +293,7 @@ def print_plan(config: PipelineConfig, console: Console) -> None:
     )
     console.print(
         f"[bold]Codex access:[/bold] {access}  "
-        f"[bold]Lean MCP:[/bold] {'enabled' if config.settings.lean_mcp else 'disabled'}  "
+        f"[bold]Proof LSP:[/bold] {'enabled' if config.settings.lean_mcp else 'disabled'}  "
         f"[bold]Project:[/bold] {config.settings.lean_project}  "
         f"[bold]Tool timeout:[/bold] {config.settings.lean_mcp_tool_timeout_seconds:g}s"
     )
@@ -323,8 +330,8 @@ def print_plan(config: PipelineConfig, console: Console) -> None:
         )
     console.print(books)
     console.print(
-        "Books are dependency-gated in both phases. Ready books compete by weighted downstream "
-        "critical-path rank; chapters pipeline formalize → review and prove ↔ repair."
+        "Drafts run optimistically across all selected chapters. Coordinator builds and fixup "
+        "batches converge globally before read-only review and proof."
     )
 
 
@@ -815,6 +822,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0
         if arguments.command == "status":
             return print_status(config, console, raw_json=arguments.json)
+        if arguments.command == "scaffold":
+            chapters = select_chapters(
+                config,
+                books=arguments.book,
+                chapter_selectors=arguments.chapter,
+            )
+            created = scaffold_directories(config, chapters)
+            noun = "directory" if len(created) == 1 else "directories"
+            console.print(f"Scaffolded {len(created)} chapter {noun}")
+            return 0
         return _run(arguments, config, console)
     except (OSError, ValueError) as error:
         Console(stderr=True).print(f"[red]error:[/red] {error}")

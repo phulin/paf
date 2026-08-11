@@ -4,4 +4,4 @@ from lastlib_swarm.models import Stage
 
 __all__ = ["Stage"]
 
-__version__ = "0.6.0"
+__version__ = "0.7.0"

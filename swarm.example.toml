@@ -16,15 +16,15 @@ lean_project = "lean"
 lean_mcp_tool_timeout_seconds = 300
 
 [stages.formalize]
-max_rounds = 3
+max_rounds = 1
+
+[stages.fixup]
+max_rounds = 12
 
 [stages.review]
 max_rounds = 6
 
 [stages.prove]
-max_rounds = 12
-
-[stages.repair]
 max_rounds = 12
 
 [[books]]

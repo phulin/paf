@@ -1,4 +1,5 @@
 import asyncio
+import json
 from dataclasses import replace
 from pathlib import Path
 
@@ -99,6 +100,29 @@ async def test_invocation_usage_excludes_persisted_attempts(tmp_path: Path) -> N
     snapshot = second.snapshot()
     assert snapshot["cost"]["estimated_usd"] == pytest.approx(0.000056)
     assert snapshot["invocation_cost"]["estimated_usd"] == pytest.approx(0.000012)
+
+
+@pytest.mark.asyncio
+async def test_state_migrates_legacy_repair_tasks_to_fixup(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = config.chapters[0]
+    state = StateStore(config)
+    await state.load_or_create()
+    run = await state.start_run(chapter.id, Stage.FIXUP)
+    await state.finish_run(run, status=TaskStatus.SUCCEEDED)
+    payload = json.loads(state.path.read_text(encoding="utf-8"))
+    task = payload["tasks"].pop(f"{chapter.id}:fixup")
+    task["stage"] = "repair"
+    task["runs"][0]["stage"] = "repair"
+    payload["tasks"][f"{chapter.id}:repair"] = task
+    state.path.write_text(json.dumps(payload), encoding="utf-8")
+
+    reloaded = StateStore(config)
+    await reloaded.load_or_create()
+
+    migrated = reloaded.task(chapter.id, Stage.FIXUP)
+    assert migrated.stage == "fixup"
+    assert migrated.runs[0].stage == "fixup"
 
 
 def test_legacy_attempt_cost_is_always_luna(tmp_path: Path) -> None:

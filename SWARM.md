@@ -1,8 +1,8 @@
 # LastLib Swarm
 
 `lastlib-swarm` orchestrates a large population of noninteractive Codex workers over an informal
-mathematics corpus and its Lean translation. It can run one stage from the command line or drive a
-resumable, fixed-point pipeline with a live terminal dashboard.
+mathematics corpus and its Lean translation. It combines an optimistic parallel drafting pass with
+coordinator-driven build convergence, read-only mathematical review, and LSP-backed proving.
 
 Install `ripgrep` and ensure its `rg` executable is on `PATH` before starting a large swarm. Agents
 use it for fast source and declaration searches. Worker-launching commands continue without it, but
@@ -11,19 +11,22 @@ fallback searches can be substantially slower.
 
 ```mermaid
 flowchart LR
-    F[Formalize chapter] --> R[Review statements]
-    R -->|review changed files| R
-    R -->|no changes + Lean valid| P[Prove whole sections]
-    P -->|statement/API problem| X[Repair statements]
-    X --> P
+    S[Scaffold directories] --> F[Formalize once]
+    F --> B[Coordinator Lake build]
+    B -->|diagnostics| X[Parallel fixup]
+    X --> B
+    B -->|clean| R[Read-only review]
+    R -->|findings| X
+    R -->|no findings| P[Prove with LSP]
+    P -->|statement/API problem| X
     P -->|no placeholders + Lean valid| D[Done]
 ```
 
-Formalization and review are pipelined per chapter: a chapter can enter review while other chapters
-are still being translated. Every chapter in an eligible book can run concurrently. `depends_on`
-orders books at statement-review boundaries; independent books run concurrently. Proof work starts
-after the selected corpus finishes statement review, then follows the same book DAG while running
-each eligible book's chapters in parallel.
+Scaffolding is deterministic and creates directories only. Formalization then runs once for every
+missing chapter scope without Lean or LSP validation, so chapters and books can draft concurrently
+despite provisional imports. The coordinator repeatedly builds all selected targets and hands exact
+failures to parallel fixup agents until the project is clean. Reviewers audit that immutable baseline
+without editing it. Only proof agents receive an LSP.
 
 For a conventional numbered corpus, point the CLI at the book directory. It discovers all direct
 Markdown children and automatically reads `BOOK_DEPENDENCIES.md` from the repository root:
@@ -52,8 +55,8 @@ uv run lastlib-swarm books/02-finite-extensions-of-local-fields.md
 Passing a `.md` as the first argument is shorthand for `pipeline <target>`. Zero-config runs default
 to `gpt-5.6-luna`, reasoning effort `max`, the packaged generic prompt library under
 `src/lastlib_swarm/prompts/`, automatic execution isolation, and a state directory at
-`.swarm/<inferred-book-id>/`. They also attach a private Lean LSP MCP server to every active agent.
-Use
+`.swarm/<inferred-book-id>/`. Proof attempts attach a private Lean LSP MCP server; drafting, fixup,
+and review do not. Use
 `swarm.example.toml` when the inferred layout is not appropriate or when coordinating multiple books.
 
 Any stage may point at a specialized prompt template. Supported replacement fields include
@@ -89,9 +92,15 @@ Run an individual stage over the whole configured corpus or a selection:
 
 ```console
 uv run lastlib-swarm stage formalize books/02-finite-extensions-of-local-fields.md
+uv run lastlib-swarm stage fixup books/02-finite-extensions-of-local-fields.md
 uv run lastlib-swarm stage review --config swarm.toml --book book02
 uv run lastlib-swarm stage prove --config swarm.toml --book book02 --chapter 3
-uv run lastlib-swarm stage repair --config swarm.toml --chapter book02/chapter-03
+```
+
+Create the deterministic directory scaffold without launching Codex:
+
+```console
+uv run lastlib-swarm scaffold books/02-finite-extensions-of-local-fields.md
 ```
 
 Run the complete pipeline:
@@ -118,17 +127,15 @@ number would be ambiguous.
 CLI overrides such as `--model`, `--reasoning-effort`, and `--max-agents` work with both inferred and
 configured runs. `--isolation auto|fuse-overlay|shared` selects the execution backend.
 
-Use `--no-lean-mcp` for a diagnostic fallback run without the Lean MCP integration.
+Use `--no-lean-mcp` to run the proof stage without the Lean MCP integration.
 
 ## Lean LSP MCP proof loop
 
-Every active Codex attempt receives its own locked
+Every proof attempt receives its own locked
 [`lean-lsp-mcp`](https://github.com/oOo0oOo/lean-lsp-mcp) stdio server, rooted inside the agent's
-private FUSE overlay. Statement stages receive whole-file diagnostics,
-outlines, hover/declaration lookup, and local source search. Proof and repair stages also receive
-proof goals, completions, code actions, and batched tactic trials. Remote search, local Loogle, and
-the MCP's `lean_build` tool are deliberately absent from the allowlist: this avoids shared-service
-rate limits, large indexing memory, and builds outside orchestrator control.
+private FUSE overlay. It exposes whole-file diagnostics, outlines, hover and declaration lookup,
+local source search, proof goals, completions, code actions, and batched tactic trials. Remote search,
+local Loogle, and the MCP's `lean_build` tool remain absent from the allowlist.
 
 Proof agents first read and attempt the entire assigned file set without checking each speculative
 proof separately. They then request whole-file diagnostics and iterate only over failing proofs and
@@ -139,7 +146,7 @@ main worktree's `.lake` is the only writable build cache. The coordinator reject
 compiler exit if its captured output contains any warning other than the exact “declaration uses
 `sorry`” diagnostic. This check reuses the targeted build and does not launch a second compiler.
 
-An MCP/LSP process exists per active attempt, not per queued agent. Its imported `.olean` files come
+An MCP/LSP process exists per active proof attempt, not per queued agent. Its imported `.olean` files come
 from a read-only snapshot of the coordinator cache taken when the attempt starts, while its document
 state remains private. No new attempt snapshot is created during a merge/build transaction, so it
 cannot pair newly merged sources with stale artifacts. Consequently `max_agents` also bounds the
@@ -194,22 +201,26 @@ After the daemon exits, `status`, `snapshot`, and `wait` fall back to the persis
 
 ## Fixed-point semantics
 
-- **Formalize** retries until the Codex process returns a structured report and the configured Lean
-  validation command succeeds.
-- **Review** always uses a fresh agent. It succeeds only when an agent makes no changes inside the
-  chapter scope and Lean validation succeeds. A modifying review triggers another independent
-  review, up to `max_rounds`.
+- **Scaffold** deterministically creates the configured chapter directories and no Lean files.
+- **Formalize** skips a materialized chapter scope or runs exactly one optimistic drafting agent.
+  Drafts are merged without invoking Lean, and compiler cleanliness is deferred to fixup.
+- **Fixup** runs every selected target through the coordinator-owned Lake cache. Failures are grouped
+  by chapter ownership and appended verbatim to parallel fixup prompts. Lake then runs again. This
+  repeats up to `max_rounds`, allowing `declaration uses sorry` but rejecting other warnings.
+- **Review** runs read-only agents against one clean source and `.olean` generation. Findings are
+  returned as structured reports, routed through fixup, rebuilt, and reviewed again until no
+  actionable finding remains.
 - **Prove** sends the whole chapter to one agent, asks for one complete proof-writing pass, and then
   uses whole-file LSP diagnostics to focus iterations on failed proofs. It succeeds only when the
   scoped Lean code has no `sorry` or `admit` tokens and final Lake validation succeeds without any
   warning other than “declaration uses `sorry`”.
-- **Repair** is entered when a proof report identifies a statement/API problem, or when a proof
-  agent makes no progress with placeholders remaining. Repair feedback includes the proof report,
-  placeholder count, and the tail of the Lean validation output. The pipeline then returns to proof.
+- A proof agent may change proof bodies but not declaration interfaces. A genuine statement/API
+  problem is reported with `needs_fixup`; the pipeline returns through fixup and read-only review
+  before proving resumes.
 
 The orchestrator independently hashes every configured chapter scope. Agent claims about changes do
 not control review convergence. Lean placeholder scanning ignores comments and strings. The strict
-agent report is used chiefly to distinguish proof errors from genuine statement repair.
+agent report distinguishes ordinary proof errors from genuine statement fixup requests.
 
 ## Multi-book scheduling
 
@@ -228,15 +239,14 @@ targets critical-path completion and adapts as dependencies unlock.
 
 Effort defaults to the number of selected chapters. Configured corpora can supply positive
 `statement_effort` and `proof_effort` values based on historical wall time or expected agent work.
-The statement and proof/repair phases have separate ranks, and both enforce book dependencies. The
-plan, TUI, persisted snapshot, and agent-control JSON expose the priority order, ranks, and critical
-path.
+Ranks prioritize competition for agent slots; optimistic drafting is not dependency-gated. The plan,
+TUI, persisted snapshot, and agent-control JSON expose the priority order, ranks, and critical path.
 
 ## TUI and token accounting
 
 The dashboard shows:
 
-- aggregate counts for formalize, review, prove, and repair;
+- aggregate counts for formalize, fixup, review, and prove;
 - each chapter's status and attempt count in every stage;
 - per-chapter tokens for the current invocation;
 - statement/proof critical-path ranks and the current statement critical path;
@@ -305,16 +315,13 @@ each attempt. Generations share unchanged file data through hard links and are r
 reader exits. Temporary mounts live outside the repository so Git discovery starts from the private
 view.
 
-All agents pinned to a cache generation share the same Lake artifact inodes and OS page-cache pages;
-the snapshot is never copied once per agent. Reopening a file through the attached MCP gives Lean's
-LSP one dependency-build pass; any resulting cache writes occupy only that agent's writable upper
-layer, are discarded at teardown, and can never be promoted. Agents reopen the destination whenever
-they switch files so its worker observes edits to imported files. The generic MCP build remains
-hidden because it builds the entire default project rather than the dependencies of the current
-file. After every serialized coordinator build, a new read-only snapshot is published from the main
-cache. Already-running agents remain pinned to their old snapshot, while newly launched agents see
-the rebuilt artifacts. Old snapshots are reclaimed as soon as their last agent exits. Source
-imports preserve mtimes so valid Lake traces are not invalidated merely by publication.
+All proof agents pinned to a cache generation share the same Lake artifact inodes and OS page-cache
+pages; the snapshot is never copied once per agent. A clean global fixup build publishes the
+read-only baseline used by review and proof. Reopening a file through the proof MCP gives Lean's LSP
+one dependency-build pass; resulting cache writes occupy only that agent's writable upper layer and
+are discarded at teardown. The generic MCP build remains hidden. Already-running proof agents remain
+pinned to their original clean snapshot, while later attempts see coordinator-published artifacts.
+Old snapshots are reclaimed when their last agent exits, and source imports preserve mtimes.
 
 FUSE isolation requires `fuse-overlayfs`, `fusermount3`, `rsync`, and an accessible `/dev/fuse`.
 `auto` selects FUSE when these primitives are present and otherwise uses the explicitly visible
@@ -356,6 +363,9 @@ Every stage automatically uses its packaged standard prompt and default retry bo
 may override either setting independently:
 
 ```toml
+[stages.fixup]
+max_rounds = 12
+
 [stages.review]
 prompt = "my-prompts/strict-review.md"
 max_rounds = 6

@@ -486,7 +486,7 @@ class SwarmApp(App[bool]):
             f"lifetime API-equivalent cost: {format_usd(lifetime_cost)}    "
             f"active stage records: {active}  concurrency cap: {maximum}\n"
             f"Statement critical path: {critical}    isolation: {isolation}  "
-            f"Lean MCP: {lean_mcp}    Codex access: {codex_access}",
+            f"Proof LSP: {lean_mcp}    Codex access: {codex_access}",
         )
         activities: list[AgentActivity] = []
         for chapter in self.chapters:

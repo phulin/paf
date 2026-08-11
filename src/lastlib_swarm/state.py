@@ -210,7 +210,7 @@ class StateStore:
         cost = self.total_cost()
         invocation_cost = self.invocation_cost()
         return {
-            "version": 2,
+            "version": 3,
             "config": str(self.config.path),
             "created_at": self.created_at,
             "updated_at": self.updated_at,
