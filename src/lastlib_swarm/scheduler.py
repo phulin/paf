@@ -2,12 +2,19 @@ from __future__ import annotations
 
 import asyncio
 import heapq
+import re
 from collections.abc import AsyncIterator, Callable, Coroutine, Iterable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from typing import Any
 
-from lastlib_swarm.codex import AgentResult, CodexExecutor, ValidationResult, validate
+from lastlib_swarm.codex import (
+    AgentResult,
+    CodexExecutor,
+    ValidationResult,
+    unexpected_lean_warnings,
+    validate,
+)
 from lastlib_swarm.corpus import build_corpus_schedule, scheduling_snapshot
 from lastlib_swarm.isolation import IsolationResult, create_isolation
 from lastlib_swarm.models import Chapter, PipelineConfig, Stage
@@ -70,7 +77,82 @@ class ReviewOutcome:
 @dataclass(frozen=True)
 class BuildDiagnostics:
     actionable: dict[str, str]
-    deferred_targets: tuple[str, ...]
+    deferred_owner_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class LeanDiagnostic:
+    severity: str
+    header: str
+    text: str
+
+
+LEAN_DIAGNOSTIC_RE = re.compile(r"^(?P<severity>error|warning):[ \t]*(?P<message>.*)$")
+LEAN_LOCATION_RE = re.compile(r"^(?P<path>.+?\.lean):(?P<line>\d+):(?P<column>\d+):(?:[ \t]|$)")
+LAKE_CONTROL_PREFIXES = (
+    "⚠ ",
+    "✖ ",
+    "✔ ",
+    "trace:",
+    "Some required targets logged failures:",
+    "Coordinator rejected ",
+)
+
+
+def _lean_diagnostics(output: str) -> tuple[LeanDiagnostic, ...]:
+    """Extract actionable Lean diagnostics without Lake replay/progress chatter."""
+
+    diagnostics: list[LeanDiagnostic] = []
+    severity = ""
+    header = ""
+    lines: list[str] = []
+
+    def finish() -> None:
+        nonlocal severity, header, lines
+        if not header:
+            return
+        text = "\n".join(lines).rstrip()
+        if severity == "error" or unexpected_lean_warnings(header):
+            diagnostics.append(LeanDiagnostic(severity, header, text))
+        severity = ""
+        header = ""
+        lines = []
+
+    for line in output.splitlines():
+        match = LEAN_DIAGNOSTIC_RE.match(line)
+        if match:
+            finish()
+            severity = match.group("severity")
+            header = line.strip()
+            lines = [line.rstrip()]
+            continue
+        if header and line.startswith(LAKE_CONTROL_PREFIXES):
+            finish()
+            continue
+        if header:
+            lines.append(line.rstrip())
+    finish()
+
+    # Validation appends a compact list of rejected warnings after the complete
+    # output. Prefer the first copy because it retains the diagnostic body.
+    unique: dict[str, LeanDiagnostic] = {}
+    for diagnostic in diagnostics:
+        unique.setdefault(diagnostic.header, diagnostic)
+    return tuple(unique.values())
+
+
+def _failed_modules(output: str) -> tuple[str, ...]:
+    marker = "Some required targets logged failures:"
+    _, found, suffix = output.rpartition(marker)
+    if not found:
+        return ()
+    modules: list[str] = []
+    for line in suffix.splitlines()[1:]:
+        if match := re.fullmatch(r"-\s+([A-Za-z0-9_'.]+)", line.strip()):
+            modules.append(match.group(1))
+        elif modules:
+            break
+    return tuple(dict.fromkeys(modules))
 
 
 class RunControl:
@@ -424,6 +506,46 @@ class Orchestrator:
             )
         )
 
+    def _path_owner_ids(self, path: str) -> tuple[str, ...]:
+        normalized = path.replace("\\", "/")
+        repo_prefix = self.config.settings.repo.as_posix().rstrip("/") + "/"
+        normalized = normalized.removeprefix(repo_prefix).removeprefix("./")
+        owners: list[str] = []
+        for chapter in self.chapters:
+            root = (chapter.lean_root / chapter.chapter_path).as_posix()
+            lean_prefix = self.config.settings.lean_project.as_posix().rstrip("/") + "/"
+            roots = (root, root.removeprefix(lean_prefix))
+            if any(
+                normalized == f"{item}.lean" or normalized.startswith(f"{item}/") for item in roots
+            ):
+                owners.append(chapter.id)
+        return tuple(dict.fromkeys(owners))
+
+    def _module_owner_ids(self, module: str) -> tuple[str, ...]:
+        return tuple(
+            chapter.id
+            for chapter in self.chapters
+            if module == chapter.chapter_module or module.startswith(chapter.chapter_module + ".")
+        )
+
+    def _diagnostic_owner_ids(self, diagnostic: LeanDiagnostic) -> tuple[str, ...]:
+        message = diagnostic.header.split(":", 1)[1].lstrip()
+        if location := LEAN_LOCATION_RE.match(message):
+            return self._path_owner_ids(location.group("path"))
+
+        # Some orchestration failures have no line/column but do name one or
+        # more modules or source roots. Matching only this diagnostic block is
+        # intentional: matching the complete Lake transcript over-assigns every
+        # replayed dependency and permitted `sorry` warning.
+        owners: list[str] = []
+        for chapter in self.chapters:
+            for identifier in self._chapter_identifiers(chapter):
+                pattern = rf"(?<![A-Za-z0-9_]){re.escape(identifier)}(?![A-Za-z0-9_])"
+                if re.search(pattern, diagnostic.text):
+                    owners.append(chapter.id)
+                    break
+        return tuple(dict.fromkeys(owners))
+
     async def _build_chapters(
         self,
         chapters: Iterable[Chapter],
@@ -511,32 +633,48 @@ class Orchestrator:
         *,
         blocked_owner_ids: set[str] | frozenset[str] = frozenset(),
     ) -> BuildDiagnostics:
-        feedback: dict[str, list[str]] = {}
-        deferred: list[str] = []
+        feedback: dict[str, dict[str, None]] = {}
         by_id = {chapter.id: chapter for chapter in self.chapters}
         for target_id, result in results.items():
             if result.succeeded:
                 continue
-            owners = [
-                chapter.id
-                for chapter in self.chapters
-                if any(
-                    identifier in result.output for identifier in self._chapter_identifiers(chapter)
+            routed = False
+            for diagnostic in _lean_diagnostics(result.output):
+                owners = self._diagnostic_owner_ids(diagnostic)
+                if not owners:
+                    continue
+                routed = True
+                block = f"Coordinator diagnostic:\n{diagnostic.text}"
+                for owner in owners:
+                    feedback.setdefault(owner, {})[block] = None
+
+            # A truncated Lake log can retain its failed-module summary while
+            # still retaining an unrelated warning. Always route the precise
+            # failed module as well as any source-located diagnostics.
+            for module in _failed_modules(result.output):
+                owners = self._module_owner_ids(module)
+                if not owners:
+                    continue
+                routed = True
+                block = f"Coordinator reported failed module `{module}`."
+                for owner in owners:
+                    feedback.setdefault(owner, {})[block] = None
+
+            if not routed:
+                block = (
+                    f"Coordinator build of {by_id[target_id].chapter_module} failed without a "
+                    f"source-located diagnostic:\n{result.output[-12000:]}"
                 )
-            ]
-            if blocked_owner_ids.intersection(owners):
-                deferred.append(target_id)
-                continue
-            if not owners:
-                owners = [target_id]
-            block = (
-                f"Coordinator build of {by_id[target_id].chapter_module} failed:\n{result.output}"
-            )
-            for owner in owners:
-                feedback.setdefault(owner, []).append(block)
+                feedback.setdefault(target_id, {})[block] = None
+
+        deferred = tuple(sorted(blocked_owner_ids.intersection(feedback)))
         return BuildDiagnostics(
-            actionable={chapter_id: "\n\n".join(blocks) for chapter_id, blocks in feedback.items()},
-            deferred_targets=tuple(deferred),
+            actionable={
+                chapter_id: "\n\n".join(blocks)
+                for chapter_id, blocks in feedback.items()
+                if chapter_id not in blocked_owner_ids
+            },
+            deferred_owner_ids=deferred,
         )
 
     async def _fixup_agent(self, chapter: Chapter, feedback: str) -> bool:
@@ -632,7 +770,7 @@ class Orchestrator:
                 results,
                 blocked_owner_ids=active_formalizer_ids,
             )
-            deferred = bool(diagnostics.deferred_targets)
+            deferred = bool(diagnostics.deferred_owner_ids)
             if newer_drafts_ready():
                 return True
             if not diagnostics.actionable:

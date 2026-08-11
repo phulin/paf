@@ -295,6 +295,104 @@ async def test_fixup_repeats_coordinator_build_and_hands_back_diagnostics(
     await orchestrator.shutdown()
 
 
+def test_build_feedback_routes_only_source_located_non_sorry_diagnostics(
+    tmp_path: Path,
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    orchestrator = Orchestrator(config, StateStore(config))
+    first, second = config.chapters
+    output = """⚠ [1/3] Replayed Book.Chapter01.Section
+warning: Book/Chapter01/Section.lean:4:1: declaration uses `sorry`
+✖ [2/3] Building Book.Chapter02.Section
+error: Book/Chapter02/Section.lean:8:3: unknown identifier `missing`
+warning: Book/Chapter02/Section.lean:10:2: unused variable `h`
+
+Coordinator rejected 1 non-sorry Lean warning(s):
+warning: Book/Chapter02/Section.lean:10:2: unused variable `h`
+"""
+
+    diagnostics = orchestrator._build_feedback({first.id: ValidationResult(False, 1, output)})
+
+    assert set(diagnostics.actionable) == {second.id}
+    feedback = diagnostics.actionable[second.id]
+    assert "unknown identifier `missing`" in feedback
+    assert feedback.count("unused variable `h`") == 1
+    assert "Chapter01" not in feedback
+    assert "declaration uses `sorry`" not in feedback
+    assert diagnostics.deferred_owner_ids == ()
+
+
+def test_build_feedback_defers_only_blocked_diagnostic_owner(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    orchestrator = Orchestrator(config, StateStore(config))
+    first, second = config.chapters
+    output = """error: Book/Chapter01/Section.lean:4:1: first failure
+error: Book/Chapter02/Section.lean:7:2: second failure
+"""
+
+    diagnostics = orchestrator._build_feedback(
+        {first.id: ValidationResult(False, 1, output)},
+        blocked_owner_ids={second.id},
+    )
+
+    assert set(diagnostics.actionable) == {first.id}
+    assert "first failure" in diagnostics.actionable[first.id]
+    assert "second failure" not in diagnostics.actionable[first.id]
+    assert diagnostics.deferred_owner_ids == (second.id,)
+
+
+def test_build_feedback_uses_failed_module_when_diagnostic_was_truncated(
+    tmp_path: Path,
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    orchestrator = Orchestrator(config, StateStore(config))
+    first, second = config.chapters
+    output = """Some required targets logged failures:
+- Book.Chapter02.Section
+error: build failed
+"""
+
+    diagnostics = orchestrator._build_feedback({first.id: ValidationResult(False, 1, output)})
+
+    assert set(diagnostics.actionable) == {second.id}
+    assert "Book.Chapter02.Section" in diagnostics.actionable[second.id]
+
+
+def test_build_feedback_keeps_failed_module_alongside_another_owned_warning(
+    tmp_path: Path,
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    orchestrator = Orchestrator(config, StateStore(config))
+    first, second = config.chapters
+    output = """warning: Book/Chapter01/Section.lean:3:1: unused variable `h`
+Some required targets logged failures:
+- Book.Chapter02.Section
+error: build failed
+"""
+
+    diagnostics = orchestrator._build_feedback({first.id: ValidationResult(False, 1, output)})
+
+    assert set(diagnostics.actionable) == {first.id, second.id}
+    assert "unused variable `h`" in diagnostics.actionable[first.id]
+    assert "Book.Chapter02.Section" in diagnostics.actionable[second.id]
+
+
+def test_build_feedback_falls_back_to_build_target_for_unlocated_failure(
+    tmp_path: Path,
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    orchestrator = Orchestrator(config, StateStore(config))
+    first, _ = config.chapters
+
+    diagnostics = orchestrator._build_feedback(
+        {first.id: ValidationResult(False, 124, "validation timed out", timed_out=True)}
+    )
+
+    assert set(diagnostics.actionable) == {first.id}
+    assert "failed without a source-located diagnostic" in diagnostics.actionable[first.id]
+    assert "validation timed out" in diagnostics.actionable[first.id]
+
+
 @pytest.mark.asyncio
 async def test_completed_drafts_enter_fixup_before_all_formalizers_finish(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -403,7 +501,7 @@ async def test_streaming_fixup_defers_diagnostics_owned_by_active_formalizer(
         return ValidationResult(
             False,
             1,
-            "error: Book/Chapter01.lean imports pending module Book.Chapter02",
+            "error: Book/Chapter02.lean:1:1: draft is still incomplete",
         )
 
     monkeypatch.setattr(scheduler_module, "validate", blocked_validation)

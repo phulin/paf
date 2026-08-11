@@ -155,6 +155,17 @@ def render_prompt(template: str, chapter: Chapter) -> str:
     return template
 
 
+def _bounded_feedback(feedback: str, maximum: int = 12000) -> str:
+    """Bound feedback while retaining both its first and final diagnostics."""
+
+    if len(feedback) <= maximum:
+        return feedback
+    omission = "\n\n... middle of coordinator feedback omitted ...\n\n"
+    available = maximum - len(omission)
+    head = available // 2
+    return feedback[:head] + omission + feedback[-(available - head) :]
+
+
 def scoped_files(repo: Path, chapter: Chapter) -> list[Path]:
     files: set[Path] = set()
     for pattern in chapter.scope:
@@ -438,7 +449,8 @@ imports with a compiler command.
 """
         if feedback:
             contract += (
-                f"\n## Feedback from the preceding attempt\n\n```text\n{feedback[-12000:]}\n```\n"
+                "\n## Feedback from the preceding attempt\n\n```text\n"
+                f"{_bounded_feedback(feedback)}\n```\n"
             )
         return f"{base.rstrip()}\n\n{common.rstrip()}\n{contract}"
 

@@ -9,6 +9,7 @@ import pytest
 
 from lastlib_swarm.codex import (
     CodexExecutor,
+    _bounded_feedback,
     _capacity_resume_delay,
     _is_capacity_failure,
     _rollout_usage,
@@ -242,6 +243,17 @@ warning: Book/Chapter.lean:24:2: a warning that merely mentions sorry
         "warning: Book/Chapter.lean:18:5: Variable name `h` is not explicitly referenced.",
         "warning: Book/Chapter.lean:24:2: a warning that merely mentions sorry",
     )
+
+
+def test_bounded_feedback_preserves_first_and_last_diagnostics() -> None:
+    feedback = "FIRST DIAGNOSTIC\n" + ("middle\n" * 3000) + "LAST DIAGNOSTIC"
+
+    bounded = _bounded_feedback(feedback)
+
+    assert len(bounded) == 12000
+    assert bounded.startswith("FIRST DIAGNOSTIC")
+    assert bounded.endswith("LAST DIAGNOSTIC")
+    assert "middle of coordinator feedback omitted" in bounded
 
 
 @pytest.mark.asyncio
