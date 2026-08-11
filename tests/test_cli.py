@@ -28,7 +28,7 @@ def test_plan_command(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> Non
     assert main(["plan", "--config", str(path)]) == 0
     output = capsys.readouterr().out
     assert "fixup" in output
-    assert "Proof LSP: enabled" in output
+    assert "Lean MCP: enabled" in output
 
 
 def test_scaffold_creates_only_chapter_directories(
@@ -103,7 +103,7 @@ def test_plan_can_disable_lean_mcp(tmp_path: Path, capsys: pytest.CaptureFixture
 
     assert main(["plan", "--config", str(path), "--no-lean-mcp"]) == 0
 
-    assert "Proof LSP: disabled" in capsys.readouterr().out
+    assert "Lean MCP: disabled" in capsys.readouterr().out
 
 
 def test_plan_accepts_just_a_markdown_target(

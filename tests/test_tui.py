@@ -52,7 +52,7 @@ async def test_dashboard_runs_an_operation_and_exits(tmp_path: Path) -> None:
     assert app.result
     assert "API-equivalent cost" in str(usage)
     assert "lifetime tokens" in str(usage)
-    assert "Proof LSP: on" in str(usage)
+    assert "Lean MCP: on" in str(usage)
     assert "Codex access: full" in str(usage)
 
 

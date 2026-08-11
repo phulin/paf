@@ -299,7 +299,7 @@ def print_plan(config: PipelineConfig, console: Console) -> None:
     )
     console.print(
         f"[bold]Codex access:[/bold] {access}  "
-        f"[bold]Proof LSP:[/bold] {'enabled' if config.settings.lean_mcp else 'disabled'}  "
+        f"[bold]Lean MCP:[/bold] {'enabled' if config.settings.lean_mcp else 'disabled'}  "
         f"[bold]Project:[/bold] {config.settings.lean_project}  "
         f"[bold]Tool timeout:[/bold] {config.settings.lean_mcp_tool_timeout_seconds:g}s"
     )
@@ -336,8 +336,9 @@ def print_plan(config: PipelineConfig, console: Console) -> None:
         )
     console.print(books)
     console.print(
-        "Completed drafts stream into targeted coordinator builds and fixup batches while other "
-        "formalizers run. A final global clean build precedes read-only review and proof."
+        "After drafting, fixup follows observed LastLib imports one chapter at a time. Every patch "
+        "is rebuilt and published before the next fixup agent; a stable topological build precedes "
+        "read-only review and proof."
     )
 
 

@@ -2,7 +2,8 @@
 
 `lastlib-swarm` orchestrates a large population of noninteractive Codex workers over an informal
 mathematics corpus and its Lean translation. It combines an optimistic parallel drafting pass with
-coordinator-driven build convergence, read-only mathematical review, and LSP-backed proving.
+coordinator-driven build convergence, MCP-backed fixup, read-only mathematical review, and
+LSP-backed proving.
 
 Install `ripgrep` and ensure its `rg` executable is on `PATH` before starting a large swarm. Agents
 use it for fast source and declaration searches. Worker-launching commands continue without it, but
@@ -12,12 +13,12 @@ fallback searches can be substantially slower.
 ```mermaid
 flowchart LR
     S[Scaffold directories] --> F[Formalize once]
-    F -->|each completed scope| B[Targeted coordinator build]
-    B -->|actionable diagnostics| X[Parallel fixup]
-    X --> B
-    B -->|pending owner| F
-    F -->|all drafts finished| G[Final full-corpus build]
-    B -->|queue drained| G
+    F -->|all drafts finished| I[Scan observed LastLib imports]
+    I --> B[Build next dependency-ready chapter]
+    B -->|actionable diagnostics| X[Serial fixup with MCP]
+    X -->|patch merged| I
+    B -->|clean cache published| I
+    I -->|all chapters clean| G[Stable topological build]
     G -->|diagnostics| X
     G -->|clean snapshot| R[Read-only review]
     R -->|findings| X
@@ -28,11 +29,11 @@ flowchart LR
 
 Scaffolding is deterministic and creates directories only. Formalization then runs once for every
 missing chapter scope without Lean or LSP validation, so chapters and books can draft concurrently
-despite provisional imports. As scopes finish, the coordinator coalesces them into targeted builds
-and hands actionable failures to parallel fixup agents while unrelated formalizers keep running.
-Diagnostics owned by an active formalizer are deferred. After all drafts finish, one full-corpus
-build/fixup loop establishes and publishes the immutable baseline used by review and proof. Reviewers
-do not edit it, and only proof agents receive an LSP.
+despite provisional imports. After all drafts finish, the coordinator discovers chapter edges with
+regexes over the current `import LastLib...` lines. It then fixes one dependency-ready chapter at a
+time with Lean MCP, rescans imports after every accepted patch, and rebuilds and publishes the cache
+before continuing. A final graph-stable topological build establishes the immutable baseline used by
+review and proof. Reviewers do not edit it; fixup and proof agents receive Lean MCP.
 
 For a conventional numbered corpus, point the CLI at the book directory. It discovers all direct
 Markdown children and automatically reads `BOOK_DEPENDENCIES.md` from the repository root:

@@ -708,7 +708,7 @@ class SwarmApp(App[bool]):
             f"Agents {active_agents}/{maximum} · {agent_breakdown} · queued {queued_agents}    "
             f"{build_status}\n"
             f"Statement critical path: {critical}    isolation: {isolation}  "
-            f"Proof LSP: {lean_mcp}    Codex access: {codex_access}",
+            f"Lean MCP: {lean_mcp}    Codex access: {codex_access}",
         )
         activities: list[AgentActivity] = []
         for chapter in self.chapters:
