@@ -1,12 +1,147 @@
 from __future__ import annotations
 
 import heapq
+import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Literal
 
 from lastlib_swarm.models import BookConfig, Chapter
 
 Phase = Literal["statements", "proofs"]
+
+LEAN_IMPORT_RE = re.compile(
+    r"^[ \t]*(?:public[ \t]+)?import[ \t]+(?P<modules>[^\r\n]+)",
+    re.MULTILINE,
+)
+LEAN_MODULE_RE = re.compile(r"\bLastLib(?:\.[A-Za-z0-9_']+)+\b")
+
+
+@dataclass(frozen=True)
+class ChapterImportGraph:
+    """The current cross-chapter graph observed directly in Lean imports."""
+
+    dependencies: dict[str, frozenset[str]]
+    successors: dict[str, frozenset[str]]
+    order: tuple[str, ...]
+    edges: tuple[tuple[str, str], ...]
+
+    def snapshot(self) -> dict[str, object]:
+        return {
+            "algorithm": "observed-lean-imports",
+            "order": list(self.order),
+            "edges": [list(edge) for edge in self.edges],
+            "dependencies": {
+                chapter_id: sorted(required)
+                for chapter_id, required in sorted(self.dependencies.items())
+            },
+        }
+
+
+def observed_imports(text: str) -> tuple[str, ...]:
+    """Extract LastLib modules from ordinary and public Lean import lines."""
+
+    modules: dict[str, None] = {}
+    for match in LEAN_IMPORT_RE.finditer(text):
+        imported = match.group("modules").split("--", 1)[0]
+        for module in LEAN_MODULE_RE.findall(imported):
+            modules[module] = None
+    return tuple(modules)
+
+
+def _chapter_source_files(repo: Path, chapter: Chapter) -> tuple[Path, ...]:
+    files: set[Path] = set()
+    for pattern in chapter.scope:
+        files.update(path for path in repo.glob(pattern) if path.is_file())
+    return tuple(sorted(files))
+
+
+def _chapter_cycle(dependencies: dict[str, set[str]]) -> tuple[str, ...]:
+    visiting: set[str] = set()
+    visited: set[str] = set()
+    path: list[str] = []
+
+    def visit(chapter_id: str) -> tuple[str, ...] | None:
+        visiting.add(chapter_id)
+        path.append(chapter_id)
+        for dependency in sorted(dependencies[chapter_id]):
+            if dependency in visiting:
+                start = path.index(dependency)
+                return (*path[start:], dependency)
+            if dependency not in visited:
+                cycle = visit(dependency)
+                if cycle is not None:
+                    return cycle
+        path.pop()
+        visiting.remove(chapter_id)
+        visited.add(chapter_id)
+        return None
+
+    for chapter_id in sorted(dependencies):
+        if chapter_id not in visited and (cycle := visit(chapter_id)):
+            return cycle
+    return ()
+
+
+def build_chapter_import_graph(repo: Path, chapters: tuple[Chapter, ...]) -> ChapterImportGraph:
+    """Build a deterministic chapter DAG solely from currently observed imports."""
+
+    by_id = {chapter.id: chapter for chapter in chapters}
+    dependencies = {chapter.id: set() for chapter in chapters}
+    module_owners = sorted(
+        ((chapter.chapter_module, chapter.id) for chapter in chapters),
+        key=lambda item: len(item[0]),
+        reverse=True,
+    )
+
+    def owner(module: str) -> str | None:
+        for prefix, chapter_id in module_owners:
+            if module == prefix or module.startswith(prefix + "."):
+                return chapter_id
+        return None
+
+    for dependent in chapters:
+        for path in _chapter_source_files(repo, dependent):
+            for module in observed_imports(path.read_text(encoding="utf-8")):
+                prerequisite = owner(module)
+                if prerequisite is not None and prerequisite != dependent.id:
+                    dependencies[dependent.id].add(prerequisite)
+
+    successors = {chapter.id: set() for chapter in chapters}
+    for dependent, required in dependencies.items():
+        for prerequisite in required:
+            successors[prerequisite].add(dependent)
+
+    indegree = {chapter_id: len(required) for chapter_id, required in dependencies.items()}
+    ready = [chapter_id for chapter_id, degree in indegree.items() if degree == 0]
+    heapq.heapify(ready)
+    order: list[str] = []
+    while ready:
+        chapter_id = heapq.heappop(ready)
+        order.append(chapter_id)
+        for successor in sorted(successors[chapter_id]):
+            indegree[successor] -= 1
+            if indegree[successor] == 0:
+                heapq.heappush(ready, successor)
+
+    if len(order) != len(by_id):
+        cycle = _chapter_cycle(dependencies)
+        detail = " -> ".join(cycle) if cycle else "unknown cycle"
+        raise ValueError(f"observed chapter import graph contains a cycle: {detail}")
+
+    edges = tuple(
+        sorted(
+            (prerequisite, dependent)
+            for dependent, required in dependencies.items()
+            for prerequisite in required
+        )
+    )
+    return ChapterImportGraph(
+        dependencies={key: frozenset(value) for key, value in dependencies.items()},
+        successors={key: frozenset(value) for key, value in successors.items()},
+        order=tuple(order),
+        edges=edges,
+    )
 
 
 @dataclass(frozen=True)
