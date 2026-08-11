@@ -30,7 +30,7 @@ from lastlib_swarm.pricing import format_usd
 from lastlib_swarm.scheduler import Orchestrator
 from lastlib_swarm.state import RunRecord, StateStore, TaskPhase, TaskRecord, TaskStatus, TokenUsage
 
-TUI_THEME = "catppuccin-mocha"
+TUI_THEME = "ansi-dark"
 
 STATUS_MARKS = {
     TaskStatus.PENDING: "· pending",
@@ -235,7 +235,6 @@ class AgentDetailScreen(Screen[None]):
         height: auto;
         max-height: 5;
         padding: 0 2;
-        background: $error-muted;
         color: $text-error;
     }
     #agent-tabs { height: 1fr; }
@@ -500,7 +499,6 @@ class SwarmApp(App[bool]):
         height: auto;
         max-height: 4;
         padding: 1 2;
-        background: $warning-muted;
         color: $text-warning;
         text-style: bold;
     }
@@ -509,7 +507,6 @@ class SwarmApp(App[bool]):
         height: auto;
         max-height: 3;
         padding: 0 2;
-        background: $error-muted;
         color: $text-error;
     }
     .stage-card {
@@ -526,7 +523,7 @@ class SwarmApp(App[bool]):
         max-height: 8;
         padding: 1 2;
         background: $surface;
-        color: $text-muted;
+        color: $text;
     }
     """
 

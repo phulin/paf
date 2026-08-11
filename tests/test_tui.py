@@ -56,7 +56,7 @@ async def test_dashboard_runs_an_operation_and_exits(tmp_path: Path) -> None:
     assert "Codex access: full" in str(usage)
 
 
-def test_dashboard_uses_catppuccin_theme(tmp_path: Path) -> None:
+def test_dashboard_inherits_terminal_theme(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
     orchestrator = Orchestrator(config, StateStore(config))
 
