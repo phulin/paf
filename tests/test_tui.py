@@ -10,7 +10,7 @@ from lastlib_swarm.models import Stage
 from lastlib_swarm.scheduler import Orchestrator
 from lastlib_swarm.state import StateStore, TaskPhase, TaskStatus, TokenUsage
 from lastlib_swarm.tui import (
-    LASTLIB_THEME,
+    TUI_THEME,
     AgentDetailScreen,
     SwarmApp,
     format_count,
@@ -56,7 +56,7 @@ async def test_dashboard_runs_an_operation_and_exits(tmp_path: Path) -> None:
     assert "Codex access: full" in str(usage)
 
 
-def test_dashboard_uses_lastlib_theme(tmp_path: Path) -> None:
+def test_dashboard_uses_catppuccin_theme(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
     orchestrator = Orchestrator(config, StateStore(config))
 
@@ -65,8 +65,8 @@ def test_dashboard_uses_lastlib_theme(tmp_path: Path) -> None:
 
     app = SwarmApp(orchestrator, operation, label="test")
 
-    assert app.theme == LASTLIB_THEME.name
-    assert LASTLIB_THEME.name in app.available_themes
+    assert app.theme == TUI_THEME
+    assert TUI_THEME in app.available_themes
 
 
 @pytest.mark.asyncio

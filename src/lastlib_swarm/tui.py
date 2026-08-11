@@ -10,7 +10,6 @@ from typing import Any, ClassVar
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal
 from textual.screen import Screen
-from textual.theme import Theme
 from textual.widgets import (
     DataTable,
     Footer,
@@ -31,21 +30,7 @@ from lastlib_swarm.pricing import format_usd
 from lastlib_swarm.scheduler import Orchestrator
 from lastlib_swarm.state import RunRecord, StateStore, TaskPhase, TaskRecord, TaskStatus, TokenUsage
 
-LASTLIB_THEME = Theme(
-    name="lastlib",
-    primary="#81a1c1",
-    secondary="#8fbcbb",
-    accent="#b48ead",
-    warning="#ebcb8b",
-    error="#bf616a",
-    success="#a3be8c",
-    foreground="#d8dee9",
-    background="#242933",
-    surface="#2e3440",
-    panel="#3b4252",
-    boost="#434c5e",
-    luminosity_spread=0.12,
-)
+TUI_THEME = "catppuccin-mocha"
 
 STATUS_MARKS = {
     TaskStatus.PENDING: "· pending",
@@ -554,8 +539,7 @@ class SwarmApp(App[bool]):
         startup_warning: str = "",
     ) -> None:
         super().__init__()
-        self.register_theme(LASTLIB_THEME)
-        self.theme = LASTLIB_THEME.name
+        self.theme = TUI_THEME
         self.orchestrator = orchestrator
         self.state = orchestrator.state
         self.operation = operation
