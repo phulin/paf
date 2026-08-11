@@ -128,7 +128,18 @@ def test_executor_uses_machine_readable_codex_mode(tmp_path: Path) -> None:
     assert "--sandbox" in review_command
     assert review_command[review_command.index("--sandbox") + 1] == "read-only"
     assert "--dangerously-bypass-approvals-and-sandbox" not in review_command
-    for stage in (Stage.FORMALIZE, Stage.FIXUP, Stage.REVIEW):
+    fixup_command = executor.command(Stage.FIXUP, isolated)
+    fixup_overrides = {
+        fixup_command[index + 1].split("=", 1)[0]: fixup_command[index + 1].split("=", 1)[1]
+        for index, item in enumerate(fixup_command[:-1])
+        if item == "--config"
+    }
+    assert "lean_diagnostic_messages" in fixup_overrides["mcp_servers.lastlib_lean.enabled_tools"]
+    assert "lean_code_actions" in fixup_overrides["mcp_servers.lastlib_lean.enabled_tools"]
+    assert "lean_multi_attempt" not in fixup_overrides["mcp_servers.lastlib_lean.enabled_tools"]
+    assert "lean_goal" not in fixup_overrides["mcp_servers.lastlib_lean.enabled_tools"]
+
+    for stage in (Stage.FORMALIZE, Stage.REVIEW):
         assert not any("mcp_servers.lastlib_lean" in item for item in executor.command(stage))
 
     resumed = executor.command(Stage.FORMALIZE, isolated, resume_thread_id="capacity-thread")
@@ -230,6 +241,18 @@ def test_executor_can_disable_lean_mcp(tmp_path: Path) -> None:
 
     assert not any("mcp_servers.lastlib_lean" in item for item in command)
     assert "Attached Lean MCP" not in prompt
+
+
+def test_fixup_prompt_requires_diagnostics_and_sorry(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    executor = CodexExecutor(config, StateStore(config))
+
+    prompt = executor.build_prompt(config.chapters[0], Stage.FIXUP)
+
+    assert "Attached Lean MCP" in prompt
+    assert "after every edit" in prompt
+    assert "Never prove" in prompt
+    assert "`by sorry`" in prompt
 
 
 def test_warning_filter_allows_only_declaration_uses_sorry() -> None:

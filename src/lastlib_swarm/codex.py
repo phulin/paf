@@ -76,6 +76,12 @@ LEAN_MCP_PROOF_TOOLS = (
     "lean_code_actions",
 )
 
+LEAN_MCP_FIXUP_TOOLS = (
+    *LEAN_MCP_BASE_TOOLS,
+    "lean_completions",
+    "lean_code_actions",
+)
+
 USAGE_POLL_SECONDS = 0.25
 PROCESS_GROUP_GRACE_SECONDS = 1.0
 COMMON_PROMPT_PATH = Path(__file__).with_name("prompts") / "common.md"
@@ -367,9 +373,11 @@ class CodexExecutor:
             Stage.FORMALIZE: """This is one optimistic drafting attempt. The coordinator merges
 accepted scoped changes without running Lean. Compiler failures are deferred to the global fixup
 loop.""",
-            Stage.FIXUP: """Use only the coordinator diagnostics and review findings appended to
-this prompt. After the complete parallel fixup batch, the coordinator runs the authoritative Lake
-build and supplies fresh output to the next iteration.""",
+            Stage.FIXUP: """Use the attached Lean MCP and the coordinator diagnostics or review
+findings appended to this prompt. This is one serial edit transaction. After it is merged, the
+coordinator rescans observed imports, rebuilds the chapter, and publishes the cache before another
+fixup agent starts. Never prove propositions in this stage: replace an obstructing proof body with
+`by sorry`, and request fresh whole-file diagnostics after every edit.""",
             Stage.REVIEW: """This attempt is read-only. Return findings in the structured report and
 set `needs_fixup` when source changes are required. The coordinator discards any attempted file
 change.""",
@@ -413,16 +421,22 @@ stage, clearly preserve or report the obstruction, and continue as far as possib
 unaffected part of the chapter. The coordinator independently checks scoped hashes, placeholders,
 diagnostics, and `{chapter.build_command}`.
 """
-        if self.config.settings.lean_mcp and stage is Stage.PROVE:
-            contract += """
+        if self.config.settings.lean_mcp and stage in (Stage.FIXUP, Stage.PROVE):
+            capabilities = (
+                "whole-file diagnostics, outline, hover, declaration lookup, local search, "
+                "completions, and code actions"
+                if stage is Stage.FIXUP
+                else "whole-file diagnostics, goals, hover, declaration lookup, code actions, "
+                "completions, tactic trials, and local search"
+            )
+            contract += f"""
 
 ### Attached Lean MCP
 
 A private `lastlib_lean` MCP server is attached to this attempt. It points at the attempt's private
-Lean project. Use its whole-file diagnostics and, where available for the stage, goals, hover,
-declaration lookup, code actions, completions, tactic trials, and local search. It intentionally
-does not expose `lean_build` or remote search. Paths passed to its tools are relative to the Lean
-project root: use `LastLib/...`, not `lean/LastLib/...`.
+Lean project. Use its {capabilities}. It intentionally does not expose `lean_build` or remote
+search. Paths passed to its tools are relative to the Lean project root: use `LastLib/...`, not
+`lean/LastLib/...`.
 Whenever you switch from one Lean file to another,
 make a whole-file diagnostic call for the destination before using other Lean tools. The MCP treats
 that switch as a reopen with one dependency-build pass. Do the same when switching back, especially
@@ -468,8 +482,9 @@ imports with a compiler command.
             command.extend(["--model", settings.model])
         if settings.reasoning_effort:
             command.extend(["--config", f'model_reasoning_effort="{settings.reasoning_effort}"'])
-        if settings.lean_mcp and stage is Stage.PROVE:
+        if settings.lean_mcp and stage in (Stage.FIXUP, Stage.PROVE):
             lean_project = (root / settings.lean_project).resolve()
+            enabled_tools = LEAN_MCP_FIXUP_TOOLS if stage is Stage.FIXUP else LEAN_MCP_PROOF_TOOLS
             mcp_config = {
                 "mcp_servers.lastlib_lean.command": str(lean_mcp_executable()),
                 "mcp_servers.lastlib_lean.args": ["-m", "lastlib_swarm.lean_mcp"],
@@ -480,7 +495,7 @@ imports with a compiler command.
                     settings.lean_mcp_tool_timeout_seconds
                 ),
                 "mcp_servers.lastlib_lean.default_tools_approval_mode": "auto",
-                "mcp_servers.lastlib_lean.enabled_tools": list(LEAN_MCP_PROOF_TOOLS),
+                "mcp_servers.lastlib_lean.enabled_tools": list(enabled_tools),
                 "mcp_servers.lastlib_lean.env.PATH": lean_mcp_path(),
                 "mcp_servers.lastlib_lean.env.LEAN_PROJECT_PATH": str(lean_project),
                 "mcp_servers.lastlib_lean.env.LEAN_LOG_LEVEL": "NONE",
