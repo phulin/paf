@@ -1,5 +1,6 @@
 import asyncio
 import json
+from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 
@@ -391,7 +392,11 @@ async def test_streaming_fixup_defers_diagnostics_owned_by_active_formalizer(
     built: list[str] = []
 
     async def blocked_validation(
-        _config: object, chapter: Chapter, *, workspace_root: Path | None = None
+        _config: object,
+        chapter: Chapter,
+        *,
+        workspace_root: Path | None = None,
+        **_kwargs: object,
     ) -> ValidationResult:
         assert workspace_root == config.settings.repo
         built.append(chapter.id)
@@ -451,9 +456,15 @@ async def test_coordinator_build_uses_build_phases_without_counting_agents(
     release_validation = asyncio.Event()
 
     async def gated_validation(
-        _config: object, chapter: Chapter, *, workspace_root: Path | None = None
+        _config: object,
+        chapter: Chapter,
+        *,
+        workspace_root: Path | None = None,
+        on_output: Callable[[str], None] | None = None,
     ) -> ValidationResult:
         assert workspace_root == config.settings.repo
+        assert on_output is not None
+        on_output(f"building {chapter.id}\n")
         if chapter.number == 1:
             validation_started.set()
             await release_validation.wait()
@@ -475,6 +486,7 @@ async def test_coordinator_build_uses_build_phases_without_counting_agents(
     assert state.coordinator_build.mode == "streaming"
     assert state.coordinator_build.completed == 0
     assert state.coordinator_build.total == 2
+    assert state.coordinator_build.output_tail[-1] == "building book/chapter-01"
     assert state.agent_summary()["active"] == 0
     assert all(
         state.task(chapter.id, Stage.FIXUP).phase == TaskPhase.BUILDING

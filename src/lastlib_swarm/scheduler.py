@@ -459,11 +459,13 @@ class Orchestrator:
                 await self.state.advance_coordinator_build(
                     chapter_id=chapter.id,
                     completed=index,
+                    command=chapter.build_command,
                 )
                 results[chapter.id] = await validate(
                     self.config,
                     chapter,
                     workspace_root=self.config.settings.repo,
+                    on_output=self.state.append_coordinator_build_output,
                 )
                 await self.state.advance_coordinator_build(
                     chapter_id=chapter.id,

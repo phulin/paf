@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import os
+import re
 from collections.abc import Iterable
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
@@ -14,6 +15,8 @@ from lastlib_swarm import json_codec as json
 from lastlib_swarm.activity import ActivityStore
 from lastlib_swarm.models import Chapter, PipelineConfig, Stage
 from lastlib_swarm.pricing import LEGACY_MODEL, CostEstimate, estimate_cost
+
+ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
 
 def timestamp() -> str:
@@ -143,6 +146,7 @@ class CoordinatorBuildRecord:
     completed: int = 0
     total: int = 0
     current_chapter_id: str = ""
+    output_tail: list[str] = field(default_factory=list)
     updated_at: str = field(default_factory=timestamp)
 
 
@@ -542,12 +546,35 @@ class StateStore:
         await self.save()
 
     async def advance_coordinator_build(
-        self, *, chapter_id: str, completed: int
+        self,
+        *,
+        chapter_id: str,
+        completed: int,
+        command: str | None = None,
     ) -> None:
         self.coordinator_build.current_chapter_id = chapter_id
         self.coordinator_build.completed = completed
+        if command is not None:
+            self.coordinator_build.output_tail = []
+            self.append_coordinator_build_output(f"$ {command}")
         self.coordinator_build.updated_at = timestamp()
         await self.save()
+
+    def append_coordinator_build_output(self, output: str, *, maximum: int = 4) -> None:
+        """Retain a small in-memory tail for live status displays."""
+
+        lines = [
+            ANSI_ESCAPE_RE.sub("", line.rstrip())[-500:]
+            for line in output.replace("\r", "\n").splitlines()
+        ]
+        lines = [line for line in lines if line]
+        if not lines:
+            return
+        self.coordinator_build.output_tail = [
+            *self.coordinator_build.output_tail,
+            *lines,
+        ][-maximum:]
+        self.coordinator_build.updated_at = timestamp()
 
     async def finish_coordinator_build(self) -> None:
         self.coordinator_build.active = False

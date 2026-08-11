@@ -341,6 +341,8 @@ async def test_dashboard_separates_agents_queues_and_coordinator_builds(tmp_path
     state = StateStore(config)
     orchestrator = Orchestrator(config, state)
     ready = asyncio.Event()
+    finish_build = asyncio.Event()
+    build_finished = asyncio.Event()
     finish = asyncio.Event()
 
     async def operation() -> bool:
@@ -360,7 +362,7 @@ async def test_dashboard_separates_agents_queues_and_coordinator_builds(tmp_path
             phase=TaskPhase.QUEUED,
         )
         await state.start_coordinator_build(
-            mode="streaming",
+            mode="global",
             stage=Stage.FIXUP,
             iteration=2,
             maximum_iterations=6,
@@ -370,7 +372,12 @@ async def test_dashboard_separates_agents_queues_and_coordinator_builds(tmp_path
             chapter_id=config.chapters[1].id,
             completed=20,
         )
+        state.append_coordinator_build_output("Building dependency graph\n")
+        state.append_coordinator_build_output("Compiling Book.Chapter02\n")
         ready.set()
+        await finish_build.wait()
+        await state.finish_coordinator_build()
+        build_finished.set()
         await finish.wait()
         return True
 
@@ -381,11 +388,21 @@ async def test_dashboard_separates_agents_queues_and_coordinator_builds(tmp_path
 
         usage = str(app.query_one("#usage", Static).content)
         assert "Agents 1/4 · formalize 1 · queued 1" in usage
-        assert "Coordinator streaming build 20/81 · iteration 2/6" in usage
+        assert "Coordinator global build 20/81 · iteration 2/6" in usage
+        status = str(app.query_one("#status", Static).content)
+        assert "GLOBAL BUILD [" in status
+        assert "20/81 (25%) · iteration 2/6 · book/chapter-02" in status
+        assert "Building dependency graph" in status
+        assert "Compiling Book.Chapter02" in status
         fixup = str(app.query_one("#stage-fixup", Static).content)
         assert "agent 0 · queue 0 · build 1 · rebuild 0" in fixup
         review = str(app.query_one("#stage-review", Static).content)
         assert "agent 0 · queue 1 · build 0 · rebuild 0" in review
+
+        finish_build.set()
+        await build_finished.wait()
+        app.refresh_dashboard()
+        assert str(app.query_one("#status", Static).content) == "Running test…"
 
         finish.set()
         await pilot.pause(1.2)

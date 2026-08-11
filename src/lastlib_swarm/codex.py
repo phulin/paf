@@ -693,7 +693,11 @@ imports with a compiler command.
 
 
 async def validate(
-    config: PipelineConfig, chapter: Chapter, *, workspace_root: Path | None = None
+    config: PipelineConfig,
+    chapter: Chapter,
+    *,
+    workspace_root: Path | None = None,
+    on_output: Callable[[str], None] | None = None,
 ) -> ValidationResult:
     root = workspace_root or config.settings.repo
     process = await asyncio.create_subprocess_exec(
@@ -705,19 +709,30 @@ async def validate(
         stderr=asyncio.subprocess.STDOUT,
         start_new_session=True,
     )
+    if process.stdout is None:
+        raise RuntimeError("failed to open validation subprocess output")
+    output_parts: list[bytes] = []
     try:
         async with asyncio.timeout(config.settings.validation_timeout_seconds):
-            output_bytes, _ = await process.communicate()
+            while line := await process.stdout.readline():
+                output_parts.append(line)
+                if on_output is not None:
+                    on_output(line.decode(errors="replace"))
+            await process.wait()
         exit_code = process.returncode or 0
         timed_out = False
     except TimeoutError:
         await _terminate(process)
-        output_bytes = b"validation timed out"
+        timeout_message = b"validation timed out"
+        output_parts.append(timeout_message)
+        if on_output is not None:
+            on_output(timeout_message.decode())
         exit_code = 124
         timed_out = True
     except asyncio.CancelledError:
         await _terminate(process)
         raise
+    output_bytes = b"".join(output_parts)
     complete_output = output_bytes.decode(errors="replace")
     warnings = unexpected_lean_warnings(complete_output)
     output = complete_output[-20000:]

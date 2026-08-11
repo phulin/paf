@@ -267,6 +267,21 @@ async def test_validation_accepts_sorry_warnings(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_validation_streams_build_output(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = replace(
+        config.chapters[0],
+        build_command="printf '%s\\n' 'building dependency' 'compiling chapter'",
+    )
+    output: list[str] = []
+
+    validation = await validate(config, chapter, on_output=output.append)
+
+    assert validation.succeeded
+    assert output == ["building dependency\n", "compiling chapter\n"]
+
+
+@pytest.mark.asyncio
 async def test_executor_consumes_jsonl_report_and_usage(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
     fake_codex = tmp_path / "fake-codex"

@@ -119,6 +119,12 @@ def format_duration(seconds: float) -> str:
     return f"{seconds}s"
 
 
+def progress_meter(completed: int, total: int, *, width: int = 24) -> str:
+    fraction = min(1.0, max(0.0, completed / total)) if total else 0.0
+    filled = int(fraction * width)
+    return "[" + "█" * filled + "░" * (width - filled) + "]"
+
+
 def seconds_since(value: str) -> float:
     try:
         return (datetime.now(UTC) - datetime.fromisoformat(value)).total_seconds()
@@ -478,7 +484,7 @@ class SwarmApp(App[bool]):
         padding: 0 1;
     }
     #tasks { height: 1fr; }
-    #status { height: 3; padding: 1 2; }
+    #status { height: auto; min-height: 3; max-height: 8; padding: 1 2; }
     """
 
     def __init__(
@@ -496,6 +502,8 @@ class SwarmApp(App[bool]):
         self.label = label
         self.startup_warning = startup_warning
         self.result = False
+        self._status_message = f"Starting {self.label}…"
+        self._show_build_progress = False
         self._rows_added: set[str] = set()
         self._row_cache: dict[str, tuple[str, ...]] = {}
         self._static_cache: dict[str, str] = {}
@@ -519,7 +527,7 @@ class SwarmApp(App[bool]):
             for stage in Stage:
                 yield Static(stage.value.title(), id=f"stage-{stage.value}", classes="stage-card")
         yield DataTable(id="tasks", zebra_stripes=True, cursor_type="row")
-        yield Static(f"Starting {self.label}…", id="status")
+        yield Static(self._status_message, id="status")
         yield Footer()
 
     def on_mount(self) -> None:
@@ -559,7 +567,7 @@ class SwarmApp(App[bool]):
         """Cancel and drain the pipeline before closing the terminal app."""
 
         self.orchestrator.control.stop()
-        self.query_one("#status", Static).update("Stopping workers and cleaning workspaces…")
+        self._set_status("Stopping workers and cleaning workspaces…")
         workers = self.workers.cancel_group(self, "pipeline")
         with suppress(WorkerCancelled):
             await self.workers.wait_for_complete(workers)
@@ -569,7 +577,7 @@ class SwarmApp(App[bool]):
         error: Exception | None = None
         try:
             await self.orchestrator.prepare()
-            self.query_one("#status", Static).update(f"Running {self.label}…")
+            self._set_status(f"Running {self.label}…", show_build_progress=True)
             self.refresh_dashboard()
             self.result = await self.operation()
         except Exception as caught:
@@ -582,13 +590,13 @@ class SwarmApp(App[bool]):
                     error = shutdown_error
 
         if error is not None:
-            self.query_one("#status", Static).update(f"Fatal orchestrator error: {error}")
+            self._set_status(f"Fatal orchestrator error: {error}")
             self.set_timer(2.0, lambda: self.exit(False))
             return
         message = (
             "Pipeline completed successfully" if self.result else "Pipeline finished with failures"
         )
-        self.query_one("#status", Static).update(message + " — returning to the shell")
+        self._set_status(message + " — returning to the shell")
         self.refresh_dashboard()
         self.set_timer(1.0, lambda: self.exit(self.result))
 
@@ -627,6 +635,26 @@ class SwarmApp(App[bool]):
                 build_status += f" · {build.current_chapter_id}"
         else:
             build_status = "Coordinator build idle"
+        if self._show_build_progress and build.active and build.mode == "global":
+            percent = 100 * build.completed / build.total if build.total else 0
+            footer_status = (
+                f"GLOBAL BUILD {progress_meter(build.completed, build.total)} "
+                f"{build.completed}/{build.total} ({percent:.0f}%) · "
+                f"iteration {build.iteration}/{build.maximum_iterations}"
+            )
+            if build.current_chapter_id:
+                footer_status += f" · {build.current_chapter_id}"
+            if build.output_tail:
+                status_width = self.query_one("#status", Static).size.width
+                line_width = max(20, status_width - 6)
+                output_tail = (
+                    line if len(line) <= line_width else "…" + line[-line_width + 1 :]
+                    for line in build.output_tail
+                )
+                footer_status += "\n" + "\n".join(f"  {line}" for line in output_tail)
+        else:
+            footer_status = self._status_message
+        self._update_static("#status", footer_status)
         self._update_static(
             "#usage",
             f"{format_usage(usage, label='This invocation')}    "
@@ -697,6 +725,11 @@ class SwarmApp(App[bool]):
             return
         self._static_cache[selector] = content
         self.query_one(selector, Static).update(content)
+
+    def _set_status(self, content: str, *, show_build_progress: bool = False) -> None:
+        self._status_message = content
+        self._show_build_progress = show_build_progress
+        self._update_static("#status", content)
 
     def _row_values(self, chapter: Chapter) -> tuple[str, ...]:
         statuses = []

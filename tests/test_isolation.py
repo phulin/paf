@@ -319,7 +319,11 @@ print(json.dumps({"type": "item.completed", "item": {
     await orchestrator.prepare()
 
     async def coordinator_validation(
-        _config: object, _chapter: object, *, workspace_root: Path | None = None
+        _config: object,
+        _chapter: object,
+        *,
+        workspace_root: Path | None = None,
+        **_kwargs: object,
     ) -> ValidationResult:
         assert workspace_root == tmp_path
         assert (tmp_path / "lean" / "Book" / "Chapter01.lean").read_text(
