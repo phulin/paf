@@ -140,6 +140,17 @@ def test_executor_uses_machine_readable_codex_mode(tmp_path: Path) -> None:
     assert "--dangerously-bypass-approvals-and-sandbox" not in resumed_review
 
 
+@pytest.mark.parametrize("stage", list(Stage))
+def test_every_agent_prompt_explains_that_git_is_unavailable(tmp_path: Path, stage: Stage) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    executor = CodexExecutor(config, StateStore(config))
+
+    prompt = executor.build_prompt(config.chapters[0], stage)
+
+    assert "filesystem is not a Git repository" in prompt
+    assert "Do not run `git` commands" in prompt
+
+
 @pytest.mark.parametrize(
     "event",
     [

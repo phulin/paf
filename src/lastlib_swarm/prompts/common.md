@@ -1,5 +1,7 @@
 ## Common Lean policy
 
+The assigned filesystem is not a Git repository. Do not run `git` commands or rely on Git metadata.
+
 ### Mathematical integrity
 
 Use canonical pinned Mathlib and established LastLib APIs before introducing new interfaces. Match
