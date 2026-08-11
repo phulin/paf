@@ -4,9 +4,7 @@ import re
 
 LEAN_ERROR_RE = re.compile(r"(?m)^[ \t]*error:[ \t]*(?P<message>.*)$")
 LEAN_WARNING_RE = re.compile(r"(?m)^[ \t]*warning:[ \t]*(?P<message>.*)$")
-LEAN_SORRY_WARNING_RE = re.compile(
-    r"(?:^|:\d+:\d+:[ \t]+)declaration uses [`']sorry[`'][ \t]*$"
-)
+LEAN_SORRY_WARNING_RE = re.compile(r"(?:^|:\d+:\d+:[ \t]+)declaration uses [`']sorry[`'][ \t]*$")
 
 
 def unexpected_lean_warnings(output: str) -> tuple[str, ...]:

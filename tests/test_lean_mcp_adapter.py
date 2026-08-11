@@ -22,9 +22,7 @@ class FakeClient:
         self.events.append(("close", path))
         self._docs.pop(path, None)
 
-    async def open(
-        self, path: str, *, wait: bool, dependency_build_mode: str
-    ) -> FakeDocument:
+    async def open(self, path: str, *, wait: bool, dependency_build_mode: str) -> FakeDocument:
         self.events.append(("open", path, wait, dependency_build_mode))
         document = FakeDocument()
         self._docs[path] = document

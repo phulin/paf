@@ -124,7 +124,7 @@ def test_tracks_parallel_items_until_all_complete(tmp_path: Path) -> None:
 def test_compacts_shell_commands_and_successful_completions(tmp_path: Path) -> None:
     activity = AgentActivity(run_id="run", chapter_id="chapter", stage="formalize")
     command = (
-        '/bin/bash -lc "sed -n \'1,80p\' '
+        "/bin/bash -lc \"sed -n '1,80p' "
         "/tmp/swarm/lean/LastLib/Book05LocalClassFieldTheory/Chapter07/"
         'Section07WhyFrobeniusIsCanonical.lean"'
     )

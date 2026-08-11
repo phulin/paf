@@ -388,8 +388,7 @@ def print_status(config: PipelineConfig, console: Console, *, raw_json: bool) ->
         )
         console.print(
             f"[bold]Agents: {int(agents.get('active', 0))}/{int(agents.get('maximum', 0))}[/bold]"
-            f"  queued: {int(agents.get('queued', 0))}"
-            + (f"  {breakdown}" if breakdown else "")
+            f"  queued: {int(agents.get('queued', 0))}" + (f"  {breakdown}" if breakdown else "")
         )
     coordinator_build = snapshot.get("coordinator_build")
     if isinstance(coordinator_build, dict) and coordinator_build.get("active"):

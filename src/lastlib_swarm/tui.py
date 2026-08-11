@@ -86,11 +86,7 @@ def stage_counts(state: StateStore, stage: Stage) -> dict[str, int]:
 def stage_phase_counts(state: StateStore, stage: Stage) -> dict[str, int]:
     counts = {phase.value: 0 for phase in TaskPhase}
     for task in state.tasks.values():
-        if (
-            task.stage == stage.value
-            and task.status == TaskStatus.RUNNING
-            and task.phase in counts
-        ):
+        if task.stage == stage.value and task.status == TaskStatus.RUNNING and task.phase in counts:
             counts[task.phase] += 1
     return counts
 
@@ -663,9 +659,12 @@ class SwarmApp(App[bool]):
         )
         isolation = self.orchestrator.isolation.name
         critical = " → ".join(self.orchestrator.statement_schedule.critical_path) or "—"
-        agent_breakdown = " · ".join(
-            f"{stage.value} {agents[stage.value]}" for stage in Stage if agents[stage.value]
-        ) or "none"
+        agent_breakdown = (
+            " · ".join(
+                f"{stage.value} {agents[stage.value]}" for stage in Stage if agents[stage.value]
+            )
+            or "none"
+        )
         build = self.state.coordinator_build
         if build.active:
             build_status = (
