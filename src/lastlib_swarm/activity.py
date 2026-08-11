@@ -15,7 +15,7 @@ EXIT_STATUS_ONLY = re.compile(r"^exit\s+\d+$", re.IGNORECASE)
 SHELL_COMMAND_WRAPPER = re.compile(r"^/bin/bash\s+-lc\s+(['\"])(.*)\1$", re.DOTALL)
 LEAN_BOOK_PATH = re.compile(
     r"""
-    (?:(?:[^\s'"`|;,()\[\]{}]+/)*lean/)?
+    /?(?:(?:[^/\s'"`|;,()\[\]{}]+/)*lean/)?
     LastLib/
     Book(?P<book>\d+)[A-Za-z0-9_]*/
     Chapter(?P<chapter>\d+)

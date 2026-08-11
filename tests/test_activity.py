@@ -1,7 +1,27 @@
 import json
 from pathlib import Path
 
-from lastlib_swarm.activity import ActivityStore, AgentActivity, systemic_errors
+from lastlib_swarm.activity import (
+    ActivityStore,
+    AgentActivity,
+    shorten_book_paths,
+    systemic_errors,
+)
+
+
+def test_shortens_book_path_in_long_lake_trace() -> None:
+    lean_paths = ":".join(
+        f"/home/example/project/lean/.lake/packages/package-{index}/.lake/build/lib/lean"
+        for index in range(20)
+    )
+    source = (
+        "/home/example/project/lean/LastLib/Book02FiniteExtensionsOfLocalFields/"
+        "Chapter07/Section04FiniteResidueFields.lean"
+    )
+
+    shortened = shorten_book_paths(f"trace: .> LEAN_PATH={lean_paths} {source}")
+
+    assert shortened.endswith("[Book 2 Chap 7 Sec 4: Finite Residue Fields]")
 
 
 def test_summarizes_agent_events_and_persists_compact_activity(tmp_path: Path) -> None:
