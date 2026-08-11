@@ -635,10 +635,10 @@ class SwarmApp(App[bool]):
                 build_status += f" · {build.current_chapter_id}"
         else:
             build_status = "Coordinator build idle"
-        if self._show_build_progress and build.active and build.mode == "global":
+        if self._show_build_progress and build.active:
             percent = 100 * build.completed / build.total if build.total else 0
             footer_status = (
-                f"GLOBAL BUILD {progress_meter(build.completed, build.total)} "
+                f"{build.mode.upper()} BUILD {progress_meter(build.completed, build.total)} "
                 f"{build.completed}/{build.total} ({percent:.0f}%) · "
                 f"iteration {build.iteration}/{build.maximum_iterations}"
             )

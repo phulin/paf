@@ -336,7 +336,10 @@ async def test_unchanged_dashboard_does_not_update_table_cells(
 
 
 @pytest.mark.asyncio
-async def test_dashboard_separates_agents_queues_and_coordinator_builds(tmp_path: Path) -> None:
+@pytest.mark.parametrize("build_mode", ["streaming", "global"])
+async def test_dashboard_separates_agents_queues_and_coordinator_builds(
+    tmp_path: Path, build_mode: str
+) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
     state = StateStore(config)
     orchestrator = Orchestrator(config, state)
@@ -362,7 +365,7 @@ async def test_dashboard_separates_agents_queues_and_coordinator_builds(tmp_path
             phase=TaskPhase.QUEUED,
         )
         await state.start_coordinator_build(
-            mode="global",
+            mode=build_mode,
             stage=Stage.FIXUP,
             iteration=2,
             maximum_iterations=6,
@@ -388,9 +391,9 @@ async def test_dashboard_separates_agents_queues_and_coordinator_builds(tmp_path
 
         usage = str(app.query_one("#usage", Static).content)
         assert "Agents 1/4 · formalize 1 · queued 1" in usage
-        assert "Coordinator global build 20/81 · iteration 2/6" in usage
+        assert f"Coordinator {build_mode} build 20/81 · iteration 2/6" in usage
         status = str(app.query_one("#status", Static).content)
-        assert "GLOBAL BUILD [" in status
+        assert f"{build_mode.upper()} BUILD [" in status
         assert "20/81 (25%) · iteration 2/6 · book/chapter-02" in status
         assert "Building dependency graph" in status
         assert "Compiling Book.Chapter02" in status
