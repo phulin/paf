@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from lastlib_swarm import json_codec as json
+from lastlib_swarm.diagnostics import unexpected_lean_warnings
 from lastlib_swarm.models import Chapter, PipelineConfig, Stage
 from lastlib_swarm.state import RunRecord, StateStore, TaskStatus, TokenUsage
 
@@ -78,8 +79,6 @@ LEAN_MCP_PROOF_TOOLS = (
 USAGE_POLL_SECONDS = 0.25
 PROCESS_GROUP_GRACE_SECONDS = 1.0
 COMMON_PROMPT_PATH = Path(__file__).with_name("prompts") / "common.md"
-LEAN_WARNING_RE = re.compile(r"(?m)^[ \t]*warning:[ \t]*(?P<message>.*)$")
-LEAN_SORRY_WARNING_RE = re.compile(r"(?:^|:\d+:\d+:[ \t]+)declaration uses [`']sorry[`'][ \t]*$")
 CAPACITY_RESUME_PROMPT = "Continue from the interrupted turn and complete the assigned task."
 
 
@@ -130,23 +129,6 @@ class AgentResult:
     thread_id: str | None = None
     error: str = ""
     capacity_exhausted: bool = False
-
-
-def unexpected_lean_warnings(output: str) -> tuple[str, ...]:
-    """Return Lean warning headers other than declarations that use ``sorry``.
-
-    Lake renders cached and freshly built Lean diagnostics in the same
-    ``warning: <location>: <message>`` form. Keep the exception intentionally
-    narrow so warnings cannot disappear merely because their text mentions a
-    sorry elsewhere in the diagnostic body.
-    """
-
-    warnings: list[str] = []
-    for match in LEAN_WARNING_RE.finditer(output):
-        message = match.group("message")
-        if not LEAN_SORRY_WARNING_RE.search(message):
-            warnings.append(match.group(0).strip())
-    return tuple(warnings)
 
 
 def render_prompt(template: str, chapter: Chapter) -> str:

@@ -13,6 +13,7 @@ from uuid import uuid4
 
 from lastlib_swarm import json_codec as json
 from lastlib_swarm.activity import ActivityStore, shorten_book_paths
+from lastlib_swarm.diagnostics import lean_diagnostic_counts
 from lastlib_swarm.models import Chapter, PipelineConfig, Stage
 from lastlib_swarm.pricing import LEGACY_MODEL, CostEstimate, estimate_cost
 
@@ -146,6 +147,8 @@ class CoordinatorBuildRecord:
     completed: int = 0
     total: int = 0
     current_chapter_id: str = ""
+    error_count: int = 0
+    warning_count: int = 0
     output_tail: list[str] = field(default_factory=list)
     updated_at: str = field(default_factory=timestamp)
 
@@ -562,8 +565,12 @@ class StateStore:
     def append_coordinator_build_output(self, output: str, *, maximum: int = 4) -> None:
         """Retain a small in-memory tail for live status displays."""
 
+        output = ANSI_ESCAPE_RE.sub("", output)
+        errors, warnings = lean_diagnostic_counts(output)
+        self.coordinator_build.error_count += errors
+        self.coordinator_build.warning_count += warnings
         lines = [
-            shorten_book_paths(ANSI_ESCAPE_RE.sub("", line.rstrip()))[-500:]
+            shorten_book_paths(line.rstrip())[-500:]
             for line in output.replace("\r", "\n").splitlines()
         ]
         lines = [line for line in lines if line]

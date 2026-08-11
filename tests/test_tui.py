@@ -377,6 +377,8 @@ async def test_dashboard_separates_agents_queues_and_coordinator_builds(
         )
         state.append_coordinator_build_output("Building dependency graph\n")
         state.append_coordinator_build_output("Compiling Book.Chapter02\n")
+        state.append_coordinator_build_output("error: Book/Chapter02.lean:3:1: broken\n")
+        state.append_coordinator_build_output("warning: Book/Chapter02.lean:4:1: unused\n")
         ready.set()
         await finish_build.wait()
         await state.finish_coordinator_build()
@@ -392,9 +394,13 @@ async def test_dashboard_separates_agents_queues_and_coordinator_builds(
         usage = str(app.query_one("#usage", Static).content)
         assert "Agents 1/4 · formalize 1 · queued 1" in usage
         assert f"Coordinator {build_mode} build 20/81 · iteration 2/6" in usage
+        assert "errors 1 · non-sorry warnings 1" in usage
         status = str(app.query_one("#status", Static).content)
-        assert f"{build_mode.upper()} BUILD [" in status
-        assert "20/81 (25%) · iteration 2/6 · book/chapter-02" in status
+        build_label = "GLOBAL BUILD" if build_mode == "global" else "BUILD"
+        assert f"{build_label} [" in status
+        assert "20/81 (25%) · iteration 2/6" in status
+        assert "errors 1 · non-sorry warnings 1" in status
+        assert "book/chapter-02" in status
         assert "Building dependency graph" in status
         assert "Compiling Book.Chapter02" in status
         fixup = str(app.query_one("#stage-fixup", Static).content)

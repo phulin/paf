@@ -8,14 +8,9 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from typing import Any
 
-from lastlib_swarm.codex import (
-    AgentResult,
-    CodexExecutor,
-    ValidationResult,
-    unexpected_lean_warnings,
-    validate,
-)
+from lastlib_swarm.codex import AgentResult, CodexExecutor, ValidationResult, validate
 from lastlib_swarm.corpus import build_corpus_schedule, scheduling_snapshot
+from lastlib_swarm.diagnostics import unexpected_lean_warnings
 from lastlib_swarm.isolation import IsolationResult, create_isolation
 from lastlib_swarm.models import Chapter, PipelineConfig, Stage
 from lastlib_swarm.state import RunRecord, StateStore, TaskPhase, TaskStatus

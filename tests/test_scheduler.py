@@ -49,12 +49,21 @@ def test_coordinator_build_output_shortens_diagnostic_paths(tmp_path: Path) -> N
 
     state.append_coordinator_build_output(
         "error: lean/LastLib/Book05LocalClassFieldTheory/Chapter07/"
-        "Section07WhyFrobeniusIsCanonical.lean:12:3: broken"
+        "Section07WhyFrobeniusIsCanonical.lean:12:3: broken\n"
+        "warning: lean/LastLib/Book05LocalClassFieldTheory/Chapter07/"
+        "Section07WhyFrobeniusIsCanonical.lean:13:3: declaration uses `sorry`\n"
+        "warning: lean/LastLib/Book05LocalClassFieldTheory/Chapter07/"
+        "Section07WhyFrobeniusIsCanonical.lean:14:3: unused variable"
     )
 
     assert state.coordinator_build.output_tail == [
-        "error: [Book 5 Chap 7 Sec 7: Why Frobenius Is Canonical]:12:3: broken"
+        "error: [Book 5 Chap 7 Sec 7: Why Frobenius Is Canonical]:12:3: broken",
+        "warning: [Book 5 Chap 7 Sec 7: Why Frobenius Is Canonical]:13:3: "
+        "declaration uses `sorry`",
+        "warning: [Book 5 Chap 7 Sec 7: Why Frobenius Is Canonical]:14:3: unused variable",
     ]
+    assert state.coordinator_build.error_count == 1
+    assert state.coordinator_build.warning_count == 1
 
 
 def result(
@@ -577,6 +586,7 @@ async def test_coordinator_build_uses_build_phases_without_counting_agents(
         assert workspace_root == config.settings.repo
         assert on_output is not None
         on_output(f"building {chapter.id}\n")
+        on_output(f"error: Book/Chapter{chapter.number:02d}.lean:1:1: broken\n")
         if chapter.number == 1:
             validation_started.set()
             await release_validation.wait()
@@ -598,7 +608,8 @@ async def test_coordinator_build_uses_build_phases_without_counting_agents(
     assert state.coordinator_build.mode == "streaming"
     assert state.coordinator_build.completed == 0
     assert state.coordinator_build.total == 2
-    assert state.coordinator_build.output_tail[-1] == "building book/chapter-01"
+    assert state.coordinator_build.output_tail[-1] == "error: Book/Chapter01.lean:1:1: broken"
+    assert state.coordinator_build.error_count == 1
     assert state.agent_summary()["active"] == 0
     assert all(
         state.task(chapter.id, Stage.FIXUP).phase == TaskPhase.BUILDING
@@ -610,11 +621,12 @@ async def test_coordinator_build_uses_build_phases_without_counting_agents(
     assert not state.coordinator_build.active
     assert state.coordinator_build.completed == 2
     assert state.coordinator_build.output_tail == [
-        f"$ {config.chapters[0].build_command}",
-        "building book/chapter-01",
+        "error: Book/Chapter01.lean:1:1: broken",
         f"$ {config.chapters[1].build_command}",
         "building book/chapter-02",
+        "error: Book/Chapter02.lean:1:1: broken",
     ]
+    assert state.coordinator_build.error_count == 2
     assert all(
         state.task(chapter.id, Stage.FIXUP).phase == TaskPhase.AWAITING_REBUILD
         for chapter in config.chapters
