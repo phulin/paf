@@ -48,8 +48,13 @@ async def test_dashboard_runs_an_operation_and_exits(tmp_path: Path) -> None:
     async with app.run_test() as pilot:
         await pilot.pause(1.2)
         usage = app.query_one("#usage", Static).content
+        table = app.query_one("#tasks", DataTable)
+        chapter_column = next(
+            column for column in table.columns.values() if column.label.plain == "Chapter"
+        )
 
     assert app.result
+    assert chapter_column.width == 40
     assert "API-equivalent cost" in str(usage)
     assert "lifetime tokens" in str(usage)
     assert "Lean MCP: on" in str(usage)

@@ -571,7 +571,7 @@ class SwarmApp(App[bool]):
         table: DataTable[Any] = self.query_one("#tasks", DataTable)
         table.add_column("Book", key="book")
         table.add_column("S/P rank", key="rank")
-        table.add_column("Chapter", key="chapter")
+        table.add_column("Chapter", key="chapter", width=40)
         for stage in Stage:
             table.add_column(stage.value.title(), key=stage.value)
         table.add_column("Current agent activity", key="activity")
