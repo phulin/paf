@@ -35,6 +35,7 @@ from lastlib_swarm.models import Chapter, PipelineConfig, Stage
 from lastlib_swarm.pricing import LEGACY_MODEL, CostEstimate, estimate_cost, format_usd
 from lastlib_swarm.scheduler import Orchestrator, scaffold_directories
 from lastlib_swarm.state import StateStore, TaskStatus
+from lastlib_swarm.state_db import read_checkpoint, read_full_snapshot
 from lastlib_swarm.tui import format_count, format_usage, run_tui
 
 RIPGREP_WARNING = (
@@ -343,13 +344,7 @@ def print_plan(config: PipelineConfig, console: Console) -> None:
 
 
 def _read_status(config: PipelineConfig) -> dict[str, object] | None:
-    path = config.settings.state_dir / "state.json"
-    if not path.is_file():
-        return None
-    value = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(value, dict):
-        raise ValueError(f"invalid state file: {path}")
-    return value
+    return read_checkpoint(config.settings.state_dir)
 
 
 def print_status(config: PipelineConfig, console: Console, *, raw_json: bool) -> int:
@@ -594,18 +589,16 @@ def _start_agent(args: argparse.Namespace, config: PipelineConfig) -> int:
 
 def _offline_snapshot(config: PipelineConfig) -> dict[str, object]:
     response = offline_status(config.settings.state_dir)
-    state_path = config.settings.state_dir / "state.json"
-    if state_path.is_file():
-        value = json.loads(state_path.read_text(encoding="utf-8"))
-        if isinstance(value, dict):
-            response["snapshot"] = value
+    value = read_full_snapshot(config.settings.state_dir)
+    if value is not None:
+        response["snapshot"] = value
     return response
 
 
 def _inspect_snapshot(
     config: PipelineConfig, *, chapter_selector: str | None, run_id: str | None
 ) -> dict[str, Any]:
-    snapshot = _read_status(config)
+    snapshot = read_full_snapshot(config.settings.state_dir)
     if snapshot is None:
         raise ValueError(f"no swarm state exists at {config.settings.state_dir}")
     raw_tasks = snapshot.get("tasks")

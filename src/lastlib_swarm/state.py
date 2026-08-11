@@ -2,20 +2,20 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import os
 import re
-from collections.abc import Iterable
-from dataclasses import asdict, dataclass, field
+from collections.abc import AsyncIterator, Iterable
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
 from uuid import uuid4
 
-from lastlib_swarm import json_codec as json
 from lastlib_swarm.activity import ActivityStore, shorten_book_paths
 from lastlib_swarm.diagnostics import lean_diagnostic_counts
 from lastlib_swarm.models import Chapter, PipelineConfig, Stage
 from lastlib_swarm.pricing import LEGACY_MODEL, CostEstimate, estimate_cost
+from lastlib_swarm.state_db import DATABASE_NAME, StateDatabase
 
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
@@ -177,11 +177,21 @@ class StateStore:
     def __init__(self, config: PipelineConfig) -> None:
         self.config = config
         self.path = config.settings.state_dir / "state.json"
+        self.database_path = config.settings.state_dir / DATABASE_NAME
         self.source_issues_path = config.settings.state_dir / "source-issues.json"
         self.logs_dir = config.settings.state_dir / "logs"
         self.activities = ActivityStore(self.logs_dir)
-        self._lock = asyncio.Lock()
+        self._database = StateDatabase(config.settings.state_dir)
+        self._flush_lock = asyncio.Lock()
+        self._batch_depth = 0
+        self._checkpoint_dirty = False
+        self._issues_dirty = False
+        self._dirty_run_ids: set[str] = set()
         self._prior_run_ids: set[str] = set()
+        self._runs_by_id: dict[str, RunRecord] = {}
+        self._chapter_runs: dict[str, list[RunRecord]] = {}
+        self._usage_cache: dict[tuple[bool, str | None], TokenUsage] = {}
+        self._cost_cache: dict[tuple[bool, str | None], CostEstimate] = {}
         self.tasks: dict[str, TaskRecord] = {}
         self.source_issues: dict[str, SourceIssueRecord] = {}
         self.scheduling: dict[str, Any] = {}
@@ -197,14 +207,11 @@ class StateStore:
 
     async def load_or_create(self) -> None:
         self.logs_dir.mkdir(parents=True, exist_ok=True)
-        persisted_source_issues: list[Any] = []
-        if self.source_issues_path.is_file():
-            ledger = json.loads(self.source_issues_path.read_text(encoding="utf-8"))
-            if not isinstance(ledger, dict) or not isinstance(ledger.get("issues"), list):
-                raise ValueError(f"invalid source-issue ledger: {self.source_issues_path}")
-            persisted_source_issues.extend(ledger["issues"])
-        if self.path.is_file():
-            raw = json.loads(self.path.read_text(encoding="utf-8"))
+        await asyncio.to_thread(self._database.initialize)
+        raw, persisted_runs, persisted_source_issues = await asyncio.to_thread(
+            self._database.load
+        )
+        if raw is not None:
             self.created_at = str(raw.get("created_at", timestamp()))
             self.updated_at = str(raw.get("updated_at", self.created_at))
             if not self.scheduling and isinstance(raw.get("scheduling"), dict):
@@ -223,26 +230,23 @@ class StateStore:
                     }
                 )
             persisted_tasks = raw.get("tasks", {})
-            for key, value in persisted_tasks.items():
-                if key.endswith(":repair"):
-                    key = f"{key[: -len(':repair')]}:fixup"
-                    if key in persisted_tasks:
+            if isinstance(persisted_tasks, dict):
+                for key, value in persisted_tasks.items():
+                    if not isinstance(key, str) or not isinstance(value, dict):
                         continue
-                runs = []
-                for item in value.get("runs", []):
-                    if item.get("stage") == "repair":
-                        item["stage"] = "fixup"
-                    usage = TokenUsage(**item.pop("usage", {}))
-                    runs.append(RunRecord(**item, usage=usage))
-                if value.get("stage") == "repair":
-                    value["stage"] = "fixup"
-                value.setdefault("phase", TaskPhase.IDLE)
-                self.tasks[key] = TaskRecord(
-                    **{name: item for name, item in value.items() if name != "runs"}, runs=runs
-                )
-            raw_source_issues = raw.get("source_issues", [])
-            if isinstance(raw_source_issues, list):
-                persisted_source_issues.extend(raw_source_issues)
+                    if key.endswith(":repair"):
+                        key = f"{key[: -len(':repair')]}:fixup"
+                        if key in persisted_tasks:
+                            continue
+                    task_value = {
+                        name: item
+                        for name, item in value.items()
+                        if name in TaskRecord.__dataclass_fields__ and name != "runs"
+                    }
+                    if task_value.get("stage") == "repair":
+                        task_value["stage"] = "fixup"
+                    task_value.setdefault("phase", TaskPhase.IDLE)
+                    self.tasks[key] = TaskRecord(**task_value)
         for value in persisted_source_issues:
             if isinstance(value, dict):
                 issue = SourceIssueRecord(**value)
@@ -255,7 +259,31 @@ class StateStore:
             for stage in Stage:
                 key = self.key(chapter.id, stage)
                 self.tasks.setdefault(key, self._new_task(chapter, stage))
-        self._prior_run_ids = {run.id for task in self.tasks.values() for run in task.runs}
+        for value in persisted_runs:
+            if not isinstance(value, dict):
+                continue
+            if value.get("stage") == "repair":
+                value["stage"] = "fixup"
+            if str(value.get("chapter_id", "")) not in configured:
+                continue
+            usage_value = value.get("usage")
+            usage = TokenUsage(**usage_value) if isinstance(usage_value, dict) else TokenUsage()
+            fields = {
+                name: item
+                for name, item in value.items()
+                if name in RunRecord.__dataclass_fields__
+                and name not in {"usage", "report", "validation", "isolation"}
+            }
+            run = RunRecord(**fields, usage=usage)
+            task = self.task(run.chapter_id, Stage(run.stage))
+            task.runs.append(run)
+            self._index_run(run)
+        for task in self.tasks.values():
+            task.runs.sort(key=lambda run: (run.started_at, run.id))
+        for runs in self._chapter_runs.values():
+            runs.sort(key=lambda run: (run.started_at, run.id))
+        self._prior_run_ids = set(self._runs_by_id)
+        recovered_runs: list[RunRecord] = []
         for task in self.tasks.values():
             if task.status == TaskStatus.RUNNING:
                 task.status = TaskStatus.PENDING
@@ -265,11 +293,16 @@ class StateStore:
                     if run.status == TaskStatus.RUNNING:
                         run.status = TaskStatus.FAILED
                         run.finished_at = timestamp()
+                        recovered_runs.append(run)
         if self.coordinator_build.active:
             self.coordinator_build.active = False
             self.coordinator_build.current_chapter_id = ""
             self.coordinator_build.updated_at = timestamp()
-        await self.save()
+        self._invalidate_aggregates()
+        self._checkpoint_dirty = True
+        self._issues_dirty = True
+        self._dirty_run_ids.update(run.id for run in recovered_runs)
+        await self.flush()
 
     def _new_task(self, chapter: Chapter, stage: Stage) -> TaskRecord:
         return TaskRecord(
@@ -280,37 +313,80 @@ class StateStore:
             stage=stage.value,
         )
 
-    async def save(self) -> None:
-        async with self._lock:
-            self.updated_at = timestamp()
-            payload = self.snapshot()
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            temporary = self.path.with_name(f".{self.path.name}.{os.getpid()}.tmp")
-            temporary.write_bytes(json.dumpb(payload, indent=True, sort_keys=True))
-            os.replace(temporary, self.path)
-            ledger = {
-                "version": 1,
-                "updated_at": self.updated_at,
-                "issues": [asdict(issue) for _, issue in sorted(self.source_issues.items())],
-            }
-            ledger_temporary = self.source_issues_path.with_name(
-                f".{self.source_issues_path.name}.{os.getpid()}.tmp"
-            )
-            ledger_temporary.write_bytes(json.dumpb(ledger, indent=True, sort_keys=True))
-            os.replace(ledger_temporary, self.source_issues_path)
+    @staticmethod
+    def _usage_dict(usage: TokenUsage) -> dict[str, Any]:
+        return {
+            "input_tokens": usage.input_tokens,
+            "cached_input_tokens": usage.cached_input_tokens,
+            "output_tokens": usage.output_tokens,
+            "reasoning_output_tokens": usage.reasoning_output_tokens,
+            "measured": usage.measured,
+        }
 
-    def snapshot(self) -> dict[str, Any]:
+    def _run_dict(self, run: RunRecord, *, include_payload: bool = True) -> dict[str, Any]:
+        value = {
+            "id": run.id,
+            "chapter_id": run.chapter_id,
+            "stage": str(run.stage),
+            "round": run.round,
+            "model": run.model,
+            "status": str(run.status),
+            "started_at": run.started_at,
+            "finished_at": run.finished_at,
+            "pid": run.pid,
+            "thread_id": run.thread_id,
+            "exit_code": run.exit_code,
+            "changed": run.changed,
+            "placeholders": run.placeholders,
+            "usage": self._usage_dict(run.usage),
+            "log_path": run.log_path,
+        }
+        if include_payload:
+            value |= {
+                "report": run.report,
+                "validation": run.validation,
+                "isolation": run.isolation,
+            }
+        return value
+
+    @staticmethod
+    def _task_dict(task: TaskRecord) -> dict[str, Any]:
+        return {
+            "chapter_id": task.chapter_id,
+            "book_id": task.book_id,
+            "chapter_number": task.chapter_number,
+            "chapter_title": task.chapter_title,
+            "stage": str(task.stage),
+            "status": str(task.status),
+            "phase": str(task.phase),
+            "detail": task.detail,
+            "rounds": task.rounds,
+            "updated_at": task.updated_at,
+        }
+
+    @staticmethod
+    def _issue_dict(issue: SourceIssueRecord) -> dict[str, Any]:
+        return {
+            name: getattr(issue, name) for name in SourceIssueRecord.__dataclass_fields__
+        }
+
+    @staticmethod
+    def _build_dict(build: CoordinatorBuildRecord) -> dict[str, Any]:
+        return {name: getattr(build, name) for name in CoordinatorBuildRecord.__dataclass_fields__}
+
+    def hot_snapshot(self) -> dict[str, Any]:
         usage = self.total_usage()
         invocation_usage = self.invocation_usage()
         cost = self.total_cost()
         invocation_cost = self.invocation_cost()
         return {
-            "version": 6,
+            "version": 7,
+            "history_database": DATABASE_NAME,
             "config": str(self.config.path),
             "created_at": self.created_at,
             "updated_at": self.updated_at,
-            "usage": asdict(usage) | {"total_tokens": usage.total_tokens},
-            "invocation_usage": asdict(invocation_usage)
+            "usage": self._usage_dict(usage) | {"total_tokens": usage.total_tokens},
+            "invocation_usage": self._usage_dict(invocation_usage)
             | {"total_tokens": invocation_usage.total_tokens},
             "cost": cost.as_dict(),
             "invocation_cost": invocation_cost.as_dict(),
@@ -318,10 +394,130 @@ class StateStore:
             "scheduling": self.scheduling,
             "fixup_graph": self.fixup_graph,
             "isolation": self.isolation,
-            "coordinator_build": asdict(self.coordinator_build),
-            "source_issues": [asdict(issue) for _, issue in sorted(self.source_issues.items())],
-            "tasks": {key: asdict(value) for key, value in sorted(self.tasks.items())},
+            "coordinator_build": self._build_dict(self.coordinator_build),
+            "tasks": {
+                key: self._task_dict(task)
+                | {
+                    "run_count": len(task.runs),
+                    "latest_run_id": task.runs[-1].id if task.runs else None,
+                }
+                for key, task in sorted(self.tasks.items())
+            },
         }
+
+    def snapshot(self) -> dict[str, Any]:
+        """Return a compatibility export, loading immutable run payloads on demand."""
+
+        snapshot = self.hot_snapshot()
+        payloads = self._database.run_payloads() if self.database_path.is_file() else {}
+        tasks: dict[str, Any] = {}
+        for key, task in sorted(self.tasks.items()):
+            runs = []
+            for run in task.runs:
+                value = payloads.get(run.id, self._run_dict(run))
+                if (
+                    run.report is not None
+                    or run.validation is not None
+                    or run.isolation is not None
+                ):
+                    value = self._run_dict(run)
+                runs.append(value)
+            tasks[key] = self._task_dict(task) | {"runs": runs}
+        snapshot["source_issues"] = [
+            self._issue_dict(issue) for _, issue in sorted(self.source_issues.items())
+        ]
+        snapshot["tasks"] = tasks
+        return snapshot
+
+    def _mark_dirty(self, *, run: RunRecord | None = None, issues: bool = False) -> None:
+        self._checkpoint_dirty = True
+        if run is not None:
+            self._dirty_run_ids.add(run.id)
+        self._issues_dirty = self._issues_dirty or issues
+
+    async def _persist(self) -> None:
+        if self._batch_depth:
+            return
+        await asyncio.sleep(0)
+        await self.flush()
+
+    async def flush(self) -> None:
+        async with self._flush_lock:
+            if not (self._checkpoint_dirty or self._dirty_run_ids or self._issues_dirty):
+                return
+            if not self.database_path.is_file():
+                await asyncio.to_thread(self._database.initialize)
+            self.updated_at = timestamp()
+            checkpoint = self.hot_snapshot()
+            dirty_runs = self._dirty_run_ids
+            issues_dirty = self._issues_dirty
+            self._dirty_run_ids = set()
+            self._checkpoint_dirty = False
+            self._issues_dirty = False
+            runs = [
+                (self.key(run.chapter_id, Stage(run.stage)), self._run_dict(run))
+                for run_id in sorted(dirty_runs)
+                if (run := self._runs_by_id.get(run_id)) is not None
+            ]
+            issues = (
+                [self._issue_dict(issue) for _, issue in sorted(self.source_issues.items())]
+                if issues_dirty
+                else None
+            )
+            await asyncio.to_thread(self._database.write_batch, checkpoint, runs, issues)
+
+    async def save(self) -> None:
+        self._mark_dirty()
+        await self._persist()
+
+    async def close(self) -> None:
+        await self.flush()
+
+    @asynccontextmanager
+    async def batch(self) -> AsyncIterator[None]:
+        self._batch_depth += 1
+        try:
+            yield
+        finally:
+            self._batch_depth -= 1
+            if not self._batch_depth:
+                await self.flush()
+
+    def _index_run(self, run: RunRecord) -> None:
+        self._runs_by_id[run.id] = run
+        self._chapter_runs.setdefault(run.chapter_id, []).append(run)
+
+    def chapter_runs(self, chapter_id: str) -> tuple[RunRecord, ...]:
+        return tuple(self._chapter_runs.get(chapter_id, ()))
+
+    def latest_run(self, chapter_id: str) -> RunRecord | None:
+        runs = self._chapter_runs.get(chapter_id, ())
+        if not runs:
+            return None
+        running = [run for run in runs if run.status == TaskStatus.RUNNING]
+        return max(running or runs, key=lambda run: (run.started_at, run.id))
+
+    def active_run(self, chapter_id: str) -> RunRecord | None:
+        return next(
+            (
+                run
+                for run in self._chapter_runs.get(chapter_id, ())
+                if run.status == TaskStatus.RUNNING
+            ),
+            None,
+        )
+
+    def load_run_details(self, run: RunRecord) -> RunRecord:
+        value = self._database.run_payload(run.id)
+        if value is None:
+            return run
+        for name in ("report", "validation", "isolation"):
+            setattr(run, name, value.get(name))
+        return run
+
+    def _invalidate_aggregates(self) -> None:
+        self._usage_cache.clear()
+        self._cost_cache.clear()
 
     def agent_summary(self) -> dict[str, Any]:
         by_stage = {stage.value: 0 for stage in Stage}
@@ -340,13 +536,14 @@ class StateStore:
             "by_stage": by_stage,
         }
 
-    def _record_source_issues(self, run: RunRecord) -> None:
+    def _record_source_issues(self, run: RunRecord) -> list[str]:
         report = run.report or {}
         raw_issues = report.get("source_issues", [])
         if not isinstance(raw_issues, list):
-            return
+            return []
         chapter = self.config.chapter(run.chapter_id)
         required = ("location", "source_excerpt", "description", "suggested_correction")
+        issue_ids: list[str] = []
         for raw in raw_issues:
             if not isinstance(raw, dict) or not all(
                 isinstance(raw.get(name), str) and raw[name].strip() for name in required
@@ -361,6 +558,7 @@ class StateStore:
                 (chapter.source.as_posix(), chapter.id, anchor.casefold())
             ).encode()
             issue_id = hashlib.sha256(fingerprint).hexdigest()[:16]
+            issue_ids.append(issue_id)
             seen_at = run.finished_at or timestamp()
             if existing := self.source_issues.get(issue_id):
                 existing.location = location
@@ -390,17 +588,25 @@ class StateStore:
                 stages=[run.stage],
                 run_ids=[run.id],
             )
+        return issue_ids
 
     def total_usage(self) -> TokenUsage:
+        key = (False, None)
+        if key in self._usage_cache:
+            return self._usage_cache[key]
         total = TokenUsage()
         for task in self.tasks.values():
             for run in task.runs:
                 total += run.usage
+        self._usage_cache[key] = total
         return total
 
     def invocation_usage(self, chapter_id: str | None = None) -> TokenUsage:
         """Usage from attempts created by this orchestrator invocation."""
 
+        key = (True, chapter_id)
+        if key in self._usage_cache:
+            return self._usage_cache[key]
         total = TokenUsage()
         for task in self.tasks.values():
             if chapter_id is not None and task.chapter_id != chapter_id:
@@ -408,9 +614,13 @@ class StateStore:
             for run in task.runs:
                 if run.id not in self._prior_run_ids:
                     total += run.usage
+        self._usage_cache[key] = total
         return total
 
     def _cost(self, *, invocation_only: bool, chapter_id: str | None = None) -> CostEstimate:
+        key = (invocation_only, chapter_id)
+        if key in self._cost_cache:
+            return self._cost_cache[key]
         total = CostEstimate()
         for task in self.tasks.values():
             if chapter_id is not None and task.chapter_id != chapter_id:
@@ -419,6 +629,7 @@ class StateStore:
                 if invocation_only and run.id in self._prior_run_ids:
                     continue
                 total += self.run_cost(run)
+        self._cost_cache[key] = total
         return total
 
     def run_cost(self, run: RunRecord) -> CostEstimate:
@@ -459,7 +670,8 @@ class StateStore:
             task.phase = TaskPhase.IDLE
         task.detail = detail
         task.updated_at = timestamp()
-        await self.save()
+        self._mark_dirty()
+        await self._persist()
 
     async def set_tasks(
         self,
@@ -486,7 +698,8 @@ class StateStore:
             task.updated_at = updated_at
             changed = True
         if changed:
-            await self.save()
+            self._mark_dirty()
+            await self._persist()
 
     async def unblock(self) -> list[str]:
         """Reset blocked tasks to pending without discarding attempt history."""
@@ -500,7 +713,8 @@ class StateStore:
             task.updated_at = timestamp()
             changed.append(key)
         if changed:
-            await self.save()
+            self._mark_dirty()
+            await self._persist()
         return changed
 
     async def start_run(self, chapter_id: str, stage: Stage) -> RunRecord:
@@ -517,21 +731,37 @@ class StateStore:
             model=self.config.settings.model,
         )
         task.runs.append(run)
-        await self.save()
+        self._index_run(run)
+        self._invalidate_aggregates()
+        self._mark_dirty(run=run)
+        await self._persist()
         return run
 
-    async def update_run(self, run: RunRecord, **changes: Any) -> None:
+    async def update_run(
+        self, run: RunRecord, *, deferred: bool = False, **changes: Any
+    ) -> None:
         for name, value in changes.items():
             setattr(run, name, value)
-        await self.save()
+        if "usage" in changes or "model" in changes:
+            self._invalidate_aggregates()
+        self._mark_dirty(run=run)
+        if not deferred:
+            await self._persist()
 
     async def finish_run(self, run: RunRecord, *, status: TaskStatus, **changes: Any) -> None:
         run.status = status
         run.finished_at = timestamp()
         for name, value in changes.items():
             setattr(run, name, value)
-        self._record_source_issues(run)
-        await self.save()
+        issue_ids = self._record_source_issues(run)
+        if isinstance(run.report, dict) and "source_issues" in run.report:
+            report = {key: value for key, value in run.report.items() if key != "source_issues"}
+            if issue_ids:
+                report["source_issue_ids"] = issue_ids
+            run.report = report
+        self._invalidate_aggregates()
+        self._mark_dirty(run=run, issues=bool(issue_ids))
+        await self._persist()
 
     async def start_coordinator_build(
         self,
@@ -550,7 +780,8 @@ class StateStore:
             maximum_iterations=maximum_iterations,
             total=total,
         )
-        await self.save()
+        self._mark_dirty()
+        await self._persist()
 
     async def advance_coordinator_build(
         self,
@@ -564,7 +795,8 @@ class StateStore:
         if command is not None:
             self.append_coordinator_build_output(f"$ {command}")
         self.coordinator_build.updated_at = timestamp()
-        await self.save()
+        self._mark_dirty()
+        await self._persist()
 
     def append_coordinator_build_output(
         self,
@@ -596,4 +828,5 @@ class StateStore:
         self.coordinator_build.active = False
         self.coordinator_build.current_chapter_id = ""
         self.coordinator_build.updated_at = timestamp()
-        await self.save()
+        self._mark_dirty()
+        await self._persist()

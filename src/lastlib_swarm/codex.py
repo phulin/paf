@@ -534,7 +534,9 @@ imports with a compiler command.
             if found.total_tokens < usage.total_tokens:
                 return
             usage = found
-            await self.state.update_run(run, usage=usage)
+            # Live UI reads the in-memory record. Let another state transition or
+            # the final run flush batch these high-frequency rollout updates.
+            await self.state.update_run(run, usage=usage, deferred=True)
 
         async def stop_usage_monitor() -> None:
             usage_stop.set()
@@ -576,7 +578,7 @@ imports with a compiler command.
                         except (json.JSONDecodeError, UnicodeDecodeError):
                             return
                         activity.consume(event, workspace_root=root)
-                        self.state.activities.save(activity)
+                        self.state.activities.save_throttled(activity)
                         capacity_failure = capacity_failure or _is_capacity_failure(event)
                         if found := _find_thread_id(event):
                             thread_id = found
@@ -666,6 +668,7 @@ imports with a compiler command.
             await stop_usage_monitor()
             activity.finish("cancelled", "agent cancelled by orchestrator")
             self.state.activities.save(activity)
+            await self.state.update_run(run, usage=usage)
             raise
         finally:
             await stop_usage_monitor()

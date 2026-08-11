@@ -14,6 +14,7 @@ from lastlib_swarm import json_codec as json
 from lastlib_swarm.corpus import scheduling_summary
 from lastlib_swarm.scheduler import Orchestrator
 from lastlib_swarm.state import TaskStatus, timestamp
+from lastlib_swarm.state_db import read_checkpoint
 
 PROTOCOL_VERSION = 2
 SOCKET_NAME = "control.sock"
@@ -263,25 +264,24 @@ def offline_status(state_dir: Path) -> dict[str, Any]:
         if isinstance(value, dict):
             return value
     state_path = state_dir / "state.json"
-    if state_path.is_file():
-        snapshot = json.loads(state_path.read_text(encoding="utf-8"))
-        if isinstance(snapshot, dict):
-            return {
-                "protocol_version": PROTOCOL_VERSION,
-                "status": "offline",
-                "result": None,
-                "state_path": str(state_path),
-                "updated_at": snapshot.get("updated_at"),
-                "usage": snapshot.get("invocation_usage", snapshot.get("usage", {})),
-                "lifetime_usage": snapshot.get("usage", {}),
-                "cost": snapshot.get("invocation_cost", {}),
-                "lifetime_cost": snapshot.get("cost", {}),
-                "isolation": snapshot.get("isolation", {}),
-                "scheduling": scheduling_summary(snapshot.get("scheduling", {})),
-                "agents": snapshot.get("agents", {}),
-                "coordinator_build": snapshot.get("coordinator_build", {}),
-                "tasks": _task_counts(snapshot),
-            }
+    snapshot = read_checkpoint(state_dir)
+    if snapshot is not None:
+        return {
+            "protocol_version": PROTOCOL_VERSION,
+            "status": "offline",
+            "result": None,
+            "state_path": str(state_path),
+            "updated_at": snapshot.get("updated_at"),
+            "usage": snapshot.get("invocation_usage", snapshot.get("usage", {})),
+            "lifetime_usage": snapshot.get("usage", {}),
+            "cost": snapshot.get("invocation_cost", {}),
+            "lifetime_cost": snapshot.get("cost", {}),
+            "isolation": snapshot.get("isolation", {}),
+            "scheduling": scheduling_summary(snapshot.get("scheduling", {})),
+            "agents": snapshot.get("agents", {}),
+            "coordinator_build": snapshot.get("coordinator_build", {}),
+            "tasks": _task_counts(snapshot),
+        }
     return {
         "protocol_version": PROTOCOL_VERSION,
         "status": "not-started",

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+import time
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -330,6 +331,7 @@ class ActivityStore:
     def __init__(self, logs_dir: Path) -> None:
         self.logs_dir = logs_dir
         self._cache: dict[str, AgentActivity] = {}
+        self._last_saved: dict[str, float] = {}
 
     def path(self, run_id: str) -> Path:
         return self.logs_dir / f"{run_id}.activity.json"
@@ -347,6 +349,15 @@ class ActivityStore:
         temporary.write_bytes(json.dumpb(activity.as_dict(), sort_keys=True))
         os.replace(temporary, path)
         self._cache[activity.run_id] = activity
+        self._last_saved[activity.run_id] = time.monotonic()
+
+    def save_throttled(self, activity: AgentActivity, *, interval: float = 1.0) -> None:
+        """Persist a derived activity summary at most once per interval."""
+
+        self._cache[activity.run_id] = activity
+        last_saved = self._last_saved.get(activity.run_id, 0.0)
+        if time.monotonic() - last_saved >= interval:
+            self.save(activity)
 
     def get(self, run_id: str) -> AgentActivity | None:
         if run_id in self._cache:

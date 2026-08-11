@@ -92,12 +92,12 @@ def stage_phase_counts(state: StateStore, stage: Stage) -> dict[str, int]:
 
 
 def running_agent_counts(state: StateStore) -> dict[str, int]:
-    counts = {stage.value: 0 for stage in Stage}
-    for task in state.tasks.values():
-        for run in task.runs:
-            if run.status == TaskStatus.RUNNING and run.stage in counts:
-                counts[run.stage] += 1
-    return counts
+    summary = state.agent_summary()
+    by_stage = summary.get("by_stage", {})
+    return {
+        stage.value: int(by_stage.get(stage.value, 0)) if isinstance(by_stage, dict) else 0
+        for stage in Stage
+    }
 
 
 def task_mark(task: TaskRecord) -> str:
@@ -131,18 +131,13 @@ def seconds_since(value: str) -> float:
 
 
 def latest_run(state: StateStore, chapter: Chapter) -> RunRecord | None:
-    runs = chapter_runs(state, chapter)
-    if not runs:
-        return None
-    running = [run for run in runs if run.status == TaskStatus.RUNNING]
-    return max(running or runs, key=lambda run: run.started_at)
+    return state.latest_run(chapter.id)
 
 
 def chapter_runs(state: StateStore, chapter: Chapter) -> list[RunRecord]:
     """Return every agent step for a chapter in chronological order."""
 
-    runs = [run for stage in Stage for run in state.task(chapter.id, stage).runs]
-    return sorted(runs, key=lambda run: (run.started_at, run.id))
+    return list(state.chapter_runs(chapter.id))
 
 
 def run_tab_label(run: RunRecord, step: int) -> str:
@@ -784,15 +779,7 @@ class SwarmApp(App[bool]):
         tokens = format_count(usage.total_tokens) if usage.measured else "—"
         cost = format_usd(self.state.invocation_cost(chapter.id))
         run = latest_run(self.state, chapter)
-        active_run = next(
-            (
-                item
-                for stage in Stage
-                for item in self.state.task(chapter.id, stage).runs
-                if item.status == TaskStatus.RUNNING
-            ),
-            None,
-        )
+        active_run = self.state.active_run(chapter.id)
         activity = self.state.activities.get(active_run.id) if active_run is not None else None
         if active_run is not None:
             current_activity = activity_label(activity, active_run)

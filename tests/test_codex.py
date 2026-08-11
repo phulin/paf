@@ -23,6 +23,7 @@ from lastlib_swarm.codex import (
 from lastlib_swarm.config import load_config
 from lastlib_swarm.models import Stage
 from lastlib_swarm.state import StateStore, TokenUsage
+from lastlib_swarm.state_db import read_full_snapshot
 from tests.support import write_project
 
 
@@ -524,7 +525,8 @@ time.sleep(60)
     activity = state.activities.get(run.id)
     assert activity is not None
     assert activity.current == "agent cancelled"
-    reloaded = json.loads(state.path.read_text(encoding="utf-8"))
+    reloaded = read_full_snapshot(config.settings.state_dir)
+    assert reloaded is not None
     persisted = reloaded["tasks"][f"{run.chapter_id}:review"]["runs"][-1]["usage"]
     assert persisted["input_tokens"] == 100
     assert persisted["output_tokens"] == 25

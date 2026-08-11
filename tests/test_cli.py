@@ -11,6 +11,7 @@ from lastlib_swarm.cli import main, select_chapters
 from lastlib_swarm.config import load_config
 from lastlib_swarm.models import PipelineConfig, Stage
 from lastlib_swarm.state import StateStore, TaskStatus
+from lastlib_swarm.state_db import read_full_snapshot
 from tests.support import write_project
 
 
@@ -202,7 +203,8 @@ def test_agent_unblock_updates_offline_state(
     assert response["unblocked_tasks"] == ["book/chapter-01:review"]
     assert response["tasks"]["blocked"] == 0
 
-    snapshot = json.loads(state.path.read_text(encoding="utf-8"))
+    snapshot = read_full_snapshot(config.settings.state_dir)
+    assert snapshot is not None
     task = snapshot["tasks"]["book/chapter-01:review"]
     assert task["status"] == "pending"
     assert task["detail"] == "manually unblocked"

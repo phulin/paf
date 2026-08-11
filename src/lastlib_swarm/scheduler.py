@@ -334,7 +334,10 @@ class Orchestrator:
         await self.isolation.prepare()
 
     async def shutdown(self) -> None:
-        await self.isolation.close()
+        try:
+            await self.isolation.close()
+        finally:
+            await self.state.close()
 
     def _already_done(self, chapter: Chapter, stage: Stage) -> bool:
         return not self.force and self.state.task(chapter.id, stage).status == TaskStatus.SUCCEEDED
@@ -664,20 +667,21 @@ class Orchestrator:
         await self.build_queue.acquire()
         try:
             if selected:
-                await self.state.set_tasks(
-                    (chapter.id for chapter in selected),
-                    Stage.FIXUP,
-                    TaskStatus.RUNNING,
-                    f"{mode} coordinator build {iteration}/{maximum_iterations}",
-                    phase=TaskPhase.BUILDING,
-                )
-                await self.state.start_coordinator_build(
-                    mode=mode,
-                    stage=Stage.FIXUP,
-                    iteration=iteration,
-                    maximum_iterations=maximum_iterations,
-                    total=len(selected),
-                )
+                async with self.state.batch():
+                    await self.state.set_tasks(
+                        (chapter.id for chapter in selected),
+                        Stage.FIXUP,
+                        TaskStatus.RUNNING,
+                        f"{mode} coordinator build {iteration}/{maximum_iterations}",
+                        phase=TaskPhase.BUILDING,
+                    )
+                    await self.state.start_coordinator_build(
+                        mode=mode,
+                        stage=Stage.FIXUP,
+                        iteration=iteration,
+                        maximum_iterations=maximum_iterations,
+                        total=len(selected),
+                    )
             for index, chapter in enumerate(selected):
                 await self.control.checkpoint()
                 await self.state.advance_coordinator_build(
@@ -711,14 +715,15 @@ class Orchestrator:
         finally:
             try:
                 if selected:
-                    await self.state.finish_coordinator_build()
-                    await self.state.set_tasks(
-                        (chapter.id for chapter in selected),
-                        Stage.FIXUP,
-                        TaskStatus.RUNNING,
-                        "awaiting coordinator rebuild",
-                        phase=TaskPhase.AWAITING_REBUILD,
-                    )
+                    async with self.state.batch():
+                        await self.state.finish_coordinator_build()
+                        await self.state.set_tasks(
+                            (chapter.id for chapter in selected),
+                            Stage.FIXUP,
+                            TaskStatus.RUNNING,
+                            "awaiting coordinator rebuild",
+                            phase=TaskPhase.AWAITING_REBUILD,
+                        )
             finally:
                 self.build_queue.release()
         return results
@@ -943,13 +948,14 @@ class Orchestrator:
 
         async def fail_graph(error: ValueError) -> bool:
             self.state.fixup_graph = {"algorithm": "observed-lean-imports", "error": str(error)}
-            await self.state.save()
-            await self.state.set_tasks(
-                by_id,
-                Stage.FIXUP,
-                TaskStatus.FAILED,
-                str(error),
-            )
+            async with self.state.batch():
+                await self.state.save()
+                await self.state.set_tasks(
+                    by_id,
+                    Stage.FIXUP,
+                    TaskStatus.FAILED,
+                    str(error),
+                )
             return False
 
         async def cancel_running() -> None:

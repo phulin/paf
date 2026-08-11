@@ -130,17 +130,35 @@ async def test_state_migrates_legacy_repair_tasks_to_fixup(tmp_path: Path) -> No
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
     chapter = config.chapters[0]
     state = StateStore(config)
-    await state.load_or_create()
-    run = await state.start_run(chapter.id, Stage.FIXUP)
-    await state.finish_run(run, status=TaskStatus.SUCCEEDED)
-    payload = json.loads(state.path.read_text(encoding="utf-8"))
-    task = payload["tasks"].pop(f"{chapter.id}:fixup")
-    task.pop("phase")
-    task["stage"] = "repair"
-    task["runs"][0]["stage"] = "repair"
-    payload["tasks"][f"{chapter.id}:repair"] = task
-    payload.pop("coordinator_build")
-    payload["version"] = 4
+    payload = {
+        "version": 4,
+        "created_at": "2026-01-01T00:00:00+00:00",
+        "updated_at": "2026-01-01T00:00:01+00:00",
+        "tasks": {
+            f"{chapter.id}:repair": {
+                "chapter_id": chapter.id,
+                "book_id": chapter.book_id,
+                "chapter_number": chapter.number,
+                "chapter_title": chapter.title,
+                "stage": "repair",
+                "status": "succeeded",
+                "detail": "legacy repair",
+                "rounds": 1,
+                "updated_at": "2026-01-01T00:00:01+00:00",
+                "runs": [
+                    {
+                        "id": "legacy-run",
+                        "chapter_id": chapter.id,
+                        "stage": "repair",
+                        "round": 1,
+                        "status": "succeeded",
+                        "usage": {"input_tokens": 10, "output_tokens": 2, "measured": True},
+                    }
+                ],
+            }
+        },
+    }
+    state.path.parent.mkdir(parents=True)
     state.path.write_text(json.dumps(payload), encoding="utf-8")
 
     reloaded = StateStore(config)
@@ -151,6 +169,13 @@ async def test_state_migrates_legacy_repair_tasks_to_fixup(tmp_path: Path) -> No
     assert migrated.phase == TaskPhase.IDLE
     assert migrated.runs[0].stage == "fixup"
     assert not reloaded.coordinator_build.active
+    assert reloaded.database_path.is_file()
+    assert (config.settings.state_dir / "state.legacy-v6.json").is_file()
+    hot = json.loads(reloaded.path.read_text(encoding="utf-8"))
+    assert "runs" not in hot["tasks"][f"{chapter.id}:fixup"]
+    assert reloaded.snapshot()["tasks"][f"{chapter.id}:fixup"]["runs"][0]["id"] == (
+        "legacy-run"
+    )
 
 
 @pytest.mark.asyncio
@@ -170,7 +195,7 @@ async def test_state_persists_fixup_graph(tmp_path: Path) -> None:
     await reloaded.load_or_create()
 
     assert reloaded.fixup_graph == state.fixup_graph
-    assert reloaded.snapshot()["version"] == 6
+    assert reloaded.snapshot()["version"] == 7
 
 
 @pytest.mark.asyncio
@@ -209,6 +234,7 @@ async def test_state_accumulates_and_deduplicates_source_issue_ledger(tmp_path: 
     assert reloaded.source_issues[recorded.id].sightings == 2
 
     reloaded.path.unlink()
+    reloaded.database_path.unlink()
     ledger_only = StateStore(config)
     await ledger_only.load_or_create()
     assert ledger_only.source_issues[recorded.id].sightings == 2
