@@ -679,6 +679,8 @@ async def test_fixup_unlocks_descendant_before_slow_independent_agent_finishes(
                 slow_finished = True
             elif chapter.id == third.id:
                 assert not slow_finished
+                assert state.task(first.id, Stage.FIXUP).status == TaskStatus.SUCCEEDED
+                assert state.task(first.id, Stage.FIXUP).phase == TaskPhase.IDLE
                 descendant_started.set()
                 slow_release.set()
             fixed.add(chapter.id)

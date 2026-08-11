@@ -1009,6 +1009,12 @@ class Orchestrator:
                     clean,
                     build_generation=build_generation,
                 )
+                await self.state.set_task(
+                    chapter_id,
+                    Stage.FIXUP,
+                    TaskStatus.SUCCEEDED,
+                    "clean coordinator build against observed imports",
+                )
                 return True
 
             diagnostics = self._build_feedback({chapter_id: result}).actionable
