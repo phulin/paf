@@ -129,6 +129,7 @@ class AgentResult:
     report: dict[str, Any] = field(default_factory=dict)
     thread_id: str | None = None
     error: str = ""
+    capacity_exhausted: bool = False
 
 
 def unexpected_lean_warnings(output: str) -> tuple[str, ...]:
@@ -269,6 +270,21 @@ def _is_capacity_failure(event: Any) -> bool:
     return any(
         isinstance(message, str) and "at capacity" in message.casefold() for message in messages
     )
+
+
+def _capacity_resume_delay(initial: float, maximum: float, attempt: int) -> float:
+    """Return capped exponential backoff for a one-indexed retry attempt."""
+
+    if attempt < 1:
+        raise ValueError("capacity retry attempt must be positive")
+    if initial <= 0 or maximum <= 0:
+        return 0.0
+    delay = min(initial, maximum)
+    for _ in range(attempt - 1):
+        if delay >= maximum / 2:
+            return maximum
+        delay *= 2
+    return min(delay, maximum)
 
 
 def _rollout_usage(event: Any) -> TokenUsage | None:
@@ -629,7 +645,13 @@ imports with a compiler command.
                     f"{self.config.settings.capacity_resume_attempts}: resuming {thread_id}"
                 )
                 self.state.activities.save(activity)
-                await asyncio.sleep(self.config.settings.capacity_resume_delay_seconds)
+                await asyncio.sleep(
+                    _capacity_resume_delay(
+                        self.config.settings.capacity_resume_delay_seconds,
+                        self.config.settings.capacity_resume_max_delay_seconds,
+                        resume_attempt,
+                    )
+                )
         except asyncio.CancelledError:
             await stop_usage_monitor()
             activity.finish("cancelled", "agent cancelled by orchestrator")
@@ -666,6 +688,7 @@ imports with a compiler command.
             report=report,
             thread_id=thread_id,
             error=error,
+            capacity_exhausted=capacity_failure and exit_code != 0,
         )
 
 

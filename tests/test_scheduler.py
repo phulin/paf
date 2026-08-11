@@ -9,7 +9,7 @@ import lastlib_swarm.scheduler as scheduler_module
 from lastlib_swarm.codex import AgentResult, CodexExecutor, ValidationResult
 from lastlib_swarm.config import load_config
 from lastlib_swarm.models import Chapter, Stage
-from lastlib_swarm.scheduler import Orchestrator
+from lastlib_swarm.scheduler import FormalizeOutcome, Orchestrator
 from lastlib_swarm.state import RunRecord, StateStore, TaskStatus, TokenUsage
 from tests.support import write_project
 
@@ -298,14 +298,15 @@ async def test_completed_drafts_enter_fixup_before_all_formalizers_finish(
     release_second = asyncio.Event()
     events: list[str] = []
 
-    async def formalize(chapter: Chapter) -> bool:
+    async def formalize(chapter: Chapter, *, rerun: bool = False) -> FormalizeOutcome:
+        assert not rerun
         if chapter.number == 2:
             events.append("formalize-2-waiting")
             await release_second.wait()
             events.append("formalize-2-finished")
-            return True
+            return FormalizeOutcome(True)
         events.append("formalize-1-finished")
-        return True
+        return FormalizeOutcome(True)
 
     async def opportunistic_fixup(
         completed_ids: set[str],
@@ -325,6 +326,52 @@ async def test_completed_drafts_enter_fixup_before_all_formalizers_finish(
 
     assert await orchestrator._formalize_with_streaming_fixup()
     assert events.index("fixup-wave") < events.index("formalize-2-finished")
+
+
+@pytest.mark.asyncio
+async def test_capacity_exhaustion_requeues_formalizer_at_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    orchestrator = Orchestrator(config, StateStore(config))
+    attempts: dict[int, int] = {1: 0, 2: 0}
+    order: list[tuple[int, bool]] = []
+
+    async def formalize(chapter: Chapter, *, rerun: bool = False) -> FormalizeOutcome:
+        attempts[chapter.number] += 1
+        order.append((chapter.number, rerun))
+        if chapter.number == 1 and attempts[chapter.number] == 1:
+            return FormalizeOutcome(False, capacity_deferred=True)
+        return FormalizeOutcome(True)
+
+    monkeypatch.setattr(orchestrator, "_formalize", formalize)
+
+    assert await orchestrator._formalize_all(streaming_fixup=False)
+    assert attempts == {1: 2, 2: 1}
+    assert order == [(1, False), (2, False), (1, True)]
+
+
+@pytest.mark.asyncio
+async def test_formalizer_failure_does_not_cancel_healthy_workers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    orchestrator = Orchestrator(config, StateStore(config))
+    healthy_finished = False
+
+    async def formalize(chapter: Chapter, *, rerun: bool = False) -> FormalizeOutcome:
+        nonlocal healthy_finished
+        assert not rerun
+        if chapter.number == 1:
+            return FormalizeOutcome(False)
+        await asyncio.sleep(0.01)
+        healthy_finished = True
+        return FormalizeOutcome(True)
+
+    monkeypatch.setattr(orchestrator, "_formalize", formalize)
+
+    assert not await orchestrator._formalize_all(streaming_fixup=False)
+    assert healthy_finished
 
 
 @pytest.mark.asyncio
@@ -533,11 +580,12 @@ chapters = [1]
     await orchestrator.prepare()
     events: list[str] = []
 
-    async def formalize(chapter: Chapter) -> bool:
+    async def formalize(chapter: Chapter, *, rerun: bool = False) -> FormalizeOutcome:
+        assert not rerun
         events.append(f"start:{chapter.book_id}")
         await asyncio.sleep(0)
         events.append(f"end:{chapter.book_id}")
-        return True
+        return FormalizeOutcome(True)
 
     monkeypatch.setattr(orchestrator, "_formalize", formalize)
 

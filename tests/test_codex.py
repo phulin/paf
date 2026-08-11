@@ -9,6 +9,7 @@ import pytest
 
 from lastlib_swarm.codex import (
     CodexExecutor,
+    _capacity_resume_delay,
     _is_capacity_failure,
     _rollout_usage,
     count_placeholders,
@@ -161,6 +162,21 @@ def test_does_not_retry_unrelated_turn_failures() -> None:
     assert not _is_capacity_failure(
         {"type": "turn.failed", "error": {"message": "authentication failed"}}
     )
+
+
+def test_capacity_retry_schedule_uses_capped_exponential_backoff() -> None:
+    assert [_capacity_resume_delay(15, 120, attempt) for attempt in range(1, 11)] == [
+        15,
+        30,
+        60,
+        120,
+        120,
+        120,
+        120,
+        120,
+        120,
+        120,
+    ]
 
 
 def test_lean_mcp_path_finds_elan_outside_inherited_path(

@@ -85,6 +85,11 @@ for unattended formalization. Set `bypass_approvals_and_sandbox = false` and
 OpenAI's official
 [Codex non-interactive guidance](https://developers.openai.com/codex/noninteractive).
 
+Transient model-capacity failures resume the same Codex thread with capped exponential backoff.
+After the configured retries are exhausted, the worker releases its concurrency slot and its chapter
+is requeued as a fresh attempt behind waiting formalizers. A failed chapter does not cancel unrelated
+formalizers; the pipeline finishes the remaining drafting work before reporting failure.
+
 ## Commands
 
 Inspect discovery and configuration without launching agents:
@@ -376,8 +381,9 @@ sandbox = "workspace-write"
 approve_for_me = false
 bypass_approvals_and_sandbox = true
 agent_timeout_seconds = 7200
-capacity_resume_attempts = 5 # resume the same Codex thread after transient capacity failures
-capacity_resume_delay_seconds = 30
+capacity_resume_attempts = 10 # resume the same Codex thread after transient capacity failures
+capacity_resume_delay_seconds = 15 # initial delay; doubles after each failure
+capacity_resume_max_delay_seconds = 120 # cap for exponential backoff
 validation_timeout_seconds = 1800
 isolation = "auto" # auto, fuse-overlay, or shared
 lean_mcp = true

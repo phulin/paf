@@ -55,6 +55,12 @@ class Attempt:
 
 
 @dataclass(frozen=True)
+class FormalizeOutcome:
+    succeeded: bool
+    capacity_deferred: bool = False
+
+
+@dataclass(frozen=True)
 class ReviewOutcome:
     succeeded: bool
     needs_fixup: bool
@@ -355,17 +361,17 @@ class Orchestrator:
                     self.build_queue.release()
             return Attempt(agent=agent, validation=validation, run=run)
 
-    async def _formalize(self, chapter: Chapter) -> bool:
+    async def _formalize(self, chapter: Chapter, *, rerun: bool = False) -> FormalizeOutcome:
         if self._already_done(chapter, Stage.FORMALIZE):
-            return True
-        if not self.force and self._scope_exists(chapter):
+            return FormalizeOutcome(True)
+        if not rerun and not self.force and self._scope_exists(chapter):
             await self.state.set_task(
                 chapter.id,
                 Stage.FORMALIZE,
                 TaskStatus.SUCCEEDED,
                 "existing chapter files skipped",
             )
-            return True
+            return FormalizeOutcome(True)
         await self.state.set_task(
             chapter.id,
             Stage.FORMALIZE,
@@ -380,14 +386,22 @@ class Orchestrator:
                 TaskStatus.SUCCEEDED,
                 "optimistic chapter draft completed",
             )
-            return True
+            return FormalizeOutcome(True)
+        if attempt.agent.capacity_exhausted:
+            await self.state.set_task(
+                chapter.id,
+                Stage.FORMALIZE,
+                TaskStatus.PENDING,
+                "capacity retries exhausted; requeued behind waiting formalizers",
+            )
+            return FormalizeOutcome(False, capacity_deferred=True)
         await self.state.set_task(
             chapter.id,
             Stage.FORMALIZE,
             TaskStatus.FAILED,
             "single drafting attempt failed",
         )
-        return False
+        return FormalizeOutcome(False)
 
     def _chapter_identifiers(self, chapter: Chapter) -> tuple[str, ...]:
         root = (chapter.lean_root / chapter.chapter_path).as_posix()
@@ -581,44 +595,47 @@ class Orchestrator:
                 return True
         return deferred
 
-    async def _formalize_with_streaming_fixup(self) -> bool:
-        """Stream completed formalizations through targeted build/fixup batches."""
+    async def _formalize_all(self, *, streaming_fixup: bool) -> bool:
+        """Run every formalizer, requeueing capacity-deferred chapters at the back."""
 
         running = {
             asyncio.create_task(self._formalize(chapter)): chapter for chapter in self.chapters
         }
         completed_ids: set[str] = set()
+        had_failure = False
         try:
             while running:
                 done, _ = await asyncio.wait(running, return_when=asyncio.FIRST_COMPLETED)
-                failed = False
                 for task in done:
                     chapter = running.pop(task)
-                    if task.result():
+                    outcome = task.result()
+                    if outcome.succeeded:
                         completed_ids.add(chapter.id)
+                    elif outcome.capacity_deferred:
+                        retry = asyncio.create_task(self._formalize(chapter, rerun=True))
+                        running[retry] = chapter
                     else:
-                        failed = True
-                if failed:
-                    for task in running:
-                        task.cancel()
-                    await asyncio.gather(*running, return_exceptions=True)
-                    return False
+                        had_failure = True
+                if not streaming_fixup:
+                    continue
                 active_ids = {chapter.id for chapter in running.values()}
                 if not await self._opportunistic_fixup(
                     completed_ids,
                     active_ids,
                     newer_drafts_ready=lambda: any(task.done() for task in running),
                 ):
-                    for task in running:
-                        task.cancel()
-                    await asyncio.gather(*running, return_exceptions=True)
-                    return False
+                    had_failure = True
         except BaseException:
             for task in running:
                 task.cancel()
             await asyncio.gather(*running, return_exceptions=True)
             raise
-        return True
+        return not had_failure
+
+    async def _formalize_with_streaming_fixup(self) -> bool:
+        """Stream completed formalizations through targeted build/fixup batches."""
+
+        return await self._formalize_all(streaming_fixup=True)
 
     async def _review_once(self, chapter: Chapter, *, rerun: bool = False) -> ReviewOutcome:
         if not rerun and self._already_done(chapter, Stage.REVIEW):
@@ -722,8 +739,9 @@ class Orchestrator:
                 *(self._review_once(chapter) for chapter in self.chapters)
             )
             return all(outcome.succeeded and not outcome.needs_fixup for outcome in outcomes)
-        operation = self._formalize if stage is Stage.FORMALIZE else self._prove
-        return all(await _gather_cancel_on_error(operation(chapter) for chapter in self.chapters))
+        if stage is Stage.FORMALIZE:
+            return await self._formalize_all(streaming_fixup=False)
+        return all(await _gather_cancel_on_error(self._prove(chapter) for chapter in self.chapters))
 
     async def run_pipeline(self) -> bool:
         if not await self._formalize_with_streaming_fixup():
