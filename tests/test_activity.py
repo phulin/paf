@@ -101,6 +101,84 @@ def test_tracks_parallel_items_until_all_complete(tmp_path: Path) -> None:
     assert activity.current == "shell: first"
 
 
+def test_compacts_shell_commands_and_successful_completions(tmp_path: Path) -> None:
+    activity = AgentActivity(run_id="run", chapter_id="chapter", stage="formalize")
+    command = (
+        '/bin/bash -lc "sed -n \'1,80p\' '
+        "/tmp/swarm/lean/LastLib/Book05LocalClassFieldTheory/Chapter07/"
+        'Section07WhyFrobeniusIsCanonical.lean"'
+    )
+    started = {
+        "type": "item.started",
+        "item": {
+            "id": "command",
+            "type": "command_execution",
+            "command": command,
+            "status": "in_progress",
+        },
+    }
+    activity.consume(started, workspace_root=tmp_path)
+
+    assert activity.current == (
+        "shell: sed -n '1,80p' [Book 5 Chap 7 Sec 7: Why Frobenius Is Canonical]"
+    )
+
+    activity.consume(
+        {
+            "type": "item.completed",
+            "item": {
+                **started["item"],
+                "status": "completed",
+                "exit_code": 0,
+            },
+        },
+        workspace_root=tmp_path,
+    )
+
+    assert activity.recent[-1].title == "done"
+
+
+def test_compacts_dependency_paths_in_commands_and_file_changes(tmp_path: Path) -> None:
+    dependency = (
+        tmp_path
+        / "lean"
+        / "LastLib"
+        / "Book05LocalClassFieldTheory"
+        / "Chapter07"
+        / "Dependencies.lean"
+    )
+    activity = AgentActivity(run_id="run", chapter_id="chapter", stage="formalize")
+    activity.consume(
+        {
+            "type": "item.started",
+            "item": {
+                "id": "command",
+                "type": "command_execution",
+                "command": f"/bin/bash -lc 'lake env lean {dependency}'",
+                "status": "in_progress",
+            },
+        },
+        workspace_root=tmp_path,
+    )
+    assert activity.current == "shell: lake env lean [Book 5 Chap 7 Dependencies]"
+
+    activity.consume(
+        {
+            "type": "item.completed",
+            "item": {
+                "id": "edit",
+                "type": "file_change",
+                "status": "completed",
+                "changes": [{"path": str(dependency), "kind": "update"}],
+            },
+        },
+        workspace_root=tmp_path,
+    )
+
+    assert activity.files == ["[Book 5 Chap 7 Dependencies]"]
+    assert activity.recent[-1].title == "editing [Book 5 Chap 7 Dependencies]"
+
+
 def test_preserves_the_complete_latest_agent_update(tmp_path: Path) -> None:
     activity = AgentActivity(run_id="run", chapter_id="chapter", stage="review")
     update = "first line\n" + "x" * 1_200 + "\nfinal line"

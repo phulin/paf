@@ -12,6 +12,27 @@ from lastlib_swarm import json_codec as json
 MAX_RECENT_EVENTS = 80
 MAX_DETAIL_CHARS = 800
 EXIT_STATUS_ONLY = re.compile(r"^exit\s+\d+$", re.IGNORECASE)
+SHELL_COMMAND_WRAPPER = re.compile(r"^/bin/bash\s+-lc\s+(['\"])(.*)\1$", re.DOTALL)
+LEAN_BOOK_PATH = re.compile(
+    r"""
+    (?:(?:[^\s'"`|;,()\[\]{}]+/)*lean/)?
+    LastLib/
+    Book(?P<book>\d+)[A-Za-z0-9_]*/
+    Chapter(?P<chapter>\d+)
+    (?:
+        \.lean
+        |
+        /
+        (?:
+            Section(?P<section>\d+)(?P<title>[A-Za-z0-9_]*)
+            |
+            (?P<special>Dependencies|Core)
+        )
+        \.lean
+    )
+    """,
+    re.VERBOSE,
+)
 
 
 def activity_timestamp() -> str:
@@ -21,6 +42,35 @@ def activity_timestamp() -> str:
 def _compact(value: str, *, limit: int = MAX_DETAIL_CHARS) -> str:
     value = " ".join(value.split())
     return value if len(value) <= limit else value[: limit - 1] + "…"
+
+
+def _words(identifier: str) -> str:
+    identifier = identifier.replace("_", " ")
+    identifier = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", identifier)
+    return re.sub(r"(?<=[A-Z])(?=[A-Z][a-z])", " ", identifier).strip()
+
+
+def _shorten_book_paths(value: str) -> str:
+    def label(match: re.Match[str]) -> str:
+        book = int(match.group("book"))
+        chapter = int(match.group("chapter"))
+        description = f"Book {book} Chap {chapter}"
+        if section := match.group("section"):
+            description += f" Sec {int(section)}"
+            if title := _words(match.group("title")):
+                description += f": {title}"
+        elif special := match.group("special"):
+            description += f" {special}"
+        return f"[{description}]"
+
+    return LEAN_BOOK_PATH.sub(label, value)
+
+
+def _display_command(command: str) -> str:
+    command = command.strip()
+    if match := SHELL_COMMAND_WRAPPER.fullmatch(command):
+        command = match.group(2)
+    return _shorten_book_paths(command)
 
 
 def _result_text(value: Any) -> str:
@@ -209,7 +259,8 @@ class AgentActivity:
         result_status = "failed" if failed else "completed"
         if failed and (candidate := reportable_error(error_detail)):
             self.latest_error = candidate
-        self._append(item_type, result_status, title, detail)
+        completed_title = "done" if item_type == "command_execution" and not failed else title
+        self._append(item_type, result_status, completed_title, detail)
         self._set_current()
 
     def _describe_item(
@@ -219,7 +270,7 @@ class AgentActivity:
             command = str(item.get("command", "shell command"))
             exit_code = item.get("exit_code")
             detail = f"exit {exit_code}" if exit_code not in (None, 0) else ""
-            return f"shell: {_compact(command, limit=180)}", detail
+            return f"shell: {_compact(_display_command(command), limit=180)}", detail
         if item_type == "mcp_tool_call":
             server = str(item.get("server", "MCP"))
             tool = str(item.get("tool", "tool"))
@@ -239,9 +290,10 @@ class AgentActivity:
     def _relative_path(value: str, workspace_root: Path) -> str:
         path = Path(value)
         try:
-            return path.relative_to(workspace_root).as_posix()
+            relative = path.relative_to(workspace_root).as_posix()
         except ValueError:
-            return path.as_posix()
+            relative = path.as_posix()
+        return _shorten_book_paths(relative)
 
     def finish(self, status: str, error: str = "") -> None:
         self.finished_at = activity_timestamp()
