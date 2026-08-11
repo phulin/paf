@@ -555,7 +555,6 @@ class StateStore:
         self.coordinator_build.current_chapter_id = chapter_id
         self.coordinator_build.completed = completed
         if command is not None:
-            self.coordinator_build.output_tail = []
             self.append_coordinator_build_output(f"$ {command}")
         self.coordinator_build.updated_at = timestamp()
         await self.save()

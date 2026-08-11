@@ -595,6 +595,12 @@ async def test_coordinator_build_uses_build_phases_without_counting_agents(
     assert all(result.succeeded for result in (await build).values())
     assert not state.coordinator_build.active
     assert state.coordinator_build.completed == 2
+    assert state.coordinator_build.output_tail == [
+        f"$ {config.chapters[0].build_command}",
+        "building book/chapter-01",
+        f"$ {config.chapters[1].build_command}",
+        "building book/chapter-02",
+    ]
     assert all(
         state.task(chapter.id, Stage.FIXUP).phase == TaskPhase.AWAITING_REBUILD
         for chapter in config.chapters
