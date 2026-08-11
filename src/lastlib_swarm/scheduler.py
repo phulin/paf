@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import heapq
-from collections.abc import AsyncIterator, Callable, Coroutine, Iterable
+from collections.abc import AsyncIterator, Coroutine, Iterable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from typing import Any
 
 from lastlib_swarm.codex import AgentResult, CodexExecutor, ValidationResult, validate
-from lastlib_swarm.corpus import CorpusSchedule, build_corpus_schedule, scheduling_snapshot
+from lastlib_swarm.corpus import build_corpus_schedule, scheduling_snapshot
 from lastlib_swarm.isolation import IsolationResult, create_isolation
 from lastlib_swarm.models import Chapter, PipelineConfig, Stage
 from lastlib_swarm.state import RunRecord, StateStore, TaskStatus
@@ -605,47 +605,6 @@ class Orchestrator:
             return all(outcome.succeeded and not outcome.needs_fixup for outcome in outcomes)
         operation = self._formalize if stage is Stage.FORMALIZE else self._prove
         return all(await _gather_cancel_on_error(operation(chapter) for chapter in self.chapters))
-
-    async def _run_book_graph(
-        self,
-        schedule: CorpusSchedule,
-        operation: Callable[[str], Coroutine[Any, Any, bool]],
-        *,
-        stages: tuple[Stage, ...],
-    ) -> set[str]:
-        pending = set(schedule.order)
-        succeeded: set[str] = set()
-        running: dict[asyncio.Task[bool], str] = {}
-        try:
-            while pending or running:
-                for book_id in schedule.order:
-                    if book_id in pending and schedule.dependencies[book_id] <= succeeded:
-                        running[asyncio.create_task(operation(book_id))] = book_id
-                        pending.remove(book_id)
-                if not running:
-                    if pending:
-                        for chapter in self.chapters:
-                            if chapter.book_id in pending:
-                                for stage in stages:
-                                    await self.state.set_task(
-                                        chapter.id,
-                                        stage,
-                                        TaskStatus.BLOCKED,
-                                        "upstream book did not complete successfully",
-                                    )
-                        pending.clear()
-                    break
-                done, _ = await asyncio.wait(running, return_when=asyncio.FIRST_COMPLETED)
-                for task in done:
-                    book_id = running.pop(task)
-                    if task.result():
-                        succeeded.add(book_id)
-        except BaseException:
-            for task in running:
-                task.cancel()
-            await asyncio.gather(*running, return_exceptions=True)
-            raise
-        return succeeded
 
     async def run_pipeline(self) -> bool:
         if not all(
