@@ -76,19 +76,11 @@ def chapter_usage(state: StateStore, chapter: Chapter) -> TokenUsage:
 
 
 def stage_counts(state: StateStore, stage: Stage) -> dict[str, int]:
-    counts = {status.value: 0 for status in TaskStatus}
-    for task in state.tasks.values():
-        if task.stage == stage.value:
-            counts[task.status] += 1
-    return counts
+    return state.stage_counts(stage)[0]
 
 
 def stage_phase_counts(state: StateStore, stage: Stage) -> dict[str, int]:
-    counts = {phase.value: 0 for phase in TaskPhase}
-    for task in state.tasks.values():
-        if task.stage == stage.value and task.status == TaskStatus.RUNNING and task.phase in counts:
-            counts[task.phase] += 1
-    return counts
+    return state.stage_counts(stage)[1]
 
 
 def running_agent_counts(state: StateStore) -> dict[str, int]:

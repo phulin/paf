@@ -53,15 +53,11 @@ def _create_schema(connection: sqlite3.Connection) -> None:
 
 def _run_summary(run: dict[str, Any]) -> dict[str, Any]:
     return {
-        key: value
-        for key, value in run.items()
-        if key not in {"report", "validation", "isolation"}
+        key: value for key, value in run.items() if key not in {"report", "validation", "isolation"}
     }
 
 
-def _clean_report(
-    run: dict[str, Any], issue_ids_by_run: dict[str, list[str]]
-) -> dict[str, Any]:
+def _clean_report(run: dict[str, Any], issue_ids_by_run: dict[str, list[str]]) -> dict[str, Any]:
     cleaned = dict(run)
     report = cleaned.get("report")
     if isinstance(report, dict):
@@ -115,7 +111,7 @@ def _legacy_payloads(
                 continue
             normalized_key = task_key
             if normalized_key.endswith(":repair"):
-                normalized_key = f"{normalized_key[:-len(':repair')]}:fixup"
+                normalized_key = f"{normalized_key[: -len(':repair')]}:fixup"
             task_runs = task.get("runs")
             if not isinstance(task_runs, list):
                 continue
@@ -168,7 +164,7 @@ def initialize_database(state_dir: Path) -> Path:
                             normalized_key = task_key
                             task = dict(value)
                             if normalized_key.endswith(":repair"):
-                                normalized_key = f"{normalized_key[:-len(':repair')]}:fixup"
+                                normalized_key = f"{normalized_key[: -len(':repair')]}:fixup"
                             if task.get("stage") == "repair":
                                 task["stage"] = "fixup"
                             task_runs = task.pop("runs", [])
@@ -212,18 +208,31 @@ def initialize_database(state_dir: Path) -> Path:
                         "INSERT INTO source_issues(id, payload) VALUES(?, ?)",
                         (str(issue["id"]), json.dumpb(issue)),
                     )
+            migrated_runs = int(connection.execute("SELECT count(*) FROM runs").fetchone()[0])
+            migrated_issues = int(
+                connection.execute("SELECT count(*) FROM source_issues").fetchone()[0]
+            )
+            checkpoint_count = int(
+                connection.execute("SELECT count(*) FROM checkpoint").fetchone()[0]
+            )
+            if migrated_runs != len(runs) or migrated_issues != len(issues):
+                raise ValueError(
+                    "legacy state migration did not preserve every run and source issue"
+                )
+            if raw is not None and checkpoint_count != 1:
+                raise ValueError("legacy state migration did not preserve its checkpoint")
             connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             connection.execute("PRAGMA journal_mode=DELETE")
+        if raw is not None:
+            backup = state_dir / LEGACY_BACKUP_NAME
+            if not backup.exists():
+                shutil.copy2(state_path, backup)
         os.replace(temporary, database_path)
     finally:
         temporary.unlink(missing_ok=True)
         temporary.with_name(f"{temporary.name}-wal").unlink(missing_ok=True)
         temporary.with_name(f"{temporary.name}-shm").unlink(missing_ok=True)
 
-    if raw is not None:
-        backup = state_dir / LEGACY_BACKUP_NAME
-        if not backup.exists():
-            shutil.copy2(state_path, backup)
     return database_path
 
 
@@ -243,9 +252,7 @@ class StateDatabase:
             checkpoint = json.loads(checkpoint_row[0]) if checkpoint_row is not None else None
             summaries = [
                 json.loads(row[0])
-                for row in connection.execute(
-                    "SELECT summary FROM runs ORDER BY started_at, id"
-                )
+                for row in connection.execute("SELECT summary FROM runs ORDER BY started_at, id")
             ]
             issues = [
                 json.loads(row[0])
@@ -273,6 +280,15 @@ class StateDatabase:
             )
             for task_key, run in runs:
                 summary = _run_summary(run)
+                payload = run
+                if not any(name in run for name in ("report", "validation", "isolation")):
+                    existing = connection.execute(
+                        "SELECT payload FROM runs WHERE id = ?", (str(run["id"]),)
+                    ).fetchone()
+                    if existing is not None:
+                        existing_payload = json.loads(existing[0])
+                        if isinstance(existing_payload, dict):
+                            payload = existing_payload | run
                 connection.execute(
                     """
                     INSERT INTO runs(
@@ -293,7 +309,7 @@ class StateDatabase:
                         str(run.get("started_at", "")),
                         str(run.get("status", "pending")),
                         json.dumpb(summary),
-                        json.dumpb(run),
+                        json.dumpb(payload),
                     ),
                 )
             if issues is not None:

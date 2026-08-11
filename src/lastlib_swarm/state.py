@@ -189,9 +189,12 @@ class StateStore:
         self._dirty_run_ids: set[str] = set()
         self._prior_run_ids: set[str] = set()
         self._runs_by_id: dict[str, RunRecord] = {}
+        self._payload_loaded_run_ids: set[str] = set()
         self._chapter_runs: dict[str, list[RunRecord]] = {}
         self._usage_cache: dict[tuple[bool, str | None], TokenUsage] = {}
         self._cost_cache: dict[tuple[bool, str | None], CostEstimate] = {}
+        self._agent_summary_cache: dict[str, Any] | None = None
+        self._stage_count_cache: dict[str, tuple[dict[str, int], dict[str, int]]] = {}
         self.tasks: dict[str, TaskRecord] = {}
         self.source_issues: dict[str, SourceIssueRecord] = {}
         self.scheduling: dict[str, Any] = {}
@@ -208,9 +211,7 @@ class StateStore:
     async def load_or_create(self) -> None:
         self.logs_dir.mkdir(parents=True, exist_ok=True)
         await asyncio.to_thread(self._database.initialize)
-        raw, persisted_runs, persisted_source_issues = await asyncio.to_thread(
-            self._database.load
-        )
+        raw, persisted_runs, persisted_source_issues = await asyncio.to_thread(self._database.load)
         if raw is not None:
             self.created_at = str(raw.get("created_at", timestamp()))
             self.updated_at = str(raw.get("updated_at", self.created_at))
@@ -299,6 +300,7 @@ class StateStore:
             self.coordinator_build.current_chapter_id = ""
             self.coordinator_build.updated_at = timestamp()
         self._invalidate_aggregates()
+        self._invalidate_status_summaries()
         self._checkpoint_dirty = True
         self._issues_dirty = True
         self._dirty_run_ids.update(run.id for run in recovered_runs)
@@ -366,9 +368,7 @@ class StateStore:
 
     @staticmethod
     def _issue_dict(issue: SourceIssueRecord) -> dict[str, Any]:
-        return {
-            name: getattr(issue, name) for name in SourceIssueRecord.__dataclass_fields__
-        }
+        return {name: getattr(issue, name) for name in SourceIssueRecord.__dataclass_fields__}
 
     @staticmethod
     def _build_dict(build: CoordinatorBuildRecord) -> dict[str, Any]:
@@ -455,7 +455,10 @@ class StateStore:
             self._checkpoint_dirty = False
             self._issues_dirty = False
             runs = [
-                (self.key(run.chapter_id, Stage(run.stage)), self._run_dict(run))
+                (
+                    self.key(run.chapter_id, Stage(run.stage)),
+                    self._run_dict(run, include_payload=run.id in self._payload_loaded_run_ids),
+                )
                 for run_id in sorted(dirty_runs)
                 if (run := self._runs_by_id.get(run_id)) is not None
             ]
@@ -513,13 +516,20 @@ class StateStore:
             return run
         for name in ("report", "validation", "isolation"):
             setattr(run, name, value.get(name))
+        self._payload_loaded_run_ids.add(run.id)
         return run
 
     def _invalidate_aggregates(self) -> None:
         self._usage_cache.clear()
         self._cost_cache.clear()
 
+    def _invalidate_status_summaries(self) -> None:
+        self._agent_summary_cache = None
+        self._stage_count_cache.clear()
+
     def agent_summary(self) -> dict[str, Any]:
+        if self._agent_summary_cache is not None:
+            return self._agent_summary_cache
         by_stage = {stage.value: 0 for stage in Stage}
         for task in self.tasks.values():
             for run in task.runs:
@@ -529,12 +539,28 @@ class StateStore:
             task.status == TaskStatus.RUNNING and task.phase == TaskPhase.QUEUED
             for task in self.tasks.values()
         )
-        return {
+        self._agent_summary_cache = {
             "active": sum(by_stage.values()),
             "maximum": self.config.settings.max_agents,
             "queued": queued,
             "by_stage": by_stage,
         }
+        return self._agent_summary_cache
+
+    def stage_counts(self, stage: Stage) -> tuple[dict[str, int], dict[str, int]]:
+        if stage.value in self._stage_count_cache:
+            return self._stage_count_cache[stage.value]
+        statuses = {status.value: 0 for status in TaskStatus}
+        phases = {phase.value: 0 for phase in TaskPhase}
+        for task in self.tasks.values():
+            if task.stage != stage.value:
+                continue
+            statuses[str(task.status)] += 1
+            if task.status == TaskStatus.RUNNING and task.phase in phases:
+                phases[str(task.phase)] += 1
+        result = (statuses, phases)
+        self._stage_count_cache[stage.value] = result
+        return result
 
     def _record_source_issues(self, run: RunRecord) -> list[str]:
         report = run.report or {}
@@ -670,6 +696,7 @@ class StateStore:
             task.phase = TaskPhase.IDLE
         task.detail = detail
         task.updated_at = timestamp()
+        self._invalidate_status_summaries()
         self._mark_dirty()
         await self._persist()
 
@@ -698,6 +725,7 @@ class StateStore:
             task.updated_at = updated_at
             changed = True
         if changed:
+            self._invalidate_status_summaries()
             self._mark_dirty()
             await self._persist()
 
@@ -713,6 +741,7 @@ class StateStore:
             task.updated_at = timestamp()
             changed.append(key)
         if changed:
+            self._invalidate_status_summaries()
             self._mark_dirty()
             await self._persist()
         return changed
@@ -732,18 +761,20 @@ class StateStore:
         )
         task.runs.append(run)
         self._index_run(run)
+        self._payload_loaded_run_ids.add(run.id)
         self._invalidate_aggregates()
+        self._invalidate_status_summaries()
         self._mark_dirty(run=run)
         await self._persist()
         return run
 
-    async def update_run(
-        self, run: RunRecord, *, deferred: bool = False, **changes: Any
-    ) -> None:
+    async def update_run(self, run: RunRecord, *, deferred: bool = False, **changes: Any) -> None:
         for name, value in changes.items():
             setattr(run, name, value)
         if "usage" in changes or "model" in changes:
             self._invalidate_aggregates()
+        if "status" in changes:
+            self._invalidate_status_summaries()
         self._mark_dirty(run=run)
         if not deferred:
             await self._persist()
@@ -760,6 +791,7 @@ class StateStore:
                 report["source_issue_ids"] = issue_ids
             run.report = report
         self._invalidate_aggregates()
+        self._invalidate_status_summaries()
         self._mark_dirty(run=run, issues=bool(issue_ids))
         await self._persist()
 

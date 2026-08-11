@@ -762,8 +762,7 @@ def _control_response(command: str, config: PipelineConfig) -> dict[str, object]
         if command == "snapshot":
             response = _offline_snapshot(config)
         elif command == "unblock":
-            state_path = config.settings.state_dir / "state.json"
-            if not state_path.is_file():
+            if read_checkpoint(config.settings.state_dir) is None:
                 response = offline_status(config.settings.state_dir) | {
                     "unblocked": 0,
                     "unblocked_tasks": [],

@@ -1,12 +1,40 @@
 import json
 from pathlib import Path
 
+import pytest
+
+import lastlib_swarm.activity as activity_module
 from lastlib_swarm.activity import (
     ActivityStore,
     AgentActivity,
     shorten_book_paths,
     systemic_errors,
 )
+
+
+def test_activity_store_throttles_reconstructible_sidecar_writes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = [0.0]
+    monkeypatch.setattr(activity_module.time, "monotonic", lambda: clock[0])
+    store = ActivityStore(tmp_path / "logs")
+    activity = AgentActivity(run_id="run", chapter_id="chapter", stage="formalize")
+    store.save(activity)
+
+    activity.current = "updated in memory"
+    activity.sequence = 1
+    clock[0] = 0.5
+    store.save_throttled(activity, interval=1.0)
+    persisted = ActivityStore(tmp_path / "logs").get("run")
+    assert persisted is not None
+    assert persisted.current != "updated in memory"
+    assert store.get("run") is activity
+
+    clock[0] = 1.0
+    store.save_throttled(activity, interval=1.0)
+    persisted = ActivityStore(tmp_path / "logs").get("run")
+    assert persisted is not None
+    assert persisted.current == "updated in memory"
 
 
 def test_shortens_book_path_in_long_lake_trace() -> None:

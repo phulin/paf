@@ -314,24 +314,38 @@ second time. Reasoning output is also shown separately and is not double-counted
 
 Codex's stdout JSONL normally reports authoritative usage only when a turn completes. Once Codex
 reports a thread id, the orchestrator also tails that thread's local rollout token-count events and
-atomically checkpoints its latest cumulative usage into the run record. Cancellation stops the
-process, drains the rollout once more, and preserves that partial spend. The final stdout usage, when
-available, updates the same record. If a Codex version does not emit recognized usage fields in
-either stream, the TUI says usage is awaiting measurement rather than inventing an estimate.
+updates the in-memory cumulative usage. These frequent updates are folded into the next state batch;
+cancellation drains the rollout once more and force-flushes that partial spend. The final stdout
+usage, when available, updates the same record. If a Codex version does not emit recognized usage
+fields in either stream, the TUI says usage is awaiting measurement rather than inventing an
+estimate.
 
 ## State, logs, and interruption
 
-Configured state defaults to `.swarm/state.json`; inferred single-target state uses
-`.swarm/<book-id>/state.json`; inferred corpora use a deterministic
-`.swarm/corpus-<id>/state.json`. Raw JSONL agent logs live below `logs/`, with the generated final-report
-schema alongside them. Compact `*.activity.json` sidecars retain the most recent event timeline and
-health counters without copying large command output into pipeline state. An attempt record is
-written atomically before its workspace is acquired or Codex is launched. Each run records its PID,
-Codex thread id when emitted, stage, round, timestamps, scoped-change result, placeholder count,
-final report, validation tail, and incrementally checkpointed usage. Task records separately persist
-their current queue/build/agent phase, while a coordinator-build record tracks the single serialized
-Lake build. Running run records—not chapter-stage records—are the authoritative live-agent count.
-Writes are atomic.
+Configured state defaults to `.swarm/`; inferred single-target state uses `.swarm/<book-id>/`, and
+inferred corpora use a deterministic `.swarm/corpus-<id>/`. `state.sqlite3` is the canonical WAL
+database. Its compact checkpoint contains current task/build state, aggregate usage, and pointers to
+run history; immutable run payloads occupy independent rows and are loaded only for inspection or a
+full `snapshot` request. `state.json` remains a small atomic compatibility export of the checkpoint,
+not the historical database.
+
+On the first load of a pre-SQLite state directory, the orchestrator imports every run and source
+issue in one transaction, verifies that the database is complete, retains the original snapshot as
+`state.legacy-v6.json`, and only then replaces `state.json` with the compact checkpoint. Restarting an
+interrupted run updates its lightweight row summary without discarding its lazily stored report,
+validation, or isolation payload.
+
+Raw JSONL agent logs live below `logs/`, with the generated final-report schema alongside them.
+Compact `*.activity.json` sidecars retain the recent event timeline and health counters without
+copying command output into pipeline state; because they are reconstructible from JSONL, event-time
+sidecar writes are rate-limited and a final summary is force-flushed. An attempt row is committed
+before its workspace is acquired or Codex is launched. Each run records its PID, Codex thread id,
+stage, round, timestamps, scoped-change result, placeholder count, final report, validation tail, and
+usage. Concurrent mutations coalesce into one SQLite transaction, coordinator transitions use
+explicit state batches, and JSON/database work runs off the TUI event loop. Task records separately
+persist their current queue/build/agent phase, while a coordinator-build record tracks the single
+serialized Lake build. Running run records—not chapter-stage records—are the authoritative live-agent
+count.
 
 Press `q` in the TUI or interrupt a headless run to terminate the active child process group. On the
 next invocation, interrupted `running` records become `pending` and can resume. Successful records

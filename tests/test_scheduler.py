@@ -1,8 +1,10 @@
 import asyncio
 import json
+import sqlite3
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -173,9 +175,7 @@ async def test_state_migrates_legacy_repair_tasks_to_fixup(tmp_path: Path) -> No
     assert (config.settings.state_dir / "state.legacy-v6.json").is_file()
     hot = json.loads(reloaded.path.read_text(encoding="utf-8"))
     assert "runs" not in hot["tasks"][f"{chapter.id}:fixup"]
-    assert reloaded.snapshot()["tasks"][f"{chapter.id}:fixup"]["runs"][0]["id"] == (
-        "legacy-run"
-    )
+    assert reloaded.snapshot()["tasks"][f"{chapter.id}:fixup"]["runs"][0]["id"] == ("legacy-run")
 
 
 @pytest.mark.asyncio
@@ -196,6 +196,96 @@ async def test_state_persists_fixup_graph(tmp_path: Path) -> None:
 
     assert reloaded.fixup_graph == state.fixup_graph
     assert reloaded.snapshot()["version"] == 7
+
+
+@pytest.mark.asyncio
+async def test_hot_checkpoint_does_not_grow_with_run_payload_history(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    state = StateStore(config)
+    await state.load_or_create()
+
+    async with state.batch():
+        for index in range(25):
+            run = await state.start_run(config.chapters[0].id, Stage.FORMALIZE)
+            await state.finish_run(
+                run,
+                status=TaskStatus.SUCCEEDED,
+                report={"summary": f"payload-{index}-" + "x" * 10_000, "issues": []},
+                validation={"succeeded": True, "output": "y" * 2_000},
+                isolation={"accepted": True, "changed_paths": [f"file-{index}.lean"]},
+            )
+
+    hot = json.loads(state.path.read_text(encoding="utf-8"))
+    task = hot["tasks"][f"{config.chapters[0].id}:formalize"]
+    assert hot["version"] == 7
+    assert "source_issues" not in hot
+    assert "runs" not in task
+    assert task["run_count"] == 25
+    assert state.path.stat().st_size < 10_000
+    with sqlite3.connect(state.database_path) as connection:
+        assert connection.execute("SELECT count(*) FROM runs").fetchone()[0] == 25
+
+    reloaded = StateStore(config)
+    await reloaded.load_or_create()
+    historical = reloaded.task(config.chapters[0].id, Stage.FORMALIZE).runs[0]
+    assert historical.report is None
+    reloaded.load_run_details(historical)
+    assert historical.report is not None
+    assert historical.report["summary"].startswith("payload-0-")
+    assert len(reloaded.snapshot()["tasks"][f"{config.chapters[0].id}:formalize"]["runs"]) == 25
+
+
+@pytest.mark.asyncio
+async def test_concurrent_run_updates_coalesce_into_one_database_batch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    state = StateStore(config)
+    await state.load_or_create()
+    async with state.batch():
+        runs = [await state.start_run(config.chapters[0].id, stage) for stage in Stage]
+
+    calls = 0
+    original = state._database.write_batch
+
+    def tracked(
+        checkpoint: dict[str, Any],
+        dirty_runs: list[tuple[str, dict[str, Any]]],
+        issues: list[dict[str, Any]] | None,
+    ) -> None:
+        nonlocal calls
+        calls += 1
+        original(checkpoint, dirty_runs, issues)
+
+    monkeypatch.setattr(state._database, "write_batch", tracked)
+    await asyncio.gather(
+        *(state.update_run(run, pid=index) for index, run in enumerate(runs, start=1))
+    )
+
+    assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_recovering_interrupted_run_preserves_lazy_payload(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    first = StateStore(config)
+    await first.load_or_create()
+    run = await first.start_run(config.chapters[0].id, Stage.REVIEW)
+    await first.update_run(
+        run,
+        report={"summary": "preserve me", "issues": []},
+        validation={"succeeded": False, "output": "interrupted"},
+    )
+
+    recovered = StateStore(config)
+    await recovered.load_or_create()
+    recovered_run = recovered.task(config.chapters[0].id, Stage.REVIEW).runs[-1]
+
+    assert recovered_run.status == TaskStatus.FAILED
+    assert recovered_run.report is None
+    recovered.load_run_details(recovered_run)
+    assert recovered_run.report == {"summary": "preserve me", "issues": []}
+    assert recovered_run.validation == {"succeeded": False, "output": "interrupted"}
 
 
 @pytest.mark.asyncio
@@ -223,6 +313,10 @@ async def test_state_accumulates_and_deduplicates_source_issue_ledger(tmp_path: 
     assert recorded.sightings == 2
     assert recorded.stages == ["formalize", "review"]
     assert len(recorded.run_ids) == 2
+    latest = state.task(config.chapters[0].id, Stage.REVIEW).runs[-1]
+    assert latest.report is not None
+    assert "source_issues" not in latest.report
+    assert latest.report["source_issue_ids"] == [recorded.id]
 
     ledger = json.loads(state.source_issues_path.read_text(encoding="utf-8"))
     assert ledger["version"] == 1
