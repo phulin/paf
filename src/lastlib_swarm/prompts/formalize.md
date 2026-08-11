@@ -7,9 +7,9 @@ next heading of the same level. Create or update `{lean_root}/{chapter_path}/` a
 `{lean_root}/{chapter_path}.lean` so the chapter exposes an accurate, proof-ready Lean API in source
 order.
 
-This is a statement pass. Proofs may use `by sorry`; definitions should have genuine bodies whenever
-the canonical construction is clear. Do not translate motivation, history, proof narration, or
-redundant paraphrases into declarations.
+This is a single optimistic drafting pass. Proofs may use `by sorry`; definitions should have genuine
+bodies whenever the canonical construction is clear. The draft need not elaborate yet. Do not
+translate motivation, history, proof narration, or redundant paraphrases into declarations.
 
 ## Coverage and proof readiness
 
@@ -37,11 +37,14 @@ desired conclusion.
 2. Inspect canonical earlier LastLib and pinned Mathlib interfaces.
 3. Complete the statement and definition pass across the entire chapter.
 4. Audit proof readiness and add only genuinely missing reusable bridges.
-5. Request whole-file diagnostics for every assigned file and repair them in coherent batches.
+5. Record unresolved dependency guesses and API conflicts for the later fixup pass.
+
+Do not run Lean, Lake, or a language server, and do not request LSP diagnostics. The coordinator will
+reconcile all chapter drafts in the repeated global fixup pass.
 
 ## Definition of done
 
-Every substantive source assertion is represented or explicitly accounted for, every declaration is
-accurately typed and ordered, definitions have real bodies where practical, and fresh whole-file
-diagnostics contain no unexpected messages. Report coverage gaps, dependency guesses, source issues,
-and important interface choices.
+Every substantive source assertion is represented or explicitly accounted for, declarations follow
+source order, and definitions have real bodies where practical. Report coverage gaps, dependency
+guesses, source issues, and important provisional interface choices. Compiler cleanliness is not a
+condition of this pass.

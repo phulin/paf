@@ -9,7 +9,7 @@ from typing import Any
 
 from lastlib_swarm.codex import AgentResult, CodexExecutor, ValidationResult, validate
 from lastlib_swarm.corpus import CorpusSchedule, build_corpus_schedule, scheduling_snapshot
-from lastlib_swarm.isolation import create_isolation
+from lastlib_swarm.isolation import IsolationResult, create_isolation
 from lastlib_swarm.models import Chapter, PipelineConfig, Stage
 from lastlib_swarm.state import RunRecord, StateStore, TaskStatus
 
@@ -52,6 +52,13 @@ class Attempt:
         if not self.validation.succeeded:
             parts.append("Validation failed:\n" + self.validation.output)
         return "\n\n".join(parts)
+
+
+@dataclass(frozen=True)
+class ReviewOutcome:
+    succeeded: bool
+    needs_fixup: bool
+    feedback: str
 
 
 class RunControl:
@@ -201,6 +208,7 @@ class Orchestrator:
     async def prepare(self) -> None:
         await self.state.load_or_create()
         await self.executor.prepare()
+        self.scaffold()
         await self.isolation.prepare()
 
     async def shutdown(self) -> None:
@@ -208,6 +216,17 @@ class Orchestrator:
 
     def _already_done(self, chapter: Chapter, stage: Stage) -> bool:
         return not self.force and self.state.task(chapter.id, stage).status == TaskStatus.SUCCEEDED
+
+    def scaffold(self) -> None:
+        """Create configured chapter directories without creating Lean files."""
+
+        for chapter in self.chapters:
+            directory = self.config.settings.repo / chapter.lean_root / chapter.chapter_path
+            directory.mkdir(parents=True, exist_ok=True)
+
+    def _scope_exists(self, chapter: Chapter) -> bool:
+        repo = self.config.settings.repo
+        return all(any(path.is_file() for path in repo.glob(pattern)) for pattern in chapter.scope)
 
     async def _attempt(
         self,
@@ -254,16 +273,31 @@ class Orchestrator:
                 # The agent is finished before this transaction begins. Merge its
                 # scoped source changes, unmount its workspace, and only then build
                 # from the main worktree against the coordinator-owned cache.
-                isolated = await workspace.collect(chapter)
+                if stage is Stage.REVIEW and agent.changed:
+                    isolated = IsolationResult(
+                        accepted=False,
+                        generation=getattr(workspace, "generation", 0),
+                        cache_generation=getattr(workspace, "cache_generation", 0),
+                        error="read-only review attempted to change files",
+                    )
+                else:
+                    isolated = await workspace.collect(chapter)
                 await workspace.close()
                 workspace = None
                 if isolated.accepted:
-                    validation = await validate(
-                        self.config,
-                        chapter,
-                        workspace_root=self.config.settings.repo,
-                    )
-                    await self.isolation.refresh_cache()
+                    if stage is Stage.PROVE:
+                        validation = await validate(
+                            self.config,
+                            chapter,
+                            workspace_root=self.config.settings.repo,
+                        )
+                        await self.isolation.refresh_cache()
+                    else:
+                        validation = ValidationResult(
+                            True,
+                            0,
+                            "validation deferred to the coordinator fixup loop",
+                        )
                 else:
                     validation = ValidationResult(
                         False,
@@ -308,91 +342,210 @@ class Orchestrator:
     async def _formalize(self, chapter: Chapter) -> bool:
         if self._already_done(chapter, Stage.FORMALIZE):
             return True
-        feedback = ""
-        maximum = self.config.stages[Stage.FORMALIZE].max_rounds
-        for round_number in range(1, maximum + 1):
+        if not self.force and self._scope_exists(chapter):
             await self.state.set_task(
                 chapter.id,
                 Stage.FORMALIZE,
-                TaskStatus.RUNNING,
-                f"agent round {round_number}/{maximum}",
+                TaskStatus.SUCCEEDED,
+                "existing chapter files skipped",
             )
-            attempt = await self._attempt(chapter, Stage.FORMALIZE, feedback=feedback)
-            if attempt.agent.succeeded and attempt.validation.succeeded:
-                await self.state.set_task(
-                    chapter.id,
-                    Stage.FORMALIZE,
-                    TaskStatus.SUCCEEDED,
-                    "chapter statements elaborate",
-                )
-                return True
-            feedback = attempt.feedback()
+            return True
+        await self.state.set_task(
+            chapter.id,
+            Stage.FORMALIZE,
+            TaskStatus.RUNNING,
+            "single optimistic drafting pass",
+        )
+        attempt = await self._attempt(chapter, Stage.FORMALIZE)
+        if attempt.agent.succeeded and attempt.validation.succeeded:
+            await self.state.set_task(
+                chapter.id,
+                Stage.FORMALIZE,
+                TaskStatus.SUCCEEDED,
+                "optimistic chapter draft completed",
+            )
+            return True
         await self.state.set_task(
             chapter.id,
             Stage.FORMALIZE,
             TaskStatus.FAILED,
-            f"did not elaborate after {maximum} rounds",
+            "single drafting attempt failed",
         )
         return False
 
-    async def _review(self, chapter: Chapter) -> bool:
-        if self._already_done(chapter, Stage.REVIEW):
+    def _chapter_identifiers(self, chapter: Chapter) -> tuple[str, ...]:
+        root = (chapter.lean_root / chapter.chapter_path).as_posix()
+        lean_prefix = self.config.settings.lean_project.as_posix().rstrip("/") + "/"
+        without_project = root.removeprefix(lean_prefix)
+        return tuple(
+            dict.fromkeys(
+                (
+                    root,
+                    without_project,
+                    chapter.chapter_module,
+                    chapter.chapter_module.replace(".", "/"),
+                )
+            )
+        )
+
+    async def _build_all(self) -> dict[str, ValidationResult]:
+        """Run every selected chapter build against the coordinator-owned cache."""
+
+        results: dict[str, ValidationResult] = {}
+        await self.build_queue.acquire()
+        try:
+            for chapter in self.chapters:
+                await self.control.checkpoint()
+                results[chapter.id] = await validate(
+                    self.config,
+                    chapter,
+                    workspace_root=self.config.settings.repo,
+                )
+            if all(result.succeeded for result in results.values()):
+                await self.isolation.refresh_cache()
+        finally:
+            self.build_queue.release()
+        return results
+
+    def _build_feedback(self, results: dict[str, ValidationResult]) -> dict[str, str]:
+        feedback: dict[str, list[str]] = {}
+        by_id = {chapter.id: chapter for chapter in self.chapters}
+        for target_id, result in results.items():
+            if result.succeeded:
+                continue
+            owners = [
+                chapter.id
+                for chapter in self.chapters
+                if any(
+                    identifier in result.output for identifier in self._chapter_identifiers(chapter)
+                )
+            ]
+            if not owners:
+                owners = [target_id]
+            block = (
+                f"Coordinator build of {by_id[target_id].chapter_module} failed:\n{result.output}"
+            )
+            for owner in owners:
+                feedback.setdefault(owner, []).append(block)
+        return {chapter_id: "\n\n".join(blocks) for chapter_id, blocks in feedback.items()}
+
+    async def _fixup_agent(self, chapter: Chapter, feedback: str) -> bool:
+        maximum = self.config.stages[Stage.FIXUP].max_rounds
+        task = self.state.task(chapter.id, Stage.FIXUP)
+        await self.state.set_task(
+            chapter.id,
+            Stage.FIXUP,
+            TaskStatus.RUNNING,
+            f"fixup attempt {task.rounds + 1} (global cap {maximum})",
+        )
+        attempt = await self._attempt(chapter, Stage.FIXUP, feedback=feedback)
+        if attempt.agent.succeeded and attempt.validation.succeeded:
             return True
-        feedback = ""
-        maximum = self.config.stages[Stage.REVIEW].max_rounds
-        for round_number in range(1, maximum + 1):
+        await self.state.set_task(
+            chapter.id,
+            Stage.FIXUP,
+            TaskStatus.FAILED,
+            "fixup agent failed",
+        )
+        return False
+
+    async def _fixup_to_clean(self, feedback: dict[str, str] | None = None) -> bool:
+        pending = dict(feedback or {})
+        by_id = {chapter.id: chapter for chapter in self.chapters}
+        maximum = self.config.stages[Stage.FIXUP].max_rounds
+        for iteration in range(1, maximum + 1):
+            if pending:
+                outcomes = await _gather_cancel_on_error(
+                    self._fixup_agent(by_id[chapter_id], diagnostic)
+                    for chapter_id, diagnostic in pending.items()
+                    if chapter_id in by_id
+                )
+                if not all(outcomes):
+                    return False
+            for chapter in self.chapters:
+                await self.state.set_task(
+                    chapter.id,
+                    Stage.FIXUP,
+                    TaskStatus.RUNNING,
+                    f"coordinator build iteration {iteration}/{maximum}",
+                )
+            results = await self._build_all()
+            if all(result.succeeded for result in results.values()):
+                for chapter in self.chapters:
+                    await self.state.set_task(
+                        chapter.id,
+                        Stage.FIXUP,
+                        TaskStatus.SUCCEEDED,
+                        f"clean coordinator build after {iteration} iteration(s)",
+                    )
+                return True
+            pending = self._build_feedback(results)
+            if not pending:
+                break
+        for chapter in self.chapters:
+            await self.state.set_task(
+                chapter.id,
+                Stage.FIXUP,
+                TaskStatus.FAILED,
+                f"global build did not become clean in {maximum} iterations",
+            )
+        return False
+
+    async def _review_once(self, chapter: Chapter, *, rerun: bool = False) -> ReviewOutcome:
+        if not rerun and self._already_done(chapter, Stage.REVIEW):
+            return ReviewOutcome(True, False, "")
+        await self.state.set_task(
+            chapter.id,
+            Stage.REVIEW,
+            TaskStatus.RUNNING,
+            "read-only review",
+        )
+        attempt = await self._attempt(chapter, Stage.REVIEW)
+        succeeded = attempt.agent.succeeded and attempt.validation.succeeded
+        needs_fixup = bool(attempt.agent.report.get("needs_fixup"))
+        complete = bool(attempt.agent.report.get("complete"))
+        feedback = attempt.feedback()
+        if succeeded and complete and not needs_fixup:
             await self.state.set_task(
                 chapter.id,
                 Stage.REVIEW,
-                TaskStatus.RUNNING,
-                f"fixed-point round {round_number}/{maximum}",
+                TaskStatus.SUCCEEDED,
+                "read-only review found no actionable issues",
             )
-            attempt = await self._attempt(chapter, Stage.REVIEW, feedback=feedback)
-            converged = (
-                attempt.agent.succeeded
-                and attempt.validation.succeeded
-                and not attempt.agent.changed
-            )
-            if converged:
-                await self.state.set_task(
-                    chapter.id,
-                    Stage.REVIEW,
-                    TaskStatus.SUCCEEDED,
-                    "independent review made no changes",
-                )
-                return True
-            feedback = attempt.feedback()
+            return ReviewOutcome(True, False, feedback)
+        detail = "review reported fixup findings" if needs_fixup else "read-only review failed"
         await self.state.set_task(
             chapter.id,
             Stage.REVIEW,
             TaskStatus.FAILED,
-            f"review did not reach a no-change fixed point in {maximum} rounds",
+            detail,
         )
+        return ReviewOutcome(succeeded and complete, needs_fixup, feedback)
+
+    async def _review_until_clean(self, *, rerun: bool = False) -> bool:
+        maximum = self.config.stages[Stage.REVIEW].max_rounds
+        for cycle in range(1, maximum + 1):
+            outcomes = await asyncio.gather(
+                *(self._review_once(chapter, rerun=rerun or cycle > 1) for chapter in self.chapters)
+            )
+            if not all(outcome.succeeded for outcome in outcomes):
+                return False
+            findings = {
+                chapter.id: outcome.feedback
+                for chapter, outcome in zip(self.chapters, outcomes, strict=True)
+                if outcome.needs_fixup
+            }
+            if not findings:
+                return True
+            if not await self._fixup_to_clean(findings):
+                return False
         return False
 
-    async def _repair_once(self, chapter: Chapter, feedback: str) -> Attempt:
-        maximum = self.config.stages[Stage.REPAIR].max_rounds
-        task = self.state.task(chapter.id, Stage.REPAIR)
-        next_round = task.rounds + 1
-        await self.state.set_task(
-            chapter.id,
-            Stage.REPAIR,
-            TaskStatus.RUNNING,
-            f"statement repair attempt {next_round} (run cap {maximum})",
-        )
-        attempt = await self._attempt(chapter, Stage.REPAIR, feedback=feedback)
-        status = TaskStatus.SUCCEEDED if attempt.agent.succeeded else TaskStatus.FAILED
-        detail = "repair pass completed" if attempt.agent.succeeded else "repair agent failed"
-        await self.state.set_task(chapter.id, Stage.REPAIR, status, detail)
-        return attempt
-
-    async def _prove(self, chapter: Chapter, *, allow_repair: bool) -> bool:
+    async def _prove(self, chapter: Chapter) -> bool:
         if self._already_done(chapter, Stage.PROVE):
             return True
         proof_maximum = self.config.stages[Stage.PROVE].max_rounds
-        repair_maximum = self.config.stages[Stage.REPAIR].max_rounds
         feedback = ""
-        repair_rounds = 0
         for proof_round in range(1, proof_maximum + 1):
             await self.state.set_task(
                 chapter.id,
@@ -415,22 +568,12 @@ class Orchestrator:
                 return True
 
             feedback = attempt.feedback()
-            needs_repair = bool(attempt.agent.report.get("needs_repair"))
-            stalled = attempt.agent.succeeded and not attempt.agent.changed
-            if allow_repair and (needs_repair or stalled):
-                if repair_rounds >= repair_maximum:
-                    break
-                repair_rounds += 1
-                repair = await self._repair_once(chapter, feedback)
-                feedback = repair.feedback()
-                if not repair.agent.succeeded:
-                    continue
-            elif needs_repair and not allow_repair:
+            if bool(attempt.agent.report.get("needs_fixup")):
                 await self.state.set_task(
                     chapter.id,
                     Stage.PROVE,
                     TaskStatus.FAILED,
-                    "proof agent requested statement repair",
+                    "proof agent requested statement fixup",
                 )
                 return False
 
@@ -438,85 +581,20 @@ class Orchestrator:
             chapter.id,
             Stage.PROVE,
             TaskStatus.FAILED,
-            f"proof/repair did not converge in {proof_maximum} proof rounds",
-        )
-        return False
-
-    async def _repair_to_fixed_point(self, chapter: Chapter) -> bool:
-        if self._already_done(chapter, Stage.REPAIR):
-            return True
-        feedback = ""
-        maximum = self.config.stages[Stage.REPAIR].max_rounds
-        for _ in range(maximum):
-            attempt = await self._repair_once(chapter, feedback)
-            if (
-                attempt.agent.succeeded
-                and attempt.validation.succeeded
-                and not attempt.agent.changed
-            ):
-                await self.state.set_task(
-                    chapter.id,
-                    Stage.REPAIR,
-                    TaskStatus.SUCCEEDED,
-                    "repair review made no changes",
-                )
-                return True
-            feedback = attempt.feedback()
-        await self.state.set_task(
-            chapter.id,
-            Stage.REPAIR,
-            TaskStatus.FAILED,
-            f"repair did not reach a no-change fixed point in {maximum} rounds",
+            f"proof pass did not converge in {proof_maximum} rounds",
         )
         return False
 
     async def run_stage(self, stage: Stage) -> bool:
-        operations = {
-            Stage.FORMALIZE: self._formalize,
-            Stage.REVIEW: self._review,
-            Stage.PROVE: lambda chapter: self._prove(chapter, allow_repair=False),
-            Stage.REPAIR: self._repair_to_fixed_point,
-        }
-
-        async def run_book(book_id: str) -> bool:
-            chapters = [chapter for chapter in self.chapters if chapter.book_id == book_id]
-            results = await _gather_cancel_on_error(
-                operations[stage](chapter) for chapter in chapters
+        if stage is Stage.FIXUP:
+            return await self._fixup_to_clean()
+        if stage is Stage.REVIEW:
+            outcomes = await asyncio.gather(
+                *(self._review_once(chapter) for chapter in self.chapters)
             )
-            return all(results)
-
-        schedule = (
-            self.statement_schedule
-            if stage in (Stage.FORMALIZE, Stage.REVIEW)
-            else self.proof_schedule
-        )
-        succeeded = await self._run_book_graph(schedule, run_book, stages=(stage,))
-        return succeeded == set(schedule.order)
-
-    async def _statement_chapter(self, chapter: Chapter) -> bool:
-        if not await self._formalize(chapter):
-            await self.state.set_task(
-                chapter.id,
-                Stage.REVIEW,
-                TaskStatus.BLOCKED,
-                "formalization failed",
-            )
-            return False
-        return await self._review(chapter)
-
-    async def _statement_book(self, book_id: str) -> bool:
-        chapters = [chapter for chapter in self.chapters if chapter.book_id == book_id]
-        results = await _gather_cancel_on_error(
-            self._statement_chapter(chapter) for chapter in chapters
-        )
-        return all(results)
-
-    async def _proof_book(self, book_id: str) -> bool:
-        chapters = [chapter for chapter in self.chapters if chapter.book_id == book_id]
-        results = await _gather_cancel_on_error(
-            self._prove(chapter, allow_repair=True) for chapter in chapters
-        )
-        return all(results)
+            return all(outcome.succeeded and not outcome.needs_fixup for outcome in outcomes)
+        operation = self._formalize if stage is Stage.FORMALIZE else self._prove
+        return all(await _gather_cancel_on_error(operation(chapter) for chapter in self.chapters))
 
     async def _run_book_graph(
         self,
@@ -559,34 +637,38 @@ class Orchestrator:
             raise
         return succeeded
 
-    async def _run_statements(self) -> set[str]:
-        return await self._run_book_graph(
-            self.statement_schedule,
-            self._statement_book,
-            stages=(Stage.FORMALIZE, Stage.REVIEW),
-        )
-
     async def run_pipeline(self) -> bool:
-        statement_books = await self._run_statements()
-        selected_books = {chapter.book_id for chapter in self.chapters}
-        for chapter in self.chapters:
-            if chapter.book_id not in statement_books:
-                for stage in (Stage.PROVE, Stage.REPAIR):
-                    await self.state.set_task(
-                        chapter.id,
-                        stage,
-                        TaskStatus.BLOCKED,
-                        "book did not complete statement review",
+        if not all(
+            await _gather_cancel_on_error(self._formalize(chapter) for chapter in self.chapters)
+        ):
+            return False
+        if not await self._fixup_to_clean():
+            return False
+        if not await self._review_until_clean():
+            return False
+
+        maximum = self.config.stages[Stage.FIXUP].max_rounds
+        for _ in range(maximum):
+            proof_results = await _gather_cancel_on_error(
+                self._prove(chapter) for chapter in self.chapters
+            )
+            if all(proof_results):
+                return True
+            findings: dict[str, str] = {}
+            for chapter in self.chapters:
+                task = self.state.task(chapter.id, Stage.PROVE)
+                if not task.runs:
+                    continue
+                report = task.runs[-1].report or {}
+                if report.get("needs_fixup"):
+                    issues = report.get("issues") or []
+                    findings[chapter.id] = "Proof-stage fixup request:\n" + "\n".join(
+                        f"- {issue}" for issue in issues
                     )
-        proof_schedule = build_corpus_schedule(
-            self.config.books,
-            self.chapters,
-            phase="proofs",
-            selected_books=statement_books,
-        )
-        proof_books = await self._run_book_graph(
-            proof_schedule,
-            self._proof_book,
-            stages=(Stage.PROVE, Stage.REPAIR),
-        )
-        return statement_books == selected_books and proof_books == selected_books
+            if not findings:
+                return False
+            if not await self._fixup_to_clean(findings):
+                return False
+            if not await self._review_until_clean(rerun=True):
+                return False
+        return False

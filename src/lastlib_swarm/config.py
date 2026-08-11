@@ -49,10 +49,10 @@ def _render(value: str, variables: dict[str, str]) -> str:
 
 
 STAGE_ROUNDS = {
-    Stage.FORMALIZE: 3,
+    Stage.FORMALIZE: 1,
+    Stage.FIXUP: 10,
     Stage.REVIEW: 5,
     Stage.PROVE: 10,
-    Stage.REPAIR: 10,
 }
 
 
@@ -68,6 +68,8 @@ def _stage_configs(raw_stages: dict[str, Any], base: Path) -> dict[Stage, StageC
     stages: dict[Stage, StageConfig] = {}
     for stage in Stage:
         raw = raw_stages.get(stage.value, {})
+        if stage is Stage.FIXUP and not raw:
+            raw = raw_stages.get("repair", {})
         if not isinstance(raw, dict):
             raise ValueError(f"[stages.{stage.value}] must be a table")
         prompt_value = raw.get("prompt")

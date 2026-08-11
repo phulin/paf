@@ -8,13 +8,14 @@ from typing import Any
 
 class Stage(StrEnum):
     FORMALIZE = "formalize"
+    FIXUP = "fixup"
     REVIEW = "review"
     PROVE = "prove"
-    REPAIR = "repair"
+    REPAIR = "fixup"  # Backward-compatible source alias.
 
 
-STATEMENT_STAGES = (Stage.FORMALIZE, Stage.REVIEW)
-PROOF_STAGES = (Stage.PROVE, Stage.REPAIR)
+STATEMENT_STAGES = (Stage.FORMALIZE, Stage.FIXUP, Stage.REVIEW)
+PROOF_STAGES = (Stage.PROVE,)
 
 
 @dataclass(frozen=True)

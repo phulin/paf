@@ -41,7 +41,13 @@ class FakeExecutor(CodexExecutor):
         return result
 
 
-def result(*, changed: bool, placeholders: int = 2) -> AgentResult:
+def result(
+    *,
+    changed: bool,
+    placeholders: int = 2,
+    needs_fixup: bool = False,
+    issues: list[str] | None = None,
+) -> AgentResult:
     return AgentResult(
         succeeded=True,
         exit_code=0,
@@ -51,9 +57,9 @@ def result(*, changed: bool, placeholders: int = 2) -> AgentResult:
         report={
             "changed": changed,
             "complete": not changed,
-            "needs_repair": False,
+            "needs_fixup": needs_fixup,
             "summary": "reviewed",
-            "issues": [],
+            "issues": issues or [],
         },
     )
 
@@ -115,28 +121,171 @@ def test_legacy_attempt_cost_is_always_luna(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_review_requires_a_no_change_round(
+async def test_prepare_scaffolds_directories_without_lean_files(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    orchestrator = Orchestrator(config, StateStore(config))
+
+    await orchestrator.prepare()
+
+    for chapter in config.chapters:
+        directory = tmp_path / chapter.lean_root / chapter.chapter_path
+        assert directory.is_dir()
+    assert not list((tmp_path / "lean").rglob("*.lean"))
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_formalize_skips_an_existing_materialized_scope(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = config.chapters[0]
+    directory = tmp_path / chapter.lean_root / chapter.chapter_path
+    directory.mkdir(parents=True)
+    (tmp_path / chapter.lean_root / f"{chapter.chapter_path}.lean").write_text(
+        "import Book.Chapter01.Section\n", encoding="utf-8"
+    )
+    (directory / "Section.lean").write_text("theorem drafted : True := by sorry\n")
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await orchestrator.prepare()
+    orchestrator.executor = FakeExecutor(state, [])
+
+    assert await orchestrator.run_stage(Stage.FORMALIZE)
+    assert state.task(chapter.id, Stage.FORMALIZE).rounds == 0
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_formalize_is_one_pass_and_does_not_build(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
     state = StateStore(config)
     orchestrator = Orchestrator(config, state)
     await orchestrator.prepare()
-    orchestrator.executor = FakeExecutor(state, [result(changed=True), result(changed=False)])
+    orchestrator.executor = FakeExecutor(state, [result(changed=True)])
 
-    async def successful_validation(
-        _config: object, _chapter: object, *, workspace_root: Path | None = None
-    ) -> ValidationResult:
-        assert workspace_root == config.settings.repo
+    async def forbidden_validation(*_args: object, **_kwargs: object) -> ValidationResult:
+        raise AssertionError("formalization must not build")
+
+    monkeypatch.setattr(scheduler_module, "validate", forbidden_validation)
+
+    assert await orchestrator.run_stage(Stage.FORMALIZE)
+    assert state.task(config.chapters[0].id, Stage.FORMALIZE).rounds == 1
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_fixup_repeats_coordinator_build_and_hands_back_diagnostics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await orchestrator.prepare()
+    orchestrator.executor = FakeExecutor(state, [result(changed=True)])
+    feedback_seen: list[str] = []
+    original_run = orchestrator.executor.run
+
+    async def tracked_run(
+        chapter: Chapter,
+        stage: Stage,
+        run: RunRecord,
+        *,
+        feedback: str = "",
+        workspace_root: Path | None = None,
+    ) -> AgentResult:
+        assert stage is Stage.FIXUP
+        feedback_seen.append(feedback)
+        return await original_run(
+            chapter,
+            stage,
+            run,
+            feedback=feedback,
+            workspace_root=workspace_root,
+        )
+
+    builds = iter(
+        (
+            ValidationResult(False, 1, "error: Book/Chapter01/Section.lean:4:1: broken"),
+            ValidationResult(True, 0, "ok"),
+        )
+    )
+
+    async def tracked_validation(*_args: object, **_kwargs: object) -> ValidationResult:
+        return next(builds)
+
+    monkeypatch.setattr(orchestrator.executor, "run", tracked_run)
+    monkeypatch.setattr(scheduler_module, "validate", tracked_validation)
+
+    assert await orchestrator.run_stage(Stage.FIXUP)
+    assert len(feedback_seen) == 1
+    assert "Book/Chapter01/Section.lean:4:1: broken" in feedback_seen[0]
+    assert state.task(config.chapters[0].id, Stage.FIXUP).rounds == 1
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_review_findings_are_fixed_then_reviewed_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await orchestrator.prepare()
+    orchestrator.executor = FakeExecutor(
+        state,
+        [
+            result(changed=False, needs_fixup=True, issues=["statement needs a hypothesis"]),
+            result(changed=True),
+            result(changed=False),
+        ],
+    )
+    stages_seen: list[Stage] = []
+    original_run = orchestrator.executor.run
+
+    async def tracked_run(
+        chapter: Chapter,
+        stage: Stage,
+        run: RunRecord,
+        *,
+        feedback: str = "",
+        workspace_root: Path | None = None,
+    ) -> AgentResult:
+        stages_seen.append(stage)
+        if stage is Stage.FIXUP:
+            assert "statement needs a hypothesis" in feedback
+        return await original_run(
+            chapter,
+            stage,
+            run,
+            feedback=feedback,
+            workspace_root=workspace_root,
+        )
+
+    async def successful_validation(*_args: object, **_kwargs: object) -> ValidationResult:
         return ValidationResult(True, 0, "ok")
 
+    monkeypatch.setattr(orchestrator.executor, "run", tracked_run)
     monkeypatch.setattr(scheduler_module, "validate", successful_validation)
+
+    assert await orchestrator._review_until_clean()
+    assert stages_seen == [Stage.REVIEW, Stage.FIXUP, Stage.REVIEW]
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_review_is_one_read_only_report(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await orchestrator.prepare()
+    orchestrator.executor = FakeExecutor(state, [result(changed=False)])
 
     assert await orchestrator.run_stage(Stage.REVIEW)
     task = state.task(config.chapters[0].id, Stage.REVIEW)
     assert task.status == TaskStatus.SUCCEEDED
-    assert task.rounds == 2
-    assert state.total_usage().total_tokens == 30
+    assert task.rounds == 1
+    assert state.total_usage().total_tokens == 15
 
 
 @pytest.mark.asyncio
@@ -195,7 +344,7 @@ async def test_prove_builds_run_after_agents_and_are_serialized_in_main_worktree
 
 
 @pytest.mark.asyncio
-async def test_individual_stage_waits_for_upstream_book(
+async def test_formalize_runs_upstream_and_downstream_books_optimistically(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config_path = write_project(tmp_path, chapters="chapters = [1]")
@@ -230,7 +379,8 @@ chapters = [1]
     monkeypatch.setattr(orchestrator, "_formalize", formalize)
 
     assert await orchestrator.run_stage(Stage.FORMALIZE)
-    assert events == ["start:book", "end:book", "start:second", "end:second"]
+    assert events[:2] == ["start:book", "start:second"]
+    assert set(events[2:]) == {"end:book", "end:second"}
 
 
 @pytest.mark.asyncio
@@ -242,7 +392,7 @@ async def test_chapter_failure_cancels_and_drains_siblings(
     sibling_started = asyncio.Event()
     sibling_cleaned = asyncio.Event()
 
-    async def statement(chapter: Chapter) -> bool:
+    async def formalize(chapter: Chapter) -> bool:
         if chapter.number == 1:
             await sibling_started.wait()
             raise RuntimeError("primary failure")
@@ -253,10 +403,10 @@ async def test_chapter_failure_cancels_and_drains_siblings(
             sibling_cleaned.set()
         raise AssertionError("unreachable")
 
-    monkeypatch.setattr(orchestrator, "_statement_chapter", statement)
+    monkeypatch.setattr(orchestrator, "_formalize", formalize)
 
     with pytest.raises(RuntimeError, match="primary failure"):
-        await orchestrator._statement_book("book")
+        await orchestrator.run_stage(Stage.FORMALIZE)
     assert sibling_cleaned.is_set()
 
 

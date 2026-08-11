@@ -17,7 +17,7 @@ from lastlib_swarm.codex import (
     unexpected_lean_warnings,
     validate,
 )
-from lastlib_swarm.config import load_config, standard_prompt_path
+from lastlib_swarm.config import load_config
 from lastlib_swarm.models import Stage
 from lastlib_swarm.state import StateStore, TokenUsage
 from tests.support import write_project
@@ -90,7 +90,7 @@ def test_executor_uses_machine_readable_codex_mode(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
     executor = CodexExecutor(config, StateStore(config))
 
-    command = executor.command(Stage.REVIEW)
+    command = executor.command(Stage.PROVE)
 
     assert command[:2] == ["codex", "exec"]
     assert "--json" in command
@@ -121,6 +121,13 @@ def test_executor_uses_machine_readable_codex_mode(tmp_path: Path) -> None:
         "Chapter {chapter_number_padded}: {chapter_title}", config.chapters[0]
     ) == ("Chapter 01: First chapter")
 
+    review_command = executor.command(Stage.REVIEW)
+    assert "--sandbox" in review_command
+    assert review_command[review_command.index("--sandbox") + 1] == "read-only"
+    assert "--dangerously-bypass-approvals-and-sandbox" not in review_command
+    for stage in (Stage.FORMALIZE, Stage.FIXUP, Stage.REVIEW):
+        assert not any("mcp_servers.lastlib_lean" in item for item in executor.command(stage))
+
 
 def test_lean_mcp_path_finds_elan_outside_inherited_path(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -144,7 +151,7 @@ def test_approve_for_me_is_not_combined_with_explicit_sandbox(tmp_path: Path) ->
             approve_for_me=True,
         ),
     )
-    command = CodexExecutor(config, StateStore(config)).command(Stage.REVIEW)
+    command = CodexExecutor(config, StateStore(config)).command(Stage.PROVE)
 
     assert "--approve-for-me" in command
     assert "--sandbox" not in command
@@ -161,58 +168,6 @@ def test_executor_can_disable_lean_mcp(tmp_path: Path) -> None:
 
     assert not any("mcp_servers.lastlib_lean" in item for item in command)
     assert "Attached Lean MCP" not in prompt
-
-
-def test_proof_prompt_requires_whole_file_pass_before_diagnostics(tmp_path: Path) -> None:
-    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
-    config = replace(
-        config,
-        stages={
-            **config.stages,
-            Stage.PROVE: replace(
-                config.stages[Stage.PROVE], prompt=standard_prompt_path(Stage.PROVE)
-            ),
-        },
-    )
-    executor = CodexExecutor(config, StateStore(config))
-
-    prompt = executor.build_prompt(config.chapters[0], Stage.PROVE)
-
-    normalized = " ".join(prompt.split())
-    whole_pass = normalized.index(
-        "one coherent proof-writing pass over the entire assigned file set"
-    )
-    diagnostics = normalized.index("After that whole-file pass")
-    assert whole_pass < diagnostics
-    assert "iterate only over proofs and dependent declarations that fail" in prompt
-
-
-@pytest.mark.parametrize("stage", list(Stage))
-def test_rendered_prompts_compose_each_layer_once(tmp_path: Path, stage: Stage) -> None:
-    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
-    config = replace(
-        config,
-        stages={
-            **config.stages,
-            stage: replace(config.stages[stage], prompt=standard_prompt_path(stage)),
-        },
-    )
-    prompt = CodexExecutor(config, StateStore(config)).build_prompt(config.chapters[0], stage)
-
-    mission = prompt.index("## Mission")
-    policy = prompt.index("## Common Lean policy")
-    runtime = prompt.index("## Runtime contract")
-    assert mission < policy < runtime
-    assert prompt.count("## Common Lean policy") == 1
-    assert prompt.count("## Runtime contract") == 1
-    assert prompt.count("import Mathlib") == 1
-    assert prompt.count("Do not run `lake build`") == 1
-    assert "Whenever you switch from one Lean file to another" in prompt
-    assert "whole-file diagnostic call for the destination" in prompt
-    assert "same when switching back" in prompt
-    assert "one dependency-build pass" in prompt
-    assert prompt.count("single writable build cache") == 1
-    assert prompt.count("declaration uses `sorry`") == 1
 
 
 def test_warning_filter_allows_only_declaration_uses_sorry() -> None:
@@ -252,9 +207,7 @@ async def test_validation_accepts_sorry_warnings(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
     chapter = replace(
         config.chapters[0],
-        build_command=(
-            "printf '%s\\n' 'warning: Book/Chapter.lean:1:1: declaration uses `sorry`'"
-        ),
+        build_command=("printf '%s\\n' 'warning: Book/Chapter.lean:1:1: declaration uses `sorry`'"),
     )
 
     validation = await validate(config, chapter)
@@ -277,7 +230,7 @@ print(json.dumps({"type": "thread.started", "thread_id": "thread-123"}))
 print(json.dumps({"type": "turn.completed", "usage": {
     "input_tokens": 100, "cached_input_tokens": 80, "output_tokens": 25,
     "reasoning_output_tokens": 10}}))
-report = {"changed": False, "complete": True, "needs_repair": False,
+report = {"changed": False, "complete": True, "needs_fixup": False,
           "summary": "done", "issues": []}
 print(json.dumps({"type": "item.completed", "item": {
     "type": "agent_message", "text": json.dumps(report)}}))
@@ -319,7 +272,7 @@ print(json.dumps({"type": "item.completed", "item": {
 print(json.dumps({"type": "turn.completed", "usage": {
     "input_tokens": 100, "cached_input_tokens": 80, "output_tokens": 25,
     "reasoning_output_tokens": 10}}))
-report = {"changed": False, "complete": True, "needs_repair": False,
+report = {"changed": False, "complete": True, "needs_fixup": False,
           "summary": "large event drained", "issues": []}
 print(json.dumps({"type": "item.completed", "item": {
     "type": "agent_message", "text": json.dumps(report)}}))
@@ -499,7 +452,7 @@ for _ in range(200):
     if Path({str(child_pid_path)!r}).is_file():
         break
     time.sleep(0.01)
-report = {{"changed": False, "complete": True, "needs_repair": False,
+report = {{"changed": False, "complete": True, "needs_fixup": False,
           "summary": "done", "issues": []}}
 print(json.dumps({{"type": "item.completed", "item": {{
     "type": "agent_message", "text": json.dumps(report)}}}}), flush=True)

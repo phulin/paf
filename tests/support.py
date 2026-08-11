@@ -28,8 +28,8 @@ prompt = "prompts/formalize.md"
 prompt = "prompts/review.md"
 [stages.prove]
 prompt = "prompts/prove.md"
-[stages.repair]
-prompt = "prompts/repair.md"
+[stages.fixup]
+prompt = "prompts/fixup.md"
 
 [[books]]
 id = "book"

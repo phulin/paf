@@ -25,11 +25,11 @@ REPORT_SCHEMA: dict[str, Any] = {
     "properties": {
         "changed": {"type": "boolean"},
         "complete": {"type": "boolean"},
-        "needs_repair": {"type": "boolean"},
+        "needs_fixup": {"type": "boolean"},
         "summary": {"type": "string"},
         "issues": {"type": "array", "items": {"type": "string"}},
     },
-    "required": ["changed", "complete", "needs_repair", "summary", "issues"],
+    "required": ["changed", "complete", "needs_fixup", "summary", "issues"],
 }
 
 LEAN_MCP_BASE_TOOLS = (
@@ -53,9 +53,7 @@ USAGE_POLL_SECONDS = 0.25
 PROCESS_GROUP_GRACE_SECONDS = 1.0
 COMMON_PROMPT_PATH = Path(__file__).with_name("prompts") / "common.md"
 LEAN_WARNING_RE = re.compile(r"(?m)^[ \t]*warning:[ \t]*(?P<message>.*)$")
-LEAN_SORRY_WARNING_RE = re.compile(
-    r"(?:^|:\d+:\d+:[ \t]+)declaration uses [`']sorry[`'][ \t]*$"
-)
+LEAN_SORRY_WARNING_RE = re.compile(r"(?:^|:\d+:\d+:[ \t]+)declaration uses [`']sorry[`'][ \t]*$")
 
 
 def lean_mcp_executable() -> Path:
@@ -225,7 +223,7 @@ def _find_report(event: Any) -> dict[str, Any] | None:
         except json.JSONDecodeError:
             continue
         if isinstance(value, dict) and all(
-            key in value for key in ("changed", "complete", "needs_repair", "summary", "issues")
+            key in value for key in ("changed", "complete", "needs_fixup", "summary", "issues")
         ):
             return value
     return None
@@ -314,6 +312,19 @@ class CodexExecutor:
         base = render_prompt(template, chapter)
         common = render_prompt(COMMON_PROMPT_PATH.read_text(encoding="utf-8"), chapter)
         scope = "\n".join(f"- `{item}`" for item in chapter.scope)
+        stage_contract = {
+            Stage.FORMALIZE: """This is one optimistic drafting attempt. The coordinator merges
+accepted scoped changes without running Lean. Compiler failures are deferred to the global fixup
+loop.""",
+            Stage.FIXUP: """Use only the coordinator diagnostics and review findings appended to
+this prompt. After the complete parallel fixup batch, the coordinator runs the authoritative Lake
+build and supplies fresh output to the next iteration.""",
+            Stage.REVIEW: """This attempt is read-only. Return findings in the structured report and
+set `needs_fixup` when source changes are required. The coordinator discards any attempted file
+change.""",
+            Stage.PROVE: """The project entered this attempt with a clean reviewed build. After the
+attempt, the coordinator builds the assigned chapter against its single writable cache.""",
+        }[stage]
         contract = f"""
 
 ## Runtime contract
@@ -328,25 +339,23 @@ context, but do not create, modify, move, delete, format, or otherwise write any
 scope. In particular, do not edit `.swarm`, `SWARM.md`, repository-level documentation, prompts,
 scripts, orchestration code, configuration, or tests, even if changing them seems useful for this
 task. You may investigate tooling or infrastructure problems and use in-scope workarounds, but if a
-fix requires an out-of-scope write, report it in `issues` instead of making that write. Before every
-edit, verify that its target matches one of the listed scope paths. Any out-of-scope write causes the
-coordinator to reject the entire attempt.
+fix requires an out-of-scope write, report it in `issues` instead of making that write. Before
+every edit, verify that its target matches one of the listed scope paths. Any out-of-scope write
+causes the coordinator to reject the entire attempt.
 
 Do not commit and do not wait for another worker.
 Do not run `lake build`, `lake env lean`, raw `lean`, or another compiler command. Builds belong to
-the coordinator: after you exit, it merges accepted scoped changes into the main worktree and
-serially runs the configured build there against the single writable build cache. That validation
-fails on every warning except the exact “declaration uses `sorry`” warning for an unfinished proof.
+the coordinator and use its single writable build cache. {stage_contract}
 
 ### Final response
 
 Return the required structured report. Set `changed` from the actual scoped diff and `complete` from
-the stage's definition of done. Set `needs_repair` only when a statement or declaration interface
-must change; ordinary unfinished or broken proof code is not statement repair. Summarize the work
+the stage's definition of done. Set `needs_fixup` only when a statement or declaration interface
+must change; ordinary unfinished or broken proof code is not statement fixup. Summarize the work
 concisely and list every unresolved issue. The coordinator independently checks scoped hashes,
 placeholders, diagnostics, and `{chapter.build_command}`.
 """
-        if self.config.settings.lean_mcp:
+        if self.config.settings.lean_mcp and stage is Stage.PROVE:
             contract += """
 
 ### Attached Lean MCP
@@ -384,7 +393,9 @@ imports with a compiler command.
         ]
         if root != settings.repo:
             command.append("--skip-git-repo-check")
-        if settings.bypass_approvals_and_sandbox:
+        if stage is Stage.REVIEW:
+            command.extend(["--sandbox", "read-only"])
+        elif settings.bypass_approvals_and_sandbox:
             command.append("--dangerously-bypass-approvals-and-sandbox")
         elif settings.approve_for_me:
             # Current Codex versions make --approve-for-me mutually exclusive
@@ -396,13 +407,8 @@ imports with a compiler command.
             command.extend(["--model", settings.model])
         if settings.reasoning_effort:
             command.extend(["--config", f'model_reasoning_effort="{settings.reasoning_effort}"'])
-        if settings.lean_mcp:
+        if settings.lean_mcp and stage is Stage.PROVE:
             lean_project = (root / settings.lean_project).resolve()
-            tools = (
-                LEAN_MCP_PROOF_TOOLS
-                if stage in (Stage.PROVE, Stage.REPAIR)
-                else LEAN_MCP_BASE_TOOLS
-            )
             mcp_config = {
                 "mcp_servers.lastlib_lean.command": str(lean_mcp_executable()),
                 "mcp_servers.lastlib_lean.args": ["-m", "lastlib_swarm.lean_mcp"],
@@ -413,7 +419,7 @@ imports with a compiler command.
                     settings.lean_mcp_tool_timeout_seconds
                 ),
                 "mcp_servers.lastlib_lean.default_tools_approval_mode": "auto",
-                "mcp_servers.lastlib_lean.enabled_tools": list(tools),
+                "mcp_servers.lastlib_lean.enabled_tools": list(LEAN_MCP_PROOF_TOOLS),
                 "mcp_servers.lastlib_lean.env.PATH": lean_mcp_path(),
                 "mcp_servers.lastlib_lean.env.LEAN_PROJECT_PATH": str(lean_project),
                 "mcp_servers.lastlib_lean.env.LEAN_LOG_LEVEL": "NONE",

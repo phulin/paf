@@ -150,11 +150,20 @@ class StateStore:
                 self.scheduling = raw["scheduling"]
             if not self.isolation and isinstance(raw.get("isolation"), dict):
                 self.isolation = raw["isolation"]
-            for key, value in raw.get("tasks", {}).items():
+            persisted_tasks = raw.get("tasks", {})
+            for key, value in persisted_tasks.items():
+                if key.endswith(":repair"):
+                    key = f"{key[: -len(':repair')]}:fixup"
+                    if key in persisted_tasks:
+                        continue
                 runs = []
                 for item in value.get("runs", []):
+                    if item.get("stage") == "repair":
+                        item["stage"] = "fixup"
                     usage = TokenUsage(**item.pop("usage", {}))
                     runs.append(RunRecord(**item, usage=usage))
+                if value.get("stage") == "repair":
+                    value["stage"] = "fixup"
                 self.tasks[key] = TaskRecord(
                     **{name: item for name, item in value.items() if name != "runs"}, runs=runs
                 )
