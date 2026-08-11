@@ -635,6 +635,37 @@ async def test_coordinator_build_uses_build_phases_without_counting_agents(
 
 
 @pytest.mark.asyncio
+async def test_coordinator_build_counts_only_errors_owned_by_each_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await orchestrator.prepare()
+
+    async def validation_with_replayed_dependency_error(
+        _config: object,
+        chapter: Chapter,
+        *,
+        workspace_root: Path | None = None,
+        on_output: Callable[[str], None] | None = None,
+    ) -> ValidationResult:
+        assert workspace_root == config.settings.repo
+        assert on_output is not None
+        on_output("error: Book/Chapter01/Section.lean:1:1: shared dependency failure\n")
+        if chapter.number == 2:
+            on_output("error: Book/Chapter02/Section.lean:2:1: target failure\n")
+        return ValidationResult(False, 1, "build failed")
+
+    monkeypatch.setattr(scheduler_module, "validate", validation_with_replayed_dependency_error)
+
+    await orchestrator._build_chapters(config.chapters, publish_if_clean=False)
+
+    assert state.coordinator_build.error_count == 2
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_agent_limiter_distinguishes_live_and_queued_runs(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
     config = replace(config, settings=replace(config.settings, max_agents=1))

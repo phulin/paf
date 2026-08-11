@@ -541,6 +541,14 @@ class Orchestrator:
                     break
         return tuple(dict.fromkeys(owners))
 
+    def _target_error_count(self, chapter: Chapter, output: str) -> int:
+        """Count streamed error headers assigned to the current build target."""
+
+        return sum(
+            diagnostic.severity == "error" and chapter.id in self._diagnostic_owner_ids(diagnostic)
+            for diagnostic in _lean_diagnostics(output)
+        )
+
     async def _build_chapters(
         self,
         chapters: Iterable[Chapter],
@@ -578,11 +586,18 @@ class Orchestrator:
                     completed=index,
                     command=chapter.build_command,
                 )
+
+                def append_output(output: str, *, current: Chapter = chapter) -> None:
+                    self.state.append_coordinator_build_output(
+                        output,
+                        error_count=self._target_error_count(current, output),
+                    )
+
                 results[chapter.id] = await validate(
                     self.config,
                     chapter,
                     workspace_root=self.config.settings.repo,
-                    on_output=self.state.append_coordinator_build_output,
+                    on_output=append_output,
                 )
                 await self.state.advance_coordinator_build(
                     chapter_id=chapter.id,

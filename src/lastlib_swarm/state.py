@@ -562,12 +562,18 @@ class StateStore:
         self.coordinator_build.updated_at = timestamp()
         await self.save()
 
-    def append_coordinator_build_output(self, output: str, *, maximum: int = 4) -> None:
+    def append_coordinator_build_output(
+        self,
+        output: str,
+        *,
+        maximum: int = 4,
+        error_count: int | None = None,
+    ) -> None:
         """Retain a small in-memory tail for live status displays."""
 
         output = ANSI_ESCAPE_RE.sub("", output)
         errors, warnings = lean_diagnostic_counts(output)
-        self.coordinator_build.error_count += errors
+        self.coordinator_build.error_count += errors if error_count is None else error_count
         self.coordinator_build.warning_count += warnings
         lines = [
             shorten_book_paths(line.rstrip())[-500:]
