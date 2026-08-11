@@ -32,7 +32,8 @@ substantive defect in the informal source with a precise `SOURCE_ISSUE` comment.
 
 Do not run Lean, Lake, or another language server. Use only the attached Lean MCP for interactive
 diagnostics. After this transaction, the coordinator rescans imports, runs the authoritative Lake
-build, and publishes its cache before another fixup agent starts.
+build when its refined predecessors are clean, and publishes the cache before releasing descendants.
+Unrelated dependency-ready agents may continue running while this result is integrated.
 
 ## Definition of done
 

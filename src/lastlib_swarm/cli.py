@@ -336,9 +336,9 @@ def print_plan(config: PipelineConfig, console: Console) -> None:
         )
     console.print(books)
     console.print(
-        "After drafting, fixup follows observed LastLib imports one chapter at a time. Every patch "
-        "is rebuilt and published before the next fixup agent; a stable topological build precedes "
-        "read-only review and proof."
+        "After drafting, every dependency-ready fixup runs concurrently from observed LastLib "
+        "imports. Each completed patch is merged and rebuilt as soon as its refined predecessors "
+        "are clean; a stable build precedes read-only review and proof."
     )
 
 

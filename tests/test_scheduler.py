@@ -478,7 +478,7 @@ async def test_fixup_rescans_new_import_before_rebuilding_edited_chapter(
 
 
 @pytest.mark.asyncio
-async def test_fixup_builds_each_patch_before_starting_the_next_agent(
+async def test_fixup_runs_dependency_ready_agent_frontier_concurrently(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
@@ -492,8 +492,89 @@ async def test_fixup_builds_each_patch_before_starting_the_next_agent(
     state = StateStore(config)
     orchestrator = Orchestrator(config, state)
     await orchestrator.prepare()
+    orchestrator.isolation.name = "fuse-overlay"
     fixed: set[str] = set()
-    events: list[str] = []
+    active = 0
+    maximum_active = 0
+    wave_started = asyncio.Event()
+
+    class FixingExecutor(FakeExecutor):
+        async def run(
+            self,
+            chapter: Chapter,
+            stage: Stage,
+            run: RunRecord,
+            *,
+            feedback: str = "",
+            workspace_root: Path | None = None,
+        ) -> AgentResult:
+            nonlocal active, maximum_active
+            assert stage is Stage.FIXUP
+            assert workspace_root is not None
+            assert "broken" in feedback
+            active += 1
+            maximum_active = max(maximum_active, active)
+            if active == len(config.chapters):
+                wave_started.set()
+            await wave_started.wait()
+            fixed.add(chapter.id)
+            path = workspace_root / "lean" / "Book" / f"Chapter{chapter.number:02d}.lean"
+            path.write_text(path.read_text(encoding="utf-8") + "-- fixed\n", encoding="utf-8")
+            agent = result(changed=True)
+            await state.finish_run(
+                run,
+                status=TaskStatus.SUCCEEDED,
+                changed=True,
+                placeholders=agent.placeholders,
+                report=agent.report,
+                usage=agent.usage,
+            )
+            active -= 1
+            return agent
+
+    orchestrator.executor = FixingExecutor(state, [])
+
+    async def validation(
+        _config: object,
+        chapter: Chapter,
+        **_kwargs: object,
+    ) -> ValidationResult:
+        if chapter.id not in fixed:
+            return ValidationResult(
+                False,
+                1,
+                f"error: Book/Chapter{chapter.number:02d}.lean:1:1: broken",
+            )
+        return ValidationResult(True, 0, "ok")
+
+    monkeypatch.setattr(scheduler_module, "validate", validation)
+
+    assert await orchestrator.run_stage(Stage.FIXUP)
+    assert maximum_active == 2
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_fixup_does_not_launch_agent_before_observed_predecessor_is_clean(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = with_lastlib_modules(
+        load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    )
+    first, second = config.chapters
+    source_root = tmp_path / "lean" / "Book"
+    source_root.mkdir(parents=True)
+    (source_root / "Chapter01.lean").write_text("def chapter1 := 1\n", encoding="utf-8")
+    (source_root / "Chapter02.lean").write_text(
+        "import LastLib.Book.Chapter01\ndef chapter2 := 2\n",
+        encoding="utf-8",
+    )
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await orchestrator.prepare()
+    orchestrator.isolation.name = "fuse-overlay"
+    fixed: set[str] = set()
+    agent_order: list[str] = []
 
     class FixingExecutor(FakeExecutor):
         async def run(
@@ -508,7 +589,7 @@ async def test_fixup_builds_each_patch_before_starting_the_next_agent(
             assert stage is Stage.FIXUP
             assert workspace_root is not None
             assert "broken" in feedback
-            events.append(f"agent:{chapter.id}")
+            agent_order.append(chapter.id)
             fixed.add(chapter.id)
             path = workspace_root / "lean" / "Book" / f"Chapter{chapter.number:02d}.lean"
             path.write_text(path.read_text(encoding="utf-8") + "-- fixed\n", encoding="utf-8")
@@ -530,7 +611,6 @@ async def test_fixup_builds_each_patch_before_starting_the_next_agent(
         chapter: Chapter,
         **_kwargs: object,
     ) -> ValidationResult:
-        events.append(f"build:{chapter.id}")
         if chapter.id not in fixed:
             return ValidationResult(
                 False,
@@ -542,15 +622,100 @@ async def test_fixup_builds_each_patch_before_starting_the_next_agent(
     monkeypatch.setattr(scheduler_module, "validate", validation)
 
     assert await orchestrator.run_stage(Stage.FIXUP)
-    first, second = config.chapters
-    assert events[:6] == [
-        f"build:{first.id}",
-        f"agent:{first.id}",
-        f"build:{first.id}",
-        f"build:{second.id}",
-        f"agent:{second.id}",
-        f"build:{second.id}",
-    ]
+    assert agent_order == [first.id, second.id]
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_fixup_unlocks_descendant_before_slow_independent_agent_finishes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = write_project(tmp_path, chapters="chapters = [1, 2]")
+    book_text = (tmp_path / "books" / "book.md").read_text(encoding="utf-8")
+    (tmp_path / "books" / "book.md").write_text(
+        book_text + "\n## 3. Third chapter\n",
+        encoding="utf-8",
+    )
+    config_text = config_path.read_text(encoding="utf-8").replace(
+        "chapters = [1, 2]",
+        "chapters = [1, 2, 3]",
+    )
+    config_path.write_text(config_text, encoding="utf-8")
+    config = with_lastlib_modules(load_config(config_path))
+    first, second, third = config.chapters
+    source_root = tmp_path / "lean" / "Book"
+    source_root.mkdir(parents=True)
+    (source_root / "Chapter01.lean").write_text("def chapter1 := 1\n", encoding="utf-8")
+    (source_root / "Chapter02.lean").write_text("def chapter2 := 2\n", encoding="utf-8")
+    (source_root / "Chapter03.lean").write_text(
+        "import LastLib.Book.Chapter01\ndef chapter3 := 3\n",
+        encoding="utf-8",
+    )
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await orchestrator.prepare()
+    orchestrator.isolation.name = "fuse-overlay"
+    fixed: set[str] = set()
+    slow_release = asyncio.Event()
+    descendant_started = asyncio.Event()
+    slow_finished = False
+
+    class OpportunisticExecutor(FakeExecutor):
+        async def run(
+            self,
+            chapter: Chapter,
+            stage: Stage,
+            run: RunRecord,
+            *,
+            feedback: str = "",
+            workspace_root: Path | None = None,
+        ) -> AgentResult:
+            nonlocal slow_finished
+            assert stage is Stage.FIXUP
+            assert workspace_root is not None
+            assert "broken" in feedback
+            if chapter.id == second.id:
+                await slow_release.wait()
+                slow_finished = True
+            elif chapter.id == third.id:
+                assert not slow_finished
+                descendant_started.set()
+                slow_release.set()
+            fixed.add(chapter.id)
+            path = workspace_root / "lean" / "Book" / f"Chapter{chapter.number:02d}.lean"
+            path.write_text(path.read_text(encoding="utf-8") + "-- fixed\n", encoding="utf-8")
+            agent = result(changed=True)
+            await state.finish_run(
+                run,
+                status=TaskStatus.SUCCEEDED,
+                changed=True,
+                placeholders=agent.placeholders,
+                report=agent.report,
+                usage=agent.usage,
+            )
+            return agent
+
+    orchestrator.executor = OpportunisticExecutor(state, [])
+
+    async def validation(
+        _config: object,
+        chapter: Chapter,
+        **_kwargs: object,
+    ) -> ValidationResult:
+        if chapter.id not in fixed:
+            return ValidationResult(
+                False,
+                1,
+                f"error: Book/Chapter{chapter.number:02d}.lean:1:1: broken",
+            )
+        return ValidationResult(True, 0, "ok")
+
+    monkeypatch.setattr(scheduler_module, "validate", validation)
+
+    assert await orchestrator.run_stage(Stage.FIXUP)
+    assert descendant_started.is_set()
+    assert slow_finished
+    assert state.fixup_graph["edges"] == [[first.id, third.id]]
     await orchestrator.shutdown()
 
 

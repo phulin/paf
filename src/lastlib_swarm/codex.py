@@ -374,10 +374,11 @@ class CodexExecutor:
 accepted scoped changes without running Lean. Compiler failures are deferred to the global fixup
 loop.""",
             Stage.FIXUP: """Use the attached Lean MCP and the coordinator diagnostics or review
-findings appended to this prompt. This is one serial edit transaction. After it is merged, the
-coordinator rescans observed imports, rebuilds the chapter, and publishes the cache before another
-fixup agent starts. Never prove propositions in this stage: replace an obstructing proof body with
-`by sorry`, and request fresh whole-file diagnostics after every edit.""",
+findings appended to this prompt. This attempt is dependency-ready and may run beside unrelated
+fixups. As soon as it finishes, the coordinator merges it, rescans observed imports, and rebuilds it
+when its refined predecessors are clean; unrelated agents continue running. Never prove propositions
+in this stage: replace an obstructing proof body with `by sorry`.
+Request fresh whole-file diagnostics after every edit.""",
             Stage.REVIEW: """This attempt is read-only. Return findings in the structured report and
 set `needs_fixup` when source changes are required. The coordinator discards any attempted file
 change.""",

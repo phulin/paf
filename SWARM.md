@@ -14,8 +14,8 @@ fallback searches can be substantially slower.
 flowchart LR
     S[Scaffold directories] --> F[Formalize once]
     F -->|all drafts finished| I[Scan observed LastLib imports]
-    I --> B[Build next dependency-ready chapter]
-    B -->|actionable diagnostics| X[Serial fixup with MCP]
+    I --> B[Build dependency-ready chapters]
+    B -->|actionable diagnostics| X[Ready fixup agents with MCP]
     X -->|patch merged| I
     B -->|clean cache published| I
     I -->|all chapters clean| G[Stable topological build]
@@ -30,10 +30,12 @@ flowchart LR
 Scaffolding is deterministic and creates directories only. Formalization then runs once for every
 missing chapter scope without Lean or LSP validation, so chapters and books can draft concurrently
 despite provisional imports. After all drafts finish, the coordinator discovers chapter edges with
-regexes over the current `import LastLib...` lines. It then fixes one dependency-ready chapter at a
-time with Lean MCP, rescans imports after every accepted patch, and rebuilds and publishes the cache
-before continuing. A final graph-stable topological build establishes the immutable baseline used by
-review and proof. Reviewers do not edit it; fixup and proof agents receive Lean MCP.
+regexes over the current `import LastLib...` lines. It then fixes dependency-ready chapters with Lean
+MCP concurrently. As soon as an agent finishes, the coordinator merges it, rescans imports, and
+rebuilds it once its refined predecessors are clean; unrelated agents keep running and a successful
+build immediately releases descendants. A final graph-stable topological build establishes the
+immutable baseline used by review and proof. Reviewers do not edit it; fixup and proof agents receive
+Lean MCP.
 
 For a conventional numbered corpus, point the CLI at the book directory. It discovers all direct
 Markdown children and automatically reads `BOOK_DEPENDENCIES.md` from the repository root:
