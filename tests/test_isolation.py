@@ -84,6 +84,38 @@ async def test_fuse_overlay_rejects_out_of_scope_changes(tmp_path: Path) -> None
 
 
 @pytest.mark.asyncio
+async def test_active_source_generation_is_immutable_when_live_repo_changes(
+    tmp_path: Path,
+) -> None:
+    manager, chapter = fuse_manager(write_project(tmp_path, chapters="chapters = [1]"))
+    infrastructure = tmp_path / "orchestrator.py"
+    infrastructure.write_text("version = 1\n", encoding="utf-8")
+    await manager.prepare()
+    workspace = await manager.acquire("immutable-source")
+    try:
+        snapshot = workspace.base / infrastructure.relative_to(tmp_path)
+        mounted = workspace.root / infrastructure.relative_to(tmp_path)
+        assert snapshot.read_text(encoding="utf-8") == "version = 1\n"
+        assert mounted.read_text(encoding="utf-8") == "version = 1\n"
+        assert snapshot.stat().st_ino != infrastructure.stat().st_ino
+
+        infrastructure.write_text("version = 2\n", encoding="utf-8")
+        allowed = workspace.root / "lean" / "Book" / "Chapter01.lean"
+        allowed.parent.mkdir(parents=True)
+        allowed.write_text("theorem allowed : True := by trivial\n", encoding="utf-8")
+
+        result = await workspace.collect(chapter)
+    finally:
+        await workspace.close()
+        await manager.close()
+
+    assert result.accepted
+    assert result.changed_paths == ("lean/Book/Chapter01.lean",)
+    assert infrastructure.read_text(encoding="utf-8") == "version = 2\n"
+    assert (tmp_path / "lean" / "Book" / "Chapter01.lean").exists()
+
+
+@pytest.mark.asyncio
 async def test_fuse_overlay_reclaims_dead_orchestrator_roots(tmp_path: Path) -> None:
     manager, _ = fuse_manager(write_project(tmp_path, chapters="chapters = [1]"))
     stale = manager.parent / f"{manager.identity}-999999999"

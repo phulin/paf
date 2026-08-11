@@ -310,13 +310,12 @@ class FuseOverlayIsolation:
         destination.mkdir(parents=True, exist_ok=False)
         command = ["rsync", "-a"]
         command.extend(f"--exclude=/{path}" for path in self.excluded)
-        command.extend(
-            (
-                f"--link-dest={self.settings.repo}",
-                f"{self.settings.repo}/",
-                f"{destination}/",
-            )
-        )
+        # Source generations must not share inodes with the live worktree. A
+        # hard-linked snapshot can change underneath an active FUSE mount when
+        # another process edits the repository in place. The mount may retain
+        # the old contents while a manifest scan of the lower directory sees
+        # the new contents, falsely attributing the external edit to the agent.
+        command.extend((f"{self.settings.repo}/", f"{destination}/"))
         await self._run(*command)
         self._generation_paths[generation] = destination
         self._generation_references[generation] = 0
