@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import heapq
-from collections.abc import AsyncIterator, Coroutine, Iterable
+from collections.abc import AsyncIterator, Callable, Coroutine, Iterable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from typing import Any
@@ -59,6 +59,12 @@ class ReviewOutcome:
     succeeded: bool
     needs_fixup: bool
     feedback: str
+
+
+@dataclass(frozen=True)
+class BuildDiagnostics:
+    actionable: dict[str, str]
+    deferred_targets: tuple[str, ...]
 
 
 class RunControl:
@@ -248,7 +254,7 @@ class Orchestrator:
         await self.control.checkpoint()
         schedule = (
             self.statement_schedule
-            if stage in (Stage.FORMALIZE, Stage.REVIEW)
+            if stage in (Stage.FORMALIZE, Stage.FIXUP, Stage.REVIEW)
             else self.proof_schedule
         )
         async with self.agent_slots.slot(schedule.priority(chapter.book_id)):
@@ -398,27 +404,48 @@ class Orchestrator:
             )
         )
 
-    async def _build_all(self) -> dict[str, ValidationResult]:
-        """Run every selected chapter build against the coordinator-owned cache."""
+    async def _build_chapters(
+        self,
+        chapters: Iterable[Chapter],
+        *,
+        publish_if_clean: bool,
+    ) -> dict[str, ValidationResult]:
+        """Build a deterministic target batch against the coordinator-owned cache."""
 
+        selected = tuple(chapters)
         results: dict[str, ValidationResult] = {}
         await self.build_queue.acquire()
         try:
-            for chapter in self.chapters:
+            for chapter in selected:
                 await self.control.checkpoint()
                 results[chapter.id] = await validate(
                     self.config,
                     chapter,
                     workspace_root=self.config.settings.repo,
                 )
-            if all(result.succeeded for result in results.values()):
+            if (
+                publish_if_clean
+                and results
+                and all(result.succeeded for result in results.values())
+            ):
                 await self.isolation.refresh_cache()
         finally:
             self.build_queue.release()
         return results
 
-    def _build_feedback(self, results: dict[str, ValidationResult]) -> dict[str, str]:
+    async def _build_all(self) -> dict[str, ValidationResult]:
+        """Build the full selection and publish only a globally clean cache snapshot."""
+
+        return await self._build_chapters(self.chapters, publish_if_clean=True)
+
+    def _build_feedback(
+        self,
+        results: dict[str, ValidationResult],
+        *,
+        blocked_owner_ids: set[str] | frozenset[str] = frozenset(),
+    ) -> BuildDiagnostics:
         feedback: dict[str, list[str]] = {}
+        deferred: list[str] = []
         by_id = {chapter.id: chapter for chapter in self.chapters}
         for target_id, result in results.items():
             if result.succeeded:
@@ -430,6 +457,9 @@ class Orchestrator:
                     identifier in result.output for identifier in self._chapter_identifiers(chapter)
                 )
             ]
+            if blocked_owner_ids.intersection(owners):
+                deferred.append(target_id)
+                continue
             if not owners:
                 owners = [target_id]
             block = (
@@ -437,7 +467,10 @@ class Orchestrator:
             )
             for owner in owners:
                 feedback.setdefault(owner, []).append(block)
-        return {chapter_id: "\n\n".join(blocks) for chapter_id, blocks in feedback.items()}
+        return BuildDiagnostics(
+            actionable={chapter_id: "\n\n".join(blocks) for chapter_id, blocks in feedback.items()},
+            deferred_targets=tuple(deferred),
+        )
 
     async def _fixup_agent(self, chapter: Chapter, feedback: str) -> bool:
         maximum = self.config.stages[Stage.FIXUP].max_rounds
@@ -489,7 +522,7 @@ class Orchestrator:
                         f"clean coordinator build after {iteration} iteration(s)",
                     )
                 return True
-            pending = self._build_feedback(results)
+            pending = self._build_feedback(results).actionable
             if not pending:
                 break
         for chapter in self.chapters:
@@ -500,6 +533,92 @@ class Orchestrator:
                 f"global build did not become clean in {maximum} iterations",
             )
         return False
+
+    async def _opportunistic_fixup(
+        self,
+        completed_ids: set[str],
+        active_formalizer_ids: set[str],
+        *,
+        newer_drafts_ready: Callable[[], bool],
+    ) -> bool:
+        """Build and fix completed drafts while unrelated formalizers keep running."""
+
+        completed = tuple(chapter for chapter in self.chapters if chapter.id in completed_ids)
+        if not completed:
+            return True
+        maximum = self.config.stages[Stage.FIXUP].max_rounds
+        deferred = False
+        for iteration in range(1, maximum + 1):
+            for chapter in completed:
+                await self.state.set_task(
+                    chapter.id,
+                    Stage.FIXUP,
+                    TaskStatus.RUNNING,
+                    f"streaming coordinator build {iteration}/{maximum}",
+                )
+            results = await self._build_chapters(completed, publish_if_clean=False)
+            if all(result.succeeded for result in results.values()):
+                return True
+
+            diagnostics = self._build_feedback(
+                results,
+                blocked_owner_ids=active_formalizer_ids,
+            )
+            deferred = bool(diagnostics.deferred_targets)
+            if newer_drafts_ready():
+                return True
+            if not diagnostics.actionable:
+                return deferred
+            by_id = {chapter.id: chapter for chapter in completed}
+            outcomes = await _gather_cancel_on_error(
+                self._fixup_agent(by_id[chapter_id], feedback)
+                for chapter_id, feedback in diagnostics.actionable.items()
+                if chapter_id in by_id
+            )
+            if not all(outcomes):
+                return False
+            if newer_drafts_ready():
+                return True
+        return deferred
+
+    async def _formalize_with_streaming_fixup(self) -> bool:
+        """Stream completed formalizations through targeted build/fixup batches."""
+
+        running = {
+            asyncio.create_task(self._formalize(chapter)): chapter for chapter in self.chapters
+        }
+        completed_ids: set[str] = set()
+        try:
+            while running:
+                done, _ = await asyncio.wait(running, return_when=asyncio.FIRST_COMPLETED)
+                failed = False
+                for task in done:
+                    chapter = running.pop(task)
+                    if task.result():
+                        completed_ids.add(chapter.id)
+                    else:
+                        failed = True
+                if failed:
+                    for task in running:
+                        task.cancel()
+                    await asyncio.gather(*running, return_exceptions=True)
+                    return False
+                active_ids = {chapter.id for chapter in running.values()}
+                if not await self._opportunistic_fixup(
+                    completed_ids,
+                    active_ids,
+                    newer_drafts_ready=lambda: any(task.done() for task in running),
+                ):
+                    for task in running:
+                        task.cancel()
+                    await asyncio.gather(*running, return_exceptions=True)
+                    return False
+        except BaseException:
+            for task in running:
+                task.cancel()
+            await asyncio.gather(*running, return_exceptions=True)
+            raise
+        return True
 
     async def _review_once(self, chapter: Chapter, *, rerun: bool = False) -> ReviewOutcome:
         if not rerun and self._already_done(chapter, Stage.REVIEW):
@@ -607,9 +726,7 @@ class Orchestrator:
         return all(await _gather_cancel_on_error(operation(chapter) for chapter in self.chapters))
 
     async def run_pipeline(self) -> bool:
-        if not all(
-            await _gather_cancel_on_error(self._formalize(chapter) for chapter in self.chapters)
-        ):
+        if not await self._formalize_with_streaming_fixup():
             return False
         if not await self._fixup_to_clean():
             return False

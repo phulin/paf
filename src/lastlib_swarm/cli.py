@@ -330,8 +330,8 @@ def print_plan(config: PipelineConfig, console: Console) -> None:
         )
     console.print(books)
     console.print(
-        "Drafts run optimistically across all selected chapters. Coordinator builds and fixup "
-        "batches converge globally before read-only review and proof."
+        "Completed drafts stream into targeted coordinator builds and fixup batches while other "
+        "formalizers run. A final global clean build precedes read-only review and proof."
     )
 
 

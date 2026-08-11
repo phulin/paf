@@ -12,10 +12,14 @@ fallback searches can be substantially slower.
 ```mermaid
 flowchart LR
     S[Scaffold directories] --> F[Formalize once]
-    F --> B[Coordinator Lake build]
-    B -->|diagnostics| X[Parallel fixup]
+    F -->|each completed scope| B[Targeted coordinator build]
+    B -->|actionable diagnostics| X[Parallel fixup]
     X --> B
-    B -->|clean| R[Read-only review]
+    B -->|pending owner| F
+    F -->|all drafts finished| G[Final full-corpus build]
+    B -->|queue drained| G
+    G -->|diagnostics| X
+    G -->|clean snapshot| R[Read-only review]
     R -->|findings| X
     R -->|no findings| P[Prove with LSP]
     P -->|statement/API problem| X
@@ -24,9 +28,11 @@ flowchart LR
 
 Scaffolding is deterministic and creates directories only. Formalization then runs once for every
 missing chapter scope without Lean or LSP validation, so chapters and books can draft concurrently
-despite provisional imports. The coordinator repeatedly builds all selected targets and hands exact
-failures to parallel fixup agents until the project is clean. Reviewers audit that immutable baseline
-without editing it. Only proof agents receive an LSP.
+despite provisional imports. As scopes finish, the coordinator coalesces them into targeted builds
+and hands actionable failures to parallel fixup agents while unrelated formalizers keep running.
+Diagnostics owned by an active formalizer are deferred. After all drafts finish, one full-corpus
+build/fixup loop establishes and publishes the immutable baseline used by review and proof. Reviewers
+do not edit it, and only proof agents receive an LSP.
 
 For a conventional numbered corpus, point the CLI at the book directory. It discovers all direct
 Markdown children and automatically reads `BOOK_DEPENDENCIES.md` from the repository root:
@@ -203,10 +209,13 @@ After the daemon exits, `status`, `snapshot`, and `wait` fall back to the persis
 
 - **Scaffold** deterministically creates the configured chapter directories and no Lean files.
 - **Formalize** skips a materialized chapter scope or runs exactly one optimistic drafting agent.
-  Drafts are merged without invoking Lean, and compiler cleanliness is deferred to fixup.
-- **Fixup** runs every selected target through the coordinator-owned Lake cache. Failures are grouped
-  by chapter ownership and appended verbatim to parallel fixup prompts. Lake then runs again. This
-  repeats up to `max_rounds`, allowing `declaration uses sorry` but rejecting other warnings.
+  Drafts are merged without agent-side Lean. Each completed scope immediately becomes eligible for
+  targeted coordinator builds instead of waiting for the entire corpus to finish drafting.
+- **Fixup** groups targeted-build failures by chapter ownership and appends them verbatim to parallel
+  fixup prompts. A failure mentioning a scope whose formalizer is still active is deferred rather
+  than assigned prematurely. Completed scopes cycle through build and fixup while other drafts run;
+  after drafting drains, a full-corpus build/fixup loop establishes global cleanliness. This repeats
+  up to `max_rounds`, allowing `declaration uses sorry` but rejecting other warnings.
 - **Review** runs read-only agents against one clean source and `.olean` generation. Findings are
   returned as structured reports, routed through fixup, rebuilt, and reviewed again until no
   actionable finding remains.

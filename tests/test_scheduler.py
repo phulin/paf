@@ -249,6 +249,104 @@ async def test_fixup_repeats_coordinator_build_and_hands_back_diagnostics(
 
 
 @pytest.mark.asyncio
+async def test_completed_drafts_enter_fixup_before_all_formalizers_finish(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    orchestrator = Orchestrator(config, StateStore(config))
+    release_second = asyncio.Event()
+    events: list[str] = []
+
+    async def formalize(chapter: Chapter) -> bool:
+        if chapter.number == 2:
+            events.append("formalize-2-waiting")
+            await release_second.wait()
+            events.append("formalize-2-finished")
+            return True
+        events.append("formalize-1-finished")
+        return True
+
+    async def opportunistic_fixup(
+        completed_ids: set[str],
+        active_formalizer_ids: set[str],
+        *,
+        newer_drafts_ready: object,
+    ) -> bool:
+        del newer_drafts_ready
+        events.append("fixup-wave")
+        assert config.chapters[0].id in completed_ids
+        if config.chapters[1].id in active_formalizer_ids:
+            release_second.set()
+        return True
+
+    monkeypatch.setattr(orchestrator, "_formalize", formalize)
+    monkeypatch.setattr(orchestrator, "_opportunistic_fixup", opportunistic_fixup)
+
+    assert await orchestrator._formalize_with_streaming_fixup()
+    assert events.index("fixup-wave") < events.index("formalize-2-finished")
+
+
+@pytest.mark.asyncio
+async def test_streaming_fixup_defers_diagnostics_owned_by_active_formalizer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await orchestrator.prepare()
+    orchestrator.executor = FakeExecutor(state, [])
+    built: list[str] = []
+
+    async def blocked_validation(
+        _config: object, chapter: Chapter, *, workspace_root: Path | None = None
+    ) -> ValidationResult:
+        assert workspace_root == config.settings.repo
+        built.append(chapter.id)
+        return ValidationResult(
+            False,
+            1,
+            "error: Book/Chapter01.lean imports pending module Book.Chapter02",
+        )
+
+    monkeypatch.setattr(scheduler_module, "validate", blocked_validation)
+
+    assert await orchestrator._opportunistic_fixup(
+        {config.chapters[0].id},
+        {config.chapters[1].id},
+        newer_drafts_ready=lambda: False,
+    )
+    assert built == [config.chapters[0].id]
+    assert state.task(config.chapters[0].id, Stage.FIXUP).rounds == 0
+    assert state.task(config.chapters[1].id, Stage.FIXUP).rounds == 0
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_streaming_build_does_not_publish_partial_cache_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    orchestrator = Orchestrator(config, StateStore(config))
+    published = 0
+
+    async def successful_validation(*_args: object, **_kwargs: object) -> ValidationResult:
+        return ValidationResult(True, 0, "ok")
+
+    async def track_publish() -> None:
+        nonlocal published
+        published += 1
+
+    monkeypatch.setattr(scheduler_module, "validate", successful_validation)
+    monkeypatch.setattr(orchestrator.isolation, "refresh_cache", track_publish)
+
+    await orchestrator._build_chapters((config.chapters[0],), publish_if_clean=False)
+    assert published == 0
+
+    await orchestrator._build_all()
+    assert published == 1
+
+
+@pytest.mark.asyncio
 async def test_review_findings_are_fixed_then_reviewed_again(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
