@@ -10,6 +10,7 @@ from typing import Any, ClassVar
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal
 from textual.screen import Screen
+from textual.theme import Theme
 from textual.widgets import (
     DataTable,
     Footer,
@@ -29,6 +30,22 @@ from lastlib_swarm.models import Chapter, Stage
 from lastlib_swarm.pricing import format_usd
 from lastlib_swarm.scheduler import Orchestrator
 from lastlib_swarm.state import RunRecord, StateStore, TaskPhase, TaskRecord, TaskStatus, TokenUsage
+
+LASTLIB_THEME = Theme(
+    name="lastlib",
+    primary="#81a1c1",
+    secondary="#8fbcbb",
+    accent="#b48ead",
+    warning="#ebcb8b",
+    error="#bf616a",
+    success="#a3be8c",
+    foreground="#d8dee9",
+    background="#242933",
+    surface="#2e3440",
+    panel="#3b4252",
+    boost="#434c5e",
+    luminosity_spread=0.12,
+)
 
 STATUS_MARKS = {
     TaskStatus.PENDING: "· pending",
@@ -205,15 +222,40 @@ def recent_raw_events(path: Path, *, maximum: int = 30) -> list[str]:
 class AgentDetailScreen(Screen[None]):
     BINDINGS: ClassVar = [("escape", "close", "Back to swarm"), ("q", "close", "Back to swarm")]
     CSS = """
+    AgentDetailScreen { background: $background; }
     #run-tabs { height: 3; }
-    #agent-heading { height: 4; padding: 1 2; background: $primary-background; text-style: bold; }
+    #agent-heading {
+        height: 4;
+        padding: 1 2;
+        background: $surface;
+        border-bottom: solid $primary-muted;
+        color: $text;
+        text-style: bold;
+    }
     #agent-metrics { height: 5; }
-    .agent-card { width: 1fr; height: 5; border: round $primary; padding: 0 1; }
-    #agent-summary { height: 8; padding: 1 2; border: round $primary; }
-    #agent-error { height: auto; max-height: 5; padding: 0 2; color: $error; }
+    .agent-card {
+        width: 1fr;
+        height: 5;
+        border: round $panel-lighten-1;
+        background: $surface;
+        padding: 0 1;
+    }
+    #agent-summary {
+        height: 8;
+        padding: 1 2;
+        border: round $primary-muted;
+        background: $surface;
+    }
+    #agent-error {
+        height: auto;
+        max-height: 5;
+        padding: 0 2;
+        background: $error-muted;
+        color: $text-error;
+    }
     #agent-tabs { height: 1fr; }
     RichLog { height: 1fr; }
-    #agent-path { height: 3; padding: 1 2; }
+    #agent-path { height: 3; padding: 1 2; color: $text-muted; }
     """
 
     def __init__(self, state: StateStore, chapter: Chapter) -> None:
@@ -458,12 +500,14 @@ class SwarmApp(App[bool]):
     SUB_TITLE = "Codex agent pipeline"
     BINDINGS: ClassVar = [("q", "quit", "Stop and quit"), ("i", "inspect_agent", "Inspect")]
     CSS = """
+    Screen { background: $background; }
     #usage {
         height: auto;
         min-height: 4;
         max-height: 7;
         padding: 1 2;
-        background: $primary-background;
+        background: $surface;
+        border-bottom: solid $primary-muted;
         color: $text;
         text-style: bold;
     }
@@ -471,20 +515,34 @@ class SwarmApp(App[bool]):
         height: auto;
         max-height: 4;
         padding: 1 2;
-        background: $warning;
-        color: $text;
+        background: $warning-muted;
+        color: $text-warning;
         text-style: bold;
     }
     #stages { height: 5; }
-    #alerts { height: auto; max-height: 3; padding: 0 2; color: $error; }
+    #alerts {
+        height: auto;
+        max-height: 3;
+        padding: 0 2;
+        background: $error-muted;
+        color: $text-error;
+    }
     .stage-card {
         width: 1fr;
         height: 5;
-        border: round $primary;
+        border: round $panel-lighten-1;
+        background: $surface;
         padding: 0 1;
     }
     #tasks { height: 1fr; }
-    #status { height: auto; min-height: 3; max-height: 8; padding: 1 2; }
+    #status {
+        height: auto;
+        min-height: 3;
+        max-height: 8;
+        padding: 1 2;
+        background: $surface;
+        color: $text-muted;
+    }
     """
 
     def __init__(
@@ -496,6 +554,8 @@ class SwarmApp(App[bool]):
         startup_warning: str = "",
     ) -> None:
         super().__init__()
+        self.register_theme(LASTLIB_THEME)
+        self.theme = LASTLIB_THEME.name
         self.orchestrator = orchestrator
         self.state = orchestrator.state
         self.operation = operation

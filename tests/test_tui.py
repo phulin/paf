@@ -9,7 +9,13 @@ from lastlib_swarm.config import load_config
 from lastlib_swarm.models import Stage
 from lastlib_swarm.scheduler import Orchestrator
 from lastlib_swarm.state import StateStore, TaskPhase, TaskStatus, TokenUsage
-from lastlib_swarm.tui import AgentDetailScreen, SwarmApp, format_count, format_usage
+from lastlib_swarm.tui import (
+    LASTLIB_THEME,
+    AgentDetailScreen,
+    SwarmApp,
+    format_count,
+    format_usage,
+)
 from tests.support import write_project
 
 
@@ -48,6 +54,19 @@ async def test_dashboard_runs_an_operation_and_exits(tmp_path: Path) -> None:
     assert "lifetime tokens" in str(usage)
     assert "Proof LSP: on" in str(usage)
     assert "Codex access: full" in str(usage)
+
+
+def test_dashboard_uses_lastlib_theme(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    orchestrator = Orchestrator(config, StateStore(config))
+
+    async def operation() -> bool:
+        return True
+
+    app = SwarmApp(orchestrator, operation, label="test")
+
+    assert app.theme == LASTLIB_THEME.name
+    assert LASTLIB_THEME.name in app.available_themes
 
 
 @pytest.mark.asyncio
