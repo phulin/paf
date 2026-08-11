@@ -43,6 +43,20 @@ class FakeExecutor(CodexExecutor):
         return result
 
 
+def test_coordinator_build_output_shortens_diagnostic_paths(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path))
+    state = StateStore(config)
+
+    state.append_coordinator_build_output(
+        "error: lean/LastLib/Book05LocalClassFieldTheory/Chapter07/"
+        "Section07WhyFrobeniusIsCanonical.lean:12:3: broken"
+    )
+
+    assert state.coordinator_build.output_tail == [
+        "error: [Book 5 Chap 7 Sec 7: Why Frobenius Is Canonical]:12:3: broken"
+    ]
+
+
 def result(
     *,
     changed: bool,

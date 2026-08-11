@@ -50,7 +50,7 @@ def _words(identifier: str) -> str:
     return re.sub(r"(?<=[A-Z])(?=[A-Z][a-z])", " ", identifier).strip()
 
 
-def _shorten_book_paths(value: str) -> str:
+def shorten_book_paths(value: str) -> str:
     def label(match: re.Match[str]) -> str:
         book = int(match.group("book"))
         chapter = int(match.group("chapter"))
@@ -70,7 +70,7 @@ def _display_command(command: str) -> str:
     command = command.strip()
     if match := SHELL_COMMAND_WRAPPER.fullmatch(command):
         command = match.group(2)
-    return _shorten_book_paths(command)
+    return shorten_book_paths(command)
 
 
 def _result_text(value: Any) -> str:
@@ -293,7 +293,7 @@ class AgentActivity:
             relative = path.relative_to(workspace_root).as_posix()
         except ValueError:
             relative = path.as_posix()
-        return _shorten_book_paths(relative)
+        return shorten_book_paths(relative)
 
     def finish(self, status: str, error: str = "") -> None:
         self.finished_at = activity_timestamp()

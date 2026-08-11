@@ -12,7 +12,7 @@ from typing import Any
 from uuid import uuid4
 
 from lastlib_swarm import json_codec as json
-from lastlib_swarm.activity import ActivityStore
+from lastlib_swarm.activity import ActivityStore, shorten_book_paths
 from lastlib_swarm.models import Chapter, PipelineConfig, Stage
 from lastlib_swarm.pricing import LEGACY_MODEL, CostEstimate, estimate_cost
 
@@ -563,7 +563,7 @@ class StateStore:
         """Retain a small in-memory tail for live status displays."""
 
         lines = [
-            ANSI_ESCAPE_RE.sub("", line.rstrip())[-500:]
+            shorten_book_paths(ANSI_ESCAPE_RE.sub("", line.rstrip()))[-500:]
             for line in output.replace("\r", "\n").splitlines()
         ]
         lines = [line for line in lines if line]
