@@ -629,8 +629,8 @@ class SwarmApp(App[bool]):
         if build.active:
             build_status = (
                 f"Coordinator {build.mode} build {build.completed}/{build.total} · "
-                f"iteration {build.iteration}/{build.maximum_iterations} · "
-                f"errors {build.error_count} · non-sorry warnings {build.warning_count}"
+                f"iter {build.iteration}/{build.maximum_iterations} · "
+                f"err {build.error_count} · warn {build.warning_count}"
             )
             if build.current_chapter_id:
                 build_status += f" · {build.current_chapter_id}"
@@ -642,8 +642,8 @@ class SwarmApp(App[bool]):
             footer_status = (
                 f"{build_label} {progress_meter(build.completed, build.total)} "
                 f"{build.completed}/{build.total} ({percent:.0f}%) · "
-                f"iteration {build.iteration}/{build.maximum_iterations} · "
-                f"errors {build.error_count} · non-sorry warnings {build.warning_count}"
+                f"iter {build.iteration}/{build.maximum_iterations} · "
+                f"err {build.error_count} · warn {build.warning_count}"
             )
             if build.current_chapter_id:
                 footer_status += f" · {build.current_chapter_id}"

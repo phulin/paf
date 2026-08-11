@@ -393,13 +393,13 @@ async def test_dashboard_separates_agents_queues_and_coordinator_builds(
 
         usage = str(app.query_one("#usage", Static).content)
         assert "Agents 1/4 · formalize 1 · queued 1" in usage
-        assert f"Coordinator {build_mode} build 20/81 · iteration 2/6" in usage
-        assert "errors 1 · non-sorry warnings 1" in usage
+        assert f"Coordinator {build_mode} build 20/81 · iter 2/6" in usage
+        assert "err 1 · warn 1" in usage
         status = str(app.query_one("#status", Static).content)
         build_label = "GLOBAL BUILD" if build_mode == "global" else "BUILD"
         assert f"{build_label} [" in status
-        assert "20/81 (25%) · iteration 2/6" in status
-        assert "errors 1 · non-sorry warnings 1" in status
+        assert "20/81 (25%) · iter 2/6" in status
+        assert "err 1 · warn 1" in status
         assert "book/chapter-02" in status
         assert "Building dependency graph" in status
         assert "Compiling Book.Chapter02" in status
