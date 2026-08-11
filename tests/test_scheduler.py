@@ -125,6 +125,47 @@ async def test_state_migrates_legacy_repair_tasks_to_fixup(tmp_path: Path) -> No
     assert migrated.runs[0].stage == "fixup"
 
 
+@pytest.mark.asyncio
+async def test_state_accumulates_and_deduplicates_source_issue_ledger(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    state = StateStore(config)
+    await state.load_or_create()
+    source_issue = {
+        "location": "Chapter 1, paragraph 2",
+        "source_excerpt": "Every local ring is a field.",
+        "description": "The assertion omits the zero-dimensional hypothesis.",
+        "suggested_correction": "Every zero-dimensional reduced local ring is a field.",
+    }
+    for stage in (Stage.FORMALIZE, Stage.REVIEW):
+        run = await state.start_run(config.chapters[0].id, stage)
+        await state.finish_run(
+            run,
+            status=TaskStatus.SUCCEEDED,
+            report={"source_issues": [source_issue]},
+        )
+
+    assert len(state.source_issues) == 1
+    recorded = next(iter(state.source_issues.values()))
+    assert recorded.source == "books/book.md"
+    assert recorded.sightings == 2
+    assert recorded.stages == ["formalize", "review"]
+    assert len(recorded.run_ids) == 2
+
+    ledger = json.loads(state.source_issues_path.read_text(encoding="utf-8"))
+    assert ledger["version"] == 1
+    assert ledger["issues"][0]["id"] == recorded.id
+    assert ledger["issues"][0]["suggested_correction"] == source_issue["suggested_correction"]
+
+    reloaded = StateStore(config)
+    await reloaded.load_or_create()
+    assert reloaded.source_issues[recorded.id].sightings == 2
+
+    reloaded.path.unlink()
+    ledger_only = StateStore(config)
+    await ledger_only.load_or_create()
+    assert ledger_only.source_issues[recorded.id].sightings == 2
+
+
 def test_legacy_attempt_cost_is_always_luna(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
     config = replace(config, settings=replace(config.settings, model="gpt-5.6-sol"))

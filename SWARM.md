@@ -127,6 +127,21 @@ uv run lastlib-swarm status books/02-finite-extensions-of-local-fields.md
 uv run lastlib-swarm status --config swarm.toml --json
 ```
 
+Inspect the accumulated informal-textbook issue ledger:
+
+```console
+uv run lastlib-swarm source-issues books/02-finite-extensions-of-local-fields.md
+uv run lastlib-swarm source-issues --config swarm.toml --json
+```
+
+Every agent report has a structured `source_issues` field. Genuine textbook defects are recorded
+with a precise location, exact identifying excerpt, mathematical explanation, and minimal suggested
+replacement. The coordinator enriches each sighting with book, chapter, stage, and run provenance,
+deduplicates repeated sightings, and persists the ledger at `.swarm/.../source-issues.json` as well
+as in the state snapshot. Detection does not stop an agent: it must make the principled accommodation
+allowed by its stage and continue through all unaffected work. The ledger is evidence for a later
+reviewed textbook patch; swarm workers do not rewrite the Markdown automatically.
+
 `--chapter N` selects that chapter number in every selected book. Use the full chapter id when a
 number would be ambiguous.
 

@@ -44,6 +44,42 @@ def test_scaffold_creates_only_chapter_directories(
     assert "Scaffolded 2 chapter directories" in capsys.readouterr().out
 
 
+def test_source_issues_command_shows_persisted_ledger(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    path = write_project(tmp_path, chapters="chapters = [1]")
+    config = load_config(path)
+    state = StateStore(config)
+
+    async def populate() -> None:
+        await state.load_or_create()
+        run = await state.start_run(config.chapters[0].id, Stage.REVIEW)
+        await state.finish_run(
+            run,
+            status=TaskStatus.SUCCEEDED,
+            report={
+                "source_issues": [
+                    {
+                        "location": "Chapter 1, theorem statement",
+                        "source_excerpt": "Every ring is a field.",
+                        "description": "The claim is false without additional hypotheses.",
+                        "suggested_correction": "Every division ring is a field when commutative.",
+                    }
+                ]
+            },
+        )
+
+    asyncio.run(populate())
+
+    assert main(["source-issues", "--config", str(path), "--json"]) == 0
+    ledger = json.loads(capsys.readouterr().out)
+    assert ledger["issues"][0]["location"] == "Chapter 1, theorem statement"
+    assert (
+        ledger["issues"][0]["suggested_correction"]
+        == "Every division ring is a field when commutative."
+    )
+
+
 def test_worker_startup_warns_prominently_when_ripgrep_is_missing(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],

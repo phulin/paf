@@ -28,8 +28,34 @@ REPORT_SCHEMA: dict[str, Any] = {
         "needs_fixup": {"type": "boolean"},
         "summary": {"type": "string"},
         "issues": {"type": "array", "items": {"type": "string"}},
+        "source_issues": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "location": {"type": "string", "minLength": 1},
+                    "source_excerpt": {"type": "string", "minLength": 1},
+                    "description": {"type": "string", "minLength": 1},
+                    "suggested_correction": {"type": "string", "minLength": 1},
+                },
+                "required": [
+                    "location",
+                    "source_excerpt",
+                    "description",
+                    "suggested_correction",
+                ],
+            },
+        },
     },
-    "required": ["changed", "complete", "needs_fixup", "summary", "issues"],
+    "required": [
+        "changed",
+        "complete",
+        "needs_fixup",
+        "summary",
+        "issues",
+        "source_issues",
+    ],
 }
 
 LEAN_MCP_BASE_TOOLS = (
@@ -225,6 +251,7 @@ def _find_report(event: Any) -> dict[str, Any] | None:
         if isinstance(value, dict) and all(
             key in value for key in ("changed", "complete", "needs_fixup", "summary", "issues")
         ):
+            value.setdefault("source_issues", [])
             return value
     return None
 
@@ -352,8 +379,15 @@ the coordinator and use its single writable build cache. {stage_contract}
 Return the required structured report. Set `changed` from the actual scoped diff and `complete` from
 the stage's definition of done. Set `needs_fixup` only when a statement or declaration interface
 must change; ordinary unfinished or broken proof code is not statement fixup. Summarize the work
-concisely and list every unresolved issue. The coordinator independently checks scoped hashes,
-placeholders, diagnostics, and `{chapter.build_command}`.
+concisely and list every unresolved issue.
+
+Record each genuine defect in the informal textbook in `source_issues`, with its precise heading or
+other location, an exact identifying excerpt, a mathematical explanation, and the smallest suggested
+replacement. Do not use this ledger for missing Lean APIs, proof failures, or tooling problems. A
+source issue is not a reason to stop: make the minimal principled accommodation permitted by this
+stage, clearly preserve or report the obstruction, and continue as far as possible through every
+unaffected part of the chapter. The coordinator independently checks scoped hashes, placeholders,
+diagnostics, and `{chapter.build_command}`.
 """
         if self.config.settings.lean_mcp and stage is Stage.PROVE:
             contract += """

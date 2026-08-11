@@ -124,6 +124,12 @@ def parser() -> argparse.ArgumentParser:
     _add_source(status)
     status.add_argument("--json", action="store_true", help="print the raw persisted state")
 
+    source_issues = commands.add_parser(
+        "source-issues", help="show the accumulated informal-textbook issue ledger"
+    )
+    _add_source(source_issues)
+    source_issues.add_argument("--json", action="store_true", help="print the raw ledger")
+
     scaffold = commands.add_parser(
         "scaffold", help="deterministically create configured chapter directories"
     )
@@ -379,6 +385,38 @@ def print_status(config: PipelineConfig, console: Console, *, raw_json: bool) ->
                 counts[str(task["status"])] += 1
     console.print("  ".join(f"{name}: {count}" for name, count in counts.items()))
     console.print(f"State: {config.settings.state_dir / 'state.json'}")
+    return 0
+
+
+def print_source_issues(config: PipelineConfig, console: Console, *, raw_json: bool) -> int:
+    path = config.settings.state_dir / "source-issues.json"
+    if not path.is_file():
+        console.print(f"No source-issue ledger exists at {path}")
+        return 0
+    ledger = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(ledger, dict) or not isinstance(ledger.get("issues"), list):
+        raise ValueError(f"invalid source-issue ledger: {path}")
+    if raw_json:
+        console.print_json(json.dumps(ledger))
+        return 0
+    table = Table(title="Source issues", box=None)
+    table.add_column("ID", style="cyan", no_wrap=True)
+    table.add_column("Chapter", style="bold")
+    table.add_column("Location")
+    table.add_column("Issue")
+    table.add_column("Suggested correction")
+    for issue in ledger["issues"]:
+        if not isinstance(issue, dict):
+            continue
+        table.add_row(
+            str(issue.get("id", "")),
+            str(issue.get("chapter_id", "")),
+            str(issue.get("location", "")),
+            str(issue.get("description", "")),
+            str(issue.get("suggested_correction", "")),
+        )
+    console.print(table)
+    console.print(f"Ledger: {path}")
     return 0
 
 
@@ -822,6 +860,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0
         if arguments.command == "status":
             return print_status(config, console, raw_json=arguments.json)
+        if arguments.command == "source-issues":
+            return print_source_issues(config, console, raw_json=arguments.json)
         if arguments.command == "scaffold":
             chapters = select_chapters(
                 config,

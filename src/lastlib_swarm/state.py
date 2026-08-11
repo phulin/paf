@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
@@ -122,15 +123,37 @@ class TaskRecord:
     runs: list[RunRecord] = field(default_factory=list)
 
 
+@dataclass
+class SourceIssueRecord:
+    id: str
+    chapter_id: str
+    book_id: str
+    chapter_number: int
+    chapter_title: str
+    source: str
+    location: str
+    source_excerpt: str
+    description: str
+    suggested_correction: str
+    status: str = "open"
+    first_seen_at: str = field(default_factory=timestamp)
+    last_seen_at: str = field(default_factory=timestamp)
+    sightings: int = 1
+    stages: list[str] = field(default_factory=list)
+    run_ids: list[str] = field(default_factory=list)
+
+
 class StateStore:
     def __init__(self, config: PipelineConfig) -> None:
         self.config = config
         self.path = config.settings.state_dir / "state.json"
+        self.source_issues_path = config.settings.state_dir / "source-issues.json"
         self.logs_dir = config.settings.state_dir / "logs"
         self.activities = ActivityStore(self.logs_dir)
         self._lock = asyncio.Lock()
         self._prior_run_ids: set[str] = set()
         self.tasks: dict[str, TaskRecord] = {}
+        self.source_issues: dict[str, SourceIssueRecord] = {}
         self.scheduling: dict[str, Any] = {}
         self.isolation: dict[str, Any] = {}
         self.created_at = timestamp()
@@ -142,6 +165,12 @@ class StateStore:
 
     async def load_or_create(self) -> None:
         self.logs_dir.mkdir(parents=True, exist_ok=True)
+        persisted_source_issues: list[Any] = []
+        if self.source_issues_path.is_file():
+            ledger = json.loads(self.source_issues_path.read_text(encoding="utf-8"))
+            if not isinstance(ledger, dict) or not isinstance(ledger.get("issues"), list):
+                raise ValueError(f"invalid source-issue ledger: {self.source_issues_path}")
+            persisted_source_issues.extend(ledger["issues"])
         if self.path.is_file():
             raw = json.loads(self.path.read_text(encoding="utf-8"))
             self.created_at = str(raw.get("created_at", timestamp()))
@@ -167,6 +196,13 @@ class StateStore:
                 self.tasks[key] = TaskRecord(
                     **{name: item for name, item in value.items() if name != "runs"}, runs=runs
                 )
+            raw_source_issues = raw.get("source_issues", [])
+            if isinstance(raw_source_issues, list):
+                persisted_source_issues.extend(raw_source_issues)
+        for value in persisted_source_issues:
+            if isinstance(value, dict):
+                issue = SourceIssueRecord(**value)
+                self.source_issues[issue.id] = issue
         configured = {chapter.id for chapter in self.config.chapters}
         self.tasks = {
             key: task for key, task in self.tasks.items() if task.chapter_id in configured
@@ -203,6 +239,16 @@ class StateStore:
             temporary = self.path.with_name(f".{self.path.name}.{os.getpid()}.tmp")
             temporary.write_bytes(json.dumpb(payload, indent=True, sort_keys=True))
             os.replace(temporary, self.path)
+            ledger = {
+                "version": 1,
+                "updated_at": self.updated_at,
+                "issues": [asdict(issue) for _, issue in sorted(self.source_issues.items())],
+            }
+            ledger_temporary = self.source_issues_path.with_name(
+                f".{self.source_issues_path.name}.{os.getpid()}.tmp"
+            )
+            ledger_temporary.write_bytes(json.dumpb(ledger, indent=True, sort_keys=True))
+            os.replace(ledger_temporary, self.source_issues_path)
 
     def snapshot(self) -> dict[str, Any]:
         usage = self.total_usage()
@@ -210,7 +256,7 @@ class StateStore:
         cost = self.total_cost()
         invocation_cost = self.invocation_cost()
         return {
-            "version": 3,
+            "version": 4,
             "config": str(self.config.path),
             "created_at": self.created_at,
             "updated_at": self.updated_at,
@@ -221,8 +267,60 @@ class StateStore:
             "invocation_cost": invocation_cost.as_dict(),
             "scheduling": self.scheduling,
             "isolation": self.isolation,
+            "source_issues": [asdict(issue) for _, issue in sorted(self.source_issues.items())],
             "tasks": {key: asdict(value) for key, value in sorted(self.tasks.items())},
         }
+
+    def _record_source_issues(self, run: RunRecord) -> None:
+        report = run.report or {}
+        raw_issues = report.get("source_issues", [])
+        if not isinstance(raw_issues, list):
+            return
+        chapter = self.config.chapter(run.chapter_id)
+        required = ("location", "source_excerpt", "description", "suggested_correction")
+        for raw in raw_issues:
+            if not isinstance(raw, dict) or not all(
+                isinstance(raw.get(name), str) and raw[name].strip() for name in required
+            ):
+                continue
+            location = raw["location"].strip()
+            excerpt = raw["source_excerpt"].strip()
+            description = raw["description"].strip()
+            correction = raw["suggested_correction"].strip()
+            anchor = excerpt or f"{location}\0{description}"
+            fingerprint = "\0".join(
+                (chapter.source.as_posix(), chapter.id, anchor.casefold())
+            ).encode()
+            issue_id = hashlib.sha256(fingerprint).hexdigest()[:16]
+            seen_at = run.finished_at or timestamp()
+            if existing := self.source_issues.get(issue_id):
+                existing.location = location
+                existing.source_excerpt = excerpt
+                existing.description = description
+                existing.suggested_correction = correction
+                existing.last_seen_at = seen_at
+                existing.sightings += 1
+                if run.stage not in existing.stages:
+                    existing.stages.append(run.stage)
+                if run.id not in existing.run_ids:
+                    existing.run_ids.append(run.id)
+                continue
+            self.source_issues[issue_id] = SourceIssueRecord(
+                id=issue_id,
+                chapter_id=chapter.id,
+                book_id=chapter.book_id,
+                chapter_number=chapter.number,
+                chapter_title=chapter.title,
+                source=chapter.source.as_posix(),
+                location=location,
+                source_excerpt=excerpt,
+                description=description,
+                suggested_correction=correction,
+                first_seen_at=seen_at,
+                last_seen_at=seen_at,
+                stages=[run.stage],
+                run_ids=[run.id],
+            )
 
     def total_usage(self) -> TokenUsage:
         total = TokenUsage()
@@ -324,4 +422,5 @@ class StateStore:
         run.finished_at = timestamp()
         for name, value in changes.items():
             setattr(run, name, value)
+        self._record_source_issues(run)
         await self.save()
