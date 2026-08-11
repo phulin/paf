@@ -3,7 +3,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from textual.widgets import DataTable, RichLog, Static
+from textual.widgets import DataTable, RichLog, Static, Tab, Tabs
 
 from lastlib_swarm.config import load_config
 from lastlib_swarm.models import Stage
@@ -182,6 +182,118 @@ async def test_selected_chapter_opens_live_agent_detail(tmp_path: Path) -> None:
 
         await pilot.press("escape")
         assert app.check_action("inspect_agent", ()) is True
+        finish.set()
+        await pilot.pause(1.2)
+
+
+@pytest.mark.asyncio
+async def test_agent_detail_can_switch_between_chapter_steps(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    ready = asyncio.Event()
+    finish = asyncio.Event()
+
+    async def record_update(run_id: str, text: str) -> None:
+        activity = state.activities.start(run_id, config.chapters[0].id, Stage.FORMALIZE.value)
+        activity.consume(
+            {
+                "type": "item.completed",
+                "item": {"id": "message", "type": "agent_message", "text": text},
+            },
+            workspace_root=tmp_path,
+        )
+        state.activities.save(activity)
+
+    async def operation() -> bool:
+        first = await state.start_run(config.chapters[0].id, Stage.FORMALIZE)
+        await state.update_run(
+            first,
+            usage=TokenUsage(input_tokens=1_000, output_tokens=100, measured=True),
+        )
+        await record_update(first.id, "formalization update")
+        await state.finish_run(first, status=TaskStatus.SUCCEEDED)
+
+        second = await state.start_run(config.chapters[0].id, Stage.REVIEW)
+        await state.update_run(
+            second,
+            usage=TokenUsage(input_tokens=2_000, output_tokens=200, measured=True),
+        )
+        await record_update(second.id, "review update")
+        ready.set()
+        await finish.wait()
+        return True
+
+    app = SwarmApp(orchestrator, operation, label="test")
+    async with app.run_test(size=(160, 50)) as pilot:
+        await ready.wait()
+        app.action_inspect_agent()
+        await pilot.pause(0.6)
+
+        screen = app.screen
+        assert isinstance(screen, AgentDetailScreen)
+        run_tabs = screen.query_one("#run-tabs", Tabs)
+        assert run_tabs.tab_count == 2
+        assert [tab.label_text for tab in run_tabs.query(Tab)] == [
+            "✓ Step 1 · Formalize round 1",
+            "▶ Step 2 · Review round 1",
+        ]
+        assert run_tabs.active == "agent-step-2"
+        assert "review round 1" in str(screen.query_one("#agent-heading", Static).content)
+        summary = screen.query_one("#agent-summary", RichLog)
+        assert "review update" in "".join(line.text for line in summary.lines)
+
+        run_tabs.active = "agent-step-1"
+        await pilot.pause(0.2)
+
+        heading = str(screen.query_one("#agent-heading", Static).content)
+        assert "step 1 of 2" in heading
+        assert "formalize round 1" in heading
+        assert "formalization update" in "".join(line.text for line in summary.lines)
+        assert "tokens 1.1k" in str(screen.query_one("#agent-spend", Static).content)
+
+        await pilot.press("escape")
+        finish.set()
+        await pilot.pause(1.2)
+
+
+@pytest.mark.asyncio
+async def test_agent_detail_adds_a_step_that_starts_while_open(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    ready = asyncio.Event()
+    start = asyncio.Event()
+    run_ready = asyncio.Event()
+    finish = asyncio.Event()
+
+    async def operation() -> bool:
+        ready.set()
+        await start.wait()
+        await state.start_run(config.chapters[0].id, Stage.FORMALIZE)
+        run_ready.set()
+        await finish.wait()
+        return True
+
+    app = SwarmApp(orchestrator, operation, label="test")
+    async with app.run_test(size=(160, 50)) as pilot:
+        await ready.wait()
+        app.push_screen(AgentDetailScreen(state, config.chapters[0]))
+        await pilot.pause(0.2)
+        run_tabs = app.screen.query_one("#run-tabs", Tabs)
+        assert run_tabs.tab_count == 0
+
+        start.set()
+        await run_ready.wait()
+        await pilot.pause(1.1)
+
+        assert run_tabs.tab_count == 1
+        assert run_tabs.active == "agent-step-1"
+        heading = str(app.screen.query_one("#agent-heading", Static).content)
+        assert "step 1 of 1" in heading
+        assert "formalize round 1" in heading
+
+        await pilot.press("escape")
         finish.set()
         await pilot.pause(1.2)
 

@@ -10,7 +10,17 @@ from typing import Any, ClassVar
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal
 from textual.screen import Screen
-from textual.widgets import DataTable, Footer, Header, RichLog, Static, TabbedContent, TabPane
+from textual.widgets import (
+    DataTable,
+    Footer,
+    Header,
+    RichLog,
+    Static,
+    Tab,
+    TabbedContent,
+    TabPane,
+    Tabs,
+)
 from textual.worker import WorkerCancelled
 
 from lastlib_swarm import json_codec as json
@@ -117,11 +127,30 @@ def seconds_since(value: str) -> float:
 
 
 def latest_run(state: StateStore, chapter: Chapter) -> RunRecord | None:
-    runs = [run for stage in Stage for run in state.task(chapter.id, stage).runs]
+    runs = chapter_runs(state, chapter)
     if not runs:
         return None
     running = [run for run in runs if run.status == TaskStatus.RUNNING]
     return max(running or runs, key=lambda run: run.started_at)
+
+
+def chapter_runs(state: StateStore, chapter: Chapter) -> list[RunRecord]:
+    """Return every agent step for a chapter in chronological order."""
+
+    runs = [run for stage in Stage for run in state.task(chapter.id, stage).runs]
+    return sorted(runs, key=lambda run: (run.started_at, run.id))
+
+
+def run_tab_label(run: RunRecord, step: int) -> str:
+    marks = {
+        TaskStatus.RUNNING: "▶",
+        TaskStatus.SUCCEEDED: "✓",
+        TaskStatus.FAILED: "✗",
+        TaskStatus.BLOCKED: "!",
+        TaskStatus.PENDING: "·",
+    }
+    mark = marks.get(TaskStatus(run.status), "·")
+    return f"{mark} Step {step} · {run.stage.title()} round {run.round}"
 
 
 def activity_label(activity: AgentActivity | None, run: RunRecord | None) -> str:
@@ -170,6 +199,7 @@ def recent_raw_events(path: Path, *, maximum: int = 30) -> list[str]:
 class AgentDetailScreen(Screen[None]):
     BINDINGS: ClassVar = [("escape", "close", "Back to swarm"), ("q", "close", "Back to swarm")]
     CSS = """
+    #run-tabs { height: 3; }
     #agent-heading { height: 4; padding: 1 2; background: $primary-background; text-style: bold; }
     #agent-metrics { height: 5; }
     .agent-card { width: 1fr; height: 5; border: round $primary; padding: 0 1; }
@@ -184,8 +214,12 @@ class AgentDetailScreen(Screen[None]):
         super().__init__()
         self.state = state
         self.chapter = chapter
-        self._rendered_sequence = -1
+        selected = latest_run(state, chapter)
+        self._selected_run_id = selected.id if selected is not None else None
+        self._rendered_activity: tuple[str, int | None] | None = None
         self._static_cache: dict[str, str] = {}
+        self._tab_runs: dict[str, str] = {}
+        self._tab_labels: dict[str, str] = {}
         self._raw_path: Path | None = None
         self._raw_offset = 0
         self._raw_pending = bytearray()
@@ -193,6 +227,18 @@ class AgentDetailScreen(Screen[None]):
 
     def compose(self) -> ComposeResult:
         yield Header()
+        runs = chapter_runs(self.state, self.chapter)
+        tabs: list[Tab] = []
+        active: str | None = None
+        for step, run in enumerate(runs, start=1):
+            tab_id = f"agent-step-{step}"
+            label = run_tab_label(run, step)
+            self._tab_runs[tab_id] = run.id
+            self._tab_labels[tab_id] = label
+            tabs.append(Tab(label, id=tab_id))
+            if run.id == self._selected_run_id:
+                active = tab_id
+        yield Tabs(*tabs, active=active, id="run-tabs")
         yield Static("Loading agent activity…", id="agent-heading", markup=False)
         with Horizontal(id="agent-metrics"):
             yield Static(id="agent-work", classes="agent-card", markup=False)
@@ -224,11 +270,27 @@ class AgentDetailScreen(Screen[None]):
     def action_close(self) -> None:
         self.app.pop_screen()
 
+    def on_tabs_tab_activated(self, event: Tabs.TabActivated) -> None:
+        if event.tabs.id != "run-tabs" or event.tab.id is None:
+            return
+        run_id = self._tab_runs.get(event.tab.id)
+        if run_id is None or run_id == self._selected_run_id:
+            return
+        self._selected_run_id = run_id
+        self._rendered_activity = None
+        self.refresh_agent()
+
     def refresh_agent(self) -> None:
-        run = latest_run(self.state, self.chapter)
+        runs = chapter_runs(self.state, self.chapter)
+        run = next((item for item in runs if item.id == self._selected_run_id), None)
+        if run is None:
+            run = latest_run(self.state, self.chapter)
+            self._selected_run_id = run.id if run is not None else None
+        self._sync_run_tabs(runs)
         if run is None:
             self._update_static("#agent-heading", f"{self.chapter.id} — no agent run recorded")
             return
+        step = next(index for index, item in enumerate(runs, start=1) if item.id == run.id)
         activity = self.state.activities.get(run.id)
         elapsed = seconds_since(run.started_at)
         if run.finished_at is not None:
@@ -239,7 +301,8 @@ class AgentDetailScreen(Screen[None]):
         last_event = format_duration(seconds_since(activity.updated_at)) if activity else "—"
         self._update_static(
             "#agent-heading",
-            f"{self.chapter.id} · {run.stage} round {run.round} · {run.status}\n"
+            f"{self.chapter.id} · step {step} of {len(runs)} · "
+            f"{run.stage} round {run.round} · {run.status}\n"
             f"{activity_label(activity, run)}",
         )
         if activity:
@@ -266,12 +329,43 @@ class AgentDetailScreen(Screen[None]):
         self._update_static("#agent-error", f"LATEST ERROR\n{error}" if error else "")
         path = Path(run.log_path) if run.log_path else self.state.logs_dir / f"{run.id}.jsonl"
         self._update_static("#agent-path", f"Raw JSONL: {path}")
-        if activity and activity.sequence != self._rendered_sequence:
+        rendered_activity = (run.id, activity.sequence if activity else None)
+        if rendered_activity != self._rendered_activity:
             self._render_activity(activity)
-            self._rendered_sequence = activity.sequence
+            self._rendered_activity = rendered_activity
         tabs = self.query_one("#agent-tabs", TabbedContent)
         if tabs.active == "raw-pane":
             self._refresh_raw_events(path)
+
+    def _sync_run_tabs(self, runs: list[RunRecord]) -> None:
+        tabs = self.query_one("#run-tabs", Tabs)
+        known_run_ids = set(self._tab_runs.values())
+        for step, run in enumerate(runs, start=1):
+            if run.id not in known_run_ids:
+                tab_id = f"agent-step-{len(self._tab_runs) + 1}"
+                self._tab_runs[tab_id] = run.id
+                label = run_tab_label(run, step)
+                self._tab_labels[tab_id] = label
+                tabs.add_tab(Tab(label, id=tab_id))
+            else:
+                tab_id = next(key for key, run_id in self._tab_runs.items() if run_id == run.id)
+            label = run_tab_label(run, step)
+            if self._tab_labels.get(tab_id) != label:
+                tab = tabs.get_tab(tab_id)
+                if tab is not None:
+                    tab.label = label
+                self._tab_labels[tab_id] = label
+
+        active = next(
+            (
+                tab_id
+                for tab_id, run_id in self._tab_runs.items()
+                if run_id == self._selected_run_id
+            ),
+            None,
+        )
+        if active is not None and tabs.active != active:
+            tabs.active = active
 
     def _update_static(self, selector: str, content: str) -> None:
         if self._static_cache.get(selector) == content:
@@ -324,30 +418,32 @@ class AgentDetailScreen(Screen[None]):
         for line in self._raw_lines:
             raw.write(line)
 
-    def _render_activity(self, activity: AgentActivity) -> None:
+    def _render_activity(self, activity: AgentActivity | None) -> None:
         timeline = self.query_one("#agent-timeline", RichLog)
         timeline.clear()
         marks = {"started": "▶", "completed": "✓", "failed": "✗", "updated": "•"}
-        for entry in activity.recent:
+        for entry in activity.recent if activity else ():
             clock = entry.at[11:19] if len(entry.at) >= 19 else entry.at
             line = f"{clock} {marks.get(entry.status, '•')} [{entry.kind}] {entry.title}"
             if entry.detail:
                 line += f"\n    {entry.detail}"
             timeline.write(line)
+        if activity is None:
+            timeline.write("No activity events recorded for this step.")
 
         plan = self.query_one("#agent-plan", RichLog)
         plan.clear()
-        for item in activity.todos:
+        for item in activity.todos if activity else ():
             mark = "✓" if item.get("completed") else "·"
             plan.write(f"{mark} {item.get('text', '')}")
-        if not activity.todos:
+        if activity is None or not activity.todos:
             plan.write("No todo list emitted yet.")
 
         files = self.query_one("#agent-files", RichLog)
         files.clear()
-        for path in activity.files:
+        for path in activity.files if activity else ():
             files.write(path)
-        if not activity.files:
+        if activity is None or not activity.files:
             files.write("No file-change event emitted yet.")
 
 
