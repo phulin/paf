@@ -377,6 +377,26 @@ def print_status(config: PipelineConfig, console: Console, *, raw_json: bool) ->
         console.print(
             f"[bold]API-equivalent cost: {format_usd(CostEstimate.from_dict(cost))}[/bold]"
         )
+    agents = snapshot.get("agents")
+    if isinstance(agents, dict):
+        by_stage = agents.get("by_stage", {})
+        breakdown = "  ".join(
+            f"{stage.value}: {int(by_stage.get(stage.value, 0))}"
+            for stage in Stage
+            if isinstance(by_stage, dict) and int(by_stage.get(stage.value, 0))
+        )
+        console.print(
+            f"[bold]Agents: {int(agents.get('active', 0))}/{int(agents.get('maximum', 0))}[/bold]"
+            f"  queued: {int(agents.get('queued', 0))}"
+            + (f"  {breakdown}" if breakdown else "")
+        )
+    coordinator_build = snapshot.get("coordinator_build")
+    if isinstance(coordinator_build, dict) and coordinator_build.get("active"):
+        console.print(
+            f"Coordinator {coordinator_build.get('mode', '')} build: "
+            f"{int(coordinator_build.get('completed', 0))}/"
+            f"{int(coordinator_build.get('total', 0))}"
+        )
     tasks = snapshot.get("tasks", {})
     counts = {status.value: 0 for status in TaskStatus}
     if isinstance(tasks, dict):

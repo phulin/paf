@@ -11,7 +11,7 @@ from lastlib_swarm.codex import AgentResult, CodexExecutor, ValidationResult, va
 from lastlib_swarm.corpus import build_corpus_schedule, scheduling_snapshot
 from lastlib_swarm.isolation import IsolationResult, create_isolation
 from lastlib_swarm.models import Chapter, PipelineConfig, Stage
-from lastlib_swarm.state import RunRecord, StateStore, TaskStatus
+from lastlib_swarm.state import RunRecord, StateStore, TaskPhase, TaskStatus
 
 
 async def _gather_cancel_on_error(
@@ -256,7 +256,15 @@ class Orchestrator:
         stage: Stage,
         *,
         feedback: str = "",
+        queue_detail: str = "",
     ) -> Attempt:
+        await self.state.set_task(
+            chapter.id,
+            stage,
+            TaskStatus.RUNNING,
+            queue_detail or f"queued for {stage.value} agent",
+            phase=TaskPhase.QUEUED,
+        )
         await self.control.checkpoint()
         schedule = (
             self.statement_schedule
@@ -372,13 +380,11 @@ class Orchestrator:
                 "existing chapter files skipped",
             )
             return FormalizeOutcome(True)
-        await self.state.set_task(
-            chapter.id,
+        attempt = await self._attempt(
+            chapter,
             Stage.FORMALIZE,
-            TaskStatus.RUNNING,
-            "single optimistic drafting pass",
+            queue_detail="single optimistic drafting pass",
         )
-        attempt = await self._attempt(chapter, Stage.FORMALIZE)
         if attempt.agent.succeeded and attempt.validation.succeeded:
             await self.state.set_task(
                 chapter.id,
@@ -423,6 +429,9 @@ class Orchestrator:
         chapters: Iterable[Chapter],
         *,
         publish_if_clean: bool,
+        mode: str = "targeted",
+        iteration: int = 1,
+        maximum_iterations: int = 1,
     ) -> dict[str, ValidationResult]:
         """Build a deterministic target batch against the coordinator-owned cache."""
 
@@ -430,12 +439,35 @@ class Orchestrator:
         results: dict[str, ValidationResult] = {}
         await self.build_queue.acquire()
         try:
-            for chapter in selected:
+            if selected:
+                await self.state.set_tasks(
+                    (chapter.id for chapter in selected),
+                    Stage.FIXUP,
+                    TaskStatus.RUNNING,
+                    f"{mode} coordinator build {iteration}/{maximum_iterations}",
+                    phase=TaskPhase.BUILDING,
+                )
+                await self.state.start_coordinator_build(
+                    mode=mode,
+                    stage=Stage.FIXUP,
+                    iteration=iteration,
+                    maximum_iterations=maximum_iterations,
+                    total=len(selected),
+                )
+            for index, chapter in enumerate(selected):
                 await self.control.checkpoint()
+                await self.state.advance_coordinator_build(
+                    chapter_id=chapter.id,
+                    completed=index,
+                )
                 results[chapter.id] = await validate(
                     self.config,
                     chapter,
                     workspace_root=self.config.settings.repo,
+                )
+                await self.state.advance_coordinator_build(
+                    chapter_id=chapter.id,
+                    completed=index + 1,
                 )
             if (
                 publish_if_clean
@@ -444,13 +476,32 @@ class Orchestrator:
             ):
                 await self.isolation.refresh_cache()
         finally:
-            self.build_queue.release()
+            try:
+                if selected:
+                    await self.state.finish_coordinator_build()
+                    await self.state.set_tasks(
+                        (chapter.id for chapter in selected),
+                        Stage.FIXUP,
+                        TaskStatus.RUNNING,
+                        "awaiting coordinator rebuild",
+                        phase=TaskPhase.AWAITING_REBUILD,
+                    )
+            finally:
+                self.build_queue.release()
         return results
 
-    async def _build_all(self) -> dict[str, ValidationResult]:
+    async def _build_all(
+        self, *, iteration: int = 1, maximum_iterations: int = 1
+    ) -> dict[str, ValidationResult]:
         """Build the full selection and publish only a globally clean cache snapshot."""
 
-        return await self._build_chapters(self.chapters, publish_if_clean=True)
+        return await self._build_chapters(
+            self.chapters,
+            publish_if_clean=True,
+            mode="global",
+            iteration=iteration,
+            maximum_iterations=maximum_iterations,
+        )
 
     def _build_feedback(
         self,
@@ -489,14 +540,20 @@ class Orchestrator:
     async def _fixup_agent(self, chapter: Chapter, feedback: str) -> bool:
         maximum = self.config.stages[Stage.FIXUP].max_rounds
         task = self.state.task(chapter.id, Stage.FIXUP)
-        await self.state.set_task(
-            chapter.id,
+        attempt = await self._attempt(
+            chapter,
             Stage.FIXUP,
-            TaskStatus.RUNNING,
-            f"fixup attempt {task.rounds + 1} (global cap {maximum})",
+            feedback=feedback,
+            queue_detail=f"fixup attempt {task.rounds + 1} (global cap {maximum})",
         )
-        attempt = await self._attempt(chapter, Stage.FIXUP, feedback=feedback)
         if attempt.agent.succeeded and attempt.validation.succeeded:
+            await self.state.set_task(
+                chapter.id,
+                Stage.FIXUP,
+                TaskStatus.RUNNING,
+                "fixup complete; awaiting coordinator rebuild",
+                phase=TaskPhase.AWAITING_REBUILD,
+            )
             return True
         await self.state.set_task(
             chapter.id,
@@ -519,14 +576,10 @@ class Orchestrator:
                 )
                 if not all(outcomes):
                     return False
-            for chapter in self.chapters:
-                await self.state.set_task(
-                    chapter.id,
-                    Stage.FIXUP,
-                    TaskStatus.RUNNING,
-                    f"coordinator build iteration {iteration}/{maximum}",
-                )
-            results = await self._build_all()
+            results = await self._build_all(
+                iteration=iteration,
+                maximum_iterations=maximum,
+            )
             if all(result.succeeded for result in results.values()):
                 for chapter in self.chapters:
                     await self.state.set_task(
@@ -563,14 +616,13 @@ class Orchestrator:
         maximum = self.config.stages[Stage.FIXUP].max_rounds
         deferred = False
         for iteration in range(1, maximum + 1):
-            for chapter in completed:
-                await self.state.set_task(
-                    chapter.id,
-                    Stage.FIXUP,
-                    TaskStatus.RUNNING,
-                    f"streaming coordinator build {iteration}/{maximum}",
-                )
-            results = await self._build_chapters(completed, publish_if_clean=False)
+            results = await self._build_chapters(
+                completed,
+                publish_if_clean=False,
+                mode="streaming",
+                iteration=iteration,
+                maximum_iterations=maximum,
+            )
             if all(result.succeeded for result in results.values()):
                 return True
 
@@ -640,13 +692,11 @@ class Orchestrator:
     async def _review_once(self, chapter: Chapter, *, rerun: bool = False) -> ReviewOutcome:
         if not rerun and self._already_done(chapter, Stage.REVIEW):
             return ReviewOutcome(True, False, "")
-        await self.state.set_task(
-            chapter.id,
+        attempt = await self._attempt(
+            chapter,
             Stage.REVIEW,
-            TaskStatus.RUNNING,
-            "read-only review",
+            queue_detail="read-only review",
         )
-        attempt = await self._attempt(chapter, Stage.REVIEW)
         succeeded = attempt.agent.succeeded and attempt.validation.succeeded
         needs_fixup = bool(attempt.agent.report.get("needs_fixup"))
         complete = bool(attempt.agent.report.get("complete"))
@@ -693,13 +743,12 @@ class Orchestrator:
         proof_maximum = self.config.stages[Stage.PROVE].max_rounds
         feedback = ""
         for proof_round in range(1, proof_maximum + 1):
-            await self.state.set_task(
-                chapter.id,
+            attempt = await self._attempt(
+                chapter,
                 Stage.PROVE,
-                TaskStatus.RUNNING,
-                f"proof round {proof_round}/{proof_maximum}",
+                feedback=feedback,
+                queue_detail=f"proof round {proof_round}/{proof_maximum}",
             )
-            attempt = await self._attempt(chapter, Stage.PROVE, feedback=feedback)
             if (
                 attempt.agent.succeeded
                 and attempt.validation.succeeded

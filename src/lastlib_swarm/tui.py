@@ -18,7 +18,7 @@ from lastlib_swarm.activity import AgentActivity, reportable_error, systemic_err
 from lastlib_swarm.models import Chapter, Stage
 from lastlib_swarm.pricing import format_usd
 from lastlib_swarm.scheduler import Orchestrator
-from lastlib_swarm.state import RunRecord, StateStore, TaskStatus, TokenUsage
+from lastlib_swarm.state import RunRecord, StateStore, TaskPhase, TaskRecord, TaskStatus, TokenUsage
 
 STATUS_MARKS = {
     TaskStatus.PENDING: "· pending",
@@ -26,6 +26,14 @@ STATUS_MARKS = {
     TaskStatus.SUCCEEDED: "✓ done",
     TaskStatus.FAILED: "✗ failed",
     TaskStatus.BLOCKED: "! blocked",
+}
+
+PHASE_MARKS = {
+    TaskPhase.IDLE: "▶ in progress",
+    TaskPhase.QUEUED: "… queued",
+    TaskPhase.BUILDING: "◆ building",
+    TaskPhase.AGENT: "▶ agent",
+    TaskPhase.AWAITING_REBUILD: "↻ rebuild",
 }
 
 
@@ -61,6 +69,33 @@ def stage_counts(state: StateStore, stage: Stage) -> dict[str, int]:
         if task.stage == stage.value:
             counts[task.status] += 1
     return counts
+
+
+def stage_phase_counts(state: StateStore, stage: Stage) -> dict[str, int]:
+    counts = {phase.value: 0 for phase in TaskPhase}
+    for task in state.tasks.values():
+        if (
+            task.stage == stage.value
+            and task.status == TaskStatus.RUNNING
+            and task.phase in counts
+        ):
+            counts[task.phase] += 1
+    return counts
+
+
+def running_agent_counts(state: StateStore) -> dict[str, int]:
+    counts = {stage.value: 0 for stage in Stage}
+    for task in state.tasks.values():
+        for run in task.runs:
+            if run.status == TaskStatus.RUNNING and run.stage in counts:
+                counts[run.stage] += 1
+    return counts
+
+
+def task_mark(task: TaskRecord) -> str:
+    if task.status == TaskStatus.RUNNING:
+        return PHASE_MARKS.get(TaskPhase(task.phase), STATUS_MARKS[TaskStatus.RUNNING])
+    return STATUS_MARKS[TaskStatus(task.status)]
 
 
 def format_duration(seconds: float) -> str:
@@ -468,7 +503,12 @@ class SwarmApp(App[bool]):
         lifetime_usage = self.state.total_usage()
         cost = self.state.invocation_cost()
         lifetime_cost = self.state.total_cost()
-        active = sum(task.status == TaskStatus.RUNNING for task in self.state.tasks.values())
+        agents = running_agent_counts(self.state)
+        active_agents = sum(agents.values())
+        queued_agents = sum(
+            task.status == TaskStatus.RUNNING and task.phase == TaskPhase.QUEUED
+            for task in self.state.tasks.values()
+        )
         maximum = self.orchestrator.config.settings.max_agents
         lean_mcp = "on" if self.orchestrator.config.settings.lean_mcp else "off"
         codex_access = (
@@ -478,13 +518,27 @@ class SwarmApp(App[bool]):
         )
         isolation = self.orchestrator.isolation.name
         critical = " → ".join(self.orchestrator.statement_schedule.critical_path) or "—"
+        agent_breakdown = " · ".join(
+            f"{stage.value} {agents[stage.value]}" for stage in Stage if agents[stage.value]
+        ) or "none"
+        build = self.state.coordinator_build
+        if build.active:
+            build_status = (
+                f"Coordinator {build.mode} build {build.completed}/{build.total} · "
+                f"iteration {build.iteration}/{build.maximum_iterations}"
+            )
+            if build.current_chapter_id:
+                build_status += f" · {build.current_chapter_id}"
+        else:
+            build_status = "Coordinator build idle"
         self._update_static(
             "#usage",
             f"{format_usage(usage, label='This invocation')}    "
             f"API-equivalent cost: {format_usd(cost)}    "
             f"lifetime tokens: {format_count(lifetime_usage.total_tokens)}    "
-            f"lifetime API-equivalent cost: {format_usd(lifetime_cost)}    "
-            f"active stage records: {active}  concurrency cap: {maximum}\n"
+            f"lifetime API-equivalent cost: {format_usd(lifetime_cost)}\n"
+            f"Agents {active_agents}/{maximum} · {agent_breakdown} · queued {queued_agents}    "
+            f"{build_status}\n"
             f"Statement critical path: {critical}    isolation: {isolation}  "
             f"Proof LSP: {lean_mcp}    Codex access: {codex_access}",
         )
@@ -507,10 +561,13 @@ class SwarmApp(App[bool]):
         self._update_static("#alerts", alert)
         for stage in Stage:
             counts = stage_counts(self.state, stage)
+            phases = stage_phase_counts(self.state, stage)
             self._update_static(
                 f"#stage-{stage.value}",
-                f"[b]{stage.value.title()}[/b]\n"
-                f"▶ {counts['running']}  ✓ {counts['succeeded']}  "
+                f"[b]{stage.value.title()} chapters[/b]\n"
+                f"agent {agents[stage.value]} · queue {phases['queued']} · "
+                f"build {phases['building']} · rebuild {phases['awaiting_rebuild']}\n"
+                f"✓ {counts['succeeded']}  "
                 f"✗ {counts['failed']}  · {counts['pending']}  ! {counts['blocked']}",
             )
         table: DataTable[Any] = self.query_one("#tasks", DataTable)
@@ -549,13 +606,43 @@ class SwarmApp(App[bool]):
         statuses = []
         for stage in Stage:
             task = self.state.task(chapter.id, stage)
-            mark = STATUS_MARKS[TaskStatus(task.status)]
+            mark = task_mark(task)
             statuses.append(f"{mark} ({task.rounds})" if task.rounds else mark)
         usage = chapter_usage(self.state, chapter)
         tokens = format_count(usage.total_tokens) if usage.measured else "—"
         cost = format_usd(self.state.invocation_cost(chapter.id))
         run = latest_run(self.state, chapter)
-        activity = self.state.activities.get(run.id) if run is not None else None
+        active_run = next(
+            (
+                item
+                for stage in Stage
+                for item in self.state.task(chapter.id, stage).runs
+                if item.status == TaskStatus.RUNNING
+            ),
+            None,
+        )
+        activity = self.state.activities.get(active_run.id) if active_run is not None else None
+        if active_run is not None:
+            current_activity = activity_label(activity, active_run)
+        else:
+            active_task = next(
+                (
+                    self.state.task(chapter.id, stage)
+                    for stage in Stage
+                    if self.state.task(chapter.id, stage).status == TaskStatus.RUNNING
+                ),
+                None,
+            )
+            phase_activity = {
+                TaskPhase.QUEUED: "queued for agent",
+                TaskPhase.BUILDING: "coordinator building",
+                TaskPhase.AWAITING_REBUILD: "awaiting coordinator rebuild",
+            }
+            if active_task is not None and active_task.phase in phase_activity:
+                current_activity = phase_activity[TaskPhase(active_task.phase)]
+            else:
+                prior_activity = self.state.activities.get(run.id) if run is not None else None
+                current_activity = activity_label(prior_activity, run)
         statement_rank = self.orchestrator.statement_schedule.rank[chapter.book_id]
         proof_rank = self.orchestrator.proof_schedule.rank[chapter.book_id]
         critical = chapter.book_id in self.orchestrator.statement_schedule.critical_path
@@ -565,7 +652,7 @@ class SwarmApp(App[bool]):
             f"{statement_rank:g}/{proof_rank:g}",
             f"{chapter.number:02d} {chapter.title}",
             *statuses,
-            activity_label(activity, run),
+            current_activity,
             f"{tokens} · {cost}",
         )
 

@@ -8,7 +8,7 @@ from textual.widgets import DataTable, RichLog, Static
 from lastlib_swarm.config import load_config
 from lastlib_swarm.models import Stage
 from lastlib_swarm.scheduler import Orchestrator
-from lastlib_swarm.state import StateStore, TaskStatus, TokenUsage
+from lastlib_swarm.state import StateStore, TaskPhase, TaskStatus, TokenUsage
 from lastlib_swarm.tui import AgentDetailScreen, SwarmApp, format_count, format_usage
 from tests.support import write_project
 
@@ -219,5 +219,61 @@ async def test_unchanged_dashboard_does_not_update_table_cells(
         app.refresh_dashboard()
 
         assert updates == 0
+        finish.set()
+        await pilot.pause(1.2)
+
+
+@pytest.mark.asyncio
+async def test_dashboard_separates_agents_queues_and_coordinator_builds(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    ready = asyncio.Event()
+    finish = asyncio.Event()
+
+    async def operation() -> bool:
+        await state.start_run(config.chapters[0].id, Stage.FORMALIZE)
+        await state.set_task(
+            config.chapters[1].id,
+            Stage.FIXUP,
+            TaskStatus.RUNNING,
+            "streaming coordinator build",
+            phase=TaskPhase.BUILDING,
+        )
+        await state.set_task(
+            config.chapters[1].id,
+            Stage.REVIEW,
+            TaskStatus.RUNNING,
+            "queued for review",
+            phase=TaskPhase.QUEUED,
+        )
+        await state.start_coordinator_build(
+            mode="streaming",
+            stage=Stage.FIXUP,
+            iteration=2,
+            maximum_iterations=6,
+            total=81,
+        )
+        await state.advance_coordinator_build(
+            chapter_id=config.chapters[1].id,
+            completed=20,
+        )
+        ready.set()
+        await finish.wait()
+        return True
+
+    app = SwarmApp(orchestrator, operation, label="test")
+    async with app.run_test(size=(180, 50)) as pilot:
+        await ready.wait()
+        app.refresh_dashboard()
+
+        usage = str(app.query_one("#usage", Static).content)
+        assert "Agents 1/4 · formalize 1 · queued 1" in usage
+        assert "Coordinator streaming build 20/81 · iteration 2/6" in usage
+        fixup = str(app.query_one("#stage-fixup", Static).content)
+        assert "agent 0 · queue 0 · build 1 · rebuild 0" in fixup
+        review = str(app.query_one("#stage-review", Static).content)
+        assert "agent 0 · queue 1 · build 0 · rebuild 0" in review
+
         finish.set()
         await pilot.pause(1.2)

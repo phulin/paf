@@ -59,6 +59,8 @@ def state_summary(
         "lifetime_cost": snapshot["cost"],
         "isolation": snapshot["isolation"],
         "scheduling": scheduling_summary(snapshot["scheduling"]),
+        "agents": snapshot["agents"],
+        "coordinator_build": snapshot["coordinator_build"],
         "tasks": _task_counts(snapshot),
     }
     if full:
@@ -276,6 +278,8 @@ def offline_status(state_dir: Path) -> dict[str, Any]:
                 "lifetime_cost": snapshot.get("cost", {}),
                 "isolation": snapshot.get("isolation", {}),
                 "scheduling": scheduling_summary(snapshot.get("scheduling", {})),
+                "agents": snapshot.get("agents", {}),
+                "coordinator_build": snapshot.get("coordinator_build", {}),
                 "tasks": _task_counts(snapshot),
             }
     return {
@@ -317,5 +321,7 @@ def offline_status(state_dir: Path) -> dict[str, Any]:
         },
         "scheduling": {},
         "isolation": {},
+        "agents": {},
+        "coordinator_build": {},
         "tasks": {status.value: 0 for status in TaskStatus},
     }

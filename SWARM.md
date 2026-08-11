@@ -275,7 +275,11 @@ TUI, persisted snapshot, and agent-control JSON expose the priority order, ranks
 
 The dashboard shows:
 
-- aggregate counts for formalize, fixup, review, and prove;
+- the live-agent total against `max_agents`, broken down by stage, plus attempts waiting for a slot;
+- the active coordinator build's mode, iteration, target progress, and current chapter;
+- chapter-stage phases (`queued`, `building`, `agent`, and `awaiting rebuild`) separately from
+  terminal stage status;
+- aggregate chapter counts for formalize, fixup, review, and prove;
 - each chapter's status and attempt count in every stage;
 - per-chapter tokens for the current invocation;
 - statement/proof critical-path ranks and the current statement critical path;
@@ -321,7 +325,10 @@ schema alongside them. Compact `*.activity.json` sidecars retain the most recent
 health counters without copying large command output into pipeline state. An attempt record is
 written atomically before its workspace is acquired or Codex is launched. Each run records its PID,
 Codex thread id when emitted, stage, round, timestamps, scoped-change result, placeholder count,
-final report, validation tail, and incrementally checkpointed usage. Writes are atomic.
+final report, validation tail, and incrementally checkpointed usage. Task records separately persist
+their current queue/build/agent phase, while a coordinator-build record tracks the single serialized
+Lake build. Running run records—not chapter-stage records—are the authoritative live-agent count.
+Writes are atomic.
 
 Press `q` in the TUI or interrupt a headless run to terminate the active child process group. On the
 next invocation, interrupted `running` records become `pending` and can resume. Successful records

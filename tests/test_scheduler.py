@@ -10,7 +10,7 @@ from lastlib_swarm.codex import AgentResult, CodexExecutor, ValidationResult
 from lastlib_swarm.config import load_config
 from lastlib_swarm.models import Chapter, Stage
 from lastlib_swarm.scheduler import FormalizeOutcome, Orchestrator
-from lastlib_swarm.state import RunRecord, StateStore, TaskStatus, TokenUsage
+from lastlib_swarm.state import RunRecord, StateStore, TaskPhase, TaskStatus, TokenUsage
 from tests.support import write_project
 
 
@@ -112,9 +112,12 @@ async def test_state_migrates_legacy_repair_tasks_to_fixup(tmp_path: Path) -> No
     await state.finish_run(run, status=TaskStatus.SUCCEEDED)
     payload = json.loads(state.path.read_text(encoding="utf-8"))
     task = payload["tasks"].pop(f"{chapter.id}:fixup")
+    task.pop("phase")
     task["stage"] = "repair"
     task["runs"][0]["stage"] = "repair"
     payload["tasks"][f"{chapter.id}:repair"] = task
+    payload.pop("coordinator_build")
+    payload["version"] = 4
     state.path.write_text(json.dumps(payload), encoding="utf-8")
 
     reloaded = StateStore(config)
@@ -122,7 +125,9 @@ async def test_state_migrates_legacy_repair_tasks_to_fixup(tmp_path: Path) -> No
 
     migrated = reloaded.task(chapter.id, Stage.FIXUP)
     assert migrated.stage == "fixup"
+    assert migrated.phase == TaskPhase.IDLE
     assert migrated.runs[0].stage == "fixup"
+    assert not reloaded.coordinator_build.active
 
 
 @pytest.mark.asyncio
@@ -432,6 +437,105 @@ async def test_streaming_build_does_not_publish_partial_cache_snapshot(
 
     await orchestrator._build_all()
     assert published == 1
+
+
+@pytest.mark.asyncio
+async def test_coordinator_build_uses_build_phases_without_counting_agents(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await orchestrator.prepare()
+    validation_started = asyncio.Event()
+    release_validation = asyncio.Event()
+
+    async def gated_validation(
+        _config: object, chapter: Chapter, *, workspace_root: Path | None = None
+    ) -> ValidationResult:
+        assert workspace_root == config.settings.repo
+        if chapter.number == 1:
+            validation_started.set()
+            await release_validation.wait()
+        return ValidationResult(True, 0, "ok")
+
+    monkeypatch.setattr(scheduler_module, "validate", gated_validation)
+    build = asyncio.create_task(
+        orchestrator._build_chapters(
+            config.chapters,
+            publish_if_clean=False,
+            mode="streaming",
+            iteration=2,
+            maximum_iterations=6,
+        )
+    )
+    await validation_started.wait()
+
+    assert state.coordinator_build.active
+    assert state.coordinator_build.mode == "streaming"
+    assert state.coordinator_build.completed == 0
+    assert state.coordinator_build.total == 2
+    assert state.agent_summary()["active"] == 0
+    assert all(
+        state.task(chapter.id, Stage.FIXUP).phase == TaskPhase.BUILDING
+        for chapter in config.chapters
+    )
+
+    release_validation.set()
+    assert all(result.succeeded for result in (await build).values())
+    assert not state.coordinator_build.active
+    assert state.coordinator_build.completed == 2
+    assert all(
+        state.task(chapter.id, Stage.FIXUP).phase == TaskPhase.AWAITING_REBUILD
+        for chapter in config.chapters
+    )
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_agent_limiter_distinguishes_live_and_queued_runs(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    config = replace(config, settings=replace(config.settings, max_agents=1))
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await orchestrator.prepare()
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+
+    class GatedExecutor(CodexExecutor):
+        async def run(
+            self,
+            chapter: Chapter,
+            stage: Stage,
+            run: RunRecord,
+            *,
+            feedback: str = "",
+            workspace_root: Path | None = None,
+        ) -> AgentResult:
+            del stage, feedback, workspace_root
+            if chapter.number == 1:
+                first_started.set()
+                await release_first.wait()
+            agent = result(changed=False)
+            await state.finish_run(run, status=TaskStatus.SUCCEEDED)
+            return agent
+
+    orchestrator.executor = GatedExecutor(config, state)
+    first = asyncio.create_task(orchestrator._attempt(config.chapters[0], Stage.FORMALIZE))
+    await first_started.wait()
+    second = asyncio.create_task(orchestrator._attempt(config.chapters[1], Stage.FORMALIZE))
+    await asyncio.sleep(0.05)
+
+    summary = state.agent_summary()
+    assert summary["active"] == 1
+    assert summary["queued"] == 1
+    assert summary["by_stage"]["formalize"] == 1
+    assert state.task(config.chapters[0].id, Stage.FORMALIZE).phase == TaskPhase.AGENT
+    assert state.task(config.chapters[1].id, Stage.FORMALIZE).phase == TaskPhase.QUEUED
+
+    release_first.set()
+    await asyncio.gather(first, second)
+    await orchestrator.shutdown()
 
 
 @pytest.mark.asyncio

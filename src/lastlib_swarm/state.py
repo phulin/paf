@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import os
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -25,6 +26,14 @@ class TaskStatus(StrEnum):
     SUCCEEDED = "succeeded"
     FAILED = "failed"
     BLOCKED = "blocked"
+
+
+class TaskPhase(StrEnum):
+    IDLE = "idle"
+    QUEUED = "queued"
+    BUILDING = "building"
+    AGENT = "agent"
+    AWAITING_REBUILD = "awaiting_rebuild"
 
 
 @dataclass
@@ -117,10 +126,24 @@ class TaskRecord:
     chapter_title: str
     stage: str
     status: str = TaskStatus.PENDING
+    phase: str = TaskPhase.IDLE
     detail: str = ""
     rounds: int = 0
     updated_at: str = field(default_factory=timestamp)
     runs: list[RunRecord] = field(default_factory=list)
+
+
+@dataclass
+class CoordinatorBuildRecord:
+    active: bool = False
+    mode: str = ""
+    stage: str = ""
+    iteration: int = 0
+    maximum_iterations: int = 0
+    completed: int = 0
+    total: int = 0
+    current_chapter_id: str = ""
+    updated_at: str = field(default_factory=timestamp)
 
 
 @dataclass
@@ -156,6 +179,7 @@ class StateStore:
         self.source_issues: dict[str, SourceIssueRecord] = {}
         self.scheduling: dict[str, Any] = {}
         self.isolation: dict[str, Any] = {}
+        self.coordinator_build = CoordinatorBuildRecord()
         self.created_at = timestamp()
         self.updated_at = self.created_at
 
@@ -179,6 +203,15 @@ class StateStore:
                 self.scheduling = raw["scheduling"]
             if not self.isolation and isinstance(raw.get("isolation"), dict):
                 self.isolation = raw["isolation"]
+            raw_build = raw.get("coordinator_build")
+            if isinstance(raw_build, dict):
+                self.coordinator_build = CoordinatorBuildRecord(
+                    **{
+                        name: value
+                        for name, value in raw_build.items()
+                        if name in CoordinatorBuildRecord.__dataclass_fields__
+                    }
+                )
             persisted_tasks = raw.get("tasks", {})
             for key, value in persisted_tasks.items():
                 if key.endswith(":repair"):
@@ -193,6 +226,7 @@ class StateStore:
                     runs.append(RunRecord(**item, usage=usage))
                 if value.get("stage") == "repair":
                     value["stage"] = "fixup"
+                value.setdefault("phase", TaskPhase.IDLE)
                 self.tasks[key] = TaskRecord(
                     **{name: item for name, item in value.items() if name != "runs"}, runs=runs
                 )
@@ -215,11 +249,16 @@ class StateStore:
         for task in self.tasks.values():
             if task.status == TaskStatus.RUNNING:
                 task.status = TaskStatus.PENDING
+                task.phase = TaskPhase.IDLE
                 task.detail = "recovered after interrupted orchestrator"
                 for run in task.runs:
                     if run.status == TaskStatus.RUNNING:
                         run.status = TaskStatus.FAILED
                         run.finished_at = timestamp()
+        if self.coordinator_build.active:
+            self.coordinator_build.active = False
+            self.coordinator_build.current_chapter_id = ""
+            self.coordinator_build.updated_at = timestamp()
         await self.save()
 
     def _new_task(self, chapter: Chapter, stage: Stage) -> TaskRecord:
@@ -256,7 +295,7 @@ class StateStore:
         cost = self.total_cost()
         invocation_cost = self.invocation_cost()
         return {
-            "version": 4,
+            "version": 5,
             "config": str(self.config.path),
             "created_at": self.created_at,
             "updated_at": self.updated_at,
@@ -265,10 +304,29 @@ class StateStore:
             | {"total_tokens": invocation_usage.total_tokens},
             "cost": cost.as_dict(),
             "invocation_cost": invocation_cost.as_dict(),
+            "agents": self.agent_summary(),
             "scheduling": self.scheduling,
             "isolation": self.isolation,
+            "coordinator_build": asdict(self.coordinator_build),
             "source_issues": [asdict(issue) for _, issue in sorted(self.source_issues.items())],
             "tasks": {key: asdict(value) for key, value in sorted(self.tasks.items())},
+        }
+
+    def agent_summary(self) -> dict[str, Any]:
+        by_stage = {stage.value: 0 for stage in Stage}
+        for task in self.tasks.values():
+            for run in task.runs:
+                if run.status == TaskStatus.RUNNING and run.stage in by_stage:
+                    by_stage[run.stage] += 1
+        queued = sum(
+            task.status == TaskStatus.RUNNING and task.phase == TaskPhase.QUEUED
+            for task in self.tasks.values()
+        )
+        return {
+            "active": sum(by_stage.values()),
+            "maximum": self.config.settings.max_agents,
+            "queued": queued,
+            "by_stage": by_stage,
         }
 
     def _record_source_issues(self, run: RunRecord) -> None:
@@ -374,13 +432,50 @@ class StateStore:
         return self.tasks[self.key(chapter_id, stage)]
 
     async def set_task(
-        self, chapter_id: str, stage: Stage, status: TaskStatus, detail: str
+        self,
+        chapter_id: str,
+        stage: Stage,
+        status: TaskStatus,
+        detail: str,
+        *,
+        phase: TaskPhase | None = None,
     ) -> None:
         task = self.task(chapter_id, stage)
         task.status = status
+        if phase is not None:
+            task.phase = phase
+        elif status != TaskStatus.RUNNING:
+            task.phase = TaskPhase.IDLE
         task.detail = detail
         task.updated_at = timestamp()
         await self.save()
+
+    async def set_tasks(
+        self,
+        chapter_ids: Iterable[str],
+        stage: Stage,
+        status: TaskStatus,
+        detail: str,
+        *,
+        phase: TaskPhase | None = None,
+    ) -> None:
+        changed = False
+        updated_at = timestamp()
+        for chapter_id in chapter_ids:
+            key = self.key(chapter_id, stage)
+            if key not in self.tasks:
+                continue
+            task = self.tasks[key]
+            task.status = status
+            if phase is not None:
+                task.phase = phase
+            elif status != TaskStatus.RUNNING:
+                task.phase = TaskPhase.IDLE
+            task.detail = detail
+            task.updated_at = updated_at
+            changed = True
+        if changed:
+            await self.save()
 
     async def unblock(self) -> list[str]:
         """Reset blocked tasks to pending without discarding attempt history."""
@@ -389,6 +484,7 @@ class StateStore:
             if task.status != TaskStatus.BLOCKED:
                 continue
             task.status = TaskStatus.PENDING
+            task.phase = TaskPhase.IDLE
             task.detail = "manually unblocked"
             task.updated_at = timestamp()
             changed.append(key)
@@ -399,6 +495,7 @@ class StateStore:
     async def start_run(self, chapter_id: str, stage: Stage) -> RunRecord:
         task = self.task(chapter_id, stage)
         task.status = TaskStatus.RUNNING
+        task.phase = TaskPhase.AGENT
         task.rounds += 1
         task.updated_at = timestamp()
         run = RunRecord(
@@ -423,4 +520,37 @@ class StateStore:
         for name, value in changes.items():
             setattr(run, name, value)
         self._record_source_issues(run)
+        await self.save()
+
+    async def start_coordinator_build(
+        self,
+        *,
+        mode: str,
+        stage: Stage,
+        iteration: int,
+        maximum_iterations: int,
+        total: int,
+    ) -> None:
+        self.coordinator_build = CoordinatorBuildRecord(
+            active=True,
+            mode=mode,
+            stage=stage.value,
+            iteration=iteration,
+            maximum_iterations=maximum_iterations,
+            total=total,
+        )
+        await self.save()
+
+    async def advance_coordinator_build(
+        self, *, chapter_id: str, completed: int
+    ) -> None:
+        self.coordinator_build.current_chapter_id = chapter_id
+        self.coordinator_build.completed = completed
+        self.coordinator_build.updated_at = timestamp()
+        await self.save()
+
+    async def finish_coordinator_build(self) -> None:
+        self.coordinator_build.active = False
+        self.coordinator_build.current_chapter_id = ""
+        self.coordinator_build.updated_at = timestamp()
         await self.save()
