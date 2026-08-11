@@ -36,6 +36,8 @@ class SwarmSettings:
     approve_for_me: bool = False
     bypass_approvals_and_sandbox: bool = True
     agent_timeout_seconds: float = 7200.0
+    capacity_resume_attempts: int = 5
+    capacity_resume_delay_seconds: float = 30.0
     validation_timeout_seconds: float = 1800.0
     isolation: str = "auto"
     lean_mcp: bool = True

@@ -228,6 +228,8 @@ def load_config(path: str | Path) -> PipelineConfig:
         approve_for_me=bool(swarm.get("approve_for_me", False)),
         bypass_approvals_and_sandbox=bool(swarm.get("bypass_approvals_and_sandbox", True)),
         agent_timeout_seconds=float(swarm.get("agent_timeout_seconds", 7200)),
+        capacity_resume_attempts=int(swarm.get("capacity_resume_attempts", 5)),
+        capacity_resume_delay_seconds=float(swarm.get("capacity_resume_delay_seconds", 30)),
         validation_timeout_seconds=float(swarm.get("validation_timeout_seconds", 1800)),
         isolation=str(swarm.get("isolation", "auto")),
         lean_mcp=bool(swarm.get("lean_mcp", True)),
@@ -240,6 +242,10 @@ def load_config(path: str | Path) -> PipelineConfig:
     )
     if settings.max_agents < 1:
         raise ValueError("swarm.max_agents must be positive")
+    if settings.capacity_resume_attempts < 0:
+        raise ValueError("swarm.capacity_resume_attempts must be nonnegative")
+    if settings.capacity_resume_delay_seconds < 0:
+        raise ValueError("swarm.capacity_resume_delay_seconds must be nonnegative")
     if settings.isolation not in {"auto", "fuse-overlay", "shared"}:
         raise ValueError("swarm.isolation must be auto, fuse-overlay, or shared")
     if settings.lean_mcp_tool_timeout_seconds <= 0:

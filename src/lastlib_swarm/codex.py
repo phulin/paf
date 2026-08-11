@@ -80,6 +80,7 @@ PROCESS_GROUP_GRACE_SECONDS = 1.0
 COMMON_PROMPT_PATH = Path(__file__).with_name("prompts") / "common.md"
 LEAN_WARNING_RE = re.compile(r"(?m)^[ \t]*warning:[ \t]*(?P<message>.*)$")
 LEAN_SORRY_WARNING_RE = re.compile(r"(?:^|:\d+:\d+:[ \t]+)declaration uses [`']sorry[`'][ \t]*$")
+CAPACITY_RESUME_PROMPT = "Continue from the interrupted turn and complete the assigned task."
 
 
 def lean_mcp_executable() -> Path:
@@ -256,6 +257,20 @@ def _find_report(event: Any) -> dict[str, Any] | None:
     return None
 
 
+def _is_capacity_failure(event: Any) -> bool:
+    if not isinstance(event, dict) or event.get("type") not in {"error", "turn.failed"}:
+        return False
+    error = event.get("error")
+    messages = [event.get("message")]
+    if isinstance(error, dict):
+        messages.append(error.get("message"))
+    elif isinstance(error, str):
+        messages.append(error)
+    return any(
+        isinstance(message, str) and "at capacity" in message.casefold() for message in messages
+    )
+
+
 def _rollout_usage(event: Any) -> TokenUsage | None:
     if not isinstance(event, dict) or event.get("type") != "event_msg":
         return None
@@ -411,27 +426,29 @@ imports with a compiler command.
             )
         return f"{base.rstrip()}\n\n{common.rstrip()}\n{contract}"
 
-    def command(self, stage: Stage, workspace_root: Path | None = None) -> list[str]:
+    def command(
+        self,
+        stage: Stage,
+        workspace_root: Path | None = None,
+        *,
+        resume_thread_id: str | None = None,
+    ) -> list[str]:
         settings = self.config.settings
         root = workspace_root or settings.repo
-        command = [
-            settings.codex_bin,
-            "exec",
-            "--json",
-            "--color",
-            "never",
-            "--cd",
-            str(root),
-            "--output-schema",
-            str(self.schema_path),
-        ]
+        command = [settings.codex_bin, "exec"]
+        if resume_thread_id is None:
+            command.extend(["--json", "--color", "never", "--cd", str(root)])
+        else:
+            command.extend(["resume", "--json"])
+        command.extend(["--output-schema", str(self.schema_path)])
         if root != settings.repo:
             command.append("--skip-git-repo-check")
         if stage is Stage.REVIEW:
-            command.extend(["--sandbox", "read-only"])
+            if resume_thread_id is None:
+                command.extend(["--sandbox", "read-only"])
         elif settings.bypass_approvals_and_sandbox:
             command.append("--dangerously-bypass-approvals-and-sandbox")
-        elif settings.approve_for_me:
+        elif settings.approve_for_me and resume_thread_id is None:
             # Current Codex versions make --approve-for-me mutually exclusive
             # with --sandbox; approve-for-me itself selects workspace-write.
             command.append("--approve-for-me")
@@ -461,6 +478,8 @@ imports with a compiler command.
             }
             for key, value in mcp_config.items():
                 command.extend(["--config", f"{key}={json.dumps(value)}"])
+        if resume_thread_id is not None:
+            command.append(resume_thread_id)
         command.append("-")
         return command
 
@@ -477,22 +496,6 @@ imports with a compiler command.
         prompt = self.build_prompt(chapter, stage, feedback=feedback)
         before = scope_digest(root, chapter)
         log_path = self.state.logs_dir / f"{run.id}.jsonl"
-        process = await asyncio.create_subprocess_exec(
-            *self.command(stage, root),
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-            cwd=root,
-            start_new_session=True,
-        )
-        await self.state.update_run(run, pid=process.pid, log_path=str(log_path))
-        if process.stdin is None or process.stdout is None:
-            raise RuntimeError("failed to open Codex subprocess pipes")
-        stdin = process.stdin
-        stdout = process.stdout
-        stdin.write(prompt.encode())
-        await stdin.drain()
-        stdin.close()
         usage = TokenUsage()
         report: dict[str, Any] = {}
         thread_id: str | None = None
@@ -512,75 +515,133 @@ imports with a compiler command.
             if usage_monitor is not None:
                 await usage_monitor
 
-        async def consume() -> None:
+        async def invoke(
+            command: list[str], input_text: str, *, append_log: bool
+        ) -> tuple[int, bool, bool]:
             nonlocal usage, report, thread_id, usage_monitor
-            with log_path.open("wb", buffering=0) as log:
-                pending = bytearray()
+            process = await asyncio.create_subprocess_exec(
+                *command,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                cwd=root,
+                start_new_session=True,
+            )
+            await self.state.update_run(run, pid=process.pid, log_path=str(log_path))
+            if process.stdin is None or process.stdout is None:
+                raise RuntimeError("failed to open Codex subprocess pipes")
+            stdin = process.stdin
+            stdout = process.stdout
+            stdin.write(input_text.encode())
+            await stdin.drain()
+            stdin.close()
+            capacity_failure = False
 
-                async def consume_line(line: bytes) -> None:
-                    nonlocal usage, report, thread_id, usage_monitor
-                    try:
-                        event = json.loads(line)
-                    except (json.JSONDecodeError, UnicodeDecodeError):
-                        return
-                    activity.consume(event, workspace_root=root)
-                    self.state.activities.save(activity)
-                    if found := _find_thread_id(event):
-                        thread_id = found
-                        await self.state.update_run(run, thread_id=found)
-                        if usage_monitor is None:
-                            usage_monitor = asyncio.create_task(
-                                _tail_rollout_usage(found, usage_stop, update_usage)
-                            )
-                    if found_usage := TokenUsage.from_event(event):
-                        await update_usage(found_usage)
-                    if found_report := _find_report(event):
-                        report = found_report
+            async def consume() -> None:
+                nonlocal usage, report, thread_id, usage_monitor, capacity_failure
+                mode = "ab" if append_log else "wb"
+                with log_path.open(mode, buffering=0) as log:
+                    pending = bytearray()
 
-                # Codex command events can contain multi-megabyte aggregated output.
-                # StreamReader.readline() has a 64 KiB default limit and stops draining
-                # the child when one such JSONL record exceeds it. Frame records from
-                # fixed-size chunks instead, without imposing an artificial line cap.
-                while chunk := await stdout.read(64 * 1024):
-                    log.write(chunk)
-                    pending.extend(chunk)
-                    while (newline := pending.find(b"\n")) >= 0:
-                        line = bytes(pending[:newline])
-                        del pending[: newline + 1]
-                        await consume_line(line)
-                if pending:
-                    await consume_line(bytes(pending))
+                    async def consume_line(line: bytes) -> None:
+                        nonlocal usage, report, thread_id, usage_monitor, capacity_failure
+                        try:
+                            event = json.loads(line)
+                        except (json.JSONDecodeError, UnicodeDecodeError):
+                            return
+                        activity.consume(event, workspace_root=root)
+                        self.state.activities.save(activity)
+                        capacity_failure = capacity_failure or _is_capacity_failure(event)
+                        if found := _find_thread_id(event):
+                            thread_id = found
+                            await self.state.update_run(run, thread_id=found)
+                            if usage_monitor is None:
+                                usage_monitor = asyncio.create_task(
+                                    _tail_rollout_usage(found, usage_stop, update_usage)
+                                )
+                        if found_usage := TokenUsage.from_event(event):
+                            await update_usage(found_usage)
+                        if found_report := _find_report(event):
+                            report = found_report
 
-        consumer = asyncio.create_task(consume())
+                    # Codex command events can contain multi-megabyte aggregated output.
+                    # StreamReader.readline() has a 64 KiB default limit and stops draining
+                    # the child when one such JSONL record exceeds it. Frame records from
+                    # fixed-size chunks instead, without imposing an artificial line cap.
+                    while chunk := await stdout.read(64 * 1024):
+                        log.write(chunk)
+                        pending.extend(chunk)
+                        while (newline := pending.find(b"\n")) >= 0:
+                            line = bytes(pending[:newline])
+                            del pending[: newline + 1]
+                            await consume_line(line)
+                    if pending:
+                        await consume_line(bytes(pending))
+
+            consumer = asyncio.create_task(consume())
+            timed_out = False
+            try:
+                async with asyncio.timeout(self.config.settings.agent_timeout_seconds):
+                    exit_code = await _wait_for_parent_exit(process)
+            except TimeoutError:
+                timed_out = True
+                await _terminate(process)
+                exit_code = 124
+            except asyncio.CancelledError:
+                await _terminate(process)
+                consumer.cancel()
+                with suppress(asyncio.CancelledError):
+                    await consumer
+                raise
+            if not timed_out:
+                # Codex can exit before its MCP/LSP descendants. Reap the complete
+                # process group before integration so no language server retains the
+                # overlay or races the coordinator-owned build.
+                await _terminate(process)
+            await consumer
+            return exit_code, timed_out, capacity_failure
+
+        resume_attempt = 0
+        capacity_failure = False
         timed_out = False
         try:
-            async with asyncio.timeout(self.config.settings.agent_timeout_seconds):
-                exit_code = await _wait_for_parent_exit(process)
-        except TimeoutError:
-            timed_out = True
-            await _terminate(process)
-            exit_code = 124
+            while True:
+                if resume_attempt:
+                    assert thread_id is not None
+                    command = self.command(stage, root, resume_thread_id=thread_id)
+                    input_text = CAPACITY_RESUME_PROMPT
+                else:
+                    command = self.command(stage, root)
+                    input_text = prompt
+                exit_code, timed_out, capacity_failure = await invoke(
+                    command, input_text, append_log=bool(resume_attempt)
+                )
+                if (
+                    exit_code == 0
+                    or not capacity_failure
+                    or thread_id is None
+                    or resume_attempt >= self.config.settings.capacity_resume_attempts
+                ):
+                    break
+                resume_attempt += 1
+                activity.retry(
+                    f"capacity retry {resume_attempt}/"
+                    f"{self.config.settings.capacity_resume_attempts}: resuming {thread_id}"
+                )
+                self.state.activities.save(activity)
+                await asyncio.sleep(self.config.settings.capacity_resume_delay_seconds)
         except asyncio.CancelledError:
-            await _terminate(process)
-            consumer.cancel()
-            with suppress(asyncio.CancelledError):
-                await consumer
             await stop_usage_monitor()
             activity.finish("cancelled", "agent cancelled by orchestrator")
             self.state.activities.save(activity)
             raise
-        if not timed_out:
-            # Codex can exit before its MCP/LSP descendants. Reap the complete
-            # process group before integration so no language server retains the
-            # overlay or races the coordinator-owned build.
-            await _terminate(process)
-        try:
-            await consumer
         finally:
             await stop_usage_monitor()
         changed = before != scope_digest(root, chapter)
         placeholders = count_placeholders(root, chapter)
         error = "agent timed out" if timed_out else ""
+        if capacity_failure and exit_code != 0:
+            error = "Codex capacity retries exhausted"
         if exit_code == 0 and not report:
             error = "Codex returned no structured final report"
         succeeded = exit_code == 0 and bool(report)

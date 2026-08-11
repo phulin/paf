@@ -9,6 +9,7 @@ import pytest
 
 from lastlib_swarm.codex import (
     CodexExecutor,
+    _is_capacity_failure,
     _rollout_usage,
     count_placeholders,
     lean_mcp_executable,
@@ -127,6 +128,39 @@ def test_executor_uses_machine_readable_codex_mode(tmp_path: Path) -> None:
     assert "--dangerously-bypass-approvals-and-sandbox" not in review_command
     for stage in (Stage.FORMALIZE, Stage.FIXUP, Stage.REVIEW):
         assert not any("mcp_servers.lastlib_lean" in item for item in executor.command(stage))
+
+    resumed = executor.command(Stage.FORMALIZE, isolated, resume_thread_id="capacity-thread")
+    assert resumed[:3] == ["codex", "exec", "resume"]
+    assert "capacity-thread" in resumed
+    assert "--json" in resumed
+    assert "--output-schema" in resumed
+    assert "--cd" not in resumed
+    resumed_review = executor.command(Stage.REVIEW, isolated, resume_thread_id="review-thread")
+    assert "--dangerously-bypass-approvals-and-sandbox" not in resumed_review
+
+
+@pytest.mark.parametrize(
+    "event",
+    [
+        {"type": "error", "message": "Selected model is at capacity. Please try again."},
+        {
+            "type": "error",
+            "message": "Error running remote compact task: Selected model is at capacity.",
+        },
+        {
+            "type": "turn.failed",
+            "error": {"message": "Selected model is at capacity. Please try again."},
+        },
+    ],
+)
+def test_detects_capacity_failures(event: dict[str, object]) -> None:
+    assert _is_capacity_failure(event)
+
+
+def test_does_not_retry_unrelated_turn_failures() -> None:
+    assert not _is_capacity_failure(
+        {"type": "turn.failed", "error": {"message": "authentication failed"}}
+    )
 
 
 def test_lean_mcp_path_finds_elan_outside_inherited_path(
@@ -255,6 +289,70 @@ print(json.dumps({"type": "item.completed", "item": {
     assert activity is not None
     assert activity.current == "agent succeeded"
     assert json.loads(activity.latest_summary)["summary"] == "done"
+
+
+@pytest.mark.asyncio
+async def test_executor_resumes_same_thread_after_capacity_failure(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    invocations_path = tmp_path / "invocations.jsonl"
+    fake_codex = tmp_path / "capacity-codex"
+    fake_codex.write_text(
+        f"""#!/usr/bin/env python3
+import json
+import sys
+from pathlib import Path
+
+prompt = sys.stdin.read()
+record = {{"args": sys.argv[1:], "prompt": prompt}}
+with Path({str(invocations_path)!r}).open("a", encoding="utf-8") as handle:
+    handle.write(json.dumps(record) + "\\n")
+if "resume" not in sys.argv:
+    print(json.dumps({{"type": "thread.started", "thread_id": "capacity-thread"}}))
+    message = "Error running remote compact task: Selected model is at capacity."
+    print(json.dumps({{"type": "error", "message": message}}))
+    print(json.dumps({{"type": "turn.failed", "error": {{"message": message}}}}))
+    raise SystemExit(1)
+report = {{"changed": False, "complete": True, "needs_fixup": False,
+          "summary": "resumed successfully", "issues": []}}
+print(json.dumps({{"type": "turn.started"}}))
+print(json.dumps({{"type": "item.completed", "item": {{
+    "type": "agent_message", "text": json.dumps(report)}}}}))
+""",
+        encoding="utf-8",
+    )
+    fake_codex.chmod(0o755)
+    config = replace(
+        config,
+        settings=replace(
+            config.settings,
+            codex_bin=str(fake_codex),
+            capacity_resume_attempts=2,
+            capacity_resume_delay_seconds=0,
+        ),
+    )
+    state = StateStore(config)
+    await state.load_or_create()
+    executor = CodexExecutor(config, state)
+    await executor.prepare()
+    run = await state.start_run(config.chapters[0].id, Stage.FORMALIZE)
+
+    result = await executor.run(config.chapters[0], Stage.FORMALIZE, run)
+
+    invocations = [json.loads(line) for line in invocations_path.read_text().splitlines()]
+    assert result.succeeded
+    assert result.thread_id == "capacity-thread"
+    assert result.report["summary"] == "resumed successfully"
+    assert len(invocations) == 2
+    assert invocations[1]["args"][:2] == ["exec", "resume"]
+    assert "capacity-thread" in invocations[1]["args"]
+    assert "Continue from the interrupted turn" in invocations[1]["prompt"]
+    log = (state.logs_dir / f"{run.id}.jsonl").read_text(encoding="utf-8")
+    assert "remote compact task" in log
+    assert "resumed successfully" in log
+    activity = state.activities.get(run.id)
+    assert activity is not None
+    assert activity.current == "agent succeeded"
+    assert any(entry.status == "retrying" for entry in activity.recent)
 
 
 @pytest.mark.asyncio

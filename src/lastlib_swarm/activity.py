@@ -252,6 +252,11 @@ class AgentActivity:
         self._append("agent", status, self.current, error)
         self.finished_at = self.updated_at
 
+    def retry(self, message: str) -> None:
+        self.current = message
+        self.current_kind = "agent"
+        self._append("agent", "retrying", message)
+
     def as_dict(self) -> dict[str, Any]:
         value = asdict(self)
         value["failures"] = self.failures
