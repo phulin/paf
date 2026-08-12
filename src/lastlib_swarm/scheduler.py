@@ -1421,6 +1421,7 @@ class Orchestrator:
                     Stage.REVIEW,
                     TaskStatus.PENDING,
                     "review checkpoint invalidated by source or dependency changes",
+                    phase=TaskPhase.RECOVERING,
                 )
         return reviewed
 
@@ -1508,7 +1509,16 @@ class Orchestrator:
         """Release dependency-ready reviews and proofs without a corpus-wide review gate."""
 
         by_id = {chapter.id: chapter for chapter in self.chapters}
-        initial_graph = self._observed_chapter_graph()
+        try:
+            initial_graph = self._observed_chapter_graph()
+        except ValueError as error:
+            await self.state.set_tasks(
+                by_id,
+                Stage.REVIEW,
+                TaskStatus.FAILED,
+                str(error),
+            )
+            return False
         reviewed = await self._reconcile_review_checkpoints(initial_graph)
         review_failures: set[str] = set()
         review_blocked: set[str] = set()
@@ -1522,6 +1532,27 @@ class Orchestrator:
             if self.state.task(chapter_id, Stage.PROVE).status == TaskStatus.SUCCEEDED
         }
         proof_fixups = {chapter_id: 0 for chapter_id in by_id}
+
+        async with self.state.batch():
+            for chapter_id in initial_graph.order:
+                if chapter_id not in reviewed:
+                    missing = initial_graph.dependencies[chapter_id].difference(reviewed)
+                    if missing:
+                        await self.state.set_task(
+                            chapter_id,
+                            Stage.REVIEW,
+                            TaskStatus.PENDING,
+                            "waiting for prerequisite reviews: " + ", ".join(sorted(missing)),
+                            phase=TaskPhase.WAITING_PREREQUISITES,
+                        )
+                if chapter_id not in reviewed:
+                    await self.state.set_task(
+                        chapter_id,
+                        Stage.PROVE,
+                        TaskStatus.PENDING,
+                        "waiting for a valid review checkpoint",
+                        phase=TaskPhase.WAITING_PREREQUISITES,
+                    )
 
         async def cancel_all() -> None:
             tasks = [task for task, _ in review_tasks.values()] + list(proof_tasks.values())
@@ -1551,6 +1582,13 @@ class Orchestrator:
                         and graph.dependencies[chapter_id].issubset(reviewed)
                     ):
                         dependencies = graph.dependencies[chapter_id]
+                        await self.state.set_task(
+                            chapter_id,
+                            Stage.REVIEW,
+                            TaskStatus.RUNNING,
+                            "waiting for dependency-ordered coordinator build",
+                            phase=TaskPhase.WAITING_BUILD,
+                        )
                         review_tasks[chapter_id] = (
                             asyncio.create_task(
                                 self._review_chapter_to_clean(
@@ -1680,12 +1718,14 @@ class Orchestrator:
                             Stage.REVIEW,
                             TaskStatus.PENDING,
                             "review invalidated by proof-requested statement fixup",
+                            phase=TaskPhase.RECOVERING,
                         )
                         await self.state.set_tasks(
                             invalidated,
                             Stage.PROVE,
                             TaskStatus.PENDING,
                             "waiting for invalidated statement review",
+                            phase=TaskPhase.WAITING_PREREQUISITES,
                         )
                     await asyncio.gather(*cancelled, return_exceptions=True)
 

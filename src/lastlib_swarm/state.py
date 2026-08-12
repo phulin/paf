@@ -34,6 +34,9 @@ class TaskStatus(StrEnum):
 
 class TaskPhase(StrEnum):
     IDLE = "idle"
+    WAITING_PREREQUISITES = "waiting_prerequisites"
+    RECOVERING = "recovering"
+    WAITING_BUILD = "waiting_build"
     QUEUED = "queued"
     BUILDING = "building"
     AGENT = "agent"
@@ -293,12 +296,12 @@ class StateStore:
                 and task.detail == "review changes merged; awaiting dependency-ordered rebuild"
             ):
                 task.status = TaskStatus.PENDING
-                task.phase = TaskPhase.IDLE
+                task.phase = TaskPhase.RECOVERING
                 task.checkpoint = None
                 task.detail = "legacy changed review awaiting rebuild and revalidation"
             if task.status == TaskStatus.RUNNING:
                 task.status = TaskStatus.PENDING
-                task.phase = TaskPhase.IDLE
+                task.phase = TaskPhase.RECOVERING
                 task.checkpoint = None
                 task.detail = "recovered after interrupted orchestrator"
                 for run in task.runs:
@@ -567,7 +570,7 @@ class StateStore:
             if task.stage != stage.value:
                 continue
             statuses[str(task.status)] += 1
-            if task.status == TaskStatus.RUNNING and task.phase in phases:
+            if task.status in (TaskStatus.PENDING, TaskStatus.RUNNING) and task.phase in phases:
                 phases[str(task.phase)] += 1
         result = (statuses, phases)
         self._stage_count_cache[stage.value] = result

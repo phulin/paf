@@ -17,6 +17,8 @@ from lastlib_swarm.tui import (
     format_agent_update,
     format_count,
     format_usage,
+    stage_phase_counts,
+    task_mark,
 )
 from tests.support import write_project
 
@@ -35,6 +37,25 @@ def test_formats_measured_token_spend_without_double_counting_cache() -> None:
     assert "1.30m" in rendered
     assert "cached 1.00m" in rendered
     assert format_count(999) == "999"
+
+
+@pytest.mark.asyncio
+async def test_pending_prerequisite_phase_is_visible_and_counted(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    state = StateStore(config)
+    await state.load_or_create()
+    chapter = config.chapters[0]
+    await state.set_task(
+        chapter.id,
+        Stage.PROVE,
+        TaskStatus.PENDING,
+        "waiting for a valid review checkpoint",
+        phase=TaskPhase.WAITING_PREREQUISITES,
+    )
+
+    task = state.task(chapter.id, Stage.PROVE)
+    assert task_mark(task) == "⌛ prerequisites"
+    assert stage_phase_counts(state, Stage.PROVE)["waiting_prerequisites"] == 1
 
 
 def test_formats_structured_agent_update_as_summary_and_issues() -> None:
@@ -497,9 +518,9 @@ async def test_dashboard_separates_agents_queues_and_coordinator_builds(
         assert "Building dependency graph" in status
         assert "Compiling Book.Chapter02" in status
         fixup = str(app.query_one("#stage-fixup", Static).content)
-        assert "agent 0 · queue 0 · build 1 · rebuild 0" in fixup
+        assert "agent 0 · queue 0 · buildq 0 · build 1 · rebuild 0" in fixup
         review = str(app.query_one("#stage-review", Static).content)
-        assert "agent 0 · queue 1 · build 0 · rebuild 0" in review
+        assert "agent 0 · queue 1 · buildq 0 · build 0 · rebuild 0" in review
 
         finish_build.set()
         await build_finished.wait()

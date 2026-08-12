@@ -43,6 +43,9 @@ STATUS_MARKS = {
 
 PHASE_MARKS = {
     TaskPhase.IDLE: "▶ in progress",
+    TaskPhase.WAITING_PREREQUISITES: "⌛ prerequisites",
+    TaskPhase.RECOVERING: "↺ recovering",
+    TaskPhase.WAITING_BUILD: "⌛ build queue",
     TaskPhase.QUEUED: "… queued",
     TaskPhase.BUILDING: "◆ building",
     TaskPhase.AGENT: "▶ agent",
@@ -94,7 +97,7 @@ def running_agent_counts(state: StateStore) -> dict[str, int]:
 
 
 def task_mark(task: TaskRecord) -> str:
-    if task.status == TaskStatus.RUNNING:
+    if task.status in (TaskStatus.PENDING, TaskStatus.RUNNING) and task.phase != TaskPhase.IDLE:
         return PHASE_MARKS.get(TaskPhase(task.phase), STATUS_MARKS[TaskStatus.RUNNING])
     return STATUS_MARKS[TaskStatus(task.status)]
 
@@ -805,7 +808,9 @@ class SwarmApp(App[bool]):
                 f"#stage-{stage.value}",
                 f"[b]{stage.value.title()} chapters[/b]\n"
                 f"agent {agents[stage.value]} · queue {phases['queued']} · "
-                f"build {phases['building']} · rebuild {phases['awaiting_rebuild']}\n"
+                f"buildq {phases['waiting_build']} · build {phases['building']} · "
+                f"rebuild {phases['awaiting_rebuild']} · "
+                f"deps {phases['waiting_prerequisites']} · recover {phases['recovering']}\n"
                 f"✓ {counts['succeeded']}  "
                 f"✗ {counts['failed']}  · {counts['pending']}  ! {counts['blocked']}",
             )
@@ -865,12 +870,17 @@ class SwarmApp(App[bool]):
                 (
                     self.state.task(chapter.id, stage)
                     for stage in Stage
-                    if self.state.task(chapter.id, stage).status == TaskStatus.RUNNING
+                    if self.state.task(chapter.id, stage).status
+                    in (TaskStatus.PENDING, TaskStatus.RUNNING)
+                    and self.state.task(chapter.id, stage).phase != TaskPhase.IDLE
                 ),
                 None,
             )
             phase_activity = {
                 TaskPhase.QUEUED: "queued for agent",
+                TaskPhase.WAITING_PREREQUISITES: "waiting for prerequisites",
+                TaskPhase.RECOVERING: "recovering interrupted work",
+                TaskPhase.WAITING_BUILD: "waiting for coordinator build",
                 TaskPhase.BUILDING: "coordinator building",
                 TaskPhase.AWAITING_REBUILD: "awaiting coordinator rebuild",
             }

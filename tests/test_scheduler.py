@@ -217,6 +217,7 @@ async def test_state_recovers_legacy_changed_review_as_pending(tmp_path: Path) -
     task = recovered.task(chapter.id, Stage.REVIEW)
 
     assert task.status == TaskStatus.PENDING
+    assert task.phase == TaskPhase.RECOVERING
     assert task.checkpoint is None
     assert task.detail == "legacy changed review awaiting rebuild and revalidation"
 
@@ -302,8 +303,11 @@ async def test_recovering_interrupted_run_preserves_lazy_payload(tmp_path: Path)
 
     recovered = StateStore(config)
     await recovered.load_or_create()
-    recovered_run = recovered.task(config.chapters[0].id, Stage.REVIEW).runs[-1]
+    recovered_task = recovered.task(config.chapters[0].id, Stage.REVIEW)
+    recovered_run = recovered_task.runs[-1]
 
+    assert recovered_task.status == TaskStatus.PENDING
+    assert recovered_task.phase == TaskPhase.RECOVERING
     assert recovered_run.status == TaskStatus.FAILED
     assert recovered_run.report is None
     recovered.load_run_details(recovered_run)
@@ -1727,6 +1731,12 @@ async def test_changed_green_dependency_invalidates_descendant_before_review(
 
     monkeypatch.setattr(first_run, "_review_once", first_review)
     assert await first_run._review_tree()
+    await first_run.state.set_task(
+        second.id,
+        Stage.PROVE,
+        TaskStatus.SUCCEEDED,
+        "no placeholders and chapter elaborates",
+    )
     await first_run.shutdown()
 
     first_path.write_text("def first := 2\n", encoding="utf-8")
@@ -1745,6 +1755,7 @@ async def test_changed_green_dependency_invalidates_descendant_before_review(
     assert await restarted._review_tree()
     assert builds == [first.id, second.id]
     assert reviews == [first.id, second.id]
+    assert restarted.state.task(second.id, Stage.PROVE).status == TaskStatus.PENDING
     await restarted.shutdown()
 
 
@@ -1777,6 +1788,9 @@ async def test_upstream_proof_starts_before_downstream_review_finishes(
     ) -> bool:
         assert not rerun
         if chapter.id == second.id:
+            assert orchestrator.state.task(second.id, Stage.REVIEW).phase == (
+                TaskPhase.WAITING_BUILD
+            )
             await upstream_proof_started.wait()
             events.append(f"review:{chapter.id}")
             finish_upstream_proof.set()
