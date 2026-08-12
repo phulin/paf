@@ -132,6 +132,7 @@ class TaskRecord:
     status: str = TaskStatus.PENDING
     phase: str = TaskPhase.IDLE
     detail: str = ""
+    checkpoint: str | None = None
     rounds: int = 0
     updated_at: str = field(default_factory=timestamp)
     runs: list[RunRecord] = field(default_factory=list)
@@ -286,9 +287,19 @@ class StateStore:
         self._prior_run_ids = set(self._runs_by_id)
         recovered_runs: list[RunRecord] = []
         for task in self.tasks.values():
+            if (
+                task.stage == Stage.REVIEW
+                and task.status == TaskStatus.SUCCEEDED
+                and task.detail == "review changes merged; awaiting dependency-ordered rebuild"
+            ):
+                task.status = TaskStatus.PENDING
+                task.phase = TaskPhase.IDLE
+                task.checkpoint = None
+                task.detail = "legacy changed review awaiting rebuild and revalidation"
             if task.status == TaskStatus.RUNNING:
                 task.status = TaskStatus.PENDING
                 task.phase = TaskPhase.IDLE
+                task.checkpoint = None
                 task.detail = "recovered after interrupted orchestrator"
                 for run in task.runs:
                     if run.status == TaskStatus.RUNNING:
@@ -687,6 +698,7 @@ class StateStore:
         detail: str,
         *,
         phase: TaskPhase | None = None,
+        checkpoint: str | None = None,
     ) -> None:
         task = self.task(chapter_id, stage)
         task.status = status
@@ -694,6 +706,11 @@ class StateStore:
             task.phase = phase
         elif status != TaskStatus.RUNNING:
             task.phase = TaskPhase.IDLE
+        if status == TaskStatus.SUCCEEDED:
+            if checkpoint is not None:
+                task.checkpoint = checkpoint
+        else:
+            task.checkpoint = None
         task.detail = detail
         task.updated_at = timestamp()
         self._invalidate_status_summaries()
@@ -721,6 +738,8 @@ class StateStore:
                 task.phase = phase
             elif status != TaskStatus.RUNNING:
                 task.phase = TaskPhase.IDLE
+            if status != TaskStatus.SUCCEEDED:
+                task.checkpoint = None
             task.detail = detail
             task.updated_at = updated_at
             changed = True
@@ -737,6 +756,7 @@ class StateStore:
                 continue
             task.status = TaskStatus.PENDING
             task.phase = TaskPhase.IDLE
+            task.checkpoint = None
             task.detail = "manually unblocked"
             task.updated_at = timestamp()
             changed.append(key)
@@ -750,6 +770,7 @@ class StateStore:
         task = self.task(chapter_id, stage)
         task.status = TaskStatus.RUNNING
         task.phase = TaskPhase.AGENT
+        task.checkpoint = None
         task.rounds += 1
         task.updated_at = timestamp()
         run = RunRecord(

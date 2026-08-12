@@ -1344,25 +1344,14 @@ class Orchestrator:
         complete = bool(attempt.agent.report.get("complete"))
         routed = self._route_review_findings(chapter, attempt.agent.report)
         if succeeded and complete and not routed:
-            await self.state.set_task(
-                chapter.id,
-                Stage.REVIEW,
-                (
-                    TaskStatus.RUNNING
-                    if attempt.agent.changed
-                    else TaskStatus.SUCCEEDED
-                ),
-                (
-                    "review changes merged; awaiting dependency-ordered rebuild"
-                    if attempt.agent.changed
-                    else "editing review found no actionable issues"
-                ),
-                phase=(
-                    TaskPhase.AWAITING_REBUILD
-                    if attempt.agent.changed
-                    else None
-                ),
-            )
+            if attempt.agent.changed:
+                await self.state.set_task(
+                    chapter.id,
+                    Stage.REVIEW,
+                    TaskStatus.RUNNING,
+                    "review changes merged; awaiting dependency-ordered rebuild",
+                    phase=TaskPhase.AWAITING_REBUILD,
+                )
             return ReviewOutcome(True, attempt.agent.changed, {}, complete=True)
         detail = "review left fixup findings" if routed else "editing review failed"
         await self.state.set_task(
@@ -1377,6 +1366,63 @@ class Orchestrator:
             routed,
             complete=complete,
         )
+
+    def _review_checkpoint(self, chapter_id: str) -> str:
+        clean = self.state.fixup_graph.get("clean", {})
+        record = clean.get(chapter_id) if isinstance(clean, dict) else None
+        certificate = record.get("certificate") if isinstance(record, dict) else None
+        if not isinstance(certificate, str) or not certificate:
+            raise RuntimeError(f"cannot complete review without a green certificate: {chapter_id}")
+        return certificate
+
+    async def _complete_review(self, chapter: Chapter, detail: str) -> None:
+        await self.state.set_task(
+            chapter.id,
+            Stage.REVIEW,
+            TaskStatus.SUCCEEDED,
+            detail,
+            checkpoint=self._review_checkpoint(chapter.id),
+        )
+
+    async def _reconcile_review_checkpoints(
+        self,
+        graph: ChapterImportGraph,
+    ) -> set[str]:
+        """Return review-complete chapters after reconciling durable certificates."""
+
+        persisted = self.state.fixup_graph.get("clean", {})
+        records = persisted if isinstance(persisted, dict) else {}
+        clean = self._retain_fixup_clean(graph, records)
+        reviewed: set[str] = set()
+        async with self.state.batch():
+            for chapter in self.chapters:
+                task = self.state.task(chapter.id, Stage.REVIEW)
+                record = clean.get(chapter.id)
+                certificate = record.get("certificate") if isinstance(record, dict) else None
+                if task.status != TaskStatus.SUCCEEDED:
+                    continue
+                if isinstance(certificate, str) and task.checkpoint == certificate:
+                    reviewed.add(chapter.id)
+                    continue
+                if isinstance(certificate, str) and task.checkpoint is None:
+                    # Version-7 states predate review checkpoints. A final success
+                    # against a still-valid green build can be adopted once.
+                    await self.state.set_task(
+                        chapter.id,
+                        Stage.REVIEW,
+                        TaskStatus.SUCCEEDED,
+                        task.detail,
+                        checkpoint=certificate,
+                    )
+                    reviewed.add(chapter.id)
+                    continue
+                await self.state.set_task(
+                    chapter.id,
+                    Stage.REVIEW,
+                    TaskStatus.PENDING,
+                    "review checkpoint invalidated by source or dependency changes",
+                )
+        return reviewed
 
     async def _review_chapter_to_clean(
         self,
@@ -1396,9 +1442,19 @@ class Orchestrator:
             persisted = self.state.fixup_graph.get("clean", {})
             records = persisted if isinstance(persisted, dict) else {}
             was_clean = chapter.id in self._retain_fixup_clean(graph, records)
+            record = records.get(chapter.id)
+            certificate = record.get("certificate") if isinstance(record, dict) else None
+            review_task = self.state.task(chapter.id, Stage.REVIEW)
+            if (
+                review_was_done
+                and isinstance(certificate, str)
+                and review_task.checkpoint == certificate
+                and was_clean
+            ):
+                return True
             if not await self._fixup_to_clean(target_ids={chapter.id}):
                 return False
-        rerun = rerun or (review_was_done and not was_clean)
+        rerun = rerun or (review_was_done and (not was_clean or review_task.checkpoint is not None))
 
         maximum = min(self.config.stages[Stage.REVIEW].max_rounds, 5)
         while rounds_used[chapter.id] < maximum:
@@ -1437,18 +1493,13 @@ class Orchestrator:
                     return False
                 continue
             if not outcome.changed:
+                detail = "editing review found no actionable issues"
                 if findings:
-                    await self.state.set_task(
-                        chapter.id,
-                        Stage.REVIEW,
-                        TaskStatus.SUCCEEDED,
-                        "no-change review findings reconciled by dependency-ordered fixup",
-                    )
+                    detail = "no-change review findings reconciled by dependency-ordered fixup"
+                await self._complete_review(chapter, detail)
                 return True
-        await self.state.set_task(
-            chapter.id,
-            Stage.REVIEW,
-            TaskStatus.SUCCEEDED,
+        await self._complete_review(
+            chapter,
             f"review/rebuild cap reached after {maximum} cycles",
         )
         return True
@@ -1457,14 +1508,19 @@ class Orchestrator:
         """Release dependency-ready reviews and proofs without a corpus-wide review gate."""
 
         by_id = {chapter.id: chapter for chapter in self.chapters}
-        reviewed: set[str] = set()
+        initial_graph = self._observed_chapter_graph()
+        reviewed = await self._reconcile_review_checkpoints(initial_graph)
         review_failures: set[str] = set()
         review_blocked: set[str] = set()
         attempted: set[str] = set()
         rounds_used = {chapter_id: 0 for chapter_id in by_id}
         review_tasks: dict[str, tuple[asyncio.Task[bool], frozenset[str]]] = {}
         proof_tasks: dict[str, asyncio.Task[bool]] = {}
-        proof_results: dict[str, bool] = {}
+        proof_results = {
+            chapter_id: True
+            for chapter_id in reviewed
+            if self.state.task(chapter_id, Stage.PROVE).status == TaskStatus.SUCCEEDED
+        }
         proof_fixups = {chapter_id: 0 for chapter_id in by_id}
 
         async def cancel_all() -> None:
@@ -1506,6 +1562,13 @@ class Orchestrator:
                             dependencies,
                         )
                         attempted.add(chapter_id)
+
+                if prove:
+                    for chapter_id in reviewed:
+                        if chapter_id not in proof_results and chapter_id not in proof_tasks:
+                            proof_tasks[chapter_id] = asyncio.create_task(
+                                self._prove(by_id[chapter_id])
+                            )
 
                 live_tasks = [task for task, _ in review_tasks.values()]
                 live_tasks.extend(proof_tasks.values())
@@ -1611,6 +1674,19 @@ class Orchestrator:
                         reviewed.discard(invalidated_id)
                         proof_results.pop(invalidated_id, None)
                         rounds_used[invalidated_id] = 0
+                    async with self.state.batch():
+                        await self.state.set_tasks(
+                            invalidated,
+                            Stage.REVIEW,
+                            TaskStatus.PENDING,
+                            "review invalidated by proof-requested statement fixup",
+                        )
+                        await self.state.set_tasks(
+                            invalidated,
+                            Stage.PROVE,
+                            TaskStatus.PENDING,
+                            "waiting for invalidated statement review",
+                        )
                     await asyncio.gather(*cancelled, return_exceptions=True)
 
                     async with self.fixup_lock:

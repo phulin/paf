@@ -200,6 +200,28 @@ async def test_state_persists_fixup_graph(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_state_recovers_legacy_changed_review_as_pending(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = config.chapters[0]
+    state = StateStore(config)
+    await state.load_or_create()
+    await state.set_task(
+        chapter.id,
+        Stage.REVIEW,
+        TaskStatus.SUCCEEDED,
+        "review changes merged; awaiting dependency-ordered rebuild",
+    )
+
+    recovered = StateStore(config)
+    await recovered.load_or_create()
+    task = recovered.task(chapter.id, Stage.REVIEW)
+
+    assert task.status == TaskStatus.PENDING
+    assert task.checkpoint is None
+    assert task.detail == "legacy changed review awaiting rebuild and revalidation"
+
+
+@pytest.mark.asyncio
 async def test_hot_checkpoint_does_not_grow_with_run_payload_history(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
     state = StateStore(config)
@@ -1393,6 +1415,7 @@ async def test_incomplete_review_routes_fixup_and_retries(
         target_ids: object = None,
     ) -> bool:
         fixups.append((feedback, target_ids))
+        state.fixup_graph["clean"] = {chapter.id: {"certificate": "test-green-certificate"}}
         return True
 
     monkeypatch.setattr(orchestrator, "_review_once", review)
@@ -1530,6 +1553,9 @@ async def test_review_is_capped_at_five_edit_rebuild_cycles(
         nonlocal rebuilds
         assert target_ids == {config.chapters[0].id}
         rebuilds += 1
+        orchestrator.state.fixup_graph["clean"] = {
+            config.chapters[0].id: {"certificate": "test-green-certificate"}
+        }
         return True
 
     monkeypatch.setattr(orchestrator, "_review_once", changed_review)
@@ -1597,7 +1623,7 @@ async def test_pipeline_reviews_each_chapter_as_soon_as_its_build_is_green(
 
 
 @pytest.mark.asyncio
-async def test_review_restart_reuses_green_certificates_without_rebuilding(
+async def test_review_restart_seeds_proofs_from_checkpoints_without_rebuilding(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = with_lastlib_modules(
@@ -1625,24 +1651,42 @@ async def test_review_restart_reuses_green_certificates_without_rebuilding(
     first_run = Orchestrator(config, StateStore(config))
     await first_run.prepare()
     assert await first_run._fixup_to_clean(target_ids={first.id, second.id})
+    first_reviews: list[str] = []
+
+    async def first_review(chapter: Chapter, *, rerun: bool = False) -> ReviewOutcome:
+        assert not rerun
+        first_reviews.append(chapter.id)
+        return ReviewOutcome(True, False, {})
+
+    monkeypatch.setattr(first_run, "_review_once", first_review)
+    assert await first_run._review_tree()
+    assert first_reviews == [first.id, second.id]
+    assert all(
+        first_run.state.task(chapter.id, Stage.REVIEW).checkpoint
+        == first_run.state.fixup_graph["clean"][chapter.id]["certificate"]
+        for chapter in config.chapters
+    )
     await first_run.shutdown()
     assert builds == [first.id, second.id]
 
     builds.clear()
-    reviews: list[str] = []
+    proofs: list[str] = []
     restarted = Orchestrator(config, StateStore(config))
     await restarted.prepare()
 
-    async def review(chapter: Chapter, *, rerun: bool = False) -> ReviewOutcome:
-        assert not rerun
-        reviews.append(chapter.id)
-        return ReviewOutcome(True, False, {})
+    async def review(_chapter: Chapter, *, rerun: bool = False) -> ReviewOutcome:
+        raise AssertionError("valid review checkpoints must not rerun")
+
+    async def prove(chapter: Chapter) -> bool:
+        proofs.append(chapter.id)
+        return True
 
     monkeypatch.setattr(restarted, "_review_once", review)
+    monkeypatch.setattr(restarted, "_prove", prove)
 
-    assert await restarted._review_tree()
+    assert await restarted._review_tree(prove=True)
     assert builds == []
-    assert reviews == [first.id, second.id]
+    assert set(proofs) == {first.id, second.id}
     await restarted.shutdown()
 
 
@@ -1676,6 +1720,13 @@ async def test_changed_green_dependency_invalidates_descendant_before_review(
     first_run = Orchestrator(config, StateStore(config))
     await first_run.prepare()
     assert await first_run._fixup_to_clean(target_ids={first.id, second.id})
+
+    async def first_review(_chapter: Chapter, *, rerun: bool = False) -> ReviewOutcome:
+        assert not rerun
+        return ReviewOutcome(True, False, {})
+
+    monkeypatch.setattr(first_run, "_review_once", first_review)
+    assert await first_run._review_tree()
     await first_run.shutdown()
 
     first_path.write_text("def first := 2\n", encoding="utf-8")
@@ -1713,6 +1764,7 @@ async def test_upstream_proof_starts_before_downstream_review_finishes(
         encoding="utf-8",
     )
     orchestrator = Orchestrator(config, StateStore(config))
+    await orchestrator.prepare()
     upstream_proof_started = asyncio.Event()
     finish_upstream_proof = asyncio.Event()
     events: list[str] = []
@@ -1744,6 +1796,7 @@ async def test_upstream_proof_starts_before_downstream_review_finishes(
 
     assert await orchestrator._review_tree(prove=True)
     assert events.index(f"prove:{first.id}") < events.index(f"review:{second.id}")
+    await orchestrator.shutdown()
     assert events.index(f"review:{first.id}") < events.index(f"review:{second.id}")
 
 
