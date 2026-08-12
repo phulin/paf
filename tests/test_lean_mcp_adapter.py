@@ -5,7 +5,7 @@ from typing import Any
 
 import pytest
 
-from lastlib_swarm.lean_mcp import reload_with_dependencies_on_switch
+from lastlib_swarm.lean_mcp import reload_with_dependencies_when_stale
 
 
 @dataclass
@@ -30,28 +30,25 @@ class FakeClient:
 
 
 @pytest.mark.asyncio
-async def test_reopens_once_on_each_file_switch_and_stale_notification() -> None:
+async def test_reopens_with_dependencies_only_after_stale_notification() -> None:
     client = FakeClient()
 
     async def original(_client: Any, path: str, wait: bool) -> FakeDocument:
         client.events.append(("reload", path, wait))
-        return client._docs[path]
+        return client._docs.setdefault(path, FakeDocument())
 
-    await reload_with_dependencies_on_switch(client, "A.lean", original=original)
-    await reload_with_dependencies_on_switch(client, "A.lean", original=original)
-    await reload_with_dependencies_on_switch(client, "B.lean", original=original)
-    await reload_with_dependencies_on_switch(client, "A.lean", original=original)
+    await reload_with_dependencies_when_stale(client, "A.lean", original=original)
+    await reload_with_dependencies_when_stale(client, "A.lean", original=original)
+    await reload_with_dependencies_when_stale(client, "B.lean", original=original)
+    await reload_with_dependencies_when_stale(client, "A.lean", original=original)
     client._docs["A.lean"].stale_imports = True
-    await reload_with_dependencies_on_switch(client, "A.lean", original=original)
+    await reload_with_dependencies_when_stale(client, "A.lean", original=original)
 
     assert client.events == [
-        ("close", "A.lean"),
-        ("open", "A.lean", False, "once"),
         ("reload", "A.lean", False),
-        ("close", "B.lean"),
-        ("open", "B.lean", False, "once"),
-        ("close", "A.lean"),
-        ("open", "A.lean", False, "once"),
+        ("reload", "A.lean", False),
+        ("reload", "B.lean", False),
+        ("reload", "A.lean", False),
         ("close", "A.lean"),
         ("open", "A.lean", False, "once"),
     ]

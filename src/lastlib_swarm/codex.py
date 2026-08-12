@@ -448,6 +448,8 @@ in this stage: replace an obstructing proof body with `by sorry`.
 Request fresh whole-file diagnostics after every edit.""",
             Stage.REVIEW: """Audit the assigned chapter and directly make every warranted in-scope
 statement or API change. Preserve proof placeholders and do not spend time proving propositions.
+Derive the assigned files' import DAG and process them from prerequisites to dependents for reading,
+editing, and diagnostics. Revisit a dependent only after an edited prerequisite is clean.
 Use the attached Lean MCP throughout the review and return only after every assigned Lean file has
 clean whole-file diagnostics, allowing only the exact “declaration uses `sorry`” warning.
 After every edit, request fresh diagnostics for the edited file and every assigned dependent that

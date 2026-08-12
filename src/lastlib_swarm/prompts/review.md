@@ -27,19 +27,23 @@ precede its users, and be independently provable from earlier declarations.
 
 ## Workflow
 
-1. Audit source coverage and the mathematical fidelity of every declaration.
-2. Audit proof readiness, dependency routes, and missing reusable interfaces.
-3. Make the minimal in-scope fix for every inaccurate, circular, vacuous, or unprovable statement.
+1. Read the assigned files' `import` lines, construct their local dependency order, and traverse the
+   files from imported prerequisites to their dependents. Keep this topological order for the audit,
+   edits, and final diagnostic pass; do not repeatedly bounce between unrelated files. If an edit
+   invalidates an already-visited dependent, revisit that dependent after its prerequisites are clean.
+2. Audit source coverage and the mathematical fidelity of every declaration.
+3. Audit proof readiness, dependency routes, and missing reusable interfaces.
+4. Make the minimal in-scope fix for every inaccurate, circular, vacuous, or unprovable statement.
    For each unresolved or out-of-scope source-changing issue, emit a `fixup_findings` entry with every
    exact repository-relative Lean path that must still be edited. Include prospective missing-file
    paths and split repairs that belong to different chapters.
-4. Keep the assigned scope compatible with the coordinator's clean-build baseline.
-5. Audit imports in every file reviewed or changed against the common focused-import policy.
-6. Use the attached Lean MCP to request whole-file diagnostics for every assigned Lean file. After
+5. Keep the assigned scope compatible with the coordinator's clean-build baseline.
+6. Audit imports in every file reviewed or changed against the common focused-import policy.
+7. Use the attached Lean MCP to request whole-file diagnostics for every assigned Lean file. After
    each edit, request fresh diagnostics for the edited file and every assigned dependent that may be
    affected. Resolve every diagnostic except the exact “declaration uses `sorry`” warning before
    finishing.
-7. Recheck the complete chapter and return structured, actionable findings.
+8. Recheck the complete chapter in dependency order and return structured, actionable findings.
 
 Do not run Lean, Lake, or another language server; use only the attached Lean MCP. Edit only the
 assigned scope. Do not report completion until all assigned files have clean final MCP diagnostics,

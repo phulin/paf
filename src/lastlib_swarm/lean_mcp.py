@@ -10,38 +10,38 @@ from leanclient.aio import AsyncLeanLSPClient
 
 Reload = Callable[[AsyncLeanLSPClient, str, bool], Awaitable[Any]]
 _ORIGINAL_RELOAD = AsyncLeanLSPClient.reload_from_disk
-_SWITCH_LOCKS: WeakKeyDictionary[Any, asyncio.Lock] = WeakKeyDictionary()
-_ACTIVE_PATHS: WeakKeyDictionary[Any, str] = WeakKeyDictionary()
+_RELOAD_LOCKS: WeakKeyDictionary[Any, asyncio.Lock] = WeakKeyDictionary()
 
 
-async def reload_with_dependencies_on_switch(
+async def reload_with_dependencies_when_stale(
     self: Any,
     path: str,
     wait: bool = False,
     *,
     original: Reload = _ORIGINAL_RELOAD,
 ) -> Any:
-    """Reopen a newly selected file with one Lean dependency-build pass."""
+    """Reopen a file with dependency preparation only after Lean marks its imports stale."""
 
-    lock = _SWITCH_LOCKS.get(self)
+    lock = _RELOAD_LOCKS.get(self)
     if lock is None:
         lock = asyncio.Lock()
-        _SWITCH_LOCKS[self] = lock
+        _RELOAD_LOCKS[self] = lock
     async with lock:
-        previous = _ACTIVE_PATHS.get(self)
         document = self._docs.get(path)
         stale = document is not None and document.stale_imports
-        if previous != path or stale:
+        if stale:
             await self.close_file(path)
-            result = await self.open(path, wait=wait, dependency_build_mode="once")
-            _ACTIVE_PATHS[self] = path
-            return result
+            return await self.open(path, wait=wait, dependency_build_mode="once")
         return await original(self, path, wait)
+
+
+# Preserve imports from before stale-only reload semantics were introduced.
+reload_with_dependencies_on_switch = reload_with_dependencies_when_stale
 
 
 def install_dependency_reopens() -> None:
     client_type: Any = AsyncLeanLSPClient
-    client_type.reload_from_disk = reload_with_dependencies_on_switch
+    client_type.reload_from_disk = reload_with_dependencies_when_stale
 
 
 def main() -> int:
