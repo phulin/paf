@@ -162,6 +162,29 @@ async def test_fuse_overlay_lazily_detaches_busy_stale_mount(
 
 
 @pytest.mark.asyncio
+async def test_fuse_overlay_reclaims_disconnected_mount(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager, _ = fuse_manager(write_project(tmp_path, chapters="chapters = [1]"))
+    stale = manager.parent / f"{manager.identity}-999999999"
+    merged = stale / "slots" / "0000-dead" / "merged"
+    merged.mkdir(parents=True)
+    commands: list[tuple[str, ...]] = []
+
+    async def fake_run(*command: str) -> None:
+        commands.append(command)
+
+    monkeypatch.setattr(isolation_module, "_mount_points", lambda: {merged})
+    monkeypatch.setattr(os.path, "ismount", lambda _path: False)
+    monkeypatch.setattr(manager, "_run", fake_run)
+
+    await manager._clean_stale_roots()
+
+    assert commands == [("fusermount3", "-u", str(merged))]
+    assert not stale.exists()
+
+
+@pytest.mark.asyncio
 async def test_fuse_overlay_imports_scope_and_rejects_a_stale_writer(tmp_path: Path) -> None:
     manager, chapter = fuse_manager(write_project(tmp_path, chapters="chapters = [1]"))
     await manager.prepare()

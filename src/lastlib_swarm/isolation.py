@@ -53,6 +53,26 @@ def fuse_overlay_available() -> bool:
     )
 
 
+def _mount_points() -> set[Path]:
+    """Read mount paths without stat-ing potentially disconnected FUSE endpoints."""
+
+    try:
+        lines = Path("/proc/self/mountinfo").read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return set()
+    return {
+        Path(
+            field.replace("\\040", " ")
+            .replace("\\011", "\t")
+            .replace("\\012", "\n")
+            .replace("\\134", "\\")
+        )
+        for line in lines
+        if len(fields := line.split()) >= 5
+        for field in (fields[4],)
+    }
+
+
 def _excluded(relative: str, prefixes: tuple[str, ...]) -> bool:
     return any(relative == prefix or relative.startswith(prefix + "/") for prefix in prefixes)
 
@@ -261,6 +281,7 @@ class FuseOverlayIsolation:
 
         if not self.parent.exists():
             return
+        mounted = _mount_points()
         for stale in self.parent.glob(f"{self.identity}-*"):
             if stale == self.root:
                 continue
@@ -274,7 +295,9 @@ class FuseOverlayIsolation:
             else:
                 continue
             for merged in stale.glob("slots/*/merged"):
-                if os.path.ismount(merged):
+                # os.path.ismount() returns False when lstat() reports ENOTCONN, which is exactly
+                # how a dead fuse-overlayfs mount presents. /proc/self/mountinfo remains readable.
+                if merged in mounted or os.path.ismount(merged):
                     await self._unmount(merged)
             shutil.rmtree(stale)
 
