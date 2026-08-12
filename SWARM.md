@@ -164,6 +164,9 @@ configured runs. `--isolation auto|fuse-overlay|shared` selects the execution ba
 
 Use `--no-lean-mcp` to run the proof stage without the Lean MCP integration.
 
+After a foreground TUI closes with a failed result, the CLI prints the failed task details, compact
+agent/build diagnostics, blocked dependents, and persisted state path to standard output.
+
 ## Lean LSP MCP proof loop
 
 Every proof attempt receives its own locked

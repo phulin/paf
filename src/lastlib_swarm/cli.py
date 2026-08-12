@@ -34,7 +34,7 @@ from lastlib_swarm.isolation import fuse_overlay_available
 from lastlib_swarm.models import Chapter, PipelineConfig, Stage
 from lastlib_swarm.pricing import LEGACY_MODEL, CostEstimate, estimate_cost, format_usd
 from lastlib_swarm.scheduler import Orchestrator, scaffold_directories
-from lastlib_swarm.state import StateStore, TaskStatus
+from lastlib_swarm.state import StateStore, TaskRecord, TaskStatus
 from lastlib_swarm.state_db import read_checkpoint, read_full_snapshot
 from lastlib_swarm.tui import format_count, format_usage, run_tui
 
@@ -349,6 +349,107 @@ def _read_status(config: PipelineConfig) -> dict[str, object] | None:
     return read_checkpoint(config.settings.state_dir)
 
 
+def _failure_excerpt(value: object, *, maximum_lines: int = 10, maximum_chars: int = 1600) -> str:
+    lines = [line.strip() for line in str(value).splitlines() if line.strip()]
+    text = "\n".join(lines[-maximum_lines:])
+    if len(text) > maximum_chars:
+        text = "…" + text[-(maximum_chars - 1) :]
+    return text
+
+
+def _task_failure_details(state: StateStore, task: TaskRecord) -> list[str]:
+    details: list[str] = []
+
+    def add(value: object) -> None:
+        detail = _failure_excerpt(value)
+        if detail and detail not in details:
+            details.append(detail)
+
+    add(getattr(task, "detail", ""))
+    runs = getattr(task, "runs", ())
+    if not runs:
+        return details
+    run = runs[-1]
+    state.load_run_details(run)
+    activity = state.activities.get(run.id)
+    if activity is not None:
+        add(reportable_error(activity.latest_error))
+    report = run.report
+    if isinstance(report, dict):
+        add(report.get("summary", ""))
+        issues = report.get("issues")
+        if isinstance(issues, list):
+            for issue in issues:
+                add(issue)
+        findings = report.get("fixup_findings")
+        if isinstance(findings, list):
+            for finding in findings:
+                if isinstance(finding, dict):
+                    add(finding.get("description", ""))
+    validation = run.validation
+    if isinstance(validation, dict) and not validation.get("succeeded", True):
+        add(validation.get("output", ""))
+    isolation = run.isolation
+    if isinstance(isolation, dict) and not isolation.get("accepted", True):
+        add(isolation.get("error", ""))
+    return details
+
+
+def _print_failure_summary(
+    state: StateStore,
+    console: Console,
+    *,
+    chapter_ids: set[str] | None = None,
+) -> None:
+    def selected(task: TaskRecord) -> bool:
+        return chapter_ids is None or task.chapter_id in chapter_ids
+
+    failed = sorted(
+        (
+            task
+            for task in state.tasks.values()
+            if selected(task) and task.status == TaskStatus.FAILED
+        ),
+        key=lambda task: (task.book_id, task.chapter_number, task.stage),
+    )
+    blocked = sorted(
+        (
+            task
+            for task in state.tasks.values()
+            if selected(task) and task.status == TaskStatus.BLOCKED
+        ),
+        key=lambda task: (task.book_id, task.chapter_number, task.stage),
+    )
+    console.print("\nFailure details", style="bold red")
+    if failed:
+        for task in failed:
+            console.print(
+                f"- {task.chapter_id} [{task.stage}]",
+                style="bold red",
+                markup=False,
+            )
+            for detail in _task_failure_details(state, task):
+                for line in detail.splitlines():
+                    console.print(f"    {line}", markup=False)
+    else:
+        console.print("- No failed task detail was recorded.", markup=False)
+
+    build = state.coordinator_build
+    if build.error_count and build.output_tail:
+        console.print("Coordinator build", style="bold red")
+        for line in build.output_tail[-12:]:
+            console.print(f"    {line}", markup=False)
+
+    if blocked:
+        console.print(f"Blocked dependents ({len(blocked)})", style="bold yellow")
+        for task in blocked:
+            console.print(
+                f"- {task.chapter_id} [{task.stage}]: {task.detail}",
+                markup=False,
+            )
+    console.print(f"State: {state.path}", markup=False)
+
+
 def print_status(config: PipelineConfig, console: Console, *, raw_json: bool) -> int:
     snapshot = _read_status(config)
     if snapshot is None:
@@ -483,7 +584,15 @@ def _run(args: argparse.Namespace, config: PipelineConfig, console: Console) -> 
     console.print(f"API-equivalent cost: {format_usd(cost)}")
     console.print(f"Lifetime tokens: {format_count(lifetime_usage.total_tokens)}")
     console.print(f"Lifetime API-equivalent cost: {format_usd(lifetime_cost)}")
-    console.print("Completed successfully" if succeeded else "Finished with failures")
+    if succeeded:
+        console.print("Completed successfully")
+    else:
+        console.print("Finished with failures")
+        _print_failure_summary(
+            state,
+            console,
+            chapter_ids={chapter.id for chapter in chapters},
+        )
     return 0 if succeeded else 1
 
 

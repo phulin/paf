@@ -1,3 +1,4 @@
+import argparse
 import asyncio
 import json
 import sys
@@ -5,6 +6,7 @@ from io import StringIO
 from pathlib import Path
 
 import pytest
+from rich.console import Console
 
 import lastlib_swarm.cli as cli_module
 from lastlib_swarm.cli import main, select_chapters
@@ -13,6 +15,107 @@ from lastlib_swarm.models import PipelineConfig, Stage
 from lastlib_swarm.state import StateStore, TaskStatus
 from lastlib_swarm.state_db import read_full_snapshot
 from tests.support import write_project
+
+
+def test_failure_summary_prints_task_build_and_blocker_details(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    state = StateStore(config)
+    chapter = config.chapters[0]
+
+    async def populate() -> None:
+        await state.load_or_create()
+        run = await state.start_run(chapter.id, Stage.REVIEW)
+        activity = state.activities.start(run.id, run.chapter_id, run.stage)
+        activity.latest_error = "Codex returned no structured final report"
+        state.activities.save(activity)
+        await state.finish_run(
+            run,
+            status=TaskStatus.FAILED,
+            report={
+                "summary": "Review found a remaining interface defect.",
+                "issues": ["The theorem needs a positivity hypothesis."],
+                "fixup_findings": [{"description": "Add the missing positivity hypothesis."}],
+            },
+            validation={
+                "succeeded": False,
+                "output": "error: Book/Chapter01.lean:7:3: type mismatch",
+            },
+        )
+        await state.set_task(
+            chapter.id,
+            Stage.REVIEW,
+            TaskStatus.FAILED,
+            "review left fixup findings",
+        )
+        await state.set_task(
+            chapter.id,
+            Stage.PROVE,
+            TaskStatus.BLOCKED,
+            "blocked because statement review did not complete",
+        )
+        await state.start_coordinator_build(
+            mode="targeted",
+            stage=Stage.FIXUP,
+            iteration=1,
+            maximum_iterations=1,
+            total=1,
+        )
+        state.append_coordinator_build_output(
+            "error: Book/Chapter01.lean:7:3: type mismatch",
+            error_count=1,
+        )
+        await state.finish_coordinator_build()
+
+    asyncio.run(populate())
+    output = StringIO()
+    console = Console(file=output, force_terminal=False, color_system=None, width=160)
+
+    cli_module._print_failure_summary(state, console)
+
+    rendered = output.getvalue()
+    assert "Failure details" in rendered
+    assert "book/chapter-01 [review]" in rendered
+    assert "The theorem needs a positivity hypothesis." in rendered
+    assert "Codex returned no structured final report" in rendered
+    assert "type mismatch" in rendered
+    assert "Coordinator build" in rendered
+    assert "Blocked dependents (1)" in rendered
+    assert str(state.path) in rendered
+
+
+def test_run_prints_failure_summary_after_tui_closes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    events: list[str] = []
+
+    def run_tui(*_args: object, **_kwargs: object) -> bool:
+        events.append("tui-closed")
+        return False
+
+    def print_summary(
+        _state: StateStore,
+        _console: Console,
+        *,
+        chapter_ids: set[str] | None = None,
+    ) -> None:
+        assert chapter_ids == {config.chapters[0].id}
+        events.append("summary-printed")
+
+    monkeypatch.setattr(cli_module, "run_tui", run_tui)
+    monkeypatch.setattr(cli_module, "_print_failure_summary", print_summary)
+    args = argparse.Namespace(
+        book=[],
+        chapter=[],
+        force=False,
+        command="pipeline",
+        no_tui=False,
+        startup_warning="",
+    )
+    console = Console(file=StringIO(), force_terminal=False, color_system=None)
+
+    assert cli_module._run(args, config, console) == 1
+    assert events == ["tui-closed", "summary-printed"]
 
 
 def test_selects_book_and_chapter_number(tmp_path: Path) -> None:
