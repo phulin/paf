@@ -2,8 +2,11 @@
 
 ## Mission
 
-Read chapter {chapter_number}, “{chapter_title},” in `{source}` and every assigned Lean file under
-`{lean_root}/{chapter_path}/` plus `{lean_root}/{chapter_path}.lean`. Independently determine whether
+Use the line-numbered source set prepended to this prompt as your initial read of chapter
+{chapter_number}, “{chapter_title},” in `{source}` and every assigned Lean file under
+`{lean_root}/{chapter_path}/` plus `{lean_root}/{chapter_path}.lean`. Do not reread a complete supplied
+file from the filesystem; inspect the filesystem only for explicitly missing or truncated content,
+post-edit content, or a targeted search or lookup. Independently determine whether
 the formalization is source-faithful, mathematically provable, proof-ready, and acyclic, and directly
 make the minimal warranted changes in the assigned scope. The snapshot starts clean; the coordinator
 has already certified that every assigned file has no diagnostic except permitted `sorry` warnings.
@@ -28,10 +31,11 @@ precede its users, and be independently provable from earlier declarations.
 
 ## Workflow
 
-1. Read the assigned files' `import` lines, construct their local dependency order, and traverse the
-   files from imported prerequisites to their dependents. Keep this topological order for the audit,
-   edits, and final diagnostic pass; do not repeatedly bounce between unrelated files. If an edit
-   invalidates an already-visited dependent, revisit that dependent after its prerequisites are clean.
+1. Use the supplied `import` lines to construct the assigned files' local dependency order, using a
+   targeted filesystem search only if the supplied content is missing or truncated. Traverse the files
+   from imported prerequisites to their dependents. Keep this topological order for the audit, edits,
+   and final diagnostic pass; do not repeatedly bounce between unrelated files. If an edit invalidates
+   an already-visited dependent, revisit that dependent after its prerequisites are clean.
 2. Audit source coverage and the mathematical fidelity of every declaration.
 3. Audit proof readiness, dependency routes, and missing reusable interfaces.
 4. Make the minimal in-scope fix for every inaccurate, circular, vacuous, or unprovable statement.

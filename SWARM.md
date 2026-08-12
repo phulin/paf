@@ -39,7 +39,9 @@ directly make scoped statement and API repairs. Each dependency-ready chapter is
 changed review and sent through fixup if needed. After at most five such cycles—or immediately after
 a no-change review—the chapter is released to proving without waiting for reviews of its descendants.
 Every review prompt begins with the complete informal book and assigned Lean file set in path order
-with numbered lines, capped at 300,000 characters. Fixup, review, and proof agents receive Lean MCP;
+with numbered lines, capped at 500,000 characters. The supplied snapshot counts as the reviewer's
+initial read; filesystem reads are reserved for missing or truncated content, post-edit content, and
+targeted searches or lookups. Fixup, review, and proof agents receive Lean MCP;
 reviewers trust the incoming green certificate for untouched files and request whole-file diagnostics
 only for files they edit and the assigned transitive dependents invalidated by those edits. A
 no-change review therefore needs no diagnostic calls.

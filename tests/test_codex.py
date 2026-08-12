@@ -329,6 +329,14 @@ def test_review_prompt_starts_with_book_scoped_files_and_line_numbers(tmp_path: 
     prompt = executor.build_prompt(config.chapters[0], Stage.REVIEW)
 
     assert prompt.startswith("# Line-numbered review source set\n")
+    assert "counts as the initial complete read" in prompt
+    assert "Do not reread complete files from the filesystem" in prompt
+    expected_initial_read = (
+        "The line-numbered source set prepended to this prompt "
+        "counts as your initial read"
+    )
+    assert expected_initial_read in prompt
+    assert "import DAG from the supplied import lines" in prompt
     book_header = "## `books/book.md`"
     root_header = "## `lean/Book/Chapter01.lean`"
     child_header = "## `lean/Book/Chapter01/Section02.lean`"
@@ -349,7 +357,8 @@ def test_review_prompt_starts_with_book_scoped_files_and_line_numbers(tmp_path: 
     assert "Line-numbered review source set" not in prove_prompt
 
 
-def test_review_source_bundle_is_capped_at_300k_characters(tmp_path: Path) -> None:
+def test_review_source_bundle_is_capped_at_500k_characters(tmp_path: Path) -> None:
+    assert REVIEW_SOURCE_BUNDLE_MAX_CHARS == 500_000
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
     target = tmp_path / "lean" / "Book" / "Chapter01.lean"
     target.parent.mkdir(parents=True)

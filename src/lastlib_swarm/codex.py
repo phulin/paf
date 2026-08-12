@@ -100,7 +100,7 @@ USAGE_POLL_SECONDS = 0.25
 PROCESS_GROUP_GRACE_SECONDS = 1.0
 COMMON_PROMPT_PATH = Path(__file__).with_name("prompts") / "common.md"
 CAPACITY_RESUME_PROMPT = "Continue from the interrupted turn and complete the assigned task."
-REVIEW_SOURCE_BUNDLE_MAX_CHARS = 300_000
+REVIEW_SOURCE_BUNDLE_MAX_CHARS = 500_000
 
 
 def lean_mcp_executable() -> Path:
@@ -185,8 +185,11 @@ def _review_source_bundle(
 
     parts = [
         "# Line-numbered review source set\n\n",
-        "This snapshot is supplied before the review instructions. "
-        "Paths are repository-relative.\n",
+        "This snapshot is supplied before the review instructions and counts as the initial "
+        "complete read of every file included in full. Do not reread complete files from the "
+        "filesystem. Read from the filesystem only when content is explicitly missing or "
+        "truncated, after you edit a file, or for a targeted search or lookup. Paths are "
+        "repository-relative.\n",
     ]
     source = chapter.source if chapter.source.is_absolute() else repo / chapter.source
     files = {source, *scoped_files(repo, chapter)}
@@ -447,8 +450,11 @@ in this stage: replace an obstructing proof body with `by sorry`.
 Request fresh whole-file diagnostics after every edit.""",
             Stage.REVIEW: """Audit the assigned chapter and directly make every warranted in-scope
 statement or API change. Preserve proof placeholders and do not spend time proving propositions.
-Derive the assigned files' import DAG and process them from prerequisites to dependents for reading,
-editing, and diagnostics. Revisit a dependent only after an edited prerequisite is clean.
+The line-numbered source set prepended to this prompt counts as your initial read. Do not reread a
+complete supplied file from the filesystem; use filesystem reads only for explicitly missing or
+truncated content, post-edit content, or a targeted search or lookup. Derive the assigned files'
+import DAG from the supplied import lines and process them from prerequisites to dependents for the
+audit, editing, and diagnostics. Revisit a dependent only after an edited prerequisite is clean.
 The coordinator has certified the incoming sources and dependencies clean except for permitted
 `sorry` warnings. Trust that certificate for every file left unchanged by this attempt: do not run
 initial or final diagnostics on untouched files. Use the attached Lean MCP on demand. Track the
