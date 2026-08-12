@@ -103,7 +103,7 @@ USAGE_POLL_SECONDS = 0.25
 PROCESS_GROUP_GRACE_SECONDS = 1.0
 COMMON_PROMPT_PATH = Path(__file__).with_name("prompts") / "common.md"
 CAPACITY_RESUME_PROMPT = "Continue from the interrupted turn and complete the assigned task."
-REVIEW_FILE_BUNDLE_MAX_CHARS = 200_000
+REVIEW_SOURCE_BUNDLE_MAX_CHARS = 300_000
 
 
 def lean_mcp_executable() -> Path:
@@ -179,24 +179,33 @@ def scoped_files(repo: Path, chapter: Chapter) -> list[Path]:
     return sorted(files)
 
 
-def _review_file_bundle(
+def _review_source_bundle(
     repo: Path,
     chapter: Chapter,
-    maximum: int = REVIEW_FILE_BUNDLE_MAX_CHARS,
+    maximum: int = REVIEW_SOURCE_BUNDLE_MAX_CHARS,
 ) -> str:
-    """Render the complete assigned file set with stable line numbers and a hard size cap."""
+    """Render the informal book and assigned files with line numbers and a hard size cap."""
 
     parts = [
-        "# Line-numbered assigned file set\n\n",
+        "# Line-numbered review source set\n\n",
         "This snapshot is supplied before the review instructions. "
         "Paths are repository-relative.\n",
     ]
-    files = sorted(scoped_files(repo, chapter), key=lambda path: path.relative_to(repo).as_posix())
-    if not files:
-        parts.append("\n(No files currently exist in the assigned scope.)\n")
-    for path in files:
-        relative = path.relative_to(repo).as_posix()
+    source = chapter.source if chapter.source.is_absolute() else repo / chapter.source
+    files = {source, *scoped_files(repo, chapter)}
+
+    def display_path(path: Path) -> str:
+        try:
+            return path.relative_to(repo).as_posix()
+        except ValueError:
+            return path.as_posix()
+
+    for path in sorted(files, key=display_path):
+        relative = display_path(path)
         parts.append(f"\n## `{relative}`\n\n")
+        if not path.is_file():
+            parts.append("[File is missing from this snapshot.]\n")
+            continue
         contents = path.read_text(encoding="utf-8", errors="replace")
         lines = contents.splitlines()
         if not lines:
@@ -207,7 +216,7 @@ def _review_file_bundle(
     bundle = "".join(parts)
     if len(bundle) <= maximum:
         return bundle
-    marker = f"\n[Assigned file set truncated at {maximum:,} characters.]\n"
+    marker = f"\n[Review source set truncated at {maximum:,} characters.]\n"
     if len(marker) >= maximum:
         return marker[:maximum]
     return bundle[: maximum - len(marker)] + marker
@@ -522,7 +531,7 @@ imports with a compiler command.
         prefix = ""
         if stage is Stage.REVIEW:
             root = workspace_root or self.config.settings.repo
-            prefix = _review_file_bundle(root, chapter).rstrip() + "\n\n"
+            prefix = _review_source_bundle(root, chapter).rstrip() + "\n\n"
         return f"{prefix}{base.rstrip()}\n\n{common.rstrip()}\n{contract}"
 
     def command(

@@ -8,12 +8,12 @@ from pathlib import Path
 import pytest
 
 from lastlib_swarm.codex import (
-    REVIEW_FILE_BUNDLE_MAX_CHARS,
+    REVIEW_SOURCE_BUNDLE_MAX_CHARS,
     CodexExecutor,
     _bounded_feedback,
     _capacity_resume_delay,
     _is_capacity_failure,
-    _review_file_bundle,
+    _review_source_bundle,
     _rollout_usage,
     count_placeholders,
     lean_mcp_executable,
@@ -272,7 +272,7 @@ def test_review_prompt_requires_scoped_edits_and_coordinator_rebuild(tmp_path: P
     assert "read-only" not in prompt
 
 
-def test_review_prompt_starts_with_every_scoped_file_and_line_numbers(tmp_path: Path) -> None:
+def test_review_prompt_starts_with_book_scoped_files_and_line_numbers(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
     root = tmp_path / "lean" / "Book"
     child = root / "Chapter01" / "Section02.lean"
@@ -286,34 +286,38 @@ def test_review_prompt_starts_with_every_scoped_file_and_line_numbers(tmp_path: 
 
     prompt = executor.build_prompt(config.chapters[0], Stage.REVIEW)
 
-    assert prompt.startswith("# Line-numbered assigned file set\n")
+    assert prompt.startswith("# Line-numbered review source set\n")
+    book_header = "## `books/book.md`"
     root_header = "## `lean/Book/Chapter01.lean`"
     child_header = "## `lean/Book/Chapter01/Section02.lean`"
     assert (
-        prompt.index(root_header)
+        prompt.index(book_header)
+        < prompt.index(root_header)
         < prompt.index(child_header)
         < prompt.index("Do A Book chapter 01")
     )
+    assert "     1 | # Book" in prompt
+    assert "     3 | ## 1. First chapter" in prompt
     assert "     1 | import Book.Chapter01.Section02" in prompt
     assert "     2 | " in prompt
     assert "     3 | def chapter := section" in prompt
     assert "     1 | def section := 2" in prompt
 
     prove_prompt = executor.build_prompt(config.chapters[0], Stage.PROVE)
-    assert "Line-numbered assigned file set" not in prove_prompt
+    assert "Line-numbered review source set" not in prove_prompt
 
 
-def test_review_file_bundle_is_capped_at_200k_characters(tmp_path: Path) -> None:
+def test_review_source_bundle_is_capped_at_300k_characters(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
     target = tmp_path / "lean" / "Book" / "Chapter01.lean"
     target.parent.mkdir(parents=True)
-    target.write_text("x" * (REVIEW_FILE_BUNDLE_MAX_CHARS + 10_000), encoding="utf-8")
+    target.write_text("x" * (REVIEW_SOURCE_BUNDLE_MAX_CHARS + 10_000), encoding="utf-8")
 
-    bundle = _review_file_bundle(tmp_path, config.chapters[0])
+    bundle = _review_source_bundle(tmp_path, config.chapters[0])
 
-    assert len(bundle) == REVIEW_FILE_BUNDLE_MAX_CHARS
+    assert len(bundle) == REVIEW_SOURCE_BUNDLE_MAX_CHARS
     assert bundle.endswith(
-        f"[Assigned file set truncated at {REVIEW_FILE_BUNDLE_MAX_CHARS:,} characters.]\n"
+        f"[Review source set truncated at {REVIEW_SOURCE_BUNDLE_MAX_CHARS:,} characters.]\n"
     )
 
 
