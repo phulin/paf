@@ -90,7 +90,8 @@ def _add_overrides(parser: argparse.ArgumentParser) -> None:
         "--lean-mcp",
         action=argparse.BooleanOptionalAction,
         default=None,
-        help="provide proof attempts with an isolated Lean LSP MCP (default: enabled)",
+        help="provide fixup, review, and proof attempts with an isolated Lean LSP MCP "
+        "(default: enabled)",
     )
 
 

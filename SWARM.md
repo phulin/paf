@@ -39,7 +39,8 @@ directly make scoped statement and API repairs. Each dependency-ready chapter is
 changed review and sent through fixup if needed. After at most five such cycles—or immediately after
 a no-change review—the chapter is released to proving without waiting for reviews of its descendants.
 Every review prompt begins with the complete informal book and assigned Lean file set in path order
-with numbered lines, capped at 300,000 characters. Fixup and proof agents receive Lean MCP.
+with numbered lines, capped at 300,000 characters. Fixup, review, and proof agents receive Lean MCP;
+reviewers must return clean whole-file diagnostics for their entire scope after making changes.
 
 For a conventional numbered corpus, point the CLI at the book directory. It discovers all direct
 Markdown children and automatically reads `BOOK_DEPENDENCIES.md` from the repository root:
@@ -68,8 +69,8 @@ uv run lastlib-swarm books/02-finite-extensions-of-local-fields.md
 Passing a `.md` as the first argument is shorthand for `pipeline <target>`. Zero-config runs default
 to `gpt-5.6-luna`, reasoning effort `max`, the packaged generic prompt library under
 `src/lastlib_swarm/prompts/`, automatic execution isolation, and a state directory at
-`.swarm/<inferred-book-id>/`. Fixup and proof attempts attach a private Lean LSP MCP server; drafting
-and review do not. Use
+`.swarm/<inferred-book-id>/`. Fixup, review, and proof attempts attach a private Lean LSP MCP server;
+drafting does not. Use
 `swarm.example.toml` when the inferred layout is not appropriate or when coordinating multiple books.
 
 Any stage may point at a specialized prompt template. Supported replacement fields include
@@ -162,7 +163,7 @@ number would be ambiguous.
 CLI overrides such as `--model`, `--reasoning-effort`, and `--max-agents` work with both inferred and
 configured runs. `--isolation auto|fuse-overlay|shared` selects the execution backend.
 
-Use `--no-lean-mcp` to run the proof stage without the Lean MCP integration.
+Use `--no-lean-mcp` to run fixup, review, and proof stages without the Lean MCP integration.
 
 After a foreground TUI closes with a failed result, the CLI prints the failed task details, compact
 agent/build diagnostics, blocked dependents, and persisted state path to standard output.
@@ -251,9 +252,11 @@ After the daemon exits, `status`, `snapshot`, and `wait` fall back to the persis
   This repeats up to `max_rounds`, allowing `declaration uses sorry` but rejecting other warnings.
 - **Review** visits dependency-ready chapters against a clean source and `.olean` generation. Agents
   make warranted in-scope statement and API changes directly; unresolved findings retain exact edit
-  paths and are routed to their owners. A changed chapter is rebuilt and, on failure, repaired by the
-  same observed-import fixup scheduler. Review/rebuild repeats up to five times and stops early on a
-  no-change review. Once a chapter is clean, its proof agent may start while descendant reviews
+  paths and are routed to their owners. Reviewers use whole-file LSP diagnostics and must leave every
+  assigned file clean except for the exact permitted “declaration uses `sorry`” warning. A changed
+  chapter is rebuilt and, on failure, repaired by the same observed-import fixup scheduler.
+  Review/rebuild repeats up to five times and stops early on a no-change review. Once a chapter is
+  clean, its proof agent may start while descendant reviews
   continue. A reported chapter-local failure is quarantined: unrelated review, fixup, and proof
   branches keep running, while actual dependents are marked blocked. Unexpected coordinator
   exceptions still fail fast after draining live workers. There is no corpus-wide clean-build or

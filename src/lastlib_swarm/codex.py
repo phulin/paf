@@ -450,6 +450,10 @@ in this stage: replace an obstructing proof body with `by sorry`.
 Request fresh whole-file diagnostics after every edit.""",
             Stage.REVIEW: """Audit the assigned chapter and directly make every warranted in-scope
 statement or API change. Preserve proof placeholders and do not spend time proving propositions.
+Use the attached Lean MCP throughout the review and return only after every assigned Lean file has
+clean whole-file diagnostics, allowing only the exact “declaration uses `sorry`” warning.
+After every edit, request fresh diagnostics for the edited file and every assigned dependent that
+may be affected.
 The coordinator merges the scoped patch, then rebuilds it and sends compiler failures through the
 dependency-ordered fixup scheduler. Report only unresolved or out-of-scope edits as
 `needs_fixup`.""",
@@ -501,11 +505,11 @@ stage, clearly preserve or report the obstruction, and continue as far as possib
 unaffected part of the chapter. The coordinator independently checks scoped hashes, placeholders,
 diagnostics, and `{chapter.build_command}`.
 """
-        if self.config.settings.lean_mcp and stage in (Stage.FIXUP, Stage.PROVE):
+        if self.config.settings.lean_mcp and stage in (Stage.FIXUP, Stage.REVIEW, Stage.PROVE):
             capabilities = (
                 "whole-file diagnostics, outline, hover, declaration lookup, local search, "
                 "completions, and code actions"
-                if stage is Stage.FIXUP
+                if stage in (Stage.FIXUP, Stage.REVIEW)
                 else "whole-file diagnostics, goals, hover, declaration lookup, code actions, "
                 "completions, tactic trials, and local search"
             )
@@ -563,9 +567,13 @@ imports with a compiler command.
             command.extend(["--model", settings.model])
         if settings.reasoning_effort:
             command.extend(["--config", f'model_reasoning_effort="{settings.reasoning_effort}"'])
-        if settings.lean_mcp and stage in (Stage.FIXUP, Stage.PROVE):
+        if settings.lean_mcp and stage in (Stage.FIXUP, Stage.REVIEW, Stage.PROVE):
             lean_project = (root / settings.lean_project).resolve()
-            enabled_tools = LEAN_MCP_FIXUP_TOOLS if stage is Stage.FIXUP else LEAN_MCP_PROOF_TOOLS
+            enabled_tools = (
+                LEAN_MCP_FIXUP_TOOLS
+                if stage in (Stage.FIXUP, Stage.REVIEW)
+                else LEAN_MCP_PROOF_TOOLS
+            )
             mcp_config = {
                 "mcp_servers.lastlib_lean.command": str(lean_mcp_executable()),
                 "mcp_servers.lastlib_lean.args": ["-m", "lastlib_swarm.lean_mcp"],

@@ -130,6 +130,19 @@ def test_executor_uses_machine_readable_codex_mode(tmp_path: Path) -> None:
     review_command = executor.command(Stage.REVIEW)
     assert "--dangerously-bypass-approvals-and-sandbox" in review_command
     assert "--sandbox" not in review_command
+    review_overrides = {
+        review_command[index + 1].split("=", 1)[0]: review_command[index + 1].split("=", 1)[1]
+        for index, item in enumerate(review_command[:-1])
+        if item == "--config"
+    }
+    assert "lean_diagnostic_messages" in review_overrides[
+        "mcp_servers.lastlib_lean.enabled_tools"
+    ]
+    assert "lean_code_actions" in review_overrides["mcp_servers.lastlib_lean.enabled_tools"]
+    assert "lean_multi_attempt" not in review_overrides[
+        "mcp_servers.lastlib_lean.enabled_tools"
+    ]
+    assert "lean_build" not in review_overrides["mcp_servers.lastlib_lean.enabled_tools"]
     fixup_command = executor.command(Stage.FIXUP, isolated)
     fixup_overrides = {
         fixup_command[index + 1].split("=", 1)[0]: fixup_command[index + 1].split("=", 1)[1]
@@ -141,8 +154,9 @@ def test_executor_uses_machine_readable_codex_mode(tmp_path: Path) -> None:
     assert "lean_multi_attempt" not in fixup_overrides["mcp_servers.lastlib_lean.enabled_tools"]
     assert "lean_goal" not in fixup_overrides["mcp_servers.lastlib_lean.enabled_tools"]
 
-    for stage in (Stage.FORMALIZE, Stage.REVIEW):
-        assert not any("mcp_servers.lastlib_lean" in item for item in executor.command(stage))
+    assert not any(
+        "mcp_servers.lastlib_lean" in item for item in executor.command(Stage.FORMALIZE)
+    )
 
     resumed = executor.command(Stage.FORMALIZE, isolated, resume_thread_id="capacity-thread")
     assert resumed[:3] == ["codex", "exec", "resume"]
@@ -266,10 +280,18 @@ def test_review_prompt_requires_scoped_edits_and_coordinator_rebuild(tmp_path: P
     executor = CodexExecutor(config, StateStore(config))
 
     prompt = executor.build_prompt(config.chapters[0], Stage.REVIEW)
+    normalized_prompt = " ".join(prompt.split())
 
     assert "directly make every warranted in-scope" in prompt
+    assert "attached Lean MCP" in prompt
+    assert "clean whole-file diagnostics" in prompt
+    assert "request fresh diagnostics for the edited file" in normalized_prompt
     assert "rebuilds it" in prompt
     assert "read-only" not in prompt
+
+    command = executor.command(Stage.REVIEW)
+    assert any("mcp_servers.lastlib_lean.command" in item for item in command)
+    assert any("lean_diagnostic_messages" in item for item in command)
 
 
 def test_review_prompt_starts_with_book_scoped_files_and_line_numbers(tmp_path: Path) -> None:
