@@ -339,7 +339,8 @@ def print_plan(config: PipelineConfig, console: Console) -> None:
     console.print(
         "After drafting, every dependency-ready fixup runs concurrently from observed LastLib "
         "imports. Each completed patch is merged and rebuilt as soon as its refined predecessors "
-        "are clean; a stable build precedes read-only review and proof."
+        "are clean. Editing reviews then follow the same dependency order; each changed chapter is "
+        "rebuilt/fixed before its proof is released, without a corpus-wide review gate."
     )
 
 

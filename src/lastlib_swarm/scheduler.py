@@ -23,7 +23,7 @@ from lastlib_swarm.corpus import (
     scheduling_snapshot,
 )
 from lastlib_swarm.diagnostics import unexpected_lean_warnings
-from lastlib_swarm.isolation import IsolationResult, create_isolation
+from lastlib_swarm.isolation import create_isolation
 from lastlib_swarm.models import Chapter, PipelineConfig, Stage
 from lastlib_swarm.state import RunRecord, StateStore, TaskPhase, TaskStatus
 
@@ -78,6 +78,7 @@ class FormalizeOutcome:
 class ReviewOutcome:
     succeeded: bool
     needs_fixup: bool
+    changed: bool
     feedback_by_owner: dict[str, str]
 
 
@@ -323,6 +324,7 @@ class Orchestrator:
         self.state.scheduling = self.scheduling_snapshot()
         self.agent_slots = PriorityLimiter(config.settings.max_agents)
         self.build_queue = CoordinatorBuildQueue()
+        self.fixup_lock = asyncio.Lock()
 
     def scheduling_snapshot(self) -> dict[str, object]:
         return scheduling_snapshot(self.statement_schedule, self.proof_schedule)
@@ -482,15 +484,7 @@ class Orchestrator:
                 # The agent is finished before this transaction begins. Merge its
                 # scoped source changes, unmount its workspace, and only then build
                 # from the main worktree against the coordinator-owned cache.
-                if stage is Stage.REVIEW and agent.changed:
-                    isolated = IsolationResult(
-                        accepted=False,
-                        generation=getattr(workspace, "generation", 0),
-                        cache_generation=getattr(workspace, "cache_generation", 0),
-                        error="read-only review attempted to change files",
-                    )
-                else:
-                    isolated = await workspace.collect(chapter)
+                isolated = await workspace.collect(chapter)
                 await workspace.close()
                 workspace = None
                 if isolated.accepted:
@@ -971,11 +965,22 @@ class Orchestrator:
         )
         return None
 
-    async def _fixup_to_clean(self, feedback: dict[str, str] | None = None) -> bool:
-        """Converge with an event-driven scheduler over the observed chapter DAG."""
+    async def _fixup_to_clean(
+        self,
+        feedback: dict[str, str] | None = None,
+        *,
+        target_ids: Iterable[str] | None = None,
+    ) -> bool:
+        """Converge globally or until selected targets are clean in the observed DAG."""
 
         pending_feedback = dict(feedback or {})
         by_id = {chapter.id: chapter for chapter in self.chapters}
+        targeted = target_ids is not None
+        goals = set(target_ids or ())
+        unknown_goals = goals.difference(by_id)
+        if unknown_goals:
+            raise ValueError(f"unknown fixup targets: {', '.join(sorted(unknown_goals))}")
+        goals.update(chapter_id for chapter_id in pending_feedback if chapter_id in by_id)
         maximum = self.config.stages[Stage.FIXUP].max_rounds
         attempts = {chapter_id: 0 for chapter_id in by_id}
         running: dict[str, RunningFixupAgent] = {}
@@ -988,6 +993,8 @@ class Orchestrator:
             for chapter_id, diagnostic in items.items():
                 if chapter_id not in by_id:
                     continue
+                if targeted:
+                    goals.add(chapter_id)
                 existing = pending_feedback.get(chapter_id, "")
                 if diagnostic not in existing:
                     pending_feedback[chapter_id] = (
@@ -1110,6 +1117,9 @@ class Orchestrator:
                     build_generation=build_generation,
                 )
 
+                if targeted and goals.issubset(clean) and not pending_feedback and not running:
+                    return True
+
                 completed = [
                     chapter_id for chapter_id, handle in running.items() if handle.task.done()
                 ]
@@ -1144,7 +1154,12 @@ class Orchestrator:
                         await build_chapter(chapter_id, graph)
                     continue
 
-                if len(clean) == len(by_id) and not pending_feedback and not running:
+                if (
+                    not targeted
+                    and len(clean) == len(by_id)
+                    and not pending_feedback
+                    and not running
+                ):
                     ordered = tuple(by_id[chapter_id] for chapter_id in graph.order)
                     results = await self._build_chapters(
                         ordered,
@@ -1220,6 +1235,14 @@ class Orchestrator:
                     )
                     continue
 
+                needed = set(goals) | set(pending_feedback)
+                pending_needed = list(needed)
+                while pending_needed:
+                    required_by = pending_needed.pop()
+                    for dependency in graph.dependencies.get(required_by, frozenset()):
+                        if dependency not in needed:
+                            needed.add(dependency)
+                            pending_needed.append(dependency)
                 buildable = [
                     chapter_id
                     for chapter_id in graph.order
@@ -1227,6 +1250,7 @@ class Orchestrator:
                     and chapter_id not in pending_feedback
                     and chapter_id not in running
                     and graph.dependencies[chapter_id].issubset(clean)
+                    and (not targeted or chapter_id in needed)
                 ]
                 if buildable:
                     await build_chapter(buildable[0], graph)
@@ -1243,7 +1267,7 @@ class Orchestrator:
             await cancel_running()
 
         await self.state.set_tasks(
-            by_id,
+            goals if targeted else by_id,
             Stage.FIXUP,
             TaskStatus.FAILED,
             "observed-import fixup could not select dependency-ready work",
@@ -1277,11 +1301,11 @@ class Orchestrator:
 
     async def _review_once(self, chapter: Chapter, *, rerun: bool = False) -> ReviewOutcome:
         if not rerun and self._already_done(chapter, Stage.REVIEW):
-            return ReviewOutcome(True, False, {})
+            return ReviewOutcome(True, False, False, {})
         attempt = await self._attempt(
             chapter,
             Stage.REVIEW,
-            queue_detail="read-only review",
+            queue_detail="source-faithful editing review",
         )
         succeeded = attempt.agent.succeeded and attempt.validation.succeeded
         needs_fixup = bool(attempt.agent.report.get("needs_fixup"))
@@ -1292,10 +1316,14 @@ class Orchestrator:
                 chapter.id,
                 Stage.REVIEW,
                 TaskStatus.SUCCEEDED,
-                "read-only review found no actionable issues",
+                (
+                    "review changes merged; awaiting dependency-ordered rebuild"
+                    if attempt.agent.changed
+                    else "editing review found no actionable issues"
+                ),
             )
-            return ReviewOutcome(True, False, {})
-        detail = "review reported fixup findings" if needs_fixup else "read-only review failed"
+            return ReviewOutcome(True, False, attempt.agent.changed, {})
+        detail = "review left fixup findings" if needs_fixup else "editing review failed"
         await self.state.set_task(
             chapter.id,
             Stage.REVIEW,
@@ -1303,30 +1331,196 @@ class Orchestrator:
             detail,
         )
         routed = self._route_review_findings(chapter, attempt.agent.report, feedback)
-        return ReviewOutcome(succeeded and complete, needs_fixup, routed)
+        return ReviewOutcome(succeeded and complete, needs_fixup, attempt.agent.changed, routed)
 
-    async def _review_until_clean(self, *, rerun: bool = False) -> bool:
-        maximum = self.config.stages[Stage.REVIEW].max_rounds
-        for cycle in range(1, maximum + 1):
-            outcomes = await asyncio.gather(
-                *(self._review_once(chapter, rerun=rerun or cycle > 1) for chapter in self.chapters)
+    async def _review_chapter_to_clean(
+        self,
+        chapter: Chapter,
+        rounds_used: dict[str, int],
+        *,
+        rerun: bool = False,
+    ) -> bool:
+        """Run at most five edit/rebuild cycles for one dependency-ready chapter."""
+
+        maximum = min(self.config.stages[Stage.REVIEW].max_rounds, 5)
+        while rounds_used[chapter.id] < maximum:
+            rounds_used[chapter.id] += 1
+            outcome = await self._review_once(
+                chapter,
+                rerun=rerun or rounds_used[chapter.id] > 1,
             )
-            if not all(outcome.succeeded for outcome in outcomes):
+            if not outcome.succeeded:
                 return False
             findings_by_owner: dict[str, dict[str, None]] = {}
-            for outcome in outcomes:
-                if not outcome.needs_fixup:
-                    continue
+            if outcome.needs_fixup:
                 for owner, feedback in outcome.feedback_by_owner.items():
                     findings_by_owner.setdefault(owner, {})[feedback] = None
-            findings = {
-                owner: "\n\n".join(blocks) for owner, blocks in findings_by_owner.items()
-            }
-            if not findings:
+            findings = {owner: "\n\n".join(blocks) for owner, blocks in findings_by_owner.items()}
+            if outcome.changed or findings:
+                targets = {chapter.id, *findings}
+                async with self.fixup_lock:
+                    if not await self._fixup_to_clean(findings, target_ids=targets):
+                        return False
+            if not outcome.changed:
+                if findings:
+                    await self.state.set_task(
+                        chapter.id,
+                        Stage.REVIEW,
+                        TaskStatus.SUCCEEDED,
+                        "no-change review findings reconciled by dependency-ordered fixup",
+                    )
                 return True
-            if not await self._fixup_to_clean(findings):
-                return False
-        return False
+        await self.state.set_task(
+            chapter.id,
+            Stage.REVIEW,
+            TaskStatus.SUCCEEDED,
+            f"review/rebuild cap reached after {maximum} cycles",
+        )
+        return True
+
+    async def _review_tree(self, *, rerun: bool = False, prove: bool = False) -> bool:
+        """Release dependency-ready reviews and proofs without a corpus-wide review gate."""
+
+        by_id = {chapter.id: chapter for chapter in self.chapters}
+        reviewed: set[str] = set()
+        attempted: set[str] = set()
+        rounds_used = {chapter_id: 0 for chapter_id in by_id}
+        review_tasks: dict[str, tuple[asyncio.Task[bool], frozenset[str]]] = {}
+        proof_tasks: dict[str, asyncio.Task[bool]] = {}
+        proof_results: dict[str, bool] = {}
+        proof_fixups = {chapter_id: 0 for chapter_id in by_id}
+
+        async def cancel_all() -> None:
+            tasks = [task for task, _ in review_tasks.values()] + list(proof_tasks.values())
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+        try:
+            while len(reviewed) < len(by_id) or (prove and len(proof_results) < len(by_id)):
+                try:
+                    graph = self._observed_chapter_graph()
+                except ValueError as error:
+                    await self.state.set_tasks(
+                        by_id,
+                        Stage.REVIEW,
+                        TaskStatus.FAILED,
+                        str(error),
+                    )
+                    return False
+
+                for chapter_id in graph.order:
+                    if (
+                        chapter_id not in reviewed
+                        and chapter_id not in review_tasks
+                        and graph.dependencies[chapter_id].issubset(reviewed)
+                    ):
+                        dependencies = graph.dependencies[chapter_id]
+                        review_tasks[chapter_id] = (
+                            asyncio.create_task(
+                                self._review_chapter_to_clean(
+                                    by_id[chapter_id],
+                                    rounds_used,
+                                    rerun=rerun or chapter_id in attempted,
+                                )
+                            ),
+                            dependencies,
+                        )
+                        attempted.add(chapter_id)
+
+                live_tasks = [task for task, _ in review_tasks.values()]
+                live_tasks.extend(proof_tasks.values())
+                if not live_tasks:
+                    await self.state.set_tasks(
+                        by_id.keys() - reviewed,
+                        Stage.REVIEW,
+                        TaskStatus.FAILED,
+                        "observed-import review could not select dependency-ready work",
+                    )
+                    return False
+                done, _ = await asyncio.wait(live_tasks, return_when=asyncio.FIRST_COMPLETED)
+
+                completed_reviews = [
+                    chapter_id for chapter_id, (task, _) in review_tasks.items() if task in done
+                ]
+                for chapter_id in completed_reviews:
+                    task, starting_dependencies = review_tasks.pop(chapter_id)
+                    if not task.result():
+                        return False
+                    current_graph = self._observed_chapter_graph()
+                    current_dependencies = current_graph.dependencies[chapter_id]
+                    if not current_dependencies.issubset(starting_dependencies):
+                        continue
+                    reviewed.add(chapter_id)
+                    if prove:
+                        proof_tasks[chapter_id] = asyncio.create_task(
+                            self._prove(by_id[chapter_id])
+                        )
+
+                completed_proofs = [
+                    chapter_id for chapter_id, task in proof_tasks.items() if task in done
+                ]
+                for chapter_id in completed_proofs:
+                    if chapter_id not in proof_tasks:
+                        continue
+                    proof_succeeded = proof_tasks.pop(chapter_id).result()
+                    if proof_succeeded:
+                        proof_results[chapter_id] = True
+                        continue
+
+                    proof_task = self.state.task(chapter_id, Stage.PROVE)
+                    report = proof_task.runs[-1].report if proof_task.runs else None
+                    if not isinstance(report, dict) or not report.get("needs_fixup"):
+                        proof_results[chapter_id] = False
+                        continue
+                    if proof_fixups[chapter_id] >= self.config.stages[Stage.FIXUP].max_rounds:
+                        proof_results[chapter_id] = False
+                        continue
+                    proof_fixups[chapter_id] += 1
+
+                    chapter = by_id[chapter_id]
+                    issues = report.get("issues")
+                    fallback = "Proof-stage fixup request:\n" + (
+                        "\n".join(f"- {issue}" for issue in issues)
+                        if isinstance(issues, list)
+                        else "statement or API repair requested"
+                    )
+                    findings = self._route_review_findings(chapter, report, fallback)
+                    targets = {chapter_id, *findings}
+
+                    current_graph = self._observed_chapter_graph()
+                    invalidated = set(targets)
+                    pending_invalidated = list(targets)
+                    while pending_invalidated:
+                        owner = pending_invalidated.pop()
+                        for successor in current_graph.successors.get(owner, frozenset()):
+                            if successor not in invalidated:
+                                invalidated.add(successor)
+                                pending_invalidated.append(successor)
+
+                    cancelled: list[asyncio.Task[bool]] = []
+                    for invalidated_id in invalidated:
+                        if handle := review_tasks.pop(invalidated_id, None):
+                            handle[0].cancel()
+                            cancelled.append(handle[0])
+                        if task := proof_tasks.pop(invalidated_id, None):
+                            task.cancel()
+                            cancelled.append(task)
+                        reviewed.discard(invalidated_id)
+                        proof_results.pop(invalidated_id, None)
+                        rounds_used[invalidated_id] = 0
+                    await asyncio.gather(*cancelled, return_exceptions=True)
+
+                    async with self.fixup_lock:
+                        if not await self._fixup_to_clean(findings, target_ids=targets):
+                            return False
+        finally:
+            await cancel_all()
+
+        return not prove or all(proof_results.values())
+
+    async def _review_until_clean(self, *, rerun: bool = False) -> bool:
+        return await self._review_tree(rerun=rerun)
 
     async def _prove(self, chapter: Chapter) -> bool:
         if self._already_done(chapter, Stage.PROVE):
@@ -1375,10 +1569,7 @@ class Orchestrator:
         if stage is Stage.FIXUP:
             return await self._fixup_to_clean()
         if stage is Stage.REVIEW:
-            outcomes = await asyncio.gather(
-                *(self._review_once(chapter) for chapter in self.chapters)
-            )
-            return all(outcome.succeeded and not outcome.needs_fixup for outcome in outcomes)
+            return await self._review_until_clean()
         if stage is Stage.FORMALIZE:
             return await self._formalize_all()
         return all(await _gather_cancel_on_error(self._prove(chapter) for chapter in self.chapters))
@@ -1388,31 +1579,4 @@ class Orchestrator:
             return False
         if not await self._fixup_to_clean():
             return False
-        if not await self._review_until_clean():
-            return False
-
-        maximum = self.config.stages[Stage.FIXUP].max_rounds
-        for _ in range(maximum):
-            proof_results = await _gather_cancel_on_error(
-                self._prove(chapter) for chapter in self.chapters
-            )
-            if all(proof_results):
-                return True
-            findings: dict[str, str] = {}
-            for chapter in self.chapters:
-                task = self.state.task(chapter.id, Stage.PROVE)
-                if not task.runs:
-                    continue
-                report = task.runs[-1].report or {}
-                if report.get("needs_fixup"):
-                    issues = report.get("issues") or []
-                    findings[chapter.id] = "Proof-stage fixup request:\n" + "\n".join(
-                        f"- {issue}" for issue in issues
-                    )
-            if not findings:
-                return False
-            if not await self._fixup_to_clean(findings):
-                return False
-            if not await self._review_until_clean(rerun=True):
-                return False
-        return False
+        return await self._review_tree(prove=True)

@@ -2,7 +2,7 @@
 
 `lastlib-swarm` orchestrates a large population of noninteractive Codex workers over an informal
 mathematics corpus and its Lean translation. It combines an optimistic parallel drafting pass with
-coordinator-driven build convergence, MCP-backed fixup, read-only mathematical review, and
+coordinator-driven build convergence, MCP-backed fixup, editing mathematical review, and
 LSP-backed proving.
 
 Install `ripgrep` and ensure its `rg` executable is on `PATH` before starting a large swarm. Agents
@@ -20,9 +20,9 @@ flowchart LR
     B -->|clean cache published| I
     I -->|all chapters clean| G[Stable topological build]
     G -->|diagnostics| X
-    G -->|clean snapshot| R[Read-only review]
-    R -->|findings| X
-    R -->|no findings| P[Prove with LSP]
+    G -->|clean snapshot| R[Editing review]
+    R -->|changed or findings| B
+    R -->|no changes| P[Prove with LSP]
     P -->|statement/API problem| X
     P -->|no placeholders + Lean valid| D[Done]
 ```
@@ -34,8 +34,10 @@ regexes over the current `import LastLib...` lines. It then fixes dependency-rea
 MCP concurrently. As soon as an agent finishes, the coordinator merges it, rescans imports, and
 rebuilds it once its refined predecessors are clean; unrelated agents keep running and a successful
 build immediately releases descendants. A final graph-stable topological build establishes the
-immutable baseline used by review and proof. Reviewers do not edit it; fixup and proof agents receive
-Lean MCP.
+baseline for review and proof. Reviewers directly make scoped statement and API repairs. Each
+dependency-ready chapter is rebuilt after a changed review and sent through fixup if needed. After
+at most five such cycles—or immediately after a no-change review—the chapter is released to proving
+without waiting for reviews of its descendants. Fixup and proof agents receive Lean MCP.
 
 For a conventional numbered corpus, point the CLI at the book directory. It discovers all direct
 Markdown children and automatically reads `BOOK_DEPENDENCIES.md` from the repository root:
@@ -64,7 +66,7 @@ uv run lastlib-swarm books/02-finite-extensions-of-local-fields.md
 Passing a `.md` as the first argument is shorthand for `pipeline <target>`. Zero-config runs default
 to `gpt-5.6-luna`, reasoning effort `max`, the packaged generic prompt library under
 `src/lastlib_swarm/prompts/`, automatic execution isolation, and a state directory at
-`.swarm/<inferred-book-id>/`. Proof attempts attach a private Lean LSP MCP server; drafting, fixup,
+`.swarm/<inferred-book-id>/`. Fixup and proof attempts attach a private Lean LSP MCP server; drafting
 and review do not. Use
 `swarm.example.toml` when the inferred layout is not appropriate or when coordinating multiple books.
 
@@ -84,10 +86,9 @@ attempted but could not prove. Disabling a linter or warning option is not an ac
 Codex is invoked in its documented noninteractive JSONL mode with a strict final-report schema.
 All swarm workers, including review workers, default to
 `--dangerously-bypass-approvals-and-sandbox`, giving them full host access for unattended
-formalization. Review workers remain contractually non-mutating, and the coordinator rejects review
-attempts that change files. To opt into sandboxed workers, set
-`bypass_approvals_and_sandbox = false`; setting `approve_for_me = true` then uses Codex's
-workspace-write sandbox for mutating stages, while review remains read-only. See
+formalization. The coordinator accepts review changes only inside the chapter's exclusive scope. To
+opt into sandboxed workers, set `bypass_approvals_and_sandbox = false`; setting
+`approve_for_me = true` then uses Codex's workspace-write sandbox for every mutating stage. See
 OpenAI's official
 [Codex non-interactive guidance](https://developers.openai.com/codex/noninteractive).
 
@@ -242,16 +243,18 @@ After the daemon exits, `status`, `snapshot`, and `wait` fall back to the persis
   than assigned prematurely. Completed scopes cycle through build and fixup while other drafts run;
   after drafting drains, a full-corpus build/fixup loop establishes global cleanliness. This repeats
   up to `max_rounds`, allowing `declaration uses sorry` but rejecting other warnings.
-- **Review** runs read-only agents against one clean source and `.olean` generation. Findings are
-  returned as structured reports with exact requested edit paths, routed to their owning chapters
-  through fixup, rebuilt, and reviewed again until no actionable finding remains. Unowned legacy or
-  repository-wide findings fall back to the reviewed chapter so they remain visible as blockers.
+- **Review** visits dependency-ready chapters against a clean source and `.olean` generation. Agents
+  make warranted in-scope statement and API changes directly; unresolved findings retain exact edit
+  paths and are routed to their owners. A changed chapter is rebuilt and, on failure, repaired by the
+  same observed-import fixup scheduler. Review/rebuild repeats up to five times and stops early on a
+  no-change review. Once a chapter is clean, its proof agent may start while descendant reviews
+  continue.
 - **Prove** sends the whole chapter to one agent, asks for one complete proof-writing pass, and then
   uses whole-file LSP diagnostics to focus iterations on failed proofs. It succeeds only when the
   scoped Lean code has no `sorry` or `admit` tokens and final Lake validation succeeds without any
   warning other than “declaration uses `sorry`”.
 - A proof agent may change proof bodies but not declaration interfaces. A genuine statement/API
-  problem is reported with `needs_fixup`; the pipeline returns through fixup and read-only review
+  problem is reported with `needs_fixup`; the pipeline returns through fixup and editing review
   before proving resumes.
 
 The orchestrator independently hashes every configured chapter scope. Agent claims about changes do

@@ -12,7 +12,7 @@ import lastlib_swarm.scheduler as scheduler_module
 from lastlib_swarm.codex import AgentResult, CodexExecutor, ValidationResult
 from lastlib_swarm.config import load_config
 from lastlib_swarm.models import Chapter, PipelineConfig, Stage
-from lastlib_swarm.scheduler import FormalizeOutcome, Orchestrator
+from lastlib_swarm.scheduler import FormalizeOutcome, Orchestrator, ReviewOutcome
 from lastlib_swarm.state import RunRecord, StateStore, TaskPhase, TaskStatus, TokenUsage
 from tests.support import write_project
 
@@ -83,7 +83,7 @@ def result(
         usage=TokenUsage(input_tokens=10, output_tokens=5, measured=True),
         report={
             "changed": changed,
-            "complete": not changed,
+            "complete": True,
             "needs_fixup": needs_fixup,
             "summary": "reviewed",
             "issues": issues or [],
@@ -514,6 +514,43 @@ async def test_fixup_builds_in_observed_chapter_import_order(
         first.id,
     ]
     assert state.fixup_graph["edges"] == [[second.id, first.id]]
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_targeted_fixup_does_not_build_cleanliness_descendants(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = with_lastlib_modules(
+        load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    )
+    first, second = config.chapters
+    source_root = tmp_path / "lean" / "Book"
+    source_root.mkdir(parents=True)
+    (source_root / "Chapter01.lean").write_text("def first := 1\n", encoding="utf-8")
+    (source_root / "Chapter02.lean").write_text(
+        "import LastLib.Book.Chapter01\ndef second := first + 1\n",
+        encoding="utf-8",
+    )
+    orchestrator = Orchestrator(config, StateStore(config))
+    await orchestrator.prepare()
+    builds: list[str] = []
+
+    async def validation(
+        _config: object,
+        chapter: Chapter,
+        **_kwargs: object,
+    ) -> ValidationResult:
+        builds.append(chapter.id)
+        return ValidationResult(True, 0, "ok")
+
+    monkeypatch.setattr(scheduler_module, "validate", validation)
+
+    assert await orchestrator._fixup_to_clean(target_ids={first.id})
+    assert builds == [first.id]
+    clean = orchestrator.state.fixup_graph["clean"]
+    assert first.id in clean
+    assert second.id not in clean
     await orchestrator.shutdown()
 
 
@@ -1199,7 +1236,73 @@ async def test_agent_limiter_distinguishes_live_and_queued_runs(tmp_path: Path) 
 
 
 @pytest.mark.asyncio
-async def test_review_findings_are_fixed_then_reviewed_again(
+async def test_changed_review_is_rebuilt_fixed_and_reviewed_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await orchestrator.prepare()
+    review_path = tmp_path / "lean" / "Book" / "Chapter01.lean"
+    review_path.parent.mkdir(parents=True, exist_ok=True)
+    review_path.write_text("def beforeReview := 1\n", encoding="utf-8")
+    orchestrator.executor = FakeExecutor(
+        state,
+        [
+            result(
+                changed=True,
+            ),
+            result(changed=True),
+            result(changed=False),
+        ],
+    )
+    stages_seen: list[Stage] = []
+    original_run = orchestrator.executor.run
+
+    async def tracked_run(
+        chapter: Chapter,
+        stage: Stage,
+        run: RunRecord,
+        *,
+        feedback: str = "",
+        workspace_root: Path | None = None,
+    ) -> AgentResult:
+        stages_seen.append(stage)
+        if stage is Stage.REVIEW and stages_seen.count(Stage.REVIEW) == 1:
+            assert workspace_root is not None
+            target = workspace_root / "lean" / "Book" / "Chapter01.lean"
+            target.write_text("def afterReview := 1\n", encoding="utf-8")
+        if stage is Stage.FIXUP:
+            assert "unknown declaration" in feedback
+        return await original_run(
+            chapter,
+            stage,
+            run,
+            feedback=feedback,
+            workspace_root=workspace_root,
+        )
+
+    builds = iter(
+        (
+            ValidationResult(False, 1, "error: Book/Chapter01.lean:1:1: unknown declaration"),
+            ValidationResult(True, 0, "ok"),
+        )
+    )
+
+    async def validation(*_args: object, **_kwargs: object) -> ValidationResult:
+        return next(builds)
+
+    monkeypatch.setattr(orchestrator.executor, "run", tracked_run)
+    monkeypatch.setattr(scheduler_module, "validate", validation)
+
+    assert await orchestrator._review_until_clean()
+    assert stages_seen == [Stage.REVIEW, Stage.FIXUP, Stage.REVIEW]
+    assert review_path.read_text(encoding="utf-8") == "def afterReview := 1\n"
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_no_change_review_stops_after_one_cycle(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
@@ -1221,39 +1324,167 @@ async def test_review_findings_are_fixed_then_reviewed_again(
                 ],
             ),
             result(changed=True),
-            result(changed=False),
         ],
     )
-    stages_seen: list[Stage] = []
-    original_run = orchestrator.executor.run
 
-    async def tracked_run(
-        chapter: Chapter,
-        stage: Stage,
-        run: RunRecord,
-        *,
-        feedback: str = "",
-        workspace_root: Path | None = None,
-    ) -> AgentResult:
-        stages_seen.append(stage)
-        if stage is Stage.FIXUP:
-            assert "statement needs a hypothesis" in feedback
-        return await original_run(
-            chapter,
-            stage,
-            run,
-            feedback=feedback,
-            workspace_root=workspace_root,
-        )
+    async def validation(*_args: object, **_kwargs: object) -> ValidationResult:
+        if state.task(config.chapters[0].id, Stage.FIXUP).rounds:
+            return ValidationResult(True, 0, "ok")
+        return ValidationResult(False, 1, "error: Book/Chapter01.lean:1:1: broken")
 
-    async def successful_validation(*_args: object, **_kwargs: object) -> ValidationResult:
-        return ValidationResult(True, 0, "ok")
-
-    monkeypatch.setattr(orchestrator.executor, "run", tracked_run)
-    monkeypatch.setattr(scheduler_module, "validate", successful_validation)
+    monkeypatch.setattr(scheduler_module, "validate", validation)
 
     assert await orchestrator._review_until_clean()
-    assert stages_seen == [Stage.REVIEW, Stage.FIXUP, Stage.REVIEW]
+    review_task = state.task(config.chapters[0].id, Stage.REVIEW)
+    assert review_task.rounds == 1
+    assert review_task.status == TaskStatus.SUCCEEDED
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_review_is_capped_at_five_edit_rebuild_cycles(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    orchestrator = Orchestrator(config, StateStore(config))
+    await orchestrator.prepare()
+    reviews = 0
+    rebuilds = 0
+
+    async def changed_review(_chapter: Chapter, *, rerun: bool = False) -> ReviewOutcome:
+        nonlocal reviews
+        assert rerun == (reviews > 0)
+        reviews += 1
+        return ReviewOutcome(True, False, True, {})
+
+    async def clean_target(
+        _feedback: dict[str, str] | None = None,
+        *,
+        target_ids: object = None,
+    ) -> bool:
+        nonlocal rebuilds
+        assert target_ids == {config.chapters[0].id}
+        rebuilds += 1
+        return True
+
+    monkeypatch.setattr(orchestrator, "_review_once", changed_review)
+    monkeypatch.setattr(orchestrator, "_fixup_to_clean", clean_target)
+
+    assert await orchestrator._review_until_clean()
+    assert reviews == 5
+    assert rebuilds == 5
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_upstream_proof_starts_before_downstream_review_finishes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = with_lastlib_modules(
+        load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    )
+    first, second = config.chapters
+    source_root = tmp_path / "lean" / "Book"
+    source_root.mkdir(parents=True)
+    (source_root / "Chapter01.lean").write_text("def first := 1\n", encoding="utf-8")
+    (source_root / "Chapter02.lean").write_text(
+        "import LastLib.Book.Chapter01\ndef second := first + 1\n",
+        encoding="utf-8",
+    )
+    orchestrator = Orchestrator(config, StateStore(config))
+    upstream_proof_started = asyncio.Event()
+    finish_upstream_proof = asyncio.Event()
+    events: list[str] = []
+
+    async def review(
+        chapter: Chapter,
+        _rounds_used: dict[str, int],
+        *,
+        rerun: bool = False,
+    ) -> bool:
+        assert not rerun
+        if chapter.id == second.id:
+            await upstream_proof_started.wait()
+            events.append(f"review:{chapter.id}")
+            finish_upstream_proof.set()
+        else:
+            events.append(f"review:{chapter.id}")
+        return True
+
+    async def prove(chapter: Chapter) -> bool:
+        events.append(f"prove:{chapter.id}")
+        if chapter.id == first.id:
+            upstream_proof_started.set()
+            await finish_upstream_proof.wait()
+        return True
+
+    monkeypatch.setattr(orchestrator, "_review_chapter_to_clean", review)
+    monkeypatch.setattr(orchestrator, "_prove", prove)
+
+    assert await orchestrator._review_tree(prove=True)
+    assert events.index(f"prove:{first.id}") < events.index(f"review:{second.id}")
+    assert events.index(f"review:{first.id}") < events.index(f"review:{second.id}")
+
+
+@pytest.mark.asyncio
+async def test_proof_fixup_requeues_only_its_review_branch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = config.chapters[0]
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await orchestrator.prepare()
+    reviews = 0
+    proofs = 0
+    fixups = 0
+
+    async def review(
+        _chapter: Chapter,
+        _rounds_used: dict[str, int],
+        *,
+        rerun: bool = False,
+    ) -> bool:
+        nonlocal reviews
+        assert rerun == (reviews > 0)
+        reviews += 1
+        return True
+
+    async def prove(_chapter: Chapter) -> bool:
+        nonlocal proofs
+        proofs += 1
+        if proofs > 1:
+            return True
+        run = await state.start_run(chapter.id, Stage.PROVE)
+        await state.finish_run(
+            run,
+            status=TaskStatus.FAILED,
+            report={
+                "needs_fixup": True,
+                "issues": ["statement needs a hypothesis"],
+                "fixup_findings": [],
+            },
+        )
+        return False
+
+    async def fixup(
+        feedback: dict[str, str] | None = None,
+        *,
+        target_ids: object = None,
+    ) -> bool:
+        nonlocal fixups
+        assert feedback is not None
+        assert "statement needs a hypothesis" in feedback[chapter.id]
+        assert target_ids == {chapter.id}
+        fixups += 1
+        return True
+
+    monkeypatch.setattr(orchestrator, "_review_chapter_to_clean", review)
+    monkeypatch.setattr(orchestrator, "_prove", prove)
+    monkeypatch.setattr(orchestrator, "_fixup_to_clean", fixup)
+
+    assert await orchestrator._review_tree(prove=True)
+    assert (reviews, proofs, fixups) == (2, 2, 1)
     await orchestrator.shutdown()
 
 

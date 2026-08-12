@@ -25,7 +25,7 @@ max_rounds = 1
 max_rounds = 12
 
 [stages.review]
-max_rounds = 6
+max_rounds = 5
 
 [stages.prove]
 max_rounds = 12

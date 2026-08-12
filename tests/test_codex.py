@@ -242,17 +242,32 @@ def test_approve_for_me_is_not_combined_with_explicit_sandbox(tmp_path: Path) ->
     assert "--dangerously-bypass-approvals-and-sandbox" not in command
 
 
-def test_review_is_sandboxed_when_full_access_is_disabled(tmp_path: Path) -> None:
+def test_review_uses_write_sandbox_when_full_access_is_disabled(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
     config = replace(
         config,
-        settings=replace(config.settings, bypass_approvals_and_sandbox=False),
+        settings=replace(
+            config.settings,
+            bypass_approvals_and_sandbox=False,
+            sandbox="workspace-write",
+        ),
     )
     command = CodexExecutor(config, StateStore(config)).command(Stage.REVIEW)
 
     assert "--sandbox" in command
-    assert command[command.index("--sandbox") + 1] == "read-only"
+    assert command[command.index("--sandbox") + 1] == "workspace-write"
     assert "--dangerously-bypass-approvals-and-sandbox" not in command
+
+
+def test_review_prompt_requires_scoped_edits_and_coordinator_rebuild(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    executor = CodexExecutor(config, StateStore(config))
+
+    prompt = executor.build_prompt(config.chapters[0], Stage.REVIEW)
+
+    assert "directly make every warranted in-scope" in prompt
+    assert "rebuilds it" in prompt
+    assert "read-only" not in prompt
 
 
 def test_executor_can_disable_lean_mcp(tmp_path: Path) -> None:

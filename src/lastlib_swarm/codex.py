@@ -403,9 +403,11 @@ fixups. As soon as it finishes, the coordinator merges it, rescans observed impo
 when its refined predecessors are clean; unrelated agents continue running. Never prove propositions
 in this stage: replace an obstructing proof body with `by sorry`.
 Request fresh whole-file diagnostics after every edit.""",
-            Stage.REVIEW: """This attempt is read-only. Return findings in the structured report and
-set `needs_fixup` when source changes are required. The coordinator discards any attempted file
-change.""",
+            Stage.REVIEW: """Audit the assigned chapter and directly make every warranted in-scope
+statement or API change. Preserve proof placeholders and do not spend time proving propositions.
+The coordinator merges the scoped patch, then rebuilds it and sends compiler failures through the
+dependency-ordered fixup scheduler. Report only unresolved or out-of-scope edits as
+`needs_fixup`.""",
             Stage.PROVE: """The project entered this attempt with a clean reviewed build. After the
 attempt, the coordinator builds the assigned chapter against its single writable cache.""",
         }[stage]
@@ -435,10 +437,11 @@ the coordinator and use its single writable build cache. {stage_contract}
 
 Return the required structured report. Set `changed` from the actual scoped diff and `complete` from
 the stage's definition of done. Set `needs_fixup` only when a statement or declaration interface
-must change; ordinary unfinished or broken proof code is not statement fixup. Summarize the work
-concisely and list every unresolved issue.
+still must change after this attempt; ordinary unfinished or broken proof code is not statement
+fixup. Summarize the work concisely and list every unresolved issue.
 
-For every actionable issue that requires a source edit, add one `fixup_findings` entry. Its
+For every unresolved actionable issue that requires another source edit, add one `fixup_findings`
+entry. Its
 `description` must state the complete minimal repair, and `owner_paths` must list the exact
 repository-relative Lean paths that need edits, including paths outside this attempt's scope. Use a
 prospective path when the repair requires creating a missing file. Split findings whose repairs have
@@ -501,9 +504,6 @@ imports with a compiler command.
             command.append("--skip-git-repo-check")
         if settings.bypass_approvals_and_sandbox:
             command.append("--dangerously-bypass-approvals-and-sandbox")
-        elif stage is Stage.REVIEW:
-            if resume_thread_id is None:
-                command.extend(["--sandbox", "read-only"])
         elif settings.approve_for_me and resume_thread_id is None:
             # Current Codex versions make --approve-for-me mutually exclusive
             # with --sandbox; approve-for-me itself selects workspace-write.
