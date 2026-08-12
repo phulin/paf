@@ -42,7 +42,6 @@ def test_formats_structured_agent_update_as_summary_and_issues() -> None:
         {
             "changed": True,
             "complete": False,
-            "needs_fixup": True,
             "summary": "Added the missing theorem.",
             "issues": ["The downstream proof still needs repair.", "Confirm the new import."],
         }
@@ -289,7 +288,6 @@ async def test_agent_detail_can_switch_between_chapter_steps(tmp_path: Path) -> 
                 {
                     "changed": False,
                     "complete": True,
-                    "needs_fixup": False,
                     "summary": "review update",
                     "issues": ["One issue for display."],
                 }

@@ -43,7 +43,7 @@ precede its users, and be independently provable from earlier declarations.
 
 Do not run Lean, Lake, or another language server; use only the attached Lean MCP. Edit only the
 assigned scope. Do not report completion until all assigned files have clean final MCP diagnostics,
-allowing only the exact “declaration uses `sorry`” warning. Set `needs_fixup` to `true` exactly when
+allowing only the exact “declaration uses `sorry`” warning. Add a `fixup_findings` entry exactly when
 a required source change remains after your edits, including a repair owned by another chapter.
 
 ## Definition of done

@@ -30,9 +30,9 @@ simplification, a canonical constructor or equivalence, and only then unfolded i
 ## Genuine statement obstructions
 
 If a target is inaccurate or cannot follow from its assumptions, leave its statement and placeholder
-unchanged and report a precise statement/API fixup request. Set `needs_fixup` to `true`. A failed search, guessed theorem name,
-tactic failure, coercion error, timeout, or unfinished proof is not evidence that the statement needs
-fixup.
+unchanged and report a precise statement/API fixup request in `fixup_findings`, including every exact
+repository-relative Lean path that must be edited. A failed search, guessed theorem name, tactic
+failure, coercion error, timeout, or unfinished proof is not evidence that the statement needs fixup.
 
 ## Definition of done
 

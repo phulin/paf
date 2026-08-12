@@ -239,7 +239,7 @@ time.sleep(0.15)
 print(json.dumps({"type": "thread.started", "thread_id": "managed-thread"}))
 print(json.dumps({"type": "turn.completed", "usage": {
     "input_tokens": 10, "cached_input_tokens": 5, "output_tokens": 2}}))
-report = {"changed": False, "complete": True, "needs_fixup": False,
+report = {"changed": False, "complete": True,
           "summary": "done", "issues": []}
 print(json.dumps({"type": "item.completed", "item": {
     "type": "agent_message", "text": json.dumps(report)}}))

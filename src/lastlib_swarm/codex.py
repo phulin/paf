@@ -26,7 +26,6 @@ REPORT_SCHEMA: dict[str, Any] = {
     "properties": {
         "changed": {"type": "boolean"},
         "complete": {"type": "boolean"},
-        "needs_fixup": {"type": "boolean"},
         "summary": {"type": "string"},
         "issues": {"type": "array", "items": {"type": "string"}},
         "fixup_findings": {
@@ -68,7 +67,6 @@ REPORT_SCHEMA: dict[str, Any] = {
     "required": [
         "changed",
         "complete",
-        "needs_fixup",
         "summary",
         "issues",
         "fixup_findings",
@@ -311,7 +309,7 @@ def _find_report(event: Any) -> dict[str, Any] | None:
         except json.JSONDecodeError:
             continue
         if isinstance(value, dict) and all(
-            key in value for key in ("changed", "complete", "needs_fixup", "summary", "issues")
+            key in value for key in ("changed", "complete", "summary", "issues")
         ):
             value.setdefault("fixup_findings", [])
             value.setdefault("source_issues", [])
@@ -455,8 +453,8 @@ clean whole-file diagnostics, allowing only the exact “declaration uses `sorry
 After every edit, request fresh diagnostics for the edited file and every assigned dependent that
 may be affected.
 The coordinator merges the scoped patch, then rebuilds it and sends compiler failures through the
-dependency-ordered fixup scheduler. Report only unresolved or out-of-scope edits as
-`needs_fixup`.""",
+dependency-ordered fixup scheduler. Report every unresolved or out-of-scope edit as a structured
+`fixup_findings` entry.""",
             Stage.PROVE: """The project entered this attempt with a clean reviewed build. After the
 attempt, the coordinator builds the assigned chapter against its single writable cache.""",
         }[stage]
@@ -485,9 +483,7 @@ the coordinator and use its single writable build cache. {stage_contract}
 ### Final response
 
 Return the required structured report. Set `changed` from the actual scoped diff and `complete` from
-the stage's definition of done. Set `needs_fixup` only when a statement or declaration interface
-still must change after this attempt; ordinary unfinished or broken proof code is not statement
-fixup. Summarize the work concisely and list every unresolved issue.
+the stage's definition of done. Summarize the work concisely and list every unresolved issue.
 
 For every unresolved actionable issue that requires another source edit, add one `fixup_findings`
 entry. Its

@@ -77,7 +77,6 @@ class FormalizeOutcome:
 @dataclass(frozen=True)
 class ReviewOutcome:
     succeeded: bool
-    needs_fixup: bool
     changed: bool
     feedback_by_owner: dict[str, str]
     complete: bool = True
@@ -617,7 +616,6 @@ class Orchestrator:
         self,
         chapter: Chapter,
         report: dict[str, Any],
-        fallback_feedback: str,
     ) -> dict[str, str]:
         """Route structured review findings to the chapters owning their requested edit paths."""
 
@@ -659,7 +657,7 @@ class Orchestrator:
 
         if routed:
             return {owner: "\n\n".join(blocks) for owner, blocks in routed.items()}
-        return {chapter.id: fallback_feedback}
+        return {}
 
     def _module_owner_ids(self, module: str) -> tuple[str, ...]:
         return tuple(
@@ -1336,17 +1334,16 @@ class Orchestrator:
 
     async def _review_once(self, chapter: Chapter, *, rerun: bool = False) -> ReviewOutcome:
         if not rerun and self._already_done(chapter, Stage.REVIEW):
-            return ReviewOutcome(True, False, False, {}, complete=True)
+            return ReviewOutcome(True, False, {}, complete=True)
         attempt = await self._attempt(
             chapter,
             Stage.REVIEW,
             queue_detail="source-faithful editing review",
         )
         succeeded = attempt.agent.succeeded and attempt.validation.succeeded
-        needs_fixup = bool(attempt.agent.report.get("needs_fixup"))
         complete = bool(attempt.agent.report.get("complete"))
-        feedback = attempt.feedback()
-        if succeeded and complete and not needs_fixup:
+        routed = self._route_review_findings(chapter, attempt.agent.report)
+        if succeeded and complete and not routed:
             await self.state.set_task(
                 chapter.id,
                 Stage.REVIEW,
@@ -1357,18 +1354,16 @@ class Orchestrator:
                     else "editing review found no actionable issues"
                 ),
             )
-            return ReviewOutcome(True, False, attempt.agent.changed, {}, complete=True)
-        detail = "review left fixup findings" if needs_fixup else "editing review failed"
+            return ReviewOutcome(True, attempt.agent.changed, {}, complete=True)
+        detail = "review left fixup findings" if routed else "editing review failed"
         await self.state.set_task(
             chapter.id,
             Stage.REVIEW,
             TaskStatus.FAILED,
             detail,
         )
-        routed = self._route_review_findings(chapter, attempt.agent.report, feedback)
         return ReviewOutcome(
             succeeded,
-            needs_fixup,
             attempt.agent.changed,
             routed,
             complete=complete,
@@ -1406,9 +1401,8 @@ class Orchestrator:
             if not outcome.succeeded:
                 return False
             findings_by_owner: dict[str, dict[str, None]] = {}
-            if outcome.needs_fixup:
-                for owner, feedback in outcome.feedback_by_owner.items():
-                    findings_by_owner.setdefault(owner, {})[feedback] = None
+            for owner, feedback in outcome.feedback_by_owner.items():
+                findings_by_owner.setdefault(owner, {})[feedback] = None
             findings = {owner: "\n\n".join(blocks) for owner, blocks in findings_by_owner.items()}
             if outcome.changed or findings:
                 targets = {chapter.id, *findings}
@@ -1575,7 +1569,7 @@ class Orchestrator:
 
                     proof_task = self.state.task(chapter_id, Stage.PROVE)
                     report = proof_task.runs[-1].report if proof_task.runs else None
-                    if not isinstance(report, dict) or not report.get("needs_fixup"):
+                    if not isinstance(report, dict) or not report.get("fixup_findings"):
                         proof_results[chapter_id] = False
                         continue
                     if proof_fixups[chapter_id] >= self.config.stages[Stage.FIXUP].max_rounds:
@@ -1584,13 +1578,7 @@ class Orchestrator:
                     proof_fixups[chapter_id] += 1
 
                     chapter = by_id[chapter_id]
-                    issues = report.get("issues")
-                    fallback = "Proof-stage fixup request:\n" + (
-                        "\n".join(f"- {issue}" for issue in issues)
-                        if isinstance(issues, list)
-                        else "statement or API repair requested"
-                    )
-                    findings = self._route_review_findings(chapter, report, fallback)
+                    findings = self._route_review_findings(chapter, report)
                     targets = {chapter_id, *findings}
 
                     current_graph = self._observed_chapter_graph()
@@ -1657,7 +1645,7 @@ class Orchestrator:
                 return True
 
             feedback = attempt.feedback()
-            if bool(attempt.agent.report.get("needs_fixup")):
+            if bool(attempt.agent.report.get("fixup_findings")):
                 await self.state.set_task(
                     chapter.id,
                     Stage.PROVE,

@@ -266,8 +266,8 @@ After the daemon exits, `status`, `snapshot`, and `wait` fall back to the persis
   scoped Lean code has no `sorry` or `admit` tokens and final Lake validation succeeds without any
   warning other than “declaration uses `sorry`”.
 - A proof agent may change proof bodies but not declaration interfaces. A genuine statement/API
-  problem is reported with `needs_fixup`; the pipeline returns through fixup and editing review
-  before proving resumes.
+  problem is reported through a structured `fixup_findings` entry; the pipeline returns through
+  fixup and editing review before proving resumes.
 
 The orchestrator independently hashes every configured chapter scope. Agent claims about changes do
 not control review convergence. Lean placeholder scanning ignores comments and strings. The strict

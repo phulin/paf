@@ -71,7 +71,6 @@ def result(
     *,
     changed: bool,
     placeholders: int = 2,
-    needs_fixup: bool = False,
     complete: bool = True,
     issues: list[str] | None = None,
     fixup_findings: list[dict[str, Any]] | None = None,
@@ -85,7 +84,6 @@ def result(
         report={
             "changed": changed,
             "complete": complete,
-            "needs_fixup": needs_fixup,
             "summary": "reviewed",
             "issues": issues or [],
             "fixup_findings": fixup_findings or [],
@@ -1316,7 +1314,6 @@ async def test_no_change_review_stops_after_one_cycle(
         [
             result(
                 changed=False,
-                needs_fixup=True,
                 issues=["statement needs a hypothesis"],
                 fixup_findings=[
                     {
@@ -1355,11 +1352,10 @@ async def test_incomplete_review_routes_fixup_and_retries(
             ReviewOutcome(
                 True,
                 True,
-                True,
                 {chapter.id: "repair the remaining statement interface"},
                 complete=False,
             ),
-            ReviewOutcome(True, False, False, {}, complete=True),
+            ReviewOutcome(True, False, {}, complete=True),
         )
     )
     fixups: list[tuple[dict[str, str] | None, object]] = []
@@ -1505,7 +1501,7 @@ async def test_review_is_capped_at_five_edit_rebuild_cycles(
         nonlocal reviews
         assert rerun == (reviews > 0)
         reviews += 1
-        return ReviewOutcome(True, False, True, {})
+        return ReviewOutcome(True, True, {})
 
     async def clean_target(
         _feedback: dict[str, str] | None = None,
@@ -1559,7 +1555,7 @@ async def test_pipeline_reviews_each_chapter_as_soon_as_its_build_is_green(
     async def review(chapter: Chapter, *, rerun: bool = False) -> ReviewOutcome:
         assert not rerun
         events.append(f"review:{chapter.id}")
-        return ReviewOutcome(True, False, False, {})
+        return ReviewOutcome(True, False, {})
 
     async def prove(chapter: Chapter) -> bool:
         events.append(f"prove:{chapter.id}")
@@ -1621,7 +1617,7 @@ async def test_review_restart_reuses_green_certificates_without_rebuilding(
     async def review(chapter: Chapter, *, rerun: bool = False) -> ReviewOutcome:
         assert not rerun
         reviews.append(chapter.id)
-        return ReviewOutcome(True, False, False, {})
+        return ReviewOutcome(True, False, {})
 
     monkeypatch.setattr(restarted, "_review_once", review)
 
@@ -1672,7 +1668,7 @@ async def test_changed_green_dependency_invalidates_descendant_before_review(
     async def review(chapter: Chapter, *, rerun: bool = False) -> ReviewOutcome:
         assert not rerun
         reviews.append(chapter.id)
-        return ReviewOutcome(True, False, False, {})
+        return ReviewOutcome(True, False, {})
 
     monkeypatch.setattr(restarted, "_review_once", review)
 
@@ -1766,9 +1762,13 @@ async def test_proof_fixup_requeues_only_its_review_branch(
             run,
             status=TaskStatus.FAILED,
             report={
-                "needs_fixup": True,
                 "issues": ["statement needs a hypothesis"],
-                "fixup_findings": [],
+                "fixup_findings": [
+                    {
+                        "description": "statement needs a hypothesis",
+                        "owner_paths": ["lean/Book/Chapter01.lean"],
+                    }
+                ],
             },
         )
         return False
@@ -1812,7 +1812,6 @@ def test_review_findings_route_to_requested_chapter_owners(tmp_path: Path) -> No
                 }
             ]
         },
-        "legacy fallback",
     )
 
     assert set(routed) == {first.id, second.id}
@@ -1839,7 +1838,6 @@ def test_unowned_review_findings_fall_back_to_reviewed_chapter(tmp_path: Path) -
                 }
             ]
         },
-        "legacy fallback",
     )
 
     assert set(routed) == {chapter.id}

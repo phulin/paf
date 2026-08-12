@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from lastlib_swarm.codex import (
+    REPORT_SCHEMA,
     REVIEW_SOURCE_BUNDLE_MAX_CHARS,
     CodexExecutor,
     _bounded_feedback,
@@ -27,6 +28,12 @@ from lastlib_swarm.models import Stage
 from lastlib_swarm.state import StateStore, TokenUsage
 from lastlib_swarm.state_db import read_full_snapshot
 from tests.support import write_project
+
+
+def test_report_schema_uses_structured_fixup_findings() -> None:
+    assert "needs_fixup" not in REPORT_SCHEMA["properties"]
+    assert "needs_fixup" not in REPORT_SCHEMA["required"]
+    assert "fixup_findings" in REPORT_SCHEMA["required"]
 
 
 def test_extracts_api_equivalent_usage() -> None:
@@ -453,7 +460,7 @@ print(json.dumps({"type": "thread.started", "thread_id": "thread-123"}))
 print(json.dumps({"type": "turn.completed", "usage": {
     "input_tokens": 100, "cached_input_tokens": 80, "output_tokens": 25,
     "reasoning_output_tokens": 10}}))
-report = {"changed": False, "complete": True, "needs_fixup": False,
+report = {"changed": False, "complete": True,
           "summary": "done", "issues": []}
 print(json.dumps({"type": "item.completed", "item": {
     "type": "agent_message", "text": json.dumps(report)}}))
@@ -501,7 +508,7 @@ if "resume" not in sys.argv:
     print(json.dumps({{"type": "error", "message": message}}))
     print(json.dumps({{"type": "turn.failed", "error": {{"message": message}}}}))
     raise SystemExit(1)
-report = {{"changed": False, "complete": True, "needs_fixup": False,
+report = {{"changed": False, "complete": True,
           "summary": "resumed successfully", "issues": []}}
 print(json.dumps({{"type": "turn.started"}}))
 print(json.dumps({{"type": "item.completed", "item": {{
@@ -559,7 +566,7 @@ print(json.dumps({"type": "item.completed", "item": {
 print(json.dumps({"type": "turn.completed", "usage": {
     "input_tokens": 100, "cached_input_tokens": 80, "output_tokens": 25,
     "reasoning_output_tokens": 10}}))
-report = {"changed": False, "complete": True, "needs_fixup": False,
+report = {"changed": False, "complete": True,
           "summary": "large event drained", "issues": []}
 print(json.dumps({"type": "item.completed", "item": {
     "type": "agent_message", "text": json.dumps(report)}}))
@@ -740,7 +747,7 @@ for _ in range(200):
     if Path({str(child_pid_path)!r}).is_file():
         break
     time.sleep(0.01)
-report = {{"changed": False, "complete": True, "needs_fixup": False,
+report = {{"changed": False, "complete": True,
           "summary": "done", "issues": []}}
 print(json.dumps({{"type": "item.completed", "item": {{
     "type": "agent_message", "text": json.dumps(report)}}}}), flush=True)
