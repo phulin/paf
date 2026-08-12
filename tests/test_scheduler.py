@@ -73,6 +73,7 @@ def result(
     placeholders: int = 2,
     needs_fixup: bool = False,
     issues: list[str] | None = None,
+    fixup_findings: list[dict[str, Any]] | None = None,
 ) -> AgentResult:
     return AgentResult(
         succeeded=True,
@@ -86,6 +87,7 @@ def result(
             "needs_fixup": needs_fixup,
             "summary": "reviewed",
             "issues": issues or [],
+            "fixup_findings": fixup_findings or [],
         },
     )
 
@@ -1207,7 +1209,17 @@ async def test_review_findings_are_fixed_then_reviewed_again(
     orchestrator.executor = FakeExecutor(
         state,
         [
-            result(changed=False, needs_fixup=True, issues=["statement needs a hypothesis"]),
+            result(
+                changed=False,
+                needs_fixup=True,
+                issues=["statement needs a hypothesis"],
+                fixup_findings=[
+                    {
+                        "description": "statement needs a hypothesis",
+                        "owner_paths": ["lean/Book/Chapter01.lean"],
+                    }
+                ],
+            ),
             result(changed=True),
             result(changed=False),
         ],
@@ -1243,6 +1255,58 @@ async def test_review_findings_are_fixed_then_reviewed_again(
     assert await orchestrator._review_until_clean()
     assert stages_seen == [Stage.REVIEW, Stage.FIXUP, Stage.REVIEW]
     await orchestrator.shutdown()
+
+
+def test_review_findings_route_to_requested_chapter_owners(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    orchestrator = Orchestrator(config, StateStore(config))
+    first, second = config.chapters
+
+    routed = orchestrator._route_review_findings(
+        first,
+        {
+            "fixup_findings": [
+                {
+                    "description": "Add the missing bridge in its actual dependency owner.",
+                    "owner_paths": [
+                        "lean/Book/Chapter01/Section02Consumer.lean",
+                        "lean/Book/Chapter02/Section01Bridge.lean",
+                    ],
+                }
+            ]
+        },
+        "legacy fallback",
+    )
+
+    assert set(routed) == {first.id, second.id}
+    assert f"auditing `{first.id}`" in routed[second.id]
+    assert "Add the missing bridge" in routed[second.id]
+    assert "lean/Book/Chapter02/Section01Bridge.lean" in routed[second.id]
+    assert "Chapter01/Section02Consumer.lean" not in routed[second.id]
+    assert "lean/Book/Chapter01/Section02Consumer.lean" in routed[first.id]
+    assert "Chapter02/Section01Bridge.lean" not in routed[first.id]
+
+
+def test_unowned_review_findings_fall_back_to_reviewed_chapter(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    orchestrator = Orchestrator(config, StateStore(config))
+    chapter = config.chapters[0]
+
+    routed = orchestrator._route_review_findings(
+        chapter,
+        {
+            "fixup_findings": [
+                {
+                    "description": "Repository-wide infrastructure is missing.",
+                    "owner_paths": ["src/tooling.py"],
+                }
+            ]
+        },
+        "legacy fallback",
+    )
+
+    assert set(routed) == {chapter.id}
+    assert "Repository-wide infrastructure is missing" in routed[chapter.id]
 
 
 @pytest.mark.asyncio

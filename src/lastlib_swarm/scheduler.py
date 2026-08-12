@@ -78,7 +78,7 @@ class FormalizeOutcome:
 class ReviewOutcome:
     succeeded: bool
     needs_fixup: bool
-    feedback: str
+    feedback_by_owner: dict[str, str]
 
 
 @dataclass(frozen=True)
@@ -617,6 +617,54 @@ class Orchestrator:
             ):
                 owners.append(chapter.id)
         return tuple(dict.fromkeys(owners))
+
+    def _route_review_findings(
+        self,
+        chapter: Chapter,
+        report: dict[str, Any],
+        fallback_feedback: str,
+    ) -> dict[str, str]:
+        """Route structured review findings to the chapters owning their requested edit paths."""
+
+        routed: dict[str, dict[str, None]] = {}
+        findings = report.get("fixup_findings")
+        if isinstance(findings, list):
+            for finding in findings:
+                if not isinstance(finding, dict):
+                    continue
+                description = finding.get("description")
+                paths = finding.get("owner_paths")
+                if not isinstance(description, str) or not description.strip():
+                    continue
+                if not isinstance(paths, list):
+                    paths = []
+                owner_paths = tuple(
+                    path for path in paths if isinstance(path, str) and path.strip()
+                )
+                paths_by_owner: dict[str, dict[str, None]] = {}
+                for path in owner_paths:
+                    owners = self._path_owner_ids(path)
+                    # Preserve compatibility with repository-wide findings that cannot be assigned
+                    # from a chapter scope. The reviewing chapter will retain them as blockers.
+                    if not owners:
+                        owners = (chapter.id,)
+                    for owner in owners:
+                        paths_by_owner.setdefault(owner, {})[path] = None
+                if not paths_by_owner:
+                    paths_by_owner[chapter.id] = {}
+                for owner, owned_paths in paths_by_owner.items():
+                    paths_block = "\n".join(f"- `{path}`" for path in owned_paths)
+                    block = (
+                        f"Review finding reported while auditing `{chapter.id}`:\n"
+                        f"{description.strip()}"
+                    )
+                    if paths_block:
+                        block += f"\nRequested edit paths owned by `{owner}`:\n{paths_block}"
+                    routed.setdefault(owner, {})[block] = None
+
+        if routed:
+            return {owner: "\n\n".join(blocks) for owner, blocks in routed.items()}
+        return {chapter.id: fallback_feedback}
 
     def _module_owner_ids(self, module: str) -> tuple[str, ...]:
         return tuple(
@@ -1229,7 +1277,7 @@ class Orchestrator:
 
     async def _review_once(self, chapter: Chapter, *, rerun: bool = False) -> ReviewOutcome:
         if not rerun and self._already_done(chapter, Stage.REVIEW):
-            return ReviewOutcome(True, False, "")
+            return ReviewOutcome(True, False, {})
         attempt = await self._attempt(
             chapter,
             Stage.REVIEW,
@@ -1246,7 +1294,7 @@ class Orchestrator:
                 TaskStatus.SUCCEEDED,
                 "read-only review found no actionable issues",
             )
-            return ReviewOutcome(True, False, feedback)
+            return ReviewOutcome(True, False, {})
         detail = "review reported fixup findings" if needs_fixup else "read-only review failed"
         await self.state.set_task(
             chapter.id,
@@ -1254,7 +1302,8 @@ class Orchestrator:
             TaskStatus.FAILED,
             detail,
         )
-        return ReviewOutcome(succeeded and complete, needs_fixup, feedback)
+        routed = self._route_review_findings(chapter, attempt.agent.report, feedback)
+        return ReviewOutcome(succeeded and complete, needs_fixup, routed)
 
     async def _review_until_clean(self, *, rerun: bool = False) -> bool:
         maximum = self.config.stages[Stage.REVIEW].max_rounds
@@ -1264,10 +1313,14 @@ class Orchestrator:
             )
             if not all(outcome.succeeded for outcome in outcomes):
                 return False
+            findings_by_owner: dict[str, dict[str, None]] = {}
+            for outcome in outcomes:
+                if not outcome.needs_fixup:
+                    continue
+                for owner, feedback in outcome.feedback_by_owner.items():
+                    findings_by_owner.setdefault(owner, {})[feedback] = None
             findings = {
-                chapter.id: outcome.feedback
-                for chapter, outcome in zip(self.chapters, outcomes, strict=True)
-                if outcome.needs_fixup
+                owner: "\n\n".join(blocks) for owner, blocks in findings_by_owner.items()
             }
             if not findings:
                 return True

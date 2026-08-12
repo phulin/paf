@@ -27,6 +27,9 @@ precede its users, and be independently provable from earlier declarations.
 1. Audit source coverage and the mathematical fidelity of every declaration.
 2. Audit proof readiness, dependency routes, and missing reusable interfaces.
 3. Describe the minimal fix for every inaccurate, circular, vacuous, or unprovable statement.
+   For each source-changing issue, emit a `fixup_findings` entry with every exact repository-relative
+   Lean path that must be edited. Include out-of-scope owners and prospective missing-file paths;
+   split repairs that belong to different chapters.
 4. Check the assigned scope against the coordinator's clean-build baseline.
 5. Audit imports in every file reviewed or changed against the common focused-import policy.
 6. Recheck the complete chapter and return structured, actionable findings.

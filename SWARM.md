@@ -243,8 +243,9 @@ After the daemon exits, `status`, `snapshot`, and `wait` fall back to the persis
   after drafting drains, a full-corpus build/fixup loop establishes global cleanliness. This repeats
   up to `max_rounds`, allowing `declaration uses sorry` but rejecting other warnings.
 - **Review** runs read-only agents against one clean source and `.olean` generation. Findings are
-  returned as structured reports, routed through fixup, rebuilt, and reviewed again until no
-  actionable finding remains.
+  returned as structured reports with exact requested edit paths, routed to their owning chapters
+  through fixup, rebuilt, and reviewed again until no actionable finding remains. Unowned legacy or
+  repository-wide findings fall back to the reviewed chapter so they remain visible as blockers.
 - **Prove** sends the whole chapter to one agent, asks for one complete proof-writing pass, and then
   uses whole-file LSP diagnostics to focus iterations on failed proofs. It succeeds only when the
   scoped Lean code has no `sorry` or `admit` tokens and final Lake validation succeeds without any

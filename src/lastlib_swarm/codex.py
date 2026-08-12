@@ -29,6 +29,22 @@ REPORT_SCHEMA: dict[str, Any] = {
         "needs_fixup": {"type": "boolean"},
         "summary": {"type": "string"},
         "issues": {"type": "array", "items": {"type": "string"}},
+        "fixup_findings": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "description": {"type": "string", "minLength": 1},
+                    "owner_paths": {
+                        "type": "array",
+                        "items": {"type": "string", "minLength": 1},
+                        "minItems": 1,
+                    },
+                },
+                "required": ["description", "owner_paths"],
+            },
+        },
         "source_issues": {
             "type": "array",
             "items": {
@@ -55,6 +71,7 @@ REPORT_SCHEMA: dict[str, Any] = {
         "needs_fixup",
         "summary",
         "issues",
+        "fixup_findings",
         "source_issues",
     ],
 }
@@ -252,6 +269,7 @@ def _find_report(event: Any) -> dict[str, Any] | None:
         if isinstance(value, dict) and all(
             key in value for key in ("changed", "complete", "needs_fixup", "summary", "issues")
         ):
+            value.setdefault("fixup_findings", [])
             value.setdefault("source_issues", [])
             return value
     return None
@@ -419,6 +437,13 @@ Return the required structured report. Set `changed` from the actual scoped diff
 the stage's definition of done. Set `needs_fixup` only when a statement or declaration interface
 must change; ordinary unfinished or broken proof code is not statement fixup. Summarize the work
 concisely and list every unresolved issue.
+
+For every actionable issue that requires a source edit, add one `fixup_findings` entry. Its
+`description` must state the complete minimal repair, and `owner_paths` must list the exact
+repository-relative Lean paths that need edits, including paths outside this attempt's scope. Use a
+prospective path when the repair requires creating a missing file. Split findings whose repairs have
+different owners. Leave `fixup_findings` empty exactly when no source edit is requested. The
+coordinator routes these entries to the chapters that own those paths.
 
 Record each genuine defect in the informal textbook in `source_issues`, with its precise heading or
 other location, an exact identifying excerpt, a mathematical explanation, and the smallest suggested
