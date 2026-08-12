@@ -1,4 +1,5 @@
 import asyncio
+import json
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +14,7 @@ from lastlib_swarm.tui import (
     TUI_THEME,
     AgentDetailScreen,
     SwarmApp,
+    format_agent_update,
     format_count,
     format_usage,
 )
@@ -33,6 +35,44 @@ def test_formats_measured_token_spend_without_double_counting_cache() -> None:
     assert "1.30m" in rendered
     assert "cached 1.00m" in rendered
     assert format_count(999) == "999"
+
+
+def test_formats_structured_agent_update_as_summary_and_issues() -> None:
+    update = json.dumps(
+        {
+            "changed": True,
+            "complete": False,
+            "needs_fixup": True,
+            "summary": "Added the missing theorem.",
+            "issues": ["The downstream proof still needs repair.", "Confirm the new import."],
+        }
+    )
+
+    rendered = format_agent_update(update, heading="LATEST AGENT UPDATE", width=60)
+    lines = rendered.splitlines()
+
+    assert lines[0].startswith("LATEST AGENT UPDATE")
+    assert lines[0].endswith("CHANGED ✓")
+    assert len(lines[0]) == 60
+    assert lines[1:] == [
+        "Added the missing theorem.",
+        "ISSUES",
+        "  • The downstream proof still needs repair.",
+        "  • Confirm the new import.",
+    ]
+
+
+def test_formats_unchanged_agent_update_with_an_empty_issue_list() -> None:
+    update = json.dumps({"changed": False, "summary": "No edit was needed.", "issues": []})
+
+    rendered = format_agent_update(update, heading="agent update", width=32, indent="    ")
+
+    assert rendered.splitlines() == [
+        "agent update           CHANGED ✗",
+        "    No edit was needed.",
+        "    ISSUES",
+        "      • None reported",
+    ]
 
 
 @pytest.mark.asyncio
@@ -243,7 +283,18 @@ async def test_agent_detail_can_switch_between_chapter_steps(tmp_path: Path) -> 
             second,
             usage=TokenUsage(input_tokens=2_000, output_tokens=200, measured=True),
         )
-        await record_update(second.id, "review update")
+        await record_update(
+            second.id,
+            json.dumps(
+                {
+                    "changed": False,
+                    "complete": True,
+                    "needs_fixup": False,
+                    "summary": "review update",
+                    "issues": ["One issue for display."],
+                }
+            ),
+        )
         ready.set()
         await finish.wait()
         return True
@@ -265,7 +316,16 @@ async def test_agent_detail_can_switch_between_chapter_steps(tmp_path: Path) -> 
         assert run_tabs.active == "agent-step-2"
         assert "review round 1" in str(screen.query_one("#agent-heading", Static).content)
         summary = screen.query_one("#agent-summary", RichLog)
-        assert "review update" in "".join(line.text for line in summary.lines)
+        rendered_summary = "\n".join(line.text for line in summary.lines)
+        assert "review update" in rendered_summary
+        assert "CHANGED ✗" in rendered_summary
+        assert "• One issue for display." in rendered_summary
+        assert '"changed"' not in rendered_summary
+        timeline = screen.query_one("#agent-timeline", RichLog)
+        rendered_timeline = "\n".join(line.text for line in timeline.lines)
+        assert "CHANGED ✗" in rendered_timeline
+        assert "• One issue for display." in rendered_timeline
+        assert '"changed"' not in rendered_timeline
 
         run_tabs.active = "agent-step-1"
         await pilot.pause(0.2)

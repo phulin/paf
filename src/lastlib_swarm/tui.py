@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import deque
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, ClassVar
@@ -155,6 +156,62 @@ def activity_label(activity: AgentActivity | None, run: RunRecord | None) -> str
     return f"{prefix}{activity.current}{idle}"
 
 
+@dataclass(frozen=True)
+class AgentUpdate:
+    changed: bool
+    summary: str
+    issues: tuple[str, ...]
+
+
+def parse_agent_update(value: str) -> AgentUpdate | None:
+    """Decode the structured report emitted as an agent message, when present."""
+
+    try:
+        report = json.loads(value)
+    except (ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(report, dict):
+        return None
+    changed = report.get("changed")
+    summary = report.get("summary")
+    issues = report.get("issues")
+    if (
+        not isinstance(changed, bool)
+        or not isinstance(summary, str)
+        or not isinstance(issues, list)
+        or not all(isinstance(issue, str) for issue in issues)
+    ):
+        return None
+    return AgentUpdate(changed=changed, summary=summary, issues=tuple(issues))
+
+
+def _right_aligned_status(label: str, status: str, width: int) -> str:
+    gap = max(1, width - len(label) - len(status))
+    return f"{label}{' ' * gap}{status}"
+
+
+def format_agent_update(value: str, *, heading: str, width: int, indent: str = "") -> str:
+    """Render a structured agent report without exposing its JSON encoding."""
+
+    update = parse_agent_update(value)
+    if update is None:
+        return f"{heading}\n{value}" if value else f"{heading}\nNo update yet."
+
+    changed = f"CHANGED {'✓' if update.changed else '✗'}"
+    lines = [_right_aligned_status(heading, changed, width)]
+    summary_lines = update.summary.splitlines() or ["No summary provided."]
+    lines.extend(f"{indent}{line}" for line in summary_lines)
+    lines.append(f"{indent}ISSUES")
+    if update.issues:
+        for issue in update.issues:
+            issue_lines = issue.splitlines() or [""]
+            lines.append(f"{indent}  • {issue_lines[0]}")
+            lines.extend(f"{indent}    {line}" for line in issue_lines[1:])
+    else:
+        lines.append(f"{indent}  • None reported")
+    return "\n".join(lines)
+
+
 def _compact_json(value: Any, *, limit: int = 400) -> Any:
     if isinstance(value, str):
         return value if len(value) <= limit else value[: limit - 1] + "…"
@@ -231,7 +288,7 @@ class AgentDetailScreen(Screen[None]):
         self.chapter = chapter
         selected = latest_run(state, chapter)
         self._selected_run_id = selected.id if selected is not None else None
-        self._rendered_activity: tuple[str, int | None] | None = None
+        self._rendered_activity: tuple[str, int | None, int] | None = None
         self._static_cache: dict[str, str] = {}
         self._tab_runs: dict[str, str] = {}
         self._tab_labels: dict[str, str] = {}
@@ -336,15 +393,22 @@ class AgentDetailScreen(Screen[None]):
             f"TIME / SPEND\nelapsed {format_duration(elapsed)} · last event {last_event}\n"
             f"tokens {usage} · API-equivalent cost {cost}",
         )
-        summary = (
-            activity.latest_summary if activity and activity.latest_summary else "No update yet."
+        summary = activity.latest_summary if activity else ""
+        summary_log = self.query_one("#agent-summary", RichLog)
+        self._update_log(
+            "#agent-summary",
+            format_agent_update(
+                summary,
+                heading="LATEST AGENT UPDATE",
+                width=summary_log.content_size.width,
+            ),
         )
-        self._update_log("#agent-summary", f"LATEST AGENT UPDATE\n{summary}")
         error = reportable_error(activity.latest_error) if activity else ""
         self._update_static("#agent-error", f"LATEST ERROR\n{error}" if error else "")
         path = Path(run.log_path) if run.log_path else self.state.logs_dir / f"{run.id}.jsonl"
         self._update_static("#agent-path", f"Raw JSONL: {path}")
-        rendered_activity = (run.id, activity.sequence if activity else None)
+        timeline_width = self.query_one("#agent-timeline", RichLog).content_size.width
+        rendered_activity = (run.id, activity.sequence if activity else None, timeline_width)
         if rendered_activity != self._rendered_activity:
             self._render_activity(activity)
             self._rendered_activity = rendered_activity
@@ -437,11 +501,29 @@ class AgentDetailScreen(Screen[None]):
         timeline = self.query_one("#agent-timeline", RichLog)
         timeline.clear()
         marks = {"started": "▶", "completed": "✓", "failed": "✗", "updated": "•"}
+        latest_message = max(
+            (entry.sequence for entry in activity.recent if entry.kind == "message"),
+            default=None,
+        ) if activity else None
         for entry in activity.recent if activity else ():
             clock = entry.at[11:19] if len(entry.at) >= 19 else entry.at
             line = f"{clock} {marks.get(entry.status, '•')} [{entry.kind}] {entry.title}"
-            if entry.detail:
-                line += f"\n    {entry.detail}"
+            detail = (
+                activity.latest_summary
+                if activity is not None
+                and entry.kind == "message"
+                and entry.sequence == latest_message
+                else entry.detail
+            )
+            if entry.kind == "message" and parse_agent_update(detail) is not None:
+                line = format_agent_update(
+                    detail,
+                    heading=line,
+                    width=timeline.content_size.width,
+                    indent="    ",
+                )
+            elif detail:
+                line += f"\n    {detail}"
             timeline.write(line)
         if activity is None:
             timeline.write("No activity events recorded for this step.")
