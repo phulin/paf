@@ -103,6 +103,7 @@ USAGE_POLL_SECONDS = 0.25
 PROCESS_GROUP_GRACE_SECONDS = 1.0
 COMMON_PROMPT_PATH = Path(__file__).with_name("prompts") / "common.md"
 CAPACITY_RESUME_PROMPT = "Continue from the interrupted turn and complete the assigned task."
+REVIEW_FILE_BUNDLE_MAX_CHARS = 200_000
 
 
 def lean_mcp_executable() -> Path:
@@ -176,6 +177,40 @@ def scoped_files(repo: Path, chapter: Chapter) -> list[Path]:
     for pattern in chapter.scope:
         files.update(path for path in repo.glob(pattern) if path.is_file())
     return sorted(files)
+
+
+def _review_file_bundle(
+    repo: Path,
+    chapter: Chapter,
+    maximum: int = REVIEW_FILE_BUNDLE_MAX_CHARS,
+) -> str:
+    """Render the complete assigned file set with stable line numbers and a hard size cap."""
+
+    parts = [
+        "# Line-numbered assigned file set\n\n",
+        "This snapshot is supplied before the review instructions. "
+        "Paths are repository-relative.\n",
+    ]
+    files = sorted(scoped_files(repo, chapter), key=lambda path: path.relative_to(repo).as_posix())
+    if not files:
+        parts.append("\n(No files currently exist in the assigned scope.)\n")
+    for path in files:
+        relative = path.relative_to(repo).as_posix()
+        parts.append(f"\n## `{relative}`\n\n")
+        contents = path.read_text(encoding="utf-8", errors="replace")
+        lines = contents.splitlines()
+        if not lines:
+            parts.append("     1 | \n")
+        else:
+            parts.extend(f"{number:6d} | {line}\n" for number, line in enumerate(lines, 1))
+
+    bundle = "".join(parts)
+    if len(bundle) <= maximum:
+        return bundle
+    marker = f"\n[Assigned file set truncated at {maximum:,} characters.]\n"
+    if len(marker) >= maximum:
+        return marker[:maximum]
+    return bundle[: maximum - len(marker)] + marker
 
 
 def scope_digest(repo: Path, chapter: Chapter) -> str:
@@ -388,6 +423,7 @@ class CodexExecutor:
         stage: Stage,
         *,
         feedback: str = "",
+        workspace_root: Path | None = None,
     ) -> str:
         template = self.config.stages[stage].prompt.read_text(encoding="utf-8")
         base = render_prompt(template, chapter)
@@ -483,7 +519,11 @@ imports with a compiler command.
                 "\n## Feedback from the preceding attempt\n\n```text\n"
                 f"{_bounded_feedback(feedback)}\n```\n"
             )
-        return f"{base.rstrip()}\n\n{common.rstrip()}\n{contract}"
+        prefix = ""
+        if stage is Stage.REVIEW:
+            root = workspace_root or self.config.settings.repo
+            prefix = _review_file_bundle(root, chapter).rstrip() + "\n\n"
+        return f"{prefix}{base.rstrip()}\n\n{common.rstrip()}\n{contract}"
 
     def command(
         self,
@@ -550,7 +590,7 @@ imports with a compiler command.
         workspace_root: Path | None = None,
     ) -> AgentResult:
         root = workspace_root or self.config.settings.repo
-        prompt = self.build_prompt(chapter, stage, feedback=feedback)
+        prompt = self.build_prompt(chapter, stage, feedback=feedback, workspace_root=root)
         before = scope_digest(root, chapter)
         log_path = self.state.logs_dir / f"{run.id}.jsonl"
         usage = TokenUsage()

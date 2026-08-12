@@ -37,7 +37,9 @@ build immediately releases descendants. A final graph-stable topological build e
 baseline for review and proof. Reviewers directly make scoped statement and API repairs. Each
 dependency-ready chapter is rebuilt after a changed review and sent through fixup if needed. After
 at most five such cycles—or immediately after a no-change review—the chapter is released to proving
-without waiting for reviews of its descendants. Fixup and proof agents receive Lean MCP.
+without waiting for reviews of its descendants. Every review prompt begins with the complete assigned
+file set in path order with numbered lines, capped at 200,000 characters. Fixup and proof agents
+receive Lean MCP.
 
 For a conventional numbered corpus, point the CLI at the book directory. It discovers all direct
 Markdown children and automatically reads `BOOK_DEPENDENCIES.md` from the repository root:

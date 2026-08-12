@@ -8,10 +8,12 @@ from pathlib import Path
 import pytest
 
 from lastlib_swarm.codex import (
+    REVIEW_FILE_BUNDLE_MAX_CHARS,
     CodexExecutor,
     _bounded_feedback,
     _capacity_resume_delay,
     _is_capacity_failure,
+    _review_file_bundle,
     _rollout_usage,
     count_placeholders,
     lean_mcp_executable,
@@ -268,6 +270,51 @@ def test_review_prompt_requires_scoped_edits_and_coordinator_rebuild(tmp_path: P
     assert "directly make every warranted in-scope" in prompt
     assert "rebuilds it" in prompt
     assert "read-only" not in prompt
+
+
+def test_review_prompt_starts_with_every_scoped_file_and_line_numbers(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    root = tmp_path / "lean" / "Book"
+    child = root / "Chapter01" / "Section02.lean"
+    child.parent.mkdir(parents=True)
+    (root / "Chapter01.lean").write_text(
+        "import Book.Chapter01.Section02\n\ndef chapter := section\n",
+        encoding="utf-8",
+    )
+    child.write_text("def section := 2\n", encoding="utf-8")
+    executor = CodexExecutor(config, StateStore(config))
+
+    prompt = executor.build_prompt(config.chapters[0], Stage.REVIEW)
+
+    assert prompt.startswith("# Line-numbered assigned file set\n")
+    root_header = "## `lean/Book/Chapter01.lean`"
+    child_header = "## `lean/Book/Chapter01/Section02.lean`"
+    assert (
+        prompt.index(root_header)
+        < prompt.index(child_header)
+        < prompt.index("Do A Book chapter 01")
+    )
+    assert "     1 | import Book.Chapter01.Section02" in prompt
+    assert "     2 | " in prompt
+    assert "     3 | def chapter := section" in prompt
+    assert "     1 | def section := 2" in prompt
+
+    prove_prompt = executor.build_prompt(config.chapters[0], Stage.PROVE)
+    assert "Line-numbered assigned file set" not in prove_prompt
+
+
+def test_review_file_bundle_is_capped_at_200k_characters(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    target = tmp_path / "lean" / "Book" / "Chapter01.lean"
+    target.parent.mkdir(parents=True)
+    target.write_text("x" * (REVIEW_FILE_BUNDLE_MAX_CHARS + 10_000), encoding="utf-8")
+
+    bundle = _review_file_bundle(tmp_path, config.chapters[0])
+
+    assert len(bundle) == REVIEW_FILE_BUNDLE_MAX_CHARS
+    assert bundle.endswith(
+        f"[Assigned file set truncated at {REVIEW_FILE_BUNDLE_MAX_CHARS:,} characters.]\n"
+    )
 
 
 def test_executor_can_disable_lean_mcp(tmp_path: Path) -> None:
