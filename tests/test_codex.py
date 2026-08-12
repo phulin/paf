@@ -176,6 +176,17 @@ def test_every_agent_prompt_explains_that_git_is_unavailable(tmp_path: Path, sta
             "type": "turn.failed",
             "error": {"message": "Selected model is at capacity. Please try again."},
         },
+        {
+            "type": "error",
+            "message": (
+                "exceeded retry limit, last status: 429 Too Many Requests, "
+                "request id: example-request"
+            ),
+        },
+        {
+            "type": "turn.failed",
+            "error": {"message": "unexpected HTTP/2 429 response from upstream"},
+        },
     ],
 )
 def test_detects_capacity_failures(event: dict[str, object]) -> None:

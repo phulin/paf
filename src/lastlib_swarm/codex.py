@@ -267,7 +267,13 @@ def _is_capacity_failure(event: Any) -> bool:
     elif isinstance(error, str):
         messages.append(error)
     return any(
-        isinstance(message, str) and "at capacity" in message.casefold() for message in messages
+        isinstance(message, str)
+        and (
+            "at capacity" in message.casefold()
+            or "too many requests" in message.casefold()
+            or re.search(r"\b(?:http(?:/\S+)?\s+)?429\b", message, re.IGNORECASE) is not None
+        )
+        for message in messages
     )
 
 
