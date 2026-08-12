@@ -129,6 +129,7 @@ def test_executor_uses_machine_readable_codex_mode(tmp_path: Path) -> None:
     assert json.loads(overrides["mcp_servers.lastlib_lean.env.PATH"]) == lean_mcp_path()
     assert "lean_diagnostic_messages" in overrides["mcp_servers.lastlib_lean.enabled_tools"]
     assert "lean_multi_attempt" in overrides["mcp_servers.lastlib_lean.enabled_tools"]
+    assert "lean_file_outline" not in overrides["mcp_servers.lastlib_lean.enabled_tools"]
     assert "lean_build" not in overrides["mcp_servers.lastlib_lean.enabled_tools"]
     assert render_prompt(
         "Chapter {chapter_number_padded}: {chapter_title}", config.chapters[0]
@@ -146,6 +147,9 @@ def test_executor_uses_machine_readable_codex_mode(tmp_path: Path) -> None:
         "mcp_servers.lastlib_lean.enabled_tools"
     ]
     assert "lean_code_actions" in review_overrides["mcp_servers.lastlib_lean.enabled_tools"]
+    assert "lean_file_outline" not in review_overrides[
+        "mcp_servers.lastlib_lean.enabled_tools"
+    ]
     assert "lean_multi_attempt" not in review_overrides[
         "mcp_servers.lastlib_lean.enabled_tools"
     ]
@@ -158,6 +162,9 @@ def test_executor_uses_machine_readable_codex_mode(tmp_path: Path) -> None:
     }
     assert "lean_diagnostic_messages" in fixup_overrides["mcp_servers.lastlib_lean.enabled_tools"]
     assert "lean_code_actions" in fixup_overrides["mcp_servers.lastlib_lean.enabled_tools"]
+    assert "lean_file_outline" not in fixup_overrides[
+        "mcp_servers.lastlib_lean.enabled_tools"
+    ]
     assert "lean_multi_attempt" not in fixup_overrides["mcp_servers.lastlib_lean.enabled_tools"]
     assert "lean_goal" not in fixup_overrides["mcp_servers.lastlib_lean.enabled_tools"]
 

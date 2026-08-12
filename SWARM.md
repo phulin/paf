@@ -174,7 +174,7 @@ agent/build diagnostics, blocked dependents, and persisted state path to standar
 
 Every proof attempt receives its own locked
 [`lean-lsp-mcp`](https://github.com/oOo0oOo/lean-lsp-mcp) stdio server, rooted inside the agent's
-private FUSE overlay. It exposes whole-file diagnostics, outlines, hover and declaration lookup,
+private FUSE overlay. It exposes whole-file diagnostics, hover and declaration lookup,
 local source search, proof goals, completions, code actions, and batched tactic trials. Remote search,
 local Loogle, and the MCP's `lean_build` tool remain absent from the allowlist.
 

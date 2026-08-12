@@ -75,7 +75,6 @@ REPORT_SCHEMA: dict[str, Any] = {
 }
 
 LEAN_MCP_BASE_TOOLS = (
-    "lean_file_outline",
     "lean_diagnostic_messages",
     "lean_hover_info",
     "lean_declaration_file",
@@ -508,7 +507,7 @@ diagnostics, and `{chapter.build_command}`.
 """
         if self.config.settings.lean_mcp and stage in (Stage.FIXUP, Stage.REVIEW, Stage.PROVE):
             capabilities = (
-                "whole-file diagnostics, outline, hover, declaration lookup, local search, "
+                "whole-file diagnostics, hover, declaration lookup, local search, "
                 "completions, and code actions"
                 if stage in (Stage.FIXUP, Stage.REVIEW)
                 else "whole-file diagnostics, goals, hover, declaration lookup, code actions, "
