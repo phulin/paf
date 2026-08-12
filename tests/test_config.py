@@ -32,6 +32,7 @@ def test_discovers_chapters_and_renders_paths(tmp_path: Path) -> None:
     assert config.settings.capacity_resume_attempts == 10
     assert config.settings.capacity_resume_delay_seconds == 15
     assert config.settings.capacity_resume_max_delay_seconds == 120
+    assert config.settings.sandbox == "danger-full-access"
 
 
 def test_selects_configured_chapters(tmp_path: Path) -> None:

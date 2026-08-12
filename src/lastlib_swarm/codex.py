@@ -474,11 +474,11 @@ imports with a compiler command.
         command.extend(["--output-schema", str(self.schema_path)])
         if root != settings.repo:
             command.append("--skip-git-repo-check")
-        if stage is Stage.REVIEW:
+        if settings.bypass_approvals_and_sandbox:
+            command.append("--dangerously-bypass-approvals-and-sandbox")
+        elif stage is Stage.REVIEW:
             if resume_thread_id is None:
                 command.extend(["--sandbox", "read-only"])
-        elif settings.bypass_approvals_and_sandbox:
-            command.append("--dangerously-bypass-approvals-and-sandbox")
         elif settings.approve_for_me and resume_thread_id is None:
             # Current Codex versions make --approve-for-me mutually exclusive
             # with --sandbox; approve-for-me itself selects workspace-write.

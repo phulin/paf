@@ -126,9 +126,8 @@ def test_executor_uses_machine_readable_codex_mode(tmp_path: Path) -> None:
     ) == ("Chapter 01: First chapter")
 
     review_command = executor.command(Stage.REVIEW)
-    assert "--sandbox" in review_command
-    assert review_command[review_command.index("--sandbox") + 1] == "read-only"
-    assert "--dangerously-bypass-approvals-and-sandbox" not in review_command
+    assert "--dangerously-bypass-approvals-and-sandbox" in review_command
+    assert "--sandbox" not in review_command
     fixup_command = executor.command(Stage.FIXUP, isolated)
     fixup_overrides = {
         fixup_command[index + 1].split("=", 1)[0]: fixup_command[index + 1].split("=", 1)[1]
@@ -150,7 +149,7 @@ def test_executor_uses_machine_readable_codex_mode(tmp_path: Path) -> None:
     assert "--output-schema" in resumed
     assert "--cd" not in resumed
     resumed_review = executor.command(Stage.REVIEW, isolated, resume_thread_id="review-thread")
-    assert "--dangerously-bypass-approvals-and-sandbox" not in resumed_review
+    assert "--dangerously-bypass-approvals-and-sandbox" in resumed_review
 
 
 @pytest.mark.parametrize("stage", list(Stage))
@@ -240,6 +239,19 @@ def test_approve_for_me_is_not_combined_with_explicit_sandbox(tmp_path: Path) ->
 
     assert "--approve-for-me" in command
     assert "--sandbox" not in command
+    assert "--dangerously-bypass-approvals-and-sandbox" not in command
+
+
+def test_review_is_sandboxed_when_full_access_is_disabled(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    config = replace(
+        config,
+        settings=replace(config.settings, bypass_approvals_and_sandbox=False),
+    )
+    command = CodexExecutor(config, StateStore(config)).command(Stage.REVIEW)
+
+    assert "--sandbox" in command
+    assert command[command.index("--sandbox") + 1] == "read-only"
     assert "--dangerously-bypass-approvals-and-sandbox" not in command
 
 

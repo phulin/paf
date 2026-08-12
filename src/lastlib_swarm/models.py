@@ -32,7 +32,7 @@ class SwarmSettings:
     codex_bin: str = "codex"
     model: str | None = "gpt-5.6-luna"
     reasoning_effort: str | None = "max"
-    sandbox: str = "workspace-write"
+    sandbox: str = "danger-full-access"
     approve_for_me: bool = False
     bypass_approvals_and_sandbox: bool = True
     agent_timeout_seconds: float = 7200.0

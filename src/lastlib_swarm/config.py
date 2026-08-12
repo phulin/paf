@@ -224,7 +224,7 @@ def load_config(path: str | Path) -> PipelineConfig:
         codex_bin=str(swarm.get("codex_bin", "codex")),
         model=str(swarm.get("model", "gpt-5.6-luna")),
         reasoning_effort=str(swarm.get("reasoning_effort", "max")),
-        sandbox=str(swarm.get("sandbox", "workspace-write")),
+        sandbox=str(swarm.get("sandbox", "danger-full-access")),
         approve_for_me=bool(swarm.get("approve_for_me", False)),
         bypass_approvals_and_sandbox=bool(swarm.get("bypass_approvals_and_sandbox", True)),
         agent_timeout_seconds=float(swarm.get("agent_timeout_seconds", 7200)),

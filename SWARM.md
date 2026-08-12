@@ -82,9 +82,12 @@ Proof agents must clear every MCP warning except “declaration uses `sorry`” 
 attempted but could not prove. Disabling a linter or warning option is not an acceptable fix.
 
 Codex is invoked in its documented noninteractive JSONL mode with a strict final-report schema.
-Swarm workers default to `--dangerously-bypass-approvals-and-sandbox`, giving them full host access
-for unattended formalization. Set `bypass_approvals_and_sandbox = false` and
-`approve_for_me = true` to restore automatic review with Codex's workspace-write sandbox. See
+All swarm workers, including review workers, default to
+`--dangerously-bypass-approvals-and-sandbox`, giving them full host access for unattended
+formalization. Review workers remain contractually non-mutating, and the coordinator rejects review
+attempts that change files. To opt into sandboxed workers, set
+`bypass_approvals_and_sandbox = false`; setting `approve_for_me = true` then uses Codex's
+workspace-write sandbox for mutating stages, while review remains read-only. See
 OpenAI's official
 [Codex non-interactive guidance](https://developers.openai.com/codex/noninteractive).
 
@@ -401,7 +404,7 @@ max_agents = 24
 codex_bin = "codex"
 model = "gpt-5.6-luna"
 reasoning_effort = "max"
-sandbox = "workspace-write"
+sandbox = "danger-full-access"
 approve_for_me = false
 bypass_approvals_and_sandbox = true
 agent_timeout_seconds = 7200
