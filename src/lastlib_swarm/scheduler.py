@@ -80,6 +80,7 @@ class ReviewOutcome:
     needs_fixup: bool
     changed: bool
     feedback_by_owner: dict[str, str]
+    complete: bool = True
 
 
 @dataclass(frozen=True)
@@ -984,6 +985,7 @@ class Orchestrator:
         maximum = self.config.stages[Stage.FIXUP].max_rounds
         attempts = {chapter_id: 0 for chapter_id in by_id}
         running: dict[str, RunningFixupAgent] = {}
+        failed: set[str] = set()
         persisted_clean = self.state.fixup_graph.get("clean", {})
         clean_records = persisted_clean if isinstance(persisted_clean, dict) else {}
         clean: dict[str, dict[str, Any]] = {}
@@ -1143,7 +1145,20 @@ class Orchestrator:
                         continue
                     attempt = await self._integrate_fixup_agent(handle)
                     if attempt is None:
-                        return False
+                        if attempts[chapter_id] < maximum:
+                            merge_feedback(
+                                {
+                                    chapter_id: (
+                                        "The previous fixup agent failed before producing an "
+                                        "acceptable patch. Retry the scoped repair from the "
+                                        "coordinator diagnostics."
+                                    )
+                                }
+                            )
+                        else:
+                            failed.add(chapter_id)
+                            self._invalidate_fixup_descendants(graph, clean, (chapter_id,))
+                        continue
                     clean.pop(chapter_id, None)
                     try:
                         graph = self._observed_chapter_graph()
@@ -1206,6 +1221,7 @@ class Orchestrator:
                     for chapter_id in graph.order
                     if chapter_id in pending_feedback
                     and chapter_id not in running
+                    and chapter_id not in failed
                     and graph.dependencies[chapter_id].issubset(clean)
                 ]
                 for chapter_id in actionable[: max(available, 0)]:
@@ -1216,7 +1232,10 @@ class Orchestrator:
                             TaskStatus.FAILED,
                             f"fixup did not converge in {maximum} attempts",
                         )
-                        return False
+                        pending_feedback.pop(chapter_id, None)
+                        failed.add(chapter_id)
+                        self._invalidate_fixup_descendants(graph, clean, (chapter_id,))
+                        continue
                     attempts[chapter_id] += 1
                     dependency_certificates = {
                         dependency: str(clean[dependency]["certificate"])
@@ -1249,6 +1268,7 @@ class Orchestrator:
                     if chapter_id not in clean
                     and chapter_id not in pending_feedback
                     and chapter_id not in running
+                    and chapter_id not in failed
                     and graph.dependencies[chapter_id].issubset(clean)
                     and (not targeted or chapter_id in needed)
                 ]
@@ -1266,12 +1286,27 @@ class Orchestrator:
         finally:
             await cancel_running()
 
-        await self.state.set_tasks(
-            goals if targeted else by_id,
-            Stage.FIXUP,
-            TaskStatus.FAILED,
-            "observed-import fixup could not select dependency-ready work",
-        )
+        required = set(goals) if targeted else set(by_id)
+        pending_required = list(required)
+        while pending_required:
+            chapter_id = pending_required.pop()
+            for dependency in graph.dependencies.get(chapter_id, frozenset()):
+                if dependency not in required:
+                    required.add(dependency)
+                    pending_required.append(dependency)
+        unresolved = required.difference(clean)
+        blocked = unresolved.difference(failed)
+        if blocked:
+            await self.state.set_tasks(
+                blocked,
+                Stage.FIXUP,
+                TaskStatus.BLOCKED if failed else TaskStatus.FAILED,
+                (
+                    "blocked by a failed prerequisite fixup; unrelated branches completed"
+                    if failed
+                    else "observed-import fixup could not select dependency-ready work"
+                ),
+            )
         return False
 
     async def _formalize_all(self) -> bool:
@@ -1301,7 +1336,7 @@ class Orchestrator:
 
     async def _review_once(self, chapter: Chapter, *, rerun: bool = False) -> ReviewOutcome:
         if not rerun and self._already_done(chapter, Stage.REVIEW):
-            return ReviewOutcome(True, False, False, {})
+            return ReviewOutcome(True, False, False, {}, complete=True)
         attempt = await self._attempt(
             chapter,
             Stage.REVIEW,
@@ -1322,7 +1357,7 @@ class Orchestrator:
                     else "editing review found no actionable issues"
                 ),
             )
-            return ReviewOutcome(True, False, attempt.agent.changed, {})
+            return ReviewOutcome(True, False, attempt.agent.changed, {}, complete=True)
         detail = "review left fixup findings" if needs_fixup else "editing review failed"
         await self.state.set_task(
             chapter.id,
@@ -1331,7 +1366,13 @@ class Orchestrator:
             detail,
         )
         routed = self._route_review_findings(chapter, attempt.agent.report, feedback)
-        return ReviewOutcome(succeeded and complete, needs_fixup, attempt.agent.changed, routed)
+        return ReviewOutcome(
+            succeeded,
+            needs_fixup,
+            attempt.agent.changed,
+            routed,
+            complete=complete,
+        )
 
     async def _review_chapter_to_clean(
         self,
@@ -1374,6 +1415,24 @@ class Orchestrator:
                 async with self.fixup_lock:
                     if not await self._fixup_to_clean(findings, target_ids=targets):
                         return False
+            if not outcome.complete:
+                if not outcome.changed and not findings:
+                    await self.state.set_task(
+                        chapter.id,
+                        Stage.REVIEW,
+                        TaskStatus.FAILED,
+                        "review was incomplete and supplied no actionable fixup",
+                    )
+                    return False
+                if rounds_used[chapter.id] >= maximum:
+                    await self.state.set_task(
+                        chapter.id,
+                        Stage.REVIEW,
+                        TaskStatus.FAILED,
+                        f"review remained incomplete after {maximum} cycles",
+                    )
+                    return False
+                continue
             if not outcome.changed:
                 if findings:
                     await self.state.set_task(
@@ -1396,6 +1455,8 @@ class Orchestrator:
 
         by_id = {chapter.id: chapter for chapter in self.chapters}
         reviewed: set[str] = set()
+        review_failures: set[str] = set()
+        review_blocked: set[str] = set()
         attempted: set[str] = set()
         rounds_used = {chapter_id: 0 for chapter_id in by_id}
         review_tasks: dict[str, tuple[asyncio.Task[bool], frozenset[str]]] = {}
@@ -1425,6 +1486,8 @@ class Orchestrator:
                 for chapter_id in graph.order:
                     if (
                         chapter_id not in reviewed
+                        and chapter_id not in review_failures
+                        and chapter_id not in review_blocked
                         and chapter_id not in review_tasks
                         and graph.dependencies[chapter_id].issubset(reviewed)
                     ):
@@ -1444,13 +1507,32 @@ class Orchestrator:
                 live_tasks = [task for task, _ in review_tasks.values()]
                 live_tasks.extend(proof_tasks.values())
                 if not live_tasks:
-                    await self.state.set_tasks(
-                        by_id.keys() - reviewed,
-                        Stage.REVIEW,
-                        TaskStatus.FAILED,
-                        "observed-import review could not select dependency-ready work",
+                    unresolved = set(by_id).difference(reviewed | review_failures | review_blocked)
+                    if unresolved:
+                        if not review_failures:
+                            raise RuntimeError(
+                                "review scheduler has unresolved chapters but no runnable tasks"
+                            )
+                        review_blocked.update(unresolved)
+                        await self.state.set_tasks(
+                            unresolved,
+                            Stage.REVIEW,
+                            TaskStatus.BLOCKED,
+                            "blocked by a failed prerequisite review; unrelated branches completed",
+                        )
+                        if prove:
+                            await self.state.set_tasks(
+                                unresolved | review_failures,
+                                Stage.PROVE,
+                                TaskStatus.BLOCKED,
+                                "blocked because statement review did not complete",
+                            )
+                        break
+                    if not prove or all(chapter_id in proof_results for chapter_id in reviewed):
+                        break
+                    raise RuntimeError(
+                        "review scheduler has unfinished proofs but no runnable tasks"
                     )
-                    return False
                 done, _ = await asyncio.wait(live_tasks, return_when=asyncio.FIRST_COMPLETED)
 
                 completed_reviews = [
@@ -1458,8 +1540,18 @@ class Orchestrator:
                 ]
                 for chapter_id in completed_reviews:
                     task, starting_dependencies = review_tasks.pop(chapter_id)
-                    if not task.result():
-                        return False
+                    succeeded = task.result()
+                    if not succeeded:
+                        review_failures.add(chapter_id)
+                        task_record = self.state.task(chapter_id, Stage.REVIEW)
+                        if task_record.status != TaskStatus.FAILED:
+                            await self.state.set_task(
+                                chapter_id,
+                                Stage.REVIEW,
+                                TaskStatus.FAILED,
+                                "chapter-local review failed; unrelated branches continue",
+                            )
+                        continue
                     current_graph = self._observed_chapter_graph()
                     current_dependencies = current_graph.dependencies[chapter_id]
                     if not current_dependencies.issubset(starting_dependencies):
@@ -1530,7 +1622,11 @@ class Orchestrator:
         finally:
             await cancel_all()
 
-        return not prove or all(proof_results.values())
+        return (
+            not review_failures
+            and not review_blocked
+            and (not prove or all(proof_results.values()))
+        )
 
     async def _review_until_clean(self, *, rerun: bool = False) -> bool:
         return await self._review_tree(rerun=rerun)

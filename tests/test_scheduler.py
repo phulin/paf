@@ -72,6 +72,7 @@ def result(
     changed: bool,
     placeholders: int = 2,
     needs_fixup: bool = False,
+    complete: bool = True,
     issues: list[str] | None = None,
     fixup_findings: list[dict[str, Any]] | None = None,
 ) -> AgentResult:
@@ -83,7 +84,7 @@ def result(
         usage=TokenUsage(input_tokens=10, output_tokens=5, measured=True),
         report={
             "changed": changed,
-            "complete": True,
+            "complete": complete,
             "needs_fixup": needs_fixup,
             "summary": "reviewed",
             "issues": issues or [],
@@ -1337,6 +1338,156 @@ async def test_no_change_review_stops_after_one_cycle(
     review_task = state.task(config.chapters[0].id, Stage.REVIEW)
     assert review_task.rounds == 1
     assert review_task.status == TaskStatus.SUCCEEDED
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_incomplete_review_routes_fixup_and_retries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = config.chapters[0]
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await orchestrator.prepare()
+    reviews = iter(
+        (
+            ReviewOutcome(
+                True,
+                True,
+                True,
+                {chapter.id: "repair the remaining statement interface"},
+                complete=False,
+            ),
+            ReviewOutcome(True, False, False, {}, complete=True),
+        )
+    )
+    fixups: list[tuple[dict[str, str] | None, object]] = []
+    review_calls = 0
+
+    async def review(_chapter: Chapter, *, rerun: bool = False) -> ReviewOutcome:
+        nonlocal review_calls
+        outcome = next(reviews)
+        assert rerun == (review_calls > 0)
+        review_calls += 1
+        return outcome
+
+    async def fixup(
+        feedback: dict[str, str] | None = None,
+        *,
+        target_ids: object = None,
+    ) -> bool:
+        fixups.append((feedback, target_ids))
+        return True
+
+    monkeypatch.setattr(orchestrator, "_review_once", review)
+    monkeypatch.setattr(orchestrator, "_fixup_to_clean", fixup)
+
+    assert await orchestrator._review_until_clean()
+    assert fixups == [
+        (None, {chapter.id}),
+        ({chapter.id: "repair the remaining statement interface"}, {chapter.id}),
+    ]
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_review_failure_quarantines_branch_without_cancelling_unrelated_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = write_project(tmp_path, chapters="chapters = [1, 2, 3]")
+    with (tmp_path / "books" / "book.md").open("a", encoding="utf-8") as source:
+        source.write("\n## 3. Third chapter\n")
+    config = with_lastlib_modules(load_config(project))
+    first, second, third = config.chapters
+    source_root = tmp_path / "lean" / "Book"
+    source_root.mkdir(parents=True)
+    (source_root / "Chapter01.lean").write_text("def first := 1\n", encoding="utf-8")
+    (source_root / "Chapter02.lean").write_text(
+        "import LastLib.Book.Chapter01\ndef second := first + 1\n",
+        encoding="utf-8",
+    )
+    (source_root / "Chapter03.lean").write_text("def third := 3\n", encoding="utf-8")
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await orchestrator.prepare()
+    third_started = asyncio.Event()
+    healthy_finished = False
+    healthy_proved = False
+    reviewed: list[str] = []
+
+    async def review(
+        chapter: Chapter,
+        _rounds_used: dict[str, int],
+        *,
+        rerun: bool = False,
+    ) -> bool:
+        nonlocal healthy_finished
+        assert not rerun
+        reviewed.append(chapter.id)
+        if chapter.id == first.id:
+            await third_started.wait()
+            return False
+        if chapter.id == third.id:
+            third_started.set()
+            await asyncio.sleep(0.01)
+            healthy_finished = True
+            return True
+        raise AssertionError("a dependent of the failed review must not start")
+
+    async def prove(chapter: Chapter) -> bool:
+        nonlocal healthy_proved
+        assert chapter.id == third.id
+        healthy_proved = True
+        return True
+
+    monkeypatch.setattr(orchestrator, "_review_chapter_to_clean", review)
+    monkeypatch.setattr(orchestrator, "_prove", prove)
+
+    assert not await orchestrator._review_tree(prove=True)
+    assert healthy_finished
+    assert healthy_proved
+    assert set(reviewed) == {first.id, third.id}
+    assert state.task(first.id, Stage.REVIEW).status == TaskStatus.FAILED
+    assert state.task(second.id, Stage.REVIEW).status == TaskStatus.BLOCKED
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_fixup_failure_does_not_cancel_independent_fixup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    config = replace(
+        config,
+        stages=config.stages | {Stage.FIXUP: replace(config.stages[Stage.FIXUP], max_rounds=1)},
+    )
+    first, second = config.chapters
+    source_root = tmp_path / "lean" / "Book"
+    source_root.mkdir(parents=True)
+    for chapter in config.chapters:
+        (source_root / f"Chapter{chapter.number:02d}.lean").write_text(
+            f"def chapter{chapter.number} := {chapter.number}\n",
+            encoding="utf-8",
+        )
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await orchestrator.prepare()
+    failed_agent = replace(result(changed=False), succeeded=False, error="local agent failure")
+    orchestrator.executor = FakeExecutor(state, [failed_agent, result(changed=False)])
+
+    async def validation(*_args: object, **_kwargs: object) -> ValidationResult:
+        return ValidationResult(True, 0, "ok")
+
+    monkeypatch.setattr(scheduler_module, "validate", validation)
+
+    assert not await orchestrator._fixup_to_clean(
+        {first.id: "repair first", second.id: "repair second"},
+        target_ids={first.id, second.id},
+    )
+    assert state.task(first.id, Stage.FIXUP).status == TaskStatus.FAILED
+    assert state.task(second.id, Stage.FIXUP).status == TaskStatus.SUCCEEDED
+    assert not orchestrator.executor.results
     await orchestrator.shutdown()
 
 

@@ -251,7 +251,10 @@ After the daemon exits, `status`, `snapshot`, and `wait` fall back to the persis
   paths and are routed to their owners. A changed chapter is rebuilt and, on failure, repaired by the
   same observed-import fixup scheduler. Review/rebuild repeats up to five times and stops early on a
   no-change review. Once a chapter is clean, its proof agent may start while descendant reviews
-  continue. There is no corpus-wide clean-build or review gate in the pipeline.
+  continue. A reported chapter-local failure is quarantined: unrelated review, fixup, and proof
+  branches keep running, while actual dependents are marked blocked. Unexpected coordinator
+  exceptions still fail fast after draining live workers. There is no corpus-wide clean-build or
+  review gate in the pipeline.
 - **Prove** sends the whole chapter to one agent, asks for one complete proof-writing pass, and then
   uses whole-file LSP diagnostics to focus iterations on failed proofs. It succeeds only when the
   scoped Lean code has no `sorry` or `admit` tokens and final Lake validation succeeds without any
