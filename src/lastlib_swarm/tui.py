@@ -186,6 +186,9 @@ def parse_agent_update(value: str) -> AgentUpdate | None:
 
 
 def _right_aligned_status(label: str, status: str, width: int) -> str:
+    available_label = width - len(status) - 1
+    if available_label > 0 and len(label) > available_label:
+        label = f"{label[: available_label - 1]}…" if available_label > 1 else "…"
     gap = max(1, width - len(label) - len(status))
     return f"{label}{' ' * gap}{status}"
 

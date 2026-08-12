@@ -74,6 +74,17 @@ def test_formats_unchanged_agent_update_with_an_empty_issue_list() -> None:
     ]
 
 
+def test_keeps_changed_status_on_heading_line_at_narrow_width() -> None:
+    update = json.dumps({"changed": False, "summary": "No edit was needed.", "issues": []})
+
+    rendered = format_agent_update(update, heading="LATEST AGENT UPDATE", width=24)
+    lines = rendered.splitlines()
+
+    assert lines[0] == "LATEST AGENT … CHANGED ✗"
+    assert len(lines[0]) == 24
+    assert lines[1] == "No edit was needed."
+
+
 @pytest.mark.asyncio
 async def test_dashboard_runs_an_operation_and_exits(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
