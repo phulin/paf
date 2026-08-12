@@ -291,10 +291,14 @@ def test_review_prompt_requires_scoped_edits_and_coordinator_rebuild(tmp_path: P
 
     assert "directly make every warranted in-scope" in prompt
     assert "attached Lean MCP" in prompt
-    assert "clean whole-file diagnostics" in prompt
+    assert "certified the incoming sources and dependencies clean" in normalized_prompt
+    assert "do not run initial or final diagnostics on untouched files" in normalized_prompt
+    assert "A no-change review needs no diagnostic calls" in normalized_prompt
     assert "process them from prerequisites to dependents" in normalized_prompt
     assert "Revisit a dependent only after an edited prerequisite is clean" in normalized_prompt
-    assert "request fresh diagnostics for the edited file" in normalized_prompt
+    assert "diagnose that changed closure in dependency order" in normalized_prompt
+    assert "Do not request diagnostics merely because you switched files" in normalized_prompt
+    assert "Whenever you switch from one Lean file to another" not in prompt
     assert "rebuilds it" in prompt
     assert "read-only" not in prompt
 

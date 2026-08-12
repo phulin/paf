@@ -40,7 +40,9 @@ changed review and sent through fixup if needed. After at most five such cycles�
 a no-change review—the chapter is released to proving without waiting for reviews of its descendants.
 Every review prompt begins with the complete informal book and assigned Lean file set in path order
 with numbered lines, capped at 300,000 characters. Fixup, review, and proof agents receive Lean MCP;
-reviewers must return clean whole-file diagnostics for their entire scope after making changes.
+reviewers trust the incoming green certificate for untouched files and request whole-file diagnostics
+only for files they edit and the assigned transitive dependents invalidated by those edits. A
+no-change review therefore needs no diagnostic calls.
 
 For a conventional numbered corpus, point the CLI at the book directory. It discovers all direct
 Markdown children and automatically reads `BOOK_DEPENDENCIES.md` from the repository root:
@@ -252,9 +254,11 @@ After the daemon exits, `status`, `snapshot`, and `wait` fall back to the persis
   This repeats up to `max_rounds`, allowing `declaration uses sorry` but rejecting other warnings.
 - **Review** visits dependency-ready chapters against a clean source and `.olean` generation. Agents
   make warranted in-scope statement and API changes directly; unresolved findings retain exact edit
-  paths and are routed to their owners. Reviewers use whole-file LSP diagnostics and must leave every
-  assigned file clean except for the exact permitted “declaration uses `sorry`” warning. A changed
-  chapter is rebuilt and, on failure, repaired by the same observed-import fixup scheduler.
+  paths and are routed to their owners. The coordinator's green certificate remains authoritative for
+  files a reviewer does not edit. Reviewers request whole-file LSP diagnostics after the last relevant
+  edit only for the edited files and their assigned transitive dependents, rechecking just the files
+  invalidated by any subsequent repair. A changed chapter is rebuilt and, on failure, repaired by the
+  same observed-import fixup scheduler.
   Review/rebuild repeats up to five times and stops early on a no-change review. Once a chapter is
   clean, its proof agent may start while descendant reviews
   continue. A reported chapter-local failure is quarantined: unrelated review, fixup, and proof

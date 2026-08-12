@@ -6,8 +6,9 @@ Read chapter {chapter_number}, “{chapter_title},” in `{source}` and every as
 `{lean_root}/{chapter_path}/` plus `{lean_root}/{chapter_path}.lean`. Independently determine whether
 the formalization is source-faithful, mathematically provable, proof-ready, and acyclic, and directly
 make the minimal warranted changes in the assigned scope. The snapshot starts clean; the coordinator
-will rebuild your patch after you return clean LSP diagnostics and route any compiler-only failures
-through fixup.
+has already certified that every assigned file has no diagnostic except permitted `sorry` warnings.
+Treat that certificate as authoritative for files you do not edit. The coordinator will rebuild your
+patch and route any compiler-only failures through fixup.
 
 ## Review standard
 
@@ -39,21 +40,25 @@ precede its users, and be independently provable from earlier declarations.
    paths and split repairs that belong to different chapters.
 5. Keep the assigned scope compatible with the coordinator's clean-build baseline.
 6. Audit imports in every file reviewed or changed against the common focused-import policy.
-7. Use the attached Lean MCP to request whole-file diagnostics for every assigned Lean file. After
-   each edit, request fresh diagnostics for the edited file and every assigned dependent that may be
-   affected. Resolve every diagnostic except the exact “declaration uses `sorry`” warning before
-   finishing.
+7. Use the attached Lean MCP on demand while investigating APIs or checking proposed repairs. Do not
+   request initial or final diagnostics for a file that remains unchanged during this attempt. Track
+   every edited file and its assigned transitive dependents. After the last relevant edit, request
+   fresh whole-file diagnostics for that changed closure in dependency order. If a diagnostic requires
+   another edit, repair it and recheck only the files invalidated by that repair. Resolve every
+   diagnostic except the exact “declaration uses `sorry`” warning before finishing.
 8. Recheck the complete chapter in dependency order and return structured, actionable findings.
 
 Do not run Lean, Lake, or another language server; use only the attached Lean MCP. Edit only the
-assigned scope. Do not report completion until all assigned files have clean final MCP diagnostics,
-allowing only the exact “declaration uses `sorry`” warning. Add a `fixup_findings` entry exactly when
-a required source change remains after your edits, including a repair owned by another chapter.
+assigned scope. A no-change review needs no diagnostic calls: the coordinator's incoming certificate
+remains the final evidence. After a changed review, do not report completion until the edited closure
+has clean final MCP diagnostics, allowing only the exact “declaration uses `sorry`” warning. Add a
+`fixup_findings` entry exactly when a required source change remains after your edits, including a
+repair owned by another chapter.
 
 ## Definition of done
 
 Every source assertion and principal proof route has been accounted for, warranted in-scope repairs
-and support lemmas have been made, imports are acyclic and focused, and final whole-file MCP
-diagnostics are clean throughout the assigned scope except for permitted `sorry` warnings. Report
-source issues and any remaining omissions, dependency-order problems, or required out-of-scope
-interface changes.
+and support lemmas have been made, imports are acyclic and focused, and the incoming clean certificate
+together with final diagnostics for the edited closure establishes that the assigned scope remains
+clean except for permitted `sorry` warnings. Report source issues and any remaining omissions,
+dependency-order problems, or required out-of-scope interface changes.

@@ -450,10 +450,13 @@ Request fresh whole-file diagnostics after every edit.""",
 statement or API change. Preserve proof placeholders and do not spend time proving propositions.
 Derive the assigned files' import DAG and process them from prerequisites to dependents for reading,
 editing, and diagnostics. Revisit a dependent only after an edited prerequisite is clean.
-Use the attached Lean MCP throughout the review and return only after every assigned Lean file has
-clean whole-file diagnostics, allowing only the exact “declaration uses `sorry`” warning.
-After every edit, request fresh diagnostics for the edited file and every assigned dependent that
-may be affected.
+The coordinator has certified the incoming sources and dependencies clean except for permitted
+`sorry` warnings. Trust that certificate for every file left unchanged by this attempt: do not run
+initial or final diagnostics on untouched files. Use the attached Lean MCP on demand. Track the
+edited files and their assigned transitive dependents, then diagnose that changed closure in
+dependency order after the last relevant edit. Recheck only files invalidated by a subsequent
+repair.
+A no-change review needs no diagnostic calls.
 The coordinator merges the scoped patch, then rebuilds it and sends compiler failures through the
 dependency-ordered fixup scheduler. Report every unresolved or out-of-scope edit as a structured
 `fixup_findings` entry.""",
@@ -511,6 +514,18 @@ diagnostics, and `{chapter.build_command}`.
                 else "whole-file diagnostics, goals, hover, declaration lookup, code actions, "
                 "completions, tactic trials, and local search"
             )
+            mcp_workflow = {
+                Stage.FIXUP: """The MCP opens and synchronizes a destination file when any Lean tool
+uses it. Do not request diagnostics merely because you switched files. Request fresh whole-file
+diagnostics after a source edit, as required by the fixup contract.""",
+                Stage.REVIEW: """Any Lean tool opens and synchronizes its destination file. Do not
+request diagnostics merely because you switched files, and do not diagnose untouched files whose
+incoming coordinator certificate remains valid. Diagnose only the edited dependency closure required
+by the review contract.""",
+                Stage.PROVE: """The MCP opens and synchronizes a destination file when any Lean tool
+uses it. Do not request diagnostics merely because you switched files. After editing, use goals and
+fresh diagnostics as needed to establish that the changed proof is clean.""",
+            }[stage]
             contract += f"""
 
 ### Attached Lean MCP
@@ -519,11 +534,9 @@ A private `lastlib_lean` MCP server is attached to this attempt. It points at th
 Lean project. Use its {capabilities}. It intentionally does not expose `lean_build` or remote
 search. Paths passed to its tools are relative to the Lean project root: use `LastLib/...`, not
 `lean/LastLib/...`.
-Whenever you switch from one Lean file to another,
-make a whole-file diagnostic call for the destination before using other Lean tools. The MCP treats
-that switch as a reopen with one dependency-build pass. Do the same when switching back, especially
-after editing a file that it imports. Do not start another language server or work around stale
-imports with a compiler command.
+{mcp_workflow}
+The MCP automatically reopens a document with one dependency-build pass only when Lean reports stale
+imports. Do not start another language server or work around stale imports with a compiler command.
 """
         if feedback:
             contract += (
