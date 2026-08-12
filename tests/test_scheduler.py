@@ -1339,6 +1339,25 @@ async def test_no_change_review_stops_after_one_cycle(
 
 
 @pytest.mark.asyncio
+async def test_changed_review_remains_active_until_rebuild_finishes(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await orchestrator.prepare()
+    orchestrator.executor = FakeExecutor(state, [result(changed=True)])
+
+    outcome = await orchestrator._review_once(config.chapters[0])
+
+    assert outcome.succeeded
+    assert outcome.changed
+    review_task = state.task(config.chapters[0].id, Stage.REVIEW)
+    assert review_task.status == TaskStatus.RUNNING
+    assert review_task.phase == TaskPhase.AWAITING_REBUILD
+    assert review_task.detail == "review changes merged; awaiting dependency-ordered rebuild"
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_incomplete_review_routes_fixup_and_retries(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

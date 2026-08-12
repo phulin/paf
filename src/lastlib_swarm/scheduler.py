@@ -1347,11 +1347,20 @@ class Orchestrator:
             await self.state.set_task(
                 chapter.id,
                 Stage.REVIEW,
-                TaskStatus.SUCCEEDED,
+                (
+                    TaskStatus.RUNNING
+                    if attempt.agent.changed
+                    else TaskStatus.SUCCEEDED
+                ),
                 (
                     "review changes merged; awaiting dependency-ordered rebuild"
                     if attempt.agent.changed
                     else "editing review found no actionable issues"
+                ),
+                phase=(
+                    TaskPhase.AWAITING_REBUILD
+                    if attempt.agent.changed
+                    else None
                 ),
             )
             return ReviewOutcome(True, attempt.agent.changed, {}, complete=True)
