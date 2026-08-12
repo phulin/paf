@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from collections import deque
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
@@ -51,6 +52,17 @@ PHASE_MARKS = {
     TaskPhase.AGENT: "▶ agent",
     TaskPhase.AWAITING_REBUILD: "↻ rebuild",
 }
+
+BOOK_ID = re.compile(r"^book(?P<number>\d+)$", re.IGNORECASE)
+
+
+def chapter_display_sort_key(chapter: Chapter) -> tuple[tuple[int, int | str], int]:
+    """Sort canonical book ids numerically, then sort chapters numerically."""
+
+    match = BOOK_ID.fullmatch(chapter.book_id)
+    if match is None:
+        return (1, chapter.book_id.casefold()), chapter.number
+    return (0, int(match.group("number"))), chapter.number
 
 
 def format_count(value: int) -> str:
@@ -619,15 +631,7 @@ class SwarmApp(App[bool]):
         self._rows_added: set[str] = set()
         self._row_cache: dict[str, tuple[str, ...]] = {}
         self._static_cache: dict[str, str] = {}
-        position = {
-            book_id: index for index, book_id in enumerate(orchestrator.statement_schedule.order)
-        }
-        self.chapters = tuple(
-            sorted(
-                orchestrator.chapters,
-                key=lambda chapter: (position[chapter.book_id], chapter.number),
-            )
-        )
+        self.chapters = tuple(sorted(orchestrator.chapters, key=chapter_display_sort_key))
 
     def compose(self) -> ComposeResult:
         yield Header()
