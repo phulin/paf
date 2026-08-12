@@ -1284,6 +1284,7 @@ async def test_changed_review_is_rebuilt_fixed_and_reviewed_again(
 
     builds = iter(
         (
+            ValidationResult(True, 0, "ok"),
             ValidationResult(False, 1, "error: Book/Chapter01.lean:1:1: unknown declaration"),
             ValidationResult(True, 0, "ok"),
         )
@@ -1328,9 +1329,7 @@ async def test_no_change_review_stops_after_one_cycle(
     )
 
     async def validation(*_args: object, **_kwargs: object) -> ValidationResult:
-        if state.task(config.chapters[0].id, Stage.FIXUP).rounds:
-            return ValidationResult(True, 0, "ok")
-        return ValidationResult(False, 1, "error: Book/Chapter01.lean:1:1: broken")
+        return ValidationResult(True, 0, "ok")
 
     monkeypatch.setattr(scheduler_module, "validate", validation)
 
@@ -1372,8 +1371,164 @@ async def test_review_is_capped_at_five_edit_rebuild_cycles(
 
     assert await orchestrator._review_until_clean()
     assert reviews == 5
-    assert rebuilds == 5
+    assert rebuilds == 6
     await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_pipeline_reviews_each_chapter_as_soon_as_its_build_is_green(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = with_lastlib_modules(
+        load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    )
+    first, second = config.chapters
+    source_root = tmp_path / "lean" / "Book"
+    source_root.mkdir(parents=True)
+    (source_root / "Chapter01.lean").write_text("def first := 1\n", encoding="utf-8")
+    (source_root / "Chapter02.lean").write_text(
+        "import LastLib.Book.Chapter01\ndef second := first + 1\n",
+        encoding="utf-8",
+    )
+    orchestrator = Orchestrator(config, StateStore(config))
+    await orchestrator.prepare()
+    events: list[str] = []
+
+    async def formalize_all() -> bool:
+        return True
+
+    async def validation(
+        _config: object,
+        chapter: Chapter,
+        **_kwargs: object,
+    ) -> ValidationResult:
+        events.append(f"build:{chapter.id}")
+        return ValidationResult(True, 0, "ok")
+
+    async def review(chapter: Chapter, *, rerun: bool = False) -> ReviewOutcome:
+        assert not rerun
+        events.append(f"review:{chapter.id}")
+        return ReviewOutcome(True, False, False, {})
+
+    async def prove(chapter: Chapter) -> bool:
+        events.append(f"prove:{chapter.id}")
+        return True
+
+    monkeypatch.setattr(orchestrator, "_formalize_all", formalize_all)
+    monkeypatch.setattr(scheduler_module, "validate", validation)
+    monkeypatch.setattr(orchestrator, "_review_once", review)
+    monkeypatch.setattr(orchestrator, "_prove", prove)
+
+    assert await orchestrator.run_pipeline()
+    assert [event for event in events if event.startswith("build:")] == [
+        f"build:{first.id}",
+        f"build:{second.id}",
+    ]
+    assert events.index(f"build:{first.id}") < events.index(f"review:{first.id}")
+    assert events.index(f"review:{first.id}") < events.index(f"build:{second.id}")
+    assert events.index(f"build:{second.id}") < events.index(f"review:{second.id}")
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_review_restart_reuses_green_certificates_without_rebuilding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = with_lastlib_modules(
+        load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    )
+    first, second = config.chapters
+    source_root = tmp_path / "lean" / "Book"
+    source_root.mkdir(parents=True)
+    (source_root / "Chapter01.lean").write_text("def first := 1\n", encoding="utf-8")
+    (source_root / "Chapter02.lean").write_text(
+        "import LastLib.Book.Chapter01\ndef second := first + 1\n",
+        encoding="utf-8",
+    )
+    builds: list[str] = []
+
+    async def validation(
+        _config: object,
+        chapter: Chapter,
+        **_kwargs: object,
+    ) -> ValidationResult:
+        builds.append(chapter.id)
+        return ValidationResult(True, 0, "ok")
+
+    monkeypatch.setattr(scheduler_module, "validate", validation)
+    first_run = Orchestrator(config, StateStore(config))
+    await first_run.prepare()
+    assert await first_run._fixup_to_clean(target_ids={first.id, second.id})
+    await first_run.shutdown()
+    assert builds == [first.id, second.id]
+
+    builds.clear()
+    reviews: list[str] = []
+    restarted = Orchestrator(config, StateStore(config))
+    await restarted.prepare()
+
+    async def review(chapter: Chapter, *, rerun: bool = False) -> ReviewOutcome:
+        assert not rerun
+        reviews.append(chapter.id)
+        return ReviewOutcome(True, False, False, {})
+
+    monkeypatch.setattr(restarted, "_review_once", review)
+
+    assert await restarted._review_tree()
+    assert builds == []
+    assert reviews == [first.id, second.id]
+    await restarted.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_changed_green_dependency_invalidates_descendant_before_review(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = with_lastlib_modules(
+        load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    )
+    first, second = config.chapters
+    source_root = tmp_path / "lean" / "Book"
+    source_root.mkdir(parents=True)
+    first_path = source_root / "Chapter01.lean"
+    first_path.write_text("def first := 1\n", encoding="utf-8")
+    (source_root / "Chapter02.lean").write_text(
+        "import LastLib.Book.Chapter01\ndef second := first + 1\n",
+        encoding="utf-8",
+    )
+    builds: list[str] = []
+
+    async def validation(
+        _config: object,
+        chapter: Chapter,
+        **_kwargs: object,
+    ) -> ValidationResult:
+        builds.append(chapter.id)
+        return ValidationResult(True, 0, "ok")
+
+    monkeypatch.setattr(scheduler_module, "validate", validation)
+    first_run = Orchestrator(config, StateStore(config))
+    await first_run.prepare()
+    assert await first_run._fixup_to_clean(target_ids={first.id, second.id})
+    await first_run.shutdown()
+
+    first_path.write_text("def first := 2\n", encoding="utf-8")
+    builds.clear()
+    reviews: list[str] = []
+    restarted = Orchestrator(config, StateStore(config))
+    await restarted.prepare()
+
+    async def review(chapter: Chapter, *, rerun: bool = False) -> ReviewOutcome:
+        assert not rerun
+        reviews.append(chapter.id)
+        return ReviewOutcome(True, False, False, {})
+
+    monkeypatch.setattr(restarted, "_review_once", review)
+
+    assert await restarted._review_tree()
+    assert builds == [first.id, second.id]
+    assert reviews == [first.id, second.id]
+    await restarted.shutdown()
 
 
 @pytest.mark.asyncio
@@ -1541,12 +1696,19 @@ def test_unowned_review_findings_fall_back_to_reviewed_chapter(tmp_path: Path) -
 
 
 @pytest.mark.asyncio
-async def test_review_is_one_read_only_report(tmp_path: Path) -> None:
+async def test_review_is_one_no_change_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
     state = StateStore(config)
     orchestrator = Orchestrator(config, state)
     await orchestrator.prepare()
     orchestrator.executor = FakeExecutor(state, [result(changed=False)])
+
+    async def validation(*_args: object, **_kwargs: object) -> ValidationResult:
+        return ValidationResult(True, 0, "ok")
+
+    monkeypatch.setattr(scheduler_module, "validate", validation)
 
     assert await orchestrator.run_stage(Stage.REVIEW)
     task = state.task(config.chapters[0].id, Stage.REVIEW)

@@ -14,14 +14,13 @@ fallback searches can be substantially slower.
 flowchart LR
     S[Scaffold directories] --> F[Formalize once]
     F -->|all drafts finished| I[Scan observed LastLib imports]
-    I --> B[Build dependency-ready chapters]
+    I --> C{Valid persisted green certificate?}
+    C -->|no| B[Build dependency-ready chapter]
+    C -->|yes| R[Editing review]
     B -->|actionable diagnostics| X[Ready fixup agents with MCP]
     X -->|patch merged| I
-    B -->|clean cache published| I
-    I -->|all chapters clean| G[Stable topological build]
-    G -->|diagnostics| X
-    G -->|clean snapshot| R[Editing review]
-    R -->|changed or findings| B
+    B -->|green certificate published| R
+    R -->|changed or findings| I
     R -->|no changes| P[Prove with LSP]
     P -->|statement/API problem| X
     P -->|no placeholders + Lean valid| D[Done]
@@ -33,13 +32,14 @@ despite provisional imports. After all drafts finish, the coordinator discovers 
 regexes over the current `import LastLib...` lines. It then fixes dependency-ready chapters with Lean
 MCP concurrently. As soon as an agent finishes, the coordinator merges it, rescans imports, and
 rebuilds it once its refined predecessors are clean; unrelated agents keep running and a successful
-build immediately releases descendants. A final graph-stable topological build establishes the
-baseline for review and proof. Reviewers directly make scoped statement and API repairs. Each
-dependency-ready chapter is rebuilt after a changed review and sent through fixup if needed. After
-at most five such cycles—or immediately after a no-change review—the chapter is released to proving
-without waiting for reviews of its descendants. Every review prompt begins with the complete informal
-book and assigned Lean file set in path order with numbered lines, capped at 300,000 characters.
-Fixup and proof agents receive Lean MCP.
+build immediately releases its review. Green certificates persist the chapter source digest together
+with its dependency certificates. On restart, unchanged certificates release reviews without a
+rebuild; a source or dependency change recursively invalidates the affected descendants. Reviewers
+directly make scoped statement and API repairs. Each dependency-ready chapter is rebuilt after a
+changed review and sent through fixup if needed. After at most five such cycles—or immediately after
+a no-change review—the chapter is released to proving without waiting for reviews of its descendants.
+Every review prompt begins with the complete informal book and assigned Lean file set in path order
+with numbered lines, capped at 300,000 characters. Fixup and proof agents receive Lean MCP.
 
 For a conventional numbered corpus, point the CLI at the book directory. It discovers all direct
 Markdown children and automatically reads `BOOK_DEPENDENCIES.md` from the repository root:
@@ -243,14 +243,15 @@ After the daemon exits, `status`, `snapshot`, and `wait` fall back to the persis
 - **Fixup** groups targeted-build failures by chapter ownership and appends them verbatim to parallel
   fixup prompts. A failure mentioning a scope whose formalizer is still active is deferred rather
   than assigned prematurely. Completed scopes cycle through build and fixup while other drafts run;
-  after drafting drains, a full-corpus build/fixup loop establishes global cleanliness. This repeats
-  up to `max_rounds`, allowing `declaration uses sorry` but rejecting other warnings.
+  the standalone fixup stage ends with a stable full-corpus build. The pipeline instead consumes
+  persisted green certificates and targets only each dependency-ready review's invalid build closure.
+  This repeats up to `max_rounds`, allowing `declaration uses sorry` but rejecting other warnings.
 - **Review** visits dependency-ready chapters against a clean source and `.olean` generation. Agents
   make warranted in-scope statement and API changes directly; unresolved findings retain exact edit
   paths and are routed to their owners. A changed chapter is rebuilt and, on failure, repaired by the
   same observed-import fixup scheduler. Review/rebuild repeats up to five times and stops early on a
   no-change review. Once a chapter is clean, its proof agent may start while descendant reviews
-  continue.
+  continue. There is no corpus-wide clean-build or review gate in the pipeline.
 - **Prove** sends the whole chapter to one agent, asks for one complete proof-writing pass, and then
   uses whole-file LSP diagnostics to focus iterations on failed proofs. It succeeds only when the
   scoped Lean code has no `sorry` or `admit` tokens and final Lake validation succeeds without any

@@ -1342,6 +1342,19 @@ class Orchestrator:
     ) -> bool:
         """Run at most five edit/rebuild cycles for one dependency-ready chapter."""
 
+        # A persisted certificate lets an unchanged chapter enter review immediately
+        # after restart. If its source or any observed dependency changed, targeted
+        # fixup rebuilds just the invalid dependency closure before review starts.
+        review_was_done = self._already_done(chapter, Stage.REVIEW)
+        async with self.fixup_lock:
+            graph = self._observed_chapter_graph()
+            persisted = self.state.fixup_graph.get("clean", {})
+            records = persisted if isinstance(persisted, dict) else {}
+            was_clean = chapter.id in self._retain_fixup_clean(graph, records)
+            if not await self._fixup_to_clean(target_ids={chapter.id}):
+                return False
+        rerun = rerun or (review_was_done and not was_clean)
+
         maximum = min(self.config.stages[Stage.REVIEW].max_rounds, 5)
         while rounds_used[chapter.id] < maximum:
             rounds_used[chapter.id] += 1
@@ -1576,7 +1589,5 @@ class Orchestrator:
 
     async def run_pipeline(self) -> bool:
         if not await self._formalize_all():
-            return False
-        if not await self._fixup_to_clean():
             return False
         return await self._review_tree(prove=True)
