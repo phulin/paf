@@ -30,7 +30,7 @@ class FakeClient:
 
 
 @pytest.mark.asyncio
-async def test_reopens_with_dependencies_only_after_stale_notification() -> None:
+async def test_prepares_dependencies_on_first_open_and_after_stale_notification() -> None:
     client = FakeClient()
 
     async def original(_client: Any, path: str, wait: bool) -> FakeDocument:
@@ -45,9 +45,9 @@ async def test_reopens_with_dependencies_only_after_stale_notification() -> None
     await reload_with_dependencies_when_stale(client, "A.lean", original=original)
 
     assert client.events == [
+        ("open", "A.lean", False, "once"),
         ("reload", "A.lean", False),
-        ("reload", "A.lean", False),
-        ("reload", "B.lean", False),
+        ("open", "B.lean", False, "once"),
         ("reload", "A.lean", False),
         ("close", "A.lean"),
         ("open", "A.lean", False, "once"),

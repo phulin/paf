@@ -20,7 +20,7 @@ async def reload_with_dependencies_when_stale(
     *,
     original: Reload = _ORIGINAL_RELOAD,
 ) -> Any:
-    """Reopen a file with dependency preparation only after Lean marks its imports stale."""
+    """Prepare dependencies on first open and when Lean marks existing imports stale."""
 
     lock = _RELOAD_LOCKS.get(self)
     if lock is None:
@@ -28,8 +28,9 @@ async def reload_with_dependencies_when_stale(
         _RELOAD_LOCKS[self] = lock
     async with lock:
         document = self._docs.get(path)
-        stale = document is not None and document.stale_imports
-        if stale:
+        if document is None:
+            return await self.open(path, wait=wait, dependency_build_mode="once")
+        if document.stale_imports:
             await self.close_file(path)
             return await self.open(path, wait=wait, dependency_build_mode="once")
         return await original(self, path, wait)
