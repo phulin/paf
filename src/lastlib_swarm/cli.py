@@ -583,15 +583,20 @@ def _run(args: argparse.Namespace, config: PipelineConfig, console: Console) -> 
     else:
         operation = orchestrator.run_pipeline
         label = "full pipeline"
-    if args.no_tui:
-        succeeded = asyncio.run(_headless(orchestrator, operation))
-    else:
-        succeeded = run_tui(
-            orchestrator,
-            operation,
-            label=label,
-            startup_warning=getattr(args, "startup_warning", ""),
-        )
+    abort_error: Exception | None = None
+    try:
+        if args.no_tui:
+            succeeded = asyncio.run(_headless(orchestrator, operation))
+        else:
+            succeeded = run_tui(
+                orchestrator,
+                operation,
+                label=label,
+                startup_warning=getattr(args, "startup_warning", ""),
+            )
+    except Exception as error:
+        succeeded = False
+        abort_error = error
     usage = state.invocation_usage()
     lifetime_usage = state.total_usage()
     cost = state.invocation_cost()
@@ -604,6 +609,10 @@ def _run(args: argparse.Namespace, config: PipelineConfig, console: Console) -> 
         console.print("Completed successfully")
     else:
         console.print("Finished with failures")
+        if abort_error is not None:
+            detail = _failure_excerpt(abort_error)
+            console.print("\nAbort error", style="bold red")
+            console.print(f"- {type(abort_error).__name__}: {detail}", markup=False)
         _print_failure_summary(
             state,
             console,

@@ -162,6 +162,33 @@ def test_run_prints_failure_summary_after_tui_closes(
     assert events == ["tui-closed", "summary-printed"]
 
 
+def test_run_prints_abort_error_after_tui_closes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+
+    def run_tui(*_args: object, **_kwargs: object) -> bool:
+        raise RuntimeError("coordinator cache promotion failed")
+
+    monkeypatch.setattr(cli_module, "run_tui", run_tui)
+    args = argparse.Namespace(
+        book=[],
+        chapter=[],
+        force=False,
+        command="pipeline",
+        no_tui=False,
+        startup_warning="",
+    )
+    output = StringIO()
+    console = Console(file=output, force_terminal=False, color_system=None)
+
+    assert cli_module._run(args, config, console) == 1
+    rendered = output.getvalue()
+    assert "Abort error" in rendered
+    assert "RuntimeError: coordinator cache promotion failed" in rendered
+    assert "Failure details" in rendered
+
+
 def test_selects_book_and_chapter_number(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path))
 

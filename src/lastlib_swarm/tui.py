@@ -785,6 +785,7 @@ class SwarmApp(App[bool]):
         self.label = label
         self.startup_warning = startup_warning
         self.result = False
+        self.fatal_error: Exception | None = None
         self._status_message = f"Starting {self.label}…"
         self._show_build_progress = False
         self._rows_added: set[str] = set()
@@ -866,6 +867,7 @@ class SwarmApp(App[bool]):
                     error = shutdown_error
 
         if error is not None:
+            self.fatal_error = error
             self._set_status(f"Fatal orchestrator error: {error}")
             self.set_timer(2.0, lambda: self.exit(False))
             return
@@ -1090,10 +1092,13 @@ def run_tui(
     label: str,
     startup_warning: str = "",
 ) -> bool:
-    result = SwarmApp(
+    app = SwarmApp(
         orchestrator,
         operation,
         label=label,
         startup_warning=startup_warning,
-    ).run()
+    )
+    result = app.run()
+    if app.fatal_error is not None:
+        raise app.fatal_error
     return bool(result)
