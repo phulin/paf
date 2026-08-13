@@ -356,6 +356,19 @@ class FuseOverlayIsolation:
         self._compaction_task: asyncio.Task[None] | None = None
         self._cleanup_tasks: set[asyncio.Task[None]] = set()
         self._deleting_layers: set[Path] = set()
+        self._workspace_sequence = 0
+
+    def _create_cache_workspace(self, parent: Path, prefix: str) -> Path:
+        """Atomically allocate a workspace beneath this orchestrator's state tree."""
+
+        while True:
+            self._workspace_sequence += 1
+            workspace = parent / f"{prefix}-{self._workspace_sequence:08d}"
+            try:
+                workspace.mkdir(parents=True, exist_ok=False)
+            except FileExistsError:
+                continue
+            return workspace
 
     async def prepare(self) -> None:
         if not fuse_overlay_available():
@@ -545,9 +558,7 @@ class FuseOverlayIsolation:
 
     async def acquire_build(self, build_id: str) -> FuseBuildWorkspace:
         generation: int | None = None
-        build_root = Path(
-            tempfile.mkdtemp(prefix="build-", dir=self.cache_builds)
-        )
+        build_root = self._create_cache_workspace(self.cache_builds, "build")
         upper = build_root / "upper"
         work = build_root / "work"
         merged = build_root / "merged"
@@ -689,9 +700,7 @@ class FuseOverlayIsolation:
         self._compaction_task = asyncio.create_task(self._compact_layers(layers))
 
     async def _compact_layers(self, layers: tuple[Path, ...]) -> None:
-        compact_root = Path(
-            tempfile.mkdtemp(prefix="compact-", dir=self.cache_compactions)
-        )
+        compact_root = self._create_cache_workspace(self.cache_compactions, "compact")
         merged = compact_root / "merged"
         compacted = compact_root / "layer"
         merged.mkdir()

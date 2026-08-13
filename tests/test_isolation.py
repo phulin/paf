@@ -34,6 +34,11 @@ def test_fuse_overlay_workspace_lives_in_swarm_state_directory(tmp_path: Path) -
 
     assert manager.parent == tmp_path / ".swarm" / "isolation"
     assert manager.root.parent == manager.parent
+    build = manager._create_cache_workspace(manager.cache_builds, "build")
+    compact = manager._create_cache_workspace(manager.cache_compactions, "compact")
+    assert build.parent == manager.root / "cache" / "builds"
+    assert compact.parent == manager.root / "cache" / "compactions"
+    assert build != compact
 
 
 @pytest.mark.asyncio
