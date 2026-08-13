@@ -4,6 +4,7 @@ import os
 import threading
 from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -53,6 +54,31 @@ async def test_fuse_overlay_manifest_scans_do_not_block_event_loop(
     assert result.accepted
     assert len(manifest_threads) == 2
     assert all(thread != event_loop_thread for thread in manifest_threads)
+
+
+@pytest.mark.asyncio
+async def test_fuse_overlay_recursive_cleanup_does_not_block_event_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager, _ = fuse_manager(write_project(tmp_path, chapters="chapters = [1]"))
+    await manager.prepare()
+    event_loop_thread = threading.get_ident()
+    cleanup_threads: list[int] = []
+    original_rmtree = isolation_module.shutil.rmtree
+
+    def tracked_rmtree(path: Any, ignore_errors: bool = False, **kwargs: Any) -> None:
+        cleanup_threads.append(threading.get_ident())
+        original_rmtree(path, ignore_errors=ignore_errors, **kwargs)
+
+    monkeypatch.setattr(isolation_module.shutil, "rmtree", tracked_rmtree)
+    workspace = await manager.acquire("responsive-release")
+    build = await manager.acquire_build("responsive-build-release")
+    await workspace.close()
+    await build.close()
+    await manager.close()
+
+    assert cleanup_threads
+    assert all(thread != event_loop_thread for thread in cleanup_threads)
 
 
 @pytest.mark.asyncio
@@ -303,6 +329,115 @@ async def test_cache_delta_publication_keeps_active_agent_snapshots_immutable(
             await first_fresh.close()
         if second_fresh is not None:
             await second_fresh.close()
+        await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_coordinator_build_promotes_only_its_private_cache_delta(tmp_path: Path) -> None:
+    config_path = write_project(tmp_path, chapters="chapters = [1]")
+    dependency = tmp_path / "lean" / ".lake" / "packages" / "dep" / "dependency.olean"
+    dependency.parent.mkdir(parents=True)
+    dependency.write_bytes(b"dependency")
+    existing = tmp_path / "lean" / ".lake" / "build" / "existing.olean"
+    existing.parent.mkdir(parents=True)
+    existing.write_bytes(b"existing")
+    manager, _ = fuse_manager(config_path)
+    await manager.prepare()
+    try:
+        initial = manager._coordinator_layers[0]
+        assert (manager._dependency_layer / dependency.relative_to(tmp_path)).is_file()
+        assert not (initial / dependency.relative_to(tmp_path)).exists()
+        assert (initial / existing.relative_to(tmp_path)).is_file()
+
+        artifact = Path("lean/.lake/build/new.olean")
+        build = await manager.acquire_build("delta")
+        target = build.root / artifact
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"new")
+        promoted = await build.finish(succeeded=True, publish=True)
+
+        delta = manager._coordinator_layers[0]
+        assert promoted == (artifact.as_posix(),)
+        assert (delta / artifact).read_bytes() == b"new"
+        assert not (delta / dependency.relative_to(tmp_path)).exists()
+        assert len(manager._coordinator_layers) == 2
+        assert (tmp_path / artifact).read_bytes() == b"new"
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_failed_coordinator_build_discards_its_cache_delta(tmp_path: Path) -> None:
+    manager, _ = fuse_manager(write_project(tmp_path, chapters="chapters = [1]"))
+    await manager.prepare()
+    pinned = await manager.acquire("before-failure")
+    fresh = None
+    artifact = Path("lean/.lake/build/failed.olean")
+    try:
+        build = await manager.acquire_build("failed")
+        target = build.root / artifact
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"partial")
+        assert await build.finish(succeeded=False, publish=False) == ()
+
+        fresh = await manager.acquire("after-failure")
+        assert not (pinned.root / artifact).exists()
+        assert not (fresh.root / artifact).exists()
+        assert not (tmp_path / artifact).exists()
+        assert len(manager._coordinator_layers) == 1
+        assert manager._published_cache_revision == 0
+    finally:
+        await pinned.close()
+        if fresh is not None:
+            await fresh.close()
+        await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_cache_layers_compact_without_invalidating_pinned_agents(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    manager = FuseOverlayIsolation(
+        replace(
+            config.settings,
+            isolation="fuse-overlay",
+            max_agents=3,
+            cache_compaction_layers=3,
+        )
+    )
+    await manager.prepare()
+    original = await manager.acquire("generation-zero")
+    first = None
+    fresh = None
+    try:
+        first_path = Path("lean/.lake/build/first.olean")
+        first_build = await manager.acquire_build("first")
+        (first_build.root / first_path).parent.mkdir(parents=True, exist_ok=True)
+        (first_build.root / first_path).write_bytes(b"first")
+        await first_build.finish(succeeded=True, publish=True)
+        first = await manager.acquire("generation-one")
+
+        second_path = Path("lean/.lake/build/second.olean")
+        second_build = await manager.acquire_build("second")
+        (second_build.root / second_path).write_bytes(b"second")
+        await second_build.finish(succeeded=True, publish=True)
+        assert manager._compaction_task is not None
+        await manager._compaction_task
+
+        fresh = await manager.acquire("compacted")
+        assert not (original.root / first_path).exists()
+        assert not (original.root / second_path).exists()
+        assert (first.root / first_path).read_bytes() == b"first"
+        assert not (first.root / second_path).exists()
+        assert (fresh.root / first_path).read_bytes() == b"first"
+        assert (fresh.root / second_path).read_bytes() == b"second"
+        assert len(manager._coordinator_layers) == 1
+        assert manager._coordinator_layers[0].name.startswith("compact-")
+    finally:
+        await original.close()
+        if first is not None:
+            await first.close()
+        if fresh is not None:
+            await fresh.close()
         await manager.close()
 
 

@@ -33,6 +33,7 @@ def test_discovers_chapters_and_renders_paths(tmp_path: Path) -> None:
     assert config.settings.capacity_resume_delay_seconds == 15
     assert config.settings.capacity_resume_max_delay_seconds == 120
     assert config.settings.sandbox == "danger-full-access"
+    assert config.settings.cache_compaction_layers == 32
 
 
 def test_selects_configured_chapters(tmp_path: Path) -> None:
@@ -63,6 +64,28 @@ def test_rejects_unknown_isolation_backend(tmp_path: Path) -> None:
     )
 
     with pytest.raises(ValueError, match=r"swarm\.isolation"):
+        load_config(path)
+
+
+def test_loads_and_validates_cache_compaction_threshold(tmp_path: Path) -> None:
+    path = write_project(tmp_path)
+    path.write_text(
+        path.read_text(encoding="utf-8").replace(
+            'isolation = "shared"',
+            'isolation = "shared"\ncache_compaction_layers = 8',
+        ),
+        encoding="utf-8",
+    )
+
+    assert load_config(path).settings.cache_compaction_layers == 8
+
+    path.write_text(
+        path.read_text(encoding="utf-8").replace(
+            "cache_compaction_layers = 8", "cache_compaction_layers = 1"
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match=r"swarm\.cache_compaction_layers"):
         load_config(path)
 
 

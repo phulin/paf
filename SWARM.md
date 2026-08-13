@@ -204,8 +204,10 @@ directly. After an agent exits, the coordinator terminates its MCP/LSP process g
 accepted scoped changes into the main worktree under a short source-consistency barrier. It then
 enqueues one visible targeted `lake build +Module`; only Lake builds acquire the prioritized
 coordinator build queue. Review and fixup verification outrank proof certification, and an active
-proof certification is cancelled and requeued when statement-critical build work arrives. The main
-worktree's `.lake` is the only writable build cache.
+proof certification is cancelled and requeued when statement-critical build work arrives. Each
+coordinator build receives a private cache upper layer. A successful build atomically promotes that
+small delta and writes only those changed artifacts back to the main worktree's `.lake`; failed and
+preempted build deltas are discarded.
 The coordinator rejects a successful compiler exit if its captured output contains any warning
 other than the exact “declaration uses `sorry`” diagnostic. This check reuses the targeted build and
 does not launch a second compiler.
@@ -421,9 +423,11 @@ by a hard-killed orchestrator.
 
 Agents never commit. With the default `auto` backend, supported Linux systems run each attempt in a
 private `fuse-overlayfs` view. Each view has two immutable lower generations: a source snapshot that
-excludes `.lake`, and a read-only snapshot of the coordinator's `.lake`. Only files changed by that
-attempt occupy its writable upper layer. Codex and its private LSP run in the merged view; validation
-never does. The coordinator rejects every out-of-scope source path, checks that the assigned
+excludes `.lake`, and an ordered manifest of read-only coordinator cache layers. The package cache
+is seeded once per invocation in a dependency layer keyed by `lean-toolchain` and
+`lake-manifest.json`; project artifacts begin in a separate layer. Only files changed by that
+attempt occupy its writable upper layer. Codex, its private LSP, and coordinator validation run in
+private merged views. The coordinator rejects every out-of-scope source path, checks that the assigned
 canonical scope has not changed since launch, and imports accepted regular files with atomic
 replacement. A stale writer is
 discarded and retried by the normal stage loop.
@@ -433,13 +437,16 @@ each attempt. Generations share unchanged file data through hard links and are r
 reader exits. Temporary mounts live outside the repository so Git discovery starts from the private
 view.
 
-All proof agents pinned to a cache generation share the same Lake artifact inodes and OS page-cache
-pages; the snapshot is never copied once per agent. A clean global fixup build publishes the
-read-only baseline used by review and proof. Reopening a file through the proof MCP gives Lean's LSP
+All proof agents pinned to a cache-generation manifest share the same Lake artifact inodes and OS
+page-cache pages; neither the complete cache nor its dependency packages are copied after each
+build. A clean coordinator build publishes its immutable delta stack for review and proof.
+Reopening a file through the proof MCP gives Lean's LSP
 one dependency-build pass; resulting cache writes occupy only that agent's writable upper layer and
 are discarded at teardown. The generic MCP build remains hidden. Already-running proof agents remain
 pinned to their original clean snapshot, while later attempts see coordinator-published artifacts.
 Old snapshots are reclaimed when their last agent exits, and source imports preserve mtimes.
+Layer stacks are compacted asynchronously after `cache_compaction_layers` entries; compaction scans
+only the mutable project/delta layers and never holds the coordinator build queue.
 
 FUSE isolation requires `fuse-overlayfs`, `fusermount3`, `rsync`, and an accessible `/dev/fuse`.
 `auto` selects FUSE when these primitives are present and otherwise uses the explicitly visible
@@ -475,6 +482,7 @@ capacity_resume_delay_seconds = 15 # initial delay; doubles after each failure
 capacity_resume_max_delay_seconds = 120 # cap for exponential backoff
 validation_timeout_seconds = 1800
 isolation = "auto" # auto, fuse-overlay, or shared
+cache_compaction_layers = 32 # asynchronously compact immutable cache layer stacks at this size
 lean_mcp = true
 lean_project = "lean" # relative to swarm.repo; contains lakefile and lean-toolchain
 lean_mcp_tool_timeout_seconds = 300

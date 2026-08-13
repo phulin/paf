@@ -1334,15 +1334,19 @@ async def test_streaming_build_does_not_publish_partial_cache_snapshot(
 
     async def track_build(build_id: str) -> object:
         workspace = await original_acquire_build(build_id)
-        original_finish = workspace.finish
 
-        async def finish(*, succeeded: bool, publish: bool) -> tuple[str, ...]:
-            nonlocal published
-            published += int(publish)
-            return await original_finish(succeeded=succeeded, publish=publish)
+        class TrackedBuild:
+            root = workspace.root
 
-        workspace.finish = finish  # type: ignore[method-assign]
-        return workspace
+            async def finish(self, *, succeeded: bool, publish: bool) -> tuple[str, ...]:
+                nonlocal published
+                published += int(publish)
+                return await workspace.finish(succeeded=succeeded, publish=publish)
+
+            async def close(self) -> None:
+                await workspace.close()
+
+        return TrackedBuild()
 
     monkeypatch.setattr(scheduler_module, "validate", successful_validation)
     monkeypatch.setattr(orchestrator.isolation, "acquire_build", track_build)

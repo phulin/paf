@@ -357,6 +357,7 @@ class FuseOverlayIsolation:
         self._active_compaction_layers: set[Path] = set()
         self._compaction_task: asyncio.Task[None] | None = None
         self._cleanup_tasks: set[asyncio.Task[None]] = set()
+        self._deleting_layers: set[Path] = set()
 
     async def prepare(self) -> None:
         if not fuse_overlay_available():
@@ -393,7 +394,7 @@ class FuseOverlayIsolation:
                 continue
             else:
                 continue
-            for merged in stale.glob("slots/*/merged"):
+            for merged in stale.glob("**/merged"):
                 # os.path.ismount() returns False when lstat() reports ENOTCONN, which is exactly
                 # how a dead fuse-overlayfs mount presents. /proc/self/mountinfo remains readable.
                 if merged in mounted or os.path.ismount(merged):
@@ -647,10 +648,20 @@ class FuseOverlayIsolation:
         self._collect_unused_layers_locked()
 
     def _schedule_remove_tree(self, path: Path) -> None:
-        if not path.exists():
+        if not path.exists() or path in self._deleting_layers:
             return
         task = asyncio.create_task(asyncio.to_thread(shutil.rmtree, path))
+        self._deleting_layers.add(path)
         self._cleanup_tasks.add(task)
+
+        def finished(completed: asyncio.Task[None]) -> None:
+            self._deleting_layers.discard(path)
+            # Retrieve failures immediately; close() also awaits retained tasks
+            # and propagates them to the orchestrator.
+            with suppress(BaseException):
+                completed.exception()
+
+        task.add_done_callback(finished)
 
     def _collect_unused_layers_locked(self) -> None:
         reachable = {
@@ -716,7 +727,7 @@ class FuseOverlayIsolation:
                 os.replace(compacted, destination)
                 self._coordinator_layers = (*prefix, destination)
                 published = self._cache_generations[self._published_cache_revision]
-                if published.layers == layers:
+                if published.layers == current:
                     self._published_cache_revision += 1
                     self._cache_generations[self._published_cache_revision] = CacheGeneration(
                         self._coordinator_layers

@@ -7,7 +7,7 @@ import re
 from collections.abc import AsyncIterator, Coroutine, Iterable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
-from typing import Any
+from typing import Any, TypedDict
 
 from lastlib_swarm.codex import (
     AgentResult,
@@ -114,6 +114,13 @@ class CoordinatorBuildLease:
     stage: Stage
     preemptible: bool
     preempt_requested: asyncio.Event
+
+
+class CoordinatorBuildSnapshot(TypedDict):
+    owner: str
+    owner_stage: str
+    queued: int
+    queued_jobs: list[str]
 
 
 @dataclass(frozen=True)
@@ -332,7 +339,7 @@ class CoordinatorBuildQueue:
         self._active = None
         self._wake()
 
-    def snapshot(self) -> dict[str, object]:
+    def snapshot(self) -> CoordinatorBuildSnapshot:
         queued = [lease for _, _, future, lease in self._waiters if not future.done()]
         return {
             "owner": self._active.label if self._active is not None else "",
@@ -383,7 +390,7 @@ class Orchestrator:
                 "best-effort" if config.settings.bypass_approvals_and_sandbox else "sandboxed"
             ),
             "lake_cache": (
-                "coordinator-owned-main-cache-with-read-only-snapshots"
+                "immutable-dependency-and-coordinator-delta-layers"
                 if self.isolation.name == "fuse-overlay"
                 else "coordinator-owned-shared-worktree"
             ),
