@@ -299,16 +299,16 @@ class StateStore:
                 task.phase = TaskPhase.RECOVERING
                 task.checkpoint = None
                 task.detail = "legacy changed review awaiting rebuild and revalidation"
+            for run in task.runs:
+                if run.status == TaskStatus.RUNNING:
+                    run.status = TaskStatus.FAILED
+                    run.finished_at = timestamp()
+                    recovered_runs.append(run)
             if task.status == TaskStatus.RUNNING:
                 task.status = TaskStatus.PENDING
                 task.phase = TaskPhase.RECOVERING
                 task.checkpoint = None
                 task.detail = "recovered after interrupted orchestrator"
-                for run in task.runs:
-                    if run.status == TaskStatus.RUNNING:
-                        run.status = TaskStatus.FAILED
-                        run.finished_at = timestamp()
-                        recovered_runs.append(run)
         if self.coordinator_build.active:
             self.coordinator_build.active = False
             self.coordinator_build.current_chapter_id = ""
@@ -376,6 +376,7 @@ class StateStore:
             "status": str(task.status),
             "phase": str(task.phase),
             "detail": task.detail,
+            "checkpoint": task.checkpoint,
             "rounds": task.rounds,
             "updated_at": task.updated_at,
         }

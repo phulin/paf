@@ -234,6 +234,48 @@ async def test_state_persists_fixup_graph(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_state_persists_review_checkpoint(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = config.chapters[0]
+    state = StateStore(config)
+    await state.load_or_create()
+    await state.set_task(
+        chapter.id,
+        Stage.REVIEW,
+        TaskStatus.SUCCEEDED,
+        "reviewed",
+        checkpoint="exact-build-certificate",
+    )
+
+    reloaded = StateStore(config)
+    await reloaded.load_or_create()
+
+    assert reloaded.task(chapter.id, Stage.REVIEW).checkpoint == "exact-build-certificate"
+    hot = json.loads(reloaded.path.read_text(encoding="utf-8"))
+    assert hot["tasks"][f"{chapter.id}:review"]["checkpoint"] == "exact-build-certificate"
+
+
+@pytest.mark.asyncio
+async def test_state_recovers_orphan_run_even_when_task_is_not_running(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = config.chapters[0]
+    state = StateStore(config)
+    await state.load_or_create()
+    run = await state.start_run(chapter.id, Stage.FIXUP)
+    await state.set_task(chapter.id, Stage.FIXUP, TaskStatus.SUCCEEDED, "newer work completed")
+    await state.close()
+
+    recovered = StateStore(config)
+    await recovered.load_or_create()
+
+    recovered_run = recovered.task(chapter.id, Stage.FIXUP).runs[-1]
+    assert recovered_run.id == run.id
+    assert recovered_run.status == TaskStatus.FAILED
+    assert recovered_run.finished_at is not None
+    assert recovered.agent_summary()["active"] == 0
+
+
+@pytest.mark.asyncio
 async def test_state_recovers_legacy_changed_review_as_pending(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
     chapter = config.chapters[0]
@@ -610,6 +652,37 @@ async def test_targeted_fixup_does_not_build_cleanliness_descendants(
     clean = orchestrator.state.fixup_graph["clean"]
     assert first.id in clean
     assert second.id not in clean
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_fixup_requests_share_one_repair_pass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    first, second = config.chapters
+    orchestrator = Orchestrator(config, StateStore(config))
+    await orchestrator.prepare()
+    calls: list[tuple[dict[str, str] | None, set[str]]] = []
+
+    async def fixup(
+        feedback: dict[str, str] | None = None,
+        *,
+        target_ids: object = None,
+    ) -> bool:
+        assert isinstance(target_ids, set)
+        calls.append((feedback, target_ids))
+        return True
+
+    monkeypatch.setattr(orchestrator, "_fixup_to_clean", fixup)
+
+    assert all(
+        await asyncio.gather(
+            orchestrator._request_fixup({first.id: "first"}, target_ids={first.id}),
+            orchestrator._request_fixup({second.id: "second"}, target_ids={second.id}),
+        )
+    )
+    assert calls == [({first.id: "first", second.id: "second"}, {first.id, second.id})]
     await orchestrator.shutdown()
 
 
@@ -1729,6 +1802,52 @@ async def test_review_restart_seeds_proofs_from_checkpoints_without_rebuilding(
 
 
 @pytest.mark.asyncio
+async def test_statement_repair_invalidates_review_and_proof_closure(tmp_path: Path) -> None:
+    config = with_lastlib_modules(
+        load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    )
+    first, second = config.chapters
+    source_root = tmp_path / "lean" / "Book"
+    source_root.mkdir(parents=True)
+    (source_root / "Chapter01.lean").write_text("def first := 1\n", encoding="utf-8")
+    (source_root / "Chapter02.lean").write_text(
+        "import LastLib.Book.Chapter01\ndef second := first + 1\n",
+        encoding="utf-8",
+    )
+    orchestrator = Orchestrator(config, StateStore(config))
+    await orchestrator.prepare()
+    for chapter in config.chapters:
+        await orchestrator.state.set_task(
+            chapter.id,
+            Stage.REVIEW,
+            TaskStatus.SUCCEEDED,
+            "reviewed",
+            checkpoint=f"certificate-{chapter.number}",
+        )
+        await orchestrator.state.set_task(
+            chapter.id,
+            Stage.PROVE,
+            TaskStatus.SUCCEEDED,
+            "proved",
+        )
+
+    invalidated = await orchestrator._invalidate_review_closure(
+        {first.id}, detail="upstream statement changed"
+    )
+
+    assert invalidated == {first.id, second.id}
+    for chapter in config.chapters:
+        review = orchestrator.state.task(chapter.id, Stage.REVIEW)
+        proof = orchestrator.state.task(chapter.id, Stage.PROVE)
+        assert review.status == TaskStatus.PENDING
+        assert review.phase == TaskPhase.RECOVERING
+        assert review.checkpoint is None
+        assert proof.status == TaskStatus.PENDING
+        assert proof.phase == TaskPhase.WAITING_PREREQUISITES
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_changed_green_dependency_invalidates_descendant_before_review(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2038,6 +2157,37 @@ async def test_prove_builds_run_after_agents_and_are_serialized_in_main_worktree
 
     assert await orchestrator.run_stage(Stage.PROVE)
     assert maximum_active_builds == 1
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_prove_stops_after_two_repeated_no_progress_rounds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = config.chapters[0]
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await orchestrator.prepare()
+    orchestrator.executor = FakeExecutor(
+        state,
+        [
+            result(changed=True, placeholders=4),
+            result(changed=False, placeholders=4),
+            result(changed=False, placeholders=4),
+        ],
+    )
+
+    async def validation(*_args: object, **_kwargs: object) -> ValidationResult:
+        return ValidationResult(True, 0, "ok")
+
+    monkeypatch.setattr(scheduler_module, "validate", validation)
+
+    assert not await orchestrator._prove(chapter)
+    task = state.task(chapter.id, Stage.PROVE)
+    assert task.rounds == 3
+    assert task.detail == "proof pass stalled with 4 placeholders"
+    assert orchestrator.executor.results == []
     await orchestrator.shutdown()
 
 
