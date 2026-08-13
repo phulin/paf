@@ -50,6 +50,9 @@ PHASE_MARKS = {
     TaskPhase.QUEUED: "… queued",
     TaskPhase.BUILDING: "◆ building",
     TaskPhase.AGENT: "▶ agent",
+    TaskPhase.VERIFICATION_QUEUED: "⌛ verify queue",
+    TaskPhase.VERIFYING: "◆ verifying",
+    TaskPhase.WAITING_FIXUP: "⌛ fixup",
     TaskPhase.AWAITING_REBUILD: "↻ rebuild",
 }
 
@@ -653,6 +656,7 @@ class SwarmApp(App[bool]):
         table.add_column("Chapter", key="chapter", width=40)
         for stage in Stage:
             table.add_column(stage.value.title(), key=stage.value)
+        table.add_column("Build", key="build")
         table.add_column("Current agent activity", key="activity")
         table.add_column("Tokens · API $", key="tokens")
         self.set_interval(1.0, self.refresh_dashboard)
@@ -745,6 +749,7 @@ class SwarmApp(App[bool]):
             or "none"
         )
         build = self.state.coordinator_build
+        build_queue = self.orchestrator.build_queue.snapshot()
         if build.active:
             build_status = (
                 f"Coordinator {build.mode} build {build.completed}/{build.total} · "
@@ -754,7 +759,12 @@ class SwarmApp(App[bool]):
             if build.current_chapter_id:
                 build_status += f" · {build.current_chapter_id}"
         else:
-            build_status = "Coordinator build idle"
+            owner = str(build_queue["owner"])
+            build_status = (
+                f"Coordinator build reserved by {owner}" if owner else "Coordinator build idle"
+            )
+        if int(build_queue["queued"]):
+            build_status += f" · queued {int(build_queue['queued'])}"
         if self._show_build_progress and build.active:
             percent = 100 * build.completed / build.total if build.total else 0
             build_label = "GLOBAL BUILD" if build.mode == "global" else "BUILD"
@@ -813,7 +823,8 @@ class SwarmApp(App[bool]):
                 f"[b]{stage.value.title()} chapters[/b]\n"
                 f"agent {agents[stage.value]} · queue {phases['queued']} · "
                 f"buildq {phases['waiting_build']} · build {phases['building']} · "
-                f"rebuild {phases['awaiting_rebuild']} · "
+                f"verifyq {phases['verification_queued']} · verify {phases['verifying']} · "
+                f"fixwait {phases['waiting_fixup']} · "
                 f"deps {phases['waiting_prerequisites']} · recover {phases['recovering']}\n"
                 f"✓ {counts['succeeded']}  "
                 f"✗ {counts['failed']}  · {counts['pending']}  ! {counts['blocked']}",
@@ -833,6 +844,7 @@ class SwarmApp(App[bool]):
                         "rank",
                         "chapter",
                         *(stage.value for stage in Stage),
+                        "build",
                         "activity",
                         "tokens",
                     ),
@@ -886,6 +898,9 @@ class SwarmApp(App[bool]):
                 TaskPhase.RECOVERING: "recovering interrupted work",
                 TaskPhase.WAITING_BUILD: "waiting for coordinator build",
                 TaskPhase.BUILDING: "coordinator building",
+                TaskPhase.VERIFICATION_QUEUED: "queued for coordinator verification",
+                TaskPhase.VERIFYING: "coordinator verifying",
+                TaskPhase.WAITING_FIXUP: "waiting for targeted fixup",
                 TaskPhase.AWAITING_REBUILD: "awaiting coordinator rebuild",
             }
             if active_task is not None and active_task.phase in phase_activity:
@@ -897,11 +912,16 @@ class SwarmApp(App[bool]):
         proof_rank = self.orchestrator.proof_schedule.rank[chapter.book_id]
         critical = chapter.book_id in self.orchestrator.statement_schedule.critical_path
         book = f"★ {chapter.book_id}" if critical else chapter.book_id
+        clean = self.state.fixup_graph.get("clean", {})
+        build_freshness = (
+            "✓ fresh" if isinstance(clean, dict) and chapter.id in clean else "○ stale"
+        )
         return (
             book,
             f"{statement_rank:g}/{proof_rank:g}",
             f"{chapter.number:02d} {chapter.title}",
             *statuses,
+            build_freshness,
             current_activity,
             f"{tokens} · {cost}",
         )

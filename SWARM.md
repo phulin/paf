@@ -39,8 +39,10 @@ together with its dependency certificates and decide only whether another build 
 review is a separate durable fact: restarts, proof-body edits, added proof lemmas, and build-certificate
 changes do not clear it. Only explicit review findings, proof-requested statement/API fixups, or a
 forced review clear the affected review/proof closure. Reviewers directly make scoped statement and
-API repairs. Each dependency-ready chapter is rebuilt after a changed review and sent through fixup
-if needed. After at most five such cycles—or immediately after a no-change review—the chapter is
+API repairs. Each dependency-ready chapter receives a prioritized coordinator verification build
+after a changed review and is sent through fixup only if that build fails. Clean verification requests
+join the live build scheduler instead of waiting behind an unrelated repair batch. After at most five
+such cycles—or immediately after a no-change review—the chapter is
 released to proving without waiting for reviews of its descendants.
 Every review prompt begins with the complete informal book and assigned Lean file set in path order
 with numbered lines, capped at 500,000 characters. The supplied snapshot counts as the reviewer's
@@ -198,9 +200,12 @@ For a multi-file changed closure, agents prepare only its maximal affected depen
 final import-order diagnostic pass. This builds the imported closure in the fewest Lake invocations;
 preparing every file separately is forbidden. Up to four likely target files are also elaborated in
 the background while the agent performs its initial reading. Agents never invoke a compiler
-directly. After an agent exits, the coordinator terminates its MCP/LSP process group, merges accepted
-scoped changes into the main worktree, and enqueues one targeted `lake build +Module`. Merge and build
-form one serialized transaction, and the main worktree's `.lake` is the only writable build cache.
+directly. After an agent exits, the coordinator terminates its MCP/LSP process group and merges
+accepted scoped changes into the main worktree under a short source-consistency barrier. It then
+enqueues one visible targeted `lake build +Module`; only Lake builds acquire the prioritized
+coordinator build queue. Review and fixup verification outrank proof certification, and an active
+proof certification is cancelled and requeued when statement-critical build work arrives. The main
+worktree's `.lake` is the only writable build cache.
 The coordinator rejects a successful compiler exit if its captured output contains any warning
 other than the exact “declaration uses `sorry`” diagnostic. This check reuses the targeted build and
 does not launch a second compiler.
@@ -279,9 +284,10 @@ After the daemon exits, `status`, `snapshot`, and `wait` fall back to the persis
   paths and are routed to their owners. The coordinator's green certificate remains authoritative for
   files a reviewer does not edit. Reviewers request whole-file LSP diagnostics after the last relevant
   edit only for the edited files and their assigned transitive dependents, rechecking just the files
-  invalidated by any subsequent repair. A changed chapter is rebuilt and, on failure, repaired by the
-  same observed-import fixup scheduler.
-  Review/rebuild repeats up to five times and stops early on a no-change review. Once a chapter is
+  invalidated by any subsequent repair. A changed chapter enters `verification queued`, then a
+  prioritized coordinator build. Only a failed build or structured `fixup_findings` starts a fixup
+  agent. Clean verification does not wait for an unrelated active repair batch.
+  Review/verification repeats up to five times and stops early on a no-change review. Once a chapter is
   clean, its proof agent may start while descendant reviews
   continue. A reported chapter-local failure is quarantined: unrelated review, fixup, and proof
   branches keep running, while actual dependents are marked blocked. Unexpected coordinator
@@ -297,7 +303,9 @@ After the daemon exits, `status`, `snapshot`, and `wait` fall back to the persis
   `sorry` or `admit` tokens and final Lake validation succeeds without any warning other than
   “declaration uses `sorry`”. The exact validated source digest is persisted independently of review
   green. If it is stale after restart, the coordinator rebuilds and recounts placeholders first; a
-  successful placeholder-free source is accepted without launching another proof agent.
+  successful placeholder-free source is accepted without launching another proof agent. Proof
+  certification uses the same visible coordinator-build record at lower priority; it never holds the
+  build queue while the proof agent edits, takes a snapshot, or merges its scoped patch.
 - A proof agent may change proof bodies but not declaration interfaces. A genuine statement/API
   problem is reported through a structured `fixup_findings` entry; the pipeline returns through
   fixup and editing review before proving resumes.
@@ -331,11 +339,12 @@ TUI, persisted snapshot, and agent-control JSON expose the priority order, ranks
 The dashboard shows:
 
 - the live-agent total against `max_agents`, broken down by stage, plus attempts waiting for a slot;
-- the active coordinator build's mode, iteration, target progress, and current chapter;
-- chapter-stage phases (`queued`, `building`, `agent`, and `awaiting rebuild`) separately from
-  terminal stage status;
+- the active coordinator build's mode, stage, iteration, target progress, current chapter, owner, and
+  queued build count;
+- chapter-stage phases (`queued`, `verification queued`, `verifying`, `waiting for fixup`, `building`,
+  and `agent`) separately from terminal stage status;
 - aggregate chapter counts for formalize, fixup, review, and prove;
-- each chapter's status and attempt count in every stage;
+- each chapter's status and attempt count in every stage, plus independent exact-build freshness;
 - per-chapter tokens for the current invocation;
 - statement/proof critical-path ranks and the current statement critical path;
 - each running agent's current command, MCP call, edit, or reasoning state and failure count;
@@ -395,9 +404,11 @@ before its workspace is acquired or Codex is launched. Each run records its PID,
 stage, round, timestamps, scoped-change result, placeholder count, final report, validation tail, and
 usage. Concurrent mutations coalesce into one SQLite transaction, coordinator transitions use
 explicit state batches, and JSON/database work runs off the TUI event loop. Task records separately
-persist their current queue/build/agent phase, while a coordinator-build record tracks the single
-serialized Lake build. Running run records—not chapter-stage records—are the authoritative live-agent
-count.
+persist agent queues, verification queues, active verification, dependency waits, and targeted-fixup
+waits. The chapter table displays exact-build freshness independently of whether a past fixup task
+succeeded. A coordinator-build record tracks the single serialized Lake build, and the TUI also shows
+its owner and queued jobs. Running run records—not chapter-stage records—are the authoritative
+live-agent count.
 
 Press `q` in the TUI or interrupt a headless run to terminate the active child process group. On the
 next invocation, interrupted `running` records become `pending` and can resume. Successful records
