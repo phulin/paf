@@ -413,6 +413,11 @@ def _print_failure_summary(
         ),
         key=lambda task: (task.book_id, task.chapter_number, task.stage),
     )
+    graph_error = state.fixup_graph.get("error")
+    graph_failure = graph_error if isinstance(graph_error, str) and graph_error else None
+    graph_failed = [task for task in failed if task.detail == graph_failure]
+    if graph_failed:
+        failed = [task for task in failed if task.detail != graph_failure]
     blocked = sorted(
         (
             task
@@ -422,6 +427,14 @@ def _print_failure_summary(
         key=lambda task: (task.book_id, task.chapter_number, task.stage),
     )
     console.print("\nFailure details", style="bold red")
+    if graph_failure and graph_failed:
+        console.print("- Coordinator [import graph]", style="bold red", markup=False)
+        console.print(f"    {graph_failure}", markup=False)
+        noun = "task" if len(graph_failed) == 1 else "tasks"
+        console.print(
+            f"    {len(graph_failed)} {noun} could not be scheduled.",
+            markup=False,
+        )
     if failed:
         for task in failed:
             console.print(
@@ -432,7 +445,7 @@ def _print_failure_summary(
             for detail in _task_failure_details(state, task):
                 for line in detail.splitlines():
                     console.print(f"    {line}", markup=False)
-    else:
+    elif not graph_failed:
         console.print("- No failed task detail was recorded.", markup=False)
 
     build = state.coordinator_build

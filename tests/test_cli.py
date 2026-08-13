@@ -83,6 +83,50 @@ def test_failure_summary_prints_task_build_and_blocker_details(tmp_path: Path) -
     assert str(state.path) in rendered
 
 
+def test_graph_failure_does_not_print_historical_agent_findings(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    state = StateStore(config)
+    chapter = config.chapters[0]
+    graph_error = (
+        "observed chapter import graph contains a cycle: "
+        "book/chapter-01 -> book/chapter-02 -> book/chapter-01"
+    )
+
+    async def populate() -> None:
+        await state.load_or_create()
+        run = await state.start_run(chapter.id, Stage.REVIEW)
+        await state.finish_run(
+            run,
+            status=TaskStatus.SUCCEEDED,
+            report={
+                "summary": "Historical review summary.",
+                "issues": ["Historical review issue."],
+                "fixup_findings": [{"description": "Historical fixup instruction."}],
+            },
+        )
+        state.fixup_graph = {"algorithm": "observed-lean-imports", "error": graph_error}
+        await state.set_task(
+            chapter.id,
+            Stage.REVIEW,
+            TaskStatus.FAILED,
+            graph_error,
+        )
+
+    asyncio.run(populate())
+    output = StringIO()
+    console = Console(file=output, force_terminal=False, color_system=None, width=160)
+
+    cli_module._print_failure_summary(state, console)
+
+    rendered = output.getvalue()
+    assert rendered.count(graph_error) == 1
+    assert "Coordinator [import graph]" in rendered
+    assert "1 task could not be scheduled." in rendered
+    assert "Historical review summary." not in rendered
+    assert "Historical review issue." not in rendered
+    assert "Historical fixup instruction." not in rendered
+
+
 def test_run_prints_failure_summary_after_tui_closes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
