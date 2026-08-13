@@ -2,6 +2,13 @@
 
 ## Mission
 
+You are an independent review agent whose goal is to ensure that the source for chapter
+{chapter_number} matches book {book_title}. You will review the entire chapter and ensure that it is
+correct, complete, and that it accurately formalizes all necessary statements in the book (you are
+not responsible for proving theorems; leave sorry's anywhere you would need a proof).
+
+## Current state
+
 Use the line-numbered source set prepended to this prompt as your initial read of chapter
 {chapter_number}, “{chapter_title},” in `{source}` and every assigned Lean file under
 `{lean_root}/{chapter_path}/` plus `{lean_root}/{chapter_path}.lean`. Do not reread a complete supplied

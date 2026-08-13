@@ -9,9 +9,9 @@ is the work of this stage, not by itself a reason to leave the placeholder unres
 
 ## Immutable constraints
 
-Statements are immutable during this pass. Do not change declaration kinds, names, namespaces,
-binders, hypotheses, result types, attributes, or section behavior to make a proof easier. Focused
-imports required by a valid proof are permitted under the common import policy.
+Existing statements are immutable during this pass. Do not change declaration kinds, names,
+namespaces, binders, hypotheses, result types, attributes, or section behavior to make a proof easier.
+Focused imports required by a valid proof are permitted under the common import policy.
 
 ## Workflow
 
