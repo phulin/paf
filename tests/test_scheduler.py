@@ -513,6 +513,25 @@ async def test_formalize_is_one_pass_and_does_not_build(
 
 
 @pytest.mark.asyncio
+async def test_formalize_rejects_an_incomplete_draft(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = config.chapters[0]
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await orchestrator.prepare()
+    orchestrator.executor = FakeExecutor(
+        state,
+        [result(changed=True, complete=False, issues=["coverage audit unfinished"])],
+    )
+
+    assert not await orchestrator.run_stage(Stage.FORMALIZE)
+    task = state.task(chapter.id, Stage.FORMALIZE)
+    assert task.status == TaskStatus.FAILED
+    assert task.detail == "formalizer reported an incomplete chapter draft"
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_fixup_repeats_coordinator_build_and_hands_back_diagnostics(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

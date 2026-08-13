@@ -2,9 +2,11 @@
 
 ## Mission
 
-Read chapter {chapter_number}, “{chapter_title},” in `{source}`, every assigned Lean file, and the
-coordinator build or review feedback appended below. Make one minimal edit transaction that moves
-the project toward a clean Lake build and a faithful common API.
+Start from the coordinator build or review feedback appended below. Read the implicated declarations,
+their required prerequisites and affected dependents, and the relevant part of chapter
+{chapter_number}, “{chapter_title},” in `{source}` when mathematical intent is needed. Do not reread
+the complete chapter or assigned file set merely because this is a new attempt. Make one minimal edit
+transaction that moves the project toward a clean Lake build and a faithful common API.
 
 This is an elaboration-only stage. Never prove a theorem, lemma, or other proposition. Replace an
 obstructing proof body in its entirety with `by sorry`. Spend effort only on imports, declaration
@@ -12,13 +14,16 @@ signatures, types, structures, instances, definitions, and API compatibility.
 
 ## Fixup standard
 
-Treat the appended coordinator feedback as authoritative. Resolve unknown declarations, invalid
-types, missing hypotheses, import cycles, incompatible provisional APIs, unsolved non-proof terms,
-and unexpected warnings owned by the assigned scope. Do not improve, complete, or debug proofs.
+Treat the appended coordinator feedback as authoritative starting evidence, while recognizing that a
+concurrent prerequisite repair may have made a diagnostic stale. Resolve current unknown
+declarations, invalid types, missing hypotheses, import cycles, incompatible provisional APIs,
+unsolved non-proof terms, and unexpected warnings owned by the assigned scope. Do not improve,
+complete, or debug proofs.
 
 Preserve the intended mathematical strength. Do not weaken a correct conclusion merely to compile,
-add the desired result as an assumption, or introduce a declaration engineered to imply it. Mark a
-substantive defect in the informal source with a precise `SOURCE_ISSUE` comment.
+add the desired result as an assumption, or introduce a declaration engineered to imply it. Record a
+substantive defect in the informal source in the structured `source_issues` ledger; do not leave a
+source-issue comment in Lean.
 
 ## Workflow
 
@@ -43,4 +48,6 @@ Unrelated dependency-ready agents may continue running while this result is inte
 
 The assigned scope addresses every applicable coordinator diagnostic or review finding without
 concealing proof obligations or changing unrelated mathematics. Remaining blockers are reported with
-their exact owner and required dependency.
+their exact owner and required dependency. Here `complete` means that every supplied finding still
+applicable to this scope has been addressed or precisely routed; it does not claim that the project
+build is clean. The coordinator's subsequent Lake build is authoritative.

@@ -382,15 +382,8 @@ def test_review_prompt_requires_scoped_edits_and_coordinator_rebuild(tmp_path: P
     normalized_prompt = " ".join(prompt.split())
 
     assert "directly make every warranted in-scope" in prompt
-    assert "attached Lean MCP" in prompt
+    assert "Attached Lean MCP" in prompt
     assert "certified the incoming sources and dependencies clean" in normalized_prompt
-    assert "do not run initial or final diagnostics on untouched files" in normalized_prompt
-    assert "A no-change review needs no diagnostic calls" in normalized_prompt
-    assert "process them from prerequisites to dependents" in normalized_prompt
-    assert "Revisit a dependent only after an edited prerequisite is clean" in normalized_prompt
-    assert "diagnose that changed closure in dependency order" in normalized_prompt
-    assert "Do not request diagnostics merely because you switched files" in normalized_prompt
-    assert "Whenever you switch from one Lean file to another" not in prompt
     assert "rebuilds it" in prompt
     assert "read-only" not in prompt
 
@@ -416,12 +409,6 @@ def test_review_prompt_starts_with_book_scoped_files_and_line_numbers(tmp_path: 
     assert prompt.startswith("# Line-numbered review source set\n")
     assert "counts as the initial complete read" in prompt
     assert "Do not reread complete files from the filesystem" in prompt
-    expected_initial_read = (
-        "The line-numbered source set prepended to this prompt "
-        "counts as your initial read"
-    )
-    assert expected_initial_read in prompt
-    assert "import DAG from the supplied import lines" in prompt
     book_header = "## `books/book.md`"
     root_header = "## `lean/Book/Chapter01.lean`"
     child_header = "## `lean/Book/Chapter01/Section02.lean`"
@@ -433,6 +420,7 @@ def test_review_prompt_starts_with_book_scoped_files_and_line_numbers(tmp_path: 
     )
     assert "     1 | # Book" in prompt
     assert "     3 | ## 1. First chapter" in prompt
+    assert "## 2. Second chapter" in prompt
     assert "     1 | import Book.Chapter01.Section02" in prompt
     assert "     2 | " in prompt
     assert "     3 | def chapter := section" in prompt
@@ -513,17 +501,34 @@ def test_fixup_prompt_requires_diagnostics_and_sorry(tmp_path: Path) -> None:
     executor = CodexExecutor(config, StateStore(config))
 
     prompt = executor.build_prompt(config.chapters[0], Stage.FIXUP)
-    normalized_prompt = " ".join(prompt.split())
-
     assert "Attached Lean MCP" in prompt
-    assert "coordinator feedback as the initial diagnostic pass" in normalized_prompt
-    assert "Do not request diagnostics merely because you entered or switched files" in (
-        normalized_prompt
+
+
+def test_shipped_nonproof_prompts_have_consistent_stage_contracts() -> None:
+    prompt_root = Path(__file__).parents[1] / "src" / "lastlib_swarm" / "prompts"
+    formalize = " ".join((prompt_root / "formalize.md").read_text().split())
+    fixup = " ".join((prompt_root / "fixup.md").read_text().split())
+    review = " ".join((prompt_root / "review.md").read_text().split())
+
+    assert "structured `source_issues` ledger" in formalize
+    assert "`SOURCE_ISSUE` comment" not in formalize
+    assert "Set `complete` to `true` only when the full chapter coverage pass is finished" in (
+        formalize
     )
-    assert "diagnose only the edited dependency closure in import order" in normalized_prompt
-    assert "after every edit" not in prompt
-    assert "Never prove" in prompt
-    assert "`by sorry`" in prompt
+    assert "mathematically natural local dependency guess" in formalize
+
+    assert "authoritative starting evidence" in fixup
+    assert "Do not reread the complete chapter or assigned file set" in fixup
+    assert "coordinator feedback as the initial diagnostic pass" in fixup
+    assert "do not request diagnostics merely because you entered or switched files" in fixup
+    assert "request whole-file MCP diagnostics for that edited dependency closure" in fixup
+    assert "`SOURCE_ISSUE` comment" not in fixup
+    assert "`complete` means that every supplied finding" in fixup
+    assert "Never prove" in fixup
+    assert "`by sorry`" in fixup
+
+    assert "Diagnose only the edited dependency closure" in review
+    assert "recheck the complete chapter" not in review.casefold()
 
 
 def test_warning_filter_allows_only_declaration_uses_sorry() -> None:

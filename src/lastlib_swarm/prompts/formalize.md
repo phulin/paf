@@ -26,10 +26,11 @@ bridges. Search for a canonical declaration first. A new bridge must use the wea
 assumptions, precede its users, and be independently provable from earlier material.
 
 Match finiteness, separation, completeness, characteristic, normalization, and typeclass assumptions
-exactly. Mark a genuine false or underspecified source assertion with a precise `SOURCE_ISSUE` comment
-and make only the minimal principled correction. If an unavailable earlier result is essential, add
-only a clearly marked, mathematically natural local dependency guess—not one engineered to imply the
-desired conclusion.
+exactly. For a genuine false or underspecified source assertion, make only the minimal principled
+correction and record the defect in the structured `source_issues` ledger rather than leaving a
+source-issue comment in Lean. If an unavailable earlier result is essential, add only a clearly
+marked, mathematically natural local dependency guess—not one engineered to imply the desired
+conclusion.
 
 ## Workflow
 
@@ -47,4 +48,5 @@ reconcile all chapter drafts in the repeated global fixup pass.
 Every substantive source assertion is represented or explicitly accounted for, declarations follow
 source order, and definitions have real bodies where practical. Report coverage gaps, dependency
 guesses, source issues, and important provisional interface choices. Compiler cleanliness is not a
-condition of this pass.
+condition of this pass. Set `complete` to `true` only when the full chapter coverage pass is finished;
+the coordinator rejects an incomplete draft rather than silently treating it as formalized.

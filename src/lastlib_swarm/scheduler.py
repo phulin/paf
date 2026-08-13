@@ -571,7 +571,8 @@ class Orchestrator:
             Stage.FORMALIZE,
             queue_detail="single optimistic drafting pass",
         )
-        if attempt.agent.succeeded and attempt.validation.succeeded:
+        complete = bool(attempt.agent.report.get("complete"))
+        if attempt.agent.succeeded and attempt.validation.succeeded and complete:
             await self.state.set_task(
                 chapter.id,
                 Stage.FORMALIZE,
@@ -591,7 +592,11 @@ class Orchestrator:
             chapter.id,
             Stage.FORMALIZE,
             TaskStatus.FAILED,
-            "single drafting attempt failed",
+            (
+                "formalizer reported an incomplete chapter draft"
+                if attempt.agent.succeeded and attempt.validation.succeeded
+                else "single drafting attempt failed"
+            ),
         )
         return FormalizeOutcome(False)
 

@@ -482,33 +482,27 @@ loop.""",
             Stage.FIXUP: """Use the attached Lean MCP and the coordinator diagnostics or review
 findings appended to this prompt. This attempt is dependency-ready and may run beside unrelated
 fixups. As soon as it finishes, the coordinator merges it, rescans observed imports, and rebuilds it
-when its refined predecessors are clean; unrelated agents continue running. Never prove propositions
-in this stage: replace an obstructing proof body with `by sorry`. Treat the coordinator feedback as
-the initial diagnostic pass, make one coherent edit batch, then diagnose only the edited dependency
-closure in import order after the last relevant edit. Recheck only files invalidated by a
-repair.""",
+when its refined predecessors are clean; unrelated agents continue running.""",
             Stage.REVIEW: """Audit the assigned chapter and directly make every warranted in-scope
 statement or API change. Preserve proof placeholders and do not spend time proving propositions.
-The line-numbered source set prepended to this prompt counts as your initial read. Do not reread a
-complete supplied file from the filesystem; use filesystem reads only for explicitly missing or
-truncated content, post-edit content, or a targeted search or lookup. Derive the assigned files'
-import DAG from the supplied import lines and process them from prerequisites to dependents for the
-audit, editing, and diagnostics. Revisit a dependent only after an edited prerequisite is clean.
 The coordinator has certified the incoming sources and dependencies clean except for permitted
-`sorry` warnings. Trust that certificate for every file left unchanged by this attempt: do not run
-initial or final diagnostics on untouched files. Use the attached Lean MCP on demand. Track the
-edited files and their assigned transitive dependents, then diagnose that changed closure in
-dependency order after the last relevant edit. Recheck only files invalidated by a subsequent
-repair.
-A no-change review needs no diagnostic calls.
-The coordinator merges the scoped patch, then rebuilds it and sends compiler failures through the
-dependency-ordered fixup scheduler. Report every unresolved or out-of-scope edit as a structured
-`fixup_findings` entry.""",
+`sorry` warnings. The coordinator merges the scoped patch, then rebuilds it and sends compiler-only
+failures through the dependency-ordered fixup scheduler.""",
             Stage.PROVE: """The project entered this attempt with a clean reviewed build. This is a
 proof-writing attempt, not an audit. Work directly on unresolved placeholders and do not diagnose
 untouched files merely to reconfirm the clean build. After the attempt, the coordinator builds the
 assigned chapter against its single writable cache."""
             + proof_retry_contract,
+        }[stage]
+        validation_contract = {
+            Stage.FORMALIZE: "The coordinator checks the scoped result but intentionally does not "
+            "compile this optimistic drafting stage.",
+            Stage.FIXUP: "The coordinator independently checks scoped hashes and placeholders, "
+            "then runs the authoritative dependency-ordered build after integration.",
+            Stage.REVIEW: "The coordinator independently checks scoped hashes, placeholders, and "
+            "the chapter build after integration.",
+            Stage.PROVE: "The coordinator independently checks scoped hashes, placeholders, "
+            "diagnostics, and the chapter build.",
         }[stage]
         contract = f"""
 
@@ -550,8 +544,7 @@ other location, an exact identifying excerpt, a mathematical explanation, and th
 replacement. Do not use this ledger for missing Lean APIs, proof failures, or tooling problems. A
 source issue is not a reason to stop: make the minimal principled accommodation permitted by this
 stage, clearly preserve or report the obstruction, and continue as far as possible through every
-unaffected part of the chapter. The coordinator independently checks scoped hashes, placeholders,
-diagnostics, and `{chapter.build_command}`.
+unaffected part of the chapter. {validation_contract}
 """
         if self.config.settings.lean_mcp and stage in (Stage.FIXUP, Stage.REVIEW, Stage.PROVE):
             capabilities = (
@@ -563,13 +556,9 @@ diagnostics, and `{chapter.build_command}`.
             )
             mcp_workflow = {
                 Stage.FIXUP: """The MCP opens and synchronizes a destination file when any Lean tool
-uses it. Do not request diagnostics merely because you entered or switched files. After the coherent
-edit batch, request fresh whole-file diagnostics only for the edited dependency closure required by
-the fixup contract.""",
-                Stage.REVIEW: """Any Lean tool opens and synchronizes its destination file. Do not
-request diagnostics merely because you switched files, and do not diagnose untouched files whose
-incoming coordinator certificate remains valid. Diagnose only the edited dependency closure required
-by the review contract.""",
+uses it. Follow the fixup workflow above for diagnostic timing and scope.""",
+                Stage.REVIEW: """Any Lean tool opens and synchronizes its destination file. Follow
+the review workflow above for diagnostic timing and scope.""",
                 Stage.PROVE: """The MCP opens and synchronizes a destination file when any Lean tool
 uses it. Do not request diagnostics merely because you switched files. After editing, use goals and
 fresh diagnostics as needed to establish that the changed proof is clean.""",
@@ -587,11 +576,12 @@ The MCP automatically reopens a document with one dependency-build pass only whe
 imports. Do not start another language server or work around stale imports with a compiler command.
 """
         if feedback:
-            feedback_heading = (
-                "Cumulative proof-attempt ledger"
-                if stage is Stage.PROVE
-                else "Feedback from the preceding attempt"
-            )
+            feedback_heading = {
+                Stage.FORMALIZE: "Coordinator feedback",
+                Stage.FIXUP: "Coordinator diagnostics and routed findings",
+                Stage.REVIEW: "Coordinator feedback",
+                Stage.PROVE: "Cumulative proof-attempt ledger",
+            }[stage]
             contract += (
                 f"\n## {feedback_heading}\n\n```text\n"
                 f"{_bounded_feedback(feedback)}\n```\n"

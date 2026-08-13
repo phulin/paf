@@ -50,7 +50,8 @@ precede its users, and be independently provable from earlier declarations.
    fresh whole-file diagnostics for that changed closure in dependency order. If a diagnostic requires
    another edit, repair it and recheck only the files invalidated by that repair. Resolve every
    diagnostic except the exact “declaration uses `sorry`” warning before finishing.
-8. Recheck the complete chapter in dependency order and return structured, actionable findings.
+8. Finish the conceptual coverage audit and return structured, actionable findings. Diagnose only the
+   edited dependency closure described above, not the complete chapter.
 
 Do not run Lean, Lake, or another language server; use only the attached Lean MCP. Edit only the
 assigned scope. A no-change review needs no diagnostic calls: the coordinator's incoming certificate

@@ -246,14 +246,18 @@ After the daemon exits, `status`, `snapshot`, and `wait` fall back to the persis
 
 - **Scaffold** deterministically creates the configured chapter directories and no Lean files.
 - **Formalize** skips a materialized chapter scope or runs exactly one optimistic drafting agent.
-  Drafts are merged without agent-side Lean. Each completed scope immediately becomes eligible for
-  targeted coordinator builds instead of waiting for the entire corpus to finish drafting.
+  Drafts are merged without agent-side Lean. A newly drafted scope is accepted only when the agent
+  reports that its full chapter coverage pass is complete. Each completed scope immediately becomes
+  eligible for targeted coordinator builds instead of waiting for the entire corpus to finish
+  drafting.
 - **Fixup** groups targeted-build failures by chapter ownership and appends them verbatim to parallel
-  fixup prompts. A failure mentioning a scope whose formalizer is still active is deferred rather
-  than assigned prematurely. Completed scopes cycle through build and fixup while other drafts run;
-  the standalone fixup stage ends with a stable full-corpus build. The pipeline instead consumes
-  persisted green certificates and targets only each dependency-ready review's invalid build closure.
-  This repeats up to `max_rounds`, allowing `declaration uses sorry` but rejecting other warnings.
+  fixup prompts. Agents treat that feedback as starting evidence, read only the implicated context,
+  and let fresh MCP diagnostics account for prerequisite repairs that made an old diagnostic stale.
+  A failure mentioning a scope whose formalizer is still active is deferred rather than assigned
+  prematurely. Completed scopes cycle through build and fixup while other drafts run; the standalone
+  fixup stage ends with a stable full-corpus build. The pipeline instead consumes persisted green
+  certificates and targets only each dependency-ready review's invalid build closure. This repeats
+  up to `max_rounds`, allowing `declaration uses sorry` but rejecting other warnings.
 - **Review** visits dependency-ready chapters against a clean source and `.olean` generation. Agents
   make warranted in-scope statement and API changes directly; unresolved findings retain exact edit
   paths and are routed to their owners. The coordinator's green certificate remains authoritative for
