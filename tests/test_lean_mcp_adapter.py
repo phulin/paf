@@ -31,9 +31,7 @@ class FakeClient:
         self.events: list[tuple[Any, ...]] = []
         self.open_modes: dict[str, str] = {}
 
-    async def open(
-        self, path: str, *, wait: bool, dependency_build_mode: str
-    ) -> FakeDocument:
+    async def open(self, path: str, *, wait: bool, dependency_build_mode: str) -> FakeDocument:
         self.events.append(("open", path, wait, dependency_build_mode))
         document = FakeDocument(
             path=path,
@@ -193,9 +191,7 @@ async def test_concurrent_stale_files_share_completed_dependency_work(tmp_path: 
         ):
             client._docs[path].diagnostics = []
 
-    first = asyncio.create_task(
-        barrier_with_dependency_refresh(client, "A.lean", original=barrier)
-    )
+    first = asyncio.create_task(barrier_with_dependency_refresh(client, "A.lean", original=barrier))
     await build_started.wait()
     second = asyncio.create_task(
         barrier_with_dependency_refresh(client, "B.lean", original=barrier)

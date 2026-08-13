@@ -26,9 +26,7 @@ _ORIGINAL_NOTIFICATION = AsyncLeanLSPClient._on_notification
 _DEPENDENCY_LOCKS: WeakKeyDictionary[Any, asyncio.Lock] = WeakKeyDictionary()
 _BUILD_GENERATIONS: WeakKeyDictionary[Any, int] = WeakKeyDictionary()
 _STALE_EPOCHS: WeakKeyDictionary[Any, dict[str, int]] = WeakKeyDictionary()
-_REFRESH_ATTEMPTS: WeakKeyDictionary[
-    Any, dict[str, tuple[str, int, int]]
-] = WeakKeyDictionary()
+_REFRESH_ATTEMPTS: WeakKeyDictionary[Any, dict[str, tuple[str, int, int]]] = WeakKeyDictionary()
 
 _IMPORT_RE = re.compile(
     r"^[ \t]*(?:(?:public|private)[ \t]+)?(?:meta[ \t]+)?import(?:[ \t]+all)?"
