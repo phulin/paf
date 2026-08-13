@@ -235,6 +235,7 @@ def load_config(path: str | Path) -> PipelineConfig:
         ),
         validation_timeout_seconds=float(swarm.get("validation_timeout_seconds", 1800)),
         isolation=str(swarm.get("isolation", "auto")),
+        cache_compaction_layers=int(swarm.get("cache_compaction_layers", 32)),
         lean_mcp=bool(swarm.get("lean_mcp", True)),
         lean_project=_repo_relative(
             repo,
@@ -253,6 +254,8 @@ def load_config(path: str | Path) -> PipelineConfig:
         raise ValueError("swarm.capacity_resume_max_delay_seconds must be nonnegative")
     if settings.isolation not in {"auto", "fuse-overlay", "shared"}:
         raise ValueError("swarm.isolation must be auto, fuse-overlay, or shared")
+    if settings.cache_compaction_layers < 2:
+        raise ValueError("swarm.cache_compaction_layers must be at least 2")
     if settings.lean_mcp_tool_timeout_seconds <= 0:
         raise ValueError("swarm.lean_mcp_tool_timeout_seconds must be positive")
 

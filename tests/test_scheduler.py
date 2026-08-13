@@ -1330,12 +1330,22 @@ async def test_streaming_build_does_not_publish_partial_cache_snapshot(
     async def successful_validation(*_args: object, **_kwargs: object) -> ValidationResult:
         return ValidationResult(True, 0, "ok")
 
-    async def track_publish() -> None:
-        nonlocal published
-        published += 1
+    original_acquire_build = orchestrator.isolation.acquire_build
+
+    async def track_build(build_id: str) -> object:
+        workspace = await original_acquire_build(build_id)
+        original_finish = workspace.finish
+
+        async def finish(*, succeeded: bool, publish: bool) -> tuple[str, ...]:
+            nonlocal published
+            published += int(publish)
+            return await original_finish(succeeded=succeeded, publish=publish)
+
+        workspace.finish = finish  # type: ignore[method-assign]
+        return workspace
 
     monkeypatch.setattr(scheduler_module, "validate", successful_validation)
-    monkeypatch.setattr(orchestrator.isolation, "refresh_cache", track_publish)
+    monkeypatch.setattr(orchestrator.isolation, "acquire_build", track_build)
 
     await orchestrator._build_chapters((config.chapters[0],), publish_if_clean=False)
     assert published == 0

@@ -14,6 +14,7 @@ capacity_resume_delay_seconds = 15
 capacity_resume_max_delay_seconds = 120
 validation_timeout_seconds = 1800
 isolation = "auto"
+cache_compaction_layers = 32
 lean_mcp = true
 lean_project = "lean"
 lean_mcp_tool_timeout_seconds = 300

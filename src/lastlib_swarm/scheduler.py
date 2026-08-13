@@ -1019,9 +1019,11 @@ class Orchestrator:
             results: dict[str, ValidationResult] = {}
             preempted = False
             source_held = False
+            build_workspace = None
             try:
                 await self.source_lock.acquire()
                 source_held = True
+                build_workspace = await self.isolation.acquire_build(label)
                 async with self.state.batch():
                     await self.state.set_tasks(
                         ids,
@@ -1055,7 +1057,7 @@ class Orchestrator:
                         validate(
                             self.config,
                             chapter,
-                            workspace_root=self.config.settings.repo,
+                            workspace_root=build_workspace.root,
                             on_output=append_output,
                         )
                     )
@@ -1081,13 +1083,16 @@ class Orchestrator:
                         chapter_id=chapter.id,
                         completed=index + 1,
                     )
-                if (
+                clean = (
                     not preempted
-                    and publish_if_clean
-                    and results
+                    and bool(results)
                     and all(result.succeeded for result in results.values())
-                ):
-                    await self.isolation.refresh_cache()
+                )
+                await build_workspace.finish(
+                    succeeded=clean,
+                    publish=publish_if_clean and clean,
+                )
+                build_workspace = None
                 if not preempted:
                     await self.state.set_tasks(
                         ids,
@@ -1098,6 +1103,8 @@ class Orchestrator:
                     )
             finally:
                 try:
+                    if build_workspace is not None:
+                        await build_workspace.close()
                     if source_held:
                         await self.state.finish_coordinator_build()
                 finally:

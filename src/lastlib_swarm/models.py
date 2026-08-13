@@ -41,6 +41,7 @@ class SwarmSettings:
     capacity_resume_max_delay_seconds: float = 120.0
     validation_timeout_seconds: float = 1800.0
     isolation: str = "auto"
+    cache_compaction_layers: int = 32
     lean_mcp: bool = True
     lean_project: Path = Path("lean")
     lean_mcp_tool_timeout_seconds: float = 300.0

@@ -218,7 +218,7 @@ async def test_fuse_overlay_imports_scope_and_rejects_a_stale_writer(tmp_path: P
 
 
 @pytest.mark.asyncio
-async def test_agent_cache_writes_are_discarded_and_coordinator_refreshes_snapshots(
+async def test_agent_cache_writes_are_discarded_and_coordinator_publishes_delta(
     tmp_path: Path,
 ) -> None:
     config_path = write_project(tmp_path, chapters="chapters = [1]")
@@ -240,15 +240,17 @@ async def test_agent_cache_writes_are_discarded_and_coordinator_refreshes_snapsh
         assert (pinned.root / seed.relative_to(tmp_path)).read_bytes() == b"shared dependency"
         result = await writer.collect(chapter)
         await writer.close()
-        coordinator_artifact = tmp_path / artifact
+        build = await manager.acquire_build("coordinator")
+        coordinator_artifact = build.root / artifact
         coordinator_artifact.parent.mkdir(parents=True, exist_ok=True)
         coordinator_artifact.write_bytes(b"coordinator artifact")
-        await manager.refresh_cache()
+        promoted = await build.finish(succeeded=True, publish=True)
         fresh = await manager.acquire("cache-fresh")
         assert result.accepted
         assert result.promoted_cache_paths == ()
         assert not (pinned.root / artifact).exists()
         assert (fresh.root / artifact).read_bytes() == b"coordinator artifact"
+        assert promoted == (artifact,)
         assert (pinned.cache / seed.relative_to(tmp_path)).stat().st_ino == (
             fresh.cache / seed.relative_to(tmp_path)
         ).stat().st_ino
@@ -264,7 +266,9 @@ async def test_agent_cache_writes_are_discarded_and_coordinator_refreshes_snapsh
 
 
 @pytest.mark.asyncio
-async def test_cache_refresh_keeps_active_agent_snapshots_immutable(tmp_path: Path) -> None:
+async def test_cache_delta_publication_keeps_active_agent_snapshots_immutable(
+    tmp_path: Path,
+) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
     manager = FuseOverlayIsolation(replace(config.settings, isolation="fuse-overlay", max_agents=3))
     await manager.prepare()
@@ -274,15 +278,17 @@ async def test_cache_refresh_keeps_active_agent_snapshots_immutable(tmp_path: Pa
     try:
         first_only = "lean/.lake/build/first.olean"
         second_only = "lean/.lake/build/second.olean"
-        first_target = tmp_path / first_only
+        first_build = await manager.acquire_build("first")
+        first_target = first_build.root / first_only
         first_target.parent.mkdir(parents=True, exist_ok=True)
         first_target.write_bytes(b"first")
-        await manager.refresh_cache()
+        await first_build.finish(succeeded=True, publish=True)
         first_fresh = await manager.acquire("cache-first-fresh")
 
-        second_target = tmp_path / second_only
+        second_build = await manager.acquire_build("second")
+        second_target = second_build.root / second_only
         second_target.write_bytes(b"second")
-        await manager.refresh_cache()
+        await second_build.finish(succeeded=True, publish=True)
         second_fresh = await manager.acquire("cache-second-fresh")
 
         assert not (pinned.root / first_only).exists()
@@ -348,11 +354,11 @@ print(json.dumps({"type": "item.completed", "item": {
         workspace_root: Path | None = None,
         **_kwargs: object,
     ) -> ValidationResult:
-        assert workspace_root == tmp_path
-        assert (tmp_path / "lean" / "Book" / "Chapter01.lean").read_text(
+        assert workspace_root is not None
+        assert (workspace_root / "lean" / "Book" / "Chapter01.lean").read_text(
             encoding="utf-8"
         ) == "theorem isolated : True := by trivial\n"
-        artifact = tmp_path / "lean" / ".lake" / "build" / "coordinator.marker"
+        artifact = workspace_root / "lean" / ".lake" / "build" / "coordinator.marker"
         artifact.parent.mkdir(parents=True, exist_ok=True)
         artifact.write_bytes(b"built in main")
         return ValidationResult(True, 0, "ok")

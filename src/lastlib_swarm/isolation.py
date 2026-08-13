@@ -44,6 +44,14 @@ class IsolationResult:
         }
 
 
+@dataclass
+class CacheGeneration:
+    """An immutable ordered cache-layer manifest pinned by active agents."""
+
+    layers: tuple[Path, ...]
+    references: int = 0
+
+
 def fuse_overlay_available() -> bool:
     return (
         Path("/dev/fuse").exists()
@@ -172,6 +180,18 @@ class SharedWorkspace:
         return
 
 
+class SharedBuildWorkspace:
+    def __init__(self, repo: Path) -> None:
+        self.root = repo
+
+    async def finish(self, *, succeeded: bool, publish: bool) -> tuple[str, ...]:
+        del succeeded, publish
+        return ()
+
+    async def close(self) -> None:
+        return
+
+
 class SharedIsolation:
     name = "shared"
 
@@ -184,8 +204,8 @@ class SharedIsolation:
     async def acquire(self, _run_id: str) -> SharedWorkspace:
         return SharedWorkspace(self.settings.repo)
 
-    async def refresh_cache(self) -> None:
-        return
+    async def acquire_build(self, _build_id: str) -> SharedBuildWorkspace:
+        return SharedBuildWorkspace(self.settings.repo)
 
     async def close(self) -> None:
         return
@@ -258,6 +278,43 @@ class FuseWorkspace:
             await self.manager.release(self)
 
 
+class FuseBuildWorkspace:
+    """A private coordinator cache transaction backed by an overlay upperdir."""
+
+    def __init__(
+        self,
+        manager: FuseOverlayIsolation,
+        *,
+        build_id: str,
+        generation: int,
+        base: Path,
+        layers: tuple[Path, ...],
+        upper: Path,
+        work: Path,
+        merged: Path,
+    ) -> None:
+        self.manager = manager
+        self.build_id = build_id
+        self.generation = generation
+        self.base = base
+        self.layers = layers
+        self.upper = upper
+        self.work = work
+        self.root = merged
+        self.closed = False
+
+    async def finish(self, *, succeeded: bool, publish: bool) -> tuple[str, ...]:
+        if self.closed:
+            raise RuntimeError("coordinator build workspace already closed")
+        self.closed = True
+        return await self.manager.finish_build(self, succeeded=succeeded, publish=publish)
+
+    async def close(self) -> None:
+        if not self.closed:
+            self.closed = True
+            await self.manager.finish_build(self, succeeded=False, publish=False)
+
+
 class FuseOverlayIsolation:
     name = "fuse-overlay"
 
@@ -267,15 +324,19 @@ class FuseOverlayIsolation:
         self.parent = Path(tempfile.gettempdir()) / f"lastlib-swarm-{os.getuid()}"
         self.root = self.parent / f"{self.identity}-{os.getpid()}"
         self.generations = self.root / "source-generations"
-        self.cache_generations = self.root / "cache-generations"
+        self.cache_root = self.root / "cache"
+        self.cache_layers = self.cache_root / "layers"
+        self.cache_builds = self.cache_root / "builds"
+        self.cache_compactions = self.cache_root / "compactions"
         self.slots = self.root / "slots"
+        lean_cache = (settings.lean_project / ".lake").as_posix()
         excluded = {
             ".git",
             ".swarm",
             ".venv",
             ".pytest_cache",
             ".lake",
-            "lean/.lake",
+            lean_cache,
         }
         with suppress(ValueError):
             excluded.add(settings.state_dir.relative_to(settings.repo).as_posix())
@@ -287,9 +348,15 @@ class FuseOverlayIsolation:
         self._revision = 0
         self._generation_paths: dict[int, Path] = {}
         self._generation_references: dict[int, int] = {}
+        self._dependency_layer = self.cache_root / "dependencies-unprepared"
+        self._coordinator_layers: tuple[Path, ...] = ()
         self._cache_revision = 0
-        self._cache_paths: dict[int, Path] = {}
-        self._cache_references: dict[int, int] = {}
+        self._published_cache_revision = 0
+        self._cache_generations: dict[int, CacheGeneration] = {}
+        self._active_build_layers: set[Path] = set()
+        self._active_compaction_layers: set[Path] = set()
+        self._compaction_task: asyncio.Task[None] | None = None
+        self._cleanup_tasks: set[asyncio.Task[None]] = set()
 
     async def prepare(self) -> None:
         if not fuse_overlay_available():
@@ -298,14 +365,15 @@ class FuseOverlayIsolation:
             )
         await self._clean_stale_roots()
         self.generations.mkdir(parents=True, exist_ok=True)
-        self.cache_generations.mkdir(parents=True, exist_ok=True)
+        self.cache_layers.mkdir(parents=True, exist_ok=True)
+        self.cache_builds.mkdir(parents=True, exist_ok=True)
+        self.cache_compactions.mkdir(parents=True, exist_ok=True)
         self.slots.mkdir(parents=True, exist_ok=True)
-        # Seed immutable source/cache generation zero before the scheduler can
-        # launch either agents or coordinator builds. Later agent acquisition
-        # never needs to copy the live writable Lake cache.
+        # Seed immutable source and split cache bases once. Every later build
+        # records only its private overlay delta.
         async with self._lock:
             await self._generation()
-            await self._cache_generation()
+            await self._seed_cache_layers()
 
     async def _clean_stale_roots(self) -> None:
         """Reclaim mounts left by dead orchestrators for this state directory."""
@@ -330,7 +398,7 @@ class FuseOverlayIsolation:
                 # how a dead fuse-overlayfs mount presents. /proc/self/mountinfo remains readable.
                 if merged in mounted or os.path.ismount(merged):
                     await self._unmount(merged)
-            shutil.rmtree(stale)
+            await asyncio.to_thread(shutil.rmtree, stale)
 
     async def _unmount(self, path: Path) -> None:
         """Unmount normally, then detach a busy mount left by a dead worker."""
@@ -375,68 +443,293 @@ class FuseOverlayIsolation:
         self._generation_references[generation] = 0
         return generation, destination
 
-    async def _copy_cache(
-        self,
-        source: Path,
-        destination: Path,
-        *,
-        link_destination: Path | None,
-    ) -> None:
+    def _cache_prefixes(self) -> tuple[str, ...]:
+        return ".lake", (self.settings.lean_project / ".lake").as_posix()
+
+    def _package_prefixes(self) -> tuple[str, ...]:
+        return tuple(f"{prefix}/packages" for prefix in self._cache_prefixes())
+
+    def _is_cache_path(self, relative: str) -> bool:
+        return any(
+            relative == prefix or relative.startswith(prefix + "/")
+            for prefix in self._cache_prefixes()
+        )
+
+    def _is_cache_ancestor(self, relative: str) -> bool:
+        return any(
+            relative == "" or prefix.startswith(relative + "/")
+            for prefix in self._cache_prefixes()
+        )
+
+    def _dependency_key(self) -> str:
+        digest = hashlib.sha256()
+        for relative in (
+            Path("lean-toolchain"),
+            self.settings.lean_project / "lake-manifest.json",
+        ):
+            digest.update(relative.as_posix().encode())
+            path = self.settings.repo / relative
+            if path.is_file():
+                digest.update(path.read_bytes())
+        return digest.hexdigest()[:16]
+
+    async def _copy_dependency_cache(self, destination: Path) -> None:
         command = [
             "rsync",
             "-a",
             "--prune-empty-dirs",
             "--include=*/",
-            "--include=/.lake/***",
-            "--include=/lean/.lake/***",
-            "--exclude=*",
         ]
-        if link_destination is not None:
-            command.append(f"--link-dest={link_destination}")
-        command.extend((f"{source}/", f"{destination}/"))
+        command.extend(f"--include=/{prefix}/***" for prefix in self._package_prefixes())
+        command.extend(("--exclude=*", f"--link-dest={self.settings.repo}"))
+        command.extend((f"{self.settings.repo}/", f"{destination}/"))
         await self._run(*command)
 
-    async def _cache_generation(self) -> tuple[int, Path]:
-        generation = self._cache_revision
-        existing = self._cache_paths.get(generation)
-        if existing is not None:
-            return generation, existing
-        destination = self.cache_generations / f"{generation:08d}"
-        destination.mkdir(parents=True, exist_ok=False)
-        await self._copy_cache(
-            self.settings.repo,
-            destination,
-            link_destination=self.settings.repo,
+    async def _copy_initial_project_cache(self, destination: Path) -> None:
+        command = ["rsync", "-a", "--prune-empty-dirs", "--include=*/"]
+        command.extend(f"--exclude=/{prefix}/***" for prefix in self._package_prefixes())
+        command.extend(f"--include=/{prefix}/***" for prefix in self._cache_prefixes())
+        command.extend(("--exclude=*", f"--link-dest={self.settings.repo}"))
+        command.extend((f"{self.settings.repo}/", f"{destination}/"))
+        await self._run(*command)
+
+    async def _seed_cache_layers(self) -> None:
+        dependency = self.cache_root / f"dependencies-{self._dependency_key()}"
+        project = self.cache_layers / "00000000-initial"
+        dependency.mkdir(parents=True, exist_ok=False)
+        project.mkdir(parents=True, exist_ok=False)
+        await asyncio.gather(
+            self._copy_dependency_cache(dependency),
+            self._copy_initial_project_cache(project),
         )
-        self._cache_paths[generation] = destination
-        self._cache_references[generation] = 0
-        return generation, destination
+        self._dependency_layer = dependency
+        self._coordinator_layers = (project,)
+        self._cache_generations[0] = CacheGeneration(self._coordinator_layers)
 
-    async def refresh_cache(self) -> None:
-        """Publish a read-only snapshot of the coordinator-owned main cache.
+    def _lower_directories(self, base: Path, layers: tuple[Path, ...]) -> str:
+        return ":".join(str(path) for path in (base, *layers, self._dependency_layer))
 
-        Agents can read these immutable snapshots but their overlay writes are
-        never promoted. The main worktree remains the only writable build cache.
-        """
+    def _cache_delta_paths(self, upper: Path) -> tuple[str, ...]:
+        paths: list[str] = []
+        for directory, names, filenames in os.walk(upper, followlinks=False):
+            current = Path(directory)
+            for name in (*names, *filenames):
+                path = current / name
+                if path.is_dir():
+                    continue
+                relative = path.relative_to(upper).as_posix()
+                parent = path.parent.relative_to(upper).as_posix()
+                if name.startswith(".wh.") and self._is_cache_ancestor(parent):
+                    continue
+                if not self._is_cache_path(relative):
+                    raise RuntimeError(
+                        f"coordinator build wrote outside its private cache: {relative}"
+                    )
+                if not name.startswith(".wh."):
+                    paths.append(relative)
+        return tuple(sorted(paths))
 
-        async with self._lock:
-            previous = self._cache_paths.get(self._cache_revision)
-            next_generation = self._cache_revision + 1
-            destination = self.cache_generations / f"{next_generation:08d}"
-            destination.mkdir(parents=True, exist_ok=False)
-            await self._copy_cache(
-                self.settings.repo,
-                destination,
-                link_destination=previous or self.settings.repo,
+    def _apply_cache_whiteouts(self, upper: Path) -> None:
+        for marker in upper.rglob(".wh.*"):
+            relative_parent = marker.parent.relative_to(upper)
+            if not self._is_cache_path(relative_parent.as_posix()):
+                continue
+            name = marker.name
+            if name in {".wh..opq", ".wh..wh..opq"}:
+                target = self.settings.repo / relative_parent
+            else:
+                target = self.settings.repo / relative_parent / name.removeprefix(".wh.")
+            if target.is_dir() and not target.is_symlink():
+                shutil.rmtree(target)
+            else:
+                target.unlink(missing_ok=True)
+
+    async def acquire_build(self, build_id: str) -> FuseBuildWorkspace:
+        generation: int | None = None
+        build_root = Path(
+            tempfile.mkdtemp(prefix="build-", dir=self.cache_builds)
+        )
+        upper = build_root / "upper"
+        work = build_root / "work"
+        merged = build_root / "merged"
+        try:
+            async with self._lock:
+                generation, base = await self._generation()
+                layers = self._coordinator_layers
+                self._generation_references[generation] += 1
+                self._active_build_layers.update(layers)
+            for path in (upper, work, merged):
+                path.mkdir(parents=True, exist_ok=False)
+            await self._run(
+                "fuse-overlayfs",
+                "-o",
+                f"lowerdir={self._lower_directories(base, layers)},"
+                f"upperdir={upper},workdir={work}",
+                str(merged),
             )
-            self._cache_revision = next_generation
-            self._cache_paths[next_generation] = destination
-            self._cache_references[next_generation] = 0
-            previous_generation = next_generation - 1
-            if previous is not None and self._cache_references[previous_generation] == 0:
-                self._cache_paths.pop(previous_generation)
-                self._cache_references.pop(previous_generation)
-                shutil.rmtree(previous)
+            if not os.path.ismount(merged):
+                raise RuntimeError(f"fuse-overlayfs did not mount {merged}")
+            return FuseBuildWorkspace(
+                self,
+                build_id=build_id,
+                generation=generation,
+                base=base,
+                layers=layers,
+                upper=upper,
+                work=work,
+                merged=merged,
+            )
+        except Exception:
+            if os.path.ismount(merged):
+                await self._unmount(merged)
+            if build_root.exists():
+                await asyncio.to_thread(shutil.rmtree, build_root)
+            if generation is not None:
+                async with self._lock:
+                    self._generation_references[generation] -= 1
+                    self._active_build_layers.difference_update(layers)
+            raise
+
+    async def finish_build(
+        self,
+        workspace: FuseBuildWorkspace,
+        *,
+        succeeded: bool,
+        publish: bool,
+    ) -> tuple[str, ...]:
+        build_root = workspace.root.parent
+        promoted: tuple[str, ...] = ()
+        layer: Path | None = None
+        try:
+            if os.path.ismount(workspace.root):
+                await self._unmount(workspace.root)
+            if succeeded:
+                promoted = await asyncio.to_thread(self._cache_delta_paths, workspace.upper)
+                if promoted:
+                    # Preserve the ordinary worktree cache for non-swarm Lake
+                    # commands and for seeding the next orchestrator invocation.
+                    await asyncio.to_thread(self._apply_cache_whiteouts, workspace.upper)
+                    await self._run(
+                        "rsync",
+                        "-a",
+                        "--exclude=.wh.*",
+                        f"{workspace.upper}/",
+                        f"{self.settings.repo}/",
+                    )
+                    async with self._lock:
+                        next_layer = self._cache_revision + 1
+                        layer = self.cache_layers / f"{next_layer:08d}-delta"
+                        os.replace(workspace.upper, layer)
+                        self._cache_revision = next_layer
+                        self._coordinator_layers = (layer, *self._coordinator_layers)
+                if publish:
+                    async with self._lock:
+                        self._published_cache_revision += 1
+                        self._cache_generations[self._published_cache_revision] = CacheGeneration(
+                            self._coordinator_layers
+                        )
+                        self._drop_unused_cache_generations_locked()
+                async with self._lock:
+                    self._start_compaction_locked()
+            return promoted
+        finally:
+            if build_root.exists():
+                await asyncio.to_thread(shutil.rmtree, build_root)
+            async with self._lock:
+                self._generation_references[workspace.generation] -= 1
+                self._active_build_layers.difference_update(workspace.layers)
+                self._drop_unused_cache_generations_locked()
+
+    def _drop_unused_cache_generations_locked(self) -> None:
+        for generation, snapshot in tuple(self._cache_generations.items()):
+            if generation != self._published_cache_revision and snapshot.references == 0:
+                self._cache_generations.pop(generation)
+        self._collect_unused_layers_locked()
+
+    def _schedule_remove_tree(self, path: Path) -> None:
+        if not path.exists():
+            return
+        task = asyncio.create_task(asyncio.to_thread(shutil.rmtree, path))
+        self._cleanup_tasks.add(task)
+
+    def _collect_unused_layers_locked(self) -> None:
+        reachable = {
+            *self._coordinator_layers,
+            *self._active_build_layers,
+            *self._active_compaction_layers,
+            *(
+                layer
+                for generation in self._cache_generations.values()
+                for layer in generation.layers
+            ),
+        }
+        for layer in self.cache_layers.iterdir():
+            if layer.is_dir() and layer not in reachable:
+                self._schedule_remove_tree(layer)
+
+    def _start_compaction_locked(self) -> None:
+        if self._compaction_task is not None:
+            if not self._compaction_task.done():
+                return
+            self._compaction_task.result()
+            self._compaction_task = None
+        if len(self._coordinator_layers) < self.settings.cache_compaction_layers:
+            return
+        layers = self._coordinator_layers
+        self._active_compaction_layers.update(layers)
+        self._compaction_task = asyncio.create_task(self._compact_layers(layers))
+
+    async def _compact_layers(self, layers: tuple[Path, ...]) -> None:
+        compact_root = Path(
+            tempfile.mkdtemp(prefix="compact-", dir=self.cache_compactions)
+        )
+        merged = compact_root / "merged"
+        compacted = compact_root / "layer"
+        merged.mkdir()
+        compacted.mkdir()
+        mounted = False
+        try:
+            await self._run(
+                "fuse-overlayfs",
+                "-o",
+                "lowerdir=" + ":".join(str(path) for path in layers),
+                str(merged),
+            )
+            mounted = True
+            if not os.path.ismount(merged):
+                raise RuntimeError(f"fuse-overlayfs did not mount {merged}")
+            await self._run(
+                "rsync",
+                "-a",
+                f"--link-dest={layers[-1]}",
+                f"{merged}/",
+                f"{compacted}/",
+            )
+            await self._unmount(merged)
+            mounted = False
+            async with self._lock:
+                current = self._coordinator_layers
+                if len(current) < len(layers) or current[-len(layers) :] != layers:
+                    return
+                prefix = current[: -len(layers)]
+                destination = self.cache_layers / f"compact-{self._cache_revision:08d}"
+                os.replace(compacted, destination)
+                self._coordinator_layers = (*prefix, destination)
+                published = self._cache_generations[self._published_cache_revision]
+                if published.layers == layers:
+                    self._published_cache_revision += 1
+                    self._cache_generations[self._published_cache_revision] = CacheGeneration(
+                        self._coordinator_layers
+                    )
+                    self._drop_unused_cache_generations_locked()
+        finally:
+            if mounted and os.path.ismount(merged):
+                await self._unmount(merged)
+            if compact_root.exists():
+                await asyncio.to_thread(shutil.rmtree, compact_root)
+            async with self._lock:
+                self._active_compaction_layers.difference_update(layers)
+                self._drop_unused_cache_generations_locked()
 
     async def acquire(self, run_id: str) -> FuseWorkspace:
         slot = await self._available.get()
@@ -447,9 +740,10 @@ class FuseOverlayIsolation:
         try:
             async with self._lock:
                 generation, base = await self._generation()
-                cache_generation, cache = await self._cache_generation()
+                cache_generation = self._published_cache_revision
+                cache = self._cache_generations[cache_generation]
                 self._generation_references[generation] += 1
-                self._cache_references[cache_generation] += 1
+                cache.references += 1
             upper = slot_root / "upper"
             work = slot_root / "work"
             for path in (upper, work, merged):
@@ -457,7 +751,8 @@ class FuseOverlayIsolation:
             await self._run(
                 "fuse-overlayfs",
                 "-o",
-                f"lowerdir={base}:{cache},upperdir={upper},workdir={work}",
+                f"lowerdir={self._lower_directories(base, cache.layers)},"
+                f"upperdir={upper},workdir={work}",
                 str(merged),
             )
             if not os.path.ismount(merged):
@@ -468,7 +763,7 @@ class FuseOverlayIsolation:
                 generation=generation,
                 cache_generation=cache_generation,
                 base=base,
-                cache=cache,
+                cache=self._dependency_layer,
                 upper=upper,
                 work=work,
                 merged=merged,
@@ -477,12 +772,12 @@ class FuseOverlayIsolation:
             if os.path.ismount(merged):
                 await self._unmount(merged)
             if slot_root.exists():
-                shutil.rmtree(slot_root)
+                await asyncio.to_thread(shutil.rmtree, slot_root)
             if generation is not None:
                 async with self._lock:
                     self._generation_references[generation] -= 1
                     if cache_generation is not None:
-                        self._cache_references[cache_generation] -= 1
+                        self._cache_generations[cache_generation].references -= 1
             self._available.put_nowait(slot)
             raise
 
@@ -565,7 +860,7 @@ class FuseOverlayIsolation:
             if os.path.ismount(workspace.root):
                 await self._unmount(workspace.root)
             slot_root = workspace.root.parent
-            shutil.rmtree(slot_root, ignore_errors=False)
+            await asyncio.to_thread(shutil.rmtree, slot_root, ignore_errors=False)
         finally:
             async with self._lock:
                 self._generation_references[workspace.generation] -= 1
@@ -575,26 +870,34 @@ class FuseOverlayIsolation:
                 ):
                     path = self._generation_paths.pop(workspace.generation)
                     self._generation_references.pop(workspace.generation)
-                    shutil.rmtree(path)
-                self._cache_references[workspace.cache_generation] -= 1
-                if (
-                    workspace.cache_generation != self._cache_revision
-                    and self._cache_references[workspace.cache_generation] == 0
-                ):
-                    cache_path = self._cache_paths.pop(workspace.cache_generation)
-                    self._cache_references.pop(workspace.cache_generation)
-                    shutil.rmtree(cache_path)
+                    await asyncio.to_thread(shutil.rmtree, path)
+                self._cache_generations[workspace.cache_generation].references -= 1
+                self._drop_unused_cache_generations_locked()
             self._available.put_nowait(workspace.slot)
 
     async def close(self) -> None:
         if self._available.qsize() != self.settings.max_agents:
             raise RuntimeError("cannot close isolation while workspaces are active")
-        if self.root.exists():
-            shutil.rmtree(self.root)
+        if self._active_build_layers:
+            raise RuntimeError("cannot close isolation while a coordinator build is active")
+        error: BaseException | None = None
+        try:
+            if self._compaction_task is not None:
+                await self._compaction_task
+            if self._cleanup_tasks:
+                await asyncio.gather(*self._cleanup_tasks)
+        except BaseException as caught:
+            error = caught
+        finally:
+            if self.root.exists():
+                await asyncio.to_thread(shutil.rmtree, self.root)
+        if error is not None:
+            raise error
 
 
 IsolationManager = SharedIsolation | FuseOverlayIsolation
 Workspace = SharedWorkspace | FuseWorkspace
+BuildWorkspace = SharedBuildWorkspace | FuseBuildWorkspace
 
 
 def create_isolation(settings: SwarmSettings) -> IsolationManager:
