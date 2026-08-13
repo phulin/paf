@@ -351,8 +351,10 @@ The dashboard shows:
 - measured cumulative input, cached input, output, and reasoning-output tokens.
 
 Select a chapter row and press Enter (or `i`) to open its agent detail screen. It updates while the
-agent runs and has tabs for the compact event timeline, Codex todo plan, touched files, and bounded
-raw JSONL events. The header includes PID/thread id, elapsed and idle time, shell/MCP/edit counts,
+agent runs and has tabs for the event timeline, Codex todo plan, touched files, and bounded raw JSONL
+events. Opening a run reconstructs its timeline from JSONL so the whole run is visible; only an
+extreme run beyond 10,000 display events is shortened, with the omission called out. The header
+includes PID/thread id, elapsed and idle time, shell/MCP/edit counts,
 complete latest agent update in a scrollable pane, latest substantive error, and measured per-run
 spend. Bare process statuses such as `exit 2` are retained in the event timeline but are not promoted
 to latest or systemic errors. The detail pane reports tokens and API-equivalent cost for that exact

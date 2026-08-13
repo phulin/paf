@@ -34,6 +34,7 @@ from lastlib_swarm.scheduler import Orchestrator
 from lastlib_swarm.state import RunRecord, StateStore, TaskPhase, TaskRecord, TaskStatus, TokenUsage
 
 TUI_THEME = "ansi-dark"
+MAX_TIMELINE_EVENTS = 10_000
 
 
 @dataclass(frozen=True)
@@ -383,6 +384,7 @@ class AgentDetailScreen(Screen[None]):
         self._raw_offset = 0
         self._raw_pending = bytearray()
         self._raw_lines: deque[str] = deque(maxlen=30)
+        self._timeline_activities: dict[str, AgentActivity] = {}
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -412,7 +414,12 @@ class AgentDetailScreen(Screen[None]):
         yield Static(id="agent-error", markup=False)
         with TabbedContent(id="agent-tabs"):
             with TabPane("Timeline", id="timeline-pane"):
-                yield RichLog(id="agent-timeline", wrap=True, markup=False)
+                yield RichLog(
+                    id="agent-timeline",
+                    wrap=True,
+                    markup=False,
+                    max_lines=None,
+                )
             with TabPane("Plan", id="plan-pane"):
                 yield RichLog(id="agent-plan", wrap=True, markup=False)
             with TabPane("Files", id="files-pane"):
@@ -495,14 +502,72 @@ class AgentDetailScreen(Screen[None]):
         self._update_static("#agent-error", f"LATEST ERROR\n{error}" if error else "")
         path = Path(run.log_path) if run.log_path else self.state.logs_dir / f"{run.id}.jsonl"
         self._update_static("#agent-path", f"Raw JSONL: {path}")
+        timeline_activity = self._timeline_activity(run, activity, path)
         timeline_width = _log_render_width(self.query_one("#agent-timeline", RichLog))
-        rendered_activity = (run.id, activity.sequence if activity else None, timeline_width)
+        rendered_activity = (
+            run.id,
+            timeline_activity.sequence if timeline_activity else None,
+            timeline_width,
+        )
         if rendered_activity != self._rendered_activity:
-            self._render_activity(activity)
+            self._render_activity(timeline_activity)
             self._rendered_activity = rendered_activity
         tabs = self.query_one("#agent-tabs", TabbedContent)
         if tabs.active == "raw-pane":
             self._refresh_raw_events(path)
+
+    def _timeline_activity(
+        self,
+        run: RunRecord,
+        compact: AgentActivity | None,
+        path: Path,
+    ) -> AgentActivity | None:
+        """Replay a run once, then extend that full timeline from its live sidecar."""
+
+        timeline = self._timeline_activities.get(run.id)
+        if timeline is None:
+            replayed = self.state.activities.replay(
+                run.id,
+                run.chapter_id,
+                run.stage,
+                path,
+                workspace_root=self.state.config.settings.repo,
+                maximum_events=MAX_TIMELINE_EVENTS,
+                cache=False,
+            )
+            if replayed is None:
+                # A newly started run may not have created its JSONL yet. Do not
+                # cache the compact fallback, so a later refresh can replay it.
+                return compact
+            timeline = replayed
+            self._timeline_activities[run.id] = timeline
+
+        if compact is None or timeline is None or compact.sequence <= timeline.sequence:
+            return timeline
+
+        additions = [entry for entry in compact.recent if entry.sequence > timeline.sequence]
+        if not additions or additions[0].sequence != timeline.sequence + 1:
+            replayed = self.state.activities.replay(
+                run.id,
+                run.chapter_id,
+                run.stage,
+                path,
+                workspace_root=self.state.config.settings.repo,
+                maximum_events=MAX_TIMELINE_EVENTS,
+                cache=False,
+            )
+            if replayed is not None:
+                self._timeline_activities[run.id] = replayed
+                return replayed
+            return timeline
+
+        timeline.recent.extend(additions)
+        del timeline.recent[:-MAX_TIMELINE_EVENTS]
+        timeline.sequence = compact.sequence
+        timeline.updated_at = compact.updated_at
+        timeline.latest_summary = compact.latest_summary
+        timeline.latest_error = compact.latest_error
+        return timeline
 
     def _sync_run_tabs(self, runs: list[RunRecord]) -> None:
         tabs = self.query_one("#run-tabs", Tabs)
@@ -592,6 +657,12 @@ class AgentDetailScreen(Screen[None]):
         timeline_width = _log_render_width(timeline)
         write_width = timeline_width if timeline.scrollable_size.width else None
         marks = {"started": "▶", "completed": "✓", "failed": "✗", "updated": "•"}
+        if activity and activity.recent and activity.recent[0].sequence > 1:
+            omitted = activity.recent[0].sequence - 1
+            timeline.write(
+                f"… {omitted:,} earlier timeline events omitted (extreme-length safeguard)",
+                width=write_width,
+            )
         latest_message = (
             max(
                 (entry.sequence for entry in activity.recent if entry.kind == "message"),

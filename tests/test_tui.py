@@ -296,31 +296,48 @@ async def test_selected_chapter_opens_live_agent_detail(tmp_path: Path) -> None:
             ),
         )
         activity = state.activities.start(run.id, run.chapter_id, run.stage)
-        activity.consume(
+        events: list[dict[str, Any]] = [
             {
                 "type": "item.completed",
                 "item": {
-                    "id": "mcp",
-                    "type": "mcp_tool_call",
-                    "server": "lastlib_lean",
-                    "tool": "lean_goal",
-                    "status": "failed",
-                    "result": {"content": [{"type": "text", "text": "diagnostic failed"}]},
+                    "id": f"timeline-{index}",
+                    "type": f"timeline_event_{index}",
+                    "status": "completed",
                 },
-            },
-            workspace_root=tmp_path,
-        )
-        activity.consume(
-            {
-                "type": "item.completed",
-                "item": {
-                    "id": "message",
-                    "type": "agent_message",
-                    "text": "complete update\n" + "x" * 1_200 + "\nEND OF UPDATE",
+            }
+            for index in range(90)
+        ]
+        events.extend(
+            [
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "id": "mcp",
+                        "type": "mcp_tool_call",
+                        "server": "lastlib_lean",
+                        "tool": "lean_goal",
+                        "status": "failed",
+                        "result": {"content": [{"type": "text", "text": "diagnostic failed"}]},
+                    },
                 },
-            },
-            workspace_root=tmp_path,
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "id": "message",
+                        "type": "agent_message",
+                        "text": "complete update\n" + "x" * 1_200 + "\nEND OF UPDATE",
+                    },
+                },
+            ]
         )
+        for event in events:
+            activity.consume(event, workspace_root=tmp_path)
+        log_path = state.logs_dir / f"{run.id}.jsonl"
+        log_path.write_text(
+            "".join(json.dumps(event) + "\n" for event in events),
+            encoding="utf-8",
+        )
+        await state.update_run(run, log_path=str(log_path))
         state.activities.save(activity)
         ready.set()
         await finish.wait()
@@ -346,6 +363,8 @@ async def test_selected_chapter_opens_live_agent_detail(tmp_path: Path) -> None:
         assert "END OF UPDATE" in "".join(line.text for line in summary.lines)
         timeline = app.screen.query_one("#agent-timeline", RichLog)
         rendered_timeline = "\n".join(line.text for line in timeline.lines)
+        assert timeline.max_lines is None
+        assert "timeline event 0" in rendered_timeline
         assert "[mcp]" in rendered_timeline
         assert "[msg]" in rendered_timeline
         assert "[mcp_tool_call]" not in rendered_timeline

@@ -37,6 +37,57 @@ def test_activity_store_throttles_reconstructible_sidecar_writes(
     assert persisted.current == "updated in memory"
 
 
+def test_activity_replay_can_retain_a_full_timeline_without_replacing_cache(
+    tmp_path: Path,
+) -> None:
+    store = ActivityStore(tmp_path / "logs")
+    compact = store.start("run", "chapter", "formalize")
+    log_path = store.logs_dir / "run.jsonl"
+    events = [
+        {
+            "type": "item.completed",
+            "item": {
+                "id": f"event-{index}",
+                "type": f"timeline_event_{index}",
+                "status": "completed",
+            },
+        }
+        for index in range(100)
+    ]
+    log_path.write_text(
+        "".join(json.dumps(event) + "\n" for event in events),
+        encoding="utf-8",
+    )
+
+    replayed = store.replay(
+        "run",
+        "chapter",
+        "formalize",
+        log_path,
+        workspace_root=tmp_path,
+        maximum_events=10_000,
+        cache=False,
+    )
+
+    assert replayed is not None
+    assert len(replayed.recent) == 100
+    assert replayed.recent[0].sequence == 1
+    assert store.get("run") is compact
+
+    bounded = store.replay(
+        "run",
+        "chapter",
+        "formalize",
+        log_path,
+        workspace_root=tmp_path,
+        maximum_events=25,
+        cache=False,
+    )
+    assert bounded is not None
+    assert len(bounded.recent) == 25
+    assert bounded.recent[0].sequence == 76
+
+
 def test_shortens_book_path_in_long_lake_trace() -> None:
     lean_paths = ":".join(
         f"/home/example/project/lean/.lake/packages/package-{index}/.lake/build/lib/lean"

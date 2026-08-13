@@ -217,6 +217,7 @@ class AgentActivity:
     files: list[str] = field(default_factory=list)
     recent: list[ActivityEntry] = field(default_factory=list)
     active_items: dict[str, dict[str, str]] = field(default_factory=dict, repr=False)
+    recent_limit: int | None = field(default=MAX_RECENT_EVENTS, repr=False, compare=False)
 
     @property
     def failures(self) -> int:
@@ -247,7 +248,8 @@ class AgentActivity:
                 detail=_compact_block(detail) if preserve_detail_layout else _compact(detail),
             )
         )
-        del self.recent[:-MAX_RECENT_EVENTS]
+        if self.recent_limit is not None:
+            del self.recent[: -self.recent_limit]
 
     def _set_current(self) -> None:
         if self.active_items:
@@ -431,6 +433,7 @@ class AgentActivity:
         value["failures"] = self.failures
         value["todo_completed"], value["todo_total"] = self.todo_progress
         value.pop("active_items", None)
+        value.pop("recent_limit", None)
         return value
 
     @classmethod
@@ -439,6 +442,7 @@ class AgentActivity:
         fields.pop("failures", None)
         fields.pop("todo_completed", None)
         fields.pop("todo_total", None)
+        fields.pop("recent_limit", None)
         fields["recent"] = [ActivityEntry(**entry) for entry in fields.get("recent", [])]
         return cls(**fields)
 
@@ -501,10 +505,17 @@ class ActivityStore:
         log_path: Path,
         *,
         workspace_root: Path,
+        maximum_events: int | None = MAX_RECENT_EVENTS,
+        cache: bool = True,
     ) -> AgentActivity | None:
         if not log_path.is_file():
             return None
-        activity = AgentActivity(run_id=run_id, chapter_id=chapter_id, stage=stage)
+        activity = AgentActivity(
+            run_id=run_id,
+            chapter_id=chapter_id,
+            stage=stage,
+            recent_limit=maximum_events,
+        )
         with log_path.open("rb") as log:
             for line in log:
                 try:
@@ -512,7 +523,8 @@ class ActivityStore:
                 except (json.JSONDecodeError, UnicodeDecodeError):
                     continue
                 activity.consume(event, workspace_root=workspace_root)
-        self._cache[run_id] = activity
+        if cache:
+            self._cache[run_id] = activity
         return activity
 
 
