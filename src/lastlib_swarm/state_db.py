@@ -152,7 +152,7 @@ def initialize_database(state_dir: Path) -> Path:
             with connection:
                 if raw is not None:
                     checkpoint = dict(raw)
-                    checkpoint["version"] = 7
+                    checkpoint["version"] = 8
                     checkpoint["history_database"] = DATABASE_NAME
                     checkpoint.pop("source_issues", None)
                     raw_tasks = checkpoint.get("tasks")

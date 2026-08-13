@@ -14,15 +14,17 @@ fallback searches can be substantially slower.
 flowchart LR
     S[Scaffold directories] --> F[Formalize once]
     F -->|all drafts finished| I[Scan observed LastLib imports]
-    I --> C{Valid persisted green certificate?}
+    I --> C{Fresh exact-build certificate?}
     C -->|no| B[Build dependency-ready chapter]
-    C -->|yes| R[Editing review]
+    C -->|yes| G{Durable review green?}
     B -->|actionable diagnostics| X[Ready fixup agents with MCP]
     X -->|patch merged| I
-    B -->|green certificate published| R
+    B -->|certificate published| G
+    G -->|no| R[Editing review]
+    G -->|yes| P[Prove or revalidate proof]
     R -->|changed or findings| I
-    R -->|no changes| P[Prove with LSP]
-    P -->|statement/API problem| X
+    R -->|green| P
+    P -->|statement/API problem; clear green closure| X
     P -->|no placeholders + Lean valid| D[Done]
 ```
 
@@ -32,12 +34,14 @@ despite provisional imports. After all drafts finish, the coordinator discovers 
 regexes over the current `import LastLib...` lines. It then fixes dependency-ready chapters with Lean
 MCP concurrently. As soon as an agent finishes, the coordinator merges it, rescans imports, and
 rebuilds it once its refined predecessors are clean; unrelated agents keep running and a successful
-build immediately releases its review. Green certificates persist the chapter source digest together
-with its dependency certificates. On restart, unchanged certificates release reviews without a
-rebuild; a source or dependency change recursively invalidates the affected descendants. Reviewers
-directly make scoped statement and API repairs. Each dependency-ready chapter is rebuilt after a
-changed review and sent through fixup if needed. After at most five such cycles—or immediately after
-a no-change review—the chapter is released to proving without waiting for reviews of its descendants.
+build immediately releases its review. Exact-build certificates persist the chapter source digest
+together with its dependency certificates and decide only whether another build is needed. A green
+review is a separate durable fact: restarts, proof-body edits, added proof lemmas, and build-certificate
+changes do not clear it. Only explicit review findings, proof-requested statement/API fixups, or a
+forced review clear the affected review/proof closure. Reviewers directly make scoped statement and
+API repairs. Each dependency-ready chapter is rebuilt after a changed review and sent through fixup
+if needed. After at most five such cycles—or immediately after a no-change review—the chapter is
+released to proving without waiting for reviews of its descendants.
 Every review prompt begins with the complete informal book and assigned Lean file set in path order
 with numbered lines, capped at 500,000 characters. The supplied snapshot counts as the reviewer's
 initial read; filesystem reads are reserved for missing or truncated content, post-edit content, and
@@ -270,14 +274,18 @@ After the daemon exits, `status`, `snapshot`, and `wait` fall back to the persis
   continue. A reported chapter-local failure is quarantined: unrelated review, fixup, and proof
   branches keep running, while actual dependents are marked blocked. Unexpected coordinator
   exceptions still fail fast after draining live workers. There is no corpus-wide clean-build or
-  review gate in the pipeline.
+  review gate in the pipeline. Successful completion records a durable green review independently of
+  exact source hashes. That field is cleared only by an explicit statement/API repair request or a
+  forced review, never by ordinary proof edits or restart reconciliation.
 - **Prove** sends one chapter to an agent and asks it to work directly on unresolved placeholders.
   A cumulative attempt ledger is prior inventory: later agents must refine an earlier proof using
   new evidence or try a materially different route instead of rereading the chapter, reconfirming
   clean diagnostics, or echoing a missing-API claim. Two consecutive rounds without reducing the
   placeholder count stop the proof loop. The stage succeeds only when the scoped Lean code has no
   `sorry` or `admit` tokens and final Lake validation succeeds without any warning other than
-  “declaration uses `sorry`”.
+  “declaration uses `sorry`”. The exact validated source digest is persisted independently of review
+  green. If it is stale after restart, the coordinator rebuilds and recounts placeholders first; a
+  successful placeholder-free source is accepted without launching another proof agent.
 - A proof agent may change proof bodies but not declaration interfaces. A genuine statement/API
   problem is reported through a structured `fixup_findings` entry; the pipeline returns through
   fixup and editing review before proving resumes.

@@ -135,7 +135,13 @@ class TaskRecord:
     status: str = TaskStatus.PENDING
     phase: str = TaskPhase.IDLE
     detail: str = ""
-    checkpoint: str | None = None
+    # Review completion is durable workflow state, independent of exact source
+    # and build certificates. ``None`` is reserved for states written before
+    # this field existed so the scheduler can migrate their run history once.
+    review_green: bool | None = None
+    # Proof completion is tied to the exact validated chapter sources. This is
+    # populated only on the prove task.
+    source_digest: str | None = None
     rounds: int = 0
     updated_at: str = field(default_factory=timestamp)
     runs: list[RunRecord] = field(default_factory=list)
@@ -251,6 +257,7 @@ class StateStore:
                     if task_value.get("stage") == "repair":
                         task_value["stage"] = "fixup"
                     task_value.setdefault("phase", TaskPhase.IDLE)
+                    task_value.setdefault("review_green", None)
                     self.tasks[key] = TaskRecord(**task_value)
         for value in persisted_source_issues:
             if isinstance(value, dict):
@@ -290,15 +297,6 @@ class StateStore:
         self._prior_run_ids = set(self._runs_by_id)
         recovered_runs: list[RunRecord] = []
         for task in self.tasks.values():
-            if (
-                task.stage == Stage.REVIEW
-                and task.status == TaskStatus.SUCCEEDED
-                and task.detail == "review changes merged; awaiting dependency-ordered rebuild"
-            ):
-                task.status = TaskStatus.PENDING
-                task.phase = TaskPhase.RECOVERING
-                task.checkpoint = None
-                task.detail = "legacy changed review awaiting rebuild and revalidation"
             for run in task.runs:
                 if run.status == TaskStatus.RUNNING:
                     run.status = TaskStatus.FAILED
@@ -307,8 +305,11 @@ class StateStore:
             if task.status == TaskStatus.RUNNING:
                 task.status = TaskStatus.PENDING
                 task.phase = TaskPhase.RECOVERING
-                task.checkpoint = None
                 task.detail = "recovered after interrupted orchestrator"
+            if task.stage == Stage.REVIEW and task.review_green is True:
+                task.status = TaskStatus.SUCCEEDED
+                task.phase = TaskPhase.IDLE
+                task.detail = "durable review remains green after restart"
         if self.coordinator_build.active:
             self.coordinator_build.active = False
             self.coordinator_build.current_chapter_id = ""
@@ -327,6 +328,7 @@ class StateStore:
             chapter_number=chapter.number,
             chapter_title=chapter.title,
             stage=stage.value,
+            review_green=False if stage is Stage.REVIEW else None,
         )
 
     @staticmethod
@@ -376,7 +378,8 @@ class StateStore:
             "status": str(task.status),
             "phase": str(task.phase),
             "detail": task.detail,
-            "checkpoint": task.checkpoint,
+            "review_green": task.review_green,
+            "source_digest": task.source_digest,
             "rounds": task.rounds,
             "updated_at": task.updated_at,
         }
@@ -395,7 +398,7 @@ class StateStore:
         cost = self.total_cost()
         invocation_cost = self.invocation_cost()
         return {
-            "version": 7,
+            "version": 8,
             "history_database": DATABASE_NAME,
             "config": str(self.config.path),
             "created_at": self.created_at,
@@ -709,7 +712,7 @@ class StateStore:
         detail: str,
         *,
         phase: TaskPhase | None = None,
-        checkpoint: str | None = None,
+        source_digest: str | None = None,
     ) -> None:
         task = self.task(chapter_id, stage)
         task.status = status
@@ -717,11 +720,8 @@ class StateStore:
             task.phase = phase
         elif status != TaskStatus.RUNNING:
             task.phase = TaskPhase.IDLE
-        if status == TaskStatus.SUCCEEDED:
-            if checkpoint is not None:
-                task.checkpoint = checkpoint
-        else:
-            task.checkpoint = None
+        if stage is Stage.PROVE:
+            task.source_digest = source_digest if status == TaskStatus.SUCCEEDED else None
         task.detail = detail
         task.updated_at = timestamp()
         self._invalidate_status_summaries()
@@ -749,8 +749,8 @@ class StateStore:
                 task.phase = phase
             elif status != TaskStatus.RUNNING:
                 task.phase = TaskPhase.IDLE
-            if status != TaskStatus.SUCCEEDED:
-                task.checkpoint = None
+            if stage is Stage.PROVE and status != TaskStatus.SUCCEEDED:
+                task.source_digest = None
             task.detail = detail
             task.updated_at = updated_at
             changed = True
@@ -767,7 +767,8 @@ class StateStore:
                 continue
             task.status = TaskStatus.PENDING
             task.phase = TaskPhase.IDLE
-            task.checkpoint = None
+            if task.stage == Stage.PROVE:
+                task.source_digest = None
             task.detail = "manually unblocked"
             task.updated_at = timestamp()
             changed.append(key)
@@ -781,7 +782,8 @@ class StateStore:
         task = self.task(chapter_id, stage)
         task.status = TaskStatus.RUNNING
         task.phase = TaskPhase.AGENT
-        task.checkpoint = None
+        if stage is Stage.PROVE:
+            task.source_digest = None
         task.rounds += 1
         task.updated_at = timestamp()
         run = RunRecord(
@@ -799,6 +801,29 @@ class StateStore:
         self._mark_dirty(run=run)
         await self._persist()
         return run
+
+    async def set_review_green(
+        self,
+        chapter_ids: Iterable[str],
+        green: bool,
+    ) -> None:
+        """Persist review completion independently of operational task status."""
+
+        changed = False
+        updated_at = timestamp()
+        for chapter_id in chapter_ids:
+            key = self.key(chapter_id, Stage.REVIEW)
+            if key not in self.tasks:
+                continue
+            task = self.tasks[key]
+            if task.review_green is green:
+                continue
+            task.review_green = green
+            task.updated_at = updated_at
+            changed = True
+        if changed:
+            self._mark_dirty()
+            await self._persist()
 
     async def update_run(self, run: RunRecord, *, deferred: bool = False, **changes: Any) -> None:
         for name, value in changes.items():

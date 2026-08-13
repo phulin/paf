@@ -9,7 +9,7 @@ from typing import Any
 import pytest
 
 import lastlib_swarm.scheduler as scheduler_module
-from lastlib_swarm.codex import AgentResult, CodexExecutor, ValidationResult
+from lastlib_swarm.codex import AgentResult, CodexExecutor, ValidationResult, scope_digest
 from lastlib_swarm.config import load_config
 from lastlib_swarm.models import Chapter, PipelineConfig, Stage
 from lastlib_swarm.scheduler import FormalizeOutcome, Orchestrator, ReviewOutcome
@@ -232,29 +232,24 @@ async def test_state_persists_fixup_graph(tmp_path: Path) -> None:
     await reloaded.load_or_create()
 
     assert reloaded.fixup_graph == state.fixup_graph
-    assert reloaded.snapshot()["version"] == 7
+    assert reloaded.snapshot()["version"] == 8
 
 
 @pytest.mark.asyncio
-async def test_state_persists_review_checkpoint(tmp_path: Path) -> None:
+async def test_state_persists_durable_review_green(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
     chapter = config.chapters[0]
     state = StateStore(config)
     await state.load_or_create()
-    await state.set_task(
-        chapter.id,
-        Stage.REVIEW,
-        TaskStatus.SUCCEEDED,
-        "reviewed",
-        checkpoint="exact-build-certificate",
-    )
+    await state.set_review_green((chapter.id,), True)
+    await state.set_task(chapter.id, Stage.REVIEW, TaskStatus.SUCCEEDED, "reviewed")
 
     reloaded = StateStore(config)
     await reloaded.load_or_create()
 
-    assert reloaded.task(chapter.id, Stage.REVIEW).checkpoint == "exact-build-certificate"
+    assert reloaded.task(chapter.id, Stage.REVIEW).review_green is True
     hot = json.loads(reloaded.path.read_text(encoding="utf-8"))
-    assert hot["tasks"][f"{chapter.id}:review"]["checkpoint"] == "exact-build-certificate"
+    assert hot["tasks"][f"{chapter.id}:review"]["review_green"] is True
 
 
 @pytest.mark.asyncio
@@ -278,26 +273,22 @@ async def test_state_recovers_orphan_run_even_when_task_is_not_running(tmp_path:
 
 
 @pytest.mark.asyncio
-async def test_state_recovers_legacy_changed_review_as_pending(tmp_path: Path) -> None:
+async def test_interrupted_review_does_not_clear_durable_green(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
     chapter = config.chapters[0]
     state = StateStore(config)
     await state.load_or_create()
-    await state.set_task(
-        chapter.id,
-        Stage.REVIEW,
-        TaskStatus.SUCCEEDED,
-        "review changes merged; awaiting dependency-ordered rebuild",
-    )
+    await state.set_review_green((chapter.id,), True)
+    await state.start_run(chapter.id, Stage.REVIEW)
 
     recovered = StateStore(config)
     await recovered.load_or_create()
     task = recovered.task(chapter.id, Stage.REVIEW)
 
-    assert task.status == TaskStatus.PENDING
-    assert task.phase == TaskPhase.RECOVERING
-    assert task.checkpoint is None
-    assert task.detail == "legacy changed review awaiting rebuild and revalidation"
+    assert task.status == TaskStatus.SUCCEEDED
+    assert task.phase == TaskPhase.IDLE
+    assert task.review_green is True
+    assert task.detail == "durable review remains green after restart"
 
 
 @pytest.mark.asyncio
@@ -319,7 +310,7 @@ async def test_hot_checkpoint_does_not_grow_with_run_payload_history(tmp_path: P
 
     hot = json.loads(state.path.read_text(encoding="utf-8"))
     task = hot["tasks"][f"{config.chapters[0].id}:formalize"]
-    assert hot["version"] == 7
+    assert hot["version"] == 8
     assert "source_issues" not in hot
     assert "runs" not in task
     assert task["run_count"] == 25
@@ -1755,7 +1746,7 @@ async def test_pipeline_reviews_each_chapter_as_soon_as_its_build_is_green(
 
 
 @pytest.mark.asyncio
-async def test_review_restart_seeds_proofs_from_checkpoints_without_rebuilding(
+async def test_review_restart_seeds_proofs_from_durable_green_without_rebuilding(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = with_lastlib_modules(
@@ -1794,8 +1785,7 @@ async def test_review_restart_seeds_proofs_from_checkpoints_without_rebuilding(
     assert await first_run._review_tree()
     assert first_reviews == [first.id, second.id]
     assert all(
-        first_run.state.task(chapter.id, Stage.REVIEW).checkpoint
-        == first_run.state.fixup_graph["clean"][chapter.id]["certificate"]
+        first_run.state.task(chapter.id, Stage.REVIEW).review_green is True
         for chapter in config.chapters
     )
     await first_run.shutdown()
@@ -1807,7 +1797,7 @@ async def test_review_restart_seeds_proofs_from_checkpoints_without_rebuilding(
     await restarted.prepare()
 
     async def review(_chapter: Chapter, *, rerun: bool = False) -> ReviewOutcome:
-        raise AssertionError("valid review checkpoints must not rerun")
+        raise AssertionError("durable green reviews must not rerun")
 
     async def prove(chapter: Chapter) -> bool:
         proofs.append(chapter.id)
@@ -1819,6 +1809,276 @@ async def test_review_restart_seeds_proofs_from_checkpoints_without_rebuilding(
     assert await restarted._review_tree(prove=True)
     assert builds == []
     assert set(proofs) == {first.id, second.id}
+    await restarted.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_restart_after_proof_adds_lemma_preserves_review_green(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = with_lastlib_modules(
+        load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    )
+    chapter = config.chapters[0]
+    source = tmp_path / "lean" / "Book" / "Chapter01.lean"
+    source.parent.mkdir(parents=True)
+    source.write_text("theorem target : True := by sorry\n", encoding="utf-8")
+    builds: list[str] = []
+
+    async def validation(
+        _config: object,
+        built: Chapter,
+        **_kwargs: object,
+    ) -> ValidationResult:
+        builds.append(built.id)
+        return ValidationResult(True, 0, "ok")
+
+    monkeypatch.setattr(scheduler_module, "validate", validation)
+    first_run = Orchestrator(config, StateStore(config))
+    await first_run.prepare()
+    assert await first_run._fixup_to_clean(target_ids={chapter.id})
+
+    async def review(_chapter: Chapter, *, rerun: bool = False) -> ReviewOutcome:
+        assert not rerun
+        return ReviewOutcome(True, False, {})
+
+    monkeypatch.setattr(first_run, "_review_once", review)
+    assert await first_run._review_tree()
+    first_run.executor = FakeExecutor(
+        first_run.state,
+        [result(changed=True, placeholders=0)],
+    )
+    original_run = first_run.executor.run
+
+    async def add_helper(
+        attempted: Chapter,
+        stage: Stage,
+        run: RunRecord,
+        *,
+        feedback: str = "",
+        workspace_root: Path | None = None,
+    ) -> AgentResult:
+        assert stage is Stage.PROVE
+        assert workspace_root is not None
+        target = workspace_root / "lean" / "Book" / "Chapter01.lean"
+        target.write_text(
+            "theorem target : True := by trivial\n"
+            "theorem helper_added_by_proof : True := by trivial\n",
+            encoding="utf-8",
+        )
+        return await original_run(
+            attempted,
+            stage,
+            run,
+            feedback=feedback,
+            workspace_root=workspace_root,
+        )
+
+    monkeypatch.setattr(first_run.executor, "run", add_helper)
+    assert await first_run._prove(chapter)
+    proof_digest = first_run.state.task(chapter.id, Stage.PROVE).source_digest
+    assert proof_digest == scope_digest(config.settings.repo, chapter)
+    await first_run.shutdown()
+
+    builds.clear()
+    restarted = Orchestrator(config, StateStore(config))
+    await restarted.prepare()
+
+    async def forbidden_review(*_args: object, **_kwargs: object) -> ReviewOutcome:
+        raise AssertionError("durable green review must not rerun")
+
+    async def forbidden_agent(*_args: object, **_kwargs: object) -> AgentResult:
+        raise AssertionError("validated proof must not rerun an agent")
+
+    monkeypatch.setattr(restarted, "_review_once", forbidden_review)
+    monkeypatch.setattr(restarted.executor, "run", forbidden_agent)
+
+    assert await restarted._review_tree(prove=True)
+    assert builds == []
+    assert restarted.state.task(chapter.id, Stage.REVIEW).review_green is True
+    assert restarted.state.task(chapter.id, Stage.PROVE).source_digest == proof_digest
+    assert "helper_added_by_proof" in source.read_text(encoding="utf-8")
+    await restarted.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_stale_build_is_refreshed_before_proof_agent_with_placeholders(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = with_lastlib_modules(
+        load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    )
+    chapter = config.chapters[0]
+    source = tmp_path / "lean" / "Book" / "Chapter01.lean"
+    source.parent.mkdir(parents=True)
+    source.write_text("theorem target : True := by sorry\n", encoding="utf-8")
+    events: list[str] = []
+
+    async def validation(
+        _config: object,
+        _chapter: Chapter,
+        **_kwargs: object,
+    ) -> ValidationResult:
+        events.append("build")
+        return ValidationResult(True, 0, "ok")
+
+    monkeypatch.setattr(scheduler_module, "validate", validation)
+    orchestrator = Orchestrator(config, StateStore(config))
+    await orchestrator.prepare()
+    fake = FakeExecutor(orchestrator.state, [result(changed=False, placeholders=0)])
+    original_run = fake.run
+
+    async def tracked_agent(
+        attempted: Chapter,
+        stage: Stage,
+        run: RunRecord,
+        *,
+        feedback: str = "",
+        workspace_root: Path | None = None,
+    ) -> AgentResult:
+        events.append("agent")
+        return await original_run(
+            attempted,
+            stage,
+            run,
+            feedback=feedback,
+            workspace_root=workspace_root,
+        )
+
+    monkeypatch.setattr(fake, "run", tracked_agent)
+    orchestrator.executor = fake
+
+    assert await orchestrator._prove(chapter)
+    assert events[:2] == ["build", "agent"]
+    assert events.count("build") == 2
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_standalone_proof_fixup_finding_clears_durable_review(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = with_lastlib_modules(
+        load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    )
+    chapter = config.chapters[0]
+    source = tmp_path / "lean" / "Book" / "Chapter01.lean"
+    source.parent.mkdir(parents=True)
+    source.write_text("theorem target : True := by sorry\n", encoding="utf-8")
+
+    async def validation(
+        _config: object,
+        _chapter: Chapter,
+        **_kwargs: object,
+    ) -> ValidationResult:
+        return ValidationResult(True, 0, "ok")
+
+    monkeypatch.setattr(scheduler_module, "validate", validation)
+    orchestrator = Orchestrator(config, StateStore(config))
+    await orchestrator.prepare()
+    assert await orchestrator._fixup_to_clean(target_ids={chapter.id})
+    await orchestrator._complete_review(chapter, "reviewed")
+    orchestrator.executor = FakeExecutor(
+        orchestrator.state,
+        [
+            result(
+                changed=False,
+                fixup_findings=[
+                    {
+                        "description": "the statement needs another hypothesis",
+                        "owner_paths": ["lean/Book/Chapter01.lean"],
+                    }
+                ],
+            )
+        ],
+    )
+
+    assert not await orchestrator._prove(chapter)
+    review = orchestrator.state.task(chapter.id, Stage.REVIEW)
+    proof = orchestrator.state.task(chapter.id, Stage.PROVE)
+    assert review.review_green is False
+    assert review.status == TaskStatus.PENDING
+    assert proof.status == TaskStatus.PENDING
+    assert proof.source_digest is None
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_legacy_reset_recovers_green_review_and_proof_without_agents(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = with_lastlib_modules(
+        load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    )
+    chapter = config.chapters[0]
+    source = tmp_path / "lean" / "Book" / "Chapter01.lean"
+    source.parent.mkdir(parents=True)
+    source.write_text("theorem finished : True := by trivial\n", encoding="utf-8")
+    state = StateStore(config)
+    await state.load_or_create()
+    review = await state.start_run(chapter.id, Stage.REVIEW)
+    await state.finish_run(
+        review,
+        status=TaskStatus.SUCCEEDED,
+        changed=False,
+        report={"complete": True, "fixup_findings": []},
+        validation={"succeeded": True, "output": "ok"},
+    )
+    proof = await state.start_run(chapter.id, Stage.PROVE)
+    await state.finish_run(
+        proof,
+        status=TaskStatus.SUCCEEDED,
+        changed=True,
+        placeholders=0,
+        report={"complete": True, "fixup_findings": []},
+        validation={"succeeded": True, "output": "ok"},
+    )
+    await state.set_task(
+        chapter.id,
+        Stage.REVIEW,
+        TaskStatus.PENDING,
+        "review checkpoint invalidated by source or dependency changes",
+    )
+    await state.set_task(
+        chapter.id,
+        Stage.PROVE,
+        TaskStatus.PENDING,
+        "waiting for invalidated statement review",
+    )
+    state.task(chapter.id, Stage.REVIEW).review_green = None
+    state.task(chapter.id, Stage.PROVE).source_digest = None
+    await state.save()
+    await state.close()
+
+    builds: list[str] = []
+
+    async def validation(
+        _config: object,
+        built: Chapter,
+        **_kwargs: object,
+    ) -> ValidationResult:
+        builds.append(built.id)
+        return ValidationResult(True, 0, "ok")
+
+    monkeypatch.setattr(scheduler_module, "validate", validation)
+    restarted = Orchestrator(config, StateStore(config))
+    await restarted.prepare()
+
+    async def forbidden_review(*_args: object, **_kwargs: object) -> ReviewOutcome:
+        raise AssertionError("historical green review must not rerun")
+
+    async def forbidden_agent(*_args: object, **_kwargs: object) -> AgentResult:
+        raise AssertionError("current placeholder-free proof must not rerun an agent")
+
+    monkeypatch.setattr(restarted, "_review_once", forbidden_review)
+    monkeypatch.setattr(restarted.executor, "run", forbidden_agent)
+
+    assert await restarted._review_tree(prove=True)
+    assert builds == [chapter.id]
+    assert restarted.state.task(chapter.id, Stage.REVIEW).review_green is True
+    proved = restarted.state.task(chapter.id, Stage.PROVE)
+    assert proved.status == TaskStatus.SUCCEEDED
+    assert proved.source_digest == scope_digest(config.settings.repo, chapter)
     await restarted.shutdown()
 
 
@@ -1838,18 +2098,16 @@ async def test_statement_repair_invalidates_review_and_proof_closure(tmp_path: P
     orchestrator = Orchestrator(config, StateStore(config))
     await orchestrator.prepare()
     for chapter in config.chapters:
+        await orchestrator.state.set_review_green((chapter.id,), True)
         await orchestrator.state.set_task(
-            chapter.id,
-            Stage.REVIEW,
-            TaskStatus.SUCCEEDED,
-            "reviewed",
-            checkpoint=f"certificate-{chapter.number}",
+            chapter.id, Stage.REVIEW, TaskStatus.SUCCEEDED, "reviewed"
         )
         await orchestrator.state.set_task(
             chapter.id,
             Stage.PROVE,
             TaskStatus.SUCCEEDED,
             "proved",
+            source_digest=f"proof-source-{chapter.number}",
         )
 
     invalidated = await orchestrator._invalidate_review_closure(
@@ -1862,14 +2120,15 @@ async def test_statement_repair_invalidates_review_and_proof_closure(tmp_path: P
         proof = orchestrator.state.task(chapter.id, Stage.PROVE)
         assert review.status == TaskStatus.PENDING
         assert review.phase == TaskPhase.RECOVERING
-        assert review.checkpoint is None
+        assert review.review_green is False
         assert proof.status == TaskStatus.PENDING
         assert proof.phase == TaskPhase.WAITING_PREREQUISITES
+        assert proof.source_digest is None
     await orchestrator.shutdown()
 
 
 @pytest.mark.asyncio
-async def test_changed_green_dependency_invalidates_descendant_before_review(
+async def test_changed_source_revalidates_proofs_without_clearing_review_green(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = with_lastlib_modules(
@@ -1910,6 +2169,7 @@ async def test_changed_green_dependency_invalidates_descendant_before_review(
         Stage.PROVE,
         TaskStatus.SUCCEEDED,
         "no placeholders and chapter elaborates",
+        source_digest=scope_digest(config.settings.repo, second),
     )
     await first_run.shutdown()
 
@@ -1926,10 +2186,14 @@ async def test_changed_green_dependency_invalidates_descendant_before_review(
 
     monkeypatch.setattr(restarted, "_review_once", review)
 
-    assert await restarted._review_tree()
-    assert builds == [first.id, second.id]
-    assert reviews == [first.id, second.id]
-    assert restarted.state.task(second.id, Stage.PROVE).status == TaskStatus.PENDING
+    assert await restarted._review_tree(prove=True)
+    assert set(builds) == {first.id, second.id}
+    assert reviews == []
+    assert all(
+        restarted.state.task(chapter.id, Stage.REVIEW).review_green is True
+        for chapter in config.chapters
+    )
+    assert restarted.state.task(second.id, Stage.PROVE).status == TaskStatus.SUCCEEDED
     await restarted.shutdown()
 
 
@@ -2042,6 +2306,8 @@ async def test_proof_fixup_requeues_only_its_review_branch(
         assert feedback is not None
         assert "statement needs a hypothesis" in feedback[chapter.id]
         assert target_ids == {chapter.id}
+        assert state.task(chapter.id, Stage.REVIEW).review_green is False
+        assert state.task(chapter.id, Stage.PROVE).status == TaskStatus.PENDING
         fixups += 1
         return True
 
@@ -2051,6 +2317,7 @@ async def test_proof_fixup_requeues_only_its_review_branch(
 
     assert await orchestrator._review_tree(prove=True)
     assert (reviews, proofs, fixups) == (2, 2, 1)
+    assert state.task(chapter.id, Stage.REVIEW).review_green is True
     await orchestrator.shutdown()
 
 

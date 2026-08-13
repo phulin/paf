@@ -50,7 +50,7 @@ async def test_pending_prerequisite_phase_is_visible_and_counted(tmp_path: Path)
         chapter.id,
         Stage.PROVE,
         TaskStatus.PENDING,
-        "waiting for a valid review checkpoint",
+        "waiting for a durable green review",
         phase=TaskPhase.WAITING_PREREQUISITES,
     )
 
