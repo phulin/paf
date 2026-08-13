@@ -271,6 +271,21 @@ async def test_quit_drains_pipeline_before_app_exit(
 
 
 @pytest.mark.asyncio
+async def test_unexpected_pipeline_cancellation_is_retained_as_fatal_error(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    orchestrator = Orchestrator(config, StateStore(config))
+
+    async def operation() -> bool:
+        raise asyncio.CancelledError("worker infrastructure cancelled the pipeline")
+
+    app = SwarmApp(orchestrator, operation, label="test")
+    async with app.run_test() as pilot:
+        await pilot.pause(0.2)
+        assert isinstance(app.fatal_error, asyncio.CancelledError)
+        assert "worker infrastructure" in str(app.fatal_error)
+
+
+@pytest.mark.asyncio
 async def test_selected_chapter_opens_live_agent_detail(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
     state = StateStore(config)

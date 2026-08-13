@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import re
 from collections import deque
 from collections.abc import Awaitable, Callable
@@ -785,7 +786,8 @@ class SwarmApp(App[bool]):
         self.label = label
         self.startup_warning = startup_warning
         self.result = False
-        self.fatal_error: Exception | None = None
+        self.fatal_error: BaseException | None = None
+        self._quit_requested = False
         self._status_message = f"Starting {self.label}…"
         self._show_build_progress = False
         self._rows_added: set[str] = set()
@@ -843,6 +845,7 @@ class SwarmApp(App[bool]):
     async def action_quit(self) -> None:
         """Cancel and drain the pipeline before closing the terminal app."""
 
+        self._quit_requested = True
         self.orchestrator.control.stop()
         self._set_status("Stopping workers and cleaning workspaces…")
         workers = self.workers.cancel_group(self, "pipeline")
@@ -851,22 +854,24 @@ class SwarmApp(App[bool]):
         self.exit(False)
 
     async def execute(self) -> None:
-        error: Exception | None = None
+        error: BaseException | None = None
         try:
             await self.orchestrator.prepare()
             self._set_status(f"Running {self.label}…", show_build_progress=True)
             self.refresh_dashboard()
             self.result = await self.operation()
-        except Exception as caught:
+        except BaseException as caught:
             error = caught
         finally:
             try:
                 await self.orchestrator.shutdown()
-            except Exception as shutdown_error:
+            except BaseException as shutdown_error:
                 if error is None:
                     error = shutdown_error
 
         if error is not None:
+            if isinstance(error, asyncio.CancelledError) and self._quit_requested:
+                return
             self.fatal_error = error
             self._set_status(f"Fatal orchestrator error: {error}")
             self.set_timer(2.0, lambda: self.exit(False))

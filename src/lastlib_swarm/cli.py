@@ -583,7 +583,7 @@ def _run(args: argparse.Namespace, config: PipelineConfig, console: Console) -> 
     else:
         operation = orchestrator.run_pipeline
         label = "full pipeline"
-    abort_error: Exception | None = None
+    abort_error: BaseException | None = None
     try:
         if args.no_tui:
             succeeded = asyncio.run(_headless(orchestrator, operation))
@@ -594,6 +594,9 @@ def _run(args: argparse.Namespace, config: PipelineConfig, console: Console) -> 
                 label=label,
                 startup_warning=getattr(args, "startup_warning", ""),
             )
+    except asyncio.CancelledError as error:
+        succeeded = False
+        abort_error = error
     except Exception as error:
         succeeded = False
         abort_error = error
