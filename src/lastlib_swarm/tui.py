@@ -697,7 +697,10 @@ class AgentDetailScreen(Screen[None]):
                 line.append(badge)
                 line.append(f" {entry.title}")
                 if detail:
-                    line.append("\n" + "\n".join(f"    {part}" for part in detail.splitlines()))
+                    if entry.kind == "mcp_tool_call" and "\n" not in detail:
+                        line.append(f" · {detail}")
+                    else:
+                        line.append("\n" + "\n".join(f"    {part}" for part in detail.splitlines()))
             timeline.write(line, width=write_width)
         if activity is None:
             timeline.write("No activity events recorded for this step.", width=write_width)

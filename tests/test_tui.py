@@ -366,6 +366,7 @@ async def test_selected_chapter_opens_live_agent_detail(tmp_path: Path) -> None:
         assert timeline.max_lines is None
         assert "timeline event 0" in rendered_timeline
         assert "[mcp]" in rendered_timeline
+        assert "[mcp] Lean goal · R diagnostic failed" in rendered_timeline
         assert "[msg]" in rendered_timeline
         assert "[mcp_tool_call]" not in rendered_timeline
 

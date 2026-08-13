@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import re
 import time
+from collections import Counter
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -12,9 +13,19 @@ from lastlib_swarm import json_codec as json
 
 MAX_RECENT_EVENTS = 80
 MAX_DETAIL_CHARS = 800
-MAX_PRETTY_STRING_CHARS = 400
-MAX_PRETTY_LIST_ITEMS = 8
-MAX_PRETTY_DICT_ITEMS = 20
+MAX_MCP_SUMMARY_CHARS = 500
+LEAN_MCP_TITLES = {
+    "lean_prepare_dependencies": "Lean deps",
+    "lean_diagnostic_messages": "Lean diagnostics",
+    "lean_hover_info": "Lean hover",
+    "lean_declaration_file": "Lean declaration",
+    "lean_local_search": "Lean search",
+    "lean_goal": "Lean goal",
+    "lean_term_goal": "Lean term goal",
+    "lean_completions": "Lean completions",
+    "lean_multi_attempt": "Lean attempts",
+    "lean_code_actions": "Lean actions",
+}
 EXIT_STATUS_ONLY = re.compile(r"^exit\s+\d+$", re.IGNORECASE)
 SHELL_COMMAND_WRAPPER = re.compile(r"^/bin/bash\s+-lc\s+(['\"])(.*)\1$", re.DOTALL)
 LEAN_BOOK_PATH = re.compile(
@@ -102,55 +113,117 @@ def _result_text(value: Any) -> str:
     return _compact(" ".join(texts))
 
 
-def _json_summary(value: Any) -> Any:
-    """Make large tool payloads useful before pretty-printing them."""
+def _mcp_text(value: Any, *, limit: int = MAX_MCP_SUMMARY_CHARS) -> str:
+    """Render an arbitrary MCP value as bounded single-line text."""
 
-    if isinstance(value, str):
-        if len(value) <= MAX_PRETTY_STRING_CHARS:
-            return value
-        return value[: MAX_PRETTY_STRING_CHARS - 1].rstrip() + "…"
-    if isinstance(value, list):
-        summary = [_json_summary(item) for item in value[:MAX_PRETTY_LIST_ITEMS]]
-        if len(value) > MAX_PRETTY_LIST_ITEMS:
-            summary.append(f"… {len(value) - MAX_PRETTY_LIST_ITEMS} more items")
-        return summary
-    if isinstance(value, dict):
-        items = list(value.items())
-        summary = {str(key): _json_summary(item) for key, item in items[:MAX_PRETTY_DICT_ITEMS]}
-        if len(items) > MAX_PRETTY_DICT_ITEMS:
-            summary["…"] = f"{len(items) - MAX_PRETTY_DICT_ITEMS} more fields"
-        return summary
-    return value
-
-
-def _pretty_value(value: Any) -> str:
     if isinstance(value, str):
         try:
             value = json.loads(value)
         except json.JSONDecodeError:
-            return _compact_block(shorten_book_paths(value))
+            return _compact(shorten_book_paths(value), limit=limit)
     try:
-        rendered = json.dumps(_json_summary(value), indent=2, sort_keys=True)
+        rendered = json.dumps(value, sort_keys=True)
     except (TypeError, ValueError):
         rendered = str(value)
-    return _compact_block(shorten_book_paths(rendered))
+    return _compact(shorten_book_paths(rendered), limit=limit)
+
+
+def _lean_location(arguments: dict[str, Any]) -> str:
+    path = shorten_book_paths(str(arguments.get("file_path", "Lean file")))
+    line = arguments.get("line")
+    column = arguments.get("column")
+    if line is not None:
+        path += f":{line}"
+        if column is not None:
+            path += f":{column}"
+    elif arguments.get("start_line") is not None or arguments.get("end_line") is not None:
+        start = arguments.get("start_line", "…")
+        end = arguments.get("end_line", "…")
+        path += f":{start}-{end}"
+    return path
+
+
+def _sample(values: list[str], *, maximum: int = 3, limit: int = 180) -> str:
+    shown = [_compact(value, limit=60) for value in values[:maximum]]
+    if len(values) > maximum:
+        shown.append(f"+{len(values) - maximum} more")
+    return _compact(", ".join(shown), limit=limit)
+
+
+def _counted_items(
+    value: Any,
+    *,
+    singular: str,
+    plural: str | None = None,
+    names: list[str] | None = None,
+) -> str:
+    items = value if isinstance(value, list) else []
+    noun = singular if len(items) == 1 else (plural or f"{singular}s")
+    summary = f"{len(items)} {noun}"
+    if names:
+        summary += f": {_sample(names)}"
+    return summary
 
 
 def _lean_mcp_query(item: dict[str, Any]) -> str:
     if item.get("server") != "lastlib_lean" or "arguments" not in item:
         return ""
-    return f"Query:\n{_pretty_value(item['arguments'])}"
+    arguments = item["arguments"]
+    if not isinstance(arguments, dict):
+        return f"Q {_mcp_text(arguments)}"
+
+    tool = item.get("tool")
+    location = _lean_location(arguments)
+    if tool == "lean_prepare_dependencies":
+        paths = arguments.get("file_paths")
+        files = [shorten_book_paths(str(path)) for path in paths] if isinstance(paths, list) else []
+        summary = _counted_items(paths, singular="file", names=files)
+        return f"Q prepare {summary}"
+    if tool == "lean_diagnostic_messages":
+        target = location
+        if declaration := arguments.get("declaration_name"):
+            target += f" ({declaration})"
+        modifiers = [str(arguments["severity"])] if arguments.get("severity") else []
+        if arguments.get("interactive"):
+            modifiers.append("interactive")
+        suffix = f" · {', '.join(modifiers)}" if modifiers else ""
+        return f"Q diagnostics {target}{suffix}"
+    if tool == "lean_hover_info":
+        return f"Q hover {location}"
+    if tool == "lean_declaration_file":
+        symbol = arguments.get("symbol", "symbol")
+        context = (
+            "full file"
+            if arguments.get("full_file")
+            else f"±{arguments.get('context_lines', 20)} lines"
+        )
+        return f"Q declaration {symbol} in {location} · {context}"
+    if tool == "lean_local_search":
+        query = _compact(str(arguments.get("query", "")), limit=180)
+        return f"Q local search “{query}” · max {arguments.get('limit', 10)}"
+    if tool == "lean_goal":
+        return f"Q goal {location}"
+    if tool == "lean_term_goal":
+        return f"Q term goal {location}"
+    if tool == "lean_completions":
+        return f"Q completions {location} · max {arguments.get('max_completions', 32)}"
+    if tool == "lean_multi_attempt":
+        snippets = arguments.get("snippets")
+        attempts = [str(value) for value in snippets] if isinstance(snippets, list) else []
+        return f"Q {_counted_items(snippets, singular='attempt', names=attempts)} at {location}"
+    if tool == "lean_code_actions":
+        return f"Q code actions {location}"
+    return f"Q {_mcp_text(arguments)}"
 
 
-def _lean_mcp_result(item: dict[str, Any]) -> str:
-    if item.get("server") != "lastlib_lean":
-        return ""
+def _lean_mcp_result_value(item: dict[str, Any]) -> Any:
     result = item.get("result")
     if isinstance(result, dict) and result.get("structured_content") is not None:
         value = result["structured_content"]
         if isinstance(value, dict) and set(value) == {"result"}:
-            value = value["result"]
-    elif result is not None:
+            return value["result"]
+        return value
+    if result is not None:
         texts: list[str] = []
         content = result.get("content") if isinstance(result, dict) else None
         if isinstance(content, list):
@@ -161,12 +234,176 @@ def _lean_mcp_result(item: dict[str, Any]) -> str:
                 and block.get("type") == "text"
                 and isinstance(block.get("text"), str)
             ]
-        value = "\n".join(texts) if texts else result
-    elif item.get("error") is not None:
-        value = {"error": item["error"]}
-    else:
+        return "\n".join(texts) if texts else result
+    if item.get("error") is not None:
+        return {"error": item["error"]}
+    return None
+
+
+def _diagnostics_result(value: dict[str, Any]) -> str:
+    items = value.get("items")
+    if not isinstance(items, list):
+        interactive = value.get("diagnostics")
+        if isinstance(interactive, list):
+            return _counted_items(interactive, singular="interactive diagnostic")
+        return _mcp_text(value)
+
+    counts = Counter(
+        str(diagnostic.get("severity", "diagnostic"))
+        for diagnostic in items
+        if isinstance(diagnostic, dict)
+    )
+    labels = []
+    for severity in ("error", "warning", "info", "hint", "diagnostic"):
+        count = counts[severity]
+        if count:
+            plurals = {"info": "info"}
+            labels.append(
+                f"{count} {severity if count == 1 else plurals.get(severity, severity + 's')}"
+            )
+    if not labels:
+        labels.append("clean")
+    if value.get("partial") or value.get("timed_out"):
+        labels.append("partial")
+    if dependencies := value.get("failed_dependencies"):
+        labels.append(f"{len(dependencies)} failed deps")
+
+    first = next((entry for entry in items if isinstance(entry, dict)), None)
+    if first is not None and first.get("message"):
+        position = f"L{first.get('line', '?')}"
+        if first.get("column") is not None:
+            position += f":{first['column']}"
+        labels.append(f"{position} {_compact(str(first['message']), limit=180)}")
+    return " · ".join(labels)
+
+
+def _goal_result(value: dict[str, Any]) -> str:
+    status = value.get("status")
+    if status == "still_elaborating":
+        return "still elaborating"
+    if status == "complete":
+        return "complete"
+    if status == "no_goal_at_position":
+        return "no goal"
+    if isinstance(value.get("goals"), list):
+        count = len(value["goals"])
+        return f"{count} {'goal' if count == 1 else 'goals'}"
+    before = value.get("goals_before")
+    after = value.get("goals_after")
+    if isinstance(before, list) or isinstance(after, list):
+        return f"{len(before or [])}→{len(after or [])} goals"
+    return _mcp_text(value)
+
+
+def _multi_attempt_result(value: dict[str, Any]) -> str:
+    items = value.get("items")
+    if not isinstance(items, list):
+        return _mcp_text(value)
+    outcomes: Counter[str] = Counter()
+    completed: list[str] = []
+    for attempt in items:
+        if not isinstance(attempt, dict):
+            outcomes["unknown"] += 1
+            continue
+        proof_status = str(attempt.get("proof_status", "")).lower()
+        diagnostics = attempt.get("diagnostics")
+        has_error = isinstance(diagnostics, list) and any(
+            isinstance(diagnostic, dict) and diagnostic.get("severity") == "error"
+            for diagnostic in diagnostics
+        )
+        if attempt.get("timed_out"):
+            outcome = "timed out"
+        elif proof_status in {"complete", "completed"}:
+            outcome = "complete"
+        elif proof_status.startswith("incomplete"):
+            outcome = "incomplete"
+        elif has_error:
+            outcome = "failed"
+        elif attempt.get("goals"):
+            outcome = "open"
+        else:
+            outcome = "complete"
+        outcomes[outcome] += 1
+        if outcome == "complete" and attempt.get("snippet"):
+            completed.append(str(attempt["snippet"]))
+
+    labels = [
+        f"{count} {outcome}"
+        for outcome in ("complete", "open", "incomplete", "failed", "timed out", "unknown")
+        if (count := outcomes[outcome])
+    ]
+    summary = f"{len(items)} attempts: {', '.join(labels) or 'no outcomes'}"
+    if completed:
+        summary += f" · worked: {_sample(completed, maximum=1, limit=120)}"
+    return summary
+
+
+def _lean_mcp_result(item: dict[str, Any]) -> str:
+    if item.get("server") != "lastlib_lean":
         return ""
-    return f"Result:\n{_pretty_value(value)}"
+    value = _lean_mcp_result_value(item)
+    if value is None:
+        return ""
+
+    tool = item.get("tool")
+    summary: str
+    if not isinstance(value, dict):
+        summary = _mcp_text(value)
+    elif "error" in value:
+        summary = f"error: {_mcp_text(value['error'])}"
+    elif tool == "lean_prepare_dependencies":
+        prepared = value.get("prepared")
+        stale = value.get("stale")
+        summary = f"{len(prepared or [])} prepared · {len(stale or [])} stale"
+    elif tool == "lean_diagnostic_messages":
+        summary = _diagnostics_result(value)
+    elif tool == "lean_hover_info":
+        symbol = value.get("symbol", "symbol")
+        summary = f"{symbol}: {_compact(str(value.get('info', 'no info')), limit=300)}"
+    elif tool == "lean_declaration_file":
+        path = shorten_book_paths(str(value.get("file_path", "declaration file")))
+        start, end, total = value.get("start_line"), value.get("end_line"), value.get("total_lines")
+        span = f" L{start}-{end}" if start is not None and end is not None else ""
+        total_text = f"/{total}" if total is not None else ""
+        summary = f"{path}{span}{total_text}"
+    elif tool in {"lean_local_search", "lean_completions"}:
+        values = value.get("items")
+        names = (
+            [
+                str(entry.get("name") or entry.get("label"))
+                for entry in values
+                if isinstance(entry, dict) and (entry.get("name") or entry.get("label"))
+            ]
+            if isinstance(values, list)
+            else []
+        )
+        singular = "match" if tool == "lean_local_search" else "completion"
+        plural = "matches" if singular == "match" else None
+        summary = _counted_items(values, singular=singular, plural=plural, names=names)
+    elif tool == "lean_goal":
+        summary = _goal_result(value)
+    elif tool == "lean_term_goal":
+        expected = value.get("expected_type")
+        summary = (
+            f"expected {_compact(str(expected), limit=350)}" if expected else "no expected type"
+        )
+    elif tool == "lean_multi_attempt":
+        summary = _multi_attempt_result(value)
+    elif tool == "lean_code_actions":
+        actions = value.get("actions")
+        titles = (
+            [
+                str(action["title"])
+                for action in actions
+                if isinstance(action, dict) and action.get("title")
+            ]
+            if isinstance(actions, list)
+            else []
+        )
+        summary = _counted_items(actions, singular="action", names=titles)
+    else:
+        summary = _mcp_text(value)
+    return f"R {_compact(summary, limit=MAX_MCP_SUMMARY_CHARS)}"
 
 
 def error_signature(message: str) -> str:
@@ -342,9 +579,9 @@ class AgentActivity:
             result_detail = _lean_mcp_result(item)
             if result_detail:
                 if detail and not was_active:
-                    query_detail = _compact_block(detail, limit=360)
-                    result_detail = _compact_block(result_detail, limit=430)
-                    detail = f"{query_detail}\n\n{result_detail}"
+                    query_detail = _compact(detail, limit=360)
+                    result_detail = _compact(result_detail, limit=430)
+                    detail = f"{query_detail} · {result_detail}"
                 else:
                     detail = result_detail
             if failed:
@@ -393,7 +630,8 @@ class AgentActivity:
         if item_type == "mcp_tool_call":
             server = str(item.get("server", "MCP"))
             tool = str(item.get("tool", "tool"))
-            return f"MCP {server}.{tool}", _lean_mcp_query(item)
+            title = LEAN_MCP_TITLES.get(tool) if server == "lastlib_lean" else None
+            return title or f"MCP {server}.{tool}", _lean_mcp_query(item)
         if item_type == "file_change":
             changes = item.get("changes")
             paths: list[str] = []
