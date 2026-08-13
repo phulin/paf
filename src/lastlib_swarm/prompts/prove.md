@@ -40,6 +40,7 @@ Focused imports required by a valid proof are permitted under the common import 
    that point, preserve the useful work and continue to independent placeholders.
 8. Diagnose edited files and affected dependents as needed; do not spend time running final
    diagnostics on untouched files, whose incoming build is already certified clean.
+9. Work in order, section-by-section.
 
 Prefer, in order, definitional equality, an exact earlier theorem, focused rewriting or
 simplification, a canonical constructor or equivalence, and only then unfolded infrastructure.
