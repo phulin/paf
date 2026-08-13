@@ -104,6 +104,16 @@ class RunningFixupAgent:
     workspace: Any
     task: asyncio.Task[AgentResult]
     dependency_certificates: dict[str, str]
+    source_lock_held: bool = False
+
+
+@dataclass
+class CoordinatorBuildLease:
+    priority: float
+    label: str
+    stage: Stage
+    preemptible: bool
+    preempt_requested: asyncio.Event
 
 
 @dataclass(frozen=True)
@@ -261,16 +271,77 @@ class PriorityLimiter:
 
 
 class CoordinatorBuildQueue:
-    """Fair gate for source integration and main-worktree builds."""
+    """Priority gate acquired only by coordinator-owned Lake builds."""
 
     def __init__(self) -> None:
-        self._lock = asyncio.Lock()
+        self._sequence = 0
+        self._active: CoordinatorBuildLease | None = None
+        self._waiters: list[
+            tuple[float, int, asyncio.Future[CoordinatorBuildLease], CoordinatorBuildLease]
+        ] = []
 
-    async def acquire(self) -> None:
-        await self._lock.acquire()
+    def _wake(self) -> None:
+        if self._active is not None:
+            return
+        while self._waiters:
+            _, _, future, lease = heapq.heappop(self._waiters)
+            if future.done():
+                continue
+            self._active = lease
+            future.set_result(lease)
+            return
 
-    def release(self) -> None:
-        self._lock.release()
+    async def acquire(
+        self,
+        *,
+        priority: float,
+        label: str,
+        stage: Stage,
+        preemptible: bool = False,
+    ) -> CoordinatorBuildLease:
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[CoordinatorBuildLease] = loop.create_future()
+        lease = CoordinatorBuildLease(
+            priority=priority,
+            label=label,
+            stage=stage,
+            preemptible=preemptible,
+            preempt_requested=asyncio.Event(),
+        )
+        self._sequence += 1
+        heapq.heappush(self._waiters, (-priority, self._sequence, future, lease))
+        if (
+            self._active is not None
+            and self._active.preemptible
+            and priority > self._active.priority
+        ):
+            self._active.preempt_requested.set()
+        self._wake()
+        try:
+            return await future
+        except asyncio.CancelledError:
+            if future.done() and not future.cancelled() and self._active is lease:
+                self.release(lease)
+            else:
+                future.cancel()
+            raise
+
+    def release(self, lease: CoordinatorBuildLease) -> None:
+        if self._active is not lease:
+            raise RuntimeError("coordinator build lease released by a non-owner")
+        self._active = None
+        self._wake()
+
+    def snapshot(self) -> dict[str, object]:
+        queued = [lease for _, _, future, lease in self._waiters if not future.done()]
+        return {
+            "owner": self._active.label if self._active is not None else "",
+            "owner_stage": self._active.stage.value if self._active is not None else "",
+            "queued": len(queued),
+            "queued_jobs": [
+                lease.label for lease in sorted(queued, key=lambda item: -item.priority)
+            ],
+        }
 
 
 def scaffold_directories(config: PipelineConfig, chapters: Iterable[Chapter]) -> tuple[str, ...]:
@@ -333,6 +404,11 @@ class Orchestrator:
         self.state.scheduling = self.scheduling_snapshot()
         self.agent_slots = PriorityLimiter(config.settings.max_agents)
         self.build_queue = CoordinatorBuildQueue()
+        # Snapshot creation and scoped source integration need a short
+        # consistency barrier with main-worktree builds. Unlike build_queue,
+        # this lock is never held for an overlay agent's editing lifetime or
+        # for a proof validation outside a coordinator build.
+        self.source_lock = asyncio.Lock()
         self._fixup_graph_lock = asyncio.Lock()
         self._fixup_requests: list[FixupRequest] = []
         self._fixup_request_lock = asyncio.Lock()
@@ -470,6 +546,21 @@ class Orchestrator:
             clean.pop(chapter_id, None)
         return invalidated
 
+    async def _invalidate_build_records(self, chapter_ids: Iterable[str]) -> set[str]:
+        """Mark an edited source closure stale before any verification is queued."""
+
+        graph = self._observed_chapter_graph()
+        persisted = self.state.fixup_graph.get("clean", {})
+        clean = self._retain_fixup_clean(graph, persisted if isinstance(persisted, dict) else {})
+        invalidated = self._invalidate_fixup_descendants(graph, clean, chapter_ids)
+        await self._save_fixup_graph(
+            graph,
+            clean,
+            build_generation=int(self.state.fixup_graph.get("build_generation", 0)),
+            invalidated=invalidated,
+        )
+        return invalidated
+
     async def _save_fixup_graph(
         self,
         graph: ChapterImportGraph,
@@ -547,21 +638,14 @@ class Orchestrator:
             await self.control.checkpoint()
             run = await self.state.start_run(chapter.id, stage)
             workspace = None
-            queue_held = False
+            source_held = False
             try:
-                # Snapshot acquisition shares the build gate. A new overlay can
-                # therefore never observe merged sources paired with a stale cache.
-                await self.build_queue.acquire()
-                queue_held = True
-                try:
+                if self.isolation.name == "shared":
+                    await self.source_lock.acquire()
+                    source_held = True
                     workspace = await self.isolation.acquire(run.id)
-                finally:
-                    # Shared worktrees cannot isolate edits from builds, so they
-                    # serialize the whole attempt. Overlay agents release the gate
-                    # immediately and remain concurrent while they edit.
-                    if self.isolation.name != "shared":
-                        self.build_queue.release()
-                        queue_held = False
+                else:
+                    workspace = await self.isolation.acquire(run.id)
                 agent = await self.executor.run(
                     chapter,
                     stage,
@@ -569,23 +653,32 @@ class Orchestrator:
                     feedback=feedback,
                     workspace_root=workspace.root,
                 )
-                if not queue_held:
-                    await self.build_queue.acquire()
-                    queue_held = True
                 # The agent is finished before this transaction begins. Merge its
                 # scoped source changes, unmount its workspace, and only then build
                 # from the main worktree against the coordinator-owned cache.
-                isolated = await workspace.collect(chapter)
+                isolated = await workspace.collect(
+                    chapter,
+                    integration_lock=None if source_held else self.source_lock,
+                )
                 await workspace.close()
                 workspace = None
+                if source_held:
+                    self.source_lock.release()
+                    source_held = False
+                if isolated.accepted and agent.changed:
+                    await self._invalidate_build_records((chapter.id,))
                 if isolated.accepted:
                     if stage is Stage.PROVE:
-                        validation = await validate(
-                            self.config,
-                            chapter,
-                            workspace_root=self.config.settings.repo,
-                        )
-                        await self.isolation.refresh_cache()
+                        validation = (
+                            await self._build_chapters(
+                                (chapter,),
+                                publish_if_clean=True,
+                                mode="proof-certification",
+                                stage=Stage.PROVE,
+                                priority=0.0,
+                                preemptible=True,
+                            )
+                        )[chapter.id]
                     else:
                         validation = ValidationResult(
                             True,
@@ -631,8 +724,8 @@ class Orchestrator:
             finally:
                 if workspace is not None:
                     await workspace.close()
-                if queue_held:
-                    self.build_queue.release()
+                if source_held:
+                    self.source_lock.release()
             return Attempt(agent=agent, validation=validation, run=run)
 
     async def _formalize(self, chapter: Chapter, *, rerun: bool = False) -> FormalizeOutcome:
@@ -889,74 +982,130 @@ class Orchestrator:
         mode: str = "targeted",
         iteration: int = 1,
         maximum_iterations: int = 1,
+        stage: Stage = Stage.FIXUP,
+        priority: float = 100.0,
+        preemptible: bool = False,
     ) -> dict[str, ValidationResult]:
         """Build a deterministic target batch against the coordinator-owned cache."""
 
         selected = tuple(chapters)
-        results: dict[str, ValidationResult] = {}
-        await self.build_queue.acquire()
-        try:
-            if selected:
+        if not selected:
+            return {}
+        ids = tuple(chapter.id for chapter in selected)
+        queued_phase = (
+            TaskPhase.VERIFICATION_QUEUED if stage is Stage.REVIEW else TaskPhase.WAITING_BUILD
+        )
+        building_phase = TaskPhase.VERIFYING if stage is Stage.REVIEW else TaskPhase.BUILDING
+        label = f"{stage.value} {mode}: " + ", ".join(ids)
+
+        while True:
+            await self.state.set_tasks(
+                ids,
+                stage,
+                TaskStatus.RUNNING,
+                (
+                    "queued for coordinator verification"
+                    if stage is Stage.REVIEW
+                    else f"queued for {mode} coordinator build"
+                ),
+                phase=queued_phase,
+            )
+            lease = await self.build_queue.acquire(
+                priority=priority,
+                label=label,
+                stage=stage,
+                preemptible=preemptible,
+            )
+            results: dict[str, ValidationResult] = {}
+            preempted = False
+            source_held = False
+            try:
+                await self.source_lock.acquire()
+                source_held = True
                 async with self.state.batch():
                     await self.state.set_tasks(
-                        (chapter.id for chapter in selected),
-                        Stage.FIXUP,
+                        ids,
+                        stage,
                         TaskStatus.RUNNING,
                         f"{mode} coordinator build {iteration}/{maximum_iterations}",
-                        phase=TaskPhase.BUILDING,
+                        phase=building_phase,
                     )
                     await self.state.start_coordinator_build(
                         mode=mode,
-                        stage=Stage.FIXUP,
+                        stage=stage,
                         iteration=iteration,
                         maximum_iterations=maximum_iterations,
                         total=len(selected),
                     )
-            for index, chapter in enumerate(selected):
-                await self.control.checkpoint()
-                await self.state.advance_coordinator_build(
-                    chapter_id=chapter.id,
-                    completed=index,
-                    command=chapter.build_command,
-                )
-
-                def append_output(output: str, *, current: Chapter = chapter) -> None:
-                    self.state.append_coordinator_build_output(
-                        output,
-                        error_count=self._target_error_count(current, output),
+                for index, chapter in enumerate(selected):
+                    await self.control.checkpoint()
+                    await self.state.advance_coordinator_build(
+                        chapter_id=chapter.id,
+                        completed=index,
+                        command=chapter.build_command,
                     )
 
-                results[chapter.id] = await validate(
-                    self.config,
-                    chapter,
-                    workspace_root=self.config.settings.repo,
-                    on_output=append_output,
-                )
-                await self.state.advance_coordinator_build(
-                    chapter_id=chapter.id,
-                    completed=index + 1,
-                )
-            if (
-                publish_if_clean
-                and results
-                and all(result.succeeded for result in results.values())
-            ):
-                await self.isolation.refresh_cache()
-        finally:
-            try:
-                if selected:
-                    async with self.state.batch():
-                        await self.state.finish_coordinator_build()
-                        await self.state.set_tasks(
-                            (chapter.id for chapter in selected),
-                            Stage.FIXUP,
-                            TaskStatus.RUNNING,
-                            "awaiting coordinator rebuild",
-                            phase=TaskPhase.AWAITING_REBUILD,
+                    def append_output(output: str, *, current: Chapter = chapter) -> None:
+                        self.state.append_coordinator_build_output(
+                            output,
+                            error_count=self._target_error_count(current, output),
                         )
+
+                    validation = asyncio.create_task(
+                        validate(
+                            self.config,
+                            chapter,
+                            workspace_root=self.config.settings.repo,
+                            on_output=append_output,
+                        )
+                    )
+                    preemption = asyncio.create_task(lease.preempt_requested.wait())
+                    try:
+                        done, _ = await asyncio.wait(
+                            (validation, preemption), return_when=asyncio.FIRST_COMPLETED
+                        )
+                    except BaseException:
+                        validation.cancel()
+                        preemption.cancel()
+                        await asyncio.gather(validation, preemption, return_exceptions=True)
+                        raise
+                    if preemption in done and lease.preempt_requested.is_set():
+                        validation.cancel()
+                        await asyncio.gather(validation, return_exceptions=True)
+                        preempted = True
+                        break
+                    preemption.cancel()
+                    await asyncio.gather(preemption, return_exceptions=True)
+                    results[chapter.id] = validation.result()
+                    await self.state.advance_coordinator_build(
+                        chapter_id=chapter.id,
+                        completed=index + 1,
+                    )
+                if (
+                    not preempted
+                    and publish_if_clean
+                    and results
+                    and all(result.succeeded for result in results.values())
+                ):
+                    await self.isolation.refresh_cache()
+                if not preempted:
+                    await self.state.set_tasks(
+                        ids,
+                        stage,
+                        TaskStatus.RUNNING,
+                        "coordinator build finished; reconciling result",
+                        phase=TaskPhase.IDLE,
+                    )
             finally:
-                self.build_queue.release()
-        return results
+                try:
+                    if source_held:
+                        await self.state.finish_coordinator_build()
+                finally:
+                    if source_held:
+                        self.source_lock.release()
+                    self.build_queue.release(lease)
+            if not preempted:
+                return results
 
     async def _build_all(
         self, *, iteration: int = 1, maximum_iterations: int = 1
@@ -1042,13 +1191,15 @@ class Orchestrator:
         await self.agent_slots.acquire(self.statement_schedule.priority(chapter.book_id))
         run = None
         workspace = None
+        source_held = False
         try:
             run = await self.state.start_run(chapter.id, Stage.FIXUP)
-            await self.build_queue.acquire()
-            try:
+            if self.isolation.name == "shared":
+                await self.source_lock.acquire()
+                source_held = True
                 workspace = await self.isolation.acquire(run.id)
-            finally:
-                self.build_queue.release()
+            else:
+                workspace = await self.isolation.acquire(run.id)
 
             async def execute() -> AgentResult:
                 try:
@@ -1068,11 +1219,14 @@ class Orchestrator:
                 workspace=workspace,
                 task=asyncio.create_task(execute()),
                 dependency_certificates=dependency_certificates,
+                source_lock_held=source_held,
             )
         except BaseException as error:
             self.agent_slots.release()
             if workspace is not None:
                 await workspace.close()
+            if source_held:
+                self.source_lock.release()
             if run is not None and run.status == TaskStatus.RUNNING:
                 detail = str(error) or type(error).__name__
                 await self.state.finish_run(
@@ -1091,14 +1245,18 @@ class Orchestrator:
         workspace = handle.workspace
         try:
             agent = await handle.task
-            await self.build_queue.acquire()
-            try:
-                isolated = await workspace.collect(handle.chapter)
-                await workspace.close()
-                workspace = None
-            finally:
-                self.build_queue.release()
+            isolated = await workspace.collect(
+                handle.chapter,
+                integration_lock=None if handle.source_lock_held else self.source_lock,
+            )
+            await workspace.close()
+            workspace = None
+            if handle.source_lock_held:
+                self.source_lock.release()
+                handle.source_lock_held = False
             if isolated.accepted:
+                if agent.changed:
+                    await self._invalidate_build_records((handle.chapter.id,))
                 validation = ValidationResult(
                     True,
                     0,
@@ -1123,6 +1281,9 @@ class Orchestrator:
         except BaseException as error:
             if workspace is not None:
                 await workspace.close()
+            if handle.source_lock_held:
+                self.source_lock.release()
+                handle.source_lock_held = False
             if handle.run.status == TaskStatus.RUNNING:
                 detail = str(error) or type(error).__name__
                 await self.state.finish_run(
@@ -1141,8 +1302,8 @@ class Orchestrator:
                 handle.chapter.id,
                 Stage.FIXUP,
                 TaskStatus.RUNNING,
-                "fixup complete; awaiting coordinator rebuild",
-                phase=TaskPhase.AWAITING_REBUILD,
+                "fixup complete; queued for coordinator verification",
+                phase=TaskPhase.VERIFICATION_QUEUED,
             )
             return attempt
         await self.state.set_task(
@@ -1168,6 +1329,20 @@ class Orchestrator:
             if self._fixup_runner is None:
                 self._fixup_runner = asyncio.create_task(self._drain_fixup_requests())
         return await future
+
+    async def _request_clean_build(
+        self,
+        *,
+        target_ids: Iterable[str],
+        stage: Stage,
+    ) -> bool:
+        """Verify clean targets without queueing behind unrelated repair agents."""
+
+        targets = set(target_ids)
+        return await self._fixup_to_clean(
+            target_ids=targets,
+            verification_stages={chapter_id: stage for chapter_id in targets},
+        )
 
     async def _drain_fixup_requests(self) -> None:
         try:
@@ -1213,6 +1388,7 @@ class Orchestrator:
         feedback: dict[str, str] | None = None,
         *,
         target_ids: Iterable[str] | None = None,
+        verification_stages: dict[str, Stage] | None = None,
     ) -> bool:
         """Converge globally or until selected targets are clean in the observed DAG."""
 
@@ -1228,6 +1404,8 @@ class Orchestrator:
         attempts = {chapter_id: 0 for chapter_id in by_id}
         running: dict[str, RunningFixupAgent] = {}
         failed: set[str] = set()
+        repaired: set[str] = set()
+        display_stages = dict(verification_stages or {})
         persisted_clean = self.state.fixup_graph.get("clean", {})
         clean_records = persisted_clean if isinstance(persisted_clean, dict) else {}
         clean: dict[str, dict[str, Any]] = {}
@@ -1288,6 +1466,11 @@ class Orchestrator:
         async def build_chapter(chapter_id: str, graph: ChapterImportGraph) -> bool:
             nonlocal build_generation
             chapter = by_id[chapter_id]
+            display_stage = (
+                Stage.FIXUP
+                if chapter_id in repaired
+                else display_stages.get(chapter_id, Stage.FIXUP)
+            )
             result = (
                 await self._build_chapters(
                     (chapter,),
@@ -1295,6 +1478,8 @@ class Orchestrator:
                     mode="topological",
                     iteration=min(attempts[chapter_id] + 1, maximum),
                     maximum_iterations=maximum,
+                    stage=display_stage,
+                    priority=200.0 if display_stage is Stage.REVIEW else 100.0,
                 )
             )[chapter_id]
             if result.succeeded:
@@ -1317,15 +1502,32 @@ class Orchestrator:
                     build_generation=build_generation,
                     invalidated=invalidated_clean,
                 )
-                await self.state.set_task(
-                    chapter_id,
-                    Stage.FIXUP,
-                    TaskStatus.SUCCEEDED,
-                    "clean coordinator build against observed imports",
-                )
+                if display_stage is Stage.REVIEW:
+                    await self.state.set_task(
+                        chapter_id,
+                        Stage.REVIEW,
+                        TaskStatus.RUNNING,
+                        "coordinator verification clean; continuing editing review",
+                        phase=TaskPhase.IDLE,
+                    )
+                else:
+                    await self.state.set_task(
+                        chapter_id,
+                        Stage.FIXUP,
+                        TaskStatus.SUCCEEDED,
+                        "clean coordinator build against observed imports",
+                    )
                 return True
 
             diagnostics = self._build_feedback({chapter_id: result}).actionable
+            if display_stage is Stage.REVIEW:
+                await self.state.set_task(
+                    chapter_id,
+                    Stage.REVIEW,
+                    TaskStatus.RUNNING,
+                    "coordinator verification failed; waiting for targeted fixup",
+                    phase=TaskPhase.WAITING_FIXUP,
+                )
             merge_feedback(diagnostics)
             invalidated_clean.update(
                 self._invalidate_fixup_descendants(
@@ -1500,6 +1702,7 @@ class Orchestrator:
                         )
                         continue
                     attempts[chapter_id] += 1
+                    repaired.add(chapter_id)
                     dependency_certificates = {
                         dependency: str(clean[dependency]["certificate"])
                         for dependency in graph.dependencies[chapter_id]
@@ -1614,8 +1817,8 @@ class Orchestrator:
                     chapter.id,
                     Stage.REVIEW,
                     TaskStatus.RUNNING,
-                    "review changes merged; awaiting dependency-ordered rebuild",
-                    phase=TaskPhase.AWAITING_REBUILD,
+                    "review changes merged; coordinator verification queued",
+                    phase=TaskPhase.VERIFICATION_QUEUED,
                 )
             return ReviewOutcome(True, attempt.agent.changed, {}, complete=True)
         detail = "review left fixup findings" if routed else "editing review failed"
@@ -1699,7 +1902,9 @@ class Orchestrator:
         persisted = self.state.fixup_graph.get("clean", {})
         records = persisted if isinstance(persisted, dict) else {}
         was_clean = chapter.id in self._retain_fixup_clean(graph, records)
-        if not was_clean and not await self._request_fixup(target_ids={chapter.id}):
+        if not was_clean and not await self._request_clean_build(
+            target_ids={chapter.id}, stage=Stage.REVIEW
+        ):
             return False
 
         maximum = min(self.config.stages[Stage.REVIEW].max_rounds, 5)
@@ -1727,10 +1932,15 @@ class Orchestrator:
                         chapter.id,
                         Stage.REVIEW,
                         TaskStatus.RUNNING,
-                        "review findings routed; awaiting dependency-ordered rebuild",
-                        phase=TaskPhase.AWAITING_REBUILD,
+                        "review findings routed; waiting for targeted fixup",
+                        phase=TaskPhase.WAITING_FIXUP,
                     )
-                if not await self._request_fixup(findings, target_ids=targets):
+                request_succeeded = (
+                    await self._request_fixup(findings, target_ids=targets)
+                    if findings
+                    else await self._request_clean_build(target_ids=targets, stage=Stage.REVIEW)
+                )
+                if not request_succeeded:
                     return False
             if not outcome.complete:
                 if not outcome.changed and not findings:
@@ -2059,26 +2269,19 @@ class Orchestrator:
     ) -> ValidationResult:
         """Refresh an exact coordinator build before launching a proof agent."""
 
-        await self.state.set_task(
-            chapter.id,
-            Stage.PROVE,
-            TaskStatus.RUNNING,
-            "refreshing stale exact build before proof work",
-            phase=TaskPhase.BUILDING,
-        )
         await self.control.checkpoint()
-        await self.build_queue.acquire()
-        try:
-            validation = await validate(
-                self.config,
-                chapter,
-                workspace_root=self.config.settings.repo,
+        validation = (
+            await self._build_chapters(
+                (chapter,),
+                publish_if_clean=True,
+                mode="proof-refresh",
+                stage=Stage.PROVE,
+                priority=0.0,
+                preemptible=True,
             )
-            if validation.succeeded:
-                await self.isolation.refresh_cache()
-                await self._publish_validated_build(chapter)
-        finally:
-            self.build_queue.release()
+        )[chapter.id]
+        if validation.succeeded:
+            await self._publish_validated_build(chapter)
         return validation
 
     async def _prove(self, chapter: Chapter) -> bool:

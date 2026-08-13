@@ -699,6 +699,117 @@ async def test_concurrent_fixup_requests_share_one_repair_pass(
 
 
 @pytest.mark.asyncio
+async def test_clean_review_verification_bypasses_active_fixup_batch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    first, second = config.chapters
+    orchestrator = Orchestrator(config, StateStore(config))
+    await orchestrator.prepare()
+    repair_started = asyncio.Event()
+    release_repair = asyncio.Event()
+    calls: list[tuple[dict[str, str] | None, set[str], dict[str, Stage]]] = []
+
+    async def converge(
+        feedback: dict[str, str] | None = None,
+        *,
+        target_ids: object = None,
+        verification_stages: dict[str, Stage] | None = None,
+    ) -> bool:
+        assert isinstance(target_ids, set)
+        calls.append((feedback, target_ids, dict(verification_stages or {})))
+        if feedback:
+            repair_started.set()
+            await release_repair.wait()
+        return True
+
+    monkeypatch.setattr(orchestrator, "_fixup_to_clean", converge)
+    repair = asyncio.create_task(
+        orchestrator._request_fixup({first.id: "repair first"}, target_ids={first.id})
+    )
+    await repair_started.wait()
+
+    assert await orchestrator._request_clean_build(target_ids={second.id}, stage=Stage.REVIEW)
+    assert not repair.done()
+    assert calls[-1] == (None, {second.id}, {second.id: Stage.REVIEW})
+
+    release_repair.set()
+    assert await repair
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_review_build_preempts_running_proof_certification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    proof_chapter, review_chapter = config.chapters
+    orchestrator = Orchestrator(config, StateStore(config))
+    await orchestrator.prepare()
+    proof_started = asyncio.Event()
+    events: list[str] = []
+    proof_attempts = 0
+
+    async def validation(
+        _config: object,
+        chapter: Chapter,
+        *,
+        workspace_root: Path | None = None,
+        on_output: Callable[[str], None] | None = None,
+    ) -> ValidationResult:
+        nonlocal proof_attempts
+        assert workspace_root == config.settings.repo
+        assert on_output is not None
+        if chapter.id == proof_chapter.id:
+            proof_attempts += 1
+            if proof_attempts == 1:
+                events.append("proof-started")
+                proof_started.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    events.append("proof-preempted")
+                    raise
+            events.append("proof-retried")
+        else:
+            events.append("review-built")
+        return ValidationResult(True, 0, "ok")
+
+    monkeypatch.setattr(scheduler_module, "validate", validation)
+    proof = asyncio.create_task(
+        orchestrator._build_chapters(
+            (proof_chapter,),
+            publish_if_clean=False,
+            mode="proof-certification",
+            stage=Stage.PROVE,
+            priority=0.0,
+            preemptible=True,
+        )
+    )
+    await proof_started.wait()
+    review = asyncio.create_task(
+        orchestrator._build_chapters(
+            (review_chapter,),
+            publish_if_clean=False,
+            mode="review-verification",
+            stage=Stage.REVIEW,
+            priority=200.0,
+        )
+    )
+
+    assert (await review)[review_chapter.id].succeeded
+    assert (await proof)[proof_chapter.id].succeeded
+    assert events == ["proof-started", "proof-preempted", "review-built", "proof-retried"]
+    assert orchestrator.build_queue.snapshot() == {
+        "owner": "",
+        "owner_stage": "",
+        "queued": 0,
+        "queued_jobs": [],
+    }
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_fixup_rescans_new_import_before_rebuilding_edited_chapter(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1296,7 +1407,7 @@ async def test_coordinator_build_uses_build_phases_without_counting_agents(
     ]
     assert state.coordinator_build.error_count == 2
     assert all(
-        state.task(chapter.id, Stage.FIXUP).phase == TaskPhase.AWAITING_REBUILD
+        state.task(chapter.id, Stage.FIXUP).phase == TaskPhase.IDLE
         for chapter in config.chapters
     )
     await orchestrator.shutdown()
@@ -1497,8 +1608,29 @@ async def test_changed_review_remains_active_until_rebuild_finishes(tmp_path: Pa
     assert outcome.changed
     review_task = state.task(config.chapters[0].id, Stage.REVIEW)
     assert review_task.status == TaskStatus.RUNNING
-    assert review_task.phase == TaskPhase.AWAITING_REBUILD
-    assert review_task.detail == "review changes merged; awaiting dependency-ordered rebuild"
+    assert review_task.phase == TaskPhase.VERIFICATION_QUEUED
+    assert review_task.detail == "review changes merged; coordinator verification queued"
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_review_snapshot_and_merge_do_not_acquire_coordinator_build_queue(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await orchestrator.prepare()
+    orchestrator.executor = FakeExecutor(state, [result(changed=False)])
+
+    async def forbidden_build_queue(**_kwargs: object) -> object:
+        raise AssertionError("agent snapshot and merge must not acquire the Lake-build queue")
+
+    monkeypatch.setattr(orchestrator.build_queue, "acquire", forbidden_build_queue)
+
+    outcome = await orchestrator._review_once(config.chapters[0])
+    assert outcome.succeeded
+    assert not outcome.changed
     await orchestrator.shutdown()
 
 
@@ -1536,7 +1668,9 @@ async def test_incomplete_review_routes_fixup_and_retries(
         feedback: dict[str, str] | None = None,
         *,
         target_ids: object = None,
+        verification_stages: object = None,
     ) -> bool:
+        del verification_stages
         fixups.append((feedback, target_ids))
         state.fixup_graph["clean"] = {chapter.id: {"certificate": "test-green-certificate"}}
         return True
@@ -1672,7 +1806,9 @@ async def test_review_is_capped_at_five_edit_rebuild_cycles(
         _feedback: dict[str, str] | None = None,
         *,
         target_ids: object = None,
+        verification_stages: object = None,
     ) -> bool:
+        del verification_stages
         nonlocal rebuilds
         assert target_ids == {config.chapters[0].id}
         rebuilds += 1
@@ -2429,9 +2565,14 @@ async def test_prove_builds_run_after_agents_and_are_serialized_in_main_worktree
         return agent
 
     async def tracked_validation(
-        _config: object, chapter: Chapter, *, workspace_root: Path | None = None
+        _config: object,
+        chapter: Chapter,
+        *,
+        workspace_root: Path | None = None,
+        on_output: Callable[[str], None] | None = None,
     ) -> ValidationResult:
         nonlocal active_builds, maximum_active_builds
+        assert on_output is not None
         assert chapter.id in completed_agents
         assert workspace_root == config.settings.repo
         active_builds += 1

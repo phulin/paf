@@ -40,6 +40,11 @@ class TaskPhase(StrEnum):
     QUEUED = "queued"
     BUILDING = "building"
     AGENT = "agent"
+    VERIFICATION_QUEUED = "verification_queued"
+    VERIFYING = "verifying"
+    WAITING_FIXUP = "waiting_fixup"
+    # Legacy persisted phase. New review and fixup transitions use the more
+    # precise verification/fixup phases above.
     AWAITING_REBUILD = "awaiting_rebuild"
 
 

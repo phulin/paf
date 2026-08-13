@@ -111,6 +111,19 @@ def tree_manifest(root: Path, *, excluded: tuple[str, ...]) -> dict[str, FileFin
     return result
 
 
+def scoped_manifest(root: Path, chapter: Chapter) -> dict[str, FileFingerprint]:
+    """Fingerprint only a chapter's exclusive scope in the live worktree."""
+
+    result: dict[str, FileFingerprint] = {}
+    for pattern in chapter.scope:
+        for path in root.glob(pattern):
+            if path.is_dir():
+                continue
+            relative = path.relative_to(root).as_posix()
+            result[relative] = _fingerprint(path)
+    return result
+
+
 @cache
 def _globstar_variants(pattern: str) -> tuple[str, ...]:
     """Expand `**/` as either zero or one-or-more path components.
@@ -146,7 +159,13 @@ class SharedWorkspace:
     def __init__(self, repo: Path) -> None:
         self.root = repo
 
-    async def collect(self, _chapter: Chapter) -> IsolationResult:
+    async def collect(
+        self,
+        _chapter: Chapter,
+        *,
+        integration_lock: asyncio.Lock | None = None,
+    ) -> IsolationResult:
+        del integration_lock
         return IsolationResult(accepted=True, generation=0)
 
     async def close(self) -> None:
@@ -197,7 +216,12 @@ class FuseWorkspace:
         self.root = merged
         self.closed = False
 
-    async def collect(self, chapter: Chapter) -> IsolationResult:
+    async def collect(
+        self,
+        chapter: Chapter,
+        *,
+        integration_lock: asyncio.Lock | None = None,
+    ) -> IsolationResult:
         # Hashing walks the entire source tree. On a large corpus it can
         # otherwise starve the TUI refresh timer just as the agent finishes.
         base, merged = await asyncio.gather(
@@ -225,6 +249,7 @@ class FuseWorkspace:
             merged_manifest=merged,
             merged_root=self.root,
             changed=changed,
+            integration_lock=integration_lock,
         )
 
     async def close(self) -> None:
@@ -275,6 +300,12 @@ class FuseOverlayIsolation:
         self.generations.mkdir(parents=True, exist_ok=True)
         self.cache_generations.mkdir(parents=True, exist_ok=True)
         self.slots.mkdir(parents=True, exist_ok=True)
+        # Seed immutable source/cache generation zero before the scheduler can
+        # launch either agents or coordinator builds. Later agent acquisition
+        # never needs to copy the live writable Lake cache.
+        async with self._lock:
+            await self._generation()
+            await self._cache_generation()
 
     async def _clean_stale_roots(self) -> None:
         """Reclaim mounts left by dead orchestrators for this state directory."""
@@ -465,65 +496,69 @@ class FuseOverlayIsolation:
         merged_manifest: dict[str, FileFingerprint],
         merged_root: Path,
         changed: tuple[str, ...],
+        integration_lock: asyncio.Lock | None = None,
     ) -> IsolationResult:
-        async with self._lock:
-            if changed:
-                current = await asyncio.to_thread(
-                    tree_manifest,
-                    self.settings.repo,
-                    excluded=self.excluded,
-                )
-                base_scope = {
-                    path: value
-                    for path, value in base_manifest.items()
-                    if _matches_scope(path, chapter)
-                }
-                current_scope = {
-                    path: value for path, value in current.items() if _matches_scope(path, chapter)
-                }
-                if base_scope != current_scope:
+        if integration_lock is not None:
+            await integration_lock.acquire()
+        try:
+            async with self._lock:
+                if changed:
+                    current_scope = await asyncio.to_thread(
+                        scoped_manifest,
+                        self.settings.repo,
+                        chapter,
+                    )
+                    base_scope = {
+                        path: value
+                        for path, value in base_manifest.items()
+                        if _matches_scope(path, chapter)
+                    }
+                    if base_scope != current_scope:
+                        return IsolationResult(
+                            accepted=False,
+                            generation=generation,
+                            cache_generation=cache_generation,
+                            changed_paths=changed,
+                            error=(
+                                "assigned scope changed after this agent started; "
+                                "retry on a fresh generation"
+                            ),
+                        )
+                unsupported = [
+                    relative
+                    for relative in changed
+                    if (fingerprint := merged_manifest.get(relative)) is not None
+                    and fingerprint.kind != "file"
+                ]
+                if unsupported:
                     return IsolationResult(
                         accepted=False,
                         generation=generation,
                         cache_generation=cache_generation,
                         changed_paths=changed,
-                        error=(
-                            "assigned scope changed after this agent started; "
-                            "retry on a fresh generation"
-                        ),
+                        error=f"unsupported changed file type: {unsupported[0]}",
                     )
-            unsupported = [
-                relative
-                for relative in changed
-                if (fingerprint := merged_manifest.get(relative)) is not None
-                and fingerprint.kind != "file"
-            ]
-            if unsupported:
+                for relative in changed:
+                    destination = self.settings.repo / relative
+                    fingerprint = merged_manifest.get(relative)
+                    if fingerprint is None:
+                        destination.unlink(missing_ok=True)
+                        continue
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    temporary = destination.with_name(f".{destination.name}.swarm-{os.getpid()}")
+                    shutil.copy2(merged_root / relative, temporary)
+                    os.replace(temporary, destination)
+                if changed:
+                    self._revision += 1
                 return IsolationResult(
-                    accepted=False,
+                    accepted=True,
                     generation=generation,
                     cache_generation=cache_generation,
                     changed_paths=changed,
-                    error=f"unsupported changed file type: {unsupported[0]}",
                 )
-            for relative in changed:
-                destination = self.settings.repo / relative
-                fingerprint = merged_manifest.get(relative)
-                if fingerprint is None:
-                    destination.unlink(missing_ok=True)
-                    continue
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                temporary = destination.with_name(f".{destination.name}.swarm-{os.getpid()}")
-                shutil.copy2(merged_root / relative, temporary)
-                os.replace(temporary, destination)
-            if changed:
-                self._revision += 1
-            return IsolationResult(
-                accepted=True,
-                generation=generation,
-                cache_generation=cache_generation,
-                changed_paths=changed,
-            )
+        finally:
+            if integration_lock is not None:
+                integration_lock.release()
 
     async def release(self, workspace: FuseWorkspace) -> None:
         try:
