@@ -396,7 +396,11 @@ async def test_agent_detail_can_switch_between_chapter_steps(tmp_path: Path) -> 
                     "changed": False,
                     "complete": True,
                     "summary": "review update",
-                    "issues": ["One issue for display."],
+                    "issues": [
+                        "One issue for display.",
+                        "A second issue forces vertical scrolling.",
+                        "A third issue keeps the scrollbar visible.",
+                    ],
                 }
             ),
         )
@@ -412,6 +416,8 @@ async def test_agent_detail_can_switch_between_chapter_steps(tmp_path: Path) -> 
 
         screen = app.screen
         assert isinstance(screen, AgentDetailScreen)
+        screen.refresh_agent()
+        await pilot.pause(0.1)
         run_tabs = screen.query_one("#run-tabs", Tabs)
         assert run_tabs.tab_count == 2
         assert [tab.label_text for tab in run_tabs.query(Tab)] == [
@@ -426,6 +432,9 @@ async def test_agent_detail_can_switch_between_chapter_steps(tmp_path: Path) -> 
         assert "CHANGED ✗" in rendered_summary
         assert "• One issue for display." in rendered_summary
         assert '"changed"' not in rendered_summary
+        assert summary.show_vertical_scrollbar
+        assert summary.lines[0].text.endswith("CHANGED ✗")
+        assert summary.lines[0].cell_length == summary.scrollable_size.width
         timeline = screen.query_one("#agent-timeline", RichLog)
         rendered_timeline = "\n".join(line.text for line in timeline.lines)
         assert "CHANGED ✗" in rendered_timeline

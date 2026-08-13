@@ -291,6 +291,12 @@ def format_agent_update(value: str, *, heading: str, width: int, indent: str = "
     return "\n".join(lines)
 
 
+def _log_render_width(log: RichLog) -> int:
+    """Return the usable log width, excluding its reserved scrollbar gutter."""
+
+    return max(1, log.scrollable_size.width)
+
+
 def _compact_json(value: Any, *, limit: int = 400) -> Any:
     if isinstance(value, str):
         return value if len(value) <= limit else value[: limit - 1] + "…"
@@ -349,6 +355,7 @@ class AgentDetailScreen(Screen[None]):
         padding: 1 2;
         border: round $primary-muted;
         background: $surface;
+        scrollbar-gutter: stable;
     }
     #agent-error {
         height: auto;
@@ -358,6 +365,7 @@ class AgentDetailScreen(Screen[None]):
     }
     #agent-tabs { height: 1fr; }
     RichLog { height: 1fr; }
+    #agent-timeline { scrollbar-gutter: stable; }
     #agent-path { height: 3; padding: 1 2; color: $text-muted; }
     """
 
@@ -416,6 +424,7 @@ class AgentDetailScreen(Screen[None]):
 
     def on_mount(self) -> None:
         self.refresh_agent()
+        self.call_after_refresh(self.refresh_agent)
         self.set_interval(1.0, self.refresh_agent)
 
     def action_close(self) -> None:
@@ -479,14 +488,14 @@ class AgentDetailScreen(Screen[None]):
             format_agent_update(
                 summary,
                 heading="LATEST AGENT UPDATE",
-                width=summary_log.content_size.width,
+                width=_log_render_width(summary_log),
             ),
         )
         error = reportable_error(activity.latest_error) if activity else ""
         self._update_static("#agent-error", f"LATEST ERROR\n{error}" if error else "")
         path = Path(run.log_path) if run.log_path else self.state.logs_dir / f"{run.id}.jsonl"
         self._update_static("#agent-path", f"Raw JSONL: {path}")
-        timeline_width = self.query_one("#agent-timeline", RichLog).content_size.width
+        timeline_width = _log_render_width(self.query_one("#agent-timeline", RichLog))
         rendered_activity = (run.id, activity.sequence if activity else None, timeline_width)
         if rendered_activity != self._rendered_activity:
             self._render_activity(activity)
@@ -537,7 +546,8 @@ class AgentDetailScreen(Screen[None]):
         self._static_cache[selector] = content
         log = self.query_one(selector, RichLog)
         log.clear()
-        log.write(content)
+        width = _log_render_width(log) if log.scrollable_size.width else None
+        log.write(content, width=width)
         log.scroll_home(animate=False)
 
     def _refresh_raw_events(self, path: Path) -> None:
@@ -579,6 +589,8 @@ class AgentDetailScreen(Screen[None]):
     def _render_activity(self, activity: AgentActivity | None) -> None:
         timeline = self.query_one("#agent-timeline", RichLog)
         timeline.clear()
+        timeline_width = _log_render_width(timeline)
+        write_width = timeline_width if timeline.scrollable_size.width else None
         marks = {"started": "▶", "completed": "✓", "failed": "✗", "updated": "•"}
         latest_message = (
             max(
@@ -604,7 +616,7 @@ class AgentDetailScreen(Screen[None]):
                 rendered = format_agent_update(
                     detail,
                     heading=heading,
-                    width=timeline.content_size.width,
+                    width=timeline_width,
                     indent="    ",
                 )
                 line = Text(rendered)
@@ -615,9 +627,9 @@ class AgentDetailScreen(Screen[None]):
                 line.append(f" {entry.title}")
                 if detail:
                     line.append("\n" + "\n".join(f"    {part}" for part in detail.splitlines()))
-            timeline.write(line)
+            timeline.write(line, width=write_width)
         if activity is None:
-            timeline.write("No activity events recorded for this step.")
+            timeline.write("No activity events recorded for this step.", width=write_width)
 
         plan = self.query_one("#agent-plan", RichLog)
         plan.clear()
