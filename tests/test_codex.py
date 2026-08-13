@@ -389,9 +389,15 @@ def test_fixup_prompt_requires_diagnostics_and_sorry(tmp_path: Path) -> None:
     executor = CodexExecutor(config, StateStore(config))
 
     prompt = executor.build_prompt(config.chapters[0], Stage.FIXUP)
+    normalized_prompt = " ".join(prompt.split())
 
     assert "Attached Lean MCP" in prompt
-    assert "after every edit" in prompt
+    assert "coordinator feedback as the initial diagnostic pass" in normalized_prompt
+    assert "Do not request diagnostics merely because you entered or switched files" in (
+        normalized_prompt
+    )
+    assert "diagnose only the edited dependency closure in import order" in normalized_prompt
+    assert "after every edit" not in prompt
     assert "Never prove" in prompt
     assert "`by sorry`" in prompt
 

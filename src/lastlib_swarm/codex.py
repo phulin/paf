@@ -446,8 +446,10 @@ loop.""",
 findings appended to this prompt. This attempt is dependency-ready and may run beside unrelated
 fixups. As soon as it finishes, the coordinator merges it, rescans observed imports, and rebuilds it
 when its refined predecessors are clean; unrelated agents continue running. Never prove propositions
-in this stage: replace an obstructing proof body with `by sorry`.
-Request fresh whole-file diagnostics after every edit.""",
+in this stage: replace an obstructing proof body with `by sorry`. Treat the coordinator feedback as
+the initial diagnostic pass, make one coherent edit batch, then diagnose only the edited dependency
+closure in import order after the last relevant edit. Recheck only files invalidated by a
+repair.""",
             Stage.REVIEW: """Audit the assigned chapter and directly make every warranted in-scope
 statement or API change. Preserve proof placeholders and do not spend time proving propositions.
 The line-numbered source set prepended to this prompt counts as your initial read. Do not reread a
@@ -521,8 +523,9 @@ diagnostics, and `{chapter.build_command}`.
             )
             mcp_workflow = {
                 Stage.FIXUP: """The MCP opens and synchronizes a destination file when any Lean tool
-uses it. Do not request diagnostics merely because you switched files. Request fresh whole-file
-diagnostics after a source edit, as required by the fixup contract.""",
+uses it. Do not request diagnostics merely because you entered or switched files. After the coherent
+edit batch, request fresh whole-file diagnostics only for the edited dependency closure required by
+the fixup contract.""",
                 Stage.REVIEW: """Any Lean tool opens and synchronizes its destination file. Do not
 request diagnostics merely because you switched files, and do not diagnose untouched files whose
 incoming coordinator certificate remains valid. Diagnose only the edited dependency closure required

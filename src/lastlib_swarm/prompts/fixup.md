@@ -24,11 +24,15 @@ substantive defect in the informal source with a precise `SOURCE_ISSUE` comment.
 
 1. Read all appended Lake diagnostics and review findings before editing.
 2. Identify which reported failures are owned by the assigned scope.
-3. Visit files in their observed import order. Request whole-file MCP diagnostics whenever entering
-   a file and again after every edit.
+3. Visit files in their observed import order. Treat the coordinator feedback as the initial
+   diagnostic pass: do not request diagnostics merely because you entered or switched files.
 4. Reconcile provisional names and interfaces with canonical earlier LastLib and pinned Mathlib APIs.
 5. Make one coherent batch of minimal changes, replacing every obstructing proof body with `by sorry`.
-6. Report every resolved and unresolved diagnostic precisely.
+   Track the edited files and their assigned transitive dependents.
+6. After the last relevant edit, request whole-file MCP diagnostics for that edited dependency closure
+   in import order. If a repair invalidates a file already checked, recheck only that file and its
+   affected dependents.
+7. Report every resolved and unresolved diagnostic precisely.
 
 Do not run Lean, Lake, or another language server. Use only the attached Lean MCP for interactive
 diagnostics. After this transaction, the coordinator rescans imports, runs the authoritative Lake
