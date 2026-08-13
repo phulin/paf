@@ -2192,6 +2192,37 @@ async def test_prove_stops_after_two_repeated_no_progress_rounds(
 
 
 @pytest.mark.asyncio
+async def test_prove_counts_edits_without_fewer_placeholders_as_no_progress(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = config.chapters[0]
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await orchestrator.prepare()
+    orchestrator.executor = FakeExecutor(
+        state,
+        [
+            result(changed=True, placeholders=4),
+            result(changed=True, placeholders=4),
+            result(changed=True, placeholders=4),
+        ],
+    )
+
+    async def validation(*_args: object, **_kwargs: object) -> ValidationResult:
+        return ValidationResult(True, 0, "ok")
+
+    monkeypatch.setattr(scheduler_module, "validate", validation)
+
+    assert not await orchestrator._prove(chapter)
+    task = state.task(chapter.id, Stage.PROVE)
+    assert task.rounds == 3
+    assert task.detail == "proof pass stalled with 4 placeholders"
+    assert orchestrator.executor.results == []
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_formalize_runs_upstream_and_downstream_books_optimistically(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

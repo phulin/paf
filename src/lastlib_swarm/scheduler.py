@@ -1913,8 +1913,7 @@ class Orchestrator:
                 return False
             placeholders = attempt.agent.placeholders
             if (
-                not attempt.agent.changed
-                and previous_placeholders is not None
+                previous_placeholders is not None
                 and placeholders >= previous_placeholders
             ):
                 stalled_rounds += 1

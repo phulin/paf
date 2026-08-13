@@ -463,6 +463,14 @@ class CodexExecutor:
         base = render_prompt(template, chapter)
         common = render_prompt(COMMON_PROMPT_PATH.read_text(encoding="utf-8"), chapter)
         scope = "\n".join(f"- `{item}`" for item in chapter.scope)
+        proof_retry_contract = ""
+        if stage is Stage.PROVE and feedback:
+            proof_retry_contract = """
+This is a retry. The preceding feedback counts as the prior inventory, not as a conclusion to echo.
+Do not repeat its full-file reads, clean diagnostics, searches, or unsuccessful proof shape. Select
+one remaining placeholder and perform a materially different concrete proof experiment. If that
+experiment establishes that an earlier declaration or interface must change, return the minimal
+structured `fixup_findings` request instead of another unchanged \"no pinned API\" report."""
         stage_contract = {
             Stage.FORMALIZE: """This is one optimistic drafting attempt. The coordinator merges
 accepted scoped changes without running Lean. Compiler failures are deferred to the global fixup
@@ -492,8 +500,11 @@ A no-change review needs no diagnostic calls.
 The coordinator merges the scoped patch, then rebuilds it and sends compiler failures through the
 dependency-ordered fixup scheduler. Report every unresolved or out-of-scope edit as a structured
 `fixup_findings` entry.""",
-            Stage.PROVE: """The project entered this attempt with a clean reviewed build. After the
-attempt, the coordinator builds the assigned chapter against its single writable cache.""",
+            Stage.PROVE: """The project entered this attempt with a clean reviewed build. This is a
+proof-writing attempt, not an audit. Work directly on unresolved placeholders and do not diagnose
+untouched files merely to reconfirm the clean build. After the attempt, the coordinator builds the
+assigned chapter against its single writable cache."""
+            + proof_retry_contract,
         }[stage]
         contract = f"""
 

@@ -442,6 +442,40 @@ def test_executor_can_disable_lean_mcp(tmp_path: Path) -> None:
     assert "Attached Lean MCP" not in prompt
 
 
+def test_prove_retry_requires_a_distinct_concrete_attempt(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    executor = CodexExecutor(config, StateStore(config))
+
+    initial = " ".join(executor.build_prompt(config.chapters[0], Stage.PROVE).split())
+    retry = " ".join(
+        executor.build_prompt(
+            config.chapters[0],
+            Stage.PROVE,
+            feedback="No pinned API was found; four placeholders remain.",
+        ).split()
+    )
+
+    assert "proof-writing attempt, not an audit" in initial
+    assert "do not diagnose untouched files" in initial
+    assert "The preceding feedback counts as the prior inventory" in retry
+    assert "perform a materially different concrete proof experiment" in retry
+    assert "instead of another unchanged \"no pinned API\" report" in retry
+
+
+def test_shipped_prove_prompt_prioritizes_implementation_over_reaudit() -> None:
+    prompt = (
+        Path(__file__).parents[1] / "src" / "lastlib_swarm" / "prompts" / "prove.md"
+    ).read_text(encoding="utf-8")
+    normalized_prompt = " ".join(prompt.split())
+
+    assert "This is an implementation task, not a chapter audit" in prompt
+    assert "use it as the initial inventory instead of repeating a complete read" in (
+        normalized_prompt
+    )
+    assert "An unchanged attempt is acceptable only after" in normalized_prompt
+    assert "Make one coherent proof-writing pass over the entire assigned file set" not in prompt
+
+
 def test_fixup_prompt_requires_diagnostics_and_sorry(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
     executor = CodexExecutor(config, StateStore(config))

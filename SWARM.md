@@ -267,10 +267,12 @@ After the daemon exits, `status`, `snapshot`, and `wait` fall back to the persis
   branches keep running, while actual dependents are marked blocked. Unexpected coordinator
   exceptions still fail fast after draining live workers. There is no corpus-wide clean-build or
   review gate in the pipeline.
-- **Prove** sends the whole chapter to one agent, asks for one complete proof-writing pass, and then
-  uses whole-file LSP diagnostics to focus iterations on failed proofs. It succeeds only when the
-  scoped Lean code has no `sorry` or `admit` tokens and final Lake validation succeeds without any
-  warning other than “declaration uses `sorry`”.
+- **Prove** sends one chapter to an agent and asks it to work directly on unresolved placeholders.
+  Retry feedback counts as the prior inventory: later agents must try a materially different proof
+  route instead of rereading the chapter, reconfirming clean diagnostics, or echoing a missing-API
+  claim. Two consecutive rounds without reducing the placeholder count stop the proof loop. The
+  stage succeeds only when the scoped Lean code has no `sorry` or `admit` tokens and final Lake
+  validation succeeds without any warning other than “declaration uses `sorry`”.
 - A proof agent may change proof bodies but not declaration interfaces. A genuine statement/API
   problem is reported through a structured `fixup_findings` entry; the pipeline returns through
   fixup and editing review before proving resumes.
