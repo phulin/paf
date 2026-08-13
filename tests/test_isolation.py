@@ -29,6 +29,13 @@ def fuse_manager(config_path: Path) -> tuple[FuseOverlayIsolation, Chapter]:
     return FuseOverlayIsolation(settings), config.chapters[0]
 
 
+def test_fuse_overlay_workspace_lives_in_swarm_state_directory(tmp_path: Path) -> None:
+    manager, _ = fuse_manager(write_project(tmp_path, chapters="chapters = [1]"))
+
+    assert manager.parent == tmp_path / ".swarm" / "isolation"
+    assert manager.root.parent == manager.parent
+
+
 @pytest.mark.asyncio
 async def test_fuse_overlay_manifest_scans_do_not_block_event_loop(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -144,7 +151,7 @@ async def test_active_source_generation_is_immutable_when_live_repo_changes(
 @pytest.mark.asyncio
 async def test_fuse_overlay_reclaims_dead_orchestrator_roots(tmp_path: Path) -> None:
     manager, _ = fuse_manager(write_project(tmp_path, chapters="chapters = [1]"))
-    stale = manager.parent / f"{manager.identity}-999999999"
+    stale = manager.parent / "999999999"
     (stale / "slots" / "0000-dead" / "merged").mkdir(parents=True)
     (stale / "marker").write_text("stale\n", encoding="utf-8")
 
@@ -160,7 +167,7 @@ async def test_fuse_overlay_lazily_detaches_busy_stale_mount(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     manager, _ = fuse_manager(write_project(tmp_path, chapters="chapters = [1]"))
-    stale = manager.parent / f"{manager.identity}-999999999"
+    stale = manager.parent / "999999999"
     merged = stale / "slots" / "0000-dead" / "merged"
     merged.mkdir(parents=True)
     commands: list[tuple[str, ...]] = []
@@ -192,7 +199,7 @@ async def test_fuse_overlay_reclaims_disconnected_mount(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     manager, _ = fuse_manager(write_project(tmp_path, chapters="chapters = [1]"))
-    stale = manager.parent / f"{manager.identity}-999999999"
+    stale = manager.parent / "999999999"
     merged = stale / "slots" / "0000-dead" / "merged"
     merged.mkdir(parents=True)
     commands: list[tuple[str, ...]] = []

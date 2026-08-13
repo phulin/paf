@@ -6,7 +6,6 @@ import hashlib
 import os
 import shutil
 import stat
-import tempfile
 from contextlib import suppress
 from dataclasses import dataclass
 from functools import cache
@@ -320,9 +319,8 @@ class FuseOverlayIsolation:
 
     def __init__(self, settings: SwarmSettings) -> None:
         self.settings = settings
-        self.identity = hashlib.sha256(str(settings.state_dir).encode()).hexdigest()[:12]
-        self.parent = Path(tempfile.gettempdir()) / f"lastlib-swarm-{os.getuid()}"
-        self.root = self.parent / f"{self.identity}-{os.getpid()}"
+        self.parent = settings.state_dir / "isolation"
+        self.root = self.parent / str(os.getpid())
         self.generations = self.root / "source-generations"
         self.cache_root = self.root / "cache"
         self.cache_layers = self.cache_root / "layers"
@@ -382,11 +380,11 @@ class FuseOverlayIsolation:
         if not self.parent.exists():
             return
         mounted = _mount_points()
-        for stale in self.parent.glob(f"{self.identity}-*"):
+        for stale in self.parent.iterdir():
             if stale == self.root:
                 continue
             try:
-                pid = int(stale.name.rsplit("-", 1)[1])
+                pid = int(stale.name)
                 os.kill(pid, 0)
             except ProcessLookupError:
                 pass
