@@ -76,6 +76,7 @@ REPORT_SCHEMA: dict[str, Any] = {
 
 LEAN_MCP_BASE_TOOLS = (
     "lean_diagnostic_messages",
+    "lean_prepare_dependencies",
     "lean_hover_info",
     "lean_declaration_file",
     "lean_local_search",
@@ -102,6 +103,7 @@ PROCESS_GROUP_GRACE_SECONDS = 1.0
 COMMON_PROMPT_PATH = Path(__file__).with_name("prompts") / "common.md"
 CAPACITY_RESUME_PROMPT = "Continue from the interrupted turn and complete the assigned task."
 REVIEW_SOURCE_BUNDLE_MAX_CHARS = 500_000
+LEAN_MCP_PREWARM_LIMIT = 4
 
 
 def lean_mcp_executable() -> Path:
@@ -175,6 +177,100 @@ def scoped_files(repo: Path, chapter: Chapter) -> list[Path]:
     for pattern in chapter.scope:
         files.update(path for path in repo.glob(pattern) if path.is_file())
     return sorted(files)
+
+
+def _scoped_maximal_lean_files(
+    repo: Path, chapter: Chapter, lean_project: Path = Path("lean")
+) -> list[Path]:
+    """Return scoped files that no other scoped file imports."""
+
+    files = scoped_files(repo, chapter)
+    lean_root = repo / lean_project
+    modules = {
+        path.relative_to(lean_root).with_suffix("").as_posix().replace("/", "."): path
+        for path in files
+        if path.suffix == ".lean" and path.is_relative_to(lean_root)
+    }
+    imported: set[Path] = set()
+    import_re = re.compile(
+        r"^[ \t]*(?:(?:public|private)[ \t]+)?(?:meta[ \t]+)?"
+        r"import(?:[ \t]+all)?[ \t]+(?P<modules>[^\r\n]+)",
+        re.MULTILINE,
+    )
+    for path in files:
+        if path.suffix != ".lean":
+            continue
+        text = path.read_text(encoding="utf-8", errors="replace")
+        for match in import_re.finditer(text):
+            for module in match.group("modules").split("--", 1)[0].split():
+                if dependency := modules.get(module):
+                    imported.add(dependency)
+    return sorted(set(modules.values()) - imported)
+
+
+def _lean_mcp_prewarm_files(
+    repo: Path,
+    chapter: Chapter,
+    stage: Stage,
+    feedback: str = "",
+    *,
+    lean_project: Path = Path("lean"),
+    limit: int = LEAN_MCP_PREWARM_LIMIT,
+) -> list[str]:
+    """Choose a small, useful file set to elaborate while the agent reads."""
+
+    lean_root = repo / lean_project
+    files = [
+        path
+        for path in scoped_files(repo, chapter)
+        if path.suffix == ".lean" and path.is_relative_to(lean_root)
+    ]
+    if not files or limit <= 0:
+        return []
+
+    def feedback_position(path: Path) -> int | None:
+        positions = [
+            position
+            for relative in (
+                path.relative_to(repo).as_posix(),
+                path.relative_to(lean_root).as_posix(),
+            )
+            if (position := feedback.find(relative)) >= 0
+        ]
+        return min(positions) if positions else None
+
+    candidates: list[Path] = []
+    mentioned = [path for path in files if feedback_position(path) is not None]
+    candidates.extend(sorted(mentioned, key=lambda path: feedback_position(path) or 0))
+    aggregator = lean_root / Path(*chapter.chapter_module.split(".")).with_suffix(".lean")
+    if aggregator in files:
+        candidates.append(aggregator)
+    if stage is Stage.PROVE:
+        candidates.extend(
+            sorted(
+                files,
+                key=lambda path: path.read_text(
+                    encoding="utf-8", errors="replace"
+                ).count("sorry"),
+                reverse=True,
+            )
+        )
+    candidates.extend(
+        path for path in files if path.name in {"Dependencies.lean", "Core.lean"}
+    )
+    candidates.extend(_scoped_maximal_lean_files(repo, chapter, lean_project))
+    candidates.extend(sorted(files, key=lambda path: path.stat().st_size, reverse=True))
+
+    selected: list[str] = []
+    seen: set[Path] = set()
+    for path in candidates:
+        if path in seen:
+            continue
+        seen.add(path)
+        selected.append(path.relative_to(lean_root).as_posix())
+        if len(selected) == limit:
+            break
+    return selected
 
 
 def _review_source_bundle(
@@ -551,11 +647,11 @@ unaffected part of the chapter. {validation_contract}
 """
         if self.config.settings.lean_mcp and stage in (Stage.FIXUP, Stage.REVIEW, Stage.PROVE):
             capabilities = (
-                "whole-file diagnostics, hover, declaration lookup, local search, "
-                "completions, and code actions"
+                "dependency preparation, whole-file diagnostics, hover, declaration lookup, "
+                "local search, completions, and code actions"
                 if stage in (Stage.FIXUP, Stage.REVIEW)
-                else "whole-file diagnostics, goals, hover, declaration lookup, code actions, "
-                "completions, tactic trials, and local search"
+                else "dependency preparation, whole-file diagnostics, goals, hover, declaration "
+                "lookup, code actions, completions, tactic trials, and local search"
             )
             mcp_workflow = {
                 Stage.FIXUP: """The MCP opens and synchronizes a destination file when any Lean tool
@@ -577,6 +673,10 @@ search. Paths passed to its tools are relative to the Lean project root: use `La
 {mcp_workflow}
 The MCP automatically reopens a document with one dependency-build pass only when Lean reports stale
 imports. Do not start another language server or work around stale imports with a compiler command.
+When checking more than one edited file, call `lean_prepare_dependencies` once with only the maximal
+affected dependents (the files in the changed closure that no other changed file imports). This
+warms their complete imported closure with coalesced dependency preparation. Then request the final
+whole-file diagnostics in import order; do not prepare every file separately.
 """
         if feedback:
             feedback_heading = {
@@ -600,6 +700,8 @@ imports. Do not start another language server or work around stale imports with 
         stage: Stage,
         workspace_root: Path | None = None,
         *,
+        chapter: Chapter | None = None,
+        feedback: str = "",
         resume_thread_id: str | None = None,
     ) -> list[str]:
         settings = self.config.settings
@@ -647,6 +749,18 @@ imports. Do not start another language server or work around stale imports with 
                 "mcp_servers.lastlib_lean.env.LEAN_LOG_LEVEL": "NONE",
                 "mcp_servers.lastlib_lean.env.PYTHONWARNINGS": "ignore",
             }
+            if chapter is not None:
+                prewarm_files = _lean_mcp_prewarm_files(
+                    root,
+                    chapter,
+                    stage,
+                    feedback,
+                    lean_project=settings.lean_project,
+                )
+                if prewarm_files:
+                    mcp_config["mcp_servers.lastlib_lean.env.LEAN_MCP_PREWARM_FILES"] = (
+                        ",".join(prewarm_files)
+                    )
             for key, value in mcp_config.items():
                 command.extend(["--config", f"{key}={json.dumps(value)}"])
         if resume_thread_id is not None:
@@ -778,10 +892,21 @@ imports. Do not start another language server or work around stale imports with 
             while True:
                 if resume_attempt:
                     assert thread_id is not None
-                    command = self.command(stage, root, resume_thread_id=thread_id)
+                    command = self.command(
+                        stage,
+                        root,
+                        chapter=chapter,
+                        feedback=feedback,
+                        resume_thread_id=thread_id,
+                    )
                     input_text = CAPACITY_RESUME_PROMPT
                 else:
-                    command = self.command(stage, root)
+                    command = self.command(
+                        stage,
+                        root,
+                        chapter=chapter,
+                        feedback=feedback,
+                    )
                     input_text = prompt
                 exit_code, timed_out, capacity_failure = await invoke(
                     command, input_text, append_log=bool(resume_attempt)

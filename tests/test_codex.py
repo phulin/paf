@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from lastlib_swarm.codex import (
+    LEAN_MCP_PREWARM_LIMIT,
     REPORT_SCHEMA,
     REVIEW_SOURCE_BUNDLE_MAX_CHARS,
     CodexExecutor,
@@ -15,6 +16,7 @@ from lastlib_swarm.codex import (
     _capacity_resume_delay,
     _complete_lines,
     _is_capacity_failure,
+    _lean_mcp_prewarm_files,
     _review_source_bundle,
     _rollout_usage,
     _tail_rollout_usage,
@@ -186,6 +188,9 @@ def test_executor_uses_machine_readable_codex_mode(tmp_path: Path) -> None:
     assert overrides["mcp_servers.lastlib_lean.cwd"] == f'"{isolated / "lean"}"'
     assert json.loads(overrides["mcp_servers.lastlib_lean.env.PATH"]) == lean_mcp_path()
     assert "lean_diagnostic_messages" in overrides["mcp_servers.lastlib_lean.enabled_tools"]
+    assert "lean_prepare_dependencies" in overrides[
+        "mcp_servers.lastlib_lean.enabled_tools"
+    ]
     assert "lean_multi_attempt" in overrides["mcp_servers.lastlib_lean.enabled_tools"]
     assert "lean_file_outline" not in overrides["mcp_servers.lastlib_lean.enabled_tools"]
     assert "lean_build" not in overrides["mcp_servers.lastlib_lean.enabled_tools"]
@@ -202,6 +207,9 @@ def test_executor_uses_machine_readable_codex_mode(tmp_path: Path) -> None:
         if item == "--config"
     }
     assert "lean_diagnostic_messages" in review_overrides[
+        "mcp_servers.lastlib_lean.enabled_tools"
+    ]
+    assert "lean_prepare_dependencies" in review_overrides[
         "mcp_servers.lastlib_lean.enabled_tools"
     ]
     assert "lean_code_actions" in review_overrides["mcp_servers.lastlib_lean.enabled_tools"]
@@ -238,6 +246,49 @@ def test_executor_uses_machine_readable_codex_mode(tmp_path: Path) -> None:
     assert "--cd" not in resumed
     resumed_review = executor.command(Stage.REVIEW, isolated, resume_thread_id="review-thread")
     assert "--dangerously-bypass-approvals-and-sandbox" in resumed_review
+
+
+def test_lean_mcp_prewarms_a_bounded_scoped_priority_set(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = config.chapters[0]
+    chapter_root = tmp_path / "lean" / "Book" / "Chapter01"
+    chapter_root.mkdir(parents=True)
+    aggregator = tmp_path / "lean" / "Book" / "Chapter01.lean"
+    dependency = chapter_root / "Dependencies.lean"
+    proof = chapter_root / "Proof.lean"
+    other = chapter_root / "Other.lean"
+    aggregator.write_text(
+        "import Book.Chapter01.Proof\nimport Book.Chapter01.Other\n",
+        encoding="utf-8",
+    )
+    dependency.write_text("import Mathlib\n", encoding="utf-8")
+    proof.write_text(
+        "import Book.Chapter01.Dependencies\n\ntheorem target : True := by sorry\n",
+        encoding="utf-8",
+    )
+    other.write_text("import Book.Chapter01.Dependencies\n", encoding="utf-8")
+
+    selected = _lean_mcp_prewarm_files(tmp_path, chapter, Stage.PROVE)
+
+    assert len(selected) <= LEAN_MCP_PREWARM_LIMIT
+    assert selected[0] == "Book/Chapter01.lean"
+    assert "Book/Chapter01/Proof.lean" in selected
+
+    command = CodexExecutor(config, StateStore(config)).command(
+        Stage.PROVE,
+        chapter=chapter,
+        feedback="Coordinator diagnostic: lean/Book/Chapter01/Other.lean:1:1",
+    )
+    overrides = {
+        command[index + 1].split("=", 1)[0]: command[index + 1].split("=", 1)[1]
+        for index, item in enumerate(command[:-1])
+        if item == "--config"
+    }
+    prewarm = json.loads(
+        overrides["mcp_servers.lastlib_lean.env.LEAN_MCP_PREWARM_FILES"]
+    ).split(",")
+    assert prewarm[0] == "Book/Chapter01/Other.lean"
+    assert len(prewarm) <= LEAN_MCP_PREWARM_LIMIT
 
 
 @pytest.mark.parametrize("stage", list(Stage))
@@ -463,6 +514,8 @@ def test_fixup_prompt_requires_diagnostics_and_sorry(tmp_path: Path) -> None:
 
     prompt = executor.build_prompt(config.chapters[0], Stage.FIXUP)
     assert "Attached Lean MCP" in prompt
+    assert "lean_prepare_dependencies" in prompt
+    assert "maximal affected dependents" in " ".join(prompt.split())
 
 
 def test_shipped_nonproof_prompts_have_consistent_stage_contracts() -> None:

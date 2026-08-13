@@ -181,17 +181,29 @@ agent/build diagnostics, blocked dependents, and persisted state path to standar
 Every proof attempt receives its own locked
 [`lean-lsp-mcp`](https://github.com/oOo0oOo/lean-lsp-mcp) stdio server, rooted inside the agent's
 private FUSE overlay. It exposes whole-file diagnostics, hover and declaration lookup,
-local source search, proof goals, completions, code actions, and batched tactic trials. Remote search,
-local Loogle, and the MCP's `lean_build` tool remain absent from the allowlist.
+local source search, proof goals, completions, code actions, batched tactic trials, and focused
+dependency preparation. Remote search, local Loogle, and the MCP's general `lean_build` tool remain
+absent from the allowlist.
 
 Proof agents first read and attempt the entire assigned file set without checking each speculative
 proof separately. They then request whole-file diagnostics and iterate only over failing proofs and
-their dependent declarations. Agents never invoke a compiler. After an agent exits, the coordinator
-terminates its MCP/LSP process group, merges accepted scoped changes into the main worktree, and
-enqueues one targeted `lake build +Module`. Merge and build form one serialized transaction, and the
-main worktree's `.lake` is the only writable build cache. The coordinator rejects a successful
-compiler exit if its captured output contains any warning other than the exact “declaration uses
-`sorry`” diagnostic. This check reuses the targeted build and does not launch a second compiler.
+their dependent declarations. The MCP opens files against the certified cache without requesting a
+build and retains warm file workers across ordinary body edits. A stale-import notification,
+stale-import diagnostic, or import-header edit enters one per-server preparation coordinator: it
+serializes the actual `lake setup-file` work through the freshness barrier, retries the query once,
+and lets queued files first test the cache produced by the preceding preparation. Repeated failed
+preparations are suppressed until source or cache state changes.
+
+For a multi-file changed closure, agents prepare only its maximal affected dependents before the
+final import-order diagnostic pass. This builds the imported closure in the fewest Lake invocations;
+preparing every file separately is forbidden. Up to four likely target files are also elaborated in
+the background while the agent performs its initial reading. Agents never invoke a compiler
+directly. After an agent exits, the coordinator terminates its MCP/LSP process group, merges accepted
+scoped changes into the main worktree, and enqueues one targeted `lake build +Module`. Merge and build
+form one serialized transaction, and the main worktree's `.lake` is the only writable build cache.
+The coordinator rejects a successful compiler exit if its captured output contains any warning
+other than the exact “declaration uses `sorry`” diagnostic. This check reuses the targeted build and
+does not launch a second compiler.
 
 An MCP/LSP process exists per active proof attempt, not per queued agent. Its imported `.olean` files come
 from a read-only snapshot of the coordinator cache taken when the attempt starts, while its document
