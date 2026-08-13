@@ -21,6 +21,7 @@ class FakeExecutor(CodexExecutor):
     def __init__(self, state: StateStore, results: list[AgentResult]) -> None:
         self.state = state
         self.results = results
+        self.feedbacks: list[str] = []
 
     async def run(
         self,
@@ -31,7 +32,8 @@ class FakeExecutor(CodexExecutor):
         feedback: str = "",
         workspace_root: Path | None = None,
     ) -> AgentResult:
-        del chapter, stage, feedback, workspace_root
+        del chapter, stage, workspace_root
+        self.feedbacks.append(feedback)
         result = self.results.pop(0)
         await self.state.finish_run(
             run,
@@ -2219,6 +2221,44 @@ async def test_prove_counts_edits_without_fewer_placeholders_as_no_progress(
     assert task.rounds == 3
     assert task.detail == "proof pass stalled with 4 placeholders"
     assert orchestrator.executor.results == []
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_prove_retries_receive_a_cumulative_attempt_ledger(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = config.chapters[0]
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await orchestrator.prepare()
+    orchestrator.executor = FakeExecutor(
+        state,
+        [
+            result(changed=True, placeholders=4, issues=["tried route one"]),
+            result(changed=True, placeholders=3, issues=["tried route two"]),
+            result(changed=False, placeholders=3, issues=["tried route three"]),
+            result(changed=False, placeholders=3),
+        ],
+    )
+
+    async def validation(*_args: object, **_kwargs: object) -> ValidationResult:
+        return ValidationResult(True, 0, "ok")
+
+    monkeypatch.setattr(scheduler_module, "validate", validation)
+
+    assert not await orchestrator._prove(chapter)
+    feedbacks = orchestrator.executor.feedbacks
+    assert feedbacks[0] == ""
+    assert "Proof attempt 1:" in feedbacks[1]
+    assert "tried route one" in feedbacks[1]
+    assert "Proof attempt 1:" in feedbacks[2]
+    assert "Proof attempt 2:" in feedbacks[2]
+    assert "tried route one" in feedbacks[2]
+    assert "tried route two" in feedbacks[2]
+    assert "Proof attempt 3:" in feedbacks[3]
+    assert "tried route three" in feedbacks[3]
     await orchestrator.shutdown()
 
 

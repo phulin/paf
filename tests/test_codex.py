@@ -251,6 +251,33 @@ def test_every_agent_prompt_explains_that_git_is_unavailable(tmp_path: Path, sta
     assert "Do not run `git` commands" in prompt
 
 
+@pytest.mark.parametrize("stage", list(Stage))
+def test_every_agent_prompt_preserves_chronological_imports(
+    tmp_path: Path, stage: Stage
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    executor = CodexExecutor(config, StateStore(config))
+
+    prompt = " ".join(executor.build_prompt(config.chapters[0], stage).split())
+
+    assert "a chapter may import only earlier chapters in the same book" in prompt
+    assert "never a later chapter or later book" in prompt
+
+
+@pytest.mark.parametrize("stage", list(Stage))
+def test_out_of_scope_source_repairs_use_fixup_findings(
+    tmp_path: Path, stage: Stage
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    executor = CodexExecutor(config, StateStore(config))
+
+    prompt = " ".join(executor.build_prompt(config.chapters[0], stage).split())
+
+    assert "If a source repair requires an out-of-scope write" in prompt
+    assert "report it in `fixup_findings` with its exact owner path" in prompt
+    assert "if a fix requires an out-of-scope write, report it in `issues`" not in prompt
+
+
 @pytest.mark.parametrize(
     "event",
     [
@@ -457,8 +484,11 @@ def test_prove_retry_requires_a_distinct_concrete_attempt(tmp_path: Path) -> Non
 
     assert "proof-writing attempt, not an audit" in initial
     assert "do not diagnose untouched files" in initial
-    assert "The preceding feedback counts as the prior inventory" in retry
-    assert "perform a materially different concrete proof experiment" in retry
+    assert "The cumulative attempt ledger appended below is prior inventory" in retry
+    assert "Cumulative proof-attempt ledger" in retry
+    assert "Feedback from the preceding attempt" not in retry
+    assert "refine a previous proof shape using specific new evidence" in retry
+    assert "or perform a materially different concrete experiment" in retry
     assert "instead of another unchanged \"no pinned API\" report" in retry
 
 
@@ -469,10 +499,10 @@ def test_shipped_prove_prompt_prioritizes_implementation_over_reaudit() -> None:
     normalized_prompt = " ".join(prompt.split())
 
     assert "This is an implementation task, not a chapter audit" in prompt
-    assert "use it as the initial inventory instead of repeating a complete read" in (
-        normalized_prompt
-    )
+    assert "the relevant part of chapter {chapter_number} in `{source}`" in normalized_prompt
     assert "An unchanged attempt is acceptable only after" in normalized_prompt
+    assert "Never put a required source edit in `issues`" in normalized_prompt
+    assert "On a retry" not in prompt
     assert "Make one coherent proof-writing pass over the entire assigned file set" not in prompt
 
 

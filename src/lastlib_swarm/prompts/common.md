@@ -17,8 +17,9 @@ Add as many focused Mathlib or stable LastLib imports as the work requires; they
 minimized. Never add the exact umbrella imports `import Mathlib` or `import LastLib`. A production
 section must not import a book or chapter aggregator when a focused module provides the API, and it
 must not import another section merely to mirror prose order. Aggregators may import leaves; leaves
-must not import aggregators. Put genuinely shared chapter interfaces in `Dependencies.lean` or
-`Core.lean` when either exists.
+must not import aggregators. Preserve chronological dependencies: a chapter may import only earlier
+chapters in the same book and chapters from earlier books, never a later chapter or later book. Put
+genuinely shared chapter interfaces in `Dependencies.lean` or `Core.lean` when either exists.
 
 ### Diagnostics and deliverables
 

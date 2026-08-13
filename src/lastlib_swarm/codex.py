@@ -466,11 +466,15 @@ class CodexExecutor:
         proof_retry_contract = ""
         if stage is Stage.PROVE and feedback:
             proof_retry_contract = """
-This is a retry. The preceding feedback counts as the prior inventory, not as a conclusion to echo.
-Do not repeat its full-file reads, clean diagnostics, searches, or unsuccessful proof shape. Select
-one remaining placeholder and perform a materially different concrete proof experiment. If that
-experiment establishes that an earlier declaration or interface must change, return the minimal
-structured `fixup_findings` request instead of another unchanged \"no pinned API\" report."""
+This is a retry. The cumulative attempt ledger appended below is prior inventory, not a conclusion
+to echo. Do not merely repeat its full-file reads, clean diagnostics, searches, or prior proof
+experiments.
+Select one remaining placeholder and either refine a previous proof shape using specific new
+evidence or perform a materially different concrete experiment: search for another earlier theorem,
+unfold the local interface, prove a focused helper, construct the object directly, or change tactic
+structure. If an experiment establishes that an earlier declaration or interface must change,
+return a minimal structured `fixup_findings` request instead of another unchanged
+\"no pinned API\" report."""
         stage_contract = {
             Stage.FORMALIZE: """This is one optimistic drafting attempt. The coordinator merges
 accepted scoped changes without running Lean. Compiler failures are deferred to the global fixup
@@ -519,10 +523,10 @@ This is a hard write boundary: edit only the paths listed above. You may read fi
 context, but do not create, modify, move, delete, format, or otherwise write any path outside this
 scope. In particular, do not edit `.swarm`, `SWARM.md`, repository-level documentation, prompts,
 scripts, orchestration code, configuration, or tests, even if changing them seems useful for this
-task. You may investigate tooling or infrastructure problems and use in-scope workarounds, but if a
-fix requires an out-of-scope write, report it in `issues` instead of making that write. Before
-every edit, verify that its target matches one of the listed scope paths. Any out-of-scope write
-causes the coordinator to reject the entire attempt.
+task. If a source repair requires an out-of-scope write, do not make that edit; report it in
+`fixup_findings` with its exact owner path. Report tooling or infrastructure problems that require
+no source edit in `issues`. Before every edit, verify that its target matches one of the listed
+scope paths. Any out-of-scope write causes the coordinator to reject the entire attempt.
 
 Do not commit and do not wait for another worker.
 Do not run `lake build`, `lake env lean`, raw `lean`, or another compiler command. Builds belong to
@@ -583,8 +587,13 @@ The MCP automatically reopens a document with one dependency-build pass only whe
 imports. Do not start another language server or work around stale imports with a compiler command.
 """
         if feedback:
+            feedback_heading = (
+                "Cumulative proof-attempt ledger"
+                if stage is Stage.PROVE
+                else "Feedback from the preceding attempt"
+            )
             contract += (
-                "\n## Feedback from the preceding attempt\n\n```text\n"
+                f"\n## {feedback_heading}\n\n```text\n"
                 f"{_bounded_feedback(feedback)}\n```\n"
             )
         prefix = ""

@@ -1880,6 +1880,7 @@ class Orchestrator:
             return True
         proof_maximum = self.config.stages[Stage.PROVE].max_rounds
         feedback = ""
+        feedback_ledger: list[str] = []
         stalled_rounds = 0
         previous_placeholders: int | None = None
         for proof_round in range(1, proof_maximum + 1):
@@ -1902,7 +1903,10 @@ class Orchestrator:
                 )
                 return True
 
-            feedback = attempt.feedback()
+            feedback_ledger.append(
+                f"Proof attempt {proof_round}:\n{attempt.feedback()}"
+            )
+            feedback = "\n\n".join(feedback_ledger)
             if bool(attempt.agent.report.get("fixup_findings")):
                 await self.state.set_task(
                     chapter.id,
