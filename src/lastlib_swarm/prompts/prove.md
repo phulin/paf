@@ -17,14 +17,18 @@ imports required by a valid proof are permitted under the common import policy.
 1. Locate the unresolved placeholders. For the proof you are actively attempting, read its
    surrounding declaration and the relevant part of chapter {chapter_number} in `{source}`. Do not
    read the complete book or assigned file set unless the target genuinely requires that context.
-2. Choose a tractable or prerequisite placeholder and work on it concretely. Confirm exact theorem
+2. Use the informal chapter's proof as the default mathematical plan. Translate its intermediate
+   constructions and reductions into Lean whenever they are sound and compatible with pinned APIs.
+   Depart materially from that plan only when Lean's library structure makes another proof
+   substantially clearer or the informal argument omits a necessary step; record the reason.
+3. Choose a tractable or prerequisite placeholder and work on it concretely. Confirm exact theorem
    signatures from source, try candidate terms or tactics, inspect the resulting goal, and iterate.
-3. Keep every clean proof and mathematically reusable helper even when another placeholder remains.
+4. Keep every clean proof and mathematically reusable helper even when another placeholder remains.
    Do not create cosmetic edits or unused scaffolding solely to register a change.
-4. Continue to independent placeholders after a genuine obstruction. Diagnose edited files and
+5. Continue to independent placeholders after a genuine obstruction. Diagnose edited files and
    affected dependents as needed; do not spend time running final diagnostics on untouched files,
    whose incoming build is already certified clean.
-5. An unchanged attempt is acceptable only after at least one concrete, checked proof experiment.
+6. An unchanged attempt is acceptable only after at least one concrete, checked proof experiment.
 
 Prefer, in order, definitional equality, an exact earlier theorem, focused rewriting or
 simplification, a canonical constructor or equivalence, and only then unfolded infrastructure.

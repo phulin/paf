@@ -500,6 +500,8 @@ def test_shipped_prove_prompt_prioritizes_implementation_over_reaudit() -> None:
 
     assert "This is an implementation task, not a chapter audit" in prompt
     assert "the relevant part of chapter {chapter_number} in `{source}`" in normalized_prompt
+    assert "Use the informal chapter's proof as the default mathematical plan" in normalized_prompt
+    assert "record the reason" in normalized_prompt
     assert "An unchanged attempt is acceptable only after" in normalized_prompt
     assert "Never put a required source edit in `issues`" in normalized_prompt
     assert "On a retry" not in prompt
