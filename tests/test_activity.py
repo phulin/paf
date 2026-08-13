@@ -342,7 +342,30 @@ def test_compacts_dependency_paths_in_commands_and_file_changes(tmp_path: Path) 
     )
 
     assert activity.files == ["[Book 5 Chap 7 Dependencies]"]
-    assert activity.recent[-1].title == "editing [Book 5 Chap 7 Dependencies]"
+    assert activity.recent[-1].title == "success"
+    assert activity.recent[-1].detail == ""
+
+
+def test_successful_file_change_only_names_file_when_started(tmp_path: Path) -> None:
+    activity = AgentActivity(run_id="run", chapter_id="chapter", stage="formalize")
+    item = {
+        "id": "edit",
+        "type": "file_change",
+        "changes": [{"path": str(tmp_path / "lean" / "Section.lean"), "kind": "update"}],
+    }
+    activity.consume(
+        {"type": "item.started", "item": {**item, "status": "in_progress"}},
+        workspace_root=tmp_path,
+    )
+    activity.consume(
+        {"type": "item.completed", "item": {**item, "status": "completed"}},
+        workspace_root=tmp_path,
+    )
+
+    started, completed = activity.recent[-2:]
+    assert started.title == "editing lean/Section.lean"
+    assert completed.title == "success"
+    assert completed.detail == ""
 
 
 def test_preserves_the_complete_latest_agent_update(tmp_path: Path) -> None:

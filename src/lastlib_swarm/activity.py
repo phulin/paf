@@ -364,7 +364,13 @@ class AgentActivity:
         result_status = "failed" if failed else "completed"
         if failed and (candidate := reportable_error(error_detail)):
             self.latest_error = candidate
-        completed_title = "done" if item_type == "command_execution" and not failed else title
+        if not failed and item_type == "command_execution":
+            completed_title = "done"
+        elif not failed and item_type == "file_change":
+            completed_title = "success"
+            detail = ""
+        else:
+            completed_title = title
         self._append(
             item_type,
             result_status,
