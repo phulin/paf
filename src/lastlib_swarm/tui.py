@@ -614,7 +614,7 @@ class AgentDetailScreen(Screen[None]):
                 line.append(badge)
                 line.append(f" {entry.title}")
                 if detail:
-                    line.append(f"\n    {detail}")
+                    line.append("\n" + "\n".join(f"    {part}" for part in detail.splitlines()))
             timeline.write(line)
         if activity is None:
             timeline.write("No activity events recorded for this step.")

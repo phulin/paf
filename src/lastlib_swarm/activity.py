@@ -12,6 +12,9 @@ from lastlib_swarm import json_codec as json
 
 MAX_RECENT_EVENTS = 80
 MAX_DETAIL_CHARS = 800
+MAX_PRETTY_STRING_CHARS = 400
+MAX_PRETTY_LIST_ITEMS = 8
+MAX_PRETTY_DICT_ITEMS = 20
 EXIT_STATUS_ONLY = re.compile(r"^exit\s+\d+$", re.IGNORECASE)
 SHELL_COMMAND_WRAPPER = re.compile(r"^/bin/bash\s+-lc\s+(['\"])(.*)\1$", re.DOTALL)
 LEAN_BOOK_PATH = re.compile(
@@ -43,6 +46,13 @@ def activity_timestamp() -> str:
 def _compact(value: str, *, limit: int = MAX_DETAIL_CHARS) -> str:
     value = " ".join(value.split())
     return value if len(value) <= limit else value[: limit - 1] + "…"
+
+
+def _compact_block(value: str, *, limit: int = MAX_DETAIL_CHARS) -> str:
+    """Bound display text without destroying its line-oriented formatting."""
+
+    value = value.strip()
+    return value if len(value) <= limit else value[: limit - 1].rstrip() + "…"
 
 
 def _words(identifier: str) -> str:
@@ -90,6 +100,73 @@ def _result_text(value: Any) -> str:
 
     visit(value)
     return _compact(" ".join(texts))
+
+
+def _json_summary(value: Any) -> Any:
+    """Make large tool payloads useful before pretty-printing them."""
+
+    if isinstance(value, str):
+        if len(value) <= MAX_PRETTY_STRING_CHARS:
+            return value
+        return value[: MAX_PRETTY_STRING_CHARS - 1].rstrip() + "…"
+    if isinstance(value, list):
+        summary = [_json_summary(item) for item in value[:MAX_PRETTY_LIST_ITEMS]]
+        if len(value) > MAX_PRETTY_LIST_ITEMS:
+            summary.append(f"… {len(value) - MAX_PRETTY_LIST_ITEMS} more items")
+        return summary
+    if isinstance(value, dict):
+        items = list(value.items())
+        summary = {str(key): _json_summary(item) for key, item in items[:MAX_PRETTY_DICT_ITEMS]}
+        if len(items) > MAX_PRETTY_DICT_ITEMS:
+            summary["…"] = f"{len(items) - MAX_PRETTY_DICT_ITEMS} more fields"
+        return summary
+    return value
+
+
+def _pretty_value(value: Any) -> str:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            return _compact_block(shorten_book_paths(value))
+    try:
+        rendered = json.dumps(_json_summary(value), indent=2, sort_keys=True)
+    except (TypeError, ValueError):
+        rendered = str(value)
+    return _compact_block(shorten_book_paths(rendered))
+
+
+def _lean_mcp_query(item: dict[str, Any]) -> str:
+    if item.get("server") != "lastlib_lean" or "arguments" not in item:
+        return ""
+    return f"Query:\n{_pretty_value(item['arguments'])}"
+
+
+def _lean_mcp_result(item: dict[str, Any]) -> str:
+    if item.get("server") != "lastlib_lean":
+        return ""
+    result = item.get("result")
+    if isinstance(result, dict) and result.get("structured_content") is not None:
+        value = result["structured_content"]
+        if isinstance(value, dict) and set(value) == {"result"}:
+            value = value["result"]
+    elif result is not None:
+        texts: list[str] = []
+        content = result.get("content") if isinstance(result, dict) else None
+        if isinstance(content, list):
+            texts = [
+                block["text"]
+                for block in content
+                if isinstance(block, dict)
+                and block.get("type") == "text"
+                and isinstance(block.get("text"), str)
+            ]
+        value = "\n".join(texts) if texts else result
+    elif item.get("error") is not None:
+        value = {"error": item["error"]}
+    else:
+        return ""
+    return f"Result:\n{_pretty_value(value)}"
 
 
 def error_signature(message: str) -> str:
@@ -149,7 +226,15 @@ class AgentActivity:
     def todo_progress(self) -> tuple[int, int]:
         return sum(bool(item.get("completed")) for item in self.todos), len(self.todos)
 
-    def _append(self, kind: str, status: str, title: str, detail: str = "") -> None:
+    def _append(
+        self,
+        kind: str,
+        status: str,
+        title: str,
+        detail: str = "",
+        *,
+        preserve_detail_layout: bool = False,
+    ) -> None:
         self.sequence += 1
         self.updated_at = activity_timestamp()
         self.recent.append(
@@ -159,7 +244,7 @@ class AgentActivity:
                 kind=kind,
                 status=status,
                 title=_compact(title, limit=240),
-                detail=_compact(detail),
+                detail=_compact_block(detail) if preserve_detail_layout else _compact(detail),
             )
         )
         del self.recent[:-MAX_RECENT_EVENTS]
@@ -224,14 +309,22 @@ class AgentActivity:
             self.active_items[item_id] = {"kind": item_type, "title": title}
             self.current = title
             self.current_kind = item_type
-            self._append(item_type, "started", title)
+            self._append(
+                item_type,
+                "started",
+                title,
+                detail,
+                preserve_detail_layout=item_type == "mcp_tool_call" and bool(detail),
+            )
             return
         if event_type != "item.completed":
             return
 
+        was_active = item_id in self.active_items
         self.active_items.pop(item_id, None)
         failed = status == "failed"
         error_detail = detail
+        result_detail = ""
         if item_type == "command_execution":
             self.commands += 1
             failed = failed or item.get("exit_code") not in (None, 0)
@@ -244,9 +337,20 @@ class AgentActivity:
             self.mcp_calls += 1
             failed = failed or bool(item.get("error"))
             self.mcp_failures += int(failed)
+            result_detail = _lean_mcp_result(item)
+            if result_detail:
+                if detail and not was_active:
+                    query_detail = _compact_block(detail, limit=360)
+                    result_detail = _compact_block(result_detail, limit=430)
+                    detail = f"{query_detail}\n\n{result_detail}"
+                else:
+                    detail = result_detail
             if failed:
-                detail = _result_text(item.get("result")) or _compact(str(item.get("error", "")))
-                error_detail = detail
+                error_detail = _result_text(item.get("result")) or _compact(
+                    str(item.get("error", ""))
+                )
+                if not detail:
+                    detail = error_detail
         elif item_type == "file_change":
             changes = item.get("changes")
             if isinstance(changes, list):
@@ -261,7 +365,13 @@ class AgentActivity:
         if failed and (candidate := reportable_error(error_detail)):
             self.latest_error = candidate
         completed_title = "done" if item_type == "command_execution" and not failed else title
-        self._append(item_type, result_status, completed_title, detail)
+        self._append(
+            item_type,
+            result_status,
+            completed_title,
+            detail,
+            preserve_detail_layout=item_type == "mcp_tool_call" and bool(result_detail),
+        )
         self._set_current()
 
     def _describe_item(
@@ -275,7 +385,7 @@ class AgentActivity:
         if item_type == "mcp_tool_call":
             server = str(item.get("server", "MCP"))
             tool = str(item.get("tool", "tool"))
-            return f"MCP {server}.{tool}", ""
+            return f"MCP {server}.{tool}", _lean_mcp_query(item)
         if item_type == "file_change":
             changes = item.get("changes")
             paths: list[str] = []

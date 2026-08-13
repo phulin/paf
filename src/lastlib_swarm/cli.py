@@ -844,10 +844,11 @@ def _print_inspection(value: dict[str, Any], console: Console) -> None:
         for entry in recent[-20:]:
             if not isinstance(entry, dict):
                 continue
-            detail = f" — {entry.get('detail')}" if entry.get("detail") else ""
             line = Text(f"{str(entry.get('at', ''))[11:19]} {entry.get('status', '•')} ")
             line.append(activity_kind_badge(str(entry.get("kind", "event"))))
-            line.append(f" {entry.get('title', '')}{detail}")
+            line.append(f" {entry.get('title', '')}")
+            if detail := entry.get("detail"):
+                line.append("\n" + "\n".join(f"    {part}" for part in str(detail).splitlines()))
             console.print(line)
     console.print(f"Raw JSONL: {value['log_path']}")
 

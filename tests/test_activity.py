@@ -117,6 +117,124 @@ def test_summarizes_agent_events_and_persists_compact_activity(tmp_path: Path) -
     assert "active_items" not in persisted
 
 
+def test_pretty_prints_lean_mcp_queries_and_results(tmp_path: Path) -> None:
+    activity = AgentActivity(run_id="run", chapter_id="chapter", stage="prove")
+    arguments = {
+        "file_path": (
+            "LastLib/Book02FiniteExtensionsOfLocalFields/Chapter07/"
+            "Section04FiniteResidueFields.lean"
+        ),
+        "line": 79,
+        "timeout_s": 1800,
+    }
+    started = {
+        "type": "item.started",
+        "item": {
+            "id": "goal",
+            "type": "mcp_tool_call",
+            "server": "lastlib_lean",
+            "tool": "lean_goal",
+            "arguments": arguments,
+            "status": "in_progress",
+        },
+    }
+    activity.consume(started, workspace_root=tmp_path)
+
+    query = activity.recent[-1].detail
+    assert query.startswith("Query:\n{\n")
+    assert '  "file_path": "[Book 2 Chap 7 Sec 4: Finite Residue Fields]"' in query
+    assert '\n  "line": 79,' in query
+
+    activity.consume(
+        {
+            "type": "item.completed",
+            "item": {
+                **started["item"],
+                "status": "completed",
+                "result": {
+                    "content": [{"type": "text", "text": "duplicate content"}],
+                    "structured_content": {
+                        "line_context": "  sorry",
+                        "goals_before": ["x : Nat\n⊢ x = x"],
+                        "goals_after": [],
+                    },
+                },
+            },
+        },
+        workspace_root=tmp_path,
+    )
+
+    detail = activity.recent[-1].detail
+    assert detail.startswith("Result:\n{\n")
+    assert '  "goals_before": [' in detail
+    assert "duplicate content" not in detail
+    assert activity.mcp_calls == 1
+
+
+def test_lean_mcp_result_falls_back_from_null_structured_content(tmp_path: Path) -> None:
+    activity = AgentActivity(run_id="run", chapter_id="chapter", stage="fixup")
+    activity.consume(
+        {
+            "type": "item.completed",
+            "item": {
+                "id": "diagnostics",
+                "type": "mcp_tool_call",
+                "server": "lastlib_lean",
+                "tool": "lean_diagnostic_messages",
+                "arguments": {"file_path": "Broken.lean"},
+                "status": "failed",
+                "error": None,
+                "result": {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "Error executing tool: elaboration failed",
+                        }
+                    ],
+                    "structured_content": None,
+                },
+            },
+        },
+        workspace_root=tmp_path,
+    )
+
+    assert activity.recent[-1].detail.endswith("Result:\nError executing tool: elaboration failed")
+    assert activity.latest_error == "Error executing tool: elaboration failed"
+
+
+def test_large_lean_mcp_query_does_not_hide_result(tmp_path: Path) -> None:
+    activity = AgentActivity(run_id="run", chapter_id="chapter", stage="prove")
+    activity.consume(
+        {
+            "type": "item.completed",
+            "item": {
+                "id": "attempt",
+                "type": "mcp_tool_call",
+                "server": "lastlib_lean",
+                "tool": "lean_multi_attempt",
+                "arguments": {
+                    "file_path": "Proof.lean",
+                    "line": 10,
+                    "snippets": ["exact " + "x" * 500 for _ in range(5)],
+                },
+                "status": "completed",
+                "result": {
+                    "structured_content": {
+                        "items": [{"snippet": "exact h", "proof_status": "complete"}]
+                    }
+                },
+            },
+        },
+        workspace_root=tmp_path,
+    )
+
+    detail = activity.recent[-1].detail
+    assert detail.startswith("Query:\n")
+    assert "\n\nResult:\n" in detail
+    assert '"proof_status": "complete"' in detail
+    assert len(detail) <= 800
+
+
 def test_tracks_parallel_items_until_all_complete(tmp_path: Path) -> None:
     activity = AgentActivity(run_id="run", chapter_id="chapter", stage="formalize")
     for item_id, command in (("one", "first"), ("two", "second")):
