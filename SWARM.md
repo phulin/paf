@@ -198,8 +198,8 @@ preparations are suppressed until source or cache state changes.
 
 For a multi-file changed closure, agents prepare only its maximal affected dependents before the
 final import-order diagnostic pass. This builds the imported closure in the fewest Lake invocations;
-preparing every file separately is forbidden. Up to four likely target files are also elaborated in
-the background while the agent performs its initial reading. Agents never invoke a compiler
+preparing every file separately is forbidden. Files are opened lazily on the first Lean tool call,
+and batched tactic trials use one scratch worker per MCP server. Agents never invoke a compiler
 directly. After an agent exits, the coordinator terminates its MCP/LSP process group and merges
 accepted scoped changes into the main worktree under a short source-consistency barrier. It then
 enqueues one visible targeted `lake build +Module`; only Lake builds acquire the prioritized

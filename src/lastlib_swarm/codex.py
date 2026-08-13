@@ -103,7 +103,6 @@ PROCESS_GROUP_GRACE_SECONDS = 1.0
 COMMON_PROMPT_PATH = Path(__file__).with_name("prompts") / "common.md"
 CAPACITY_RESUME_PROMPT = "Continue from the interrupted turn and complete the assigned task."
 REVIEW_SOURCE_BUNDLE_MAX_CHARS = 500_000
-LEAN_MCP_PREWARM_LIMIT = 4
 
 
 def lean_mcp_executable() -> Path:
@@ -177,100 +176,6 @@ def scoped_files(repo: Path, chapter: Chapter) -> list[Path]:
     for pattern in chapter.scope:
         files.update(path for path in repo.glob(pattern) if path.is_file())
     return sorted(files)
-
-
-def _scoped_maximal_lean_files(
-    repo: Path, chapter: Chapter, lean_project: Path = Path("lean")
-) -> list[Path]:
-    """Return scoped files that no other scoped file imports."""
-
-    files = scoped_files(repo, chapter)
-    lean_root = repo / lean_project
-    modules = {
-        path.relative_to(lean_root).with_suffix("").as_posix().replace("/", "."): path
-        for path in files
-        if path.suffix == ".lean" and path.is_relative_to(lean_root)
-    }
-    imported: set[Path] = set()
-    import_re = re.compile(
-        r"^[ \t]*(?:(?:public|private)[ \t]+)?(?:meta[ \t]+)?"
-        r"import(?:[ \t]+all)?[ \t]+(?P<modules>[^\r\n]+)",
-        re.MULTILINE,
-    )
-    for path in files:
-        if path.suffix != ".lean":
-            continue
-        text = path.read_text(encoding="utf-8", errors="replace")
-        for match in import_re.finditer(text):
-            for module in match.group("modules").split("--", 1)[0].split():
-                if dependency := modules.get(module):
-                    imported.add(dependency)
-    return sorted(set(modules.values()) - imported)
-
-
-def _lean_mcp_prewarm_files(
-    repo: Path,
-    chapter: Chapter,
-    stage: Stage,
-    feedback: str = "",
-    *,
-    lean_project: Path = Path("lean"),
-    limit: int = LEAN_MCP_PREWARM_LIMIT,
-) -> list[str]:
-    """Choose a small, useful file set to elaborate while the agent reads."""
-
-    lean_root = repo / lean_project
-    files = [
-        path
-        for path in scoped_files(repo, chapter)
-        if path.suffix == ".lean" and path.is_relative_to(lean_root)
-    ]
-    if not files or limit <= 0:
-        return []
-
-    def feedback_position(path: Path) -> int | None:
-        positions = [
-            position
-            for relative in (
-                path.relative_to(repo).as_posix(),
-                path.relative_to(lean_root).as_posix(),
-            )
-            if (position := feedback.find(relative)) >= 0
-        ]
-        return min(positions) if positions else None
-
-    candidates: list[Path] = []
-    mentioned = [path for path in files if feedback_position(path) is not None]
-    candidates.extend(sorted(mentioned, key=lambda path: feedback_position(path) or 0))
-    aggregator = lean_root / Path(*chapter.chapter_module.split(".")).with_suffix(".lean")
-    if aggregator in files:
-        candidates.append(aggregator)
-    if stage is Stage.PROVE:
-        candidates.extend(
-            sorted(
-                files,
-                key=lambda path: path.read_text(
-                    encoding="utf-8", errors="replace"
-                ).count("sorry"),
-                reverse=True,
-            )
-        )
-    candidates.extend(
-        path for path in files if path.name in {"Dependencies.lean", "Core.lean"}
-    )
-    candidates.extend(_scoped_maximal_lean_files(repo, chapter, lean_project))
-    candidates.extend(sorted(files, key=lambda path: path.stat().st_size, reverse=True))
-
-    selected: list[str] = []
-    seen: set[Path] = set()
-    for path in candidates:
-        if path in seen:
-            continue
-        seen.add(path)
-        selected.append(path.relative_to(lean_root).as_posix())
-        if len(selected) == limit:
-            break
-    return selected
 
 
 def _review_source_bundle(
@@ -746,21 +651,10 @@ whole-file diagnostics in import order; do not prepare every file separately.
                 "mcp_servers.lastlib_lean.enabled_tools": list(enabled_tools),
                 "mcp_servers.lastlib_lean.env.PATH": lean_mcp_path(),
                 "mcp_servers.lastlib_lean.env.LEAN_PROJECT_PATH": str(lean_project),
+                "mcp_servers.lastlib_lean.env.LEAN_MCP_SCRATCH_SLOTS": "1",
                 "mcp_servers.lastlib_lean.env.LEAN_LOG_LEVEL": "NONE",
                 "mcp_servers.lastlib_lean.env.PYTHONWARNINGS": "ignore",
             }
-            if chapter is not None:
-                prewarm_files = _lean_mcp_prewarm_files(
-                    root,
-                    chapter,
-                    stage,
-                    feedback,
-                    lean_project=settings.lean_project,
-                )
-                if prewarm_files:
-                    mcp_config["mcp_servers.lastlib_lean.env.LEAN_MCP_PREWARM_FILES"] = (
-                        ",".join(prewarm_files)
-                    )
             for key, value in mcp_config.items():
                 command.extend(["--config", f"{key}={json.dumps(value)}"])
         if resume_thread_id is not None:

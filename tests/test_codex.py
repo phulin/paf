@@ -8,7 +8,6 @@ from pathlib import Path
 import pytest
 
 from lastlib_swarm.codex import (
-    LEAN_MCP_PREWARM_LIMIT,
     REPORT_SCHEMA,
     REVIEW_SOURCE_BUNDLE_MAX_CHARS,
     CodexExecutor,
@@ -16,7 +15,6 @@ from lastlib_swarm.codex import (
     _capacity_resume_delay,
     _complete_lines,
     _is_capacity_failure,
-    _lean_mcp_prewarm_files,
     _review_source_bundle,
     _rollout_usage,
     _tail_rollout_usage,
@@ -187,6 +185,10 @@ def test_executor_uses_machine_readable_codex_mode(tmp_path: Path) -> None:
     ]
     assert overrides["mcp_servers.lastlib_lean.cwd"] == f'"{isolated / "lean"}"'
     assert json.loads(overrides["mcp_servers.lastlib_lean.env.PATH"]) == lean_mcp_path()
+    assert json.loads(
+        overrides["mcp_servers.lastlib_lean.env.LEAN_MCP_SCRATCH_SLOTS"]
+    ) == "1"
+    assert "mcp_servers.lastlib_lean.env.LEAN_MCP_PREWARM_FILES" not in overrides
     assert "lean_diagnostic_messages" in overrides["mcp_servers.lastlib_lean.enabled_tools"]
     assert "lean_prepare_dependencies" in overrides[
         "mcp_servers.lastlib_lean.enabled_tools"
@@ -248,7 +250,7 @@ def test_executor_uses_machine_readable_codex_mode(tmp_path: Path) -> None:
     assert "--dangerously-bypass-approvals-and-sandbox" in resumed_review
 
 
-def test_lean_mcp_prewarms_a_bounded_scoped_priority_set(tmp_path: Path) -> None:
+def test_lean_mcp_does_not_prewarm_files(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
     chapter = config.chapters[0]
     chapter_root = tmp_path / "lean" / "Book" / "Chapter01"
@@ -268,12 +270,6 @@ def test_lean_mcp_prewarms_a_bounded_scoped_priority_set(tmp_path: Path) -> None
     )
     other.write_text("import Book.Chapter01.Dependencies\n", encoding="utf-8")
 
-    selected = _lean_mcp_prewarm_files(tmp_path, chapter, Stage.PROVE)
-
-    assert len(selected) <= LEAN_MCP_PREWARM_LIMIT
-    assert selected[0] == "Book/Chapter01.lean"
-    assert "Book/Chapter01/Proof.lean" in selected
-
     command = CodexExecutor(config, StateStore(config)).command(
         Stage.PROVE,
         chapter=chapter,
@@ -284,11 +280,10 @@ def test_lean_mcp_prewarms_a_bounded_scoped_priority_set(tmp_path: Path) -> None
         for index, item in enumerate(command[:-1])
         if item == "--config"
     }
-    prewarm = json.loads(
-        overrides["mcp_servers.lastlib_lean.env.LEAN_MCP_PREWARM_FILES"]
-    ).split(",")
-    assert prewarm[0] == "Book/Chapter01/Other.lean"
-    assert len(prewarm) <= LEAN_MCP_PREWARM_LIMIT
+    assert "mcp_servers.lastlib_lean.env.LEAN_MCP_PREWARM_FILES" not in overrides
+    assert json.loads(
+        overrides["mcp_servers.lastlib_lean.env.LEAN_MCP_SCRATCH_SLOTS"]
+    ) == "1"
 
 
 @pytest.mark.parametrize("stage", list(Stage))
