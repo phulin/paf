@@ -477,6 +477,9 @@ def test_prove_retry_requires_a_distinct_concrete_attempt(tmp_path: Path) -> Non
     assert "Feedback from the preceding attempt" not in retry
     assert "refine a previous proof shape using specific new evidence" in retry
     assert "or perform a materially different concrete experiment" in retry
+    assert "Persist through several checked approaches" in retry
+    assert "Add and prove focused local or private helper lemmas" in retry
+    assert "Stop only after sustained concrete work" in retry
     assert "instead of another unchanged \"no pinned API\" report" in retry
 
 
@@ -490,7 +493,13 @@ def test_shipped_prove_prompt_prioritizes_implementation_over_reaudit() -> None:
     assert "the relevant part of chapter {chapter_number} in `{source}`" in normalized_prompt
     assert "Use the informal chapter's proof as the default mathematical plan" in normalized_prompt
     assert "record the reason" in normalized_prompt
-    assert "An unchanged attempt is acceptable only after" in normalized_prompt
+    assert "Be tenacious" in normalized_prompt
+    assert "A difficult proof is the work of this stage" in normalized_prompt
+    assert "You may add focused local or private helper lemmas" in normalized_prompt
+    assert "try several materially different proof shapes" in normalized_prompt
+    assert "Give up on a target only after sustained concrete effort" in normalized_prompt
+    assert "specific mathematical argument" in normalized_prompt
+    assert "A thin attempt does not become acceptable merely by documenting it" in normalized_prompt
     assert "Never put a required source edit in `issues`" in normalized_prompt
     assert "On a retry" not in prompt
     assert "Make one coherent proof-writing pass over the entire assigned file set" not in prompt

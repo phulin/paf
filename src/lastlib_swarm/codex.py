@@ -472,9 +472,12 @@ experiments.
 Select one remaining placeholder and either refine a previous proof shape using specific new
 evidence or perform a materially different concrete experiment: search for another earlier theorem,
 unfold the local interface, prove a focused helper, construct the object directly, or change tactic
-structure. If an experiment establishes that an earlier declaration or interface must change,
-return a minimal structured `fixup_findings` request instead of another unchanged
-\"no pinned API\" report."""
+structure. Persist through several checked approaches; a retry is not exhausted by one new failed
+tactic. Add and prove focused local or private helper lemmas when they unlock the result. Stop only
+after sustained concrete work exposes the same hard obstruction, or after a specific mathematical
+argument shows that the statement cannot follow from its assumptions. If the latter establishes
+that an earlier declaration or interface must change, return a minimal structured `fixup_findings`
+request instead of another unchanged \"no pinned API\" report."""
         stage_contract = {
             Stage.FORMALIZE: """This is one optimistic drafting attempt. The coordinator merges
 accepted scoped changes without running Lean. Compiler failures are deferred to the global fixup
