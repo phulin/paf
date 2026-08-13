@@ -12,9 +12,13 @@ from lastlib_swarm.models import Stage
 from lastlib_swarm.scheduler import Orchestrator
 from lastlib_swarm.state import StateStore, TaskPhase, TaskStatus, TokenUsage
 from lastlib_swarm.tui import (
+    ACTIVITY_KIND_ALIASES,
+    ACTIVITY_KIND_DISPLAYS,
     TUI_THEME,
     AgentDetailScreen,
     SwarmApp,
+    activity_kind_badge,
+    activity_kind_display,
     format_agent_update,
     format_count,
     format_usage,
@@ -22,6 +26,44 @@ from lastlib_swarm.tui import (
     task_mark,
 )
 from tests.support import write_project
+
+
+def test_activity_kinds_have_short_unique_labels_and_colors() -> None:
+    expected_labels = {
+        "agent": "agent",
+        "usage": "tokens",
+        "todo": "plan",
+        "message": "msg",
+        "reasoning": "think",
+        "command_execution": "bash",
+        "file_change": "edit",
+        "mcp_tool_call": "mcp",
+        "collab_tool_call": "swarm",
+        "web_search": "web",
+        "error": "error",
+        "context_compaction": "compact",
+    }
+
+    assert {kind: activity_kind_display(kind).label for kind in expected_labels} == expected_labels
+    assert len({value.label for value in ACTIVITY_KIND_DISPLAYS.values()}) == len(
+        ACTIVITY_KIND_DISPLAYS
+    )
+    assert len({value.color for value in ACTIVITY_KIND_DISPLAYS.values()}) == len(
+        ACTIVITY_KIND_DISPLAYS
+    )
+    assert set(ACTIVITY_KIND_ALIASES.values()) <= set(ACTIVITY_KIND_DISPLAYS)
+    assert activity_kind_display("compaction") == activity_kind_display("context_compaction")
+
+    badge = activity_kind_badge("command_execution")
+    assert badge.plain == "[bash]"
+    assert "#2ac3de" in str(badge.style)
+
+
+def test_unknown_activity_kind_gets_a_bounded_neutral_badge() -> None:
+    display = activity_kind_display("future_extremely_long_event_kind")
+
+    assert display.label == "future-extr…"
+    assert display.color == "#a9b1d6"
 
 
 def test_formats_measured_token_spend_without_double_counting_cache() -> None:
@@ -302,6 +344,11 @@ async def test_selected_chapter_opens_live_agent_detail(tmp_path: Path) -> None:
         summary = app.screen.query_one("#agent-summary", RichLog)
         assert summary.max_lines is None
         assert "END OF UPDATE" in "".join(line.text for line in summary.lines)
+        timeline = app.screen.query_one("#agent-timeline", RichLog)
+        rendered_timeline = "\n".join(line.text for line in timeline.lines)
+        assert "[mcp]" in rendered_timeline
+        assert "[msg]" in rendered_timeline
+        assert "[mcp_tool_call]" not in rendered_timeline
 
         await pilot.press("escape")
         assert app.check_action("inspect_agent", ()) is True

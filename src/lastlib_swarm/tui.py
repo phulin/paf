@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, ClassVar
 
+from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal
 from textual.screen import Screen
@@ -33,6 +34,63 @@ from lastlib_swarm.scheduler import Orchestrator
 from lastlib_swarm.state import RunRecord, StateStore, TaskPhase, TaskRecord, TaskStatus, TokenUsage
 
 TUI_THEME = "ansi-dark"
+
+
+@dataclass(frozen=True)
+class ActivityKindDisplay:
+    label: str
+    color: str
+
+
+# Keep labels narrow enough for the timeline and colors distinct so a scan down
+# the log makes changes in activity immediately visible.  This includes the
+# current Codex item kinds plus newer protocol kinds that older sidecars may not
+# contain yet.
+ACTIVITY_KIND_DISPLAYS = {
+    "agent": ActivityKindDisplay("agent", "#7aa2f7"),
+    "usage": ActivityKindDisplay("tokens", "#bb9af7"),
+    "todo": ActivityKindDisplay("plan", "#e0af68"),
+    "message": ActivityKindDisplay("msg", "#7dcfff"),
+    "reasoning": ActivityKindDisplay("think", "#9d7cd8"),
+    "command_execution": ActivityKindDisplay("bash", "#2ac3de"),
+    "file_change": ActivityKindDisplay("edit", "#9ece6a"),
+    "mcp_tool_call": ActivityKindDisplay("mcp", "#f7768e"),
+    "collab_tool_call": ActivityKindDisplay("swarm", "#ff9e64"),
+    "web_search": ActivityKindDisplay("web", "#73daca"),
+    "error": ActivityKindDisplay("error", "#db4b4b"),
+    "context_compaction": ActivityKindDisplay("compact", "#c0caf5"),
+    "dynamic_tool_call": ActivityKindDisplay("tool", "#b4f9f8"),
+    "image_generation": ActivityKindDisplay("image", "#e0aaff"),
+    "image_view": ActivityKindDisplay("view", "#fca7ea"),
+    "sub_agent_activity": ActivityKindDisplay("subagent", "#c3e88d"),
+    "hook_prompt": ActivityKindDisplay("hook", "#ffc777"),
+    "entered_review_mode": ActivityKindDisplay("review+", "#89ddff"),
+    "exited_review_mode": ActivityKindDisplay("review-", "#82aaff"),
+    "user_message": ActivityKindDisplay("user", "#f78c6c"),
+    "extension": ActivityKindDisplay("ext", "#c792ea"),
+}
+
+# Protocol versions have used both of these spellings for the same concepts.
+ACTIVITY_KIND_ALIASES = {
+    "collab_agent_tool_call": "collab_tool_call",
+    "compaction": "context_compaction",
+}
+
+
+def activity_kind_display(kind: str) -> ActivityKindDisplay:
+    canonical = ACTIVITY_KIND_ALIASES.get(kind, kind)
+    if display := ACTIVITY_KIND_DISPLAYS.get(canonical):
+        return display
+    label = kind.replace("_", "-")
+    if len(label) > 12:
+        label = f"{label[:11]}…"
+    return ActivityKindDisplay(label or "event", "#a9b1d6")
+
+
+def activity_kind_badge(kind: str) -> Text:
+    display = activity_kind_display(kind)
+    return Text(f"[{display.label}]", style=f"bold {display.color}")
+
 
 STATUS_MARKS = {
     TaskStatus.PENDING: "· pending",
@@ -522,13 +580,19 @@ class AgentDetailScreen(Screen[None]):
         timeline = self.query_one("#agent-timeline", RichLog)
         timeline.clear()
         marks = {"started": "▶", "completed": "✓", "failed": "✗", "updated": "•"}
-        latest_message = max(
-            (entry.sequence for entry in activity.recent if entry.kind == "message"),
-            default=None,
-        ) if activity else None
+        latest_message = (
+            max(
+                (entry.sequence for entry in activity.recent if entry.kind == "message"),
+                default=None,
+            )
+            if activity
+            else None
+        )
         for entry in activity.recent if activity else ():
             clock = entry.at[11:19] if len(entry.at) >= 19 else entry.at
-            line = f"{clock} {marks.get(entry.status, '•')} [{entry.kind}] {entry.title}"
+            prefix = f"{clock} {marks.get(entry.status, '•')} "
+            badge = activity_kind_badge(entry.kind)
+            heading = f"{prefix}{badge.plain} {entry.title}"
             detail = (
                 activity.latest_summary
                 if activity is not None
@@ -537,14 +601,20 @@ class AgentDetailScreen(Screen[None]):
                 else entry.detail
             )
             if entry.kind == "message" and parse_agent_update(detail) is not None:
-                line = format_agent_update(
+                rendered = format_agent_update(
                     detail,
-                    heading=line,
+                    heading=heading,
                     width=timeline.content_size.width,
                     indent="    ",
                 )
-            elif detail:
-                line += f"\n    {detail}"
+                line = Text(rendered)
+                line.stylize(badge.style, len(prefix), len(prefix) + len(badge))
+            else:
+                line = Text(prefix)
+                line.append(badge)
+                line.append(f" {entry.title}")
+                if detail:
+                    line.append(f"\n    {detail}")
             timeline.write(line)
         if activity is None:
             timeline.write("No activity events recorded for this step.")

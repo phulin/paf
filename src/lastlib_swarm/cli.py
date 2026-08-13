@@ -14,6 +14,7 @@ from typing import Any
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
+from rich.text import Text
 
 from lastlib_swarm import json_codec as json
 from lastlib_swarm.activity import ActivityStore, reportable_error
@@ -36,7 +37,7 @@ from lastlib_swarm.pricing import LEGACY_MODEL, CostEstimate, estimate_cost, for
 from lastlib_swarm.scheduler import Orchestrator, scaffold_directories
 from lastlib_swarm.state import StateStore, TaskRecord, TaskStatus
 from lastlib_swarm.state_db import read_checkpoint, read_full_snapshot
-from lastlib_swarm.tui import format_count, format_usage, run_tui
+from lastlib_swarm.tui import activity_kind_badge, format_count, format_usage, run_tui
 
 RIPGREP_WARNING = (
     "ripgrep (`rg`) was not found on PATH. Swarm agents rely on fast source search and may be "
@@ -844,10 +845,10 @@ def _print_inspection(value: dict[str, Any], console: Console) -> None:
             if not isinstance(entry, dict):
                 continue
             detail = f" — {entry.get('detail')}" if entry.get("detail") else ""
-            console.print(
-                f"{str(entry.get('at', ''))[11:19]} {entry.get('status', '•')} "
-                f"[{entry.get('kind', 'event')}] {entry.get('title', '')}{detail}"
-            )
+            line = Text(f"{str(entry.get('at', ''))[11:19]} {entry.get('status', '•')} ")
+            line.append(activity_kind_badge(str(entry.get("kind", "event"))))
+            line.append(f" {entry.get('title', '')}{detail}")
+            console.print(line)
     console.print(f"Raw JSONL: {value['log_path']}")
 
 
