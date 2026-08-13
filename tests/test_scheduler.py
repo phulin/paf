@@ -129,6 +129,40 @@ async def test_invocation_usage_excludes_persisted_attempts(tmp_path: Path) -> N
 
 
 @pytest.mark.asyncio
+async def test_usage_and_cost_aggregates_cache_all_chapters_in_one_pass(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    state = StateStore(config)
+    await state.load_or_create()
+    first, second = config.chapters
+    first_run = await state.start_run(first.id, Stage.FORMALIZE)
+    second_run = await state.start_run(second.id, Stage.FORMALIZE)
+    await state.update_run(
+        first_run,
+        usage=TokenUsage(input_tokens=100, output_tokens=20, measured=True),
+    )
+    await state.update_run(
+        second_run,
+        usage=TokenUsage(input_tokens=200, output_tokens=40, measured=True),
+    )
+
+    assert state.invocation_usage().total_tokens == 360
+    assert state.invocation_usage(first.id).total_tokens == 120
+    assert state.invocation_usage(second.id).total_tokens == 240
+    total_cost = state.invocation_cost().estimated_usd
+    assert state.invocation_cost(first.id).estimated_usd == pytest.approx(total_cost / 3)
+    assert state.invocation_cost(second.id).estimated_usd == pytest.approx(2 * total_cost / 3)
+
+    await state.update_run(
+        first_run,
+        usage=TokenUsage(input_tokens=150, output_tokens=30, measured=True),
+    )
+
+    assert state.invocation_usage().total_tokens == 420
+    assert state.invocation_usage(first.id).total_tokens == 180
+    assert state.invocation_usage(second.id).total_tokens == 240
+
+
+@pytest.mark.asyncio
 async def test_state_migrates_legacy_repair_tasks_to_fixup(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
     chapter = config.chapters[0]

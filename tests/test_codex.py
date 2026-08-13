@@ -13,9 +13,11 @@ from lastlib_swarm.codex import (
     CodexExecutor,
     _bounded_feedback,
     _capacity_resume_delay,
+    _complete_lines,
     _is_capacity_failure,
     _review_source_bundle,
     _rollout_usage,
+    _tail_rollout_usage,
     count_placeholders,
     lean_mcp_executable,
     lean_mcp_path,
@@ -78,6 +80,62 @@ def test_extracts_live_rollout_usage() -> None:
     assert usage is not None
     assert usage.total_tokens == 425
     assert usage.cached_input_tokens == 300
+
+
+def test_frames_complete_lines_without_discarding_a_partial_record() -> None:
+    pending = bytearray(b'{"first":')
+
+    lines = _complete_lines(pending, b'1}\n{"second":2}\n{"third":')
+
+    assert lines == (b'{"first":1}', b'{"second":2}')
+    assert pending == b'{"third":'
+
+
+@pytest.mark.asyncio
+async def test_rollout_tail_skips_large_non_usage_records_before_json_decode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from lastlib_swarm import codex as codex_module
+
+    rollout = tmp_path / "rollout.jsonl"
+    irrelevant = b'{"type":"response_item","payload":"' + b"x" * (2 * 1024 * 1024) + b'"}\n'
+    token_count = json.dumps(
+        {
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "total_token_usage": {
+                        "input_tokens": 400,
+                        "cached_input_tokens": 300,
+                        "output_tokens": 25,
+                    }
+                },
+            },
+        }
+    ).encode()
+    rollout.write_bytes(irrelevant + token_count + b"\n")
+    decoded_sizes: list[int] = []
+    original_loads = codex_module.json.loads
+
+    def recording_loads(value: bytes) -> object:
+        decoded_sizes.append(len(value))
+        return original_loads(value)
+
+    monkeypatch.setattr(codex_module, "_codex_rollout", lambda _thread_id: rollout)
+    monkeypatch.setattr(codex_module.json, "loads", recording_loads)
+    monkeypatch.setattr(codex_module, "USAGE_POLL_SECONDS", 0)
+    stop = asyncio.Event()
+    updates: list[TokenUsage] = []
+
+    async def update(usage: TokenUsage) -> None:
+        updates.append(usage)
+        stop.set()
+
+    await _tail_rollout_usage("thread", stop, update)
+
+    assert [usage.total_tokens for usage in updates] == [425]
+    assert decoded_sizes == [len(token_count)]
 
 
 def test_counts_only_lean_code_placeholders(tmp_path: Path) -> None:

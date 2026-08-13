@@ -96,7 +96,8 @@ LEAN_MCP_FIXUP_TOOLS = (
     "lean_code_actions",
 )
 
-USAGE_POLL_SECONDS = 0.25
+USAGE_POLL_SECONDS = 1.0
+ROLLOUT_READ_BYTES = 1024 * 1024
 PROCESS_GROUP_GRACE_SECONDS = 1.0
 COMMON_PROMPT_PATH = Path(__file__).with_name("prompts") / "common.md"
 CAPACITY_RESUME_PROMPT = "Continue from the interrupted turn and complete the assigned task."
@@ -366,6 +367,20 @@ def _rollout_usage(event: Any) -> TokenUsage | None:
     return TokenUsage.from_event(info.get("total_token_usage"))
 
 
+def _complete_lines(pending: bytearray, chunk: bytes) -> tuple[bytes, ...]:
+    """Append a chunk and remove complete lines without repeatedly shifting the buffer."""
+
+    pending.extend(chunk)
+    lines: list[bytes] = []
+    start = 0
+    while (newline := pending.find(b"\n", start)) >= 0:
+        lines.append(bytes(pending[start:newline]))
+        start = newline + 1
+    if start:
+        del pending[:start]
+    return tuple(lines)
+
+
 def _codex_rollout(thread_id: str) -> Path | None:
     codex_home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
     sessions = codex_home / "sessions"
@@ -387,31 +402,41 @@ async def _tail_rollout_usage(
     offset = 0
     pending = bytearray()
     while True:
+        chunk = b""
         if path is None:
             path = await asyncio.to_thread(_codex_rollout, thread_id)
         if path is not None:
             try:
                 with path.open("rb") as handle:
                     handle.seek(offset)
-                    chunk = handle.read()
+                    # Rollouts contain full tool results as well as tiny token-count
+                    # records. Bound each synchronous read so a burst from many agents
+                    # cannot monopolize the TUI's event loop.
+                    chunk = handle.read(ROLLOUT_READ_BYTES)
                     offset = handle.tell()
             except (FileNotFoundError, OSError):
                 path = None
                 offset = 0
                 pending.clear()
             else:
-                pending.extend(chunk)
-                while (newline := pending.find(b"\n")) >= 0:
-                    line = bytes(pending[:newline])
-                    del pending[: newline + 1]
+                for line in _complete_lines(pending, chunk):
+                    # Token accounting does not need to decode the much larger tool,
+                    # message, and reasoning records duplicated in the rollout.
+                    if b'"token_count"' not in line:
+                        continue
                     try:
                         event = json.loads(line)
                     except (json.JSONDecodeError, UnicodeDecodeError):
                         continue
                     if usage := _rollout_usage(event):
                         await update(usage)
-        if stop.is_set():
+        if stop.is_set() and (path is None or len(chunk) < ROLLOUT_READ_BYTES):
             return
+        if len(chunk) == ROLLOUT_READ_BYTES:
+            # Catch up on a large or resumed rollout one bounded chunk at a time,
+            # explicitly giving terminal input and render callbacks a turn between them.
+            await asyncio.sleep(0)
+            continue
         with suppress(TimeoutError):
             await asyncio.wait_for(stop.wait(), timeout=USAGE_POLL_SECONDS)
 
@@ -705,10 +730,7 @@ imports. Do not start another language server or work around stale imports with 
                     # fixed-size chunks instead, without imposing an artificial line cap.
                     while chunk := await stdout.read(64 * 1024):
                         log.write(chunk)
-                        pending.extend(chunk)
-                        while (newline := pending.find(b"\n")) >= 0:
-                            line = bytes(pending[:newline])
-                            del pending[: newline + 1]
+                        for line in _complete_lines(pending, chunk):
                             await consume_line(line)
                     if pending:
                         await consume_line(bytes(pending))

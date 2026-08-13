@@ -631,46 +631,53 @@ class StateStore:
         return issue_ids
 
     def total_usage(self) -> TokenUsage:
-        key = (False, None)
-        if key in self._usage_cache:
-            return self._usage_cache[key]
-        total = TokenUsage()
-        for task in self.tasks.values():
-            for run in task.runs:
-                total += run.usage
-        self._usage_cache[key] = total
-        return total
+        return self._usage(invocation_only=False)
 
     def invocation_usage(self, chapter_id: str | None = None) -> TokenUsage:
         """Usage from attempts created by this orchestrator invocation."""
 
-        key = (True, chapter_id)
+        return self._usage(invocation_only=True, chapter_id=chapter_id)
+
+    def _usage(self, *, invocation_only: bool, chapter_id: str | None = None) -> TokenUsage:
+        key = (invocation_only, chapter_id)
         if key in self._usage_cache:
             return self._usage_cache[key]
-        total = TokenUsage()
-        for task in self.tasks.values():
-            if chapter_id is not None and task.chapter_id != chapter_id:
+
+        by_chapter = {chapter.id: TokenUsage() for chapter in self.config.chapters}
+        for run in self._runs_by_id.values():
+            if invocation_only and run.id in self._prior_run_ids:
                 continue
-            for run in task.runs:
-                if run.id not in self._prior_run_ids:
-                    total += run.usage
-        self._usage_cache[key] = total
-        return total
+            by_chapter[run.chapter_id] += run.usage
+        total = TokenUsage()
+        for usage in by_chapter.values():
+            total += usage
+
+        self._usage_cache[(invocation_only, None)] = total
+        self._usage_cache.update(
+            ((invocation_only, item), usage) for item, usage in by_chapter.items()
+        )
+        return self._usage_cache.get(key, TokenUsage())
 
     def _cost(self, *, invocation_only: bool, chapter_id: str | None = None) -> CostEstimate:
         key = (invocation_only, chapter_id)
         if key in self._cost_cache:
             return self._cost_cache[key]
-        total = CostEstimate()
-        for task in self.tasks.values():
-            if chapter_id is not None and task.chapter_id != chapter_id:
+
+        by_chapter = {chapter.id: CostEstimate() for chapter in self.config.chapters}
+        for run in self._runs_by_id.values():
+            if invocation_only and run.id in self._prior_run_ids:
                 continue
-            for run in task.runs:
-                if invocation_only and run.id in self._prior_run_ids:
-                    continue
-                total += self.run_cost(run)
-        self._cost_cache[key] = total
-        return total
+            cost = self.run_cost(run)
+            by_chapter[run.chapter_id] += cost
+        total = CostEstimate()
+        for cost in by_chapter.values():
+            total += cost
+
+        self._cost_cache[(invocation_only, None)] = total
+        self._cost_cache.update(
+            ((invocation_only, item), cost) for item, cost in by_chapter.items()
+        )
+        return self._cost_cache.get(key, CostEstimate())
 
     def run_cost(self, run: RunRecord) -> CostEstimate:
         if not run.usage.measured:
