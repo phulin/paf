@@ -43,6 +43,12 @@ the coordinator batches the remaining dependency-ready chapters into subsequent 
 instead of verifying them one by one; unrelated agents keep running and a successful repair build
 immediately releases its review while fixup continues on other dependency-ready chapters. The final
 stable verification is likewise one grouped Lake invocation.
+All later coordinator checks use the same coalescer: fixup, review, proof refresh, and proof
+certification requests that are pending together contribute targets to one Lake command, even
+across stages. The highest-priority request supplies the batch priority, and any non-preemptible
+request makes the shared command non-preemptible. If the command fails, diagnostics are routed to
+their owning chapters and affected import descendants while independent targets are retried as one
+smaller batch and retain their successful certificates.
 A review starts once its own fixup is clean and all of its observed dependencies have been reviewed;
 there is no corpus-wide barrier between fixup and review. The coordinator remembers the source and
 dependency digests of successful builds so it can avoid rebuilding unchanged chapters. Review has
@@ -51,9 +57,9 @@ succeeded; explicit review findings, proof-requested statement/API repairs, and 
 only the reviews that receive findings. Reviewers directly make scoped statement and API repairs.
 If a review edits source, transitive build certificates are invalidated and downstream proofs are
 kept green when a fresh coordinator build still succeeds. Fixup ends once the initial post-draft
-build has converged. Each dependency-ready chapter
-receives a prioritized coordinator verification build after a changed review; failures and structured
-findings return to review with the diagnostics attached. After at most five
+build has converged. Dependency-ready chapters receive prioritized, coalesced coordinator
+verification after changed reviews; failures and structured findings return to review with the
+diagnostics attached. After at most five
 such cycles—or immediately after a no-change review—the chapter is
 released to proving without waiting for reviews of its descendants.
 Every review prompt begins with the complete informal book and assigned Lean file set in path order

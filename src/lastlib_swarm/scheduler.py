@@ -99,6 +99,20 @@ class ValidatedBuildSnapshot:
     source_digests: dict[str, str]
 
 
+@dataclass(frozen=True)
+class PendingBuildRequest:
+    chapters: tuple[Chapter, ...]
+    publish_if_clean: bool
+    mode: str
+    iteration: int
+    maximum_iterations: int
+    stage: Stage
+    priority: float
+    preemptible: bool
+    snapshots: dict[str, ValidatedBuildSnapshot] | None
+    future: asyncio.Future[dict[str, ValidationResult]]
+
+
 @dataclass
 class RunningFixupAgent:
     chapter: Chapter
@@ -143,6 +157,7 @@ LAKE_CONTROL_PREFIXES = (
 )
 PROOF_FEEDBACK_MAX_CHARS = 24_000
 PROOF_FEEDBACK_ROUNDS = 3
+BUILD_COALESCE_SECONDS = 0.01
 
 
 def _bounded_proof_feedback(blocks: Iterable[str]) -> str:
@@ -301,6 +316,9 @@ class Orchestrator:
         self.state.scheduling = self.scheduling_snapshot()
         self.agent_slots = PriorityLimiter(config.settings.max_agents)
         self.build_queue = CoordinatorBuildQueue()
+        self._pending_build_requests: list[PendingBuildRequest] = []
+        self._build_dispatch_task: asyncio.Task[None] | None = None
+        self._build_batch_tasks: set[asyncio.Task[None]] = set()
         # Snapshot creation and scoped source integration need a short
         # consistency barrier with main-worktree builds. Unlike build_queue,
         # this lock is never held for an overlay agent's editing lifetime or
@@ -332,6 +350,18 @@ class Orchestrator:
 
     async def shutdown(self) -> None:
         try:
+            if self._build_dispatch_task is not None:
+                self._build_dispatch_task.cancel()
+                await asyncio.gather(self._build_dispatch_task, return_exceptions=True)
+                self._build_dispatch_task = None
+            batches = tuple(self._build_batch_tasks)
+            for task in batches:
+                task.cancel()
+            await asyncio.gather(*batches, return_exceptions=True)
+            for request in self._pending_build_requests:
+                if not request.future.done():
+                    request.future.cancel()
+            self._pending_build_requests.clear()
             await self.isolation.close()
         finally:
             await self.state.close()
@@ -971,14 +1001,6 @@ class Orchestrator:
                     break
         return tuple(dict.fromkeys(owners))
 
-    def _target_error_count(self, chapter: Chapter, output: str) -> int:
-        """Count streamed error headers assigned to the current build target."""
-
-        return sum(
-            diagnostic.severity == "error" and chapter.id in self._diagnostic_owner_ids(diagnostic)
-            for diagnostic in _lean_diagnostics(output)
-        )
-
     async def _build_chapters(
         self,
         chapters: Iterable[Chapter],
@@ -991,9 +1013,183 @@ class Orchestrator:
         priority: float = 100.0,
         preemptible: bool = False,
         snapshots: dict[str, ValidatedBuildSnapshot] | None = None,
-        combine_targets: bool = False,
     ) -> dict[str, ValidationResult]:
-        """Build a deterministic target batch against the coordinator-owned cache."""
+        """Coalesce pending coordinator requests and return this caller's target results."""
+
+        selected = tuple(dict.fromkeys(chapter.id for chapter in chapters))
+        if not selected:
+            return {}
+        by_id = {chapter.id: chapter for chapter in self.chapters}
+        request_chapters = tuple(by_id[chapter_id] for chapter_id in selected)
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[dict[str, ValidationResult]] = loop.create_future()
+        request = PendingBuildRequest(
+            chapters=request_chapters,
+            publish_if_clean=publish_if_clean,
+            mode=mode,
+            iteration=iteration,
+            maximum_iterations=maximum_iterations,
+            stage=stage,
+            priority=priority,
+            preemptible=preemptible,
+            snapshots=snapshots,
+            future=future,
+        )
+        self._pending_build_requests.append(request)
+        if self._build_dispatch_task is None or self._build_dispatch_task.done():
+            self._build_dispatch_task = asyncio.create_task(self._dispatch_build_requests())
+        return await future
+
+    async def _dispatch_build_requests(self) -> None:
+        """Let concurrent callers enqueue, then launch one shared build transaction."""
+
+        await asyncio.sleep(BUILD_COALESCE_SECONDS)
+        requests = tuple(
+            request for request in self._pending_build_requests if not request.future.cancelled()
+        )
+        self._pending_build_requests.clear()
+        self._build_dispatch_task = None
+        if not requests:
+            return
+        task = asyncio.create_task(self._run_build_batch(requests))
+        self._build_batch_tasks.add(task)
+        task.add_done_callback(self._build_batch_tasks.discard)
+
+    async def _run_build_batch(self, requests: tuple[PendingBuildRequest, ...]) -> None:
+        """Execute and partition a coalesced batch until every caller has a precise result."""
+
+        requested_ids = {chapter.id for request in requests for chapter in request.chapters}
+        remaining = set(requested_ids)
+        results_by_id: dict[str, ValidationResult] = {}
+        snapshots_by_id: dict[str, ValidatedBuildSnapshot] = {}
+
+        def finish_ready_requests() -> None:
+            for request in requests:
+                if request.future.done():
+                    continue
+                ids = tuple(chapter.id for chapter in request.chapters)
+                if not all(chapter_id in results_by_id for chapter_id in ids):
+                    continue
+                if request.snapshots is not None:
+                    request.snapshots.update(
+                        {
+                            chapter_id: snapshots_by_id[chapter_id]
+                            for chapter_id in ids
+                            if chapter_id in snapshots_by_id
+                        }
+                    )
+                request.future.set_result(
+                    {chapter_id: results_by_id[chapter_id] for chapter_id in ids}
+                )
+
+        try:
+            while remaining:
+                active = tuple(
+                    request
+                    for request in requests
+                    if not request.future.done()
+                    and any(chapter.id in remaining for chapter in request.chapters)
+                )
+                candidate_ids = {
+                    chapter.id
+                    for request in active
+                    for chapter in request.chapters
+                    if chapter.id in remaining
+                }
+                if not candidate_ids:
+                    break
+                selected_by_id: dict[str, Chapter] = {}
+                for request in active:
+                    for chapter in request.chapters:
+                        if chapter.id in candidate_ids:
+                            selected_by_id.setdefault(chapter.id, chapter)
+                candidates = tuple(selected_by_id.values())
+                first_prefix = candidates[0].build_command.strip().rpartition(" ")[0]
+                selected = tuple(
+                    chapter
+                    for chapter in candidates
+                    if chapter.build_command.strip().rpartition(" ")[0] == first_prefix
+                )
+                active_ids = {chapter.id for chapter in selected}
+                attempt_requests = tuple(
+                    request
+                    for request in active
+                    if any(chapter.id in active_ids for chapter in request.chapters)
+                )
+                modes = {request.mode for request in attempt_requests}
+                mode = next(iter(modes)) if len(modes) == 1 else "batched"
+                owner = max(attempt_requests, key=lambda request: request.priority)
+                target_stages = {
+                    chapter.id: frozenset(
+                        request.stage for request in attempt_requests if chapter in request.chapters
+                    )
+                    for chapter in selected
+                }
+                attempt_snapshots: dict[str, ValidatedBuildSnapshot] = {}
+                capture_snapshots = any(
+                    request.snapshots is not None for request in attempt_requests
+                )
+                attempt_results = await self._execute_build_chapters(
+                    selected,
+                    publish_if_clean=any(request.publish_if_clean for request in attempt_requests),
+                    mode=mode,
+                    iteration=max(request.iteration for request in attempt_requests),
+                    maximum_iterations=max(
+                        request.maximum_iterations for request in attempt_requests
+                    ),
+                    stage=owner.stage,
+                    priority=owner.priority,
+                    preemptible=all(request.preemptible for request in attempt_requests),
+                    snapshots=attempt_snapshots if capture_snapshots else None,
+                    target_stages=target_stages,
+                )
+                if all(result.succeeded for result in attempt_results.values()):
+                    results_by_id.update(attempt_results)
+                    snapshots_by_id.update(attempt_snapshots)
+                    remaining.difference_update(active_ids)
+                    finish_ready_requests()
+                    continue
+
+                owners = set(self._build_feedback(attempt_results).actionable)
+                graph = self._observed_chapter_graph()
+                affected = {
+                    chapter_id
+                    for chapter_id in active_ids
+                    if self._dependency_closure(graph, (chapter_id,)) & owners
+                }
+                if not affected:
+                    affected = active_ids
+                results_by_id.update(
+                    (chapter_id, attempt_results[chapter_id]) for chapter_id in affected
+                )
+                remaining.difference_update(affected)
+                finish_ready_requests()
+        except BaseException as error:
+            for request in requests:
+                if request.future.done():
+                    continue
+                if isinstance(error, asyncio.CancelledError):
+                    request.future.cancel()
+                else:
+                    request.future.set_exception(error)
+        finally:
+            finish_ready_requests()
+
+    async def _execute_build_chapters(
+        self,
+        chapters: Iterable[Chapter],
+        *,
+        publish_if_clean: bool,
+        mode: str = "targeted",
+        iteration: int = 1,
+        maximum_iterations: int = 1,
+        stage: Stage = Stage.FIXUP,
+        priority: float = 100.0,
+        preemptible: bool = False,
+        snapshots: dict[str, ValidatedBuildSnapshot] | None = None,
+        target_stages: dict[str, frozenset[Stage]] | None = None,
+    ) -> dict[str, ValidationResult]:
+        """Execute one deterministic Lake invocation against the coordinator cache."""
 
         selected = tuple(chapters)
         if not selected:
@@ -1003,15 +1199,26 @@ class Orchestrator:
 
         while True:
             await self.control.checkpoint()
-            await self.state.set_tasks(
-                ids,
-                stage,
+            stages = target_stages or {chapter_id: frozenset((stage,)) for chapter_id in ids}
+
+            async def set_target_tasks(
+                status: TaskStatus,
+                detail: str,
+                *,
+                current_stages: dict[str, frozenset[Stage]] = stages,
+            ) -> None:
+                for target_stage in Stage:
+                    stage_ids = tuple(
+                        chapter_id
+                        for chapter_id in ids
+                        if target_stage in current_stages[chapter_id]
+                    )
+                    if stage_ids:
+                        await self.state.set_tasks(stage_ids, target_stage, status, detail)
+
+            await set_target_tasks(
                 TaskStatus.RUNNING,
-                (
-                    "queued for coordinator verification"
-                    if stage is Stage.REVIEW
-                    else f"queued for {mode} coordinator build"
-                ),
+                f"queued for {mode} coordinator build",
             )
             lease = await self.build_queue.acquire(
                 priority=priority,
@@ -1028,14 +1235,13 @@ class Orchestrator:
             async def flush_build_progress() -> None:
                 await asyncio.sleep(0.25)
                 await self.state.flush()
+
             try:
                 await self.source_lock.acquire()
                 source_held = True
                 build_workspace = await self.isolation.acquire_build(label)
                 async with self.state.batch():
-                    await self.state.set_tasks(
-                        ids,
-                        stage,
+                    await set_target_tasks(
                         TaskStatus.RUNNING,
                         f"{mode} coordinator build {iteration}/{maximum_iterations}",
                     )
@@ -1047,7 +1253,7 @@ class Orchestrator:
                         total=len(selected),
                         target_chapter_ids=ids,
                     )
-                if combine_targets and len(selected) > 1:
+                if len(selected) > 1:
                     targets = []
                     prefixes = []
                     for chapter in selected:
@@ -1055,37 +1261,31 @@ class Orchestrator:
                         prefix, separator, target = command.rpartition(" ")
                         if not separator or not target.startswith("+"):
                             raise ValueError(
-                                "cannot combine optimistic build command without a trailing "
+                                "cannot combine build command without a trailing "
                                 f"Lake target: {command}"
                             )
                         prefixes.append(prefix.rstrip())
                         targets.append(target)
                     if len(set(prefixes)) != 1:
-                        raise ValueError("optimistic build commands do not share a common prefix")
+                        raise ValueError("build commands do not share a common prefix")
                     combined = f"{prefixes[0]} {' '.join(targets)}"
                     build_units = ((selected[0], combined, ids, len(selected)),)
                 else:
-                    build_units = tuple(
-                        (chapter, chapter.build_command, (chapter.id,), index + 1)
-                        for index, chapter in enumerate(selected)
-                    )
-                for chapter, command, result_ids, completed in build_units:
+                    chapter = selected[0]
+                    build_units = ((chapter, chapter.build_command, (chapter.id,), 1),)
+                for chapter, command, result_ids, _completed in build_units:
                     await self.state.advance_coordinator_build(
                         chapter_id=chapter.id,
-                        completed=0 if combine_targets else completed - 1,
+                        completed=0,
                         command=command,
                     )
 
-                    def append_output(output: str, *, current: Chapter = chapter) -> None:
+                    def append_output(output: str) -> None:
                         nonlocal progress_flush
-                        error_count = (
-                            sum(
-                                diagnostic.severity == "error"
-                                and bool(set(self._diagnostic_owner_ids(diagnostic)) & set(ids))
-                                for diagnostic in _lean_diagnostics(output)
-                            )
-                            if combine_targets
-                            else self._target_error_count(current, output)
+                        error_count = sum(
+                            diagnostic.severity == "error"
+                            and bool(set(self._diagnostic_owner_ids(diagnostic)) & set(ids))
+                            for diagnostic in _lean_diagnostics(output)
                         )
                         self.state.append_coordinator_build_output(
                             output,
@@ -1123,11 +1323,7 @@ class Orchestrator:
                     results.update((chapter_id, result) for chapter_id in result_ids)
                     await self.state.advance_coordinator_build(
                         chapter_id=chapter.id,
-                        completed=(
-                            self.state.coordinator_build.total
-                            if combine_targets
-                            else completed
-                        ),
+                        completed=self.state.coordinator_build.total,
                     )
                 clean = (
                     not preempted
@@ -1155,9 +1351,7 @@ class Orchestrator:
                 )
                 build_workspace = None
                 if not preempted:
-                    await self.state.set_tasks(
-                        ids,
-                        stage,
+                    await set_target_tasks(
                         TaskStatus.RUNNING,
                         "coordinator build finished; reconciling result",
                     )
@@ -1426,6 +1620,37 @@ class Orchestrator:
                         f"{existing}\n\n{diagnostic}" if existing else diagnostic
                     )
 
+        async def publish_successful_builds(
+            results: dict[str, ValidationResult],
+            snapshots: dict[str, ValidatedBuildSnapshot],
+            *,
+            detail: str,
+        ) -> set[str]:
+            nonlocal build_generation, clean
+            successful = {
+                chapter_id: snapshots[chapter_id]
+                for chapter_id, result in results.items()
+                if result.succeeded and chapter_id in snapshots
+            }
+            if not successful or not await self._publish_validated_builds(successful):
+                return set()
+            persisted = self.state.fixup_graph.get("clean", {})
+            records = persisted if isinstance(persisted, dict) else {}
+            clean = self._retain_fixup_clean(self._observed_chapter_graph(), records)
+            build_generation = int(self.state.fixup_graph.get("build_generation", 0))
+            published = set(successful).intersection(clean)
+            invalidated_clean.difference_update(published)
+            if published:
+                await self.state.set_tasks(
+                    published,
+                    Stage.FIXUP,
+                    TaskStatus.SUCCEEDED,
+                    detail,
+                )
+                if progress_event is not None:
+                    progress_event.set()
+            return published
+
         async def fail_graph(error: ValueError) -> bool:
             self.state.fixup_graph = {"algorithm": "observed-lean-imports", "error": str(error)}
             async with self.state.batch():
@@ -1491,37 +1716,26 @@ class Orchestrator:
                 stage=Stage.FIXUP,
                 priority=100.0,
                 snapshots=snapshots,
-                combine_targets=True,
             )
-            if all(result.succeeded for result in results.values()):
-                published = await self._publish_validated_builds(snapshots)
-                if not published:
-                    merge_feedback(
-                        {
-                            chapter_id: (
-                                "The source scope changed after its coordinator build; "
-                                "rebuild the fresh generation."
-                            )
-                            for chapter_id in ids
-                        }
-                    )
-                    return False
-                persisted = self.state.fixup_graph.get("clean", {})
-                records = persisted if isinstance(persisted, dict) else {}
-                clean = self._retain_fixup_clean(self._observed_chapter_graph(), records)
-                build_generation = int(self.state.fixup_graph.get("build_generation", 0))
-                invalidated_clean.difference_update(ids)
-                await self.state.set_tasks(
-                    ids,
-                    Stage.FIXUP,
-                    TaskStatus.SUCCEEDED,
-                    "clean coordinator build against observed imports",
-                )
-                if progress_event is not None:
-                    progress_event.set()
+            published = await publish_successful_builds(
+                results,
+                snapshots,
+                detail="clean coordinator build against observed imports",
+            )
+            if published == set(ids):
                 return True
 
             diagnostics = self._build_feedback(results).actionable
+            diagnostics.update(
+                {
+                    chapter_id: (
+                        "The source scope changed after its coordinator build; "
+                        "rebuild the fresh generation."
+                    )
+                    for chapter_id, result in results.items()
+                    if result.succeeded and chapter_id not in published
+                }
+            )
             merge_feedback(diagnostics)
             invalidated_clean.update(
                 self._invalidate_fixup_descendants(
@@ -1537,14 +1751,6 @@ class Orchestrator:
                 invalidated=invalidated_clean,
             )
             return False
-
-        async def build_chapter(
-            chapter_id: str,
-            graph: ChapterImportGraph,
-            *,
-            mode: str = "topological",
-        ) -> bool:
-            return await build_chapters((chapter_id,), graph, mode=mode)
 
         async def start_actionable_fixups(graph: ChapterImportGraph) -> None:
             """Fill free agent slots from the dependency-ready feedback frontier."""
@@ -1641,28 +1847,24 @@ class Orchestrator:
                 iteration=1,
                 maximum_iterations=maximum,
                 snapshots=snapshots,
-                combine_targets=True,
             )
-            if (
-                all(result.succeeded for result in results.values())
-                and await self._publish_validated_builds(snapshots)
-            ):
-                persisted = self.state.fixup_graph.get("clean", {})
-                clean = self._retain_fixup_clean(
-                    self._observed_chapter_graph(),
-                    persisted if isinstance(persisted, dict) else {},
-                )
-                build_generation = int(self.state.fixup_graph.get("build_generation", 0))
-            else:
+            published = await publish_successful_builds(
+                results,
+                snapshots,
+                detail="clean optimistic coordinator build; no fixup agent needed",
+            )
+            if published != set(results):
                 diagnostics = self._build_feedback(results).actionable
-                if not diagnostics:
-                    diagnostics = {
-                        chapter.id: (
+                diagnostics.update(
+                    {
+                        chapter_id: (
                             "The source scope changed after the combined optimistic build; "
                             "rebuild the fresh generation."
                         )
-                        for chapter in optimistic
+                        for chapter_id, result in results.items()
+                        if result.succeeded and chapter_id not in published
                     }
+                )
                 merge_feedback(diagnostics)
                 invalidated_clean.update(
                     self._invalidate_fixup_descendants(graph, clean, diagnostics)
@@ -1777,8 +1979,6 @@ class Orchestrator:
                     except ValueError as error:
                         return await fail_graph(error)
                     clean = self._retain_fixup_clean(graph, clean)
-                    if graph.dependencies[chapter_id].issubset(clean):
-                        await build_chapter(chapter_id, graph)
                     continue
 
                 if (
@@ -1796,7 +1996,6 @@ class Orchestrator:
                         iteration=1,
                         maximum_iterations=1,
                         snapshots=snapshots,
-                        combine_targets=True,
                     )
                     verified = self._observed_chapter_graph()
                     clean = self._retain_fixup_clean(verified, clean)
@@ -1840,14 +2039,15 @@ class Orchestrator:
                     continue
 
                 needed = self._dependency_closure(graph, set(goals) | set(pending_feedback))
+                blocked_roots = set(pending_feedback) | set(running) | failed
+                unavailable = (
+                    self._successor_closure(graph, blocked_roots) if blocked_roots else set()
+                )
                 buildable = [
                     chapter_id
                     for chapter_id in graph.order
                     if chapter_id not in clean
-                    and chapter_id not in pending_feedback
-                    and chapter_id not in running
-                    and chapter_id not in failed
-                    and graph.dependencies[chapter_id].issubset(clean)
+                    and chapter_id not in unavailable
                     and (not targeted or chapter_id in needed)
                 ]
                 if buildable:

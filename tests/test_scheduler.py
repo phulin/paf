@@ -843,8 +843,8 @@ async def test_partial_optimistic_failure_batches_remaining_topological_builds(
 
     assert commands == [
         f"cd lean && lake build {target(first)} {target(second)} {target(third)}",
-        f"cd lean && lake build {target(first)}",
         f"cd lean && lake build {target(second)} {target(third)}",
+        f"cd lean && lake build {target(first)}",
         f"cd lean && lake build {target(first)} {target(second)} {target(third)}",
     ]
     assert orchestrator.state.task(first.id, Stage.FIXUP).rounds == 1
@@ -1028,6 +1028,106 @@ async def test_review_build_preempts_running_proof_certification(
 
 
 @pytest.mark.asyncio
+async def test_concurrent_review_builds_share_commands_and_partition_diagnostics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = write_project(tmp_path, chapters="chapters = [1, 2, 3]")
+    with (tmp_path / "books" / "book.md").open("a", encoding="utf-8") as source:
+        source.write("\n## 3. Third chapter\n")
+    config = load_config(project)
+    first, second, third = config.chapters
+    orchestrator = Orchestrator(config, StateStore(config))
+    await orchestrator.prepare()
+    commands: list[str] = []
+
+    async def validation(
+        _config: object,
+        chapter: Chapter,
+        **_kwargs: object,
+    ) -> ValidationResult:
+        commands.append(chapter.build_command)
+        if len(commands) == 1:
+            return ValidationResult(
+                False,
+                1,
+                "error: Book/Chapter01/Section.lean:1:1: broken review output",
+            )
+        return ValidationResult(True, 0, "ok")
+
+    monkeypatch.setattr(scheduler_module, "validate", validation)
+
+    first_feedback, second_feedback, third_feedback = await asyncio.gather(
+        orchestrator._review_build(first),
+        orchestrator._review_build(second),
+        orchestrator._review_build(third),
+    )
+
+    def target(chapter: Chapter) -> str:
+        return chapter.build_command.rpartition(" ")[2]
+
+    assert commands == [
+        f"cd lean && lake build {target(first)} {target(second)} {target(third)}",
+        f"cd lean && lake build {target(second)} {target(third)}",
+    ]
+    assert set(first_feedback) == {first.id}
+    assert "broken review output" in first_feedback[first.id]
+    assert second_feedback == {}
+    assert third_feedback == {}
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_pending_review_and_proof_builds_share_a_cross_stage_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    review_chapter, proof_chapter = config.chapters
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await orchestrator.prepare()
+    commands: list[str] = []
+
+    async def validation(
+        _config: object,
+        chapter: Chapter,
+        **_kwargs: object,
+    ) -> ValidationResult:
+        commands.append(chapter.build_command)
+        return ValidationResult(True, 0, "ok")
+
+    monkeypatch.setattr(scheduler_module, "validate", validation)
+
+    review, proof = await asyncio.gather(
+        orchestrator._build_chapters(
+            (review_chapter,),
+            publish_if_clean=False,
+            mode="review-verification",
+            stage=Stage.REVIEW,
+            priority=200.0,
+        ),
+        orchestrator._build_chapters(
+            (proof_chapter,),
+            publish_if_clean=False,
+            mode="proof-certification",
+            stage=Stage.PROVE,
+            priority=0.0,
+            preemptible=True,
+        ),
+    )
+
+    review_target = review_chapter.build_command.rpartition(" ")[2]
+    proof_target = proof_chapter.build_command.rpartition(" ")[2]
+    assert commands == [f"cd lean && lake build {review_target} {proof_target}"]
+    assert review[review_chapter.id].succeeded
+    assert proof[proof_chapter.id].succeeded
+    assert state.task(review_chapter.id, Stage.REVIEW).status == TaskStatus.RUNNING
+    assert state.task(proof_chapter.id, Stage.PROVE).status == TaskStatus.RUNNING
+    assert state.task(review_chapter.id, Stage.PROVE).status == TaskStatus.PENDING
+    assert state.task(proof_chapter.id, Stage.REVIEW).status == TaskStatus.PENDING
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_fixup_rescans_new_import_before_rebuilding_edited_chapter(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1101,8 +1201,8 @@ async def test_fixup_rescans_new_import_before_rebuilding_edited_chapter(
     assert await orchestrator.run_stage(Stage.FIXUP)
     assert events[:4] == [
         f"build:{first.id}",
-        f"agent:{first.id}",
         f"build:{second.id}",
+        f"agent:{first.id}",
         f"build:{first.id}",
     ]
     assert state.fixup_graph["edges"] == [[second.id, first.id]]
@@ -1174,13 +1274,20 @@ async def test_fixup_runs_dependency_ready_agent_frontier_concurrently(
         chapter: Chapter,
         **_kwargs: object,
     ) -> ValidationResult:
-        if chapter.id == config.chapters[1].id:
-            await asyncio.wait_for(first_agent_started.wait(), timeout=1)
-        if chapter.id not in fixed:
+        targeted = tuple(
+            item
+            for item in config.chapters
+            if item.build_command.rpartition(" ")[2] in chapter.build_command
+        )
+        broken = tuple(item for item in targeted if item.id not in fixed)
+        if broken:
             return ValidationResult(
                 False,
                 1,
-                f"error: Book/Chapter{chapter.number:02d}.lean:1:1: broken",
+                "\n".join(
+                    f"error: Book/Chapter{item.number:02d}.lean:1:1: broken"
+                    for item in broken
+                ),
             )
         return ValidationResult(True, 0, "ok")
 
@@ -1248,11 +1355,20 @@ async def test_fixup_does_not_launch_agent_before_observed_predecessor_is_clean(
         chapter: Chapter,
         **_kwargs: object,
     ) -> ValidationResult:
-        if chapter.id not in fixed:
+        targeted = tuple(
+            item
+            for item in config.chapters
+            if item.build_command.rpartition(" ")[2] in chapter.build_command
+        )
+        broken = tuple(item for item in targeted if item.id not in fixed)
+        if broken:
             return ValidationResult(
                 False,
                 1,
-                f"error: Book/Chapter{chapter.number:02d}.lean:1:1: broken",
+                "\n".join(
+                    f"error: Book/Chapter{item.number:02d}.lean:1:1: broken"
+                    for item in broken
+                ),
             )
         return ValidationResult(True, 0, "ok")
 
@@ -1340,11 +1456,20 @@ async def test_fixup_unlocks_descendant_before_slow_independent_agent_finishes(
         chapter: Chapter,
         **_kwargs: object,
     ) -> ValidationResult:
-        if chapter.id not in fixed:
+        targeted = tuple(
+            item
+            for item in config.chapters
+            if item.build_command.rpartition(" ")[2] in chapter.build_command
+        )
+        broken = tuple(item for item in targeted if item.id not in fixed)
+        if broken:
             return ValidationResult(
                 False,
                 1,
-                f"error: Book/Chapter{chapter.number:02d}.lean:1:1: broken",
+                "\n".join(
+                    f"error: Book/Chapter{item.number:02d}.lean:1:1: broken"
+                    for item in broken
+                ),
             )
         return ValidationResult(True, 0, "ok")
 
@@ -1600,11 +1725,17 @@ async def test_coordinator_build_does_not_count_as_an_agent(
     ) -> ValidationResult:
         assert workspace_root == config.settings.repo
         assert on_output is not None
-        on_output(f"building {chapter.id}\n")
-        on_output(f"error: Book/Chapter{chapter.number:02d}.lean:1:1: broken\n")
-        if chapter.number == 1:
-            validation_started.set()
-            await release_validation.wait()
+        targeted = tuple(
+            item
+            for item in config.chapters
+            if item.build_command.rpartition(" ")[2] in chapter.build_command
+        )
+        for index, item in enumerate(targeted):
+            on_output(f"building {item.id}\n")
+            on_output(f"error: Book/Chapter{item.number:02d}.lean:1:1: broken\n")
+            if index == 0:
+                validation_started.set()
+                await release_validation.wait()
         return ValidationResult(True, 0, "ok")
 
     monkeypatch.setattr(scheduler_module, "validate", gated_validation)
@@ -1636,8 +1767,8 @@ async def test_coordinator_build_does_not_count_as_an_agent(
     assert not state.coordinator_build.active
     assert state.coordinator_build.completed == 2
     assert state.coordinator_build.output_tail == [
+        "building book/chapter-01",
         "error: Book/Chapter01.lean:1:1: broken",
-        f"$ {config.chapters[1].build_command}",
         "building book/chapter-02",
         "error: Book/Chapter02.lean:1:1: broken",
     ]
@@ -1668,7 +1799,7 @@ async def test_coordinator_build_counts_only_errors_owned_by_each_target(
         assert workspace_root == config.settings.repo
         assert on_output is not None
         on_output("error: Book/Chapter01/Section.lean:1:1: shared dependency failure\n")
-        if chapter.number == 2:
+        if config.chapters[1].build_command.rpartition(" ")[2] in chapter.build_command:
             on_output("error: Book/Chapter02/Section.lean:2:1: target failure\n")
         return ValidationResult(False, 1, "build failed")
 
@@ -2889,7 +3020,11 @@ async def test_changed_source_revalidates_proofs_without_clearing_review_success
         chapter: Chapter,
         **_kwargs: object,
     ) -> ValidationResult:
-        builds.append(chapter.id)
+        builds.extend(
+            item.id
+            for item in config.chapters
+            if item.build_command.rpartition(" ")[2] in chapter.build_command
+        )
         return ValidationResult(True, 0, "ok")
 
     monkeypatch.setattr(scheduler_module, "validate", validation)
@@ -3248,6 +3383,7 @@ async def test_prove_builds_run_after_agents_and_are_serialized_in_main_worktree
     original_run = orchestrator.executor.run
     active_builds = 0
     maximum_active_builds = 0
+    build_commands: list[str] = []
 
     async def tracked_run(
         chapter: Chapter,
@@ -3278,6 +3414,7 @@ async def test_prove_builds_run_after_agents_and_are_serialized_in_main_worktree
         assert on_output is not None
         assert chapter.id in completed_agents
         assert workspace_root == config.settings.repo
+        build_commands.append(chapter.build_command)
         active_builds += 1
         maximum_active_builds = max(maximum_active_builds, active_builds)
         await asyncio.sleep(0)
@@ -3289,6 +3426,8 @@ async def test_prove_builds_run_after_agents_and_are_serialized_in_main_worktree
 
     assert await orchestrator.run_stage(Stage.PROVE)
     assert maximum_active_builds == 1
+    targets = [chapter.build_command.rpartition(" ")[2] for chapter in config.chapters]
+    assert build_commands == [f"cd lean && lake build {' '.join(targets)}"]
     await orchestrator.shutdown()
 
 
