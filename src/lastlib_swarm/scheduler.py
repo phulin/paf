@@ -2149,7 +2149,7 @@ class Orchestrator:
                                 chapter_id,
                                 Stage.REVIEW,
                                 TaskStatus.PENDING,
-                                "waiting for prerequisite reviews: " + ", ".join(sorted(missing)),
+                                "waiting: " + ", ".join(sorted(missing)),
                             )
                 if chapter_id not in reviewed:
                     await self.state.set_task(
