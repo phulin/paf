@@ -14,17 +14,17 @@ fallback searches can be substantially slower.
 flowchart LR
     S[Scaffold directories] --> F[Formalize once]
     F -->|all drafts finished| I[Scan observed LastLib imports]
-    I --> C{Fresh exact-build certificate?}
+    I --> C{Source and dependencies already built?}
     C -->|no| B[Build dependency-ready chapter]
-    C -->|yes| G{Durable review green?}
+    C -->|yes| G{Review already succeeded?}
     B -->|actionable diagnostics| X[Ready fixup agents with MCP]
     X -->|patch merged| I
-    B -->|certificate published| G
+    B -->|clean| G
     G -->|no| R[Editing review]
     G -->|yes| P[Prove or revalidate proof]
     R -->|changed or findings| I
-    R -->|green| P
-    P -->|statement/API problem; clear green closure| X
+    R -->|succeeded| P
+    P -->|statement/API problem; reopen affected reviews| X
     P -->|no placeholders + Lean valid| D[Done]
 ```
 
@@ -34,11 +34,11 @@ despite provisional imports. After all drafts finish, the coordinator discovers 
 regexes over the current `import LastLib...` lines. It then fixes dependency-ready chapters with Lean
 MCP concurrently. As soon as an agent finishes, the coordinator merges it, rescans imports, and
 rebuilds it once its refined predecessors are clean; unrelated agents keep running and a successful
-build immediately releases its review. Exact-build certificates persist the chapter source digest
-together with its dependency certificates and decide only whether another build is needed. A green
-review is a separate durable fact: restarts, proof-body edits, added proof lemmas, and build-certificate
-changes do not clear it. Only explicit review findings, proof-requested statement/API fixups, or a
-forced review clear the affected review/proof closure. Reviewers directly make scoped statement and
+build immediately releases its review. The coordinator remembers the source and dependency digests
+of successful builds so it can avoid rebuilding unchanged chapters. Review has no separate green
+flag: a successful review task is the whole state. Restarts and ordinary proof-body edits leave it
+succeeded; explicit review findings, proof-requested statement/API fixups, and forced review reopen
+the affected review/proof closure. Reviewers directly make scoped statement and
 API repairs. Each dependency-ready chapter receives a prioritized coordinator verification build
 after a changed review and is sent through fixup only if that build fails. Clean verification requests
 join the live build scheduler instead of waiting behind an unrelated repair batch. After at most five
@@ -48,7 +48,7 @@ Every review prompt begins with the complete informal book and assigned Lean fil
 with numbered lines, capped at 500,000 characters. The supplied snapshot counts as the reviewer's
 initial read; filesystem reads are reserved for missing or truncated content, post-edit content, and
 targeted searches or lookups. Fixup, review, and proof agents receive Lean MCP;
-reviewers trust the incoming green certificate for untouched files and request whole-file diagnostics
+reviewers trust the last clean build for untouched files and request whole-file diagnostics
 only for files they edit and the assigned transitive dependents invalidated by those edits. A
 no-change review therefore needs no diagnostic calls.
 
@@ -106,9 +106,9 @@ OpenAI's official
 [Codex non-interactive guidance](https://developers.openai.com/codex/noninteractive).
 
 Transient model-capacity failures resume the same Codex thread with capped exponential backoff.
-After the configured retries are exhausted, the worker releases its concurrency slot and its chapter
-is requeued as a fresh attempt behind waiting formalizers. A failed chapter does not cancel unrelated
-formalizers; the pipeline finishes the remaining drafting work before reporting failure.
+After the configured retries are exhausted, that stage fails instead of creating an unbounded stream
+of fresh attempts. A failed chapter does not cancel unrelated formalizers; the pipeline finishes the
+remaining drafting work before reporting failure.
 
 ## Commands
 
@@ -278,12 +278,12 @@ After the daemon exits, `status`, `snapshot`, and `wait` fall back to the persis
   and let fresh MCP diagnostics account for prerequisite repairs that made an old diagnostic stale.
   A failure mentioning a scope whose formalizer is still active is deferred rather than assigned
   prematurely. Completed scopes cycle through build and fixup while other drafts run; the standalone
-  fixup stage ends with a stable full-corpus build. The pipeline instead consumes persisted green
-  certificates and targets only each dependency-ready review's invalid build closure. This repeats
+  fixup stage ends with a stable full-corpus build. The pipeline reuses successful unchanged builds
+  and targets only each dependency-ready review's invalid build closure. This repeats
   up to `max_rounds`, allowing `declaration uses sorry` but rejecting other warnings.
 - **Review** visits dependency-ready chapters against a clean source and `.olean` generation. Agents
   make warranted in-scope statement and API changes directly; unresolved findings retain exact edit
-  paths and are routed to their owners. The coordinator's green certificate remains authoritative for
+  paths and are routed to their owners. The last clean coordinator build remains authoritative for
   files a reviewer does not edit. Reviewers request whole-file LSP diagnostics after the last relevant
   edit only for the edited files and their assigned transitive dependents, rechecking just the files
   invalidated by any subsequent repair. A changed chapter enters `verification queued`, then a
@@ -294,9 +294,9 @@ After the daemon exits, `status`, `snapshot`, and `wait` fall back to the persis
   continue. A reported chapter-local failure is quarantined: unrelated review, fixup, and proof
   branches keep running, while actual dependents are marked blocked. Unexpected coordinator
   exceptions still fail fast after draining live workers. There is no corpus-wide clean-build or
-  review gate in the pipeline. Successful completion records a durable green review independently of
-  exact source hashes. That field is cleared only by an explicit statement/API repair request or a
-  forced review, never by ordinary proof edits or restart reconciliation.
+  review gate in the pipeline. Successful completion leaves the review task `succeeded`. An explicit
+  statement/API repair request or forced review moves it back to `pending`; ordinary proof edits and
+  restart reconciliation do not.
 - **Prove** sends one chapter to an agent and asks it to work directly on unresolved placeholders.
   A cumulative attempt ledger is prior inventory: later agents must refine an earlier proof using
   new evidence or try a materially different route instead of rereading the chapter, reconfirming
@@ -304,9 +304,9 @@ After the daemon exits, `status`, `snapshot`, and `wait` fall back to the persis
   placeholder count stop the proof loop. The stage succeeds only when the scoped Lean code has no
   `sorry` or `admit` tokens and final Lake validation succeeds without any warning other than
   “declaration uses `sorry`”. The exact validated source digest is persisted independently of review
-  green. If it is stale after restart, the coordinator rebuilds and recounts placeholders first; a
+  status. If it is stale after restart, the coordinator rebuilds and recounts placeholders first; a
   successful placeholder-free source is accepted without launching another proof agent. Proof
-  certification uses the same visible coordinator-build record at lower priority; it never holds the
+  validation uses the same visible coordinator-build record at lower priority; it never holds the
   build queue while the proof agent edits, takes a snapshot, or merges its scoped patch.
 - A proof agent may change proof bodies but not declaration interfaces. A genuine statement/API
   problem is reported through a structured `fixup_findings` entry; the pipeline returns through
@@ -340,12 +340,11 @@ TUI, persisted snapshot, and agent-control JSON expose the priority order, ranks
 
 The dashboard shows:
 
-- the live-agent total against `max_agents`, broken down by stage, plus attempts waiting for a slot;
+- the live-agent total against `max_agents`, broken down by stage;
 - the active coordinator build's mode, stage, iteration, target progress, current chapter, owner, and
   queued build count;
-- chapter-stage phases (`queued`, `verification queued`, `verifying`, `waiting for fixup`, `building`,
-  and `agent`) separately from terminal stage status;
-- aggregate chapter counts for formalize, fixup, review, and prove;
+- aggregate `pending`, `running`, `succeeded`, `failed`, and `blocked` chapter counts for formalize,
+  fixup, review, and prove;
 - each chapter's status and attempt count in every stage, plus independent exact-build freshness;
 - per-chapter tokens for the current invocation;
 - statement/proof critical-path ranks and the current statement critical path;
@@ -408,9 +407,10 @@ sidecar writes are rate-limited and a final summary is force-flushed. An attempt
 before its workspace is acquired or Codex is launched. Each run records its PID, Codex thread id,
 stage, round, timestamps, scoped-change result, placeholder count, final report, validation tail, and
 usage. Concurrent mutations coalesce into one SQLite transaction, coordinator transitions use
-explicit state batches, and JSON/database work runs off the TUI event loop. Task records separately
-persist agent queues, verification queues, active verification, dependency waits, and targeted-fixup
-waits. Structured repair requests are checkpointed before entering the in-memory batching queue and
+explicit state batches, and JSON/database work runs off the TUI event loop. Task records persist one
+status (`pending`, `running`, `succeeded`, `failed`, or `blocked`) plus a short detail describing what
+a running or pending task is doing. Structured repair requests are checkpointed before entering the
+in-memory batching queue and
 removed only after their dependency-aware fixup pass returns. Restart recovery restores those queued
 requests and also reconstructs proof-requested statement repairs written by older orchestrators that
 invalidated review state before checkpointing the handoff. The chapter table displays exact-build

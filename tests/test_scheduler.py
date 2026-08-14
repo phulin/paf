@@ -13,7 +13,7 @@ from lastlib_swarm.codex import AgentResult, CodexExecutor, ValidationResult, sc
 from lastlib_swarm.config import load_config
 from lastlib_swarm.models import Chapter, PipelineConfig, Stage
 from lastlib_swarm.scheduler import FormalizeOutcome, Orchestrator, ReviewOutcome
-from lastlib_swarm.state import RunRecord, StateStore, TaskPhase, TaskStatus, TokenUsage
+from lastlib_swarm.state import RunRecord, StateStore, TaskStatus, TokenUsage
 from tests.support import write_project
 
 
@@ -205,7 +205,6 @@ async def test_state_migrates_legacy_repair_tasks_to_fixup(tmp_path: Path) -> No
 
     migrated = reloaded.task(chapter.id, Stage.FIXUP)
     assert migrated.stage == "fixup"
-    assert migrated.phase == TaskPhase.IDLE
     assert migrated.runs[0].stage == "fixup"
     assert not reloaded.coordinator_build.active
     assert reloaded.database_path.is_file()
@@ -232,7 +231,7 @@ async def test_state_persists_fixup_graph(tmp_path: Path) -> None:
     await reloaded.load_or_create()
 
     assert reloaded.fixup_graph == state.fixup_graph
-    assert reloaded.snapshot()["version"] == 9
+    assert reloaded.snapshot()["version"] == 10
 
 
 @pytest.mark.asyncio
@@ -267,20 +266,19 @@ async def test_proof_review_requests_persist_and_acknowledge_exact_findings(
 
 
 @pytest.mark.asyncio
-async def test_state_persists_durable_review_green(tmp_path: Path) -> None:
+async def test_state_persists_successful_review_status(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
     chapter = config.chapters[0]
     state = StateStore(config)
     await state.load_or_create()
-    await state.set_review_green((chapter.id,), True)
     await state.set_task(chapter.id, Stage.REVIEW, TaskStatus.SUCCEEDED, "reviewed")
 
     reloaded = StateStore(config)
     await reloaded.load_or_create()
 
-    assert reloaded.task(chapter.id, Stage.REVIEW).review_green is True
+    assert reloaded.task(chapter.id, Stage.REVIEW).status == TaskStatus.SUCCEEDED
     hot = json.loads(reloaded.path.read_text(encoding="utf-8"))
-    assert hot["tasks"][f"{chapter.id}:review"]["review_green"] is True
+    assert "review_green" not in hot["tasks"][f"{chapter.id}:review"]
 
 
 @pytest.mark.asyncio
@@ -304,22 +302,20 @@ async def test_state_recovers_orphan_run_even_when_task_is_not_running(tmp_path:
 
 
 @pytest.mark.asyncio
-async def test_interrupted_review_does_not_clear_durable_green(tmp_path: Path) -> None:
+async def test_interrupted_review_is_requeued(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
     chapter = config.chapters[0]
     state = StateStore(config)
     await state.load_or_create()
-    await state.set_review_green((chapter.id,), True)
+    await state.set_task(chapter.id, Stage.REVIEW, TaskStatus.SUCCEEDED, "reviewed")
     await state.start_run(chapter.id, Stage.REVIEW)
 
     recovered = StateStore(config)
     await recovered.load_or_create()
     task = recovered.task(chapter.id, Stage.REVIEW)
 
-    assert task.status == TaskStatus.SUCCEEDED
-    assert task.phase == TaskPhase.IDLE
-    assert task.review_green is True
-    assert task.detail == "durable review remains green after restart"
+    assert task.status == TaskStatus.PENDING
+    assert task.detail == "recovered after interrupted orchestrator"
 
 
 @pytest.mark.asyncio
@@ -341,7 +337,7 @@ async def test_hot_checkpoint_does_not_grow_with_run_payload_history(tmp_path: P
 
     hot = json.loads(state.path.read_text(encoding="utf-8"))
     task = hot["tasks"][f"{config.chapters[0].id}:formalize"]
-    assert hot["version"] == 9
+    assert hot["version"] == 10
     assert "source_issues" not in hot
     assert "runs" not in task
     assert task["run_count"] == 25
@@ -407,7 +403,6 @@ async def test_recovering_interrupted_run_preserves_lazy_payload(tmp_path: Path)
     recovered_run = recovered_task.runs[-1]
 
     assert recovered_task.status == TaskStatus.PENDING
-    assert recovered_task.phase == TaskPhase.RECOVERING
     assert recovered_run.status == TaskStatus.FAILED
     assert recovered_run.report is None
     recovered.load_run_details(recovered_run)
@@ -799,7 +794,6 @@ async def test_fixup_request_is_visible_and_durable_while_another_batch_runs(
 
     queued = orchestrator.state.task(second.id, Stage.FIXUP)
     assert queued.status == TaskStatus.RUNNING
-    assert queued.phase == TaskPhase.WAITING_FIXUP
     assert "queued behind the active repair batch" in queued.detail
     assert len(orchestrator.state.fixup_requests) == 2
     while True:
@@ -874,7 +868,7 @@ async def test_unqueued_proof_finding_is_recovered_as_durable_review(
             ]
         },
     )
-    await state.set_review_green((chapter.id,), False)
+    await state.set_task(chapter.id, Stage.REVIEW, TaskStatus.PENDING, "needs review")
     await state.close()
 
     recovered = StateStore(config)
@@ -887,7 +881,7 @@ async def test_unqueued_proof_finding_is_recovered_as_durable_review(
     assert len(request_ids) == 1
     assert recovered.fixup_requests == {}
     assert len(recovered.proof_review_requests) == 1
-    assert recovered.task(chapter.id, Stage.REVIEW).review_green is False
+    assert recovered.task(chapter.id, Stage.REVIEW).status == TaskStatus.PENDING
     await orchestrator.shutdown()
 
 
@@ -1287,7 +1281,6 @@ async def test_fixup_unlocks_descendant_before_slow_independent_agent_finishes(
             elif chapter.id == third.id:
                 assert not slow_finished
                 assert state.task(first.id, Stage.FIXUP).status == TaskStatus.SUCCEEDED
-                assert state.task(first.id, Stage.FIXUP).phase == TaskPhase.IDLE
                 descendant_started.set()
                 slow_release.set()
             fixed.add(chapter.id)
@@ -1329,7 +1322,7 @@ async def test_fixup_unlocks_descendant_before_slow_independent_agent_finishes(
 
 
 @pytest.mark.asyncio
-async def test_fixup_reuses_valid_persisted_build_certificates(
+async def test_fixup_reuses_valid_persisted_build_records(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
@@ -1467,7 +1460,7 @@ def test_build_feedback_falls_back_to_build_target_for_unlocated_failure(
 
 
 @pytest.mark.asyncio
-async def test_capacity_exhaustion_requeues_formalizer_at_back(
+async def test_capacity_exhaustion_is_a_bounded_formalizer_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
@@ -1478,15 +1471,15 @@ async def test_capacity_exhaustion_requeues_formalizer_at_back(
     async def formalize(chapter: Chapter, *, rerun: bool = False) -> FormalizeOutcome:
         attempts[chapter.number] += 1
         order.append((chapter.number, rerun))
-        if chapter.number == 1 and attempts[chapter.number] == 1:
-            return FormalizeOutcome(False, capacity_deferred=True)
+        if chapter.number == 1:
+            return FormalizeOutcome(False)
         return FormalizeOutcome(True)
 
     monkeypatch.setattr(orchestrator, "_formalize", formalize)
 
-    assert await orchestrator._formalize_all()
-    assert attempts == {1: 2, 2: 1}
-    assert order == [(1, False), (2, False), (1, True)]
+    assert not await orchestrator._formalize_all()
+    assert attempts == {1: 1, 2: 1}
+    assert order == [(1, False), (2, False)]
 
 
 @pytest.mark.asyncio
@@ -1552,7 +1545,7 @@ async def test_streaming_build_does_not_publish_partial_cache_snapshot(
 
 
 @pytest.mark.asyncio
-async def test_coordinator_build_uses_build_phases_without_counting_agents(
+async def test_coordinator_build_does_not_count_as_an_agent(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
@@ -1598,7 +1591,7 @@ async def test_coordinator_build_uses_build_phases_without_counting_agents(
     assert state.coordinator_build.error_count == 1
     assert state.agent_summary()["active"] == 0
     assert all(
-        state.task(chapter.id, Stage.FIXUP).phase == TaskPhase.BUILDING
+        state.task(chapter.id, Stage.FIXUP).status == TaskStatus.RUNNING
         for chapter in config.chapters
     )
 
@@ -1614,7 +1607,7 @@ async def test_coordinator_build_uses_build_phases_without_counting_agents(
     ]
     assert state.coordinator_build.error_count == 2
     assert all(
-        state.task(chapter.id, Stage.FIXUP).phase == TaskPhase.IDLE
+        state.task(chapter.id, Stage.FIXUP).status == TaskStatus.RUNNING
         for chapter in config.chapters
     )
     await orchestrator.shutdown()
@@ -1683,7 +1676,7 @@ async def test_validated_build_refuses_to_certify_a_newer_source_generation(
 
 
 @pytest.mark.asyncio
-async def test_agent_limiter_distinguishes_live_and_queued_runs(tmp_path: Path) -> None:
+async def test_agent_summary_counts_only_started_runs(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
     config = replace(config, settings=replace(config.settings, max_agents=1))
     state = StateStore(config)
@@ -1718,10 +1711,8 @@ async def test_agent_limiter_distinguishes_live_and_queued_runs(tmp_path: Path) 
 
     summary = state.agent_summary()
     assert summary["active"] == 1
-    assert summary["queued"] == 1
+    assert summary["queued"] == 0
     assert summary["by_stage"]["formalize"] == 1
-    assert state.task(config.chapters[0].id, Stage.FORMALIZE).phase == TaskPhase.AGENT
-    assert state.task(config.chapters[1].id, Stage.FORMALIZE).phase == TaskPhase.QUEUED
 
     release_first.set()
     await asyncio.gather(first, second)
@@ -1846,7 +1837,6 @@ async def test_changed_review_remains_active_until_rebuild_finishes(tmp_path: Pa
     assert outcome.changed
     review_task = state.task(config.chapters[0].id, Stage.REVIEW)
     assert review_task.status == TaskStatus.RUNNING
-    assert review_task.phase == TaskPhase.VERIFICATION_QUEUED
     assert review_task.detail == "review changes merged; coordinator verification queued"
     await orchestrator.shutdown()
 
@@ -2066,19 +2056,14 @@ async def test_review_is_capped_at_five_edit_rebuild_cycles(
 
 
 @pytest.mark.asyncio
-async def test_capacity_deferred_review_does_not_consume_a_review_round(
+async def test_capacity_failure_consumes_a_review_round(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
     chapter = config.chapters[0]
     orchestrator = Orchestrator(config, StateStore(config))
     await orchestrator.prepare()
-    outcomes = iter(
-        (
-            ReviewOutcome(False, False, {}, complete=False, capacity_deferred=True),
-            ReviewOutcome(True, False, {}),
-        )
-    )
+    outcomes = iter((ReviewOutcome(False, False, {}, complete=False),))
 
     async def clean(*_args: object, **_kwargs: object) -> bool:
         return True
@@ -2091,7 +2076,7 @@ async def test_capacity_deferred_review_does_not_consume_a_review_round(
     monkeypatch.setattr(orchestrator, "_review_once", review)
     rounds = {chapter.id: 0}
 
-    assert await orchestrator._review_chapter_to_clean(chapter, rounds)
+    assert not await orchestrator._review_chapter_to_clean(chapter, rounds)
     assert rounds[chapter.id] == 1
     await orchestrator.shutdown()
 
@@ -2124,9 +2109,7 @@ async def test_fixup_cancellation_releases_shared_source_lock(
 
     orchestrator.executor = BlockingExecutor(config, orchestrator.state)
     task = asyncio.create_task(
-        orchestrator._fixup_to_clean(
-            {chapter.id: "repair"}, target_ids={chapter.id}
-        )
+        orchestrator._fixup_to_clean({chapter.id: "repair"}, target_ids={chapter.id})
     )
     await started.wait()
 
@@ -2140,7 +2123,7 @@ async def test_fixup_cancellation_releases_shared_source_lock(
 
 
 @pytest.mark.asyncio
-async def test_capacity_deferred_fixup_does_not_consume_the_repair_cap(
+async def test_capacity_failure_consumes_the_fixup_cap(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
@@ -2161,24 +2144,20 @@ async def test_capacity_deferred_fixup_does_not_consume_the_repair_cap(
     )
     orchestrator = Orchestrator(config, StateStore(config))
     await orchestrator.prepare()
-    orchestrator.executor = FakeExecutor(
-        orchestrator.state, [capacity, result(changed=False)]
-    )
+    orchestrator.executor = FakeExecutor(orchestrator.state, [capacity])
 
     async def validation(*_args: object, **_kwargs: object) -> ValidationResult:
         return ValidationResult(True, 0, "ok")
 
     monkeypatch.setattr(scheduler_module, "validate", validation)
 
-    assert await orchestrator._fixup_to_clean(
-        {chapter.id: "repair"}, target_ids={chapter.id}
-    )
-    assert len(orchestrator.executor.feedbacks) == 2
+    assert not await orchestrator._fixup_to_clean({chapter.id: "repair"}, target_ids={chapter.id})
+    assert len(orchestrator.executor.feedbacks) == 1
     await orchestrator.shutdown()
 
 
 @pytest.mark.asyncio
-async def test_capacity_deferred_proof_does_not_consume_a_proof_round(
+async def test_capacity_failure_stops_proof_work(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
@@ -2192,26 +2171,23 @@ async def test_capacity_deferred_proof_does_not_consume_a_proof_round(
         exit_code=1,
         capacity_exhausted=True,
     )
-    success = result(changed=False, placeholders=0)
-    agents = iter((capacity, success))
+    agents = iter((capacity,))
     calls = 0
 
     async def attempt(*_args: object, **_kwargs: object) -> object:
         nonlocal calls
         calls += 1
-        return scheduler_module.Attempt(
-            next(agents), ValidationResult(True, 0, "ok"), run
-        )
+        return scheduler_module.Attempt(next(agents), ValidationResult(True, 0, "ok"), run)
 
     monkeypatch.setattr(orchestrator, "_attempt", attempt)
 
-    assert await orchestrator._prove(chapter)
-    assert calls == 2
+    assert not await orchestrator._prove(chapter)
+    assert calls == 1
     await orchestrator.shutdown()
 
 
 @pytest.mark.asyncio
-async def test_pipeline_reviews_each_chapter_as_soon_as_its_build_is_green(
+async def test_pipeline_reviews_each_chapter_as_soon_as_its_build_succeeds(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = with_lastlib_modules(
@@ -2353,9 +2329,7 @@ async def test_proof_releases_agent_slot_before_coordinator_build(
 
 
 def test_proof_feedback_is_bounded_and_retains_latest_diagnostics() -> None:
-    feedback = scheduler_module._bounded_proof_feedback(
-        ("old" * 20_000, "latest diagnostic")
-    )
+    feedback = scheduler_module._bounded_proof_feedback(("old" * 20_000, "latest diagnostic"))
 
     assert len(feedback) == scheduler_module.PROOF_FEEDBACK_MAX_CHARS
     assert "older proof feedback omitted" in feedback
@@ -2363,7 +2337,7 @@ def test_proof_feedback_is_bounded_and_retains_latest_diagnostics() -> None:
 
 
 @pytest.mark.asyncio
-async def test_review_restart_seeds_proofs_from_durable_green_without_rebuilding(
+async def test_review_restart_seeds_proofs_from_successful_reviews_without_rebuilding(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = with_lastlib_modules(
@@ -2402,7 +2376,7 @@ async def test_review_restart_seeds_proofs_from_durable_green_without_rebuilding
     assert await first_run._review_tree()
     assert first_reviews == [first.id, second.id]
     assert all(
-        first_run.state.task(chapter.id, Stage.REVIEW).review_green is True
+        first_run.state.task(chapter.id, Stage.REVIEW).status == TaskStatus.SUCCEEDED
         for chapter in config.chapters
     )
     await first_run.shutdown()
@@ -2414,7 +2388,7 @@ async def test_review_restart_seeds_proofs_from_durable_green_without_rebuilding
     await restarted.prepare()
 
     async def review(_chapter: Chapter, *, rerun: bool = False) -> ReviewOutcome:
-        raise AssertionError("durable green reviews must not rerun")
+        raise AssertionError("successful reviews must not rerun")
 
     async def prove(chapter: Chapter, *, defer_review: bool = False) -> bool:
         assert defer_review
@@ -2431,12 +2405,10 @@ async def test_review_restart_seeds_proofs_from_durable_green_without_rebuilding
 
 
 @pytest.mark.asyncio
-async def test_restart_after_proof_adds_lemma_preserves_review_green(
+async def test_restart_after_proof_adds_lemma_preserves_review_success(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    config = with_lastlib_modules(
-        load_config(write_project(tmp_path, chapters="chapters = [1]"))
-    )
+    config = with_lastlib_modules(load_config(write_project(tmp_path, chapters="chapters = [1]")))
     chapter = config.chapters[0]
     source = tmp_path / "lean" / "Book" / "Chapter01.lean"
     source.parent.mkdir(parents=True)
@@ -2503,7 +2475,7 @@ async def test_restart_after_proof_adds_lemma_preserves_review_green(
     await restarted.prepare()
 
     async def forbidden_review(*_args: object, **_kwargs: object) -> ReviewOutcome:
-        raise AssertionError("durable green review must not rerun")
+        raise AssertionError("successful review must not rerun")
 
     async def forbidden_agent(*_args: object, **_kwargs: object) -> AgentResult:
         raise AssertionError("validated proof must not rerun an agent")
@@ -2513,7 +2485,7 @@ async def test_restart_after_proof_adds_lemma_preserves_review_green(
 
     assert await restarted._review_tree(prove=True)
     assert builds == []
-    assert restarted.state.task(chapter.id, Stage.REVIEW).review_green is True
+    assert restarted.state.task(chapter.id, Stage.REVIEW).status == TaskStatus.SUCCEEDED
     assert restarted.state.task(chapter.id, Stage.PROVE).source_digest == proof_digest
     assert "helper_added_by_proof" in source.read_text(encoding="utf-8")
     await restarted.shutdown()
@@ -2523,9 +2495,7 @@ async def test_restart_after_proof_adds_lemma_preserves_review_green(
 async def test_stale_build_is_refreshed_before_proof_agent_with_placeholders(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    config = with_lastlib_modules(
-        load_config(write_project(tmp_path, chapters="chapters = [1]"))
-    )
+    config = with_lastlib_modules(load_config(write_project(tmp_path, chapters="chapters = [1]")))
     chapter = config.chapters[0]
     source = tmp_path / "lean" / "Book" / "Chapter01.lean"
     source.parent.mkdir(parents=True)
@@ -2576,9 +2546,7 @@ async def test_stale_build_is_refreshed_before_proof_agent_with_placeholders(
 async def test_standalone_proof_fixup_finding_clears_durable_review(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    config = with_lastlib_modules(
-        load_config(write_project(tmp_path, chapters="chapters = [1]"))
-    )
+    config = with_lastlib_modules(load_config(write_project(tmp_path, chapters="chapters = [1]")))
     chapter = config.chapters[0]
     source = tmp_path / "lean" / "Book" / "Chapter01.lean"
     source.parent.mkdir(parents=True)
@@ -2614,7 +2582,6 @@ async def test_standalone_proof_fixup_finding_clears_durable_review(
     assert not await orchestrator._prove(chapter)
     review = orchestrator.state.task(chapter.id, Stage.REVIEW)
     proof = orchestrator.state.task(chapter.id, Stage.PROVE)
-    assert review.review_green is False
     assert review.status == TaskStatus.PENDING
     assert proof.status == TaskStatus.PENDING
     assert proof.source_digest is None
@@ -2626,12 +2593,10 @@ async def test_standalone_proof_fixup_finding_clears_durable_review(
 
 
 @pytest.mark.asyncio
-async def test_legacy_reset_recovers_green_review_and_proof_without_agents(
+async def test_pending_review_is_not_recovered_from_historical_runs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    config = with_lastlib_modules(
-        load_config(write_project(tmp_path, chapters="chapters = [1]"))
-    )
+    config = with_lastlib_modules(load_config(write_project(tmp_path, chapters="chapters = [1]")))
     chapter = config.chapters[0]
     source = tmp_path / "lean" / "Book" / "Chapter01.lean"
     source.parent.mkdir(parents=True)
@@ -2667,7 +2632,6 @@ async def test_legacy_reset_recovers_green_review_and_proof_without_agents(
         TaskStatus.PENDING,
         "waiting for invalidated statement review",
     )
-    state.task(chapter.id, Stage.REVIEW).review_green = None
     state.task(chapter.id, Stage.PROVE).source_digest = None
     await state.save()
     await state.close()
@@ -2686,18 +2650,18 @@ async def test_legacy_reset_recovers_green_review_and_proof_without_agents(
     restarted = Orchestrator(config, StateStore(config))
     await restarted.prepare()
 
-    async def forbidden_review(*_args: object, **_kwargs: object) -> ReviewOutcome:
-        raise AssertionError("historical green review must not rerun")
+    async def review_again(*_args: object, **_kwargs: object) -> ReviewOutcome:
+        return ReviewOutcome(True, False, {})
 
     async def forbidden_agent(*_args: object, **_kwargs: object) -> AgentResult:
         raise AssertionError("current placeholder-free proof must not rerun an agent")
 
-    monkeypatch.setattr(restarted, "_review_once", forbidden_review)
+    monkeypatch.setattr(restarted, "_review_once", review_again)
     monkeypatch.setattr(restarted.executor, "run", forbidden_agent)
 
     assert await restarted._review_tree(prove=True)
     assert builds == [chapter.id]
-    assert restarted.state.task(chapter.id, Stage.REVIEW).review_green is True
+    assert restarted.state.task(chapter.id, Stage.REVIEW).status == TaskStatus.SUCCEEDED
     proved = restarted.state.task(chapter.id, Stage.PROVE)
     assert proved.status == TaskStatus.SUCCEEDED
     assert proved.source_digest == scope_digest(config.settings.repo, chapter)
@@ -2720,7 +2684,6 @@ async def test_statement_repair_invalidates_review_and_proof_closure(tmp_path: P
     orchestrator = Orchestrator(config, StateStore(config))
     await orchestrator.prepare()
     for chapter in config.chapters:
-        await orchestrator.state.set_review_green((chapter.id,), True)
         await orchestrator.state.set_task(
             chapter.id, Stage.REVIEW, TaskStatus.SUCCEEDED, "reviewed"
         )
@@ -2741,10 +2704,7 @@ async def test_statement_repair_invalidates_review_and_proof_closure(tmp_path: P
         review = orchestrator.state.task(chapter.id, Stage.REVIEW)
         proof = orchestrator.state.task(chapter.id, Stage.PROVE)
         assert review.status == TaskStatus.PENDING
-        assert review.phase == TaskPhase.RECOVERING
-        assert review.review_green is False
         assert proof.status == TaskStatus.PENDING
-        assert proof.phase == TaskPhase.WAITING_PREREQUISITES
         assert proof.source_digest is None
     await orchestrator.shutdown()
 
@@ -2769,13 +2729,12 @@ async def test_review_completion_cannot_resurrect_an_invalidated_generation(
         expected_generation=started_generation,
     )
     review = orchestrator.state.task(chapter.id, Stage.REVIEW)
-    assert review.review_green is False
     assert review.status == TaskStatus.PENDING
     await orchestrator.shutdown()
 
 
 @pytest.mark.asyncio
-async def test_changed_source_revalidates_proofs_without_clearing_review_green(
+async def test_changed_source_revalidates_proofs_without_clearing_review_success(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = with_lastlib_modules(
@@ -2837,7 +2796,7 @@ async def test_changed_source_revalidates_proofs_without_clearing_review_green(
     assert set(builds) == {first.id, second.id}
     assert reviews == []
     assert all(
-        restarted.state.task(chapter.id, Stage.REVIEW).review_green is True
+        restarted.state.task(chapter.id, Stage.REVIEW).status == TaskStatus.SUCCEEDED
         for chapter in config.chapters
     )
     assert restarted.state.task(second.id, Stage.PROVE).status == TaskStatus.SUCCEEDED
@@ -2873,9 +2832,7 @@ async def test_upstream_proof_starts_before_downstream_review_finishes(
     ) -> bool:
         assert not rerun
         if chapter.id == second.id:
-            assert orchestrator.state.task(second.id, Stage.REVIEW).phase == (
-                TaskPhase.WAITING_BUILD
-            )
+            assert orchestrator.state.task(second.id, Stage.REVIEW).status == TaskStatus.RUNNING
             await upstream_proof_started.wait()
             events.append(f"review:{chapter.id}")
             finish_upstream_proof.set()
@@ -2959,7 +2916,7 @@ async def test_proof_finding_requeues_only_its_review_branch(
     assert "statement needs a hypothesis" in review_feedback[1]
     assert state.fixup_requests == {}
     assert state.proof_review_requests == {}
-    assert state.task(chapter.id, Stage.REVIEW).review_green is True
+    assert state.task(chapter.id, Stage.REVIEW).status == TaskStatus.SUCCEEDED
     await orchestrator.shutdown()
 
 

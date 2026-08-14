@@ -188,14 +188,10 @@ def test_executor_uses_machine_readable_codex_mode(tmp_path: Path) -> None:
     ]
     assert overrides["mcp_servers.lastlib_lean.cwd"] == f'"{isolated / "lean"}"'
     assert json.loads(overrides["mcp_servers.lastlib_lean.env.PATH"]) == lean_mcp_path()
-    assert json.loads(
-        overrides["mcp_servers.lastlib_lean.env.LEAN_MCP_SCRATCH_SLOTS"]
-    ) == "1"
+    assert json.loads(overrides["mcp_servers.lastlib_lean.env.LEAN_MCP_SCRATCH_SLOTS"]) == "1"
     assert "mcp_servers.lastlib_lean.env.LEAN_MCP_PREWARM_FILES" not in overrides
     assert "lean_diagnostic_messages" in overrides["mcp_servers.lastlib_lean.enabled_tools"]
-    assert "lean_prepare_dependencies" in overrides[
-        "mcp_servers.lastlib_lean.enabled_tools"
-    ]
+    assert "lean_prepare_dependencies" in overrides["mcp_servers.lastlib_lean.enabled_tools"]
     assert "lean_multi_attempt" in overrides["mcp_servers.lastlib_lean.enabled_tools"]
     assert "lean_file_outline" not in overrides["mcp_servers.lastlib_lean.enabled_tools"]
     assert "lean_build" not in overrides["mcp_servers.lastlib_lean.enabled_tools"]
@@ -211,19 +207,11 @@ def test_executor_uses_machine_readable_codex_mode(tmp_path: Path) -> None:
         for index, item in enumerate(review_command[:-1])
         if item == "--config"
     }
-    assert "lean_diagnostic_messages" in review_overrides[
-        "mcp_servers.lastlib_lean.enabled_tools"
-    ]
-    assert "lean_prepare_dependencies" in review_overrides[
-        "mcp_servers.lastlib_lean.enabled_tools"
-    ]
+    assert "lean_diagnostic_messages" in review_overrides["mcp_servers.lastlib_lean.enabled_tools"]
+    assert "lean_prepare_dependencies" in review_overrides["mcp_servers.lastlib_lean.enabled_tools"]
     assert "lean_code_actions" in review_overrides["mcp_servers.lastlib_lean.enabled_tools"]
-    assert "lean_file_outline" not in review_overrides[
-        "mcp_servers.lastlib_lean.enabled_tools"
-    ]
-    assert "lean_multi_attempt" not in review_overrides[
-        "mcp_servers.lastlib_lean.enabled_tools"
-    ]
+    assert "lean_file_outline" not in review_overrides["mcp_servers.lastlib_lean.enabled_tools"]
+    assert "lean_multi_attempt" not in review_overrides["mcp_servers.lastlib_lean.enabled_tools"]
     assert "lean_build" not in review_overrides["mcp_servers.lastlib_lean.enabled_tools"]
     fixup_command = executor.command(Stage.FIXUP, isolated)
     fixup_overrides = {
@@ -233,15 +221,11 @@ def test_executor_uses_machine_readable_codex_mode(tmp_path: Path) -> None:
     }
     assert "lean_diagnostic_messages" in fixup_overrides["mcp_servers.lastlib_lean.enabled_tools"]
     assert "lean_code_actions" in fixup_overrides["mcp_servers.lastlib_lean.enabled_tools"]
-    assert "lean_file_outline" not in fixup_overrides[
-        "mcp_servers.lastlib_lean.enabled_tools"
-    ]
+    assert "lean_file_outline" not in fixup_overrides["mcp_servers.lastlib_lean.enabled_tools"]
     assert "lean_multi_attempt" not in fixup_overrides["mcp_servers.lastlib_lean.enabled_tools"]
     assert "lean_goal" not in fixup_overrides["mcp_servers.lastlib_lean.enabled_tools"]
 
-    assert not any(
-        "mcp_servers.lastlib_lean" in item for item in executor.command(Stage.FORMALIZE)
-    )
+    assert not any("mcp_servers.lastlib_lean" in item for item in executor.command(Stage.FORMALIZE))
 
     resumed = executor.command(Stage.FORMALIZE, isolated, resume_thread_id="capacity-thread")
     assert resumed[:3] == ["codex", "exec", "resume"]
@@ -284,9 +268,7 @@ def test_lean_mcp_does_not_prewarm_files(tmp_path: Path) -> None:
         if item == "--config"
     }
     assert "mcp_servers.lastlib_lean.env.LEAN_MCP_PREWARM_FILES" not in overrides
-    assert json.loads(
-        overrides["mcp_servers.lastlib_lean.env.LEAN_MCP_SCRATCH_SLOTS"]
-    ) == "1"
+    assert json.loads(overrides["mcp_servers.lastlib_lean.env.LEAN_MCP_SCRATCH_SLOTS"]) == "1"
 
 
 @pytest.mark.parametrize("stage", list(Stage))
@@ -301,9 +283,7 @@ def test_every_agent_prompt_explains_that_git_is_unavailable(tmp_path: Path, sta
 
 
 @pytest.mark.parametrize("stage", list(Stage))
-def test_every_agent_prompt_preserves_chronological_imports(
-    tmp_path: Path, stage: Stage
-) -> None:
+def test_every_agent_prompt_preserves_chronological_imports(tmp_path: Path, stage: Stage) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
     executor = CodexExecutor(config, StateStore(config))
 
@@ -314,9 +294,7 @@ def test_every_agent_prompt_preserves_chronological_imports(
 
 
 @pytest.mark.parametrize("stage", list(Stage))
-def test_out_of_scope_source_repairs_use_fixup_findings(
-    tmp_path: Path, stage: Stage
-) -> None:
+def test_out_of_scope_source_repairs_use_fixup_findings(tmp_path: Path, stage: Stage) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
     executor = CodexExecutor(config, StateStore(config))
 
@@ -943,9 +921,7 @@ time.sleep(60)
             await asyncio.sleep(0.01)
         assert child_pid
         pressure = await asyncio.wait_for(
-            codex_module._wait_for_fd_pressure(
-                process, process_tree, 64, lambda: True
-            ),
+            codex_module._wait_for_fd_pressure(process, process_tree, 64, lambda: True),
             timeout=5,
         )
         assert pressure >= 64
@@ -1175,6 +1151,69 @@ print(json.dumps({{"type": "item.completed", "item": {{
     finally:
         if child_pid and _process_is_running(child_pid):
             os.kill(child_pid, signal.SIGKILL)
+
+
+@pytest.mark.asyncio
+async def test_cancellation_while_recording_spawned_pid_reaps_agent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    pid_path = tmp_path / "cancelled-before-pid-save.pid"
+    fake_codex = tmp_path / "codex-cancelled-before-pid-save"
+    fake_codex.write_text(
+        f"""#!/usr/bin/env python3
+import os
+import sys
+import time
+from pathlib import Path
+
+Path({str(pid_path)!r}).write_text(str(os.getpid()))
+sys.stdin.read()
+time.sleep(60)
+""",
+        encoding="utf-8",
+    )
+    fake_codex.chmod(0o755)
+    config = replace(config, settings=replace(config.settings, codex_bin=str(fake_codex)))
+    state = StateStore(config)
+    await state.load_or_create()
+    executor = CodexExecutor(config, state)
+    await executor.prepare()
+    run = await state.start_run(config.chapters[0].id, Stage.REVIEW)
+    original_update_run = state.update_run
+    pid_update_started = asyncio.Event()
+    never = asyncio.Event()
+
+    async def block_pid_update(target_run, **changes):
+        if "pid" in changes:
+            pid_update_started.set()
+            await never.wait()
+        await original_update_run(target_run, **changes)
+
+    monkeypatch.setattr(state, "update_run", block_pid_update)
+    task = asyncio.create_task(executor.run(config.chapters[0], Stage.REVIEW, run))
+
+    pid = 0
+    try:
+        await asyncio.wait_for(pid_update_started.wait(), timeout=5)
+        for _ in range(200):
+            if pid_path.is_file():
+                pid = int(pid_path.read_text(encoding="utf-8"))
+                break
+            await asyncio.sleep(0.01)
+        assert pid
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        for _ in range(200):
+            if not _process_is_running(pid):
+                break
+            await asyncio.sleep(0.01)
+        assert not _process_is_running(pid)
+    finally:
+        task.cancel()
+        if pid and _process_is_running(pid):
+            os.kill(pid, signal.SIGKILL)
 
 
 def _process_is_running(pid: int) -> bool:

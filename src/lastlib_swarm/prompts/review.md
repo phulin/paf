@@ -16,8 +16,8 @@ file from the filesystem; inspect the filesystem only for explicitly missing or 
 post-edit content, or a targeted search or lookup. Independently determine whether
 the formalization is source-faithful, mathematically provable, proof-ready, and acyclic, and directly
 make the minimal warranted changes in the assigned scope. The snapshot starts clean; the coordinator
-has already certified that every assigned file has no diagnostic except permitted `sorry` warnings.
-Treat that certificate as authoritative for files you do not edit. The coordinator will rebuild your
+has already built every assigned file with no diagnostic except permitted `sorry` warnings.
+Treat that clean baseline as authoritative for files you do not edit. The coordinator will rebuild your
 patch and route any compiler-only failures through fixup.
 
 ## Review standard
@@ -61,7 +61,7 @@ precede its users, and be independently provable from earlier declarations.
    edited dependency closure described above, not the complete chapter.
 
 Do not run Lean, Lake, or another language server; use only the attached Lean MCP. Edit only the
-assigned scope. A no-change review needs no diagnostic calls: the coordinator's incoming certificate
+assigned scope. A no-change review needs no diagnostic calls: the coordinator's incoming clean build
 remains the final evidence. After a changed review, do not report completion until the edited closure
 has clean final MCP diagnostics, allowing only the exact “declaration uses `sorry`” warning. Add a
 `fixup_findings` entry exactly when a required source change remains after your edits, including a
@@ -70,7 +70,7 @@ repair owned by another chapter.
 ## Definition of done
 
 Every source assertion and principal proof route has been accounted for, warranted in-scope repairs
-and support lemmas have been made, imports are acyclic and focused, and the incoming clean certificate
+and support lemmas have been made, imports are acyclic and focused, and the incoming clean build
 together with final diagnostics for the edited closure establishes that the assigned scope remains
 clean except for permitted `sorry` warnings. Report source issues and any remaining omissions,
 dependency-order problems, or required out-of-scope interface changes.

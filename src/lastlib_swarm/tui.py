@@ -32,7 +32,7 @@ from lastlib_swarm.activity import AgentActivity, reportable_error, systemic_err
 from lastlib_swarm.models import Chapter, Stage
 from lastlib_swarm.pricing import format_usd
 from lastlib_swarm.scheduler import Orchestrator
-from lastlib_swarm.state import RunRecord, StateStore, TaskPhase, TaskRecord, TaskStatus, TokenUsage
+from lastlib_swarm.state import RunRecord, StateStore, TaskRecord, TaskStatus, TokenUsage
 
 TUI_THEME = "ansi-dark"
 MAX_TIMELINE_EVENTS = 10_000
@@ -102,20 +102,6 @@ STATUS_MARKS = {
     TaskStatus.BLOCKED: "! blocked",
 }
 
-PHASE_MARKS = {
-    TaskPhase.IDLE: "▶ in progress",
-    TaskPhase.WAITING_PREREQUISITES: "⌛ prerequisites",
-    TaskPhase.RECOVERING: "↺ recovering",
-    TaskPhase.WAITING_BUILD: "⌛ build queue",
-    TaskPhase.QUEUED: "… queued",
-    TaskPhase.BUILDING: "◆ building",
-    TaskPhase.AGENT: "▶ agent",
-    TaskPhase.VERIFICATION_QUEUED: "⌛ verify queue",
-    TaskPhase.VERIFYING: "◆ verifying",
-    TaskPhase.WAITING_FIXUP: "⌛ fixup",
-    TaskPhase.AWAITING_REBUILD: "↻ rebuild",
-}
-
 BOOK_ID = re.compile(r"^book(?P<number>\d+)$", re.IGNORECASE)
 
 
@@ -155,11 +141,7 @@ def chapter_usage(state: StateStore, chapter: Chapter) -> TokenUsage:
 
 
 def stage_counts(state: StateStore, stage: Stage) -> dict[str, int]:
-    return state.stage_counts(stage)[0]
-
-
-def stage_phase_counts(state: StateStore, stage: Stage) -> dict[str, int]:
-    return state.stage_counts(stage)[1]
+    return state.stage_counts(stage)
 
 
 def running_agent_counts(state: StateStore) -> dict[str, int]:
@@ -172,8 +154,6 @@ def running_agent_counts(state: StateStore) -> dict[str, int]:
 
 
 def task_mark(task: TaskRecord) -> str:
-    if task.status in (TaskStatus.PENDING, TaskStatus.RUNNING) and task.phase != TaskPhase.IDLE:
-        return PHASE_MARKS.get(TaskPhase(task.phase), STATUS_MARKS[TaskStatus.RUNNING])
     return STATUS_MARKS[TaskStatus(task.status)]
 
 
@@ -937,10 +917,7 @@ class SwarmApp(App[bool]):
         lifetime_cost = self.state.total_cost()
         agents = running_agent_counts(self.state)
         active_agents = sum(agents.values())
-        queued_agents = sum(
-            task.status == TaskStatus.RUNNING and task.phase == TaskPhase.QUEUED
-            for task in self.state.tasks.values()
-        )
+        queued_agents = int(self.state.agent_summary().get("queued", 0))
         maximum = self.orchestrator.config.settings.max_agents
         lean_mcp = "on" if self.orchestrator.config.settings.lean_mcp else "off"
         codex_access = (
@@ -1025,15 +1002,10 @@ class SwarmApp(App[bool]):
         self._update_static("#alerts", alert)
         for stage in Stage:
             counts = stage_counts(self.state, stage)
-            phases = stage_phase_counts(self.state, stage)
             self._update_static(
                 f"#stage-{stage.value}",
                 f"[b]{stage.value.title()} chapters[/b]\n"
-                f"agent {agents[stage.value]} · queue {phases['queued']} · "
-                f"buildq {phases['waiting_build']} · build {phases['building']} · "
-                f"verifyq {phases['verification_queued']} · verify {phases['verifying']} · "
-                f"fixwait {phases['waiting_fixup']} · "
-                f"deps {phases['waiting_prerequisites']} · recover {phases['recovering']}\n"
+                f"agent {agents[stage.value]} · running {counts['running']}\n"
                 f"✓ {counts['succeeded']}  "
                 f"✗ {counts['failed']}  · {counts['pending']}  ! {counts['blocked']}",
             )
@@ -1096,23 +1068,12 @@ class SwarmApp(App[bool]):
                     for stage in Stage
                     if self.state.task(chapter.id, stage).status
                     in (TaskStatus.PENDING, TaskStatus.RUNNING)
-                    and self.state.task(chapter.id, stage).phase != TaskPhase.IDLE
+                    and self.state.task(chapter.id, stage).detail
                 ),
                 None,
             )
-            phase_activity = {
-                TaskPhase.QUEUED: "queued for agent",
-                TaskPhase.WAITING_PREREQUISITES: "waiting for prerequisites",
-                TaskPhase.RECOVERING: "recovering interrupted work",
-                TaskPhase.WAITING_BUILD: "waiting for coordinator build",
-                TaskPhase.BUILDING: "coordinator building",
-                TaskPhase.VERIFICATION_QUEUED: "queued for coordinator verification",
-                TaskPhase.VERIFYING: "coordinator verifying",
-                TaskPhase.WAITING_FIXUP: "waiting for targeted fixup",
-                TaskPhase.AWAITING_REBUILD: "awaiting coordinator rebuild",
-            }
-            if active_task is not None and active_task.phase in phase_activity:
-                current_activity = phase_activity[TaskPhase(active_task.phase)]
+            if active_task is not None:
+                current_activity = active_task.detail
             else:
                 prior_activity = self.state.activities.get(run.id) if run is not None else None
                 current_activity = activity_label(prior_activity, run)

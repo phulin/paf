@@ -403,7 +403,14 @@ class FuseOverlayIsolation:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
         )
-        output, _ = await process.communicate()
+        try:
+            output, _ = await process.communicate()
+        except BaseException:
+            with suppress(ProcessLookupError):
+                process.terminate()
+            with suppress(BaseException):
+                await process.wait()
+            raise
         if process.returncode:
             raise RuntimeError(
                 f"{' '.join(command[:1])} failed ({process.returncode}): "
@@ -444,8 +451,7 @@ class FuseOverlayIsolation:
 
     def _is_cache_ancestor(self, relative: str) -> bool:
         return any(
-            relative == "" or prefix.startswith(relative + "/")
-            for prefix in self._cache_prefixes()
+            relative == "" or prefix.startswith(relative + "/") for prefix in self._cache_prefixes()
         )
 
     def _dependency_key(self) -> str:
@@ -561,8 +567,7 @@ class FuseOverlayIsolation:
             await self._run(
                 "fuse-overlayfs",
                 "-o",
-                f"lowerdir={self._lower_directories(base, layers)},"
-                f"upperdir={upper},workdir={work}",
+                f"lowerdir={self._lower_directories(base, layers)},upperdir={upper},workdir={work}",
                 str(merged),
             )
             if not os.path.ismount(merged):

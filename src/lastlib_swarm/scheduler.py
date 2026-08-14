@@ -28,8 +28,9 @@ from lastlib_swarm.corpus import (
 from lastlib_swarm.diagnostics import unexpected_lean_warnings
 from lastlib_swarm.isolation import create_isolation
 from lastlib_swarm.models import Chapter, PipelineConfig, Stage
+from lastlib_swarm.run_lock import RepositoryRunLock
 from lastlib_swarm.scope import ScopeMatcher
-from lastlib_swarm.state import RunRecord, StateStore, TaskPhase, TaskStatus
+from lastlib_swarm.state import RunRecord, StateStore, TaskStatus
 
 
 async def _gather_cancel_on_error(
@@ -75,7 +76,6 @@ class Attempt:
 @dataclass(frozen=True)
 class FormalizeOutcome:
     succeeded: bool
-    capacity_deferred: bool = False
 
 
 @dataclass(frozen=True)
@@ -84,7 +84,6 @@ class ReviewOutcome:
     changed: bool
     feedback_by_owner: dict[str, str]
     complete: bool = True
-    capacity_deferred: bool = False
 
 
 @dataclass(frozen=True)
@@ -316,16 +315,21 @@ class Orchestrator:
         self._invalidated_reviews: set[str] = set()
         self._review_invalidation_generations: dict[str, int] = {}
         self._review_generation_lock = asyncio.Lock()
+        self._run_lock = RepositoryRunLock(config.settings.repo)
 
     def scheduling_snapshot(self) -> dict[str, object]:
         return scheduling_snapshot(self.statement_schedule, self.proof_schedule)
 
     async def prepare(self) -> None:
-        await self.state.load_or_create()
-        await self._migrate_review_green()
-        await self.executor.prepare()
-        self.scaffold()
-        await self.isolation.prepare()
+        self._run_lock.acquire()
+        try:
+            await self.state.load_or_create()
+            await self.executor.prepare()
+            self.scaffold()
+            await self.isolation.prepare()
+        except BaseException:
+            self._run_lock.release()
+            raise
 
     async def shutdown(self) -> None:
         try:
@@ -334,7 +338,10 @@ class Orchestrator:
                 await asyncio.gather(self._fixup_runner, return_exceptions=True)
             await self.isolation.close()
         finally:
-            await self.state.close()
+            try:
+                await self.state.close()
+            finally:
+                self._run_lock.release()
 
     def _already_done(self, chapter: Chapter, stage: Stage) -> bool:
         return not self.force and self.state.task(chapter.id, stage).status == TaskStatus.SUCCEEDED
@@ -385,9 +392,7 @@ class Orchestrator:
         return retained
 
     @staticmethod
-    def _dependency_closure(
-        graph: ChapterImportGraph, chapter_ids: Iterable[str]
-    ) -> set[str]:
+    def _dependency_closure(graph: ChapterImportGraph, chapter_ids: Iterable[str]) -> set[str]:
         required = set(chapter_ids)
         pending = list(required)
         while pending:
@@ -399,9 +404,7 @@ class Orchestrator:
         return required
 
     @staticmethod
-    def _successor_closure(
-        graph: ChapterImportGraph, chapter_ids: Iterable[str]
-    ) -> set[str]:
+    def _successor_closure(graph: ChapterImportGraph, chapter_ids: Iterable[str]) -> set[str]:
         affected = set(chapter_ids)
         pending = list(affected)
         while pending:
@@ -529,9 +532,7 @@ class Orchestrator:
                         continue
                     local = clean.get(chapter_id)
                     local_generation = (
-                        int(local.get("build_generation", 0))
-                        if isinstance(local, dict)
-                        else -1
+                        int(local.get("build_generation", 0)) if isinstance(local, dict) else -1
                     )
                     # Merge concurrently published exact builds without
                     # resurrecting records this caller explicitly invalidated.
@@ -557,9 +558,7 @@ class Orchestrator:
             return revision
 
     def _scope_exists(self, chapter: Chapter) -> bool:
-        return ScopeMatcher(chapter.scope).has_match_for_each_pattern(
-            self.config.settings.repo
-        )
+        return ScopeMatcher(chapter.scope).has_match_for_each_pattern(self.config.settings.repo)
 
     async def _attempt(
         self,
@@ -574,7 +573,6 @@ class Orchestrator:
             stage,
             TaskStatus.RUNNING,
             queue_detail or f"queued for {stage.value} agent",
-            phase=TaskPhase.QUEUED,
         )
         await self.control.checkpoint()
         schedule = (
@@ -588,7 +586,6 @@ class Orchestrator:
         workspace = None
         source_held = False
         try:
-            await self.control.checkpoint()
             run = await self.state.start_run(chapter.id, stage)
             if self.isolation.name == "shared":
                 await self.source_lock.acquire()
@@ -719,10 +716,10 @@ class Orchestrator:
             await self.state.set_task(
                 chapter.id,
                 Stage.FORMALIZE,
-                TaskStatus.PENDING,
-                "capacity retries exhausted; requeued behind waiting formalizers",
+                TaskStatus.FAILED,
+                "model capacity remained unavailable after the configured retries",
             )
-            return FormalizeOutcome(False, capacity_deferred=True)
+            return FormalizeOutcome(False)
         await self.state.set_task(
             chapter.id,
             Stage.FORMALIZE,
@@ -898,101 +895,16 @@ class Orchestrator:
             for chapter_id in feedback
             if chapter_id in by_id
         }
-        stale_green = {
+        stale_reviews = {
             chapter_id
             for chapter_id in pending_owners
-            if self.state.task(chapter_id, Stage.REVIEW).review_green is True
+            if self.state.task(chapter_id, Stage.REVIEW).status == TaskStatus.SUCCEEDED
         }
-        if stale_green:
+        if stale_reviews:
             await self._invalidate_review_closure(
-                stale_green,
+                stale_reviews,
                 detail="recovering pending failed-proof review findings",
             )
-
-    async def _migrate_review_green(self) -> None:
-        """Classify pre-attestation review state once from durable run history."""
-
-        legacy = {
-            chapter.id
-            for chapter in self.chapters
-            if self.state.task(chapter.id, Stage.REVIEW).review_green is None
-        }
-        if not legacy:
-            return
-        try:
-            graph = self._observed_chapter_graph()
-        except ValueError:
-            # Graph diagnostics belong to the normal scheduler. Leaving None is
-            # deliberate: migration will retry instead of guessing.
-            return
-
-        green = {chapter_id: False for chapter_id in legacy}
-        events: list[tuple[str, str, str, set[str]]] = []
-
-        for chapter_id in legacy:
-            task = self.state.task(chapter_id, Stage.REVIEW)
-            if (
-                task.status == TaskStatus.SUCCEEDED
-                and task.detail
-                != "review changes merged; awaiting dependency-ordered rebuild"
-            ):
-                events.append((task.updated_at, "1-positive", chapter_id, {chapter_id}))
-
-        for chapter in self.chapters:
-            for run in self.state.chapter_runs(chapter.id):
-                if run.stage not in (Stage.REVIEW, Stage.PROVE):
-                    continue
-                if run.status != TaskStatus.SUCCEEDED:
-                    continue
-                self.state.load_run_details(run)
-                report = run.report if isinstance(run.report, dict) else {}
-                validation = run.validation if isinstance(run.validation, dict) else {}
-                finished_at = run.finished_at or run.started_at
-                findings = report.get("fixup_findings")
-                if isinstance(findings, list) and findings:
-                    owners = {chapter.id, *self._route_review_findings(chapter, report)}
-                    events.append(
-                        (
-                            finished_at,
-                            "2-invalidate",
-                            run.id,
-                            self._successor_closure(graph, owners),
-                        )
-                    )
-                    continue
-                strict_review = (
-                    run.stage == Stage.REVIEW
-                    and run.changed is False
-                    and validation.get("succeeded") is True
-                    and report.get("complete") is True
-                )
-                if strict_review:
-                    events.append((finished_at, "1-positive", run.id, {chapter.id}))
-
-        for _, kind, _, chapter_ids in sorted(events):
-            value = kind == "1-positive"
-            for chapter_id in chapter_ids.intersection(legacy):
-                green[chapter_id] = value
-
-        async with self.state.batch():
-            for chapter_id, is_green in green.items():
-                await self.state.set_review_green((chapter_id,), is_green)
-                task = self.state.task(chapter_id, Stage.REVIEW)
-                if is_green and task.status != TaskStatus.SUCCEEDED:
-                    await self.state.set_task(
-                        chapter_id,
-                        Stage.REVIEW,
-                        TaskStatus.SUCCEEDED,
-                        "durable green review recovered from run history",
-                    )
-                elif not is_green and task.status == TaskStatus.SUCCEEDED:
-                    await self.state.set_task(
-                        chapter_id,
-                        Stage.REVIEW,
-                        TaskStatus.PENDING,
-                        "legacy review requires a durable green result",
-                        phase=TaskPhase.RECOVERING,
-                    )
 
     def _module_owner_ids(self, module: str) -> tuple[str, ...]:
         return tuple(
@@ -1046,13 +958,10 @@ class Orchestrator:
         if not selected:
             return {}
         ids = tuple(chapter.id for chapter in selected)
-        queued_phase = (
-            TaskPhase.VERIFICATION_QUEUED if stage is Stage.REVIEW else TaskPhase.WAITING_BUILD
-        )
-        building_phase = TaskPhase.VERIFYING if stage is Stage.REVIEW else TaskPhase.BUILDING
         label = f"{stage.value} {mode}: " + ", ".join(ids)
 
         while True:
+            await self.control.checkpoint()
             await self.state.set_tasks(
                 ids,
                 stage,
@@ -1062,7 +971,6 @@ class Orchestrator:
                     if stage is Stage.REVIEW
                     else f"queued for {mode} coordinator build"
                 ),
-                phase=queued_phase,
             )
             lease = await self.build_queue.acquire(
                 priority=priority,
@@ -1084,7 +992,6 @@ class Orchestrator:
                         stage,
                         TaskStatus.RUNNING,
                         f"{mode} coordinator build {iteration}/{maximum_iterations}",
-                        phase=building_phase,
                     )
                     await self.state.start_coordinator_build(
                         mode=mode,
@@ -1094,7 +1001,6 @@ class Orchestrator:
                         total=len(selected),
                     )
                 for index, chapter in enumerate(selected):
-                    await self.control.checkpoint()
                     await self.state.advance_coordinator_build(
                         chapter_id=chapter.id,
                         completed=index,
@@ -1168,7 +1074,6 @@ class Orchestrator:
                         stage,
                         TaskStatus.RUNNING,
                         "coordinator build finished; reconciling result",
-                        phase=TaskPhase.IDLE,
                     )
             finally:
                 try:
@@ -1261,7 +1166,6 @@ class Orchestrator:
             Stage.FIXUP,
             TaskStatus.RUNNING,
             f"fixup run {task.rounds + 1} (repair-cycle cap {maximum})",
-            phase=TaskPhase.QUEUED,
         )
         await self.control.checkpoint()
         await self.agent_slots.acquire(self.statement_schedule.priority(chapter.book_id))
@@ -1380,15 +1284,14 @@ class Orchestrator:
                 Stage.FIXUP,
                 TaskStatus.RUNNING,
                 "fixup complete; queued for coordinator verification",
-                phase=TaskPhase.VERIFICATION_QUEUED,
             )
             return attempt
         await self.state.set_task(
             handle.chapter.id,
             Stage.FIXUP,
-            TaskStatus.PENDING if agent.capacity_exhausted else TaskStatus.FAILED,
+            TaskStatus.FAILED,
             (
-                "capacity retries exhausted; fixup requeued"
+                "capacity retries exhausted; fixup failed"
                 if agent.capacity_exhausted
                 else "fixup agent failed"
             ),
@@ -1429,7 +1332,6 @@ class Orchestrator:
                         Stage.FIXUP,
                         TaskStatus.RUNNING,
                         "targeted fixup request queued behind the active repair batch",
-                        phase=TaskPhase.WAITING_FIXUP,
                     )
         except BaseException:
             future.cancel()
@@ -1478,7 +1380,6 @@ class Orchestrator:
                             Stage.FIXUP,
                             TaskStatus.RUNNING,
                             "recovered queued targeted fixup after restart",
-                            phase=TaskPhase.WAITING_FIXUP,
                         )
                 future = asyncio.get_running_loop().create_future()
                 self._fixup_requests.append(
@@ -1552,9 +1453,7 @@ class Orchestrator:
                             request.future.set_exception(error)
                     raise
                 else:
-                    await self.state.finish_fixup_requests(
-                        request.id for request in requests
-                    )
+                    await self.state.finish_fixup_requests(request.id for request in requests)
                     for request in requests:
                         if not request.future.done():
                             goals = request.target_ids | set(request.feedback)
@@ -1651,7 +1550,6 @@ class Orchestrator:
                 Stage.FIXUP,
                 TaskStatus.RUNNING,
                 "stale dependency snapshot; fixup requeued",
-                phase=TaskPhase.QUEUED,
             )
             merge_feedback({handle.chapter.id: detail})
 
@@ -1677,9 +1575,7 @@ class Orchestrator:
                 )
             )[chapter_id]
             if result.succeeded:
-                published = await self._publish_validated_build(
-                    chapter, snapshots[chapter_id]
-                )
+                published = await self._publish_validated_build(chapter, snapshots[chapter_id])
                 if not published:
                     merge_feedback(
                         {
@@ -1701,7 +1597,6 @@ class Orchestrator:
                         Stage.REVIEW,
                         TaskStatus.RUNNING,
                         "coordinator verification clean; continuing editing review",
-                        phase=TaskPhase.IDLE,
                     )
                 else:
                     await self.state.set_task(
@@ -1719,7 +1614,6 @@ class Orchestrator:
                     Stage.REVIEW,
                     TaskStatus.RUNNING,
                     "coordinator verification failed; waiting for targeted fixup",
-                    phase=TaskPhase.WAITING_FIXUP,
                 )
             merge_feedback(diagnostics)
             invalidated_clean.update(
@@ -1737,9 +1631,7 @@ class Orchestrator:
             return await fail_graph(error)
 
         clean = self._retain_fixup_clean(graph, clean_records)
-        invalidated_clean.update(
-            self._invalidate_fixup_descendants(graph, clean, pending_feedback)
-        )
+        invalidated_clean.update(self._invalidate_fixup_descendants(graph, clean, pending_feedback))
         await self._save_fixup_graph(
             graph,
             clean,
@@ -1791,26 +1683,20 @@ class Orchestrator:
                         continue
                     attempt = await self._integrate_fixup_agent(handle)
                     if attempt is None:
-                        if handle.task.result().capacity_exhausted:
-                            attempts[chapter_id] -= 1
-                            merge_feedback({chapter_id: handle.feedback})
-                            continue
                         if attempts[chapter_id] < maximum:
                             merge_feedback(
                                 {
                                     chapter_id: (
-                                        "The previous fixup agent failed before producing an "
-                                        "acceptable patch. Retry the scoped repair from the "
-                                        "coordinator diagnostics."
+                                        "The previous fixup agent failed or exhausted its capacity "
+                                        "budget before producing an acceptable patch. Retry the "
+                                        "scoped repair from the coordinator diagnostics."
                                     )
                                 }
                             )
                         else:
                             failed.add(chapter_id)
                             invalidated_clean.update(
-                                self._invalidate_fixup_descendants(
-                                    graph, clean, (chapter_id,)
-                                )
+                                self._invalidate_fixup_descendants(graph, clean, (chapter_id,))
                             )
                         continue
                     clean.pop(chapter_id, None)
@@ -1847,9 +1733,7 @@ class Orchestrator:
                         and len(clean) == len(by_id)
                         and await self._publish_validated_builds(snapshots)
                     ):
-                        build_generation = int(
-                            self.state.fixup_graph.get("build_generation", 0)
-                        )
+                        build_generation = int(self.state.fixup_graph.get("build_generation", 0))
                         persisted = self.state.fixup_graph.get("clean", {})
                         clean = self._retain_fixup_clean(
                             verified,
@@ -1895,9 +1779,7 @@ class Orchestrator:
                         pending_feedback.pop(chapter_id, None)
                         failed.add(chapter_id)
                         invalidated_clean.update(
-                            self._invalidate_fixup_descendants(
-                                graph, clean, (chapter_id,)
-                            )
+                            self._invalidate_fixup_descendants(graph, clean, (chapter_id,))
                         )
                         continue
                     attempts[chapter_id] += 1
@@ -1919,9 +1801,7 @@ class Orchestrator:
                     )
                     continue
 
-                needed = self._dependency_closure(
-                    graph, set(goals) | set(pending_feedback)
-                )
+                needed = self._dependency_closure(graph, set(goals) | set(pending_feedback))
                 buildable = [
                     chapter_id
                     for chapter_id in graph.order
@@ -1946,9 +1826,7 @@ class Orchestrator:
         finally:
             await cancel_running()
 
-        required = self._dependency_closure(
-            graph, set(goals) if targeted else set(by_id)
-        )
+        required = self._dependency_closure(graph, set(goals) if targeted else set(by_id))
         unresolved = required.difference(clean)
         blocked = unresolved.difference(failed)
         if blocked:
@@ -1965,7 +1843,7 @@ class Orchestrator:
         return False
 
     async def _formalize_all(self) -> bool:
-        """Run every formalizer, requeueing capacity-deferred chapters at the back."""
+        """Run every formalizer once and retain chapter-local failures."""
 
         running = {
             asyncio.create_task(self._formalize(chapter)): chapter for chapter in self.chapters
@@ -1975,12 +1853,9 @@ class Orchestrator:
             while running:
                 done, _ = await asyncio.wait(running, return_when=asyncio.FIRST_COMPLETED)
                 for task in done:
-                    chapter = running.pop(task)
+                    running.pop(task)
                     outcome = task.result()
-                    if outcome.capacity_deferred:
-                        retry = asyncio.create_task(self._formalize(chapter, rerun=True))
-                        running[retry] = chapter
-                    elif not outcome.succeeded:
+                    if not outcome.succeeded:
                         had_failure = True
         except BaseException:
             for task in running:
@@ -2012,16 +1887,14 @@ class Orchestrator:
             await self.state.set_task(
                 chapter.id,
                 Stage.REVIEW,
-                TaskStatus.PENDING,
-                "capacity retries exhausted; review requeued",
-                phase=TaskPhase.QUEUED,
+                TaskStatus.FAILED,
+                "model capacity remained unavailable after the configured retries",
             )
             return ReviewOutcome(
                 False,
                 attempt.agent.changed,
                 {},
                 complete=False,
-                capacity_deferred=True,
             )
         succeeded = attempt.agent.succeeded and attempt.validation.succeeded
         complete = bool(attempt.agent.report.get("complete"))
@@ -2033,7 +1906,6 @@ class Orchestrator:
                     Stage.REVIEW,
                     TaskStatus.RUNNING,
                     "review changes merged; coordinator verification queued",
-                    phase=TaskPhase.VERIFICATION_QUEUED,
                 )
             return ReviewOutcome(True, attempt.agent.changed, {}, complete=True)
         detail = "review left fixup findings" if routed else "editing review failed"
@@ -2068,7 +1940,6 @@ class Orchestrator:
             ):
                 return False
             async with self.state.batch():
-                await self.state.set_review_green((chapter.id,), True)
                 await self.state.finish_proof_review_requests(
                     chapter.id,
                     proof_request_ids,
@@ -2102,20 +1973,17 @@ class Orchestrator:
                 )
             self._invalidated_reviews.update(invalidated)
             async with self.state.batch():
-                await self.state.set_review_green(invalidated, False)
                 await self.state.set_tasks(
                     invalidated,
                     Stage.REVIEW,
                     TaskStatus.PENDING,
                     detail,
-                    phase=TaskPhase.RECOVERING,
                 )
                 await self.state.set_tasks(
                     invalidated,
                     Stage.PROVE,
                     TaskStatus.PENDING,
                     "waiting for invalidated statement review",
-                    phase=TaskPhase.WAITING_PREREQUISITES,
                 )
         return invalidated
 
@@ -2131,9 +1999,7 @@ class Orchestrator:
         """Run at most five edit/rebuild cycles for one dependency-ready chapter."""
 
         review_generation = self._review_invalidation_generation(chapter.id)
-        # Durable green reviews do not depend on exact source/build hashes. A
-        # chapter reaches this method only when review is genuinely required.
-        if self.state.task(chapter.id, Stage.REVIEW).review_green is True:
+        if self.state.task(chapter.id, Stage.REVIEW).status == TaskStatus.SUCCEEDED:
             return True
         graph = self._observed_chapter_graph()
         persisted = self.state.fixup_graph.get("clean", {})
@@ -2158,9 +2024,6 @@ class Orchestrator:
                 if review_feedback
                 else await self._review_once(chapter, rerun=review_rerun)
             )
-            if outcome.capacity_deferred:
-                rounds_used[chapter.id] -= 1
-                continue
             review_feedback = ""
             if not outcome.succeeded:
                 return False
@@ -2181,7 +2044,6 @@ class Orchestrator:
                         Stage.REVIEW,
                         TaskStatus.RUNNING,
                         "review findings routed; waiting for targeted fixup",
-                        phase=TaskPhase.WAITING_FIXUP,
                     )
                 request_succeeded = (
                     await self._request_fixup(findings, target_ids=targets)
@@ -2259,18 +2121,8 @@ class Orchestrator:
             chapter.id
             for chapter in self.chapters
             if chapter.id not in quarantined_ids
-            and self.state.task(chapter.id, Stage.REVIEW).review_green is True
+            and self.state.task(chapter.id, Stage.REVIEW).status == TaskStatus.SUCCEEDED
         }
-        async with self.state.batch():
-            for chapter_id in reviewed:
-                task = self.state.task(chapter_id, Stage.REVIEW)
-                if task.status != TaskStatus.SUCCEEDED:
-                    await self.state.set_task(
-                        chapter_id,
-                        Stage.REVIEW,
-                        TaskStatus.SUCCEEDED,
-                        "durable review remains green",
-                    )
         review_failures: set[str] = set(quarantined_ids)
         review_blocked: set[str] = set()
         attempted: set[str] = set()
@@ -2317,21 +2169,17 @@ class Orchestrator:
                             Stage.REVIEW,
                             TaskStatus.PENDING,
                             "waiting for prerequisite reviews: " + ", ".join(sorted(missing)),
-                            phase=TaskPhase.WAITING_PREREQUISITES,
                         )
                 if chapter_id not in reviewed:
                     await self.state.set_task(
                         chapter_id,
                         Stage.PROVE,
                         TaskStatus.PENDING,
-                        "waiting for a durable green review",
-                        phase=TaskPhase.WAITING_PREREQUISITES,
+                        "waiting for successful review",
                     )
 
         async def cancel_all() -> None:
-            tasks = [handle.task for handle in review_tasks.values()] + list(
-                proof_tasks.values()
-            )
+            tasks = [handle.task for handle in review_tasks.values()] + list(proof_tasks.values())
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
@@ -2357,7 +2205,7 @@ class Orchestrator:
                 reviewed.update(
                     chapter_id
                     for chapter_id in by_id
-                    if self.state.task(chapter_id, Stage.REVIEW).review_green is True
+                    if self.state.task(chapter_id, Stage.REVIEW).status == TaskStatus.SUCCEEDED
                 )
                 for chapter_id in tuple(proof_results):
                     if chapter_id not in reviewed:
@@ -2386,7 +2234,6 @@ class Orchestrator:
                                     Stage.REVIEW,
                                     TaskStatus.PENDING,
                                     "prerequisite review was invalidated during review",
-                                    phase=TaskPhase.WAITING_PREREQUISITES,
                                 )
 
                 for chapter_id in graph.order:
@@ -2404,7 +2251,6 @@ class Orchestrator:
                             Stage.REVIEW,
                             TaskStatus.RUNNING,
                             "waiting for dependency-ordered coordinator build",
-                            phase=TaskPhase.WAITING_BUILD,
                         )
                         review_operation = (
                             self._review_chapter_to_clean(
@@ -2467,19 +2313,14 @@ class Orchestrator:
                 done, _ = await asyncio.wait(live_tasks, return_when=asyncio.FIRST_COMPLETED)
 
                 completed_reviews = [
-                    chapter_id
-                    for chapter_id, handle in review_tasks.items()
-                    if handle.task in done
+                    chapter_id for chapter_id, handle in review_tasks.items() if handle.task in done
                 ]
                 for chapter_id in completed_reviews:
                     handle = review_tasks.pop(chapter_id)
                     succeeded = handle.task.result()
                     if not succeeded:
                         task_record = self.state.task(chapter_id, Stage.REVIEW)
-                        if (
-                            task_record.status == TaskStatus.PENDING
-                            and task_record.phase == TaskPhase.RECOVERING
-                        ):
+                        if task_record.status == TaskStatus.PENDING:
                             rounds_used[chapter_id] = 0
                             continue
                         review_failures.add(chapter_id)
@@ -2495,7 +2336,7 @@ class Orchestrator:
                     current_dependencies = current_graph.dependencies[chapter_id]
                     if not current_dependencies.issubset(handle.dependencies):
                         continue
-                    if self.state.task(chapter_id, Stage.REVIEW).review_green is not True:
+                    if self.state.task(chapter_id, Stage.REVIEW).status != TaskStatus.SUCCEEDED:
                         await self._complete_review(
                             by_id[chapter_id],
                             "editing review completed",
@@ -2666,11 +2507,10 @@ class Orchestrator:
                 await self.state.set_task(
                     chapter.id,
                     Stage.PROVE,
-                    TaskStatus.PENDING,
-                    "capacity retries exhausted; proof requeued",
-                    phase=TaskPhase.QUEUED,
+                    TaskStatus.FAILED,
+                    "model capacity remained unavailable after the configured retries",
                 )
-                continue
+                return False
             proof_round += 1
             if (
                 attempt.agent.succeeded
@@ -2686,9 +2526,7 @@ class Orchestrator:
                 )
                 return True
 
-            feedback_ledger.append(
-                f"Proof attempt {proof_round}:\n{attempt.feedback()}"
-            )
+            feedback_ledger.append(f"Proof attempt {proof_round}:\n{attempt.feedback()}")
             feedback = _bounded_proof_feedback(feedback_ledger)
             if bool(attempt.agent.report.get("fixup_findings")):
                 if not defer_review:
@@ -2699,10 +2537,7 @@ class Orchestrator:
                     )
                 return False
             placeholders = attempt.agent.placeholders
-            if (
-                previous_placeholders is not None
-                and placeholders >= previous_placeholders
-            ):
+            if previous_placeholders is not None and placeholders >= previous_placeholders:
                 stalled_rounds += 1
             else:
                 stalled_rounds = 0

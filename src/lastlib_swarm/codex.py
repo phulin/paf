@@ -598,10 +598,7 @@ whole-file diagnostics in import order; do not prepare every file separately.
                 Stage.REVIEW: "Failed proof findings to evaluate",
                 Stage.PROVE: "Cumulative proof-attempt ledger",
             }[stage]
-            contract += (
-                f"\n## {feedback_heading}\n\n```text\n"
-                f"{_bounded_feedback(feedback)}\n```\n"
-            )
+            contract += f"\n## {feedback_heading}\n\n```text\n{_bounded_feedback(feedback)}\n```\n"
         prefix = ""
         if stage is Stage.REVIEW:
             root = workspace_root or self.config.settings.repo
@@ -722,7 +719,15 @@ whole-file diagnostics in import order; do not prepare every file separately.
                 start_new_session=True,
             )
             process_tree = _ProcessTreeTracker(process.pid)
-            await self.state.update_run(run, pid=process.pid, log_path=str(log_path))
+            try:
+                await self.state.update_run(run, pid=process.pid, log_path=str(log_path))
+            except BaseException:
+                # Cancellation can arrive immediately after spawning, before the
+                # normal invocation cleanup guard exists. Reap the process here
+                # so a cancelled scheduler task cannot leak Codex or its mount.
+                with suppress(BaseException):
+                    await _terminate(process, process_tree)
+                raise
             if process.stdin is None or process.stdout is None:
                 await _terminate(process)
                 raise RuntimeError("failed to open Codex subprocess pipes")
@@ -1057,10 +1062,7 @@ class _ProcessTreeTracker:
             identity = _process_identity(pid)
             if identity is None:
                 continue
-            if (
-                (known_start := self.known.get(pid)) is not None
-                and identity[1] != known_start
-            ):
+            if (known_start := self.known.get(pid)) is not None and identity[1] != known_start:
                 continue
             descendants.add(pid)
             self.known[pid] = identity[1]

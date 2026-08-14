@@ -10,7 +10,7 @@ from textual.widgets import DataTable, RichLog, Static, Tab, TabbedContent, Tabs
 from lastlib_swarm.config import load_config
 from lastlib_swarm.models import Stage
 from lastlib_swarm.scheduler import Orchestrator
-from lastlib_swarm.state import StateStore, TaskPhase, TaskStatus, TokenUsage
+from lastlib_swarm.state import StateStore, TaskStatus, TokenUsage
 from lastlib_swarm.tui import (
     ACTIVITY_KIND_ALIASES,
     ACTIVITY_KIND_DISPLAYS,
@@ -22,7 +22,7 @@ from lastlib_swarm.tui import (
     format_agent_update,
     format_count,
     format_usage,
-    stage_phase_counts,
+    stage_counts,
     task_mark,
 )
 from tests.support import write_project
@@ -83,7 +83,7 @@ def test_formats_measured_token_spend_without_double_counting_cache() -> None:
 
 
 @pytest.mark.asyncio
-async def test_pending_prerequisite_phase_is_visible_and_counted(tmp_path: Path) -> None:
+async def test_pending_prerequisite_work_is_visible_and_counted(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
     state = StateStore(config)
     await state.load_or_create()
@@ -93,12 +93,11 @@ async def test_pending_prerequisite_phase_is_visible_and_counted(tmp_path: Path)
         Stage.PROVE,
         TaskStatus.PENDING,
         "waiting for a durable green review",
-        phase=TaskPhase.WAITING_PREREQUISITES,
     )
 
     task = state.task(chapter.id, Stage.PROVE)
-    assert task_mark(task) == "⌛ prerequisites"
-    assert stage_phase_counts(state, Stage.PROVE)["waiting_prerequisites"] == 1
+    assert task_mark(task) == "· pending"
+    assert stage_counts(state, Stage.PROVE)["pending"] == 1
 
 
 def test_formats_structured_agent_update_as_summary_and_issues() -> None:
@@ -606,14 +605,12 @@ async def test_dashboard_separates_agents_queues_and_coordinator_builds(
             Stage.FIXUP,
             TaskStatus.RUNNING,
             "streaming coordinator build",
-            phase=TaskPhase.BUILDING,
         )
         await state.set_task(
             config.chapters[1].id,
             Stage.REVIEW,
             TaskStatus.RUNNING,
             "queued for review",
-            phase=TaskPhase.QUEUED,
         )
         await state.start_coordinator_build(
             mode=build_mode,
@@ -643,7 +640,7 @@ async def test_dashboard_separates_agents_queues_and_coordinator_builds(
         app.refresh_dashboard()
 
         usage = str(app.query_one("#usage", Static).content)
-        assert "Agents 1/4 · formalize 1 · queued 1" in usage
+        assert "Agents 1/4 · formalize 1 · queued 0" in usage
         assert f"Coordinator {build_mode} build 20/81 · iter 2/6" in usage
         assert "err 1 · warn 1" in usage
         status = str(app.query_one("#status", Static).content)
@@ -655,9 +652,9 @@ async def test_dashboard_separates_agents_queues_and_coordinator_builds(
         assert "Building dependency graph" in status
         assert "Compiling Book.Chapter02" in status
         fixup = str(app.query_one("#stage-fixup", Static).content)
-        assert "agent 0 · queue 0 · buildq 0 · build 1 · verifyq 0 · verify 0 · fixwait 0" in fixup
+        assert "agent 0 · running 1" in fixup
         review = str(app.query_one("#stage-review", Static).content)
-        assert "agent 0 · queue 1 · buildq 0 · build 0 · verifyq 0 · verify 0 · fixwait 0" in review
+        assert "agent 0 · running 1" in review
 
         finish_build.set()
         await build_finished.wait()
