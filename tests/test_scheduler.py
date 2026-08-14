@@ -1,7 +1,7 @@
 import asyncio
 import json
 import sqlite3
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -695,6 +695,39 @@ async def test_concurrent_fixup_requests_share_one_repair_pass(
         )
     )
     assert calls == [({first.id: "first", second.id: "second"}, {first.id, second.id})]
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_batched_fixup_requests_resolve_from_their_own_goal_closures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    first, second = config.chapters
+    orchestrator = Orchestrator(config, StateStore(config))
+    await orchestrator.prepare()
+
+    async def partially_failed_fixup(
+        _feedback: dict[str, str] | None = None,
+        *,
+        target_ids: object = None,
+    ) -> bool:
+        assert target_ids == {first.id, second.id}
+        return False
+
+    def goals_are_clean(goal_ids: Iterable[str]) -> bool:
+        return set(goal_ids) == {first.id}
+
+    monkeypatch.setattr(orchestrator, "_fixup_to_clean", partially_failed_fixup)
+    monkeypatch.setattr(orchestrator, "_fixup_goals_are_clean", goals_are_clean)
+
+    first_result, second_result = await asyncio.gather(
+        orchestrator._request_fixup({first.id: "first"}, target_ids={first.id}),
+        orchestrator._request_fixup({second.id: "second"}, target_ids={second.id}),
+    )
+
+    assert first_result is True
+    assert second_result is False
     await orchestrator.shutdown()
 
 

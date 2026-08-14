@@ -1562,6 +1562,15 @@ class Orchestrator:
             verification_stages={chapter_id: stage for chapter_id in targets},
         )
 
+    def _fixup_goals_are_clean(self, goal_ids: Iterable[str]) -> bool:
+        graph = self._observed_chapter_graph()
+        persisted = self.state.fixup_graph.get("clean", {})
+        clean = self._retain_fixup_clean(
+            graph,
+            persisted if isinstance(persisted, dict) else {},
+        )
+        return self._dependency_closure(graph, goal_ids).issubset(clean)
+
     async def _drain_fixup_requests(self) -> None:
         try:
             while True:
@@ -1600,7 +1609,10 @@ class Orchestrator:
                     )
                     for request in requests:
                         if not request.future.done():
-                            request.future.set_result(succeeded)
+                            goals = request.target_ids | set(request.feedback)
+                            request.future.set_result(
+                                succeeded or self._fixup_goals_are_clean(goals)
+                            )
         finally:
             async with self._fixup_request_lock:
                 pending, self._fixup_requests = self._fixup_requests, []
