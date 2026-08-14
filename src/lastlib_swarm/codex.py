@@ -19,6 +19,7 @@ from lastlib_swarm import json_codec as json
 from lastlib_swarm.activity import EVENT_TIMESTAMP_FIELD, activity_timestamp
 from lastlib_swarm.diagnostics import unexpected_lean_warnings
 from lastlib_swarm.models import Chapter, PipelineConfig, Stage
+from lastlib_swarm.scope import ScopeMatcher
 from lastlib_swarm.state import RunRecord, StateStore, TaskStatus, TokenUsage
 
 REPORT_SCHEMA: dict[str, Any] = {
@@ -174,10 +175,7 @@ def _bounded_feedback(feedback: str, maximum: int = 12000) -> str:
 
 
 def scoped_files(repo: Path, chapter: Chapter) -> list[Path]:
-    files: set[Path] = set()
-    for pattern in chapter.scope:
-        files.update(path for path in repo.glob(pattern) if path.is_file())
-    return sorted(files)
+    return ScopeMatcher(chapter.scope).files(repo)
 
 
 def _review_source_bundle(

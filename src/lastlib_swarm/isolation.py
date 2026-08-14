@@ -1,17 +1,17 @@
 from __future__ import annotations
 
 import asyncio
-import fnmatch
 import hashlib
 import os
 import shutil
 import stat
 from contextlib import suppress
 from dataclasses import dataclass
-from functools import cache
 from pathlib import Path
+from uuid import uuid4
 
 from lastlib_swarm.models import Chapter, SwarmSettings
+from lastlib_swarm.scope import ScopeMatcher
 
 
 @dataclass(frozen=True)
@@ -121,45 +121,14 @@ def tree_manifest(root: Path, *, excluded: tuple[str, ...]) -> dict[str, FileFin
 def scoped_manifest(root: Path, chapter: Chapter) -> dict[str, FileFingerprint]:
     """Fingerprint only a chapter's exclusive scope in the live worktree."""
 
-    result: dict[str, FileFingerprint] = {}
-    for pattern in chapter.scope:
-        for path in root.glob(pattern):
-            if path.is_dir():
-                continue
-            relative = path.relative_to(root).as_posix()
-            result[relative] = _fingerprint(path)
-    return result
-
-
-@cache
-def _globstar_variants(pattern: str) -> tuple[str, ...]:
-    """Expand `**/` as either zero or one-or-more path components.
-
-    `fnmatch` treats `**` like an ordinary `*`, so its spelling with a
-    following slash accidentally requires at least one child directory. Git
-    and pathlib glob semantics allow zero directories as well.
-    """
-
-    variants = {pattern}
-    pending = [pattern]
-    while pending:
-        candidate = pending.pop()
-        start = 0
-        while (index := candidate.find("**/", start)) >= 0:
-            collapsed = candidate[:index] + candidate[index + 3 :]
-            if collapsed not in variants:
-                variants.add(collapsed)
-                pending.append(collapsed)
-            start = index + 3
-    return tuple(sorted(variants))
+    return {
+        path.relative_to(root).as_posix(): _fingerprint(path)
+        for path in ScopeMatcher(chapter.scope).files(root)
+    }
 
 
 def _matches_scope(relative: str, chapter: Chapter) -> bool:
-    return any(
-        fnmatch.fnmatchcase(relative, variant)
-        for pattern in chapter.scope
-        for variant in _globstar_variants(pattern)
-    )
+    return ScopeMatcher(chapter.scope).matches(relative)
 
 
 class SharedWorkspace:
@@ -874,16 +843,53 @@ class FuseOverlayIsolation:
                         changed_paths=changed,
                         error=f"unsupported changed file type: {unsupported[0]}",
                     )
-                for relative in changed:
-                    destination = self.settings.repo / relative
-                    fingerprint = merged_manifest.get(relative)
-                    if fingerprint is None:
-                        destination.unlink(missing_ok=True)
-                        continue
-                    destination.parent.mkdir(parents=True, exist_ok=True)
-                    temporary = destination.with_name(f".{destination.name}.swarm-{os.getpid()}")
-                    shutil.copy2(merged_root / relative, temporary)
-                    os.replace(temporary, destination)
+                transaction = f"{os.getpid()}-{uuid4().hex}"
+                staged: dict[str, Path] = {}
+                backups: dict[str, Path] = {}
+                committed: list[str] = []
+                try:
+                    # Complete every allocation and content verification before
+                    # the first live path changes. In particular, ENOSPC while
+                    # copying cannot leave a partially imported scope.
+                    for relative in changed:
+                        fingerprint = merged_manifest.get(relative)
+                        if fingerprint is None:
+                            continue
+                        destination = self.settings.repo / relative
+                        destination.parent.mkdir(parents=True, exist_ok=True)
+                        temporary = destination.with_name(
+                            f".{destination.name}.swarm-stage-{transaction}"
+                        )
+                        shutil.copy2(merged_root / relative, temporary)
+                        if _fingerprint(temporary) != fingerprint:
+                            raise OSError(f"staged source verification failed: {relative}")
+                        staged[relative] = temporary
+
+                    for relative in changed:
+                        destination = self.settings.repo / relative
+                        destination.parent.mkdir(parents=True, exist_ok=True)
+                        if os.path.lexists(destination):
+                            backup = destination.with_name(
+                                f".{destination.name}.swarm-backup-{transaction}"
+                            )
+                            os.replace(destination, backup)
+                            backups[relative] = backup
+                        committed.append(relative)
+                        if relative in staged:
+                            os.replace(staged[relative], destination)
+                except BaseException:
+                    for relative in reversed(committed):
+                        destination = self.settings.repo / relative
+                        if os.path.lexists(destination):
+                            destination.unlink()
+                        if backup := backups.get(relative):
+                            os.replace(backup, destination)
+                    raise
+                finally:
+                    for temporary in staged.values():
+                        temporary.unlink(missing_ok=True)
+                    for backup in backups.values():
+                        backup.unlink(missing_ok=True)
                 if changed:
                     self._revision += 1
                 return IsolationResult(

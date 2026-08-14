@@ -28,6 +28,7 @@ from lastlib_swarm.corpus import (
 from lastlib_swarm.diagnostics import unexpected_lean_warnings
 from lastlib_swarm.isolation import create_isolation
 from lastlib_swarm.models import Chapter, PipelineConfig, Stage
+from lastlib_swarm.scope import ScopeMatcher
 from lastlib_swarm.state import RunRecord, StateStore, TaskPhase, TaskStatus
 
 
@@ -667,8 +668,9 @@ class Orchestrator:
             return revision
 
     def _scope_exists(self, chapter: Chapter) -> bool:
-        repo = self.config.settings.repo
-        return all(any(path.is_file() for path in repo.glob(pattern)) for pattern in chapter.scope)
+        return ScopeMatcher(chapter.scope).has_match_for_each_pattern(
+            self.config.settings.repo
+        )
 
     async def _attempt(
         self,
