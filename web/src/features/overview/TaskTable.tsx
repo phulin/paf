@@ -1,19 +1,27 @@
 import { ChevronRight, ListFilter, Search } from "lucide-react";
 import { useState } from "react";
+import type { CoordinatorBuild } from "../../types";
 import { ActivityCell, StatusPill } from "./TaskStatus";
 import { chapterLabel, STAGES, type ChapterRow } from "./model";
 
 export function TaskTable({
   rows,
   selected,
+  build,
   setSelected,
 }: {
   rows: ChapterRow[];
+  build: CoordinatorBuild;
   selected: ChapterRow | null;
   setSelected: (row: ChapterRow | null) => void;
 }) {
   const [filter, setFilter] = useState<"active" | "all" | "issues">("active");
   const [query, setQuery] = useState("");
+  const buildTargets = new Set(
+    build.target_chapter_ids?.length
+      ? build.target_chapter_ids
+      : build.current_chapter_id ? [build.current_chapter_id] : [],
+  );
   const visible = rows.filter((row) => {
     const tasks = Object.values(row.stages);
     const matchesQuery = `${row.book} ${row.title}`.toLowerCase().includes(query.toLowerCase());
@@ -43,7 +51,15 @@ export function TaskTable({
             {visible.slice(0, 22).map((row) => (
               <tr key={row.id} className={selected?.id === row.id ? "selected" : ""} onClick={() => setSelected(row)}>
                 <td><div className="chapter-cell"><span className="chapter-index">{chapterLabel(row)}</span><div><strong>{row.title}</strong></div></div></td>
-                {STAGES.map((stage) => <td key={stage}><StatusPill status={row.stages[stage]?.status} rounds={row.stages[stage]?.rounds} /></td>)}
+                {STAGES.map((stage) => (
+                  <td key={stage}>
+                    <StatusPill
+                      status={row.stages[stage]?.status}
+                      rounds={row.stages[stage]?.rounds}
+                      building={build.active && build.stage === stage && buildTargets.has(row.id)}
+                    />
+                  </td>
+                ))}
                 <td><ActivityCell activity={row.activity} task={row.latestTask} /></td>
                 <td><ChevronRight className="row-chevron" size={16} /></td>
               </tr>

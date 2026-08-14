@@ -41,7 +41,7 @@ export function Overview({ state, connected }: { state: SwarmState; connected: b
     <main className="main overview">
       <DashboardSummary state={state} rows={rows} connected={connected} />
       <BuildPanel state={state} openTimeline={() => setTimelineOpen(true)} />
-      <TaskTable rows={rows} selected={selected} setSelected={inspectChapter} />
+      <TaskTable rows={rows} build={state.coordinator_build} selected={selected} setSelected={inspectChapter} />
       {timelineOpen && <TimelineDrawer state={state} close={() => setTimelineOpen(false)} />}
       {selected && <ChapterInspector row={selected} close={closeChapter} />}
     </main>

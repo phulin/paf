@@ -72,6 +72,7 @@ export const demoState: SwarmState = {
     error_count: 0,
     warning_count: 2,
     current_chapter_id: "book03/chapter-08",
+    target_chapter_ids: ["book03/chapter-08"],
     output_tail: [
       "Building LastLib.Book03RamificationTheory.Chapter08",
       "[143/216] Section02PolynomialDiscriminantsAndTheIndexCorrection",

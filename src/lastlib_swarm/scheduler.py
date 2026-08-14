@@ -1023,6 +1023,11 @@ class Orchestrator:
             preempted = False
             source_held = False
             build_workspace = None
+            progress_flush: asyncio.Task[None] | None = None
+
+            async def flush_build_progress() -> None:
+                await asyncio.sleep(0.25)
+                await self.state.flush()
             try:
                 await self.source_lock.acquire()
                 source_held = True
@@ -1040,6 +1045,7 @@ class Orchestrator:
                         iteration=iteration,
                         maximum_iterations=maximum_iterations,
                         total=len(selected),
+                        target_chapter_ids=ids,
                     )
                 if combine_targets and len(selected) > 1:
                     targets = []
@@ -1071,6 +1077,7 @@ class Orchestrator:
                     )
 
                     def append_output(output: str, *, current: Chapter = chapter) -> None:
+                        nonlocal progress_flush
                         error_count = (
                             sum(
                                 diagnostic.severity == "error"
@@ -1084,6 +1091,8 @@ class Orchestrator:
                             output,
                             error_count=error_count,
                         )
+                        if progress_flush is None or progress_flush.done():
+                            progress_flush = asyncio.create_task(flush_build_progress())
 
                     validation = asyncio.create_task(
                         validate(
@@ -1154,6 +1163,8 @@ class Orchestrator:
                     )
             finally:
                 try:
+                    if progress_flush is not None:
+                        await progress_flush
                     if build_workspace is not None:
                         await build_workspace.close()
                     if source_held:

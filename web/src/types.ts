@@ -31,6 +31,7 @@ export interface CoordinatorBuild {
   total: number;
   iteration: number;
   maximum_iterations: number;
+  target_chapter_ids?: string[];
   error_count: number;
   warning_count: number;
   current_chapter_id: string | null;

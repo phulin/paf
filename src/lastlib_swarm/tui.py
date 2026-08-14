@@ -1015,11 +1015,18 @@ class SwarmApp(App[bool]):
         self._update_static("#alerts", alert)
         for stage in Stage:
             counts = stage_counts(self.state, stage)
-            building = int(build.active and build.stage == stage.value)
+            build_targets = (
+                set(build.target_chapter_ids)
+                or ({build.current_chapter_id} if build.current_chapter_id else set())
+            )
+            building = (
+                len(build_targets) if build.active and build.stage == stage.value else 0
+            )
+            running = max(0, counts["running"] - building)
             self._update_static(
                 f"#stage-{stage.value}",
                 f"[b]{stage.value.title()} chapters[/b]\n"
-                f"agent {agents[stage.value]} · running {counts['running']} · "
+                f"agent {agents[stage.value]} · running {running} · "
                 f"building {building}\n"
                 f"✓ {counts['succeeded']}  "
                 f"✗ {counts['failed']}  · {counts['pending']}  ! {counts['blocked']}",
@@ -1065,13 +1072,16 @@ class SwarmApp(App[bool]):
     def _row_values(self, chapter: Chapter) -> tuple[str, ...]:
         statuses = []
         build = self.state.coordinator_build
+        build_targets = set(build.target_chapter_ids)
+        if not build_targets and build.current_chapter_id:
+            build_targets.add(build.current_chapter_id)
         for stage in Stage:
             task = self.state.task(chapter.id, stage)
             mark = task_mark(
                 task,
                 building=(
                     build.active
-                    and build.current_chapter_id == chapter.id
+                    and chapter.id in build_targets
                     and build.stage == stage.value
                 ),
             )
@@ -1082,7 +1092,7 @@ class SwarmApp(App[bool]):
         run = latest_run(self.state, chapter)
         active_run = self.state.active_run(chapter.id)
         activity = self.state.activities.get(active_run.id) if active_run is not None else None
-        if build.active and build.current_chapter_id == chapter.id:
+        if build.active and chapter.id in build_targets:
             current_activity = f"{build.mode} coordinator build"
         elif active_run is not None:
             current_activity = activity_label(activity, active_run)

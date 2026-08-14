@@ -311,6 +311,7 @@ h1, h2, p { margin: 0; }
 .status-pill { width: fit-content; display: inline-flex; align-items: center; justify-content: flex-start; gap: 5px; color: var(--muted); font: 600 8px/1 ui-monospace, monospace; text-transform: uppercase; white-space: nowrap; }
 .status-succeeded { color: var(--green); }
 .status-running { color: var(--cyan); }
+.status-building { color: var(--cyan); }
 .status-failed { color: var(--red); }
 .status-blocked { color: var(--amber); }
 .round-count { margin-left: 1px; color: var(--muted-2); font-weight: 500; }

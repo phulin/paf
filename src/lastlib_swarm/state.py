@@ -143,6 +143,7 @@ class CoordinatorBuildRecord:
     maximum_iterations: int = 0
     completed: int = 0
     total: int = 0
+    target_chapter_ids: list[str] = field(default_factory=list)
     current_chapter_id: str = ""
     error_count: int = 0
     warning_count: int = 0
@@ -988,6 +989,7 @@ class StateStore:
         iteration: int,
         maximum_iterations: int,
         total: int,
+        target_chapter_ids: Iterable[str] = (),
     ) -> None:
         self.coordinator_build = CoordinatorBuildRecord(
             active=True,
@@ -996,6 +998,7 @@ class StateStore:
             iteration=iteration,
             maximum_iterations=maximum_iterations,
             total=total,
+            target_chapter_ids=list(target_chapter_ids),
         )
         self._mark_dirty()
         await self._persist()
@@ -1053,6 +1056,7 @@ class StateStore:
             *lines,
         ][-maximum:]
         self.coordinator_build.updated_at = timestamp()
+        self._mark_dirty()
 
     async def finish_coordinator_build(self) -> None:
         self.coordinator_build.active = False

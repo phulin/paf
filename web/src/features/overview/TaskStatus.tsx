@@ -12,11 +12,16 @@ function StatusIcon({ status }: { status?: TaskStatus }) {
   }
 }
 
-export function StatusPill({ status = "pending", rounds }: { status?: TaskStatus; rounds?: number }) {
+export function StatusPill({
+  status = "pending",
+  rounds,
+  building = false,
+}: { status?: TaskStatus; rounds?: number; building?: boolean }) {
+  const displayStatus = building ? "building" : status;
   return (
-    <span className={`status-pill status-${status}`}>
+    <span className={`status-pill status-${displayStatus}`}>
       <StatusIcon status={status} />
-      <span>{status === "succeeded" ? "done" : status}</span>
+      <span>{building ? "building" : status === "succeeded" ? "done" : status}</span>
       {Boolean(rounds) && <span className="round-count">×{rounds}</span>}
     </span>
   );

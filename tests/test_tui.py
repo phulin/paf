@@ -690,6 +690,7 @@ async def test_dashboard_separates_agents_queues_and_coordinator_builds(
             iteration=2,
             maximum_iterations=6,
             total=81,
+            target_chapter_ids=(config.chapters[1].id,),
         )
         await state.advance_coordinator_build(
             chapter_id=config.chapters[1].id,
@@ -724,7 +725,7 @@ async def test_dashboard_separates_agents_queues_and_coordinator_builds(
         assert "Building dependency graph" in status
         assert "Compiling Book.Chapter02" in status
         fixup = str(app.query_one("#stage-fixup", Static).content)
-        assert "agent 0 · running 1 · building 1" in fixup
+        assert "agent 0 · running 0 · building 1" in fixup
         review = str(app.query_one("#stage-review", Static).content)
         assert "agent 0 · running 1 · building 0" in review
         row = app._row_values(config.chapters[1])
