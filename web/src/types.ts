@@ -84,8 +84,16 @@ export interface AgentActivity {
   mcp_calls?: number;
   file_changes?: number;
   failures?: number;
+  todo_completed?: number;
+  todo_total?: number;
+  todos?: AgentTodo[];
   latest_summary?: string;
   recent?: ActivityEvent[];
+}
+
+export interface AgentTodo {
+  completed: boolean;
+  text: string;
 }
 
 export interface ActivityEvent {

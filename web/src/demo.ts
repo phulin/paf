@@ -86,6 +86,14 @@ export const demoState: SwarmState = {
       mcp_calls: 18,
       file_changes: 3,
       failures: 0,
+      todo_completed: 2,
+      todo_total: 4,
+      todos: [
+        { completed: true, text: "Inventory the chapter and existing Lean declarations" },
+        { completed: true, text: "Identify the matching Mathlib discriminant API" },
+        { completed: false, text: "Close the remaining minpoly identity" },
+        { completed: false, text: "Run diagnostics and audit chapter coverage" },
+      ],
       latest_summary: "Closed two proof holes; checking the remaining minpoly identity.",
       recent: [
         { at: now, kind: "mcp_tool_call", status: "completed", title: "Lean diagnostics", detail: "0 errors · 1 declaration uses sorry" },
@@ -100,6 +108,14 @@ export const demoState: SwarmState = {
       mcp_calls: 0,
       file_changes: 1,
       failures: 0,
+      todo_completed: 1,
+      todo_total: 4,
+      todos: [
+        { completed: true, text: "Inventory the source section and scoped files" },
+        { completed: false, text: "State the finite-prime contribution" },
+        { completed: false, text: "Formalize the discriminant term" },
+        { completed: false, text: "Audit coverage and unresolved dependencies" },
+      ],
       recent: [
         { at: now, kind: "file_change", status: "completed", title: "Created Section03PrimeAndDiscriminantTerms.lean" },
         { at: now, kind: "todo", status: "updated", title: "Plan 3/6", detail: "State the finite-prime contribution." },

@@ -400,6 +400,18 @@ h1, h2, p { margin: 0; }
 .drawer-stage > div strong { color: var(--text); font: 650 10px/1 ui-monospace, monospace; text-transform: uppercase; }
 .drawer-stage > div span { color: var(--muted); font-size: 9px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .drawer-section { padding: 18px 0; border-bottom: 1px solid var(--border); }
+.agent-plan-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.agent-plan-heading em { color: var(--cyan); font: 650 10px/1 ui-monospace, monospace; font-style: normal; }
+.agent-plan-progress { height: 2px; margin-top: 11px; overflow: hidden; background: #17212a; }
+.agent-plan-progress span { display: block; height: 100%; background: var(--cyan); transition: width .25s ease; }
+.agent-plan ol { display: flex; flex-direction: column; gap: 2px; margin: 10px 0 0; padding: 0; list-style: none; }
+.agent-plan li { min-height: 34px; display: grid; grid-template-columns: 24px 1fr; align-items: center; gap: 7px; padding: 5px 7px; border-left: 2px solid transparent; color: var(--muted); font-size: 11px; line-height: 1.4; }
+.agent-plan li.current { border-left-color: var(--cyan); background: rgba(92,207,230,.045); color: var(--text-strong); }
+.agent-plan li.completed { color: var(--muted-2); }
+.plan-marker { width: 20px; height: 20px; display: grid; place-items: center; border: 1px solid var(--border-strong); color: var(--muted-2); font: 650 8px/1 ui-monospace, monospace; }
+.agent-plan li.current .plan-marker { border-color: rgba(92,207,230,.4); color: var(--cyan); }
+.agent-plan li.completed .plan-marker { border-color: rgba(136,212,152,.2); color: var(--green); }
+.agent-plan-empty { margin-top: 10px; color: var(--muted); font-size: 11px; line-height: 1.5; }
 .agent-summary { margin-top: 10px; color: var(--text); font-size: 11px; line-height: 1.65; }
 .agent-report { margin-top: 11px; }
 .agent-report.plain { padding: 1px 0; }
@@ -594,6 +606,7 @@ h1, h2, p { margin: 0; }
 .drawer-stage > div strong { font-size: 12px; }
 .drawer-stage > div span { font-size: 10px; }
 .agent-summary { font-size: 13px; }
+.agent-plan li, .agent-plan-empty { font-size: 12px; }
 .agent-stats span { font-size: 10px; }
 .drawer-section > code { font-size: 11px; }
 .back-button { font-size: 11px; }

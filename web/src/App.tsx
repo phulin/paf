@@ -773,6 +773,40 @@ function AgentUpdate({ activity }: { activity?: AgentActivity }) {
   );
 }
 
+function AgentPlan({ activity }: { activity?: AgentActivity }) {
+  const todos = activity?.todos ?? [];
+  const completed = todos.filter((todo) => todo.completed).length;
+  const total = activity?.todo_total ?? todos.length;
+  const progress = total > 0 ? Math.min(100, Math.round(((activity?.todo_completed ?? completed) / total) * 100)) : 0;
+  const currentIndex = todos.findIndex((todo) => !todo.completed);
+
+  return (
+    <div className="agent-plan">
+      <div className="agent-plan-heading">
+        <span className="eyebrow">Current agent plan</span>
+        {total > 0 && <em>{activity?.todo_completed ?? completed}/{total}</em>}
+      </div>
+      {todos.length > 0 ? (
+        <>
+          <div className="agent-plan-progress"><span style={{ width: `${progress}%` }} /></div>
+          <ol>
+            {todos.map((todo, index) => (
+              <li className={`${todo.completed ? "completed" : ""} ${index === currentIndex ? "current" : ""}`} key={`${todo.text}-${index}`}>
+                <span className="plan-marker">
+                  {todo.completed ? <Check size={12} /> : <span>{String(index + 1).padStart(2, "0")}</span>}
+                </span>
+                <span>{todo.text}</span>
+              </li>
+            ))}
+          </ol>
+        </>
+      ) : (
+        <p className="agent-plan-empty">No plan has been published for this run yet.</p>
+      )}
+    </div>
+  );
+}
+
 function ChapterInspector({ row, close }: { row: ChapterRow; close: () => void }) {
   const activity = row.activity;
   return (
@@ -793,6 +827,9 @@ function ChapterInspector({ row, close }: { row: ChapterRow; close: () => void }
               </div>
             );
           })}
+        </div>
+        <div className="drawer-section">
+          <AgentPlan activity={activity} />
         </div>
         <div className="drawer-section">
           <span className="eyebrow">Latest agent update</span>
