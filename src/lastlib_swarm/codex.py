@@ -681,6 +681,9 @@ whole-file diagnostics in import order; do not prepare every file separately.
         activity = self.state.activities.start(run.id, chapter.id, stage.value)
         usage_stop = asyncio.Event()
         usage_monitor: asyncio.Task[None] | None = None
+        attempt_deadline = (
+            asyncio.get_running_loop().time() + self.config.settings.agent_timeout_seconds
+        )
 
         async def update_usage(found: TokenUsage) -> None:
             nonlocal usage
@@ -781,7 +784,7 @@ whole-file diagnostics in import order; do not prepare every file separately.
                         lambda: thread_id is not None,
                     )
                 )
-                async with asyncio.timeout(self.config.settings.agent_timeout_seconds):
+                async with asyncio.timeout_at(attempt_deadline):
                     done, _ = await asyncio.wait(
                         (exit_wait, pressure_wait), return_when=asyncio.FIRST_COMPLETED
                     )
@@ -829,6 +832,10 @@ whole-file diagnostics in import order; do not prepare every file separately.
         timed_out = False
         try:
             while True:
+                if asyncio.get_running_loop().time() >= attempt_deadline:
+                    timed_out = True
+                    exit_code = 124
+                    break
                 if resume_attempt:
                     assert thread_id is not None
                     command = self.command(
@@ -874,13 +881,19 @@ whole-file diagnostics in import order; do not prepare every file separately.
                         f"{self.config.settings.capacity_resume_attempts}: resuming {thread_id}"
                     )
                     self.state.activities.save(activity)
-                    await asyncio.sleep(
-                        _capacity_resume_delay(
-                            self.config.settings.capacity_resume_delay_seconds,
-                            self.config.settings.capacity_resume_max_delay_seconds,
-                            capacity_retries,
-                        )
+                    delay = _capacity_resume_delay(
+                        self.config.settings.capacity_resume_delay_seconds,
+                        self.config.settings.capacity_resume_max_delay_seconds,
+                        capacity_retries,
                     )
+                    remaining = attempt_deadline - asyncio.get_running_loop().time()
+                    if delay >= remaining:
+                        if remaining > 0:
+                            await asyncio.sleep(remaining)
+                        timed_out = True
+                        exit_code = 124
+                        break
+                    await asyncio.sleep(delay)
                     continue
                 break
         except asyncio.CancelledError:

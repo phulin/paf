@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import heapq
 import re
+from collections import deque
 from collections.abc import AsyncIterator, Coroutine, Iterable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
@@ -84,6 +85,7 @@ class ReviewOutcome:
     changed: bool
     feedback_by_owner: dict[str, str]
     complete: bool = True
+    capacity_deferred: bool = False
 
 
 @dataclass(frozen=True)
@@ -114,6 +116,7 @@ class RunningFixupAgent:
     workspace: Any
     task: asyncio.Task[AgentResult]
     dependency_certificates: dict[str, str]
+    feedback: str
     source_lock_held: bool = False
 
 
@@ -150,6 +153,18 @@ LAKE_CONTROL_PREFIXES = (
     "Some required targets logged failures:",
     "Coordinator rejected ",
 )
+PROOF_FEEDBACK_MAX_CHARS = 24_000
+PROOF_FEEDBACK_ROUNDS = 3
+
+
+def _bounded_proof_feedback(blocks: Iterable[str]) -> str:
+    text = "\n\n".join(blocks)
+    if len(text) <= PROOF_FEEDBACK_MAX_CHARS:
+        return text
+    marker = "\n\n... older proof feedback omitted ...\n\n"
+    available = PROOF_FEEDBACK_MAX_CHARS - len(marker)
+    head = available // 3
+    return text[:head] + marker + text[-(available - head) :]
 
 
 def _lean_diagnostics(output: str) -> tuple[LeanDiagnostic, ...]:
@@ -693,107 +708,113 @@ class Orchestrator:
             if stage in (Stage.FORMALIZE, Stage.FIXUP, Stage.REVIEW)
             else self.proof_schedule
         )
-        async with self.agent_slots.slot(schedule.priority(chapter.book_id)):
+        await self.agent_slots.acquire(schedule.priority(chapter.book_id))
+        slot_held = True
+        run = None
+        workspace = None
+        source_held = False
+        try:
             await self.control.checkpoint()
             run = await self.state.start_run(chapter.id, stage)
+            if self.isolation.name == "shared":
+                await self.source_lock.acquire()
+                source_held = True
+                workspace = await self.isolation.acquire(run.id)
+            else:
+                workspace = await self.isolation.acquire(run.id)
+            agent = await self.executor.run(
+                chapter,
+                stage,
+                run,
+                feedback=feedback,
+                workspace_root=workspace.root,
+            )
+            self.agent_slots.release()
+            slot_held = False
+            # Agent capacity covers live Codex processes, not integration or a
+            # potentially preempted coordinator build queued after they exit.
+            isolated = await workspace.collect(
+                chapter,
+                integration_lock=None if source_held else self.source_lock,
+            )
+            await workspace.close()
             workspace = None
-            source_held = False
-            try:
-                if self.isolation.name == "shared":
-                    await self.source_lock.acquire()
-                    source_held = True
-                    workspace = await self.isolation.acquire(run.id)
-                else:
-                    workspace = await self.isolation.acquire(run.id)
-                agent = await self.executor.run(
-                    chapter,
-                    stage,
-                    run,
-                    feedback=feedback,
-                    workspace_root=workspace.root,
-                )
-                # The agent is finished before this transaction begins. Merge its
-                # scoped source changes, unmount its workspace, and only then build
-                # from the main worktree against the coordinator-owned cache.
-                isolated = await workspace.collect(
-                    chapter,
-                    integration_lock=None if source_held else self.source_lock,
-                )
-                await workspace.close()
-                workspace = None
-                if source_held:
-                    self.source_lock.release()
-                    source_held = False
-                if isolated.accepted and agent.changed:
-                    await self._invalidate_build_records((chapter.id,))
-                if isolated.accepted:
-                    if stage is Stage.PROVE:
-                        snapshots: dict[str, ValidatedBuildSnapshot] = {}
-                        validation = (
-                            await self._build_chapters(
-                                (chapter,),
-                                publish_if_clean=True,
-                                mode="proof-certification",
-                                stage=Stage.PROVE,
-                                priority=0.0,
-                                preemptible=True,
-                                snapshots=snapshots,
-                            )
-                        )[chapter.id]
-                        if validation.succeeded and not await self._publish_validated_build(
-                            chapter, snapshots[chapter.id]
-                        ):
-                            validation = ValidationResult(
-                                False,
-                                1,
-                                "Source scope changed after the coordinator build; retry required.",
-                            )
-                    else:
+            if source_held:
+                self.source_lock.release()
+                source_held = False
+            if isolated.accepted and agent.changed:
+                await self._invalidate_build_records((chapter.id,))
+            if isolated.accepted:
+                if stage is Stage.PROVE:
+                    snapshots: dict[str, ValidatedBuildSnapshot] = {}
+                    validation = (
+                        await self._build_chapters(
+                            (chapter,),
+                            publish_if_clean=True,
+                            mode="proof-certification",
+                            stage=Stage.PROVE,
+                            priority=0.0,
+                            preemptible=True,
+                            snapshots=snapshots,
+                        )
+                    )[chapter.id]
+                    if validation.succeeded and not await self._publish_validated_build(
+                        chapter, snapshots[chapter.id]
+                    ):
                         validation = ValidationResult(
-                            True,
-                            0,
-                            "validation deferred to the coordinator fixup loop",
+                            False,
+                            1,
+                            "Source scope changed after the coordinator build; retry required.",
                         )
                 else:
                     validation = ValidationResult(
-                        False,
-                        1,
-                        f"Isolation rejected the agent result: {isolated.error}",
+                        True,
+                        0,
+                        "validation deferred to the coordinator fixup loop",
                     )
-                if not isolated.accepted:
-                    detail = isolated.error
-                    if isolated.out_of_scope_paths:
-                        detail += ": " + ", ".join(isolated.out_of_scope_paths)
-                    agent = replace(agent, succeeded=False, error=detail)
-                    validation = ValidationResult(
-                        False,
-                        1,
-                        f"Isolation rejected the agent result: {detail}\n\n{validation.output}",
-                    )
-                    await self.state.update_run(run, status=TaskStatus.FAILED)
-                await self.state.update_run(
-                    run,
-                    isolation=isolated.as_dict(),
-                    validation=validation.as_dict(),
+            else:
+                validation = ValidationResult(
+                    False,
+                    1,
+                    f"Isolation rejected the agent result: {isolated.error}",
                 )
-            except BaseException as error:
-                if run.status == TaskStatus.RUNNING:
-                    detail = str(error) or type(error).__name__
-                    await self.state.finish_run(
-                        run,
-                        status=TaskStatus.FAILED,
-                        isolation={
-                            "accepted": False,
-                            "error": f"orchestration failed before completion: {detail}",
-                        },
-                    )
-                raise
-            finally:
-                if workspace is not None:
-                    await workspace.close()
-                if source_held:
-                    self.source_lock.release()
-            return Attempt(agent=agent, validation=validation, run=run)
+            if not isolated.accepted:
+                detail = isolated.error
+                if isolated.out_of_scope_paths:
+                    detail += ": " + ", ".join(isolated.out_of_scope_paths)
+                agent = replace(agent, succeeded=False, error=detail)
+                validation = ValidationResult(
+                    False,
+                    1,
+                    f"Isolation rejected the agent result: {detail}\n\n{validation.output}",
+                )
+                await self.state.update_run(run, status=TaskStatus.FAILED)
+            await self.state.update_run(
+                run,
+                isolation=isolated.as_dict(),
+                validation=validation.as_dict(),
+            )
+        except BaseException as error:
+            if run is not None and run.status == TaskStatus.RUNNING:
+                detail = str(error) or type(error).__name__
+                await self.state.finish_run(
+                    run,
+                    status=TaskStatus.FAILED,
+                    isolation={
+                        "accepted": False,
+                        "error": f"orchestration failed before completion: {detail}",
+                    },
+                )
+            raise
+        finally:
+            if slot_held:
+                self.agent_slots.release()
+            if workspace is not None:
+                await workspace.close()
+            if source_held:
+                self.source_lock.release()
+        assert run is not None
+        return Attempt(agent=agent, validation=validation, run=run)
 
     async def _formalize(self, chapter: Chapter, *, rerun: bool = False) -> FormalizeOutcome:
         if self._already_done(chapter, Stage.FORMALIZE):
@@ -1309,6 +1330,7 @@ class Orchestrator:
                 workspace=workspace,
                 task=asyncio.create_task(execute()),
                 dependency_certificates=dependency_certificates,
+                feedback=feedback,
                 source_lock_held=source_held,
             )
         except BaseException as error:
@@ -1399,8 +1421,12 @@ class Orchestrator:
         await self.state.set_task(
             handle.chapter.id,
             Stage.FIXUP,
-            TaskStatus.FAILED,
-            "fixup agent failed",
+            TaskStatus.PENDING if agent.capacity_exhausted else TaskStatus.FAILED,
+            (
+                "capacity retries exhausted; fixup requeued"
+                if agent.capacity_exhausted
+                else "fixup agent failed"
+            ),
         )
         return None
 
@@ -1684,10 +1710,16 @@ class Orchestrator:
             await asyncio.gather(*(handle.task for handle in handles), return_exceptions=True)
             for handle in handles:
                 await handle.workspace.close()
+                if handle.source_lock_held:
+                    self.source_lock.release()
+                    handle.source_lock_held = False
 
         async def discard_stale(handle: RunningFixupAgent, changed: tuple[str, ...]) -> None:
             detail = "dependency changed while fixup agent was running: " + ", ".join(changed)
             await handle.workspace.close()
+            if handle.source_lock_held:
+                self.source_lock.release()
+                handle.source_lock_held = False
             validation = ValidationResult(False, 1, detail)
             await self.state.update_run(
                 handle.run,
@@ -1839,6 +1871,10 @@ class Orchestrator:
                         continue
                     attempt = await self._integrate_fixup_agent(handle)
                     if attempt is None:
+                        if handle.task.result().capacity_exhausted:
+                            attempts[chapter_id] -= 1
+                            merge_feedback({chapter_id: handle.feedback})
+                            continue
                         if attempts[chapter_id] < maximum:
                             merge_feedback(
                                 {
@@ -2051,6 +2087,21 @@ class Orchestrator:
             Stage.REVIEW,
             queue_detail="source-faithful editing review",
         )
+        if attempt.agent.capacity_exhausted:
+            await self.state.set_task(
+                chapter.id,
+                Stage.REVIEW,
+                TaskStatus.PENDING,
+                "capacity retries exhausted; review requeued",
+                phase=TaskPhase.QUEUED,
+            )
+            return ReviewOutcome(
+                False,
+                attempt.agent.changed,
+                {},
+                complete=False,
+                capacity_deferred=True,
+            )
         succeeded = attempt.agent.succeeded and attempt.validation.succeeded
         complete = bool(attempt.agent.report.get("complete"))
         routed = self._route_review_findings(chapter, attempt.agent.report)
@@ -2179,6 +2230,9 @@ class Orchestrator:
                 chapter,
                 rerun=rerun or rounds_used[chapter.id] > 1,
             )
+            if outcome.capacity_deferred:
+                rounds_used[chapter.id] -= 1
+                continue
             if not outcome.succeeded:
                 return False
             findings_by_owner: dict[str, dict[str, None]] = {}
@@ -2240,13 +2294,20 @@ class Orchestrator:
             expected_generation=review_generation,
         )
 
-    async def _review_tree(self, *, rerun: bool = False, prove: bool = False) -> bool:
+    async def _review_tree(
+        self,
+        *,
+        rerun: bool = False,
+        prove: bool = False,
+        quarantined: Iterable[str] = (),
+    ) -> bool:
         """Release dependency-ready reviews and proofs without a corpus-wide review gate."""
 
         recovered_fixups = await self._recover_fixup_requests()
         if recovered_fixups and not all(await asyncio.gather(*recovered_fixups)):
             return False
         by_id = {chapter.id: chapter for chapter in self.chapters}
+        quarantined_ids = set(quarantined).intersection(by_id)
         try:
             initial_graph = self._observed_chapter_graph()
         except ValueError as error:
@@ -2265,7 +2326,8 @@ class Orchestrator:
         reviewed = {
             chapter.id
             for chapter in self.chapters
-            if self.state.task(chapter.id, Stage.REVIEW).review_green is True
+            if chapter.id not in quarantined_ids
+            and self.state.task(chapter.id, Stage.REVIEW).review_green is True
         }
         async with self.state.batch():
             for chapter_id in reviewed:
@@ -2277,7 +2339,7 @@ class Orchestrator:
                         TaskStatus.SUCCEEDED,
                         "durable review remains green",
                     )
-        review_failures: set[str] = set()
+        review_failures: set[str] = set(quarantined_ids)
         review_blocked: set[str] = set()
         attempted: set[str] = set()
         rounds_used = {chapter_id: 0 for chapter_id in by_id}
@@ -2301,6 +2363,19 @@ class Orchestrator:
         proof_fixups = {chapter_id: 0 for chapter_id in by_id}
 
         async with self.state.batch():
+            if quarantined_ids:
+                await self.state.set_tasks(
+                    quarantined_ids,
+                    Stage.REVIEW,
+                    TaskStatus.FAILED,
+                    "formalization failed; quarantined from review",
+                )
+                await self.state.set_tasks(
+                    quarantined_ids,
+                    Stage.PROVE,
+                    TaskStatus.BLOCKED,
+                    "formalization failed; quarantined from proof",
+                )
             for chapter_id in initial_graph.order:
                 if chapter_id not in reviewed:
                     missing = initial_graph.dependencies[chapter_id].difference(reviewed)
@@ -2617,16 +2692,29 @@ class Orchestrator:
                     return True
         proof_maximum = self.config.stages[Stage.PROVE].max_rounds
         feedback = initial_feedback
-        feedback_ledger: list[str] = [initial_feedback] if initial_feedback else []
+        feedback_ledger: deque[str] = deque(maxlen=PROOF_FEEDBACK_ROUNDS)
+        if initial_feedback:
+            feedback_ledger.append(initial_feedback)
         stalled_rounds = 0
         previous_placeholders: int | None = None
-        for proof_round in range(1, proof_maximum + 1):
+        proof_round = 0
+        while proof_round < proof_maximum:
             attempt = await self._attempt(
                 chapter,
                 Stage.PROVE,
                 feedback=feedback,
-                queue_detail=f"proof round {proof_round}/{proof_maximum}",
+                queue_detail=f"proof round {proof_round + 1}/{proof_maximum}",
             )
+            if attempt.agent.capacity_exhausted:
+                await self.state.set_task(
+                    chapter.id,
+                    Stage.PROVE,
+                    TaskStatus.PENDING,
+                    "capacity retries exhausted; proof requeued",
+                    phase=TaskPhase.QUEUED,
+                )
+                continue
+            proof_round += 1
             if (
                 attempt.agent.succeeded
                 and attempt.validation.succeeded
@@ -2644,7 +2732,7 @@ class Orchestrator:
             feedback_ledger.append(
                 f"Proof attempt {proof_round}:\n{attempt.feedback()}"
             )
-            feedback = "\n\n".join(feedback_ledger)
+            feedback = _bounded_proof_feedback(feedback_ledger)
             if bool(attempt.agent.report.get("fixup_findings")):
                 findings = self._route_review_findings(chapter, attempt.agent.report)
                 await self._invalidate_review_closure(
@@ -2691,6 +2779,20 @@ class Orchestrator:
         return all(await _gather_cancel_on_error(self._prove(chapter) for chapter in self.chapters))
 
     async def run_pipeline(self) -> bool:
-        if not await self._formalize_all():
-            return False
-        return await self._review_tree(prove=True)
+        formalized = await self._formalize_all()
+        quarantined = (
+            {
+                chapter.id
+                for chapter in self.chapters
+                if self.state.task(chapter.id, Stage.FORMALIZE).status != TaskStatus.SUCCEEDED
+            }
+            if not formalized
+            else set()
+        )
+        if quarantined:
+            await self._invalidate_review_closure(
+                quarantined,
+                detail="review invalidated by failed formalization",
+            )
+        reviewed = await self._review_tree(prove=True, quarantined=quarantined)
+        return formalized and reviewed

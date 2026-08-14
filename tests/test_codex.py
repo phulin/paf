@@ -748,6 +748,58 @@ print(json.dumps({{"type": "item.completed", "item": {{
 
 
 @pytest.mark.asyncio
+async def test_capacity_resume_uses_the_original_attempt_deadline(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    invocations_path = tmp_path / "deadline-invocations"
+    fake_codex = tmp_path / "deadline-codex"
+    fake_codex.write_text(
+        f"""#!/usr/bin/env python3
+import json
+import sys
+import time
+from pathlib import Path
+
+sys.stdin.read()
+with Path({str(invocations_path)!r}).open("a", encoding="utf-8") as handle:
+    handle.write("run\\n")
+if "resume" not in sys.argv:
+    print(json.dumps({{"type": "thread.started", "thread_id": "deadline-thread"}}))
+    message = "Selected model is at capacity."
+    print(json.dumps({{"type": "turn.failed", "error": {{"message": message}}}}))
+    time.sleep(0.15)
+    raise SystemExit(1)
+time.sleep(60)
+""",
+        encoding="utf-8",
+    )
+    fake_codex.chmod(0o755)
+    config = replace(
+        config,
+        settings=replace(
+            config.settings,
+            codex_bin=str(fake_codex),
+            agent_timeout_seconds=0.3,
+            capacity_resume_attempts=2,
+            capacity_resume_delay_seconds=0,
+        ),
+    )
+    state = StateStore(config)
+    await state.load_or_create()
+    executor = CodexExecutor(config, state)
+    await executor.prepare()
+    run = await state.start_run(config.chapters[0].id, Stage.REVIEW)
+    started = asyncio.get_running_loop().time()
+
+    result = await executor.run(config.chapters[0], Stage.REVIEW, run)
+    elapsed = asyncio.get_running_loop().time() - started
+
+    assert result.exit_code == 124
+    assert result.error == "agent timed out"
+    assert invocations_path.read_text(encoding="utf-8").splitlines() == ["run", "run"]
+    assert elapsed < 0.4
+
+
+@pytest.mark.asyncio
 async def test_executor_recycles_fd_leaking_codex_and_resumes_same_thread(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
