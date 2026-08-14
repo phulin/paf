@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from textual.widgets import DataTable, RichLog, Static, Tab, TabbedContent, Tabs
+from textual.widgets import DataTable, RichLog, Static, Tab, TabbedContent, Tabs, TextArea
 
 from lastlib_swarm.config import load_config
 from lastlib_swarm.models import Stage
@@ -386,10 +386,8 @@ async def test_selected_chapter_opens_live_agent_detail(tmp_path: Path) -> None:
 
         app.screen.query_one("#agent-tabs", TabbedContent).active = "prompt-pane"
         await pilot.pause(0.1)
-        prompt = app.screen.query_one("#agent-prompt", RichLog)
-        assert "Prompt was not recorded for this run." in "".join(
-            line.text for line in prompt.lines
-        )
+        prompt = app.screen.query_one("#agent-prompt", TextArea)
+        assert prompt.text == "Prompt was not recorded for this run."
 
         await pilot.press("escape")
         assert app.check_action("inspect_agent", ()) is True
@@ -489,8 +487,8 @@ async def test_agent_detail_can_switch_between_chapter_steps(tmp_path: Path) -> 
         agent_tabs = screen.query_one("#agent-tabs", TabbedContent)
         agent_tabs.active = "prompt-pane"
         await pilot.pause(0.1)
-        prompt = screen.query_one("#agent-prompt", RichLog)
-        assert "second review prompt" in "".join(line.text for line in prompt.lines)
+        prompt = screen.query_one("#agent-prompt", TextArea)
+        assert prompt.text == "second review prompt"
 
         run_tabs.active = "agent-step-1"
         await pilot.pause(0.2)
@@ -500,7 +498,7 @@ async def test_agent_detail_can_switch_between_chapter_steps(tmp_path: Path) -> 
         assert "formalize round 1" in heading
         assert "formalization update" in "".join(line.text for line in summary.lines)
         assert "tokens 1.1k" in str(screen.query_one("#agent-spend", Static).content)
-        assert "first formalization prompt" in "".join(line.text for line in prompt.lines)
+        assert prompt.text == "first formalization prompt"
 
         await pilot.press("escape")
         finish.set()

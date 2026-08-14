@@ -24,6 +24,7 @@ from textual.widgets import (
     TabbedContent,
     TabPane,
     Tabs,
+    TextArea,
 )
 from textual.worker import WorkerCancelled
 
@@ -368,7 +369,7 @@ class AgentDetailScreen(Screen[None]):
         self._raw_pending = bytearray()
         self._raw_lines: deque[str] = deque(maxlen=30)
         self._timeline_activities: dict[str, AgentActivity] = {}
-        self._rendered_prompt: tuple[str, str | None, int | None, int | None, int] | None = None
+        self._rendered_prompt: tuple[str, str, int | None, int | None] | None = None
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -405,7 +406,13 @@ class AgentDetailScreen(Screen[None]):
                     max_lines=None,
                 )
             with TabPane("Prompt", id="prompt-pane"):
-                yield RichLog(id="agent-prompt", wrap=True, markup=False, max_lines=None)
+                yield TextArea(
+                    id="agent-prompt",
+                    soft_wrap=True,
+                    read_only=True,
+                    show_cursor=False,
+                    highlight_cursor_line=False,
+                )
             with TabPane("Plan", id="plan-pane"):
                 yield RichLog(id="agent-plan", wrap=True, markup=False)
             with TabPane("Files", id="files-pane"):
@@ -521,14 +528,13 @@ class AgentDetailScreen(Screen[None]):
 
     def _refresh_prompt(self, run: RunRecord) -> None:
         path = self.state.logs_dir / f"{run.id}.prompt.md"
-        width = _log_render_width(self.query_one("#agent-prompt", RichLog))
         size: int | None = None
         modified: int | None = None
         with suppress(OSError):
             stat = path.stat()
             size = stat.st_size
             modified = stat.st_mtime_ns
-        rendered = (run.id, str(path), size, modified, width)
+        rendered = (run.id, str(path), size, modified)
         if rendered == self._rendered_prompt:
             return
         if size is None:
@@ -538,10 +544,9 @@ class AgentDetailScreen(Screen[None]):
                 content = path.read_text(encoding="utf-8")
             except (OSError, UnicodeError) as error:
                 content = f"Could not read prompt file {path}: {error}"
-        prompt = self.query_one("#agent-prompt", RichLog)
-        prompt.clear()
-        prompt.write(content, width=width)
-        prompt.scroll_home(animate=False)
+        prompt = self.query_one("#agent-prompt", TextArea)
+        prompt.load_text(content)
+        prompt.scroll_home(animate=False, immediate=True)
         self._rendered_prompt = rendered
 
     def _timeline_activity(
