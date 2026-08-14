@@ -545,17 +545,17 @@ function EventKind({ kind }: { kind: string }) {
   return <span className={`event-kind kind-${kind}`}>{short[kind] ?? kind.slice(0, 8)}</span>;
 }
 
-function LiveFeed({ state }: { state: SwarmState }) {
+function LiveFeed({ state, drawer = false }: { state: SwarmState; drawer?: boolean }) {
   const events = Object.entries(state.activities ?? {})
     .flatMap(([runId, activity]) => (activity.recent ?? []).map((event) => ({ ...event, runId })))
     .sort((left, right) => right.at.localeCompare(left.at))
-    .slice(0, 7);
+    .slice(0, drawer ? 60 : 7);
   return (
-    <section className="panel feed-panel">
-      <div className="panel-header">
-        <div><span className="eyebrow">Event stream</span><h2>Agent timeline</h2></div>
-        <span className="tiny-live"><span /> tailing</span>
-      </div>
+    <section className={`panel feed-panel ${drawer ? "drawer-feed" : ""}`}>
+      {!drawer && <div className="panel-header">
+          <div><span className="eyebrow">Event stream</span><h2>Agent timeline</h2></div>
+          <span className="tiny-live"><span /> tailing</span>
+        </div>}
       <div className="feed-list">
         {events.length ? events.map((event, index) => (
           <div className="feed-event" key={`${event.runId}-${event.sequence ?? index}`}>
@@ -575,12 +575,16 @@ function LiveFeed({ state }: { state: SwarmState }) {
   );
 }
 
-function BuildPanel({ state }: { state: SwarmState }) {
+function BuildPanel({ state, openTimeline }: { state: SwarmState; openTimeline: () => void }) {
   const build = state.coordinator_build ?? demoState.coordinator_build;
   const progress = build.total ? 100 * build.completed / build.total : 0;
+  const eventCount = Object.values(state.activities ?? {}).reduce(
+    (total, activity) => total + (activity.recent?.length ?? 0),
+    0,
+  );
   return (
     <section className="panel build-panel">
-      <div className="panel-header">
+      <div className="build-heading">
         <div><span className="eyebrow">Coordinator</span><h2>Build channel</h2></div>
         <span className={`build-state ${build.active ? "active" : ""}`}>{build.active ? "building" : "idle"}</span>
       </div>
@@ -591,21 +595,59 @@ function BuildPanel({ state }: { state: SwarmState }) {
           <strong>{build.current_chapter_id ?? "No chapter reserved"}</strong>
         </div>
       </div>
-      <div className="build-progress-label"><span>{build.completed ?? 0} / {build.total ?? 0} modules</span><strong>{Math.round(progress)}%</strong></div>
-      <ProgressBar value={progress} color="var(--green)" />
-      <div className="build-counters">
-        <span><Check size={13} /> iteration {build.iteration ?? 0}/{build.maximum_iterations ?? 0}</span>
-        <span className={build.error_count ? "error-text" : ""}><X size={13} /> {build.error_count ?? 0} errors</span>
-        <span className={build.warning_count ? "warning-text" : ""}><AlertTriangle size={13} /> {build.warning_count ?? 0} warnings</span>
+      <div className="build-progress-block">
+        <div className="build-progress-label"><span>{build.completed ?? 0} / {build.total ?? 0} modules</span><strong>{Math.round(progress)}%</strong></div>
+        <ProgressBar value={progress} color="var(--green)" />
+        <div className="build-counters">
+          <span><Check size={13} /> iter {build.iteration ?? 0}/{build.maximum_iterations ?? 0}</span>
+          <span className={build.error_count ? "error-text" : ""}><X size={13} /> {build.error_count ?? 0} errors</span>
+          <span className={build.warning_count ? "warning-text" : ""}><AlertTriangle size={13} /> {build.warning_count ?? 0} warnings</span>
+        </div>
       </div>
       <div className="terminal-output">
         <div className="terminal-bar"><span /><span /><span /><em>lake build</em></div>
-        {(build.output_tail?.length ? build.output_tail : ["coordinator build idle", "waiting for next certified change…"]).slice(-3).map((line, index) => (
+        {(build.output_tail?.length ? build.output_tail : ["coordinator build idle", "waiting for next certified change…"]).slice(-2).map((line, index) => (
           <div key={index}><span className="prompt-mark">›</span>{line}</div>
         ))}
         <span className="terminal-cursor" />
       </div>
+      <button className="timeline-trigger" onClick={openTimeline}>
+        <span className="timeline-trigger-icon"><Activity size={17} /></span>
+        <span><small>Event stream</small><strong>Agent timeline</strong></span>
+        <em>{formatNumber(eventCount)}</em>
+        <ChevronRight size={15} />
+      </button>
     </section>
+  );
+}
+
+function TimelineDrawer({ state, close }: { state: SwarmState; close: () => void }) {
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") close();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [close]);
+
+  return (
+    <div className="drawer-backdrop timeline-backdrop" onMouseDown={(event) => event.target === event.currentTarget && close()}>
+      <aside className="timeline-drawer">
+        <div className="drawer-header timeline-drawer-header">
+          <div><span className="eyebrow">Live event stream</span><h2>Agent timeline</h2></div>
+          <div className="timeline-header-actions">
+            <span className="tiny-live"><span /> tailing</span>
+            <IconButton label="Close" onClick={close}><X size={18} /></IconButton>
+          </div>
+        </div>
+        <div className="timeline-drawer-summary">
+          <span><Users size={14} /><strong>{state.agents?.active ?? 0}</strong> agents</span>
+          <span><Cpu size={14} /><strong>{Object.keys(state.activities ?? {}).length}</strong> runs</span>
+          <span><Clock3 size={14} /> updated {timeAgo(state.updated_at)}</span>
+        </div>
+        <LiveFeed state={state} drawer />
+      </aside>
+    </div>
   );
 }
 
@@ -771,6 +813,7 @@ function ChapterInspector({ row, close }: { row: ChapterRow; close: () => void }
 function Overview({ state, connected }: { state: SwarmState; connected: boolean }) {
   const rows = useMemo(() => chapterRows(state), [state]);
   const [selected, setSelected] = useState<ChapterRow | null>(null);
+  const [timelineOpen, setTimelineOpen] = useState(false);
   const tasks = Object.values(state.tasks ?? {});
   const successful = tasks.filter((task) => task.status === "succeeded").length;
   const chaptersDone = rows.filter((row) => row.stages.prove?.status === "succeeded").length;
@@ -792,10 +835,9 @@ function Overview({ state, connected }: { state: SwarmState; connected: boolean 
         {STAGES.map((stage) => <StageCard key={stage} stage={stage} tasks={tasks.filter((task) => task.stage === stage)} />)}
       </section>
 
-      <div className="dashboard-grid">
-        <TaskTable rows={rows} selected={selected} setSelected={setSelected} />
-        <div className="side-stack"><LiveFeed state={state} /><BuildPanel state={state} /></div>
-      </div>
+      <BuildPanel state={state} openTimeline={() => setTimelineOpen(true)} />
+      <TaskTable rows={rows} selected={selected} setSelected={setSelected} />
+      {timelineOpen && <TimelineDrawer state={state} close={() => setTimelineOpen(false)} />}
       {selected && <ChapterInspector row={selected} close={() => setSelected(null)} />}
     </main>
   );
