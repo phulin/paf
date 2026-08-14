@@ -1629,7 +1629,6 @@ async def test_changed_review_is_rebuilt_fixed_and_reviewed_again(
                 changed=True,
             ),
             result(changed=True),
-            result(changed=False),
         ],
     )
     stages_seen: list[Stage] = []
@@ -1671,13 +1670,13 @@ async def test_changed_review_is_rebuilt_fixed_and_reviewed_again(
     monkeypatch.setattr(scheduler_module, "validate", validation)
 
     assert await orchestrator._review_until_clean()
-    assert stages_seen == [Stage.REVIEW, Stage.REVIEW, Stage.REVIEW]
+    assert stages_seen == [Stage.REVIEW, Stage.REVIEW]
     assert review_path.read_text(encoding="utf-8") == "def afterReview := 1\n"
     await orchestrator.shutdown()
 
 
 @pytest.mark.asyncio
-async def test_review_finding_returns_to_review_until_clean(
+async def test_review_finding_gets_one_targeted_repair_pass(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
@@ -1698,7 +1697,6 @@ async def test_review_finding_returns_to_review_until_clean(
                 ],
             ),
             result(changed=True),
-            result(changed=False),
         ],
     )
 
@@ -1709,7 +1707,7 @@ async def test_review_finding_returns_to_review_until_clean(
 
     assert await orchestrator._review_until_clean()
     review_task = state.task(config.chapters[0].id, Stage.REVIEW)
-    assert review_task.rounds == 3
+    assert review_task.rounds == 2
     assert review_task.status == TaskStatus.SUCCEEDED
     await orchestrator.shutdown()
 
@@ -2916,7 +2914,7 @@ async def test_review_finding_waits_for_downstream_agents_before_rebuild(
     assert await asyncio.wait_for(review_tree, timeout=2)
     assert not downstream_cancelled.is_set()
     assert rebuilds == [first.id]
-    assert reviews[first.id] == 3
+    assert reviews[first.id] == 2
     assert reviews[second.id] == 2
     assert reviews[third.id] == 1
     assert all(

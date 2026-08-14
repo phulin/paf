@@ -293,10 +293,12 @@ After the daemon exits, `status`, `snapshot`, and `wait` fall back to the persis
   invalidated by any subsequent repair. A changed chapter receives a prioritized coordinator build.
   Failed builds and structured `fixup_findings` are fed to full-scope review agents for the owning
   chapters; they never reopen fixup.
-  Review/verification repeats up to five times and stops early on a no-change review. Once a chapter is
-  clean, its proof agent may start while descendant reviews
-  continue. A reported chapter-local failure is quarantined: unrelated review and proof
-  branches keep running, while actual dependents are marked blocked. Unexpected coordinator
+  An initial review that edits source receives another full pass until one pass is clean, capped at
+  five review/verification cycles. A review launched with specific persisted findings instead makes
+  one repair pass and completes as soon as its coordinator rebuild is clean; it does not require a
+  redundant no-change confirmation pass. Once a chapter is clean, its proof agent may start while
+  descendant reviews continue. A reported chapter-local failure is quarantined: unrelated review and
+  proof branches keep running, while actual dependents are marked blocked. Unexpected coordinator
   exceptions still fail fast after draining live workers. There is no corpus-wide clean-build or
   review gate in the pipeline. Successful completion leaves the review task `succeeded`. An explicit
   statement/API repair request moves only its owning review back to `pending`; forced review moves all

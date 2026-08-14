@@ -1988,6 +1988,7 @@ class Orchestrator:
         while rounds_used[chapter.id] < maximum:
             rounds_used[chapter.id] += 1
             review_rerun = rerun or rounds_used[chapter.id] > 1
+            finding_guided = bool(review_feedback)
             outcome = (
                 await self._review_once(
                     chapter,
@@ -2045,6 +2046,13 @@ class Orchestrator:
                     )
                     return False
                 continue
+            if finding_guided:
+                return await self._complete_review(
+                    chapter,
+                    "targeted review completed with no pending findings",
+                    expected_generation=review_generation,
+                    proof_request_ids=request_ids,
+                )
             if not outcome.changed:
                 return await self._complete_review(
                     chapter,
