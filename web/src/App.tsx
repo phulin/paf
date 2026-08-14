@@ -69,6 +69,7 @@ const DECLARATION_KINDS: DeclarationKind[] = [
   "instance",
 ];
 const CORPUS_QUERY_PARAM = "corpus";
+const CHAPTER_QUERY_PARAM = "chapter";
 
 function corpusFromUrl(): string | null {
   return new URL(window.location.href).searchParams.get(CORPUS_QUERY_PARAM);
@@ -79,6 +80,28 @@ function setCorpusUrl(corpus: string, mode: "push" | "replace"): void {
   url.searchParams.set(CORPUS_QUERY_PARAM, corpus);
   const next = `${url.pathname}${url.search}${url.hash}`;
   const historyState = { ...(window.history.state ?? {}), corpus };
+  delete historyState.lastlibChapterView;
+  if (mode === "push") window.history.pushState(historyState, "", next);
+  else window.history.replaceState(historyState, "", next);
+}
+
+function chapterFromUrl(): string | null {
+  return new URL(window.location.href).searchParams.get(CHAPTER_QUERY_PARAM);
+}
+
+function setChapterUrl(chapter: string | null, mode: "push" | "replace"): void {
+  const url = new URL(window.location.href);
+  if (chapter) url.searchParams.set(CHAPTER_QUERY_PARAM, chapter);
+  else url.searchParams.delete(CHAPTER_QUERY_PARAM);
+  const next = `${url.pathname}${url.search}${url.hash}`;
+  const historyState = { ...(window.history.state ?? {}) };
+  if (chapter) {
+    historyState.chapter = chapter;
+    historyState.lastlibChapterView = mode === "push";
+  } else {
+    delete historyState.chapter;
+    delete historyState.lastlibChapterView;
+  }
   if (mode === "push") window.history.pushState(historyState, "", next);
   else window.history.replaceState(historyState, "", next);
 }
@@ -951,14 +974,42 @@ function ChapterInspector({ row, close }: { row: ChapterRow; close: () => void }
 
 function Overview({ state, connected }: { state: SwarmState; connected: boolean }) {
   const rows = useMemo(() => chapterRows(state), [state]);
-  const [selected, setSelected] = useState<ChapterRow | null>(null);
+  const [selectedChapter, setSelectedChapter] = useState<string | null>(() => chapterFromUrl());
   const [timelineOpen, setTimelineOpen] = useState(false);
+  const selected = rows.find((row) => row.id === selectedChapter) ?? null;
   const tasks = Object.values(state.tasks ?? {});
   const successful = tasks.filter((task) => task.status === "succeeded").length;
   const chaptersDone = rows.filter((row) => row.stages.prove?.status === "succeeded").length;
   const active = tasks.filter((task) => task.status === "running").length;
   const failed = tasks.filter((task) => task.status === "failed" || task.status === "blocked").length;
   const completion = tasks.length ? Math.round(100 * successful / tasks.length) : 0;
+
+  const inspectChapter = (row: ChapterRow | null) => {
+    if (!row || row.id === selectedChapter) return;
+    setChapterUrl(row.id, "push");
+    setSelectedChapter(row.id);
+  };
+
+  const closeChapter = () => {
+    setSelectedChapter(null);
+    if (chapterFromUrl() && window.history.state?.lastlibChapterView === true) {
+      window.history.back();
+    } else {
+      setChapterUrl(null, "replace");
+    }
+  };
+
+  useEffect(() => {
+    const restoreChapter = () => setSelectedChapter(chapterFromUrl());
+    window.addEventListener("popstate", restoreChapter);
+    return () => window.removeEventListener("popstate", restoreChapter);
+  }, []);
+
+  useEffect(() => {
+    if (!connected || !selectedChapter || rows.some((row) => row.id === selectedChapter)) return;
+    setSelectedChapter(null);
+    setChapterUrl(null, "replace");
+  }, [connected, rows, selectedChapter]);
 
   return (
     <main className="main overview">
@@ -975,9 +1026,9 @@ function Overview({ state, connected }: { state: SwarmState; connected: boolean 
       </section>
 
       <BuildPanel state={state} openTimeline={() => setTimelineOpen(true)} />
-      <TaskTable rows={rows} selected={selected} setSelected={setSelected} />
+      <TaskTable rows={rows} selected={selected} setSelected={inspectChapter} />
       {timelineOpen && <TimelineDrawer state={state} close={() => setTimelineOpen(false)} />}
-      {selected && <ChapterInspector row={selected} close={() => setSelected(null)} />}
+      {selected && <ChapterInspector row={selected} close={closeChapter} />}
     </main>
   );
 }
