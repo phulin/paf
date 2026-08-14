@@ -409,10 +409,13 @@ stage, round, timestamps, scoped-change result, placeholder count, final report,
 usage. Concurrent mutations coalesce into one SQLite transaction, coordinator transitions use
 explicit state batches, and JSON/database work runs off the TUI event loop. Task records separately
 persist agent queues, verification queues, active verification, dependency waits, and targeted-fixup
-waits. The chapter table displays exact-build freshness independently of whether a past fixup task
-succeeded. A coordinator-build record tracks the single serialized Lake build, and the TUI also shows
-its owner and queued jobs. Running run records—not chapter-stage records—are the authoritative
-live-agent count.
+waits. Structured repair requests are checkpointed before entering the in-memory batching queue and
+removed only after their dependency-aware fixup pass returns. Restart recovery restores those queued
+requests and also reconstructs proof-requested statement repairs written by older orchestrators that
+invalidated review state before checkpointing the handoff. The chapter table displays exact-build
+freshness independently of whether a past fixup task succeeded. A coordinator-build record tracks the
+single serialized Lake build, and the TUI also shows its owner and queued jobs. Running run records—not
+chapter-stage records—are the authoritative live-agent count.
 
 Press `q` in the TUI or interrupt a headless run to terminate the active child process group. On the
 next invocation, interrupted `running` records become `pending` and can resume. Successful records

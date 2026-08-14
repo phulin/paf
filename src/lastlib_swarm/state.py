@@ -214,6 +214,7 @@ class StateStore:
         self.source_issues: dict[str, SourceIssueRecord] = {}
         self.scheduling: dict[str, Any] = {}
         self.fixup_graph: dict[str, Any] = {}
+        self.fixup_requests: dict[str, dict[str, Any]] = {}
         self.isolation: dict[str, Any] = {}
         self.coordinator_build = CoordinatorBuildRecord()
         self.created_at = timestamp()
@@ -234,6 +235,13 @@ class StateStore:
                 self.scheduling = raw["scheduling"]
             if not self.fixup_graph and isinstance(raw.get("fixup_graph"), dict):
                 self.fixup_graph = raw["fixup_graph"]
+            raw_fixup_requests = raw.get("fixup_requests")
+            if isinstance(raw_fixup_requests, dict):
+                self.fixup_requests = {
+                    request_id: dict(value)
+                    for request_id, value in raw_fixup_requests.items()
+                    if isinstance(request_id, str) and isinstance(value, dict)
+                }
             if not self.isolation and isinstance(raw.get("isolation"), dict):
                 self.isolation = raw["isolation"]
             raw_build = raw.get("coordinator_build")
@@ -403,7 +411,7 @@ class StateStore:
         cost = self.total_cost()
         invocation_cost = self.invocation_cost()
         return {
-            "version": 8,
+            "version": 9,
             "history_database": DATABASE_NAME,
             "config": str(self.config.path),
             "created_at": self.created_at,
@@ -416,6 +424,7 @@ class StateStore:
             "agents": self.agent_summary(),
             "scheduling": self.scheduling,
             "fixup_graph": self.fixup_graph,
+            "fixup_requests": self.fixup_requests,
             "isolation": self.isolation,
             "coordinator_build": self._build_dict(self.coordinator_build),
             "tasks": {
@@ -495,6 +504,35 @@ class StateStore:
     async def save(self) -> None:
         self._mark_dirty()
         await self._persist()
+
+    async def enqueue_fixup_request(
+        self,
+        feedback: dict[str, str],
+        target_ids: Iterable[str],
+        *,
+        origin_run_id: str | None = None,
+        request_id: str | None = None,
+    ) -> str:
+        """Persist a repair request before the in-memory scheduler waits on it."""
+
+        request_id = request_id or uuid4().hex[:12]
+        self.fixup_requests[request_id] = {
+            "feedback": dict(feedback),
+            "target_ids": sorted(set(target_ids)),
+            "origin_run_id": origin_run_id,
+            "created_at": timestamp(),
+        }
+        self._mark_dirty()
+        await self._persist()
+        return request_id
+
+    async def finish_fixup_requests(self, request_ids: Iterable[str]) -> None:
+        changed = False
+        for request_id in request_ids:
+            changed = self.fixup_requests.pop(request_id, None) is not None or changed
+        if changed:
+            self._mark_dirty()
+            await self._persist()
 
     async def close(self) -> None:
         await self.flush()

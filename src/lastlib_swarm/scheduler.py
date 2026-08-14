@@ -8,6 +8,7 @@ from collections.abc import AsyncIterator, Coroutine, Iterable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from typing import Any, TypedDict
+from uuid import uuid4
 
 from lastlib_swarm.codex import (
     AgentResult,
@@ -92,9 +93,11 @@ class BuildDiagnostics:
 
 @dataclass
 class FixupRequest:
+    id: str
     feedback: dict[str, str]
     target_ids: set[str]
     future: asyncio.Future[bool]
+    ready: asyncio.Event
 
 
 @dataclass
@@ -420,6 +423,7 @@ class Orchestrator:
         self._fixup_requests: list[FixupRequest] = []
         self._fixup_request_lock = asyncio.Lock()
         self._fixup_runner: asyncio.Task[None] | None = None
+        self._fixup_requests_recovered = False
         self._invalidated_reviews: set[str] = set()
 
     def scheduling_snapshot(self) -> dict[str, object]:
@@ -1336,13 +1340,143 @@ class Orchestrator:
     ) -> bool:
         """Batch concurrent repair requests into one dependency-aware fixup pass."""
 
+        request_id = uuid4().hex[:12]
+        request_feedback = dict(feedback or {})
+        request_targets = set(target_ids)
         future = asyncio.get_running_loop().create_future()
-        request = FixupRequest(dict(feedback or {}), set(target_ids), future)
+        ready = asyncio.Event()
+        request = FixupRequest(request_id, request_feedback, request_targets, future, ready)
         async with self._fixup_request_lock:
             self._fixup_requests.append(request)
             if self._fixup_runner is None:
                 self._fixup_runner = asyncio.create_task(self._drain_fixup_requests())
+        try:
+            async with self.state.batch():
+                await self.state.enqueue_fixup_request(
+                    request_feedback,
+                    request_targets,
+                    request_id=request_id,
+                )
+                for chapter_id in request_feedback:
+                    active = self.state.active_run(chapter_id)
+                    if active is not None and active.stage == Stage.FIXUP.value:
+                        continue
+                    await self.state.set_task(
+                        chapter_id,
+                        Stage.FIXUP,
+                        TaskStatus.RUNNING,
+                        "targeted fixup request queued behind the active repair batch",
+                        phase=TaskPhase.WAITING_FIXUP,
+                    )
+        except BaseException:
+            future.cancel()
+            raise
+        finally:
+            ready.set()
         return await future
+
+    async def _recover_fixup_requests(self) -> list[asyncio.Future[bool]]:
+        """Restore durable repair requests, including legacy proof handoff gaps."""
+
+        if self._fixup_requests_recovered:
+            return []
+        self._fixup_requests_recovered = True
+
+        persisted_origins = {
+            value.get("origin_run_id")
+            for value in self.state.fixup_requests.values()
+            if isinstance(value, dict)
+        }
+        by_id = {chapter.id: chapter for chapter in self.chapters}
+        for chapter in self.chapters:
+            proof_runs = self.state.task(chapter.id, Stage.PROVE).runs
+            if not proof_runs:
+                continue
+            run = proof_runs[-1]
+            self.state.load_run_details(run)
+            report = run.report if isinstance(run.report, dict) else {}
+            if not report.get("fixup_findings") or run.id in persisted_origins:
+                continue
+            if self.state.task(chapter.id, Stage.REVIEW).review_green is True:
+                continue
+            findings = self._route_review_findings(chapter, report)
+            unhandled: dict[str, str] = {}
+            for owner, block in findings.items():
+                handled = any(
+                    fixup_run.status == TaskStatus.SUCCEEDED
+                    and fixup_run.finished_at is not None
+                    and fixup_run.finished_at >= (run.finished_at or run.started_at)
+                    for fixup_run in self.state.task(owner, Stage.FIXUP).runs
+                )
+                if not handled:
+                    unhandled[owner] = block
+            if not unhandled:
+                continue
+            async with self.state.batch():
+                await self.state.enqueue_fixup_request(
+                    unhandled,
+                    {chapter.id, *unhandled},
+                    origin_run_id=run.id,
+                )
+                for owner in unhandled:
+                    await self.state.set_task(
+                        owner,
+                        Stage.FIXUP,
+                        TaskStatus.RUNNING,
+                        "recovered proof-requested fixup from durable run history",
+                        phase=TaskPhase.WAITING_FIXUP,
+                    )
+            persisted_origins.add(run.id)
+
+        futures: list[asyncio.Future[bool]] = []
+        async with self._fixup_request_lock:
+            known = {request.id for request in self._fixup_requests}
+            for request_id, value in self.state.fixup_requests.items():
+                if request_id in known or not isinstance(value, dict):
+                    continue
+                feedback_value = value.get("feedback")
+                targets_value = value.get("target_ids")
+                feedback = (
+                    {
+                        chapter_id: block
+                        for chapter_id, block in feedback_value.items()
+                        if chapter_id in by_id and isinstance(block, str)
+                    }
+                    if isinstance(feedback_value, dict)
+                    else {}
+                )
+                targets = (
+                    {chapter_id for chapter_id in targets_value if chapter_id in by_id}
+                    if isinstance(targets_value, list)
+                    else set()
+                )
+                if not targets and not feedback:
+                    await self.state.finish_fixup_requests((request_id,))
+                    continue
+                async with self.state.batch():
+                    for owner in feedback:
+                        await self.state.set_task(
+                            owner,
+                            Stage.FIXUP,
+                            TaskStatus.RUNNING,
+                            "recovered queued targeted fixup after restart",
+                            phase=TaskPhase.WAITING_FIXUP,
+                        )
+                future = asyncio.get_running_loop().create_future()
+                self._fixup_requests.append(
+                    FixupRequest(
+                        request_id,
+                        feedback,
+                        targets | set(feedback),
+                        future,
+                        asyncio.Event(),
+                    )
+                )
+                self._fixup_requests[-1].ready.set()
+                futures.append(future)
+            if self._fixup_requests and self._fixup_runner is None:
+                self._fixup_runner = asyncio.create_task(self._drain_fixup_requests())
+        return futures
 
     async def _request_clean_build(
         self,
@@ -1370,6 +1504,11 @@ class Orchestrator:
                         return
                     requests, self._fixup_requests = self._fixup_requests, []
 
+                await asyncio.gather(*(request.ready.wait() for request in requests))
+                requests = [request for request in requests if not request.future.cancelled()]
+                if not requests:
+                    continue
+
                 feedback: dict[str, str] = {}
                 targets: set[str] = set()
                 for request in requests:
@@ -1386,6 +1525,9 @@ class Orchestrator:
                             request.future.set_exception(error)
                     raise
                 else:
+                    await self.state.finish_fixup_requests(
+                        request.id for request in requests
+                    )
                     for request in requests:
                         if not request.future.done():
                             request.future.set_result(succeeded)
@@ -1989,6 +2131,9 @@ class Orchestrator:
     async def _review_tree(self, *, rerun: bool = False, prove: bool = False) -> bool:
         """Release dependency-ready reviews and proofs without a corpus-wide review gate."""
 
+        recovered_fixups = await self._recover_fixup_requests()
+        if recovered_fixups and not all(await asyncio.gather(*recovered_fixups)):
+            return False
         by_id = {chapter.id: chapter for chapter in self.chapters}
         try:
             initial_graph = self._observed_chapter_graph()
@@ -2415,6 +2560,9 @@ class Orchestrator:
 
     async def run_stage(self, stage: Stage) -> bool:
         if stage is Stage.FIXUP:
+            recovered_fixups = await self._recover_fixup_requests()
+            if recovered_fixups and not all(await asyncio.gather(*recovered_fixups)):
+                return False
             return await self._fixup_to_clean()
         if stage is Stage.REVIEW:
             return await self._review_until_clean()

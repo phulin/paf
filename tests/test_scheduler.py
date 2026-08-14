@@ -232,7 +232,7 @@ async def test_state_persists_fixup_graph(tmp_path: Path) -> None:
     await reloaded.load_or_create()
 
     assert reloaded.fixup_graph == state.fixup_graph
-    assert reloaded.snapshot()["version"] == 8
+    assert reloaded.snapshot()["version"] == 9
 
 
 @pytest.mark.asyncio
@@ -310,7 +310,7 @@ async def test_hot_checkpoint_does_not_grow_with_run_payload_history(tmp_path: P
 
     hot = json.loads(state.path.read_text(encoding="utf-8"))
     task = hot["tasks"][f"{config.chapters[0].id}:formalize"]
-    assert hot["version"] == 8
+    assert hot["version"] == 9
     assert "source_issues" not in hot
     assert "runs" not in task
     assert task["run_count"] == 25
@@ -695,6 +695,146 @@ async def test_concurrent_fixup_requests_share_one_repair_pass(
         )
     )
     assert calls == [({first.id: "first", second.id: "second"}, {first.id, second.id})]
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_fixup_request_is_visible_and_durable_while_another_batch_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    first, second = config.chapters
+    orchestrator = Orchestrator(config, StateStore(config))
+    await orchestrator.prepare()
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    calls = 0
+
+    async def fixup(
+        feedback: dict[str, str] | None = None,
+        *,
+        target_ids: object = None,
+    ) -> bool:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            first_started.set()
+            await release_first.wait()
+        return True
+
+    monkeypatch.setattr(orchestrator, "_fixup_to_clean", fixup)
+    first_request = asyncio.create_task(
+        orchestrator._request_fixup({first.id: "first"}, target_ids={first.id})
+    )
+    await first_started.wait()
+    second_request = asyncio.create_task(
+        orchestrator._request_fixup({second.id: "second"}, target_ids={second.id})
+    )
+    while len(orchestrator.state.fixup_requests) < 2:
+        await asyncio.sleep(0)
+
+    queued = orchestrator.state.task(second.id, Stage.FIXUP)
+    assert queued.status == TaskStatus.RUNNING
+    assert queued.phase == TaskPhase.WAITING_FIXUP
+    assert "queued behind the active repair batch" in queued.detail
+    assert len(orchestrator.state.fixup_requests) == 2
+    while True:
+        persisted = json.loads(orchestrator.state.path.read_text(encoding="utf-8"))
+        if len(persisted["fixup_requests"]) == 2:
+            break
+        await asyncio.sleep(0)
+    assert len(persisted["fixup_requests"]) == 2
+
+    release_first.set()
+    assert all(await asyncio.gather(first_request, second_request))
+    assert orchestrator.state.fixup_requests == {}
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_interrupted_fixup_request_is_restored_from_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = config.chapters[0]
+    state = StateStore(config)
+    await state.load_or_create()
+    request_id = await state.enqueue_fixup_request(
+        {chapter.id: "missing scalar tower"},
+        {chapter.id},
+        origin_run_id="proof-run",
+    )
+    await state.close()
+
+    recovered = StateStore(config)
+    orchestrator = Orchestrator(config, recovered)
+    await orchestrator.prepare()
+    calls: list[tuple[dict[str, str] | None, set[str]]] = []
+
+    async def fixup(
+        feedback: dict[str, str] | None = None,
+        *,
+        target_ids: object = None,
+    ) -> bool:
+        assert isinstance(target_ids, set)
+        calls.append((feedback, target_ids))
+        return True
+
+    monkeypatch.setattr(orchestrator, "_fixup_to_clean", fixup)
+    futures = await orchestrator._recover_fixup_requests()
+
+    assert all(await asyncio.gather(*futures))
+    assert calls == [({chapter.id: "missing scalar tower"}, {chapter.id})]
+    assert request_id not in recovered.fixup_requests
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_unqueued_proof_finding_is_recovered_from_run_history(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = config.chapters[0]
+    state = StateStore(config)
+    await state.load_or_create()
+    run = await state.start_run(chapter.id, Stage.PROVE)
+    await state.finish_run(
+        run,
+        status=TaskStatus.SUCCEEDED,
+        report={
+            "fixup_findings": [
+                {
+                    "description": "add the missing scalar tower",
+                    "owner_paths": ["lean/Book/Chapter01.lean"],
+                }
+            ]
+        },
+    )
+    await state.set_review_green((chapter.id,), False)
+    await state.close()
+
+    recovered = StateStore(config)
+    orchestrator = Orchestrator(config, recovered)
+    await orchestrator.prepare()
+    calls: list[dict[str, str] | None] = []
+
+    async def fixup(
+        feedback: dict[str, str] | None = None,
+        *,
+        target_ids: object = None,
+    ) -> bool:
+        calls.append(feedback)
+        assert target_ids == {chapter.id}
+        return True
+
+    monkeypatch.setattr(orchestrator, "_fixup_to_clean", fixup)
+    futures = await orchestrator._recover_fixup_requests()
+
+    assert all(await asyncio.gather(*futures))
+    assert len(calls) == 1
+    assert calls[0] is not None
+    assert "missing scalar tower" in calls[0][chapter.id]
+    assert recovered.fixup_requests == {}
     await orchestrator.shutdown()
 
 
@@ -2458,6 +2598,8 @@ async def test_proof_fixup_requeues_only_its_review_branch(
         assert target_ids == {chapter.id}
         assert state.task(chapter.id, Stage.REVIEW).review_green is False
         assert state.task(chapter.id, Stage.PROVE).status == TaskStatus.PENDING
+        assert state.task(chapter.id, Stage.FIXUP).status == TaskStatus.RUNNING
+        assert state.task(chapter.id, Stage.FIXUP).phase == TaskPhase.WAITING_FIXUP
         fixups += 1
         return True
 
