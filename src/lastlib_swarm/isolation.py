@@ -346,7 +346,8 @@ class FuseOverlayIsolation:
         self._revision = 0
         self._generation_paths: dict[int, Path] = {}
         self._generation_references: dict[int, int] = {}
-        self._dependency_layer = self.cache_root / "dependencies-unprepared"
+        self._dependency_backing = self.cache_root / "dependencies-unprepared"
+        self._dependency_layer = self.cache_root / "dependency-links"
         self._coordinator_layers: tuple[Path, ...] = ()
         self._cache_revision = 0
         self._published_cache_revision = 0
@@ -512,14 +513,27 @@ class FuseOverlayIsolation:
 
     async def _seed_cache_layers(self) -> None:
         dependency = self.cache_root / f"dependencies-{self._dependency_key()}"
+        links = self._dependency_layer
         project = self.cache_layers / "00000000-initial"
         dependency.mkdir(parents=True, exist_ok=False)
+        links.mkdir(parents=True, exist_ok=False)
         project.mkdir(parents=True, exist_ok=False)
         await asyncio.gather(
             self._copy_dependency_cache(dependency),
             self._copy_initial_project_cache(project),
         )
-        self._dependency_layer = dependency
+        # A fuse-overlayfs process keeps backing descriptors for package files
+        # loaded by Lean. Putting the package tree in every agent's lowerdir
+        # multiplies that descriptor set by the number of agents. Let package
+        # paths leave the private overlay through absolute symlinks instead.
+        for prefix in self._package_prefixes():
+            target = dependency / prefix
+            if not target.is_dir():
+                continue
+            link = links / prefix
+            link.parent.mkdir(parents=True, exist_ok=True)
+            link.symlink_to(target, target_is_directory=True)
+        self._dependency_backing = dependency
         self._coordinator_layers = (project,)
         self._cache_generations[0] = CacheGeneration(self._coordinator_layers)
 

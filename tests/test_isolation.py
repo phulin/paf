@@ -342,6 +342,34 @@ async def test_agent_cache_writes_are_discarded_and_coordinator_publishes_delta(
 
 
 @pytest.mark.asyncio
+async def test_dependency_packages_bypass_fuse(tmp_path: Path) -> None:
+    config_path = write_project(tmp_path, chapters="chapters = [1]")
+    dependency = tmp_path / "lean" / ".lake" / "packages" / "dep" / "dependency.olean"
+    dependency.parent.mkdir(parents=True)
+    dependency.write_bytes(b"shared dependency")
+    manager, _ = fuse_manager(config_path)
+    await manager.prepare()
+    first, second = await asyncio.gather(
+        manager.acquire("dependency-first"),
+        manager.acquire("dependency-second"),
+    )
+    relative = dependency.relative_to(tmp_path)
+    package_link = manager._dependency_layer / "lean" / ".lake" / "packages"
+    try:
+        assert package_link.is_symlink()
+        assert package_link.resolve() == (
+            manager._dependency_backing / "lean" / ".lake" / "packages"
+        )
+        assert (manager._dependency_backing / relative).read_bytes() == b"shared dependency"
+        assert (first.root / relative).read_bytes() == b"shared dependency"
+        assert (second.root / relative).read_bytes() == b"shared dependency"
+    finally:
+        await first.close()
+        await second.close()
+        await manager.close()
+
+
+@pytest.mark.asyncio
 async def test_cache_delta_publication_keeps_active_agent_snapshots_immutable(
     tmp_path: Path,
 ) -> None:
@@ -395,6 +423,7 @@ async def test_coordinator_build_promotes_only_its_private_cache_delta(tmp_path:
     await manager.prepare()
     try:
         initial = manager._coordinator_layers[0]
+        assert (manager._dependency_layer / "lean" / ".lake" / "packages").is_symlink()
         assert (manager._dependency_layer / dependency.relative_to(tmp_path)).is_file()
         assert not (initial / dependency.relative_to(tmp_path)).exists()
         assert (initial / existing.relative_to(tmp_path)).is_file()
