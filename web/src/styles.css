@@ -478,6 +478,94 @@ h1, h2, p { margin: 0; }
 .statement-meta strong { display: block; overflow: hidden; margin-top: 7px; color: var(--text); font: 600 9px/1 ui-monospace, monospace; white-space: nowrap; text-overflow: ellipsis; }
 .statement-meta p { margin-top: 5px; overflow: hidden; color: var(--muted); font: 500 8px/1.3 ui-monospace, monospace; white-space: nowrap; text-overflow: ellipsis; }
 
+/* Readability scale: keep the TUI density without terminal-sized type. */
+.brand-name { font-size: 14px; }
+.brand-sub { font-size: 9px; }
+.top-nav button { font-size: 12px; }
+.connection, .live-control { font-size: 11px; }
+.swarm-trigger-copy small { font-size: 9px; }
+.swarm-trigger-copy strong { font-size: 11px; }
+.swarm-agent-count { font-size: 12px; }
+.swarm-menu-head strong { font-size: 12px; }
+.swarm-menu-label { font-size: 9px; }
+.swarm-menu-item { min-height: 59px; }
+.swarm-item-copy strong { font-size: 11px; }
+.swarm-item-copy small { font-size: 9px; }
+.swarm-item-agents strong { font-size: 13px; }
+.swarm-item-agents small { font-size: 8px; }
+.swarm-menu-empty { font-size: 11px; }
+.status-bar { font-size: 10px; }
+.overview { padding-top: 20px; }
+.eyebrow { font-size: 10.5px; }
+.metric-value { font-size: 24px; }
+.metric-detail { font-size: 11px; }
+.strip-label strong { font-size: 12px; }
+.stage-index { font-size: 10px; }
+.stage-name { font-size: 12px; }
+.stage-top strong { font-size: 12px; }
+.stage-counts { font-size: 10.5px; }
+.panel-header { min-height: 62px; }
+.panel-header h2 { font-size: 15px; }
+.mini-tabs button { font-size: 10px; }
+.compact-search { width: 165px; }
+.compact-search input { font-size: 11px; }
+.task-table th { height: 37px; font-size: 10px; }
+.task-table td { height: 59px; }
+.book-id { font-size: 10px; }
+.chapter-cell strong { font-size: 12px; }
+.chapter-cell div span { font-size: 10px; }
+.status-pill { min-width: 76px; height: 27px; font-size: 9.5px; }
+.activity-cell strong, .activity-cell > span { font-size: 11px; }
+.activity-cell div span { font-size: 9.5px; }
+.table-footer { height: 33px; font-size: 10px; }
+.empty-table { font-size: 11px; }
+.tiny-live { font-size: 9px; }
+.feed-event { grid-template-columns: 59px 13px 1fr; min-height: 59px; }
+.feed-event time { font-size: 9.5px; }
+.feed-content strong { font-size: 11px; }
+.feed-content p { font-size: 9.5px; }
+.event-kind { font-size: 8.5px; }
+.feed-empty strong { font-size: 12px; }
+.feed-empty span { font-size: 10px; }
+.build-state { font-size: 9px; }
+.build-target span { font-size: 9.5px; }
+.build-target strong { font-size: 11px; }
+.build-progress-label { font-size: 10px; }
+.build-counters { font-size: 9px; }
+.terminal-output { min-height: 88px; font-size: 9px; line-height: 1.7; }
+.terminal-bar em { font-size: 8px; }
+.drawer-stage-number { font-size: 10px; }
+.drawer-stage > div strong { font-size: 12px; }
+.drawer-stage > div span { font-size: 10px; }
+.agent-summary { font-size: 13px; }
+.agent-stats span { font-size: 10px; }
+.drawer-section code { font-size: 11px; }
+.back-button { font-size: 11px; }
+.index-status { font-size: 11px; }
+.statement-search input { font-size: 13px; }
+.select-wrap select { font-size: 11px; }
+.browser-panel-title { height: 44px; font-size: 10.5px; }
+.tree-row { height: 38px; }
+.tree-row > span { font-size: 11px; }
+.tree-row > span b, .tree-row > em { font-size: 9px; }
+.tree-label { font-size: 9px; }
+.tree-proof-summary > div:not(.tree-label):not(.progress-track) { height: 29px; font-size: 10px; }
+.results-title span:last-child { font-size: 9px; }
+.statement-result { min-height: 102px; }
+.statement-result-body strong { font-size: 11.5px; }
+.statement-result-body code { font-size: 10px; }
+.statement-result-body > span { font-size: 9px; }
+.no-results strong { font-size: 12px; }
+.no-results span, .detail-empty span, .result-limit { font-size: 10px; }
+.detail-header { height: 44px; }
+.detail-kind { font-size: 10px; }
+.detail-actions button { height: 29px; font-size: 10px; }
+.statement-doc { font-size: 12px; }
+.source-path { font-size: 10px; }
+.code-line { min-height: 22px; font-size: 11.5px; line-height: 22px; }
+.statement-meta strong { font-size: 11px; }
+.statement-meta p { font-size: 10px; }
+
 .spinning { animation: spin .7s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
 @keyframes pulse { 50% { opacity: .45; box-shadow: none; } }
@@ -520,7 +608,7 @@ h1, h2, p { margin: 0; }
 @media (max-width: 590px) {
   .app-header { padding: 0 8px; }
   .brand-glyph { width: 30px; height: 30px; }
-  .brand-name { font-size: 11px; }
+  .brand-name { font-size: 13px; }
   .brand > div:last-child { display: none; }
   .brand { margin-right: 7px; }
   .swarm-switcher { margin-right: auto; }

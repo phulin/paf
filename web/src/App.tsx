@@ -651,7 +651,7 @@ function ChapterInspector({ row, close }: { row: ChapterRow; close: () => void }
   );
 }
 
-function Overview({ state, connected, onBrowse }: { state: SwarmState; connected: boolean; onBrowse: () => void }) {
+function Overview({ state, connected }: { state: SwarmState; connected: boolean }) {
   const rows = useMemo(() => chapterRows(state), [state]);
   const [selected, setSelected] = useState<ChapterRow | null>(null);
   const tasks = Object.values(state.tasks ?? {});
@@ -663,15 +663,6 @@ function Overview({ state, connected, onBrowse }: { state: SwarmState; connected
 
   return (
     <main className="main overview">
-      <div className="page-heading">
-        <div>
-          <div className="breadcrumb"><span>lastlib</span><ChevronRight size={12} /><span>swarm</span><ChevronRight size={12} /><strong>live</strong></div>
-          <h1>Formalization overview</h1>
-          <p>From Mathlib to Fermat's Last Theorem, one verified edge at a time.</p>
-        </div>
-        <button className="browse-cta" onClick={onBrowse}><BookOpen size={17} /><span>Browse Lean statements</span><span className="key-hint">⌘ K</span></button>
-      </div>
-
       <div className="metrics-grid">
         <MetricCard icon={<Users size={19} />} label="Agents online" value={`${state.agents?.active ?? active} / ${state.agents?.maximum ?? 0}`} detail={<><span className="success-text">{active} working</span><i />{state.agents?.queued ?? 0} queued</>} accent="var(--cyan)" />
         <MetricCard icon={<CheckCircle2 size={19} />} label="Pipeline progress" value={`${completion}%`} detail={<><span>{successful} / {tasks.length} tasks</span><i />{chaptersDone} chapters proved</>} accent="var(--green)" />
@@ -946,7 +937,7 @@ export default function App() {
       />
       <Rail view={view} setView={navigate} />
       {view === "overview"
-        ? <Overview state={state} connected={connected} onBrowse={() => navigate("statements")} />
+        ? <Overview state={state} connected={connected} />
         : <StatementBrowser close={() => navigate("overview")} connected={connected} />}
       <footer className="status-bar">
         <span><span className={`footer-dot ${connected ? "connected" : ""}`} /> {connected ? state.source : "demo snapshot"}</span>
