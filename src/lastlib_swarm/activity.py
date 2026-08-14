@@ -28,7 +28,7 @@ LEAN_MCP_TITLES = {
     "lean_code_actions": "Lean actions",
 }
 EXIT_STATUS_ONLY = re.compile(r"^exit\s+\d+$", re.IGNORECASE)
-SHELL_COMMAND_WRAPPER = re.compile(r"^/bin/bash\s+-lc\s+(['\"])(.*)\1$", re.DOTALL)
+SHELL_COMMAND_WRAPPER = re.compile(r"^/(?:usr/)?bin/bash\s+-lc\s+(['\"])(.*)\1$", re.DOTALL)
 LEAN_BOOK_PATH = re.compile(
     r"""
     /?(?:(?:[^/\s'"`|;,()\[\]{}]+/)*lean/)?

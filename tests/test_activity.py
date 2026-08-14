@@ -607,6 +607,28 @@ def test_compacts_shell_commands_and_successful_completions(tmp_path: Path) -> N
     assert activity.recent[-1].title == "done"
 
 
+@pytest.mark.parametrize("bash", ["/bin/bash", "/usr/bin/bash"])
+@pytest.mark.parametrize("quote", ["'", '"'])
+def test_compacts_shell_command_wrappers_for_bash_paths_and_quotes(
+    tmp_path: Path, bash: str, quote: str
+) -> None:
+    activity = AgentActivity(run_id="run", chapter_id="chapter", stage="formalize")
+    activity.consume(
+        {
+            "type": "item.started",
+            "item": {
+                "id": "command",
+                "type": "command_execution",
+                "command": f"{bash} -lc {quote}lake build +Book.Chapter{quote}",
+                "status": "in_progress",
+            },
+        },
+        workspace_root=tmp_path,
+    )
+
+    assert activity.current == "shell: lake build +Book.Chapter"
+
+
 def test_compacts_dependency_paths_in_commands_and_file_changes(tmp_path: Path) -> None:
     dependency = (
         tmp_path
