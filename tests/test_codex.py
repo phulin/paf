@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import signal
+from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 
@@ -842,12 +843,12 @@ print(json.dumps({{"type": "item.completed", "item": {{
         process: asyncio.subprocess.Process,
         _process_tree: object,
         _threshold: int,
-        resumable: object,
+        resumable: Callable[[], bool],
     ) -> int:
         nonlocal monitor_calls
         monitor_calls += 1
         if monitor_calls == 1:
-            while not resumable():  # type: ignore[operator]
+            while not resumable():
                 await asyncio.sleep(0.01)
             return 300
         await process.wait()
