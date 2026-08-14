@@ -368,7 +368,7 @@ h1, h2, p { margin: 0; }
 .terminal-cursor { display: inline-block; width: 5px; height: 9px; background: var(--green); animation: blink 1.1s steps(1) infinite; }
 
 .drawer-backdrop { position: fixed; z-index: 60; inset: var(--header-h) 0 var(--status-h) var(--rail-w); background: rgba(2,4,7,.62); backdrop-filter: blur(2px); }
-.inspector-drawer { position: absolute; inset: 0 0 0 auto; width: min(440px, 94vw); padding: 0 18px; border-left: 1px solid var(--border-strong); background: #0a0f15; box-shadow: -30px 0 80px rgba(0,0,0,.35); animation: slideIn .2s ease-out; }
+.inspector-drawer { position: absolute; inset: 0 0 0 auto; width: min(440px, 94vw); padding: 0 18px; overflow-y: auto; border-left: 1px solid var(--border-strong); background: #0a0f15; box-shadow: -30px 0 80px rgba(0,0,0,.35); animation: slideIn .2s ease-out; }
 .drawer-header { min-height: 86px; display: flex; align-items: center; justify-content: space-between; gap: 15px; border-bottom: 1px solid var(--border); }
 .drawer-header h2 { margin-top: 7px; color: var(--text-strong); font-size: 18px; font-weight: 650; }
 .drawer-stage-list { padding: 17px 0; border-bottom: 1px solid var(--border); }
@@ -379,9 +379,43 @@ h1, h2, p { margin: 0; }
 .drawer-stage > div span { color: var(--muted); font-size: 9px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .drawer-section { padding: 18px 0; border-bottom: 1px solid var(--border); }
 .agent-summary { margin-top: 10px; color: var(--text); font-size: 11px; line-height: 1.65; }
+.agent-report { margin-top: 11px; }
+.agent-report.plain { padding: 1px 0; }
+.agent-report.plain .agent-summary { margin-top: 0; }
+.agent-report-status { display: flex; flex-wrap: wrap; gap: 6px; }
+.report-badge { min-height: 25px; display: inline-flex; align-items: center; gap: 6px; padding: 0 7px; border: 1px solid var(--border); background: var(--panel); color: var(--muted); font: 650 9px/1 ui-monospace, monospace; text-transform: uppercase; }
+.report-badge.complete { color: var(--green); border-color: rgba(136,212,152,.22); background: rgba(136,212,152,.04); }
+.report-badge.working { color: var(--cyan); border-color: rgba(92,207,230,.22); background: rgba(92,207,230,.04); }
+.report-badge.changed { color: var(--violet); border-color: rgba(186,156,245,.22); background: rgba(186,156,245,.04); }
+.report-clear { min-height: 34px; display: flex; align-items: center; gap: 7px; margin-top: 12px; padding: 0 10px; border: 1px solid rgba(136,212,152,.15); background: rgba(136,212,152,.025); color: var(--green); font: 550 10px/1.3 ui-monospace, monospace; }
+.report-group { margin-top: 13px; border: 1px solid var(--border); background: #080c11; }
+.report-group-title { height: 34px; display: flex; align-items: center; gap: 7px; padding: 0 9px; border-bottom: 1px solid var(--border); color: var(--amber); font: 650 10px/1 ui-monospace, monospace; text-transform: uppercase; letter-spacing: .04em; }
+.report-group-title em { min-width: 18px; height: 18px; display: grid; place-items: center; margin-left: auto; background: rgba(255,255,255,.05); color: var(--text); font-style: normal; font-size: 9px; }
+.report-group.issues .report-group-title { color: var(--red); }
+.report-group.fixups .report-group-title { color: var(--violet); }
+.report-group.source-issues .report-group-title { color: var(--amber); }
+.report-group ul { display: flex; flex-direction: column; gap: 8px; margin: 0; padding: 10px 12px 10px 27px; }
+.report-group li { padding-left: 2px; color: #c8d2dc; font-size: 11px; line-height: 1.55; }
+.report-group li::marker { color: var(--red); }
+.report-finding { padding: 11px; border-bottom: 1px solid var(--border); }
+.report-finding:last-child { border-bottom: 0; }
+.report-finding > p { color: #c8d2dc; font-size: 11px; line-height: 1.55; }
+.owner-paths { display: flex; flex-direction: column; gap: 4px; margin-top: 9px; }
+.owner-paths code { display: block; padding: 6px 7px; border: 1px solid #1d2933; background: #06090d; color: var(--cyan); font: 500 9px/1.35 ui-monospace, monospace; word-break: break-all; }
+.source-issue { border-bottom: 1px solid var(--border); }
+.source-issue:last-child { border-bottom: 0; }
+.source-issue summary { min-height: 38px; display: flex; align-items: center; gap: 8px; padding: 7px 9px; color: var(--text); font: 600 10px/1.35 ui-monospace, monospace; cursor: pointer; list-style: none; }
+.source-issue summary::-webkit-details-marker { display: none; }
+.source-issue summary span { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.source-issue[open] summary svg { transform: rotate(180deg); }
+.source-issue > p { padding: 0 10px 10px; color: #c8d2dc; font-size: 11px; line-height: 1.55; }
+.source-issue blockquote { margin: 0 10px 10px; padding: 8px 9px; border-left: 2px solid var(--amber); background: #06090d; color: var(--muted); font: 500 9px/1.5 ui-monospace, monospace; }
+.suggested-fix { margin: 0 10px 10px; padding: 9px; border: 1px solid rgba(136,212,152,.16); background: rgba(136,212,152,.025); }
+.suggested-fix strong { color: var(--green); font: 650 9px/1 ui-monospace, monospace; text-transform: uppercase; }
+.suggested-fix p { margin-top: 6px; color: var(--text); font-size: 10px; line-height: 1.5; }
 .agent-stats { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-top: 13px; }
 .agent-stats span { display: flex; align-items: center; gap: 6px; padding: 8px; background: var(--panel); border: 1px solid var(--border); color: var(--muted); font: 500 8px/1 ui-monospace, monospace; }
-.drawer-section code { display: block; margin-top: 10px; padding: 10px; color: var(--cyan); background: #070a0e; border: 1px solid var(--border); font: 500 9px/1.5 ui-monospace, monospace; word-break: break-all; }
+.drawer-section > code { display: block; margin-top: 10px; padding: 10px; color: var(--cyan); background: #070a0e; border: 1px solid var(--border); font: 500 9px/1.5 ui-monospace, monospace; word-break: break-all; }
 
 /* Statement browser */
 .statement-page { display: flex; flex-direction: column; overflow: hidden; }
@@ -539,7 +573,7 @@ h1, h2, p { margin: 0; }
 .drawer-stage > div span { font-size: 10px; }
 .agent-summary { font-size: 13px; }
 .agent-stats span { font-size: 10px; }
-.drawer-section code { font-size: 11px; }
+.drawer-section > code { font-size: 11px; }
 .back-button { font-size: 11px; }
 .index-status { font-size: 11px; }
 .statement-search input { font-size: 13px; }
