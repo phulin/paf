@@ -38,27 +38,44 @@ precede its users, and be independently provable from earlier declarations.
 
 ## Workflow
 
+Use the native `update_plan` tool as the authoritative checklist for this attempt; do not keep the
+checklist only in prose, a scratch file, or the final report.
+
 1. Use the supplied `import` lines to construct the assigned files' local dependency order, using a
-   targeted filesystem search only if the supplied content is missing or truncated. Traverse the files
-   from imported prerequisites to their dependents. Keep this topological order for the audit, edits,
-   and final diagnostic pass; do not repeatedly bounce between unrelated files. If an edit invalidates
-   an already-visited dependent, revisit that dependent after its prerequisites are clean.
-2. Audit source coverage and the mathematical fidelity of every declaration.
-3. Audit proof readiness, dependency routes, and missing reusable interfaces.
-4. Make the minimal in-scope fix for every inaccurate, circular, vacuous, or unprovable statement.
+   targeted filesystem search only if the supplied content is missing or truncated. Before beginning
+   the audit, use `update_plan` to create a top-level checklist with one item for every
+   numbered source section, in source order, followed by a chapter-wide coverage/import audit and a
+   final edited-closure diagnostic item. Keep exactly one item in progress.
+2. Work through the section checklist in order. When a section becomes current, compare it closely
+   with its Lean representation and expand its section item in the native plan into a checklist of
+   the individual results to review: definitions, precise assertions, examples, warnings, and
+   proof-support interfaces. Keep later sections as unexpanded pending items until you reach them,
+   and add newly discovered results to the active section's checklist.
+3. Review each result-level item for source coverage, mathematical fidelity, proof readiness, and a
+   plausible acyclic dependency route. Make every warranted in-scope repair, or record the precise
+   unresolved finding, before marking that result complete. Never mark a batch of results complete
+   before doing their individual reviews.
+4. Traverse involved Lean files from imported prerequisites to their dependents while reviewing and
+   editing each result. Keep this topological order for edits and diagnostics; do not repeatedly
+   bounce between unrelated files. If an edit invalidates an already-visited dependent, revisit that
+   dependent after its prerequisites are clean. Finish every result in the active section before
+   moving to the next section.
+5. Make the minimal in-scope fix for every inaccurate, circular, vacuous, or unprovable statement.
    For each unresolved or out-of-scope source-changing issue, emit a `fixup_findings` entry with every
    exact repository-relative Lean path that must still be edited. Include prospective missing-file
    paths and split repairs that belong to different chapters.
-5. Keep the assigned scope compatible with the coordinator's clean-build baseline.
-6. Audit imports in every file reviewed or changed against the common focused-import policy.
+6. After all sections are checked off, perform the planned chapter-wide coverage and focused-import
+   audit and reconcile every finding with the result checklist. Keep the assigned scope compatible
+   with the coordinator's clean-build baseline.
 7. Use the attached Lean MCP on demand while investigating APIs or checking proposed repairs. Do not
    request initial or final diagnostics for a file that remains unchanged during this attempt. Track
    every edited file and its assigned transitive dependents. After the last relevant edit, request
    fresh whole-file diagnostics for that changed closure in dependency order. If a diagnostic requires
    another edit, repair it and recheck only the files invalidated by that repair. Resolve every
-   diagnostic except the exact “declaration uses `sorry`” warning before finishing.
-8. Finish the conceptual coverage audit and return structured, actionable findings. Diagnose only the
-   edited dependency closure described above, not the complete chapter.
+   diagnostic except the exact “declaration uses `sorry`” warning before checking off the final
+   diagnostic item.
+8. Return structured, actionable findings. Diagnose only the edited dependency closure described
+   above, not the complete chapter.
 
 Do not run Lean, Lake, or another language server; use only the attached Lean MCP. Edit only the
 assigned scope. A no-change review needs no diagnostic calls: the coordinator's incoming clean build

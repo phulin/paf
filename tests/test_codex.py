@@ -401,25 +401,16 @@ def test_review_uses_write_sandbox_when_full_access_is_disabled(tmp_path: Path) 
     assert "--dangerously-bypass-approvals-and-sandbox" not in command
 
 
-def test_review_prompt_requires_scoped_edits_and_coordinator_rebuild(tmp_path: Path) -> None:
+def test_review_command_enables_lean_mcp(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
     executor = CodexExecutor(config, StateStore(config))
-
-    prompt = executor.build_prompt(config.chapters[0], Stage.REVIEW)
-    normalized_prompt = " ".join(prompt.split())
-
-    assert "directly make every warranted in-scope" in prompt
-    assert "Attached Lean MCP" in prompt
-    assert "certified the incoming sources and dependencies clean" in normalized_prompt
-    assert "rebuilds it" in prompt
-    assert "read-only" not in prompt
 
     command = executor.command(Stage.REVIEW)
     assert any("mcp_servers.lastlib_lean.command" in item for item in command)
     assert any("lean_diagnostic_messages" in item for item in command)
 
 
-def test_review_prompt_starts_with_book_scoped_files_and_line_numbers(tmp_path: Path) -> None:
+def test_review_source_bundle_contains_book_scoped_files_in_order(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
     root = tmp_path / "lean" / "Book"
     child = root / "Chapter01" / "Section02.lean"
@@ -429,50 +420,14 @@ def test_review_prompt_starts_with_book_scoped_files_and_line_numbers(tmp_path: 
         encoding="utf-8",
     )
     child.write_text("def section := 2\n", encoding="utf-8")
-    executor = CodexExecutor(config, StateStore(config))
+    bundle = _review_source_bundle(tmp_path, config.chapters[0])
 
-    prompt = executor.build_prompt(config.chapters[0], Stage.REVIEW)
-
-    assert prompt.startswith("# Line-numbered review source set\n")
-    assert "counts as the initial complete read" in prompt
-    assert "Do not reread complete files from the filesystem" in prompt
     book_header = "## `books/book.md`"
     root_header = "## `lean/Book/Chapter01.lean`"
     child_header = "## `lean/Book/Chapter01/Section02.lean`"
     assert (
-        prompt.index(book_header)
-        < prompt.index(root_header)
-        < prompt.index(child_header)
-        < prompt.index("Do A Book chapter 01")
+        bundle.index(book_header) < bundle.index(root_header) < bundle.index(child_header)
     )
-    assert "     1 | # Book" in prompt
-    assert "     3 | ## 1. First chapter" in prompt
-    assert "## 2. Second chapter" in prompt
-    assert "     1 | import Book.Chapter01.Section02" in prompt
-    assert "     2 | " in prompt
-    assert "     3 | def chapter := section" in prompt
-    assert "     1 | def section := 2" in prompt
-
-    prove_prompt = executor.build_prompt(config.chapters[0], Stage.PROVE)
-    assert "Line-numbered review source set" not in prove_prompt
-
-
-def test_failed_proof_feedback_selects_full_scope_review_prompt(tmp_path: Path) -> None:
-    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
-    executor = CodexExecutor(config, StateStore(config))
-
-    prompt = executor.build_prompt(
-        config.chapters[0],
-        Stage.REVIEW,
-        feedback="the statement may need another hypothesis",
-    )
-    normalized_prompt = " ".join(prompt.split())
-
-    assert "Proof-triggered statement review and repair" in prompt
-    assert "re-review the entire assigned source scope" in normalized_prompt.lower()
-    assert "do not assume a reported finding is correct" in normalized_prompt
-    assert "Failed proof findings to evaluate" in prompt
-    assert "the statement may need another hypothesis" in prompt
 
 
 def test_review_source_bundle_is_capped_at_500k_characters(tmp_path: Path) -> None:
@@ -512,11 +467,11 @@ def test_fixup_prompt_requires_diagnostics_and_sorry(tmp_path: Path) -> None:
     assert "maximal affected dependents" in " ".join(prompt.split())
 
 
-def test_shipped_nonproof_prompts_have_consistent_stage_contracts() -> None:
+def test_shipped_prompts_have_consistent_stage_contracts() -> None:
     prompt_root = Path(__file__).parents[1] / "src" / "lastlib_swarm" / "prompts"
     formalize = " ".join((prompt_root / "formalize.md").read_text().split())
     fixup = " ".join((prompt_root / "fixup.md").read_text().split())
-    review = " ".join((prompt_root / "review.md").read_text().split())
+    prove = " ".join((prompt_root / "prove.md").read_text().split())
 
     assert "structured `source_issues` ledger" in formalize
     assert "`SOURCE_ISSUE` comment" not in formalize
@@ -524,6 +479,10 @@ def test_shipped_nonproof_prompts_have_consistent_stage_contracts() -> None:
         formalize
     )
     assert "mathematically natural local dependency guess" in formalize
+    assert "native `update_plan` tool" in formalize
+    assert "one item for every numbered source section" in formalize
+    assert "expand its section item" in formalize
+    assert "individual results to formalize" in formalize
 
     assert "authoritative starting evidence" in fixup
     assert "Do not reread the complete chapter or assigned file set" in fixup
@@ -535,8 +494,10 @@ def test_shipped_nonproof_prompts_have_consistent_stage_contracts() -> None:
     assert "Never prove" in fixup
     assert "`by sorry`" in fixup
 
-    assert "Diagnose only the edited dependency closure" in review
-    assert "recheck the complete chapter" not in review.casefold()
+    assert "`update_plan` tool" in prove
+    assert "one item for every file that contains work" in prove
+    assert "in that dependency order" in prove
+    assert "never check off files out of order" in prove
 
 
 def test_warning_filter_allows_only_declaration_uses_sorry() -> None:

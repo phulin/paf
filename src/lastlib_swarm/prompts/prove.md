@@ -15,32 +15,43 @@ Focused imports required by a valid proof are permitted under the common import 
 
 ## Workflow
 
-1. Locate the unresolved placeholders. For the proof you are actively attempting, read its
-   surrounding declaration and the relevant part of chapter {chapter_number} in `{source}`. Do not
-   read the complete book or assigned file set unless the target genuinely requires that context.
-2. Use the informal chapter's proof as the default mathematical plan. Translate its intermediate
+1. Locate the unresolved placeholders from the supplied assigned source and use the supplied imports
+   to order their files from prerequisites to dependents. Before editing a proof, use the native
+   `update_plan` tool to create an authoritative checklist with one item for every file that contains work
+   for this attempt, in that dependency order, followed by a final edited-closure diagnostic item.
+   Keep exactly one file in progress and do not keep this checklist only in prose or a scratch file.
+2. Work through the file checklist in order. For the active file, record its unresolved declaration
+   names in the plan item, then read each proof's surrounding declaration and the relevant part of
+   chapter {chapter_number} in `{source}`. Do not read the complete book or unrelated assigned files
+   unless a target genuinely requires that context. If proof work requires an additional assigned
+   helper file, add it to the checklist at its dependency-correct position before editing it.
+3. Use the informal chapter's proof as the default mathematical plan. Translate its intermediate
    constructions and reductions into Lean whenever they are sound and compatible with pinned APIs.
    Depart materially from that plan only when Lean's library structure makes another proof
    substantially clearer or the informal argument omits a necessary step; record the reason.
-3. Choose a tractable or prerequisite placeholder and work on it concretely. Confirm exact theorem
-   signatures from source, try candidate terms or tactics, inspect the resulting goal, and iterate.
-4. Prove intermediate facts when the final result does not yield directly. You may add focused
+4. Within the active file, choose a tractable or prerequisite placeholder and work on it concretely.
+   Confirm exact theorem signatures from source, try candidate terms or tactics, inspect the
+   resulting goal, and iterate.
+5. Prove intermediate facts when the final result does not yield directly. You may add focused
    local or private helper lemmas in the assigned files, derive a reusable missing lemma at the
    earliest chronologically valid location in scope, and refactor the target proof around those
    stepping stones. Every added helper must itself be proved and used; do not add new placeholders.
-5. Keep every clean proof and mathematically reusable helper even when another placeholder remains.
+6. Keep every clean proof and mathematically reusable helper even when another placeholder remains.
    Do not create cosmetic edits or unused scaffolding solely to register a change.
-6. Stay with a plausible target through elaboration failures and incomplete proof states. Inspect
+7. Stay with a plausible target through elaboration failures and incomplete proof states. Inspect
    the exact residual goals, search declarations and existing uses, simplify the target into helper
    lemmas, and try several materially different proof shapes. A guessed theorem name, a failed
    tactic, or one unsuccessful approach is only evidence for the next experiment.
-7. Give up on a target only after sustained concrete effort with multiple checked experiments that
+8. Give up on a target only after sustained concrete effort with multiple checked experiments that
    expose the same hard obstruction, or when you have a specific mathematical argument that the
    statement is false or cannot follow from its assumptions. When one target has genuinely reached
    that point, preserve the useful work and continue to independent placeholders.
-8. Diagnose edited files and affected dependents as needed; do not spend time running final
-   diagnostics on untouched files, whose incoming build is already certified clean.
-9. Work in order, section-by-section.
+9. Mark the active file complete only after every placeholder in it is either proved or has received
+   the sustained concrete attempt and precise reporting required below. Then advance to the next
+   file; never check off files out of order or batch-complete unvisited files.
+10. After every file is checked off, diagnose edited files and affected dependents as needed and
+    check off the final diagnostic item. Do not spend time running final diagnostics on untouched
+    files, whose incoming build is already certified clean.
 
 Prefer, in order, definitional equality, an exact earlier theorem, focused rewriting or
 simplification, a canonical constructor or equivalence, and only then unfolded infrastructure.

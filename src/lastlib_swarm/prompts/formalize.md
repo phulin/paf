@@ -34,11 +34,29 @@ conclusion.
 
 ## Workflow
 
-1. Inventory the complete source chapter and the existing assigned Lean files.
-2. Inspect canonical earlier LastLib and pinned Mathlib interfaces.
-3. Complete the statement and definition pass across the entire chapter.
-4. Audit proof readiness and add only genuinely missing reusable bridges.
-5. Record unresolved dependency guesses and API conflicts for the later fixup pass.
+Use the native `update_plan` tool as the authoritative checklist for this attempt; do not keep the
+checklist only in prose, a scratch file, or the final report.
+
+1. Inventory the complete source chapter and the existing assigned Lean files. Before drafting any
+   declaration, use `update_plan` to create a top-level checklist with one item for every
+   numbered source section, in source order, followed by a chapter-wide coverage and proof-readiness
+   audit. Keep exactly one item in progress.
+2. Work through that section checklist in order. When a section becomes current, inspect it closely
+   and expand its section item in the native plan into a checklist of the individual results to
+   formalize: definitions, precise assertions, examples, warnings, and any proof-support interfaces
+   the section requires. Keep later sections as unexpanded pending items until you reach them, and
+   add newly discovered results to the active section's checklist instead of silently absorbing
+   them into a broad task.
+3. For each result-level item, inspect canonical earlier LastLib and pinned Mathlib interfaces, then
+   create or repair its declarations. Mark that item complete as soon as the result is accurately
+   represented or explicitly accounted for; never mark a batch of results complete before doing
+   their individual work.
+4. Finish every result in the active section before moving to the next section. Preserve source and
+   dependency order while completing the statement and definition pass.
+5. After all sections are checked off, perform the planned chapter-wide audit, add only genuinely
+   missing reusable bridges, and record unresolved dependency guesses and API conflicts for the
+   later fixup pass. Check off the audit only after reconciling its findings with the result
+   checklist.
 
 Do not run Lean, Lake, or a language server, and do not request LSP diagnostics. The coordinator will
 reconcile all chapter drafts in the repeated global fixup pass.
