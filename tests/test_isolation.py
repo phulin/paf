@@ -1,7 +1,9 @@
 import asyncio
 import json
 import os
+import shutil
 import threading
+import time
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -91,6 +93,42 @@ async def test_fuse_overlay_recursive_cleanup_does_not_block_event_loop(
 
     assert cleanup_threads
     assert all(thread != event_loop_thread for thread in cleanup_threads)
+
+
+@pytest.mark.asyncio
+async def test_cache_layer_cleanup_is_serialized_and_releases_finished_tasks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    manager = FuseOverlayIsolation(replace(config.settings, isolation="fuse-overlay"))
+    manager.cache_layers.mkdir(parents=True)
+    paths = [manager.cache_layers / f"unused-{index}" for index in range(6)]
+    for path in paths:
+        path.mkdir()
+
+    active = 0
+    maximum_active = 0
+    original_rmtree = shutil.rmtree
+
+    def tracked_rmtree(path: Any, **kwargs: Any) -> None:
+        nonlocal active, maximum_active
+        active += 1
+        maximum_active = max(maximum_active, active)
+        try:
+            time.sleep(0.01)
+            original_rmtree(path, **kwargs)
+        finally:
+            active -= 1
+
+    monkeypatch.setattr(shutil, "rmtree", tracked_rmtree)
+    for path in paths:
+        manager._schedule_remove_tree(path)
+    await asyncio.gather(*tuple(manager._cleanup_tasks))
+    await asyncio.sleep(0)
+
+    assert maximum_active == 1
+    assert not manager._cleanup_tasks
+    assert not manager._deleting_layers
 
 
 @pytest.mark.asyncio

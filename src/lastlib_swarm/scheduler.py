@@ -27,7 +27,6 @@ from lastlib_swarm.corpus import (
 from lastlib_swarm.diagnostics import unexpected_lean_warnings
 from lastlib_swarm.isolation import create_isolation
 from lastlib_swarm.models import Chapter, PipelineConfig, Stage
-from lastlib_swarm.run_lock import RepositoryRunLock
 from lastlib_swarm.state import RunRecord, StateStore, TaskPhase, TaskStatus
 
 
@@ -422,22 +421,16 @@ class Orchestrator:
         self._fixup_request_lock = asyncio.Lock()
         self._fixup_runner: asyncio.Task[None] | None = None
         self._invalidated_reviews: set[str] = set()
-        self._run_lock = RepositoryRunLock(config.settings.repo)
 
     def scheduling_snapshot(self) -> dict[str, object]:
         return scheduling_snapshot(self.statement_schedule, self.proof_schedule)
 
     async def prepare(self) -> None:
-        self._run_lock.acquire()
-        try:
-            await self.state.load_or_create()
-            await self._migrate_review_green()
-            await self.executor.prepare()
-            self.scaffold()
-            await self.isolation.prepare()
-        except BaseException:
-            self._run_lock.release()
-            raise
+        await self.state.load_or_create()
+        await self._migrate_review_green()
+        await self.executor.prepare()
+        self.scaffold()
+        await self.isolation.prepare()
 
     async def shutdown(self) -> None:
         try:
@@ -446,10 +439,7 @@ class Orchestrator:
                 await asyncio.gather(self._fixup_runner, return_exceptions=True)
             await self.isolation.close()
         finally:
-            try:
-                await self.state.close()
-            finally:
-                self._run_lock.release()
+            await self.state.close()
 
     def _already_done(self, chapter: Chapter, stage: Stage) -> bool:
         return not self.force and self.state.task(chapter.id, stage).status == TaskStatus.SUCCEEDED

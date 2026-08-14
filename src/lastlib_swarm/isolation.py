@@ -355,6 +355,11 @@ class FuseOverlayIsolation:
         self._active_compaction_layers: set[Path] = set()
         self._compaction_task: asyncio.Task[None] | None = None
         self._cleanup_tasks: set[asyncio.Task[None]] = set()
+        self._cleanup_errors: list[BaseException] = []
+        # Recursive deletion walks large Lake trees and holds directory descriptors
+        # along the way. Serializing these background walks prevents obsolete cache
+        # layers from creating an unbounded system-wide FD spike.
+        self._cleanup_limiter = asyncio.Semaphore(1)
         self._deleting_layers: set[Path] = set()
         self._workspace_sequence = 0
 
@@ -659,16 +664,20 @@ class FuseOverlayIsolation:
     def _schedule_remove_tree(self, path: Path) -> None:
         if not path.exists() or path in self._deleting_layers:
             return
-        task = asyncio.create_task(asyncio.to_thread(shutil.rmtree, path))
+
+        async def remove() -> None:
+            async with self._cleanup_limiter:
+                await asyncio.to_thread(shutil.rmtree, path)
+
+        task = asyncio.create_task(remove())
         self._deleting_layers.add(path)
         self._cleanup_tasks.add(task)
 
         def finished(completed: asyncio.Task[None]) -> None:
             self._deleting_layers.discard(path)
-            # Retrieve failures immediately; close() also awaits retained tasks
-            # and propagates them to the orchestrator.
-            with suppress(BaseException):
-                completed.exception()
+            self._cleanup_tasks.discard(completed)
+            if not completed.cancelled() and (error := completed.exception()) is not None:
+                self._cleanup_errors.append(error)
 
         task.add_done_callback(finished)
 
@@ -904,6 +913,8 @@ class FuseOverlayIsolation:
                 await self._compaction_task
             if self._cleanup_tasks:
                 await asyncio.gather(*self._cleanup_tasks)
+            if self._cleanup_errors:
+                raise self._cleanup_errors[0]
         except BaseException as caught:
             error = caught
         finally:

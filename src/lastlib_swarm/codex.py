@@ -710,12 +710,10 @@ whole-file diagnostics in import order; do not prepare every file separately.
             )
             await self.state.update_run(run, pid=process.pid, log_path=str(log_path))
             if process.stdin is None or process.stdout is None:
+                await _terminate(process)
                 raise RuntimeError("failed to open Codex subprocess pipes")
             stdin = process.stdin
             stdout = process.stdout
-            stdin.write(input_text.encode())
-            await stdin.drain()
-            stdin.close()
             capacity_failure = False
 
             async def consume() -> None:
@@ -759,17 +757,26 @@ whole-file diagnostics in import order; do not prepare every file separately.
             consumer = asyncio.create_task(consume())
             timed_out = False
             try:
+                stdin.write(input_text.encode())
+                await stdin.drain()
+                stdin.close()
+                with suppress(BrokenPipeError, ConnectionResetError):
+                    await stdin.wait_closed()
                 async with asyncio.timeout(self.config.settings.agent_timeout_seconds):
                     exit_code = await _wait_for_parent_exit(process)
             except TimeoutError:
                 timed_out = True
                 await _terminate(process)
                 exit_code = 124
-            except asyncio.CancelledError:
-                await _terminate(process)
-                consumer.cancel()
-                with suppress(asyncio.CancelledError):
-                    await consumer
+            except BaseException:
+                stdin.close()
+                with suppress(BrokenPipeError, ConnectionResetError):
+                    await stdin.wait_closed()
+                with suppress(BaseException):
+                    await _terminate(process)
+                if not consumer.done():
+                    consumer.cancel()
+                await asyncio.gather(consumer, return_exceptions=True)
                 raise
             if not timed_out:
                 # Codex can exit before its MCP/LSP descendants. Reap the complete
