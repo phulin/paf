@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from leanclient.aio import LeanClientError
 
 from lastlib_swarm.lean_mcp import (
     barrier_with_dependency_refresh,
@@ -122,11 +123,15 @@ async def test_stale_diagnostic_rebuilds_and_retries_once(tmp_path: Path) -> Non
         ("open", "A.lean", False, "once"),
         ("barrier", "A.lean", None),
     ]
+    assert client._docs["A.lean"] is document
+    assert document.diagnostics == []
     assert client._docs["A.lean"].diagnostics == []
 
 
 @pytest.mark.asyncio
-async def test_failed_stale_recovery_is_not_repeated_without_new_state(tmp_path: Path) -> None:
+async def test_failed_stale_recovery_is_hidden_and_not_repeated_without_new_state(
+    tmp_path: Path,
+) -> None:
     write(tmp_path, "A.lean", "import Mathlib\n")
     client = FakeClient(tmp_path)
     document = await client.open("A.lean", wait=False, dependency_build_mode="never")
@@ -139,8 +144,10 @@ async def test_failed_stale_recovery_is_not_repeated_without_new_state(tmp_path:
             {"message": "Imports are out of date and must be rebuilt"}
         ]
 
-    await barrier_with_dependency_refresh(client, "A.lean", original=barrier)
-    await barrier_with_dependency_refresh(client, "A.lean", original=barrier)
+    with pytest.raises(LeanClientError, match="usable dependency snapshot"):
+        await barrier_with_dependency_refresh(client, "A.lean", original=barrier)
+    with pytest.raises(LeanClientError, match="usable dependency snapshot"):
+        await barrier_with_dependency_refresh(client, "A.lean", original=barrier)
 
     assert [event for event in client.events if event[0] == "open"] == [
         ("open", "A.lean", False, "once")
@@ -158,7 +165,8 @@ async def test_failed_stale_recovery_is_not_repeated_without_new_state(tmp_path:
         },
         original=publish,
     )
-    await barrier_with_dependency_refresh(client, "A.lean", original=barrier)
+    with pytest.raises(LeanClientError, match="usable dependency snapshot"):
+        await barrier_with_dependency_refresh(client, "A.lean", original=barrier)
     assert [event for event in client.events if event[0] == "open"] == [
         ("open", "A.lean", False, "once"),
         ("open", "A.lean", False, "once"),

@@ -11,7 +11,7 @@ from weakref import WeakKeyDictionary
 from lean_lsp_mcp import main as upstream_main
 from lean_lsp_mcp import server
 from lean_lsp_mcp.client_utils import open_synced
-from leanclient.aio import AsyncLeanLSPClient
+from leanclient.aio import AsyncLeanLSPClient, LeanClientError
 from mcp.server.fastmcp import Context
 from mcp.types import ToolAnnotations
 
@@ -24,6 +24,7 @@ _ORIGINAL_BARRIER = AsyncLeanLSPClient.barrier
 _ORIGINAL_NOTIFICATION = AsyncLeanLSPClient._on_notification
 
 _DEPENDENCY_LOCKS: WeakKeyDictionary[Any, asyncio.Lock] = WeakKeyDictionary()
+_DOCUMENT_LOCKS: WeakKeyDictionary[Any, dict[str, asyncio.Lock]] = WeakKeyDictionary()
 _BUILD_GENERATIONS: WeakKeyDictionary[Any, int] = WeakKeyDictionary()
 _STALE_EPOCHS: WeakKeyDictionary[Any, dict[str, int]] = WeakKeyDictionary()
 _REFRESH_ATTEMPTS: WeakKeyDictionary[Any, dict[str, tuple[str, int, int]]] = WeakKeyDictionary()
@@ -41,6 +42,15 @@ def _client_lock(client: Any) -> asyncio.Lock:
     if lock is None:
         lock = asyncio.Lock()
         _DEPENDENCY_LOCKS[client] = lock
+    return lock
+
+
+def _document_lock(client: Any, path: str) -> asyncio.Lock:
+    locks = _DOCUMENT_LOCKS.setdefault(client, {})
+    lock = locks.get(path)
+    if lock is None:
+        lock = asyncio.Lock()
+        locks[path] = lock
     return lock
 
 
@@ -74,6 +84,33 @@ def _has_stale_diagnostic(document: Any) -> bool:
 
 def _needs_dependency_refresh(document: Any) -> bool:
     return bool(document.stale_imports or _has_stale_diagnostic(document))
+
+
+def _require_fresh_dependencies(document: Any, path: str) -> Any:
+    if _needs_dependency_refresh(document):
+        raise LeanClientError(
+            f"Lean could not prepare a usable dependency snapshot for {path}."
+        )
+    return document
+
+
+def _preserve_document_identity(client: Any, path: str, previous: Any, current: Any) -> Any:
+    """Move reopened state onto the object already held by an in-flight query."""
+
+    if previous is current:
+        return current
+    current_state = vars(current).copy()
+    previous_uri = previous.uri
+    current_uri = current.uri
+    vars(previous).clear()
+    vars(previous).update(current_state)
+    client._docs[path] = previous
+    for uri in {previous_uri, current_uri}:
+        mapped = client._docs_by_uri.get(uri)
+        if mapped is previous or mapped is current:
+            client._docs_by_uri.pop(uri, None)
+    client._docs_by_uri[previous.uri] = previous
+    return previous
 
 
 def record_stale_dependency(
@@ -113,9 +150,12 @@ async def _open_and_finish_dependency_setup(
     *,
     original_barrier: Barrier,
 ) -> Any:
+    previous = self._docs.get(path)
     await self.close_file(path)
     document = await self.open(path, wait=False, dependency_build_mode=mode)
     await original_barrier(self, path, timeout)
+    if previous is not None:
+        document = _preserve_document_identity(self, path, previous, document)
     return document
 
 
@@ -148,7 +188,7 @@ async def _refresh_dependencies(
         attempt_key = (_source_digest(disk), epoch, generation)
         attempts = _REFRESH_ATTEMPTS.setdefault(self, {})
         if not header_changed and attempts.get(path) == attempt_key:
-            return document
+            return _require_fresh_dependencies(document, path)
 
         # A dependency preparation that completed while this request waited may
         # already have repaired the cache. Reopen without a build first in that
@@ -175,7 +215,7 @@ async def _refresh_dependencies(
             generation += 1
             _BUILD_GENERATIONS[self] = generation
         attempts[path] = (_source_digest(document.text), _stale_epoch(self, path), generation)
-        return document
+        return _require_fresh_dependencies(document, path)
 
 
 async def reload_with_dependencies_when_stale(
@@ -195,14 +235,15 @@ async def reload_with_dependencies_when_stale(
     disk = (Path(self.project_path) / path).read_text(encoding="utf-8")
     header_changed = disk != document.text and _imports(disk) != _imports(document.text)
     if header_changed or _needs_dependency_refresh(document):
-        return await _refresh_dependencies(
-            self,
-            path,
-            observed_generation=_build_generation(self),
-            timeout=None,
-            force_for_header_change=header_changed,
-            original_barrier=original_barrier,
-        )
+        async with _document_lock(self, path):
+            return await _refresh_dependencies(
+                self,
+                path,
+                observed_generation=_build_generation(self),
+                timeout=None,
+                force_for_header_change=header_changed,
+                original_barrier=original_barrier,
+            )
     return await original(self, path, wait)
 
 
@@ -215,18 +256,19 @@ async def barrier_with_dependency_refresh(
 ) -> None:
     """Wait for fresh results, then repair and retry stale imports once."""
 
-    observed_generation = _build_generation(self)
-    await original(self, path, timeout)
-    document = self._docs.get(path)
-    if document is None or not _needs_dependency_refresh(document):
-        return
-    await _refresh_dependencies(
-        self,
-        path,
-        observed_generation=observed_generation,
-        timeout=timeout,
-        original_barrier=original,
-    )
+    async with _document_lock(self, path):
+        observed_generation = _build_generation(self)
+        await original(self, path, timeout)
+        document = self._docs.get(path)
+        if document is None or not _needs_dependency_refresh(document):
+            return
+        await _refresh_dependencies(
+            self,
+            path,
+            observed_generation=observed_generation,
+            timeout=timeout,
+            original_barrier=original,
+        )
 
 
 # Preserve the earlier adapter name for downstream imports.
