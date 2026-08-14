@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from lastlib_swarm import json_codec as json
+from lastlib_swarm.activity import EVENT_TIMESTAMP_FIELD, activity_timestamp
 from lastlib_swarm.diagnostics import unexpected_lean_warnings
 from lastlib_swarm.models import Chapter, PipelineConfig, Stage
 from lastlib_swarm.state import RunRecord, StateStore, TaskStatus, TokenUsage
@@ -724,13 +725,20 @@ whole-file diagnostics in import order; do not prepare every file separately.
                 with log_path.open(mode, buffering=0) as log:
                     pending = bytearray()
 
-                    async def consume_line(line: bytes) -> None:
+                    async def consume_line(line: bytes, *, terminated: bool = True) -> None:
                         nonlocal usage, report, thread_id, usage_monitor, capacity_failure
                         try:
                             event = json.loads(line)
                         except (json.JSONDecodeError, UnicodeDecodeError):
+                            log.write(line + (b"\n" if terminated else b""))
                             return
-                        activity.consume(event, workspace_root=root)
+                        received_at = activity_timestamp()
+                        if isinstance(event, dict):
+                            event = {**event, EVENT_TIMESTAMP_FIELD: received_at}
+                            log.write(json.dumpb(event) + b"\n")
+                        else:
+                            log.write(line + (b"\n" if terminated else b""))
+                        activity.consume(event, workspace_root=root, at=received_at)
                         self.state.activities.save_throttled(activity)
                         capacity_failure = capacity_failure or _is_capacity_failure(event)
                         if found := _find_thread_id(event):
@@ -750,11 +758,10 @@ whole-file diagnostics in import order; do not prepare every file separately.
                     # the child when one such JSONL record exceeds it. Frame records from
                     # fixed-size chunks instead, without imposing an artificial line cap.
                     while chunk := await stdout.read(64 * 1024):
-                        log.write(chunk)
                         for line in _complete_lines(pending, chunk):
                             await consume_line(line)
                     if pending:
-                        await consume_line(bytes(pending))
+                        await consume_line(bytes(pending), terminated=False)
 
             consumer = asyncio.create_task(consume())
             timed_out = False

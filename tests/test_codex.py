@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 import lastlib_swarm.codex as codex_module
+from lastlib_swarm.activity import EVENT_TIMESTAMP_FIELD
 from lastlib_swarm.codex import (
     REPORT_SCHEMA,
     REVIEW_SOURCE_BUNDLE_MAX_CHARS,
@@ -614,7 +615,17 @@ async def test_validation_streams_build_output(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_executor_consumes_jsonl_report_and_usage(tmp_path: Path) -> None:
+async def test_executor_consumes_jsonl_report_and_usage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    event_times = iter(
+        [
+            "2026-08-14T10:00:00+00:00",
+            "2026-08-14T10:00:01+00:00",
+            "2026-08-14T10:00:02+00:00",
+        ]
+    )
+    monkeypatch.setattr(codex_module, "activity_timestamp", lambda: next(event_times))
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
     fake_codex = tmp_path / "fake-codex"
     fake_codex.write_text(
@@ -652,6 +663,24 @@ print(json.dumps({"type": "item.completed", "item": {
     assert activity is not None
     assert activity.current == "agent succeeded"
     assert json.loads(activity.latest_summary)["summary"] == "done"
+    log_path = state.logs_dir / f"{run.id}.jsonl"
+    logged_events = [json.loads(line) for line in log_path.read_text().splitlines()]
+    recorded_at = [event[EVENT_TIMESTAMP_FIELD] for event in logged_events]
+    assert recorded_at == [
+        "2026-08-14T10:00:00+00:00",
+        "2026-08-14T10:00:01+00:00",
+        "2026-08-14T10:00:02+00:00",
+    ]
+    replayed = state.activities.replay(
+        run.id,
+        run.chapter_id,
+        Stage.REVIEW.value,
+        log_path,
+        workspace_root=tmp_path,
+        cache=False,
+    )
+    assert replayed is not None
+    assert [entry.at for entry in replayed.recent] == recorded_at
 
 
 @pytest.mark.asyncio

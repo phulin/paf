@@ -14,6 +14,7 @@ from lastlib_swarm import json_codec as json
 MAX_RECENT_EVENTS = 80
 MAX_DETAIL_CHARS = 800
 MAX_MCP_SUMMARY_CHARS = 500
+EVENT_TIMESTAMP_FIELD = "_lastlib_received_at"
 LEAN_MCP_TITLES = {
     "lean_prepare_dependencies": "Lean deps",
     "lean_diagnostic_messages": "Lean diagnostics",
@@ -471,10 +472,11 @@ class AgentActivity:
         title: str,
         detail: str = "",
         *,
+        at: str | None = None,
         preserve_detail_layout: bool = False,
     ) -> None:
         self.sequence += 1
-        self.updated_at = activity_timestamp()
+        self.updated_at = at or activity_timestamp()
         self.recent.append(
             ActivityEntry(
                 sequence=self.sequence,
@@ -497,18 +499,20 @@ class AgentActivity:
             self.current = "thinking / preparing the next action"
             self.current_kind = "agent"
 
-    def consume(self, event: Any, *, workspace_root: Path) -> None:
+    def consume(self, event: Any, *, workspace_root: Path, at: str | None = None) -> None:
         if not isinstance(event, dict):
             return
+        if at is None and isinstance(event.get(EVENT_TIMESTAMP_FIELD), str):
+            at = event[EVENT_TIMESTAMP_FIELD]
         event_type = event.get("type")
         if event_type == "thread.started":
             self.current = "Codex thread started"
-            self._append("agent", "started", self.current)
+            self._append("agent", "started", self.current, at=at)
             return
         if event_type == "turn.started":
             self.current = "reasoning"
             self.current_kind = "agent"
-            self._append("agent", "started", "turn started")
+            self._append("agent", "started", "turn started", at=at)
             return
         if event_type == "turn.completed":
             usage = event.get("usage")
@@ -517,7 +521,7 @@ class AgentActivity:
                 input_tokens = int(usage.get("input_tokens", 0))
                 output_tokens = int(usage.get("output_tokens", 0))
                 detail = f"{input_tokens + output_tokens:,} tokens"
-            self._append("usage", "completed", "turn completed", detail)
+            self._append("usage", "completed", "turn completed", detail, at=at)
             self._set_current()
             return
 
@@ -533,13 +537,13 @@ class AgentActivity:
             if isinstance(items, list):
                 self.todos = [value for value in items if isinstance(value, dict)]
             done, total = self.todo_progress
-            self._append("todo", "updated", f"plan updated ({done}/{total} complete)")
+            self._append("todo", "updated", f"plan updated ({done}/{total} complete)", at=at)
             return
 
         if item_type == "agent_message":
             text = item.get("text")
             self.latest_summary = text.strip() if isinstance(text, str) else ""
-            self._append("message", "completed", "agent update", self.latest_summary)
+            self._append("message", "completed", "agent update", self.latest_summary, at=at)
             self._set_current()
             return
 
@@ -553,6 +557,7 @@ class AgentActivity:
                 "started",
                 title,
                 detail,
+                at=at,
                 preserve_detail_layout=item_type == "mcp_tool_call" and bool(detail),
             )
             return
@@ -615,6 +620,7 @@ class AgentActivity:
             result_status,
             completed_title,
             detail,
+            at=at,
             preserve_detail_layout=item_type == "mcp_tool_call" and bool(result_detail),
         )
         self._set_current()
@@ -748,6 +754,7 @@ class ActivityStore:
     ) -> AgentActivity | None:
         if not log_path.is_file():
             return None
+        persisted = self.get(run_id)
         activity = AgentActivity(
             run_id=run_id,
             chapter_id=chapter_id,
@@ -761,9 +768,35 @@ class ActivityStore:
                 except (json.JSONDecodeError, UnicodeDecodeError):
                     continue
                 activity.consume(event, workspace_root=workspace_root)
+        if persisted is not None:
+            self._restore_persisted_timestamps(activity, persisted)
         if cache:
             self._cache[run_id] = activity
         return activity
+
+    @staticmethod
+    def _restore_persisted_timestamps(replayed: AgentActivity, persisted: AgentActivity) -> None:
+        """Recover timestamps for legacy JSONL events from the compact sidecar."""
+
+        def signature(entry: ActivityEntry) -> tuple[str, str, str, str]:
+            return entry.kind, entry.status, entry.title, entry.detail
+
+        replay_index = len(replayed.recent) - 1
+        for known in reversed(persisted.recent):
+            match = next(
+                (
+                    index
+                    for index in range(replay_index, -1, -1)
+                    if signature(replayed.recent[index]) == signature(known)
+                ),
+                None,
+            )
+            if match is None:
+                continue
+            replayed.recent[match].at = known.at
+            replay_index = match - 1
+        if replayed.recent:
+            replayed.updated_at = replayed.recent[-1].at
 
 
 def systemic_errors(activities: list[AgentActivity]) -> list[tuple[int, str]]:

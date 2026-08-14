@@ -5,6 +5,7 @@ import pytest
 
 import lastlib_swarm.activity as activity_module
 from lastlib_swarm.activity import (
+    EVENT_TIMESTAMP_FIELD,
     ActivityStore,
     AgentActivity,
     shorten_book_paths,
@@ -86,6 +87,77 @@ def test_activity_replay_can_retain_a_full_timeline_without_replacing_cache(
     assert bounded is not None
     assert len(bounded.recent) == 25
     assert bounded.recent[0].sequence == 76
+
+
+def test_activity_replay_preserves_recorded_event_timestamps(tmp_path: Path) -> None:
+    store = ActivityStore(tmp_path / "logs")
+    log_path = store.logs_dir / "run.jsonl"
+    recorded_at = [
+        "2026-08-14T10:00:00+00:00",
+        "2026-08-14T10:07:30+00:00",
+    ]
+    events = [
+        {"type": "turn.started", EVENT_TIMESTAMP_FIELD: recorded_at[0]},
+        {
+            "type": "item.completed",
+            "item": {"id": "message", "type": "agent_message", "text": "still working"},
+            EVENT_TIMESTAMP_FIELD: recorded_at[1],
+        },
+    ]
+    log_path.parent.mkdir(parents=True)
+    log_path.write_text(
+        "".join(json.dumps(event) + "\n" for event in events),
+        encoding="utf-8",
+    )
+
+    replayed = store.replay(
+        "run",
+        "chapter",
+        "formalize",
+        log_path,
+        workspace_root=tmp_path,
+        cache=False,
+    )
+
+    assert replayed is not None
+    assert [entry.at for entry in replayed.recent] == recorded_at
+    assert replayed.updated_at == recorded_at[-1]
+
+
+def test_activity_replay_recovers_legacy_timestamps_from_sidecar(tmp_path: Path) -> None:
+    store = ActivityStore(tmp_path / "logs")
+    activity = store.start("run", "chapter", "formalize")
+    events = [
+        {"type": "turn.started"},
+        {
+            "type": "item.completed",
+            "item": {"id": "message", "type": "agent_message", "text": "still working"},
+        },
+    ]
+    recorded_at = [
+        "2026-08-14T10:00:00+00:00",
+        "2026-08-14T10:07:30+00:00",
+    ]
+    for event, at in zip(events, recorded_at, strict=True):
+        activity.consume(event, workspace_root=tmp_path, at=at)
+    store.save(activity)
+    log_path = store.logs_dir / "run.jsonl"
+    log_path.write_text(
+        "".join(json.dumps(event) + "\n" for event in events),
+        encoding="utf-8",
+    )
+
+    replayed = ActivityStore(store.logs_dir).replay(
+        "run",
+        "chapter",
+        "formalize",
+        log_path,
+        workspace_root=tmp_path,
+        cache=False,
+    )
+
+    assert replayed is not None
+    assert [entry.at for entry in replayed.recent] == recorded_at
 
 
 def test_shortens_book_path_in_long_lake_trace() -> None:
