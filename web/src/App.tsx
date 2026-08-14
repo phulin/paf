@@ -68,6 +68,20 @@ const DECLARATION_KINDS: DeclarationKind[] = [
   "class",
   "instance",
 ];
+const CORPUS_QUERY_PARAM = "corpus";
+
+function corpusFromUrl(): string | null {
+  return new URL(window.location.href).searchParams.get(CORPUS_QUERY_PARAM);
+}
+
+function setCorpusUrl(corpus: string, mode: "push" | "replace"): void {
+  const url = new URL(window.location.href);
+  url.searchParams.set(CORPUS_QUERY_PARAM, corpus);
+  const next = `${url.pathname}${url.search}${url.hash}`;
+  const historyState = { ...(window.history.state ?? {}), corpus };
+  if (mode === "push") window.history.pushState(historyState, "", next);
+  else window.history.replaceState(historyState, "", next);
+}
 
 function formatNumber(value: number): string {
   if (!Number.isFinite(value)) return "—";
@@ -114,7 +128,7 @@ function useSwarmState(live: boolean) {
   const [state, setState] = useState<SwarmState>(demoState);
   const [swarms, setSwarms] = useState<SwarmSummary[]>([]);
   const [selectedSwarm, setSelectedSwarm] = useState<string | null>(() =>
-    window.localStorage.getItem("lastlib.selectedSwarm"),
+    corpusFromUrl() ?? window.localStorage.getItem("lastlib.selectedSwarm"),
   );
   const [connected, setConnected] = useState(false);
   const [fetching, setFetching] = useState(true);
@@ -130,6 +144,10 @@ function useSwarmState(live: boolean) {
         ? selectedSwarm
         : list.find((swarm) => swarm.active)?.id ?? list[0]?.id ?? null;
       if (target !== selectedSwarm) setSelectedSwarm(target);
+      if (target) {
+        window.localStorage.setItem("lastlib.selectedSwarm", target);
+        if (corpusFromUrl() !== target) setCorpusUrl(target, "replace");
+      }
       const params = target ? `?swarm=${encodeURIComponent(target)}` : "";
       const response = await fetch(`/api/swarm${params}`, { cache: "no-store" });
       if (!response.ok) throw new Error(`state endpoint returned ${response.status}`);
@@ -143,8 +161,20 @@ function useSwarmState(live: boolean) {
   }, [selectedSwarm]);
 
   const selectSwarm = useCallback((swarmId: string) => {
+    if (swarmId === selectedSwarm) return;
     window.localStorage.setItem("lastlib.selectedSwarm", swarmId);
+    setCorpusUrl(swarmId, "push");
     setSelectedSwarm(swarmId);
+  }, [selectedSwarm]);
+
+  useEffect(() => {
+    const restoreCorpus = () => {
+      const corpus = corpusFromUrl();
+      if (corpus) window.localStorage.setItem("lastlib.selectedSwarm", corpus);
+      setSelectedSwarm(corpus);
+    };
+    window.addEventListener("popstate", restoreCorpus);
+    return () => window.removeEventListener("popstate", restoreCorpus);
   }, []);
 
   useEffect(() => {
@@ -1175,8 +1205,16 @@ export default function App() {
 
   const navigate = (next: View) => {
     setView(next);
-    window.history.replaceState(null, "", next === "statements" ? "#statements" : window.location.pathname);
+    const url = new URL(window.location.href);
+    url.hash = next === "statements" ? "statements" : "";
+    window.history.replaceState(window.history.state, "", `${url.pathname}${url.search}${url.hash}`);
   };
+
+  useEffect(() => {
+    const restoreView = () => setView(window.location.hash === "#statements" ? "statements" : "overview");
+    window.addEventListener("popstate", restoreView);
+    return () => window.removeEventListener("popstate", restoreView);
+  }, []);
 
   useEffect(() => {
     const openSearch = (event: KeyboardEvent) => {
