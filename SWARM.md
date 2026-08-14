@@ -38,9 +38,11 @@ one optimistic Lake invocation. Lake schedules those targets against the Lean im
 build publishes every selected certificate and skips fixup agents entirely. Otherwise the
 coordinator routes diagnostics to their owning chapters and fixes the dependency-ready owners with
 Lean MCP concurrently. As soon as an agent finishes, the coordinator merges it, rescans imports,
-and rebuilds it once its refined predecessors are clean; unrelated agents keep running and a
-successful repair build immediately releases its review while fixup continues on other
-dependency-ready chapters.
+and rebuilds it once its refined predecessors are clean. After a partially failing grouped build,
+the coordinator batches the remaining dependency-ready chapters into subsequent Lake invocations
+instead of verifying them one by one; unrelated agents keep running and a successful repair build
+immediately releases its review while fixup continues on other dependency-ready chapters. The final
+stable verification is likewise one grouped Lake invocation.
 A review starts once its own fixup is clean and all of its observed dependencies have been reviewed;
 there is no corpus-wide barrier between fixup and review. The coordinator remembers the source and
 dependency digests of successful builds so it can avoid rebuilding unchanged chapters. Review has

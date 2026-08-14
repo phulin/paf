@@ -807,6 +807,53 @@ async def test_optimistic_build_skips_chapters_with_reusable_clean_builds(
 
 
 @pytest.mark.asyncio
+async def test_partial_optimistic_failure_batches_remaining_topological_builds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = write_project(tmp_path, chapters="chapters = [1, 2, 3]")
+    with (tmp_path / "books" / "book.md").open("a", encoding="utf-8") as source:
+        source.write("\n## 3. Third chapter\n")
+    config = with_lastlib_modules(load_config(project))
+    first, second, third = config.chapters
+    orchestrator = Orchestrator(config, StateStore(config))
+    await orchestrator.prepare()
+    orchestrator.executor = FakeExecutor(orchestrator.state, [result(changed=False)])
+    commands: list[str] = []
+
+    async def validation(
+        _config: object,
+        chapter: Chapter,
+        **_kwargs: object,
+    ) -> ValidationResult:
+        commands.append(chapter.build_command)
+        if len(commands) == 1:
+            return ValidationResult(
+                False,
+                1,
+                "error: Book/Chapter01/Section.lean:1:1: broken",
+            )
+        return ValidationResult(True, 0, "ok")
+
+    monkeypatch.setattr(scheduler_module, "validate", validation)
+
+    assert await orchestrator.run_stage(Stage.FIXUP)
+
+    def target(chapter: Chapter) -> str:
+        return chapter.build_command.rpartition(" ")[2]
+
+    assert commands == [
+        f"cd lean && lake build {target(first)} {target(second)} {target(third)}",
+        f"cd lean && lake build {target(first)}",
+        f"cd lean && lake build {target(second)} {target(third)}",
+        f"cd lean && lake build {target(first)} {target(second)} {target(third)}",
+    ]
+    assert orchestrator.state.task(first.id, Stage.FIXUP).rounds == 1
+    assert orchestrator.state.task(second.id, Stage.FIXUP).rounds == 0
+    assert orchestrator.state.task(third.id, Stage.FIXUP).rounds == 0
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_post_review_fixup_request_is_migrated_back_to_review(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
     chapter = config.chapters[0]

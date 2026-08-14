@@ -1470,29 +1470,31 @@ class Orchestrator:
             )
             merge_feedback({handle.chapter.id: detail})
 
-        async def build_chapter(
-            chapter_id: str,
+        async def build_chapters(
+            chapter_ids: Iterable[str],
             graph: ChapterImportGraph,
             *,
             mode: str = "topological",
         ) -> bool:
             nonlocal build_generation, clean
-            chapter = by_id[chapter_id]
+            ids = tuple(chapter_ids)
+            if not ids:
+                return True
+            chapters = tuple(by_id[chapter_id] for chapter_id in ids)
             snapshots: dict[str, ValidatedBuildSnapshot] = {}
-            result = (
-                await self._build_chapters(
-                    (chapter,),
-                    publish_if_clean=True,
-                    mode=mode,
-                    iteration=min(attempts[chapter_id] + 1, maximum),
-                    maximum_iterations=maximum,
-                    stage=Stage.FIXUP,
-                    priority=100.0,
-                    snapshots=snapshots,
-                )
-            )[chapter_id]
-            if result.succeeded:
-                published = await self._publish_validated_build(chapter, snapshots[chapter_id])
+            results = await self._build_chapters(
+                chapters,
+                publish_if_clean=True,
+                mode=mode,
+                iteration=min(max(attempts[chapter_id] for chapter_id in ids) + 1, maximum),
+                maximum_iterations=maximum,
+                stage=Stage.FIXUP,
+                priority=100.0,
+                snapshots=snapshots,
+                combine_targets=True,
+            )
+            if all(result.succeeded for result in results.values()):
+                published = await self._publish_validated_builds(snapshots)
                 if not published:
                     merge_feedback(
                         {
@@ -1500,6 +1502,7 @@ class Orchestrator:
                                 "The source scope changed after its coordinator build; "
                                 "rebuild the fresh generation."
                             )
+                            for chapter_id in ids
                         }
                     )
                     return False
@@ -1507,9 +1510,9 @@ class Orchestrator:
                 records = persisted if isinstance(persisted, dict) else {}
                 clean = self._retain_fixup_clean(self._observed_chapter_graph(), records)
                 build_generation = int(self.state.fixup_graph.get("build_generation", 0))
-                invalidated_clean.discard(chapter_id)
-                await self.state.set_task(
-                    chapter_id,
+                invalidated_clean.difference_update(ids)
+                await self.state.set_tasks(
+                    ids,
                     Stage.FIXUP,
                     TaskStatus.SUCCEEDED,
                     "clean coordinator build against observed imports",
@@ -1518,13 +1521,13 @@ class Orchestrator:
                     progress_event.set()
                 return True
 
-            diagnostics = self._build_feedback({chapter_id: result}).actionable
+            diagnostics = self._build_feedback(results).actionable
             merge_feedback(diagnostics)
             invalidated_clean.update(
                 self._invalidate_fixup_descendants(
                     graph,
                     clean,
-                    diagnostics or (chapter_id,),
+                    diagnostics or ids,
                 )
             )
             await self._save_fixup_graph(
@@ -1534,6 +1537,14 @@ class Orchestrator:
                 invalidated=invalidated_clean,
             )
             return False
+
+        async def build_chapter(
+            chapter_id: str,
+            graph: ChapterImportGraph,
+            *,
+            mode: str = "topological",
+        ) -> bool:
+            return await build_chapters((chapter_id,), graph, mode=mode)
 
         async def start_actionable_fixups(graph: ChapterImportGraph) -> None:
             """Fill free agent slots from the dependency-ready feedback frontier."""
@@ -1785,6 +1796,7 @@ class Orchestrator:
                         iteration=1,
                         maximum_iterations=1,
                         snapshots=snapshots,
+                        combine_targets=True,
                     )
                     verified = self._observed_chapter_graph()
                     clean = self._retain_fixup_clean(verified, clean)
@@ -1839,7 +1851,7 @@ class Orchestrator:
                     and (not targeted or chapter_id in needed)
                 ]
                 if buildable:
-                    await build_chapter(buildable[0], graph)
+                    await build_chapters(buildable, graph)
                     continue
 
                 if running:
