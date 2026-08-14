@@ -104,6 +104,7 @@ USAGE_POLL_SECONDS = 1.0
 ROLLOUT_READ_BYTES = 1024 * 1024
 PROCESS_GROUP_GRACE_SECONDS = 1.0
 COMMON_PROMPT_PATH = Path(__file__).with_name("prompts") / "common.md"
+PROOF_REVIEW_PROMPT_PATH = Path(__file__).with_name("prompts") / "proof_review.md"
 CAPACITY_RESUME_PROMPT = "Continue from the interrupted turn and complete the assigned task."
 REVIEW_SOURCE_BUNDLE_MAX_CHARS = 500_000
 
@@ -460,7 +461,12 @@ class CodexExecutor:
         feedback: str = "",
         workspace_root: Path | None = None,
     ) -> str:
-        template = self.config.stages[stage].prompt.read_text(encoding="utf-8")
+        prompt_path = (
+            PROOF_REVIEW_PROMPT_PATH
+            if stage is Stage.REVIEW and feedback
+            else self.config.stages[stage].prompt
+        )
+        template = prompt_path.read_text(encoding="utf-8")
         base = render_prompt(template, chapter)
         common = render_prompt(COMMON_PROMPT_PATH.read_text(encoding="utf-8"), chapter)
         scope = "\n".join(f"- `{item}`" for item in chapter.scope)
@@ -487,8 +493,10 @@ loop.""",
 findings appended to this prompt. This attempt is dependency-ready and may run beside unrelated
 fixups. As soon as it finishes, the coordinator merges it, rescans observed imports, and rebuilds it
 when its refined predecessors are clean; unrelated agents continue running.""",
-            Stage.REVIEW: """Audit the assigned chapter and directly make every warranted in-scope
-statement or API change. Preserve proof placeholders and do not spend time proving propositions.
+            Stage.REVIEW: """Audit and directly make every warranted in-scope statement or API
+change across the entire assigned chapter. When proof findings are attached, independently evaluate
+each one while still re-reviewing the complete scope. Preserve proof placeholders and do not spend
+time proving propositions.
 The coordinator has certified the incoming sources and dependencies clean except for permitted
 `sorry` warnings. The coordinator merges the scoped patch, then rebuilds it and sends compiler-only
 failures through the dependency-ordered fixup scheduler.""",
@@ -587,7 +595,7 @@ whole-file diagnostics in import order; do not prepare every file separately.
             feedback_heading = {
                 Stage.FORMALIZE: "Coordinator feedback",
                 Stage.FIXUP: "Coordinator diagnostics and routed findings",
-                Stage.REVIEW: "Coordinator feedback",
+                Stage.REVIEW: "Failed proof findings to evaluate",
                 Stage.PROVE: "Cumulative proof-attempt ledger",
             }[stage]
             contract += (

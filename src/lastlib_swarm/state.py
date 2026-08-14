@@ -215,6 +215,7 @@ class StateStore:
         self.scheduling: dict[str, Any] = {}
         self.fixup_graph: dict[str, Any] = {}
         self.fixup_requests: dict[str, dict[str, Any]] = {}
+        self.proof_review_requests: dict[str, dict[str, Any]] = {}
         self.isolation: dict[str, Any] = {}
         self.coordinator_build = CoordinatorBuildRecord()
         self.created_at = timestamp()
@@ -240,6 +241,13 @@ class StateStore:
                 self.fixup_requests = {
                     request_id: dict(value)
                     for request_id, value in raw_fixup_requests.items()
+                    if isinstance(request_id, str) and isinstance(value, dict)
+                }
+            raw_proof_review_requests = raw.get("proof_review_requests")
+            if isinstance(raw_proof_review_requests, dict):
+                self.proof_review_requests = {
+                    request_id: dict(value)
+                    for request_id, value in raw_proof_review_requests.items()
                     if isinstance(request_id, str) and isinstance(value, dict)
                 }
             if not self.isolation and isinstance(raw.get("isolation"), dict):
@@ -425,6 +433,7 @@ class StateStore:
             "scheduling": self.scheduling,
             "fixup_graph": self.fixup_graph,
             "fixup_requests": self.fixup_requests,
+            "proof_review_requests": self.proof_review_requests,
             "isolation": self.isolation,
             "coordinator_build": self._build_dict(self.coordinator_build),
             "tasks": {
@@ -530,6 +539,51 @@ class StateStore:
         changed = False
         for request_id in request_ids:
             changed = self.fixup_requests.pop(request_id, None) is not None or changed
+        if changed:
+            self._mark_dirty()
+            await self._persist()
+
+    async def enqueue_proof_review_request(
+        self,
+        feedback: dict[str, str],
+        *,
+        origin_run_id: str,
+        request_id: str | None = None,
+    ) -> tuple[str, bool]:
+        """Persist proof findings before invalidating their review closure."""
+
+        for existing_id, value in self.proof_review_requests.items():
+            if value.get("origin_run_id") == origin_run_id:
+                return existing_id, False
+        request_id = request_id or uuid4().hex[:12]
+        self.proof_review_requests[request_id] = {
+            "feedback": dict(feedback),
+            "origin_run_id": origin_run_id,
+            "created_at": timestamp(),
+        }
+        self._mark_dirty()
+        await self._persist()
+        return request_id, True
+
+    async def finish_proof_review_requests(
+        self,
+        chapter_id: str,
+        request_ids: Iterable[str],
+    ) -> None:
+        """Acknowledge only the findings consumed by one successful review."""
+
+        changed = False
+        for request_id in request_ids:
+            value = self.proof_review_requests.get(request_id)
+            if not isinstance(value, dict):
+                continue
+            feedback = value.get("feedback")
+            if not isinstance(feedback, dict) or chapter_id not in feedback:
+                continue
+            feedback.pop(chapter_id, None)
+            changed = True
+            if not feedback:
+                self.proof_review_requests.pop(request_id, None)
         if changed:
             self._mark_dirty()
             await self._persist()

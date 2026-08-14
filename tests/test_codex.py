@@ -479,6 +479,24 @@ def test_review_prompt_starts_with_book_scoped_files_and_line_numbers(tmp_path: 
     assert "Line-numbered review source set" not in prove_prompt
 
 
+def test_failed_proof_feedback_selects_full_scope_review_prompt(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    executor = CodexExecutor(config, StateStore(config))
+
+    prompt = executor.build_prompt(
+        config.chapters[0],
+        Stage.REVIEW,
+        feedback="the statement may need another hypothesis",
+    )
+    normalized_prompt = " ".join(prompt.split())
+
+    assert "Proof-triggered statement review and repair" in prompt
+    assert "re-review the entire assigned source scope" in normalized_prompt.lower()
+    assert "do not assume a reported finding is correct" in normalized_prompt
+    assert "Failed proof findings to evaluate" in prompt
+    assert "the statement may need another hypothesis" in prompt
+
+
 def test_review_source_bundle_is_capped_at_500k_characters(tmp_path: Path) -> None:
     assert REVIEW_SOURCE_BUNDLE_MAX_CHARS == 500_000
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))

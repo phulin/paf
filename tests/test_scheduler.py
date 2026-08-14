@@ -236,6 +236,37 @@ async def test_state_persists_fixup_graph(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_proof_review_requests_persist_and_acknowledge_exact_findings(
+    tmp_path: Path,
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = config.chapters[0]
+    state = StateStore(config)
+    await state.load_or_create()
+    first_id, first_created = await state.enqueue_proof_review_request(
+        {chapter.id: "first failed-proof finding"},
+        origin_run_id="proof-one",
+    )
+    second_id, second_created = await state.enqueue_proof_review_request(
+        {chapter.id: "new finding that arrived during review"},
+        origin_run_id="proof-two",
+    )
+    assert first_created and second_created
+    await state.finish_proof_review_requests(chapter.id, (first_id,))
+    await state.close()
+
+    reloaded = StateStore(config)
+    await reloaded.load_or_create()
+
+    assert first_id not in reloaded.proof_review_requests
+    assert second_id in reloaded.proof_review_requests
+    assert reloaded.proof_review_requests[second_id]["feedback"] == {
+        chapter.id: "new finding that arrived during review"
+    }
+    await reloaded.close()
+
+
+@pytest.mark.asyncio
 async def test_state_persists_durable_review_green(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
     chapter = config.chapters[0]
@@ -823,8 +854,8 @@ async def test_interrupted_fixup_request_is_restored_from_state(
 
 
 @pytest.mark.asyncio
-async def test_unqueued_proof_finding_is_recovered_from_run_history(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+async def test_unqueued_proof_finding_is_recovered_as_durable_review(
+    tmp_path: Path,
 ) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
     chapter = config.chapters[0]
@@ -849,25 +880,14 @@ async def test_unqueued_proof_finding_is_recovered_from_run_history(
     recovered = StateStore(config)
     orchestrator = Orchestrator(config, recovered)
     await orchestrator.prepare()
-    calls: list[dict[str, str] | None] = []
+    await orchestrator._recover_proof_review_requests()
 
-    async def fixup(
-        feedback: dict[str, str] | None = None,
-        *,
-        target_ids: object = None,
-    ) -> bool:
-        calls.append(feedback)
-        assert target_ids == {chapter.id}
-        return True
-
-    monkeypatch.setattr(orchestrator, "_fixup_to_clean", fixup)
-    futures = await orchestrator._recover_fixup_requests()
-
-    assert all(await asyncio.gather(*futures))
-    assert len(calls) == 1
-    assert calls[0] is not None
-    assert "missing scalar tower" in calls[0][chapter.id]
+    feedback, request_ids = orchestrator._proof_review_feedback(chapter.id)
+    assert "missing scalar tower" in feedback
+    assert len(request_ids) == 1
     assert recovered.fixup_requests == {}
+    assert len(recovered.proof_review_requests) == 1
+    assert recovered.task(chapter.id, Stage.REVIEW).review_green is False
     await orchestrator.shutdown()
 
 
@@ -1948,7 +1968,8 @@ async def test_review_failure_quarantines_branch_without_cancelling_unrelated_wo
             return True
         raise AssertionError("a dependent of the failed review must not start")
 
-    async def prove(chapter: Chapter) -> bool:
+    async def prove(chapter: Chapter, *, defer_review: bool = False) -> bool:
+        assert defer_review
         nonlocal healthy_proved
         assert chapter.id == third.id
         healthy_proved = True
@@ -2224,7 +2245,8 @@ async def test_pipeline_reviews_each_chapter_as_soon_as_its_build_is_green(
         events.append(f"review:{chapter.id}")
         return ReviewOutcome(True, False, {})
 
-    async def prove(chapter: Chapter) -> bool:
+    async def prove(chapter: Chapter, *, defer_review: bool = False) -> bool:
+        assert defer_review
         events.append(f"prove:{chapter.id}")
         return True
 
@@ -2278,7 +2300,8 @@ async def test_pipeline_quarantines_failed_formalization_but_reviews_independent
         reviewed.append(chapter.id)
         return ReviewOutcome(True, False, {})
 
-    async def prove(chapter: Chapter) -> bool:
+    async def prove(chapter: Chapter, *, defer_review: bool = False) -> bool:
+        assert defer_review
         proved.append(chapter.id)
         return True
 
@@ -2393,7 +2416,8 @@ async def test_review_restart_seeds_proofs_from_durable_green_without_rebuilding
     async def review(_chapter: Chapter, *, rerun: bool = False) -> ReviewOutcome:
         raise AssertionError("durable green reviews must not rerun")
 
-    async def prove(chapter: Chapter) -> bool:
+    async def prove(chapter: Chapter, *, defer_review: bool = False) -> bool:
+        assert defer_review
         proofs.append(chapter.id)
         return True
 
@@ -2594,6 +2618,10 @@ async def test_standalone_proof_fixup_finding_clears_durable_review(
     assert review.status == TaskStatus.PENDING
     assert proof.status == TaskStatus.PENDING
     assert proof.source_digest is None
+    feedback, request_ids = orchestrator._proof_review_feedback(chapter.id)
+    assert "the statement needs another hypothesis" in feedback
+    assert len(request_ids) == 1
+    assert orchestrator.state.fixup_requests == {}
     await orchestrator.shutdown()
 
 
@@ -2855,7 +2883,8 @@ async def test_upstream_proof_starts_before_downstream_review_finishes(
             events.append(f"review:{chapter.id}")
         return True
 
-    async def prove(chapter: Chapter) -> bool:
+    async def prove(chapter: Chapter, *, defer_review: bool = False) -> bool:
+        assert defer_review
         events.append(f"prove:{chapter.id}")
         if chapter.id == first.id:
             upstream_proof_started.set()
@@ -2872,7 +2901,7 @@ async def test_upstream_proof_starts_before_downstream_review_finishes(
 
 
 @pytest.mark.asyncio
-async def test_proof_fixup_requeues_only_its_review_branch(
+async def test_proof_finding_requeues_only_its_review_branch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
@@ -2882,20 +2911,25 @@ async def test_proof_fixup_requeues_only_its_review_branch(
     await orchestrator.prepare()
     reviews = 0
     proofs = 0
-    fixups = 0
+    review_feedback: list[str] = []
 
     async def review(
         _chapter: Chapter,
         _rounds_used: dict[str, int],
         *,
         rerun: bool = False,
+        feedback: str = "",
+        proof_request_ids: tuple[str, ...] = (),
     ) -> bool:
         nonlocal reviews
         assert rerun == (reviews > 0)
+        review_feedback.append(feedback)
+        assert bool(proof_request_ids) == bool(feedback)
         reviews += 1
         return True
 
-    async def prove(_chapter: Chapter) -> bool:
+    async def prove(_chapter: Chapter, *, defer_review: bool = False) -> bool:
+        assert defer_review
         nonlocal proofs
         proofs += 1
         if proofs > 1:
@@ -2916,28 +2950,15 @@ async def test_proof_fixup_requeues_only_its_review_branch(
         )
         return False
 
-    async def fixup(
-        feedback: dict[str, str] | None = None,
-        *,
-        target_ids: object = None,
-    ) -> bool:
-        nonlocal fixups
-        assert feedback is not None
-        assert "statement needs a hypothesis" in feedback[chapter.id]
-        assert target_ids == {chapter.id}
-        assert state.task(chapter.id, Stage.REVIEW).review_green is False
-        assert state.task(chapter.id, Stage.PROVE).status == TaskStatus.PENDING
-        assert state.task(chapter.id, Stage.FIXUP).status == TaskStatus.RUNNING
-        assert state.task(chapter.id, Stage.FIXUP).phase == TaskPhase.WAITING_FIXUP
-        fixups += 1
-        return True
-
     monkeypatch.setattr(orchestrator, "_review_chapter_to_clean", review)
     monkeypatch.setattr(orchestrator, "_prove", prove)
-    monkeypatch.setattr(orchestrator, "_fixup_to_clean", fixup)
 
     assert await orchestrator._review_tree(prove=True)
-    assert (reviews, proofs, fixups) == (2, 2, 1)
+    assert (reviews, proofs) == (2, 2)
+    assert review_feedback[0] == ""
+    assert "statement needs a hypothesis" in review_feedback[1]
+    assert state.fixup_requests == {}
+    assert state.proof_review_requests == {}
     assert state.task(chapter.id, Stage.REVIEW).review_green is True
     await orchestrator.shutdown()
 

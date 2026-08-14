@@ -120,6 +120,13 @@ class RunningFixupAgent:
 
 
 @dataclass(frozen=True)
+class RunningReview:
+    task: asyncio.Task[bool]
+    dependencies: frozenset[str]
+    proof_request_ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class LeanDiagnostic:
     severity: str
     header: str
@@ -805,6 +812,103 @@ class Orchestrator:
             return {owner: "\n\n".join(blocks) for owner, blocks in routed.items()}
         return {}
 
+    def _proof_review_feedback(
+        self,
+        chapter_id: str,
+    ) -> tuple[str, tuple[str, ...]]:
+        blocks: dict[str, None] = {}
+        request_ids: list[str] = []
+        for request_id, value in self.state.proof_review_requests.items():
+            feedback = value.get("feedback") if isinstance(value, dict) else None
+            block = feedback.get(chapter_id) if isinstance(feedback, dict) else None
+            if not isinstance(block, str) or not block.strip():
+                continue
+            request_ids.append(request_id)
+            blocks[block] = None
+        return "\n\n".join(blocks), tuple(request_ids)
+
+    async def _queue_proof_review(
+        self,
+        chapter: Chapter,
+        report: dict[str, Any],
+        *,
+        origin_run_id: str,
+    ) -> set[str]:
+        """Durably hand proof findings to full-scope statement reviews."""
+
+        routed = self._route_review_findings(chapter, report)
+        if not routed:
+            return set()
+        origin_blocks = tuple(dict.fromkeys(routed.values()))
+        origin_feedback = (
+            f"Proof of `{chapter.id}` failed with possible statement or interface defects. "
+            "Evaluate these findings while re-reviewing the complete assigned scope:\n\n"
+            + "\n\n".join(origin_blocks)
+        )
+        feedback = dict(routed)
+        feedback[chapter.id] = origin_feedback
+        _, created = await self.state.enqueue_proof_review_request(
+            feedback,
+            origin_run_id=origin_run_id,
+        )
+        targets = {chapter.id, *routed}
+        if not created:
+            return self._successor_closure(self._observed_chapter_graph(), targets)
+        return await self._invalidate_review_closure(
+            targets,
+            detail="review invalidated by failed-proof findings",
+        )
+
+    async def _recover_proof_review_requests(self) -> None:
+        """Recover the proof-to-review handoff if a process died between its durable steps."""
+
+        persisted_origins = {
+            value.get("origin_run_id")
+            for value in self.state.proof_review_requests.values()
+            if isinstance(value, dict)
+        }
+        for chapter in self.chapters:
+            proof_runs = self.state.task(chapter.id, Stage.PROVE).runs
+            if not proof_runs:
+                continue
+            run = proof_runs[-1]
+            self.state.load_run_details(run)
+            report = run.report if isinstance(run.report, dict) else {}
+            if not report.get("fixup_findings") or run.id in persisted_origins:
+                continue
+            review_runs = self.state.task(chapter.id, Stage.REVIEW).runs
+            reviewed_after = any(
+                review_run.status == TaskStatus.SUCCEEDED
+                and review_run.finished_at is not None
+                and review_run.finished_at >= (run.finished_at or run.started_at)
+                for review_run in review_runs
+            )
+            if reviewed_after:
+                continue
+            await self._queue_proof_review(chapter, report, origin_run_id=run.id)
+            persisted_origins.add(run.id)
+
+        by_id = {chapter.id: chapter for chapter in self.chapters}
+        pending_owners = {
+            chapter_id
+            for value in self.state.proof_review_requests.values()
+            if isinstance(value, dict)
+            for feedback in (value.get("feedback"),)
+            if isinstance(feedback, dict)
+            for chapter_id in feedback
+            if chapter_id in by_id
+        }
+        stale_green = {
+            chapter_id
+            for chapter_id in pending_owners
+            if self.state.task(chapter_id, Stage.REVIEW).review_green is True
+        }
+        if stale_green:
+            await self._invalidate_review_closure(
+                stale_green,
+                detail="recovering pending failed-proof review findings",
+            )
+
     async def _migrate_review_green(self) -> None:
         """Classify pre-attestation review state once from durable run history."""
 
@@ -1335,58 +1439,13 @@ class Orchestrator:
         return await future
 
     async def _recover_fixup_requests(self) -> list[asyncio.Future[bool]]:
-        """Restore durable repair requests, including legacy proof handoff gaps."""
+        """Restore durable review-originated repair requests."""
 
         if self._fixup_requests_recovered:
             return []
         self._fixup_requests_recovered = True
 
-        persisted_origins = {
-            value.get("origin_run_id")
-            for value in self.state.fixup_requests.values()
-            if isinstance(value, dict)
-        }
         by_id = {chapter.id: chapter for chapter in self.chapters}
-        for chapter in self.chapters:
-            proof_runs = self.state.task(chapter.id, Stage.PROVE).runs
-            if not proof_runs:
-                continue
-            run = proof_runs[-1]
-            self.state.load_run_details(run)
-            report = run.report if isinstance(run.report, dict) else {}
-            if not report.get("fixup_findings") or run.id in persisted_origins:
-                continue
-            if self.state.task(chapter.id, Stage.REVIEW).review_green is True:
-                continue
-            findings = self._route_review_findings(chapter, report)
-            unhandled: dict[str, str] = {}
-            for owner, block in findings.items():
-                handled = any(
-                    fixup_run.status == TaskStatus.SUCCEEDED
-                    and fixup_run.finished_at is not None
-                    and fixup_run.finished_at >= (run.finished_at or run.started_at)
-                    for fixup_run in self.state.task(owner, Stage.FIXUP).runs
-                )
-                if not handled:
-                    unhandled[owner] = block
-            if not unhandled:
-                continue
-            async with self.state.batch():
-                await self.state.enqueue_fixup_request(
-                    unhandled,
-                    {chapter.id, *unhandled},
-                    origin_run_id=run.id,
-                )
-                for owner in unhandled:
-                    await self.state.set_task(
-                        owner,
-                        Stage.FIXUP,
-                        TaskStatus.RUNNING,
-                        "recovered proof-requested fixup from durable run history",
-                        phase=TaskPhase.WAITING_FIXUP,
-                    )
-            persisted_origins.add(run.id)
-
         futures: list[asyncio.Future[bool]] = []
         async with self._fixup_request_lock:
             known = {request.id for request in self._fixup_requests}
@@ -1930,13 +1989,24 @@ class Orchestrator:
             raise
         return not had_failure
 
-    async def _review_once(self, chapter: Chapter, *, rerun: bool = False) -> ReviewOutcome:
+    async def _review_once(
+        self,
+        chapter: Chapter,
+        *,
+        rerun: bool = False,
+        feedback: str = "",
+    ) -> ReviewOutcome:
         if not rerun and self._already_done(chapter, Stage.REVIEW):
             return ReviewOutcome(True, False, {}, complete=True)
         attempt = await self._attempt(
             chapter,
             Stage.REVIEW,
-            queue_detail="source-faithful editing review",
+            feedback=feedback,
+            queue_detail=(
+                "full-scope review of failed-proof findings"
+                if feedback
+                else "source-faithful editing review"
+            ),
         )
         if attempt.agent.capacity_exhausted:
             await self.state.set_task(
@@ -1989,6 +2059,7 @@ class Orchestrator:
         detail: str,
         *,
         expected_generation: int | None = None,
+        proof_request_ids: Iterable[str] = (),
     ) -> bool:
         async with self._review_generation_lock:
             if (
@@ -1998,6 +2069,10 @@ class Orchestrator:
                 return False
             async with self.state.batch():
                 await self.state.set_review_green((chapter.id,), True)
+                await self.state.finish_proof_review_requests(
+                    chapter.id,
+                    proof_request_ids,
+                )
                 await self.state.set_task(
                     chapter.id,
                     Stage.REVIEW,
@@ -2050,6 +2125,8 @@ class Orchestrator:
         rounds_used: dict[str, int],
         *,
         rerun: bool = False,
+        feedback: str = "",
+        proof_request_ids: tuple[str, ...] = (),
     ) -> bool:
         """Run at most five edit/rebuild cycles for one dependency-ready chapter."""
 
@@ -2068,15 +2145,23 @@ class Orchestrator:
             return False
 
         maximum = min(self.config.stages[Stage.REVIEW].max_rounds, 5)
+        review_feedback = feedback
         while rounds_used[chapter.id] < maximum:
             rounds_used[chapter.id] += 1
-            outcome = await self._review_once(
-                chapter,
-                rerun=rerun or rounds_used[chapter.id] > 1,
+            review_rerun = rerun or rounds_used[chapter.id] > 1
+            outcome = (
+                await self._review_once(
+                    chapter,
+                    rerun=review_rerun,
+                    feedback=review_feedback,
+                )
+                if review_feedback
+                else await self._review_once(chapter, rerun=review_rerun)
             )
             if outcome.capacity_deferred:
                 rounds_used[chapter.id] -= 1
                 continue
+            review_feedback = ""
             if not outcome.succeeded:
                 return False
             findings_by_owner: dict[str, dict[str, None]] = {}
@@ -2131,11 +2216,13 @@ class Orchestrator:
                     chapter,
                     detail,
                     expected_generation=review_generation,
+                    proof_request_ids=proof_request_ids,
                 )
         return await self._complete_review(
             chapter,
             f"review/rebuild cap reached after {maximum} cycles",
             expected_generation=review_generation,
+            proof_request_ids=proof_request_ids,
         )
 
     async def _review_tree(
@@ -2147,6 +2234,7 @@ class Orchestrator:
     ) -> bool:
         """Release dependency-ready reviews and proofs without a corpus-wide review gate."""
 
+        await self._recover_proof_review_requests()
         recovered_fixups = await self._recover_fixup_requests()
         if recovered_fixups and not all(await asyncio.gather(*recovered_fixups)):
             return False
@@ -2187,7 +2275,7 @@ class Orchestrator:
         review_blocked: set[str] = set()
         attempted: set[str] = set()
         rounds_used = {chapter_id: 0 for chapter_id in by_id}
-        review_tasks: dict[str, tuple[asyncio.Task[bool], frozenset[str]]] = {}
+        review_tasks: dict[str, RunningReview] = {}
         proof_tasks: dict[str, asyncio.Task[bool]] = {}
         persisted_clean = self.state.fixup_graph.get("clean", {})
         clean = self._retain_fixup_clean(
@@ -2204,7 +2292,7 @@ class Orchestrator:
                 == clean[chapter_id].get("source_digest")
             )
         }
-        proof_fixups = {chapter_id: 0 for chapter_id in by_id}
+        proof_reviews = {chapter_id: 0 for chapter_id in by_id}
 
         async with self.state.batch():
             if quarantined_ids:
@@ -2241,7 +2329,9 @@ class Orchestrator:
                     )
 
         async def cancel_all() -> None:
-            tasks = [task for task, _ in review_tasks.values()] + list(proof_tasks.values())
+            tasks = [handle.task for handle in review_tasks.values()] + list(
+                proof_tasks.values()
+            )
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
@@ -2274,15 +2364,15 @@ class Orchestrator:
                         proof_results.pop(chapter_id, None)
                 stale_reviews = [
                     chapter_id
-                    for chapter_id, (task, dependencies) in review_tasks.items()
+                    for chapter_id, handle in review_tasks.items()
                     if self.state.task(chapter_id, Stage.REVIEW).status != TaskStatus.RUNNING
-                    or not dependencies.issubset(reviewed)
+                    or not handle.dependencies.issubset(reviewed)
                 ]
                 cancelled_reviews: list[asyncio.Task[bool]] = []
                 for chapter_id in stale_reviews:
-                    task, _ = review_tasks.pop(chapter_id)
-                    task.cancel()
-                    cancelled_reviews.append(task)
+                    handle = review_tasks.pop(chapter_id)
+                    handle.task.cancel()
+                    cancelled_reviews.append(handle.task)
                 if cancelled_reviews:
                     await asyncio.gather(*cancelled_reviews, return_exceptions=True)
                     async with self.state.batch():
@@ -2308,6 +2398,7 @@ class Orchestrator:
                         and graph.dependencies[chapter_id].issubset(reviewed)
                     ):
                         dependencies = graph.dependencies[chapter_id]
+                        proof_feedback, proof_request_ids = self._proof_review_feedback(chapter_id)
                         await self.state.set_task(
                             chapter_id,
                             Stage.REVIEW,
@@ -2315,15 +2406,25 @@ class Orchestrator:
                             "waiting for dependency-ordered coordinator build",
                             phase=TaskPhase.WAITING_BUILD,
                         )
-                        review_tasks[chapter_id] = (
-                            asyncio.create_task(
-                                self._review_chapter_to_clean(
-                                    by_id[chapter_id],
-                                    rounds_used,
-                                    rerun=rerun or chapter_id in attempted,
-                                )
-                            ),
-                            dependencies,
+                        review_operation = (
+                            self._review_chapter_to_clean(
+                                by_id[chapter_id],
+                                rounds_used,
+                                rerun=rerun or chapter_id in attempted,
+                                feedback=proof_feedback,
+                                proof_request_ids=proof_request_ids,
+                            )
+                            if proof_feedback
+                            else self._review_chapter_to_clean(
+                                by_id[chapter_id],
+                                rounds_used,
+                                rerun=rerun or chapter_id in attempted,
+                            )
+                        )
+                        review_tasks[chapter_id] = RunningReview(
+                            task=asyncio.create_task(review_operation),
+                            dependencies=dependencies,
+                            proof_request_ids=proof_request_ids,
                         )
                         attempted.add(chapter_id)
 
@@ -2331,10 +2432,10 @@ class Orchestrator:
                     for chapter_id in reviewed:
                         if chapter_id not in proof_results and chapter_id not in proof_tasks:
                             proof_tasks[chapter_id] = asyncio.create_task(
-                                self._prove(by_id[chapter_id])
+                                self._prove(by_id[chapter_id], defer_review=True)
                             )
 
-                live_tasks = [task for task, _ in review_tasks.values()]
+                live_tasks = [handle.task for handle in review_tasks.values()]
                 live_tasks.extend(proof_tasks.values())
                 if not live_tasks:
                     unresolved = set(by_id).difference(reviewed | review_failures | review_blocked)
@@ -2366,14 +2467,22 @@ class Orchestrator:
                 done, _ = await asyncio.wait(live_tasks, return_when=asyncio.FIRST_COMPLETED)
 
                 completed_reviews = [
-                    chapter_id for chapter_id, (task, _) in review_tasks.items() if task in done
+                    chapter_id
+                    for chapter_id, handle in review_tasks.items()
+                    if handle.task in done
                 ]
                 for chapter_id in completed_reviews:
-                    task, starting_dependencies = review_tasks.pop(chapter_id)
-                    succeeded = task.result()
+                    handle = review_tasks.pop(chapter_id)
+                    succeeded = handle.task.result()
                     if not succeeded:
-                        review_failures.add(chapter_id)
                         task_record = self.state.task(chapter_id, Stage.REVIEW)
+                        if (
+                            task_record.status == TaskStatus.PENDING
+                            and task_record.phase == TaskPhase.RECOVERING
+                        ):
+                            rounds_used[chapter_id] = 0
+                            continue
+                        review_failures.add(chapter_id)
                         if task_record.status != TaskStatus.FAILED:
                             await self.state.set_task(
                                 chapter_id,
@@ -2384,17 +2493,18 @@ class Orchestrator:
                         continue
                     current_graph = self._observed_chapter_graph()
                     current_dependencies = current_graph.dependencies[chapter_id]
-                    if not current_dependencies.issubset(starting_dependencies):
+                    if not current_dependencies.issubset(handle.dependencies):
                         continue
                     if self.state.task(chapter_id, Stage.REVIEW).review_green is not True:
                         await self._complete_review(
                             by_id[chapter_id],
                             "editing review completed",
+                            proof_request_ids=handle.proof_request_ids,
                         )
                     reviewed.add(chapter_id)
                     if prove:
                         proof_tasks[chapter_id] = asyncio.create_task(
-                            self._prove(by_id[chapter_id])
+                            self._prove(by_id[chapter_id], defer_review=True)
                         )
 
                 completed_proofs = [
@@ -2413,24 +2523,30 @@ class Orchestrator:
                     if not isinstance(report, dict) or not report.get("fixup_findings"):
                         proof_results[chapter_id] = False
                         continue
-                    if proof_fixups[chapter_id] >= self.config.stages[Stage.FIXUP].max_rounds:
+                    if proof_reviews[chapter_id] >= self.config.stages[Stage.REVIEW].max_rounds:
                         proof_results[chapter_id] = False
+                        await self.state.set_task(
+                            chapter_id,
+                            Stage.PROVE,
+                            TaskStatus.FAILED,
+                            "proof findings persisted after the review retry cap",
+                        )
                         continue
-                    proof_fixups[chapter_id] += 1
+                    proof_reviews[chapter_id] += 1
 
                     chapter = by_id[chapter_id]
-                    findings = self._route_review_findings(chapter, report)
-                    targets = {chapter_id, *findings}
-                    invalidated = await self._invalidate_review_closure(
-                        targets,
-                        detail="review invalidated by proof-requested statement fixup",
+                    proof_run = proof_task.runs[-1]
+                    invalidated = await self._queue_proof_review(
+                        chapter,
+                        report,
+                        origin_run_id=proof_run.id,
                     )
 
                     cancelled: list[asyncio.Task[bool]] = []
                     for invalidated_id in invalidated:
                         if handle := review_tasks.pop(invalidated_id, None):
-                            handle[0].cancel()
-                            cancelled.append(handle[0])
+                            handle.task.cancel()
+                            cancelled.append(handle.task)
                         if task := proof_tasks.pop(invalidated_id, None):
                             task.cancel()
                             cancelled.append(task)
@@ -2438,9 +2554,6 @@ class Orchestrator:
                         proof_results.pop(invalidated_id, None)
                         rounds_used[invalidated_id] = 0
                     await asyncio.gather(*cancelled, return_exceptions=True)
-
-                    if not await self._request_fixup(findings, target_ids=targets):
-                        return False
         finally:
             await cancel_all()
 
@@ -2482,7 +2595,7 @@ class Orchestrator:
             )
         return validation
 
-    async def _prove(self, chapter: Chapter) -> bool:
+    async def _prove(self, chapter: Chapter, *, defer_review: bool = False) -> bool:
         initial_feedback = ""
         if not self.force:
             graph = self._observed_chapter_graph()
@@ -2578,11 +2691,12 @@ class Orchestrator:
             )
             feedback = _bounded_proof_feedback(feedback_ledger)
             if bool(attempt.agent.report.get("fixup_findings")):
-                findings = self._route_review_findings(chapter, attempt.agent.report)
-                await self._invalidate_review_closure(
-                    {chapter.id, *findings},
-                    detail="review invalidated by proof-requested statement fixup",
-                )
+                if not defer_review:
+                    await self._queue_proof_review(
+                        chapter,
+                        attempt.agent.report,
+                        origin_run_id=attempt.run.id,
+                    )
                 return False
             placeholders = attempt.agent.placeholders
             if (
