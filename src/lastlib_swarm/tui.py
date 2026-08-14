@@ -386,6 +386,7 @@ class AgentDetailScreen(Screen[None]):
         self._raw_pending = bytearray()
         self._raw_lines: deque[str] = deque(maxlen=30)
         self._timeline_activities: dict[str, AgentActivity] = {}
+        self._rendered_prompt: tuple[str, str | None, int | None, int | None, int] | None = None
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -421,6 +422,8 @@ class AgentDetailScreen(Screen[None]):
                     markup=False,
                     max_lines=None,
                 )
+            with TabPane("Prompt", id="prompt-pane"):
+                yield RichLog(id="agent-prompt", wrap=True, markup=False, max_lines=None)
             with TabPane("Plan", id="plan-pane"):
                 yield RichLog(id="agent-plan", wrap=True, markup=False)
             with TabPane("Files", id="files-pane"):
@@ -446,7 +449,22 @@ class AgentDetailScreen(Screen[None]):
             return
         self._selected_run_id = run_id
         self._rendered_activity = None
+        self._rendered_prompt = None
         self.refresh_agent()
+
+    def on_tabbed_content_tab_activated(self, event: TabbedContent.TabActivated) -> None:
+        if event.tabbed_content.id != "agent-tabs" or event.pane.id != "prompt-pane":
+            return
+        run = next(
+            (
+                item
+                for item in chapter_runs(self.state, self.chapter)
+                if item.id == self._selected_run_id
+            ),
+            None,
+        )
+        if run is not None:
+            self._refresh_prompt(run)
 
     def refresh_agent(self) -> None:
         runs = chapter_runs(self.state, self.chapter)
@@ -514,8 +532,35 @@ class AgentDetailScreen(Screen[None]):
             self._render_activity(timeline_activity)
             self._rendered_activity = rendered_activity
         tabs = self.query_one("#agent-tabs", TabbedContent)
+        if tabs.active == "prompt-pane":
+            self._refresh_prompt(run)
         if tabs.active == "raw-pane":
             self._refresh_raw_events(path)
+
+    def _refresh_prompt(self, run: RunRecord) -> None:
+        path = self.state.logs_dir / f"{run.id}.prompt.md"
+        width = _log_render_width(self.query_one("#agent-prompt", RichLog))
+        size: int | None = None
+        modified: int | None = None
+        with suppress(OSError):
+            stat = path.stat()
+            size = stat.st_size
+            modified = stat.st_mtime_ns
+        rendered = (run.id, str(path), size, modified, width)
+        if rendered == self._rendered_prompt:
+            return
+        if size is None:
+            content = "Prompt was not recorded for this run."
+        else:
+            try:
+                content = path.read_text(encoding="utf-8")
+            except (OSError, UnicodeError) as error:
+                content = f"Could not read prompt file {path}: {error}"
+        prompt = self.query_one("#agent-prompt", RichLog)
+        prompt.clear()
+        prompt.write(content, width=width)
+        prompt.scroll_home(animate=False)
+        self._rendered_prompt = rendered
 
     def _timeline_activity(
         self,

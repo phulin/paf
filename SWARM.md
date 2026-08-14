@@ -353,10 +353,10 @@ The dashboard shows:
 - measured cumulative input, cached input, output, and reasoning-output tokens.
 
 Select a chapter row and press Enter (or `i`) to open its agent detail screen. It updates while the
-agent runs and has tabs for the event timeline, Codex todo plan, touched files, and bounded raw JSONL
-events. Opening a run reconstructs its timeline from JSONL so the whole run is visible; only an
-extreme run beyond 10,000 display events is shortened, with the omission called out. The header
-includes PID/thread id, elapsed and idle time, shell/MCP/edit counts,
+agent runs and has tabs for the event timeline, exact submitted prompt, Codex todo plan, touched
+files, and bounded raw JSONL events. Opening a run reconstructs its timeline from JSONL so the whole
+run is visible; only an extreme run beyond 10,000 display events is shortened, with the omission
+called out. The header includes PID/thread id, elapsed and idle time, shell/MCP/edit counts,
 complete latest agent update in a scrollable pane, latest substantive error, and measured per-run
 spend. Bare process statuses such as `exit 2` are retained in the event timeline but are not promoted
 to latest or systemic errors. The detail pane reports tokens and API-equivalent cost for that exact
@@ -400,7 +400,8 @@ issue in one transaction, verifies that the database is complete, retains the or
 interrupted run updates its lightweight row summary without discarding its lazily stored report,
 validation, or isolation payload.
 
-Raw JSONL agent logs live below `logs/`, with the generated final-report schema alongside them.
+Raw JSONL agent logs and their exact submitted `.prompt.md` sidecars live below `logs/`, with the
+generated final-report schema alongside them.
 Compact `*.activity.json` sidecars retain the recent event timeline and health counters without
 copying command output into pipeline state; because they are reconstructible from JSONL, event-time
 sidecar writes are rate-limited and a final summary is force-flushed. An attempt row is committed

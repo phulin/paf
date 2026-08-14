@@ -671,6 +671,7 @@ print(json.dumps({"type": "item.completed", "item": {
     executor = CodexExecutor(config, state)
     await executor.prepare()
     run = await state.start_run(config.chapters[0].id, Stage.REVIEW)
+    expected_prompt = executor.build_prompt(config.chapters[0], Stage.REVIEW)
 
     result = await executor.run(config.chapters[0], Stage.REVIEW, run)
 
@@ -678,6 +679,8 @@ print(json.dumps({"type": "item.completed", "item": {
     assert result.thread_id == "thread-123"
     assert result.usage.total_tokens == 125
     assert result.report["summary"] == "done"
+    prompt_path = state.logs_dir / f"{run.id}.prompt.md"
+    assert prompt_path.read_text(encoding="utf-8") == expected_prompt
     activity = state.activities.get(run.id)
     assert activity is not None
     assert activity.current == "agent succeeded"

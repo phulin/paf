@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from textual.widgets import DataTable, RichLog, Static, Tab, Tabs
+from textual.widgets import DataTable, RichLog, Static, Tab, TabbedContent, Tabs
 
 from lastlib_swarm.config import load_config
 from lastlib_swarm.models import Stage
@@ -385,6 +385,13 @@ async def test_selected_chapter_opens_live_agent_detail(tmp_path: Path) -> None:
         assert "[msg]" in rendered_timeline
         assert "[mcp_tool_call]" not in rendered_timeline
 
+        app.screen.query_one("#agent-tabs", TabbedContent).active = "prompt-pane"
+        await pilot.pause(0.1)
+        prompt = app.screen.query_one("#agent-prompt", RichLog)
+        assert "Prompt was not recorded for this run." in "".join(
+            line.text for line in prompt.lines
+        )
+
         await pilot.press("escape")
         assert app.check_action("inspect_agent", ()) is True
         finish.set()
@@ -412,6 +419,8 @@ async def test_agent_detail_can_switch_between_chapter_steps(tmp_path: Path) -> 
 
     async def operation() -> bool:
         first = await state.start_run(config.chapters[0].id, Stage.FORMALIZE)
+        first_prompt = state.logs_dir / f"{first.id}.prompt.md"
+        first_prompt.write_text("first formalization prompt", encoding="utf-8")
         await state.update_run(
             first,
             usage=TokenUsage(input_tokens=1_000, output_tokens=100, measured=True),
@@ -420,6 +429,8 @@ async def test_agent_detail_can_switch_between_chapter_steps(tmp_path: Path) -> 
         await state.finish_run(first, status=TaskStatus.SUCCEEDED)
 
         second = await state.start_run(config.chapters[0].id, Stage.REVIEW)
+        second_prompt = state.logs_dir / f"{second.id}.prompt.md"
+        second_prompt.write_text("second review prompt", encoding="utf-8")
         await state.update_run(
             second,
             usage=TokenUsage(input_tokens=2_000, output_tokens=200, measured=True),
@@ -476,6 +487,12 @@ async def test_agent_detail_can_switch_between_chapter_steps(tmp_path: Path) -> 
         assert "• One issue for display." in rendered_timeline
         assert '"changed"' not in rendered_timeline
 
+        agent_tabs = screen.query_one("#agent-tabs", TabbedContent)
+        agent_tabs.active = "prompt-pane"
+        await pilot.pause(0.1)
+        prompt = screen.query_one("#agent-prompt", RichLog)
+        assert "second review prompt" in "".join(line.text for line in prompt.lines)
+
         run_tabs.active = "agent-step-1"
         await pilot.pause(0.2)
 
@@ -484,6 +501,7 @@ async def test_agent_detail_can_switch_between_chapter_steps(tmp_path: Path) -> 
         assert "formalize round 1" in heading
         assert "formalization update" in "".join(line.text for line in summary.lines)
         assert "tokens 1.1k" in str(screen.query_one("#agent-spend", Static).content)
+        assert "first formalization prompt" in "".join(line.text for line in prompt.lines)
 
         await pilot.press("escape")
         finish.set()

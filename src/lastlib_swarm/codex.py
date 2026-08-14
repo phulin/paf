@@ -681,6 +681,8 @@ whole-file diagnostics in import order; do not prepare every file separately.
     ) -> AgentResult:
         root = workspace_root or self.config.settings.repo
         prompt = self.build_prompt(chapter, stage, feedback=feedback, workspace_root=root)
+        prompt_path = self.state.logs_dir / f"{run.id}.prompt.md"
+        prompt_path.write_text(prompt, encoding="utf-8")
         before = scope_digest(root, chapter)
         log_path = self.state.logs_dir / f"{run.id}.jsonl"
         usage = TokenUsage()
