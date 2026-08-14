@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+import lastlib_swarm.codex as codex_module
 from lastlib_swarm.codex import (
     REPORT_SCHEMA,
     REVIEW_SOURCE_BUNDLE_MAX_CHARS,
@@ -715,6 +716,78 @@ print(json.dumps({{"type": "item.completed", "item": {{
     assert activity is not None
     assert activity.current == "agent succeeded"
     assert any(entry.status == "retrying" for entry in activity.recent)
+
+
+@pytest.mark.asyncio
+async def test_executor_recycles_fd_leaking_codex_and_resumes_same_thread(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    invocations_path = tmp_path / "fd-invocations.jsonl"
+    fake_codex = tmp_path / "fd-leaking-codex"
+    fake_codex.write_text(
+        f"""#!/usr/bin/env python3
+import json
+import sys
+import time
+from pathlib import Path
+
+prompt = sys.stdin.read()
+with Path({str(invocations_path)!r}).open("a", encoding="utf-8") as handle:
+    handle.write(json.dumps({{"args": sys.argv[1:], "prompt": prompt}}) + "\\n")
+if "resume" not in sys.argv:
+    print(json.dumps({{"type": "thread.started", "thread_id": "fd-thread"}}), flush=True)
+    time.sleep(60)
+report = {{"changed": False, "complete": True,
+          "summary": "resumed after fd recycle", "issues": []}}
+print(json.dumps({{"type": "item.completed", "item": {{
+    "type": "agent_message", "text": json.dumps(report)}}}}))
+""",
+        encoding="utf-8",
+    )
+    fake_codex.chmod(0o755)
+    config = replace(
+        config,
+        settings=replace(
+            config.settings,
+            codex_bin=str(fake_codex),
+            codex_fd_recycle_threshold=256,
+            codex_fd_recycle_attempts=2,
+        ),
+    )
+    monitor_calls = 0
+
+    async def fd_pressure(
+        process: asyncio.subprocess.Process,
+        _threshold: int,
+        resumable: object,
+    ) -> int:
+        nonlocal monitor_calls
+        monitor_calls += 1
+        if monitor_calls == 1:
+            while not resumable():  # type: ignore[operator]
+                await asyncio.sleep(0.01)
+            return 300
+        await process.wait()
+        return 0
+
+    monkeypatch.setattr(codex_module, "_wait_for_fd_pressure", fd_pressure)
+    state = StateStore(config)
+    await state.load_or_create()
+    executor = CodexExecutor(config, state)
+    await executor.prepare()
+    run = await state.start_run(config.chapters[0].id, Stage.REVIEW)
+
+    result = await executor.run(config.chapters[0], Stage.REVIEW, run)
+
+    invocations = [json.loads(line) for line in invocations_path.read_text().splitlines()]
+    assert result.succeeded
+    assert result.thread_id == "fd-thread"
+    assert len(invocations) == 2
+    assert invocations[1]["args"][:2] == ["exec", "resume"]
+    activity = state.activities.get(run.id)
+    assert activity is not None
+    assert any("resource recycle" in entry.title for entry in activity.recent)
 
 
 @pytest.mark.asyncio

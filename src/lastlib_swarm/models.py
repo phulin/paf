@@ -39,6 +39,8 @@ class SwarmSettings:
     capacity_resume_attempts: int = 10
     capacity_resume_delay_seconds: float = 15.0
     capacity_resume_max_delay_seconds: float = 120.0
+    codex_fd_recycle_threshold: int = 256
+    codex_fd_recycle_attempts: int = 20
     validation_timeout_seconds: float = 1800.0
     isolation: str = "auto"
     cache_compaction_layers: int = 32

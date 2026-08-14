@@ -698,7 +698,7 @@ whole-file diagnostics in import order; do not prepare every file separately.
 
         async def invoke(
             command: list[str], input_text: str, *, append_log: bool
-        ) -> tuple[int, bool, bool]:
+        ) -> tuple[int, bool, bool, int]:
             nonlocal usage, report, thread_id, usage_monitor
             process = await asyncio.create_subprocess_exec(
                 *command,
@@ -756,14 +756,32 @@ whole-file diagnostics in import order; do not prepare every file separately.
 
             consumer = asyncio.create_task(consume())
             timed_out = False
+            fd_pressure = 0
+            exit_wait: asyncio.Task[int] | None = None
+            pressure_wait: asyncio.Task[int] | None = None
             try:
                 stdin.write(input_text.encode())
                 await stdin.drain()
                 stdin.close()
                 with suppress(BrokenPipeError, ConnectionResetError):
                     await stdin.wait_closed()
+                exit_wait = asyncio.create_task(_wait_for_parent_exit(process))
+                pressure_wait = asyncio.create_task(
+                    _wait_for_fd_pressure(
+                        process,
+                        self.config.settings.codex_fd_recycle_threshold,
+                        lambda: thread_id is not None,
+                    )
+                )
                 async with asyncio.timeout(self.config.settings.agent_timeout_seconds):
-                    exit_code = await _wait_for_parent_exit(process)
+                    done, _ = await asyncio.wait(
+                        (exit_wait, pressure_wait), return_when=asyncio.FIRST_COMPLETED
+                    )
+                    if pressure_wait in done and (fd_pressure := pressure_wait.result()):
+                        await _terminate(process)
+                        exit_code = 75
+                    else:
+                        exit_code = await exit_wait
             except TimeoutError:
                 timed_out = True
                 await _terminate(process)
@@ -778,15 +796,27 @@ whole-file diagnostics in import order; do not prepare every file separately.
                     consumer.cancel()
                 await asyncio.gather(consumer, return_exceptions=True)
                 raise
+            finally:
+                pending = [
+                    task
+                    for task in (exit_wait, pressure_wait)
+                    if task is not None and not task.done()
+                ]
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    await asyncio.gather(*pending, return_exceptions=True)
             if not timed_out:
                 # Codex can exit before its MCP/LSP descendants. Reap the complete
                 # process group before integration so no language server retains the
                 # overlay or races the coordinator-owned build.
                 await _terminate(process)
             await consumer
-            return exit_code, timed_out, capacity_failure
+            return exit_code, timed_out, capacity_failure, fd_pressure
 
         resume_attempt = 0
+        capacity_retries = 0
+        fd_recycles = 0
         capacity_failure = False
         timed_out = False
         try:
@@ -809,29 +839,42 @@ whole-file diagnostics in import order; do not prepare every file separately.
                         feedback=feedback,
                     )
                     input_text = prompt
-                exit_code, timed_out, capacity_failure = await invoke(
+                exit_code, timed_out, capacity_failure, fd_pressure = await invoke(
                     command, input_text, append_log=bool(resume_attempt)
                 )
-                if (
-                    exit_code == 0
-                    or not capacity_failure
-                    or thread_id is None
-                    or resume_attempt >= self.config.settings.capacity_resume_attempts
-                ):
+                if exit_code == 0 or thread_id is None:
                     break
-                resume_attempt += 1
-                activity.retry(
-                    f"capacity retry {resume_attempt}/"
-                    f"{self.config.settings.capacity_resume_attempts}: resuming {thread_id}"
-                )
-                self.state.activities.save(activity)
-                await asyncio.sleep(
-                    _capacity_resume_delay(
-                        self.config.settings.capacity_resume_delay_seconds,
-                        self.config.settings.capacity_resume_max_delay_seconds,
-                        resume_attempt,
+                if fd_pressure:
+                    if fd_recycles >= self.config.settings.codex_fd_recycle_attempts:
+                        break
+                    fd_recycles += 1
+                    resume_attempt += 1
+                    activity.retry(
+                        f"resource recycle {fd_recycles}/"
+                        f"{self.config.settings.codex_fd_recycle_attempts}: Codex reached "
+                        f"{fd_pressure} open descriptors; resuming {thread_id}"
                     )
-                )
+                    self.state.activities.save(activity)
+                    continue
+                if capacity_failure:
+                    if capacity_retries >= self.config.settings.capacity_resume_attempts:
+                        break
+                    capacity_retries += 1
+                    resume_attempt += 1
+                    activity.retry(
+                        f"capacity retry {capacity_retries}/"
+                        f"{self.config.settings.capacity_resume_attempts}: resuming {thread_id}"
+                    )
+                    self.state.activities.save(activity)
+                    await asyncio.sleep(
+                        _capacity_resume_delay(
+                            self.config.settings.capacity_resume_delay_seconds,
+                            self.config.settings.capacity_resume_max_delay_seconds,
+                            capacity_retries,
+                        )
+                    )
+                    continue
+                break
         except asyncio.CancelledError:
             await stop_usage_monitor()
             activity.finish("cancelled", "agent cancelled by orchestrator")
@@ -843,6 +886,11 @@ whole-file diagnostics in import order; do not prepare every file separately.
         changed = before != scope_digest(root, chapter)
         placeholders = count_placeholders(root, chapter)
         error = "agent timed out" if timed_out else ""
+        if fd_pressure and exit_code != 0:
+            error = (
+                f"Codex descriptor leak persisted after {fd_recycles} resource recycles "
+                f"({fd_pressure} open descriptors)"
+            )
         if capacity_failure and exit_code != 0:
             error = "Codex capacity retries exhausted"
         if exit_code == 0 and not report:
@@ -939,6 +987,34 @@ async def _wait_for_parent_exit(process: asyncio.subprocess.Process) -> int:
     while process.returncode is None:
         await asyncio.sleep(0.05)
     return process.returncode
+
+
+def _open_descriptor_count(pid: int) -> int:
+    """Read a Linux process's live descriptor count without retaining handles."""
+
+    try:
+        with os.scandir(f"/proc/{pid}/fd") as entries:
+            return sum(1 for _ in entries)
+    except (FileNotFoundError, PermissionError, ProcessLookupError):
+        return 0
+
+
+async def _wait_for_fd_pressure(
+    process: asyncio.subprocess.Process,
+    threshold: int,
+    resumable: Callable[[], bool],
+) -> int:
+    """Return the observed count when a resumable Codex child approaches EMFILE."""
+
+    if threshold <= 0:
+        await process.wait()
+        return 0
+    while process.returncode is None:
+        count = _open_descriptor_count(process.pid)
+        if resumable() and count >= threshold:
+            return count
+        await asyncio.sleep(1)
+    return 0
 
 
 async def _terminate(process: asyncio.subprocess.Process) -> None:

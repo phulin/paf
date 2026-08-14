@@ -233,6 +233,8 @@ def load_config(path: str | Path) -> PipelineConfig:
         capacity_resume_max_delay_seconds=float(
             swarm.get("capacity_resume_max_delay_seconds", 120)
         ),
+        codex_fd_recycle_threshold=int(swarm.get("codex_fd_recycle_threshold", 256)),
+        codex_fd_recycle_attempts=int(swarm.get("codex_fd_recycle_attempts", 20)),
         validation_timeout_seconds=float(swarm.get("validation_timeout_seconds", 1800)),
         isolation=str(swarm.get("isolation", "auto")),
         cache_compaction_layers=int(swarm.get("cache_compaction_layers", 32)),
@@ -252,6 +254,10 @@ def load_config(path: str | Path) -> PipelineConfig:
         raise ValueError("swarm.capacity_resume_delay_seconds must be nonnegative")
     if settings.capacity_resume_max_delay_seconds < 0:
         raise ValueError("swarm.capacity_resume_max_delay_seconds must be nonnegative")
+    if settings.codex_fd_recycle_threshold < 0:
+        raise ValueError("swarm.codex_fd_recycle_threshold must be nonnegative")
+    if settings.codex_fd_recycle_attempts < 0:
+        raise ValueError("swarm.codex_fd_recycle_attempts must be nonnegative")
     if settings.isolation not in {"auto", "fuse-overlay", "shared"}:
         raise ValueError("swarm.isolation must be auto, fuse-overlay, or shared")
     if settings.cache_compaction_layers < 2:
