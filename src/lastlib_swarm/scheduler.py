@@ -1422,7 +1422,12 @@ class Orchestrator:
             )
             merge_feedback({handle.chapter.id: detail})
 
-        async def build_chapter(chapter_id: str, graph: ChapterImportGraph) -> bool:
+        async def build_chapter(
+            chapter_id: str,
+            graph: ChapterImportGraph,
+            *,
+            mode: str = "topological",
+        ) -> bool:
             nonlocal build_generation, clean
             chapter = by_id[chapter_id]
             snapshots: dict[str, ValidatedBuildSnapshot] = {}
@@ -1430,7 +1435,7 @@ class Orchestrator:
                 await self._build_chapters(
                     (chapter,),
                     publish_if_clean=True,
-                    mode="topological",
+                    mode=mode,
                     iteration=min(attempts[chapter_id] + 1, maximum),
                     maximum_iterations=maximum,
                     stage=Stage.FIXUP,
@@ -1474,6 +1479,12 @@ class Orchestrator:
                     diagnostics or (chapter_id,),
                 )
             )
+            await self._save_fixup_graph(
+                graph,
+                clean,
+                build_generation=build_generation,
+                invalidated=invalidated_clean,
+            )
             return False
 
         try:
@@ -1505,60 +1516,42 @@ class Orchestrator:
 
         # Drafting deliberately skips Lean validation. Before spending an
         # agent slot on any resulting fixup feedback, optimistically build the
-        # complete selected closure once. A clean batch needs no fixup agent;
-        # a failed batch supplies the diagnostics for the ordinary
-        # dependency-ordered convergence loop below.
+        # complete selected closure once. Successful chapters can release
+        # review immediately, but no fixup agent starts until the whole pass
+        # has supplied its diagnostics.
         optimistic_ids = self._dependency_closure(graph, goals) if targeted else set(by_id)
-        optimistic = tuple(
-            by_id[chapter_id] for chapter_id in graph.order if chapter_id in optimistic_ids
-        )
-        snapshots: dict[str, ValidatedBuildSnapshot] = {}
-        results = await self._build_chapters(
-            optimistic,
-            publish_if_clean=True,
-            mode="optimistic",
-            iteration=1,
-            maximum_iterations=1,
-            stage=Stage.FIXUP,
-            priority=100.0,
-            snapshots=snapshots,
-        )
-        successful = {
-            chapter_id for chapter_id, result in results.items() if result.succeeded
-        }
-        for chapter_id in successful:
-            pending_feedback.pop(chapter_id, None)
-        diagnostics = self._build_feedback(results).actionable
-        merge_feedback(diagnostics)
-        invalidated_clean.update(
-            self._invalidate_fixup_descendants(graph, clean, diagnostics)
-        )
+        for chapter_id in graph.order:
+            if chapter_id not in optimistic_ids:
+                continue
+            if await build_chapter(chapter_id, graph, mode="optimistic"):
+                pending_feedback.pop(chapter_id, None)
 
-        if (
-            results
-            and all(result.succeeded for result in results.values())
-            and await self._publish_validated_builds(snapshots)
-        ):
-            persisted = self.state.fixup_graph.get("clean", {})
-            clean = self._retain_fixup_clean(
-                self._observed_chapter_graph(),
-                persisted if isinstance(persisted, dict) else {},
-            )
-            build_generation = int(self.state.fixup_graph.get("build_generation", 0))
-            invalidated_clean.difference_update(optimistic_ids)
-            completed = goals if targeted else set(by_id)
+        # A successful target can certify imported predecessors too. Reconcile
+        # all records after the pass before deciding whether any feedback still
+        # warrants an agent.
+        graph = self._observed_chapter_graph()
+        persisted = self.state.fixup_graph.get("clean", {})
+        clean = self._retain_fixup_clean(
+            graph,
+            persisted if isinstance(persisted, dict) else {},
+        )
+        optimistic_clean = optimistic_ids.intersection(clean)
+        for chapter_id in optimistic_clean:
+            pending_feedback.pop(chapter_id, None)
+        invalidated_clean.difference_update(optimistic_clean)
+        if optimistic_clean:
             await self.state.set_tasks(
-                completed,
+                optimistic_clean,
                 Stage.FIXUP,
                 TaskStatus.SUCCEEDED,
                 "clean optimistic coordinator build; no fixup agent needed",
             )
             if progress_event is not None:
                 progress_event.set()
-            if (targeted and goals.issubset(clean)) or (
-                not targeted and len(clean) == len(by_id)
-            ):
-                return True
+        if not pending_feedback and (
+            (targeted and goals.issubset(clean)) or (not targeted and len(clean) == len(by_id))
+        ):
+            return True
 
         try:
             while True:

@@ -990,11 +990,10 @@ async def test_fixup_rescans_new_import_before_rebuilding_edited_chapter(
     monkeypatch.setattr(scheduler_module, "validate", validation)
 
     assert await orchestrator.run_stage(Stage.FIXUP)
-    assert events[:5] == [
+    assert events[:4] == [
         f"build:{first.id}",
         f"build:{second.id}",
         f"agent:{first.id}",
-        f"build:{second.id}",
         f"build:{first.id}",
     ]
     assert state.fixup_graph["edges"] == [[second.id, first.id]]
