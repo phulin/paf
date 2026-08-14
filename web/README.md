@@ -9,10 +9,11 @@ npm install
 npm run dev
 ```
 
-Open `http://localhost:5173`. The overview refreshes `.swarm/*/state.json` every three seconds. The
-statement browser indexes `lean/LastLib/**/*.lean`, caches unchanged files, and refreshes edited
-files on subsequent searches. A bundled demo snapshot keeps the production bundle usable when it
-is served without repository filesystem access.
+Open `http://localhost:5173`. The header menu discovers every `.swarm/*/state.json`, puts currently
+running swarms first, and remembers the selected run. The overview refreshes that swarm every three
+seconds. The statement browser indexes `lean/LastLib/**/*.lean`, caches unchanged files, and
+refreshes edited files on subsequent searches. A bundled demo snapshot keeps the production bundle
+usable when it is served without repository filesystem access.
 
 Other commands:
 

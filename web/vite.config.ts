@@ -199,12 +199,19 @@ async function declarations(): Promise<IndexedDeclaration[]> {
   return declarationCache;
 }
 
-async function latestStatePath(): Promise<string | null> {
+interface SwarmCandidate {
+  id: string;
+  path: string;
+  modified: number;
+  state: Record<string, unknown>;
+}
+
+async function swarmCandidates(): Promise<SwarmCandidate[]> {
   let entries;
   try {
     entries = await fs.readdir(swarmRoot, { withFileTypes: true });
   } catch {
-    return null;
+    return [];
   }
   const candidates = await Promise.all(
     entries
@@ -212,17 +219,45 @@ async function latestStatePath(): Promise<string | null> {
       .map(async (entry) => {
         const statePath = path.join(swarmRoot, entry.name, "state.json");
         try {
-          return { path: statePath, stat: await fs.stat(statePath) };
+          const [stat, contents] = await Promise.all([
+            fs.stat(statePath),
+            fs.readFile(statePath, "utf8"),
+          ]);
+          return {
+            id: entry.name,
+            path: statePath,
+            modified: stat.mtimeMs,
+            state: JSON.parse(contents) as Record<string, unknown>,
+          };
         } catch {
           return null;
         }
       }),
   );
-  return (
-    candidates
-      .filter((candidate): candidate is NonNullable<typeof candidate> => Boolean(candidate))
-      .sort((left, right) => right.stat.mtimeMs - left.stat.mtimeMs)[0]?.path ?? null
-  );
+  return candidates
+    .filter((candidate): candidate is NonNullable<typeof candidate> => Boolean(candidate))
+    .sort((left, right) => right.modified - left.modified);
+}
+
+function swarmSummary(candidate: SwarmCandidate) {
+  const tasks = (candidate.state.tasks ?? {}) as Record<
+    string,
+    { status?: string; book_id?: string }
+  >;
+  const agents = (candidate.state.agents ?? {}) as Record<string, unknown>;
+  const build = (candidate.state.coordinator_build ?? {}) as Record<string, unknown>;
+  const activeAgents = Number(agents.active ?? 0);
+  return {
+    id: candidate.id,
+    active: activeAgents > 0 || build.active === true,
+    updated_at: String(candidate.state.updated_at ?? new Date(candidate.modified).toISOString()),
+    active_agents: activeAgents,
+    maximum_agents: Number(agents.maximum ?? 0),
+    queued_agents: Number(agents.queued ?? 0),
+    running_tasks: Object.values(tasks).filter((task) => task.status === "running").length,
+    task_count: Object.keys(tasks).length,
+    book_count: new Set(Object.values(tasks).map((task) => task.book_id).filter(Boolean)).size,
+  };
 }
 
 function json(response: ServerResponse, value: unknown, status = 200): void {
@@ -232,14 +267,32 @@ function json(response: ServerResponse, value: unknown, status = 200): void {
   response.end(JSON.stringify(value));
 }
 
-async function serveSwarm(response: ServerResponse): Promise<void> {
-  const statePath = await latestStatePath();
-  if (!statePath) {
+async function serveSwarms(response: ServerResponse): Promise<void> {
+  const candidates = await swarmCandidates();
+  json(response, {
+    swarms: candidates
+      .map(swarmSummary)
+      .sort((left, right) => Number(right.active) - Number(left.active) || right.updated_at.localeCompare(left.updated_at)),
+  });
+}
+
+async function serveSwarm(request: IncomingMessage, response: ServerResponse): Promise<void> {
+  const candidates = await swarmCandidates();
+  const url = new URL(request.url ?? "/api/swarm", "http://localhost");
+  const requested = url.searchParams.get("swarm");
+  const candidate = requested
+    ? candidates.find((item) => item.id === requested)
+    : candidates.find((item) => swarmSummary(item).active) ?? candidates[0];
+  if (!candidate) {
     json(response, { error: "No .swarm state found" }, 404);
     return;
   }
-  const state = JSON.parse(await fs.readFile(statePath, "utf8")) as Record<string, unknown>;
-  const stateDir = path.dirname(statePath);
+  if (requested && candidate.id !== requested) {
+    json(response, { error: `Unknown swarm: ${requested}` }, 404);
+    return;
+  }
+  const state = candidate.state;
+  const stateDir = path.dirname(candidate.path);
   const tasks = (state.tasks ?? {}) as Record<string, { latest_run_id?: string; updated_at?: string }>;
   const recentRuns = [...new Set(
     Object.values(tasks)
@@ -262,7 +315,8 @@ async function serveSwarm(response: ServerResponse): Promise<void> {
   );
   json(response, {
     ...state,
-    source: path.relative(repositoryRoot, statePath),
+    swarm_id: candidate.id,
+    source: path.relative(repositoryRoot, candidate.path),
     activities: Object.fromEntries(activityPairs.filter((pair) => pair !== null)),
   });
 }
@@ -313,8 +367,12 @@ async function serveStatements(request: IncomingMessage, response: ServerRespons
 function lastLibApi(): Plugin {
   const middleware = () => async (request: IncomingMessage, response: ServerResponse, next: () => void) => {
     try {
+      if (request.url?.startsWith("/api/swarms")) {
+        await serveSwarms(response);
+        return;
+      }
       if (request.url?.startsWith("/api/swarm")) {
-        await serveSwarm(response);
+        await serveSwarm(request, response);
         return;
       }
       if (request.url?.startsWith("/api/statements")) {

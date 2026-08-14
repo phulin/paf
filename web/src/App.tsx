@@ -41,6 +41,7 @@ import type {
   LeanStatement,
   Stage,
   StatementResponse,
+  SwarmSummary,
   SwarmState,
   Task,
   TaskStatus,
@@ -107,13 +108,26 @@ function StatusPill({ status = "pending", rounds }: { status?: TaskStatus; round
 
 function useSwarmState(live: boolean) {
   const [state, setState] = useState<SwarmState>(demoState);
+  const [swarms, setSwarms] = useState<SwarmSummary[]>([]);
+  const [selectedSwarm, setSelectedSwarm] = useState<string | null>(() =>
+    window.localStorage.getItem("lastlib.selectedSwarm"),
+  );
   const [connected, setConnected] = useState(false);
   const [fetching, setFetching] = useState(true);
 
   const refresh = useCallback(async () => {
     setFetching(true);
     try {
-      const response = await fetch("/api/swarm", { cache: "no-store" });
+      const listResponse = await fetch("/api/swarms", { cache: "no-store" });
+      if (!listResponse.ok) throw new Error(`swarm list endpoint returned ${listResponse.status}`);
+      const list = (await listResponse.json() as { swarms: SwarmSummary[] }).swarms;
+      setSwarms(list);
+      const target = list.some((swarm) => swarm.id === selectedSwarm)
+        ? selectedSwarm
+        : list.find((swarm) => swarm.active)?.id ?? list[0]?.id ?? null;
+      if (target !== selectedSwarm) setSelectedSwarm(target);
+      const params = target ? `?swarm=${encodeURIComponent(target)}` : "";
+      const response = await fetch(`/api/swarm${params}`, { cache: "no-store" });
       if (!response.ok) throw new Error(`state endpoint returned ${response.status}`);
       setState(await response.json() as SwarmState);
       setConnected(true);
@@ -122,6 +136,11 @@ function useSwarmState(live: boolean) {
     } finally {
       setFetching(false);
     }
+  }, [selectedSwarm]);
+
+  const selectSwarm = useCallback((swarmId: string) => {
+    window.localStorage.setItem("lastlib.selectedSwarm", swarmId);
+    setSelectedSwarm(swarmId);
   }, []);
 
   useEffect(() => {
@@ -131,7 +150,7 @@ function useSwarmState(live: boolean) {
     return () => window.clearInterval(timer);
   }, [live, refresh]);
 
-  return { state, connected, fetching, refresh };
+  return { state, swarms, selectedSwarm, selectSwarm, connected, fetching, refresh };
 }
 
 function IconButton({
@@ -160,6 +179,9 @@ function Header({
   connected,
   fetching,
   refresh,
+  swarms,
+  selectedSwarm,
+  selectSwarm,
 }: {
   view: View;
   setView: (view: View) => void;
@@ -168,6 +190,9 @@ function Header({
   connected: boolean;
   fetching: boolean;
   refresh: () => Promise<void>;
+  swarms: SwarmSummary[];
+  selectedSwarm: string | null;
+  selectSwarm: (swarmId: string) => void;
 }) {
   return (
     <header className="app-header">
@@ -178,6 +203,7 @@ function Header({
           <div className="brand-sub">FORMALIZATION OBSERVATORY</div>
         </div>
       </div>
+      <SwarmSwitcher swarms={swarms} selectedSwarm={selectedSwarm} onSelect={selectSwarm} />
       <nav className="top-nav" aria-label="Primary navigation">
         <button className={view === "overview" ? "active" : ""} onClick={() => setView("overview")}>
           <LayoutDashboard size={14} /> Overview
@@ -200,6 +226,98 @@ function Header({
         </IconButton>
       </div>
     </header>
+  );
+}
+
+function SwarmSwitcher({
+  swarms,
+  selectedSwarm,
+  onSelect,
+}: {
+  swarms: SwarmSummary[];
+  selectedSwarm: string | null;
+  onSelect: (swarmId: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const rootRef = useRef<HTMLDivElement>(null);
+  const selected = swarms.find((swarm) => swarm.id === selectedSwarm) ?? swarms[0];
+  const active = swarms.filter((swarm) => swarm.active);
+  const recent = swarms.filter((swarm) => !swarm.active);
+
+  useEffect(() => {
+    const close = (event: MouseEvent) => {
+      if (!rootRef.current?.contains(event.target as Node)) setOpen(false);
+    };
+    const escape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setOpen(false);
+    };
+    document.addEventListener("mousedown", close);
+    document.addEventListener("keydown", escape);
+    return () => {
+      document.removeEventListener("mousedown", close);
+      document.removeEventListener("keydown", escape);
+    };
+  }, []);
+
+  const choose = (swarmId: string) => {
+    onSelect(swarmId);
+    setOpen(false);
+  };
+
+  return (
+    <div className="swarm-switcher" ref={rootRef}>
+      <button className={`swarm-trigger ${open ? "open" : ""}`} onClick={() => setOpen(!open)} aria-expanded={open}>
+        <span className={`swarm-status-dot ${selected?.active ? "active" : ""}`} />
+        <span className="swarm-trigger-copy">
+          <small>Watching swarm</small>
+          <strong>{selected?.id ?? "demo-snapshot"}</strong>
+        </span>
+        {selected && <span className="swarm-agent-count">{selected.active_agents}<em>/{selected.maximum_agents}</em></span>}
+        <ChevronDown size={14} />
+      </button>
+      {open && (
+        <div className="swarm-menu">
+          <div className="swarm-menu-head">
+            <div><span className="eyebrow">Swarm processes</span><strong>{active.length} currently running</strong></div>
+            <Activity size={16} />
+          </div>
+          {active.length > 0 && <div className="swarm-menu-label">Running now</div>}
+          {active.map((swarm) => (
+            <SwarmMenuItem key={swarm.id} swarm={swarm} selected={swarm.id === selected?.id} onSelect={choose} />
+          ))}
+          {recent.length > 0 && <div className="swarm-menu-label recent">Recent state</div>}
+          {recent.map((swarm) => (
+            <SwarmMenuItem key={swarm.id} swarm={swarm} selected={swarm.id === selected?.id} onSelect={choose} />
+          ))}
+          {!swarms.length && <div className="swarm-menu-empty">Repository API unavailable</div>}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function SwarmMenuItem({
+  swarm,
+  selected,
+  onSelect,
+}: {
+  swarm: SwarmSummary;
+  selected: boolean;
+  onSelect: (swarmId: string) => void;
+}) {
+  return (
+    <button className={`swarm-menu-item ${selected ? "selected" : ""}`} onClick={() => onSelect(swarm.id)}>
+      <span className={`swarm-item-mark ${swarm.active ? "active" : ""}`}>{swarm.active ? <Play size={10} fill="currentColor" /> : <Pause size={10} />}</span>
+      <span className="swarm-item-copy">
+        <strong>{swarm.id}</strong>
+        <small>{swarm.book_count} books · {swarm.task_count} tasks · updated {timeAgo(swarm.updated_at)}</small>
+      </span>
+      <span className="swarm-item-agents">
+        <strong>{swarm.active_agents}</strong>
+        <small>agents</small>
+      </span>
+      {selected && <Check size={14} />}
+    </button>
   );
 }
 
@@ -783,7 +901,15 @@ function StatementBrowser({ close, connected }: { close: () => void; connected: 
 export default function App() {
   const [view, setView] = useState<View>(window.location.hash === "#statements" ? "statements" : "overview");
   const [live, setLive] = useState(true);
-  const { state, connected, fetching, refresh } = useSwarmState(live);
+  const {
+    state,
+    swarms,
+    selectedSwarm,
+    selectSwarm,
+    connected,
+    fetching,
+    refresh,
+  } = useSwarmState(live);
 
   const navigate = (next: View) => {
     setView(next);
@@ -803,7 +929,18 @@ export default function App() {
 
   return (
     <div className="app-shell">
-      <Header view={view} setView={navigate} live={live} setLive={setLive} connected={connected} fetching={fetching} refresh={refresh} />
+      <Header
+        view={view}
+        setView={navigate}
+        live={live}
+        setLive={setLive}
+        connected={connected}
+        fetching={fetching}
+        refresh={refresh}
+        swarms={swarms}
+        selectedSwarm={selectedSwarm}
+        selectSwarm={selectSwarm}
+      />
       <Rail view={view} setView={navigate} />
       {view === "overview"
         ? <Overview state={state} connected={connected} onBrowse={() => navigate("statements")} />

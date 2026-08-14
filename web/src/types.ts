@@ -38,6 +38,7 @@ export interface CoordinatorBuild {
 }
 
 export interface SwarmState {
+  swarm_id?: string;
   source: string;
   updated_at: string;
   usage: Usage;
@@ -57,6 +58,22 @@ export interface SwarmState {
   coordinator_build: CoordinatorBuild;
   tasks: Record<string, Task>;
   activities?: Record<string, AgentActivity>;
+}
+
+export interface SwarmSummary {
+  id: string;
+  active: boolean;
+  updated_at: string;
+  active_agents: number;
+  maximum_agents: number;
+  queued_agents: number;
+  running_tasks: number;
+  task_count: number;
+  book_count: number;
+}
+
+export interface SwarmListResponse {
+  swarms: SwarmSummary[];
 }
 
 export interface AgentActivity {
