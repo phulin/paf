@@ -3233,7 +3233,7 @@ async def test_review_finding_rebuilds_upstream_while_downstream_agents_drain(
     assert await asyncio.wait_for(review_tree, timeout=2)
     assert not downstream_cancelled.is_set()
     assert reviews[first.id] == 2
-    assert reviews[second.id] == 2
+    assert reviews[second.id] == 1
     assert reviews[third.id] == 1
     assert all(
         orchestrator.state.task(chapter.id, Stage.REVIEW).status == TaskStatus.SUCCEEDED
@@ -3243,7 +3243,7 @@ async def test_review_finding_rebuilds_upstream_while_downstream_agents_drain(
 
 
 @pytest.mark.asyncio
-async def test_invalidated_review_blocks_new_descendant_proofs_until_green(
+async def test_invalidated_review_allows_descendant_proofs_to_run_optimistically(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     project = write_project(tmp_path, chapters="chapters = [1, 2, 3]")
@@ -3282,6 +3282,7 @@ async def test_invalidated_review_blocks_new_descendant_proofs_until_green(
     upstream_review_started = asyncio.Event()
     release_upstream_review = asyncio.Event()
     proofs_started: list[str] = []
+    descendant_proofs_started = asyncio.Event()
 
     async def review(
         chapter: Chapter,
@@ -3296,6 +3297,8 @@ async def test_invalidated_review_blocks_new_descendant_proofs_until_green(
     async def prove(chapter: Chapter, *, defer_review: bool = False) -> bool:
         assert defer_review
         proofs_started.append(chapter.id)
+        if {second.id, third.id}.issubset(proofs_started):
+            descendant_proofs_started.set()
         return True
 
     monkeypatch.setattr(orchestrator, "_review_chapter_to_clean", review)
@@ -3303,13 +3306,157 @@ async def test_invalidated_review_blocks_new_descendant_proofs_until_green(
 
     review_tree = asyncio.create_task(orchestrator._review_tree(prove=True))
     await asyncio.wait_for(upstream_review_started.wait(), timeout=2)
-    for _ in range(5):
-        await asyncio.sleep(0)
-    assert proofs_started == []
+    await asyncio.wait_for(descendant_proofs_started.wait(), timeout=2)
+    assert set(proofs_started) == {second.id, third.id}
 
     release_upstream_review.set()
     assert await asyncio.wait_for(review_tree, timeout=2)
     assert set(proofs_started) == {first.id, second.id, third.id}
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_initial_review_waits_for_transitive_review_dependencies(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = write_project(tmp_path, chapters="chapters = [1, 2, 3]")
+    book = tmp_path / "books" / "book.md"
+    book.write_text(
+        book.read_text(encoding="utf-8") + "\n## 3. Third chapter\n",
+        encoding="utf-8",
+    )
+    config = with_lastlib_modules(load_config(project))
+    first, second, third = config.chapters
+    source_root = tmp_path / "lean" / "Book"
+    source_root.mkdir(parents=True)
+    (source_root / "Chapter01.lean").write_text("def first := 1\n", encoding="utf-8")
+    (source_root / "Chapter02.lean").write_text(
+        "import LastLib.Book.Chapter01\ndef second := first + 1\n",
+        encoding="utf-8",
+    )
+    (source_root / "Chapter03.lean").write_text(
+        "import LastLib.Book.Chapter02\ndef third := second + 1\n",
+        encoding="utf-8",
+    )
+    orchestrator = Orchestrator(config, StateStore(config))
+    await orchestrator.prepare()
+    await orchestrator.state.set_task(
+        second.id,
+        Stage.REVIEW,
+        TaskStatus.SUCCEEDED,
+        "locally reviewed",
+    )
+    first_review = orchestrator.state.task(first.id, Stage.REVIEW)
+    first_review.rounds = 1
+    await orchestrator.state.set_task(
+        first.id,
+        Stage.REVIEW,
+        TaskStatus.PENDING,
+        "re-review requested",
+    )
+
+    rereview_started = asyncio.Event()
+    release_rereview = asyncio.Event()
+    initial_review_started = asyncio.Event()
+
+    async def review(
+        chapter: Chapter,
+        _rounds_used: dict[str, int],
+        **_kwargs: object,
+    ) -> bool:
+        if chapter.id == first.id:
+            rereview_started.set()
+            await release_rereview.wait()
+        elif chapter.id == third.id:
+            initial_review_started.set()
+        else:
+            raise AssertionError(f"unexpected review for {chapter.id}")
+        return True
+
+    monkeypatch.setattr(orchestrator, "_review_chapter_to_clean", review)
+
+    review_tree = asyncio.create_task(orchestrator._review_tree())
+    await asyncio.wait_for(rereview_started.wait(), timeout=2)
+    for _ in range(5):
+        await asyncio.sleep(0)
+    assert not initial_review_started.is_set()
+
+    release_rereview.set()
+    assert await asyncio.wait_for(review_tree, timeout=2)
+    assert initial_review_started.is_set()
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_dirty_rebuilds_wait_only_for_an_agent_on_the_same_chapter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = with_lastlib_modules(
+        load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    )
+    first, second = config.chapters
+    source_root = tmp_path / "lean" / "Book"
+    source_root.mkdir(parents=True)
+    (source_root / "Chapter01.lean").write_text("def first := 1\n", encoding="utf-8")
+    (source_root / "Chapter02.lean").write_text(
+        "import LastLib.Book.Chapter01\ndef second := first + 1\n",
+        encoding="utf-8",
+    )
+    orchestrator = Orchestrator(config, StateStore(config))
+    await orchestrator.prepare()
+    for chapter in config.chapters:
+        await orchestrator.state.set_task(
+            chapter.id,
+            Stage.REVIEW,
+            TaskStatus.SUCCEEDED,
+            "reviewed",
+        )
+    orchestrator.state.task(first.id, Stage.REVIEW).rounds = 1
+    await orchestrator.state.set_task(
+        first.id,
+        Stage.REVIEW,
+        TaskStatus.PENDING,
+        "re-review requested",
+    )
+    orchestrator.state.fixup_graph["dirty"] = [first.id, second.id]
+    await orchestrator.state.save()
+
+    rereview_started = asyncio.Event()
+    release_rereview = asyncio.Event()
+    second_rebuilt = asyncio.Event()
+    rebuilt: list[str] = []
+
+    async def review(
+        chapter: Chapter,
+        _rounds_used: dict[str, int],
+        **_kwargs: object,
+    ) -> bool:
+        assert chapter.id == first.id
+        rereview_started.set()
+        await release_rereview.wait()
+        return True
+
+    async def rebuild(chapter: Chapter) -> bool:
+        rebuilt.append(chapter.id)
+        dirty = set(orchestrator.state.fixup_graph.get("dirty", ()))
+        dirty.discard(chapter.id)
+        orchestrator.state.fixup_graph["dirty"] = sorted(dirty)
+        await orchestrator.state.save()
+        if chapter.id == second.id:
+            second_rebuilt.set()
+        return True
+
+    monkeypatch.setattr(orchestrator, "_review_chapter_to_clean", review)
+    monkeypatch.setattr(orchestrator, "_rebuild_dirty_chapter", rebuild)
+
+    review_tree = asyncio.create_task(orchestrator._review_tree())
+    await asyncio.wait_for(rereview_started.wait(), timeout=2)
+    await asyncio.wait_for(second_rebuilt.wait(), timeout=2)
+    assert rebuilt == [second.id]
+
+    release_rereview.set()
+    assert await asyncio.wait_for(review_tree, timeout=2)
+    assert rebuilt == [second.id, first.id]
     await orchestrator.shutdown()
 
 
@@ -3325,6 +3472,20 @@ async def test_proof_finding_requeues_only_its_review_branch(
     reviews = 0
     proofs = 0
     review_feedback: list[str] = []
+    build_invalidations: list[tuple[str, ...]] = []
+    original_invalidate_build_records = orchestrator._invalidate_build_records
+
+    async def invalidate_build_records(chapter_ids: Iterable[str]) -> set[str]:
+        targets = tuple(chapter_ids)
+        build_invalidations.append(targets)
+        return await original_invalidate_build_records(targets)
+
+    async def rebuild_dirty_chapter(rebuilt: Chapter) -> bool:
+        dirty = set(state.fixup_graph.get("dirty", ()))
+        dirty.discard(rebuilt.id)
+        state.fixup_graph["dirty"] = sorted(dirty)
+        await state.save()
+        return True
 
     async def review(
         _chapter: Chapter,
@@ -3365,11 +3526,14 @@ async def test_proof_finding_requeues_only_its_review_branch(
 
     monkeypatch.setattr(orchestrator, "_review_chapter_to_clean", review)
     monkeypatch.setattr(orchestrator, "_prove", prove)
+    monkeypatch.setattr(orchestrator, "_invalidate_build_records", invalidate_build_records)
+    monkeypatch.setattr(orchestrator, "_rebuild_dirty_chapter", rebuild_dirty_chapter)
 
     assert await orchestrator._review_tree(prove=True)
     assert (reviews, proofs) == (2, 2)
     assert review_feedback[0] == ""
     assert "statement needs a hypothesis" in review_feedback[1]
+    assert build_invalidations == [(chapter.id,)]
     assert state.fixup_requests == {}
     assert state.proof_review_requests == {}
     assert state.task(chapter.id, Stage.REVIEW).status == TaskStatus.SUCCEEDED

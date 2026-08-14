@@ -436,20 +436,6 @@ class Orchestrator:
                     pending.append(successor)
         return affected
 
-    @staticmethod
-    def _dependency_closed_chapters(
-        graph: ChapterImportGraph,
-        chapter_ids: Iterable[str],
-    ) -> set[str]:
-        """Keep chapters whose entire observed import ancestry is present."""
-
-        candidates = set(chapter_ids)
-        closed: set[str] = set()
-        for chapter_id in graph.order:
-            if chapter_id in candidates and graph.dependencies[chapter_id].issubset(closed):
-                closed.add(chapter_id)
-        return closed
-
     async def _publish_validated_builds(
         self,
         snapshots: dict[str, ValidatedBuildSnapshot],
@@ -510,6 +496,7 @@ class Orchestrator:
                 graph,
                 clean,
                 build_generation=build_generation,
+                validated=required,
             )
             return True
 
@@ -553,9 +540,11 @@ class Orchestrator:
         *,
         build_generation: int,
         invalidated: Iterable[str] = (),
+        validated: Iterable[str] = (),
     ) -> int:
         async with self._fixup_graph_lock:
             explicitly_invalidated = set(invalidated)
+            explicitly_validated = set(validated)
             previous = self.state.fixup_graph
             previous_edges = previous.get("edges") if isinstance(previous, dict) else None
             current = previous.get("clean", {}) if isinstance(previous, dict) else {}
@@ -584,10 +573,14 @@ class Orchestrator:
                 build_generation,
                 int(previous.get("build_generation", 0)) if isinstance(previous, dict) else 0,
             )
+            dirty = set(previous.get("dirty", ())) if isinstance(previous, dict) else set()
+            dirty.update(explicitly_invalidated)
+            dirty.difference_update(explicitly_validated)
             self.state.fixup_graph = graph.snapshot() | {
                 "revision": revision,
                 "build_generation": build_generation,
                 "clean": clean,
+                "dirty": sorted(dirty),
             }
             await self.state.save()
             return revision
@@ -890,10 +883,13 @@ class Orchestrator:
         targets = {chapter.id, *routed}
         if not created:
             return targets
-        return await self._invalidate_reviews(
+        invalidated_reviews = await self._invalidate_reviews(
             targets,
             detail="review invalidated by failed-proof findings",
         )
+        invalidated_builds = await self._invalidate_build_records(targets)
+        self._proof_rechecks.update(invalidated_builds)
+        return invalidated_reviews
 
     def _has_completed_green_review(self, chapter_id: str) -> bool:
         """Whether history contains a completed no-change review pass."""
@@ -2300,7 +2296,7 @@ class Orchestrator:
         feedback: str = "",
         proof_request_ids: tuple[str, ...] = (),
     ) -> bool:
-        """Run at most five edit/rebuild cycles for one dependency-ready chapter."""
+        """Run at most five edit/rebuild cycles for one reviewable chapter."""
 
         review_generation = self._review_invalidation_generation(chapter.id)
         if self.state.task(chapter.id, Stage.REVIEW).status == TaskStatus.SUCCEEDED:
@@ -2324,15 +2320,6 @@ class Orchestrator:
                 block = items[chapter.id]
                 if block not in review_feedback:
                     review_feedback = f"{review_feedback}\n\n{block}" if review_feedback else block
-            external = set(items).difference({chapter.id})
-            if chapter.id in self._successor_closure(graph, external) if external else False:
-                await self.state.set_task(
-                    chapter.id,
-                    Stage.REVIEW,
-                    TaskStatus.PENDING,
-                    "waiting for prerequisite follow-up reviews",
-                )
-                return False
             if chapter.id in items:
                 await self.state.set_task(
                     chapter.id,
@@ -2345,7 +2332,7 @@ class Orchestrator:
         persisted = self.state.fixup_graph.get("clean", {})
         records = persisted if isinstance(persisted, dict) else {}
         was_clean = chapter.id in self._retain_fixup_clean(graph, records)
-        if not was_clean:
+        if not was_clean and not rerun:
             build_feedback = await self._review_build(chapter)
             if build_feedback and not await route_feedback(
                 build_feedback,
@@ -2475,16 +2462,17 @@ class Orchestrator:
         attempted: set[str] = set()
         rounds_used = {chapter_id: 0 for chapter_id in by_id}
         review_tasks: dict[str, RunningReview] = {}
+        rebuild_tasks: dict[str, asyncio.Task[bool]] = {}
         proof_tasks: dict[str, asyncio.Task[bool]] = {}
+        failed_rebuilds: set[str] = set()
         persisted_clean = self.state.fixup_graph.get("clean", {})
         clean = self._retain_fixup_clean(
             initial_graph,
             persisted_clean if isinstance(persisted_clean, dict) else {},
         )
-        green = self._dependency_closed_chapters(initial_graph, reviewed)
         proof_results = {
             chapter_id: True
-            for chapter_id in green
+            for chapter_id in reviewed
             if (
                 self.state.task(chapter_id, Stage.PROVE).status == TaskStatus.SUCCEEDED
                 and isinstance(clean.get(chapter_id), dict)
@@ -2526,7 +2514,10 @@ class Orchestrator:
                             "waiting for clean initial fixup",
                         )
                     else:
-                        missing = initial_graph.dependencies[chapter_id].difference(reviewed)
+                        required_reviews = self._dependency_closure(
+                            initial_graph, (chapter_id,)
+                        ).difference({chapter_id})
+                        missing = required_reviews.difference(reviewed)
                         if missing:
                             await self.state.set_task(
                                 chapter_id,
@@ -2543,7 +2534,9 @@ class Orchestrator:
                     )
 
         async def cancel_all() -> None:
-            tasks = [handle.task for handle in review_tasks.values()] + list(proof_tasks.values())
+            tasks = [handle.task for handle in review_tasks.values()]
+            tasks.extend(rebuild_tasks.values())
+            tasks.extend(proof_tasks.values())
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
@@ -2612,18 +2605,18 @@ class Orchestrator:
                 # direct findings. Source edits separately trigger build rechecks.
                 reviewed.difference_update(self._invalidated_reviews)
                 self._invalidated_reviews.clear()
-                pending_rechecks = set(self._proof_rechecks)
+                new_rechecks = set(self._proof_rechecks)
                 self._proof_rechecks.clear()
-                for chapter_id in pending_rechecks:
+                failed_rebuilds.difference_update(new_rechecks)
+                dirty_value = self.state.fixup_graph.get("dirty", ())
+                dirty_builds = set(dirty_value) if isinstance(dirty_value, list) else set()
+                for chapter_id in dirty_builds:
                     proof_results.pop(chapter_id, None)
-                    if chapter_id in proof_tasks:
-                        self._proof_rechecks.add(chapter_id)
                 reviewed.update(
                     chapter_id
                     for chapter_id in by_id
                     if self.state.task(chapter_id, Stage.REVIEW).status == TaskStatus.SUCCEEDED
                 )
-                green = self._dependency_closed_chapters(graph, reviewed)
                 for chapter_id in tuple(proof_results):
                     if chapter_id not in reviewed:
                         proof_results.pop(chapter_id, None)
@@ -2657,27 +2650,39 @@ class Orchestrator:
                                 )
 
                 for chapter_id in graph.order:
+                    review_task = self.state.task(chapter_id, Stage.REVIEW)
+                    rereview = chapter_id in attempted or review_task.rounds > 0 or rerun
+                    required_reviews = self._dependency_closure(
+                        graph, (chapter_id,)
+                    ).difference({chapter_id})
                     if (
                         chapter_id not in reviewed
                         and chapter_id not in review_failures
                         and chapter_id not in review_blocked
                         and chapter_id not in review_tasks
-                        and fixup_ready(chapter_id)
-                        and graph.dependencies[chapter_id].issubset(green)
+                        and chapter_id not in proof_tasks
+                        and chapter_id not in rebuild_tasks
+                        and (rereview or fixup_ready(chapter_id))
+                        and (rereview or required_reviews.issubset(reviewed))
                     ):
                         dependencies = graph.dependencies[chapter_id]
                         proof_feedback, proof_request_ids = self._proof_review_feedback(chapter_id)
+                        review_rerun = rerun or chapter_id in attempted or review_task.rounds > 0
                         await self.state.set_task(
                             chapter_id,
                             Stage.REVIEW,
                             TaskStatus.RUNNING,
-                            "waiting for dependency-ordered coordinator build",
+                            (
+                                "targeted re-review queued"
+                                if rereview
+                                else "waiting for dependency-ordered coordinator build"
+                            ),
                         )
                         review_operation = (
                             self._review_chapter_to_clean(
                                 by_id[chapter_id],
                                 rounds_used,
-                                rerun=rerun or chapter_id in attempted,
+                                rerun=review_rerun,
                                 feedback=proof_feedback,
                                 proof_request_ids=proof_request_ids,
                             )
@@ -2685,7 +2690,7 @@ class Orchestrator:
                             else self._review_chapter_to_clean(
                                 by_id[chapter_id],
                                 rounds_used,
-                                rerun=rerun or chapter_id in attempted,
+                                rerun=review_rerun,
                             )
                         )
                         review_tasks[chapter_id] = RunningReview(
@@ -2695,11 +2700,26 @@ class Orchestrator:
                         )
                         attempted.add(chapter_id)
 
+                for chapter_id in graph.order:
+                    if (
+                        chapter_id in dirty_builds
+                        and chapter_id not in failed_rebuilds
+                        and chapter_id not in review_tasks
+                        and chapter_id not in proof_tasks
+                        and chapter_id not in rebuild_tasks
+                        and fixup_ready(chapter_id)
+                    ):
+                        rebuild_tasks[chapter_id] = asyncio.create_task(
+                            self._rebuild_dirty_chapter(by_id[chapter_id])
+                        )
+
                 if prove:
-                    for chapter_id in green:
+                    for chapter_id in reviewed:
                         if (
                             chapter_id not in proof_results
                             and chapter_id not in proof_tasks
+                            and chapter_id not in review_tasks
+                            and chapter_id not in rebuild_tasks
                             and fixup_ready(chapter_id)
                         ):
                             proof_tasks[chapter_id] = asyncio.create_task(
@@ -2707,6 +2727,7 @@ class Orchestrator:
                             )
 
                 live_tasks = [handle.task for handle in review_tasks.values()]
+                live_tasks.extend(rebuild_tasks.values())
                 live_tasks.extend(proof_tasks.values())
                 progress_waiter: asyncio.Task[bool] | None = None
                 if fixup is not None and not fixup.task.done():
@@ -2775,6 +2796,14 @@ class Orchestrator:
                             proof_request_ids=handle.proof_request_ids,
                         )
                     reviewed.add(chapter_id)
+
+                completed_rebuilds = [
+                    chapter_id for chapter_id, task in rebuild_tasks.items() if task in done
+                ]
+                for chapter_id in completed_rebuilds:
+                    succeeded = rebuild_tasks.pop(chapter_id).result()
+                    if not succeeded:
+                        failed_rebuilds.add(chapter_id)
 
                 completed_proofs = [
                     chapter_id for chapter_id, task in proof_tasks.items() if task in done
@@ -2859,6 +2888,22 @@ class Orchestrator:
                 "Source scope changed after the coordinator build; retry required.",
             )
         return validation
+
+    async def _rebuild_dirty_chapter(self, chapter: Chapter) -> bool:
+        """Refresh one invalidated exact build while its chapter has no agent."""
+
+        validation = await self._refresh_stale_proof_build(chapter)
+        await self.state.set_task(
+            chapter.id,
+            Stage.PROVE,
+            TaskStatus.PENDING,
+            (
+                "dependency-sensitive coordinator rebuild completed"
+                if validation.succeeded
+                else "dependency-sensitive coordinator rebuild failed"
+            ),
+        )
+        return validation.succeeded
 
     async def _prove(self, chapter: Chapter, *, defer_review: bool = False) -> bool:
         initial_feedback = ""
