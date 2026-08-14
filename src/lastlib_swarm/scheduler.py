@@ -157,7 +157,6 @@ LAKE_CONTROL_PREFIXES = (
 )
 PROOF_FEEDBACK_MAX_CHARS = 24_000
 PROOF_FEEDBACK_ROUNDS = 3
-BUILD_COALESCE_SECONDS = 0.01
 
 
 def _bounded_proof_feedback(blocks: Iterable[str]) -> str:
@@ -1043,7 +1042,7 @@ class Orchestrator:
     async def _dispatch_build_requests(self) -> None:
         """Let concurrent callers enqueue, then launch one shared build transaction."""
 
-        await asyncio.sleep(BUILD_COALESCE_SECONDS)
+        await asyncio.sleep(0)
         requests = tuple(
             request for request in self._pending_build_requests if not request.future.cancelled()
         )
@@ -1358,7 +1357,9 @@ class Orchestrator:
             finally:
                 try:
                     if progress_flush is not None:
-                        await progress_flush
+                        if not progress_flush.done():
+                            progress_flush.cancel()
+                        await asyncio.gather(progress_flush, return_exceptions=True)
                     if build_workspace is not None:
                         await build_workspace.close()
                     if source_held:

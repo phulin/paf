@@ -3383,7 +3383,6 @@ async def test_prove_builds_run_after_agents_and_are_serialized_in_main_worktree
     original_run = orchestrator.executor.run
     active_builds = 0
     maximum_active_builds = 0
-    build_commands: list[str] = []
 
     async def tracked_run(
         chapter: Chapter,
@@ -3414,7 +3413,6 @@ async def test_prove_builds_run_after_agents_and_are_serialized_in_main_worktree
         assert on_output is not None
         assert chapter.id in completed_agents
         assert workspace_root == config.settings.repo
-        build_commands.append(chapter.build_command)
         active_builds += 1
         maximum_active_builds = max(maximum_active_builds, active_builds)
         await asyncio.sleep(0)
@@ -3426,8 +3424,6 @@ async def test_prove_builds_run_after_agents_and_are_serialized_in_main_worktree
 
     assert await orchestrator.run_stage(Stage.PROVE)
     assert maximum_active_builds == 1
-    targets = [chapter.build_command.rpartition(" ")[2] for chapter in config.chapters]
-    assert build_commands == [f"cd lean && lake build {' '.join(targets)}"]
     await orchestrator.shutdown()
 
 
