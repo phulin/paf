@@ -17,14 +17,14 @@ flowchart LR
     I --> C{Source and dependencies already built?}
     C -->|no| B[Build dependency-ready chapter]
     C -->|yes| G{Review already succeeded?}
-    B -->|actionable diagnostics| X[Ready fixup agents with MCP]
+    B -->|initial build diagnostics| X[Fixup agents with MCP]
     X -->|patch merged| I
     B -->|clean| G
     G -->|no| R[Editing review]
     G -->|yes| P[Prove or revalidate proof]
-    R -->|changed or findings| I
+    R -->|changed, findings, or build failure| R
     R -->|succeeded| P
-    P -->|statement/API problem; reopen affected reviews| X
+    P -->|statement/API problem; reopen affected reviews| R
     P -->|no placeholders + Lean valid| D[Done]
 ```
 
@@ -37,11 +37,11 @@ rebuilds it once its refined predecessors are clean; unrelated agents keep runni
 build immediately releases its review. The coordinator remembers the source and dependency digests
 of successful builds so it can avoid rebuilding unchanged chapters. Review has no separate green
 flag: a successful review task is the whole state. Restarts and ordinary proof-body edits leave it
-succeeded; explicit review findings, proof-requested statement/API fixups, and forced review reopen
+succeeded; explicit review findings, proof-requested statement/API repairs, and forced review reopen
 the affected review/proof closure. Reviewers directly make scoped statement and
-API repairs. Each dependency-ready chapter receives a prioritized coordinator verification build
-after a changed review and is sent through fixup only if that build fails. Clean verification requests
-join the live build scheduler instead of waiting behind an unrelated repair batch. After at most five
+API repairs. Fixup ends once the initial post-draft build has converged. Each dependency-ready chapter
+receives a prioritized coordinator verification build after a changed review; failures and structured
+findings return to review with the diagnostics attached. After at most five
 such cycles—or immediately after a no-change review—the chapter is
 released to proving without waiting for reviews of its descendants.
 Every review prompt begins with the complete informal book and assigned Lean file set in path order
@@ -277,21 +277,21 @@ After the daemon exits, `status`, `snapshot`, and `wait` fall back to the persis
   fixup prompts. Agents treat that feedback as starting evidence, read only the implicated context,
   and let fresh MCP diagnostics account for prerequisite repairs that made an old diagnostic stale.
   A failure mentioning a scope whose formalizer is still active is deferred rather than assigned
-  prematurely. Completed scopes cycle through build and fixup while other drafts run; the standalone
-  fixup stage ends with a stable full-corpus build. The pipeline reuses successful unchanged builds
-  and targets only each dependency-ready review's invalid build closure. This repeats
+  prematurely. Completed scopes cycle through build and fixup during the initial post-draft pass; the
+  standalone fixup stage and the pipeline's initial fixup phase end with a stable full-corpus build.
+  Once review begins, this stage is never re-entered. Initial convergence repeats
   up to `max_rounds`, allowing `declaration uses sorry` but rejecting other warnings.
 - **Review** visits dependency-ready chapters against a clean source and `.olean` generation. Agents
   make warranted in-scope statement and API changes directly; unresolved findings retain exact edit
   paths and are routed to their owners. The last clean coordinator build remains authoritative for
   files a reviewer does not edit. Reviewers request whole-file LSP diagnostics after the last relevant
   edit only for the edited files and their assigned transitive dependents, rechecking just the files
-  invalidated by any subsequent repair. A changed chapter enters `verification queued`, then a
-  prioritized coordinator build. Only a failed build or structured `fixup_findings` starts a fixup
-  agent. Clean verification does not wait for an unrelated active repair batch.
+  invalidated by any subsequent repair. A changed chapter receives a prioritized coordinator build.
+  Failed builds and structured `fixup_findings` are fed to full-scope review agents for the owning
+  chapters; they never reopen fixup.
   Review/verification repeats up to five times and stops early on a no-change review. Once a chapter is
   clean, its proof agent may start while descendant reviews
-  continue. A reported chapter-local failure is quarantined: unrelated review, fixup, and proof
+  continue. A reported chapter-local failure is quarantined: unrelated review and proof
   branches keep running, while actual dependents are marked blocked. Unexpected coordinator
   exceptions still fail fast after draining live workers. There is no corpus-wide clean-build or
   review gate in the pipeline. Successful completion leaves the review task `succeeded`. An explicit
@@ -309,8 +309,8 @@ After the daemon exits, `status`, `snapshot`, and `wait` fall back to the persis
   validation uses the same visible coordinator-build record at lower priority; it never holds the
   build queue while the proof agent edits, takes a snapshot, or merges its scoped patch.
 - A proof agent may change proof bodies but not declaration interfaces. A genuine statement/API
-  problem is reported through a structured `fixup_findings` entry; the pipeline returns through
-  fixup and editing review before proving resumes.
+  problem is reported through a structured `fixup_findings` entry; despite the legacy field name,
+  the pipeline returns directly to editing review before proving resumes.
 
 The orchestrator independently hashes every configured chapter scope. Agent claims about changes do
 not control review convergence. Lean placeholder scanning ignores comments and strings. The strict

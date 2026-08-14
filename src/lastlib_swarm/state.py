@@ -397,7 +397,7 @@ class StateStore:
         cost = self.total_cost()
         invocation_cost = self.invocation_cost()
         return {
-            "version": 10,
+            "version": 11,
             "history_database": DATABASE_NAME,
             "config": str(self.config.path),
             "created_at": self.created_at,
@@ -520,6 +520,70 @@ class StateStore:
         if changed:
             self._mark_dirty()
             await self._persist()
+
+    async def migrate_post_review_fixups(self) -> set[str]:
+        """Move legacy post-review repair requests back to the review queue."""
+
+        migrated: set[str] = set()
+        if not self.fixup_requests:
+            return migrated
+        async with self.batch():
+            for request_id, value in tuple(self.fixup_requests.items()):
+                if not isinstance(value, dict):
+                    self.fixup_requests.pop(request_id, None)
+                    continue
+                raw_feedback = value.get("feedback")
+                feedback = (
+                    {
+                        chapter_id: block
+                        for chapter_id, block in raw_feedback.items()
+                        if isinstance(chapter_id, str) and isinstance(block, str) and block.strip()
+                    }
+                    if isinstance(raw_feedback, dict)
+                    else {}
+                )
+                raw_targets = value.get("target_ids")
+                targets = (
+                    {chapter_id for chapter_id in raw_targets if isinstance(chapter_id, str)}
+                    if isinstance(raw_targets, list)
+                    else set()
+                )
+                targets.update(feedback)
+                targets = {
+                    chapter_id
+                    for chapter_id in targets
+                    if self.key(chapter_id, Stage.REVIEW) in self.tasks
+                }
+                for chapter_id in targets:
+                    feedback.setdefault(
+                        chapter_id,
+                        "Re-review this chapter: post-review repair work was incorrectly queued "
+                        "as fixup.",
+                    )
+                if feedback:
+                    await self.enqueue_proof_review_request(
+                        feedback,
+                        origin_run_id=f"legacy-review-fixup:{request_id}",
+                        request_id=request_id,
+                    )
+                self.fixup_requests.pop(request_id, None)
+                migrated.update(targets)
+            for chapter_id in migrated:
+                await self.set_task(
+                    chapter_id,
+                    Stage.FIXUP,
+                    TaskStatus.SUCCEEDED,
+                    "initial fixup complete; later findings moved to review",
+                )
+                await self.set_task(
+                    chapter_id,
+                    Stage.REVIEW,
+                    TaskStatus.PENDING,
+                    "recovered post-review findings",
+                )
+            self._mark_dirty()
+            await self._persist()
+        return migrated
 
     async def enqueue_proof_review_request(
         self,

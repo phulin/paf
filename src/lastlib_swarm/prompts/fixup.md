@@ -27,7 +27,7 @@ source-issue comment in Lean.
 
 ## Workflow
 
-1. Read all appended Lake diagnostics and review findings before editing.
+1. Read all appended diagnostics from the initial post-draft build before editing.
 2. Identify which reported failures are owned by the assigned scope.
 3. Visit files in their observed import order. Treat the coordinator feedback as the initial
    diagnostic pass: do not request diagnostics merely because you entered or switched files.

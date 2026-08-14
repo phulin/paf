@@ -18,7 +18,7 @@ the formalization is source-faithful, mathematically provable, proof-ready, and 
 make the minimal warranted changes in the assigned scope. The snapshot starts clean; the coordinator
 has already built every assigned file with no diagnostic except permitted `sorry` warnings.
 Treat that clean baseline as authoritative for files you do not edit. The coordinator will rebuild your
-patch and route any compiler-only failures through fixup.
+patch and return any compiler failures to a follow-up review pass.
 
 ## Review standard
 

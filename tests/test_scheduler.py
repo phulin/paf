@@ -1,7 +1,7 @@
 import asyncio
 import json
 import sqlite3
-from collections.abc import Callable, Iterable
+from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -231,7 +231,7 @@ async def test_state_persists_fixup_graph(tmp_path: Path) -> None:
     await reloaded.load_or_create()
 
     assert reloaded.fixup_graph == state.fixup_graph
-    assert reloaded.snapshot()["version"] == 10
+    assert reloaded.snapshot()["version"] == 11
 
 
 @pytest.mark.asyncio
@@ -337,7 +337,7 @@ async def test_hot_checkpoint_does_not_grow_with_run_payload_history(tmp_path: P
 
     hot = json.loads(state.path.read_text(encoding="utf-8"))
     task = hot["tasks"][f"{config.chapters[0].id}:formalize"]
-    assert hot["version"] == 10
+    assert hot["version"] == 11
     assert "source_issues" not in hot
     assert "runs" not in task
     assert task["run_count"] == 25
@@ -694,125 +694,7 @@ async def test_targeted_fixup_does_not_build_cleanliness_descendants(
 
 
 @pytest.mark.asyncio
-async def test_concurrent_fixup_requests_share_one_repair_pass(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
-    first, second = config.chapters
-    orchestrator = Orchestrator(config, StateStore(config))
-    await orchestrator.prepare()
-    calls: list[tuple[dict[str, str] | None, set[str]]] = []
-
-    async def fixup(
-        feedback: dict[str, str] | None = None,
-        *,
-        target_ids: object = None,
-    ) -> bool:
-        assert isinstance(target_ids, set)
-        calls.append((feedback, target_ids))
-        return True
-
-    monkeypatch.setattr(orchestrator, "_fixup_to_clean", fixup)
-
-    assert all(
-        await asyncio.gather(
-            orchestrator._request_fixup({first.id: "first"}, target_ids={first.id}),
-            orchestrator._request_fixup({second.id: "second"}, target_ids={second.id}),
-        )
-    )
-    assert calls == [({first.id: "first", second.id: "second"}, {first.id, second.id})]
-    await orchestrator.shutdown()
-
-
-@pytest.mark.asyncio
-async def test_batched_fixup_requests_resolve_from_their_own_goal_closures(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
-    first, second = config.chapters
-    orchestrator = Orchestrator(config, StateStore(config))
-    await orchestrator.prepare()
-
-    async def partially_failed_fixup(
-        _feedback: dict[str, str] | None = None,
-        *,
-        target_ids: object = None,
-    ) -> bool:
-        assert target_ids == {first.id, second.id}
-        return False
-
-    def goals_are_clean(goal_ids: Iterable[str]) -> bool:
-        return set(goal_ids) == {first.id}
-
-    monkeypatch.setattr(orchestrator, "_fixup_to_clean", partially_failed_fixup)
-    monkeypatch.setattr(orchestrator, "_fixup_goals_are_clean", goals_are_clean)
-
-    first_result, second_result = await asyncio.gather(
-        orchestrator._request_fixup({first.id: "first"}, target_ids={first.id}),
-        orchestrator._request_fixup({second.id: "second"}, target_ids={second.id}),
-    )
-
-    assert first_result is True
-    assert second_result is False
-    await orchestrator.shutdown()
-
-
-@pytest.mark.asyncio
-async def test_fixup_request_is_visible_and_durable_while_another_batch_runs(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
-    first, second = config.chapters
-    orchestrator = Orchestrator(config, StateStore(config))
-    await orchestrator.prepare()
-    first_started = asyncio.Event()
-    release_first = asyncio.Event()
-    calls = 0
-
-    async def fixup(
-        feedback: dict[str, str] | None = None,
-        *,
-        target_ids: object = None,
-    ) -> bool:
-        nonlocal calls
-        calls += 1
-        if calls == 1:
-            first_started.set()
-            await release_first.wait()
-        return True
-
-    monkeypatch.setattr(orchestrator, "_fixup_to_clean", fixup)
-    first_request = asyncio.create_task(
-        orchestrator._request_fixup({first.id: "first"}, target_ids={first.id})
-    )
-    await first_started.wait()
-    second_request = asyncio.create_task(
-        orchestrator._request_fixup({second.id: "second"}, target_ids={second.id})
-    )
-    while len(orchestrator.state.fixup_requests) < 2:
-        await asyncio.sleep(0)
-
-    queued = orchestrator.state.task(second.id, Stage.FIXUP)
-    assert queued.status == TaskStatus.RUNNING
-    assert "queued behind the active repair batch" in queued.detail
-    assert len(orchestrator.state.fixup_requests) == 2
-    while True:
-        persisted = json.loads(orchestrator.state.path.read_text(encoding="utf-8"))
-        if len(persisted["fixup_requests"]) == 2:
-            break
-        await asyncio.sleep(0)
-    assert len(persisted["fixup_requests"]) == 2
-
-    release_first.set()
-    assert all(await asyncio.gather(first_request, second_request))
-    assert orchestrator.state.fixup_requests == {}
-    await orchestrator.shutdown()
-
-
-@pytest.mark.asyncio
-async def test_interrupted_fixup_request_is_restored_from_state(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+async def test_post_review_fixup_request_is_migrated_back_to_review(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
     chapter = config.chapters[0]
     state = StateStore(config)
@@ -827,23 +709,13 @@ async def test_interrupted_fixup_request_is_restored_from_state(
     recovered = StateStore(config)
     orchestrator = Orchestrator(config, recovered)
     await orchestrator.prepare()
-    calls: list[tuple[dict[str, str] | None, set[str]]] = []
 
-    async def fixup(
-        feedback: dict[str, str] | None = None,
-        *,
-        target_ids: object = None,
-    ) -> bool:
-        assert isinstance(target_ids, set)
-        calls.append((feedback, target_ids))
-        return True
-
-    monkeypatch.setattr(orchestrator, "_fixup_to_clean", fixup)
-    futures = await orchestrator._recover_fixup_requests()
-
-    assert all(await asyncio.gather(*futures))
-    assert calls == [({chapter.id: "missing scalar tower"}, {chapter.id})]
     assert request_id not in recovered.fixup_requests
+    feedback, request_ids = orchestrator._proof_review_feedback(chapter.id)
+    assert feedback == "missing scalar tower"
+    assert request_ids == (request_id,)
+    assert recovered.task(chapter.id, Stage.FIXUP).status == TaskStatus.SUCCEEDED
+    assert recovered.task(chapter.id, Stage.REVIEW).status == TaskStatus.PENDING
     await orchestrator.shutdown()
 
 
@@ -882,46 +754,6 @@ async def test_unqueued_proof_finding_is_recovered_as_durable_review(
     assert recovered.fixup_requests == {}
     assert len(recovered.proof_review_requests) == 1
     assert recovered.task(chapter.id, Stage.REVIEW).status == TaskStatus.PENDING
-    await orchestrator.shutdown()
-
-
-@pytest.mark.asyncio
-async def test_clean_review_verification_bypasses_active_fixup_batch(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
-    first, second = config.chapters
-    orchestrator = Orchestrator(config, StateStore(config))
-    await orchestrator.prepare()
-    repair_started = asyncio.Event()
-    release_repair = asyncio.Event()
-    calls: list[tuple[dict[str, str] | None, set[str], dict[str, Stage]]] = []
-
-    async def converge(
-        feedback: dict[str, str] | None = None,
-        *,
-        target_ids: object = None,
-        verification_stages: dict[str, Stage] | None = None,
-    ) -> bool:
-        assert isinstance(target_ids, set)
-        calls.append((feedback, target_ids, dict(verification_stages or {})))
-        if feedback:
-            repair_started.set()
-            await release_repair.wait()
-        return True
-
-    monkeypatch.setattr(orchestrator, "_fixup_to_clean", converge)
-    repair = asyncio.create_task(
-        orchestrator._request_fixup({first.id: "repair first"}, target_ids={first.id})
-    )
-    await repair_started.wait()
-
-    assert await orchestrator._request_clean_build(target_ids={second.id}, stage=Stage.REVIEW)
-    assert not repair.done()
-    assert calls[-1] == (None, {second.id}, {second.id: Stage.REVIEW})
-
-    release_repair.set()
-    assert await repair
     await orchestrator.shutdown()
 
 
@@ -1756,8 +1588,6 @@ async def test_changed_review_is_rebuilt_fixed_and_reviewed_again(
             assert workspace_root is not None
             target = workspace_root / "lean" / "Book" / "Chapter01.lean"
             target.write_text("def afterReview := 1\n", encoding="utf-8")
-        if stage is Stage.FIXUP:
-            assert "unknown declaration" in feedback
         return await original_run(
             chapter,
             stage,
@@ -1781,13 +1611,13 @@ async def test_changed_review_is_rebuilt_fixed_and_reviewed_again(
     monkeypatch.setattr(scheduler_module, "validate", validation)
 
     assert await orchestrator._review_until_clean()
-    assert stages_seen == [Stage.REVIEW, Stage.FIXUP, Stage.REVIEW]
+    assert stages_seen == [Stage.REVIEW, Stage.REVIEW, Stage.REVIEW]
     assert review_path.read_text(encoding="utf-8") == "def afterReview := 1\n"
     await orchestrator.shutdown()
 
 
 @pytest.mark.asyncio
-async def test_no_change_review_stops_after_one_cycle(
+async def test_review_finding_returns_to_review_until_clean(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
@@ -1808,6 +1638,7 @@ async def test_no_change_review_stops_after_one_cycle(
                 ],
             ),
             result(changed=True),
+            result(changed=False),
         ],
     )
 
@@ -1818,7 +1649,7 @@ async def test_no_change_review_stops_after_one_cycle(
 
     assert await orchestrator._review_until_clean()
     review_task = state.task(config.chapters[0].id, Stage.REVIEW)
-    assert review_task.rounds == 1
+    assert review_task.rounds == 3
     assert review_task.status == TaskStatus.SUCCEEDED
     await orchestrator.shutdown()
 
@@ -1863,7 +1694,7 @@ async def test_review_snapshot_and_merge_do_not_acquire_coordinator_build_queue(
 
 
 @pytest.mark.asyncio
-async def test_incomplete_review_routes_fixup_and_retries(
+async def test_incomplete_review_routes_follow_up_to_review(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
@@ -1882,35 +1713,35 @@ async def test_incomplete_review_routes_fixup_and_retries(
             ReviewOutcome(True, False, {}, complete=True),
         )
     )
-    fixups: list[tuple[dict[str, str] | None, object]] = []
+    feedbacks: list[str] = []
+    builds = 0
     review_calls = 0
 
-    async def review(_chapter: Chapter, *, rerun: bool = False) -> ReviewOutcome:
+    async def review(
+        _chapter: Chapter,
+        *,
+        rerun: bool = False,
+        feedback: str = "",
+    ) -> ReviewOutcome:
         nonlocal review_calls
+        feedbacks.append(feedback)
         outcome = next(reviews)
         assert rerun == (review_calls > 0)
         review_calls += 1
         return outcome
 
-    async def fixup(
-        feedback: dict[str, str] | None = None,
-        *,
-        target_ids: object = None,
-        verification_stages: object = None,
-    ) -> bool:
-        del verification_stages
-        fixups.append((feedback, target_ids))
-        state.fixup_graph["clean"] = {chapter.id: {"certificate": "test-green-certificate"}}
-        return True
+    async def review_build(_chapter: Chapter) -> dict[str, str]:
+        nonlocal builds
+        builds += 1
+        return {}
 
     monkeypatch.setattr(orchestrator, "_review_once", review)
-    monkeypatch.setattr(orchestrator, "_fixup_to_clean", fixup)
+    monkeypatch.setattr(orchestrator, "_review_build", review_build)
 
     assert await orchestrator._review_until_clean()
-    assert fixups == [
-        (None, {chapter.id}),
-        ({chapter.id: "repair the remaining statement interface"}, {chapter.id}),
-    ]
+    assert feedbacks == ["", "repair the remaining statement interface"]
+    assert builds == 2
+    assert state.task(chapter.id, Stage.FIXUP).rounds == 0
     await orchestrator.shutdown()
 
 
@@ -2025,29 +1856,22 @@ async def test_review_is_capped_at_five_edit_rebuild_cycles(
     reviews = 0
     rebuilds = 0
 
-    async def changed_review(_chapter: Chapter, *, rerun: bool = False) -> ReviewOutcome:
+    async def changed_review(
+        _chapter: Chapter, *, rerun: bool = False, feedback: str = ""
+    ) -> ReviewOutcome:
+        del feedback
         nonlocal reviews
         assert rerun == (reviews > 0)
         reviews += 1
         return ReviewOutcome(True, True, {})
 
-    async def clean_target(
-        _feedback: dict[str, str] | None = None,
-        *,
-        target_ids: object = None,
-        verification_stages: object = None,
-    ) -> bool:
-        del verification_stages
+    async def review_build(_chapter: Chapter) -> dict[str, str]:
         nonlocal rebuilds
-        assert target_ids == {config.chapters[0].id}
         rebuilds += 1
-        orchestrator.state.fixup_graph["clean"] = {
-            config.chapters[0].id: {"certificate": "test-green-certificate"}
-        }
-        return True
+        return {}
 
     monkeypatch.setattr(orchestrator, "_review_once", changed_review)
-    monkeypatch.setattr(orchestrator, "_fixup_to_clean", clean_target)
+    monkeypatch.setattr(orchestrator, "_review_build", review_build)
 
     assert await orchestrator._review_until_clean()
     assert reviews == 5
@@ -2065,14 +1889,16 @@ async def test_capacity_failure_consumes_a_review_round(
     await orchestrator.prepare()
     outcomes = iter((ReviewOutcome(False, False, {}, complete=False),))
 
-    async def clean(*_args: object, **_kwargs: object) -> bool:
-        return True
+    async def clean(*_args: object, **_kwargs: object) -> dict[str, str]:
+        return {}
 
-    async def review(_chapter: Chapter, *, rerun: bool = False) -> ReviewOutcome:
-        del rerun
+    async def review(
+        _chapter: Chapter, *, rerun: bool = False, feedback: str = ""
+    ) -> ReviewOutcome:
+        del rerun, feedback
         return next(outcomes)
 
-    monkeypatch.setattr(orchestrator, "_request_clean_build", clean)
+    monkeypatch.setattr(orchestrator, "_review_build", clean)
     monkeypatch.setattr(orchestrator, "_review_once", review)
     rounds = {chapter.id: 0}
 
@@ -2237,8 +2063,8 @@ async def test_pipeline_reviews_each_chapter_as_soon_as_its_build_succeeds(
         f"build:{second.id}",
     ]
     assert events.index(f"build:{first.id}") < events.index(f"review:{first.id}")
-    assert events.index(f"review:{first.id}") < events.index(f"build:{second.id}")
     assert events.index(f"build:{second.id}") < events.index(f"review:{second.id}")
+    assert events.index(f"build:{second.id}") < events.index(f"review:{first.id}")
     await orchestrator.shutdown()
 
 
