@@ -745,6 +745,36 @@ async def test_optimistic_build_discards_stale_feedback_without_fixup_agent(
 
 
 @pytest.mark.asyncio
+async def test_optimistic_build_skips_chapters_with_reusable_clean_builds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    first, second = config.chapters
+    orchestrator = Orchestrator(config, StateStore(config))
+    await orchestrator.prepare()
+    builds: list[str] = []
+
+    async def successful_validation(
+        _config: object,
+        chapter: Chapter,
+        **_kwargs: object,
+    ) -> ValidationResult:
+        builds.append(chapter.id)
+        return ValidationResult(True, 0, "ok")
+
+    monkeypatch.setattr(scheduler_module, "validate", successful_validation)
+
+    assert await orchestrator._fixup_to_clean(target_ids={first.id})
+    builds.clear()
+
+    assert await orchestrator._fixup_to_clean()
+    assert builds == [second.id]
+    assert orchestrator.state.task(first.id, Stage.FIXUP).status == TaskStatus.SUCCEEDED
+    assert orchestrator.state.task(first.id, Stage.FIXUP).detail == "clean initial build reused"
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_post_review_fixup_request_is_migrated_back_to_review(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
     chapter = config.chapters[0]
@@ -1284,7 +1314,7 @@ async def test_fixup_reuses_valid_persisted_build_records(
     await second.prepare()
     assert await second.run_stage(Stage.FIXUP)
 
-    assert builds == [chapter.id for chapter in config.chapters]
+    assert builds == []
     await second.shutdown()
 
 

@@ -1569,6 +1569,7 @@ class Orchestrator:
         # complete selected closure once. Stream both successful chapters and
         # dependency-ready diagnostics to their consumers as each build ends.
         optimistic_ids = self._dependency_closure(graph, goals) if targeted else set(by_id)
+        optimistic_ids.difference_update(clean)
         for chapter_id in graph.order:
             if chapter_id not in optimistic_ids:
                 continue
