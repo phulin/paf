@@ -91,6 +91,12 @@ class BuildDiagnostics:
     deferred_owner_ids: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class ValidatedBuildSnapshot:
+    graph: ChapterImportGraph
+    source_digests: dict[str, str]
+
+
 @dataclass
 class FixupRequest:
     id: str
@@ -493,51 +499,89 @@ class Orchestrator:
                 retained[chapter_id] = dict(record)
         return retained
 
-    async def _publish_validated_build(self, chapter: Chapter) -> None:
-        """Record an exact build that already validated the target and its imports."""
-
-        graph = self._observed_chapter_graph()
-        persisted = self.state.fixup_graph.get("clean", {})
-        records = persisted if isinstance(persisted, dict) else {}
-        clean = self._retain_fixup_clean(graph, records)
-        required = {chapter.id}
-        pending = [chapter.id]
+    @staticmethod
+    def _dependency_closure(
+        graph: ChapterImportGraph, chapter_ids: Iterable[str]
+    ) -> set[str]:
+        required = set(chapter_ids)
+        pending = list(required)
         while pending:
             chapter_id = pending.pop()
-            for dependency in graph.dependencies[chapter_id]:
+            for dependency in graph.dependencies.get(chapter_id, frozenset()):
                 if dependency not in required:
                     required.add(dependency)
                     pending.append(dependency)
+        return required
 
-        by_id = {item.id: item for item in self.chapters}
-        build_generation = int(self.state.fixup_graph.get("build_generation", 0))
-        for chapter_id in graph.order:
-            if chapter_id not in required:
-                continue
-            source = scope_digest(self.config.settings.repo, by_id[chapter_id])
-            certificate = self._fixup_certificate(
-                source,
-                graph.dependencies[chapter_id],
-                clean,
-            )
-            record = clean.get(chapter_id)
-            if (
-                isinstance(record, dict)
-                and record.get("source_digest") == source
-                and record.get("certificate") == certificate
-            ):
-                continue
-            build_generation += 1
-            clean[chapter_id] = {
-                "source_digest": source,
-                "certificate": certificate,
-                "build_generation": build_generation,
+    async def _publish_validated_builds(
+        self,
+        snapshots: dict[str, ValidatedBuildSnapshot],
+    ) -> bool:
+        """Publish only if the exact source graph built is still current."""
+
+        if not snapshots:
+            return False
+        async with self.source_lock:
+            graph = self._observed_chapter_graph()
+            captured: dict[str, str] = {}
+            required = self._dependency_closure(graph, snapshots)
+            for snapshot in snapshots.values():
+                if snapshot.graph.edges != graph.edges:
+                    return False
+                for chapter_id, digest in snapshot.source_digests.items():
+                    existing = captured.setdefault(chapter_id, digest)
+                    if existing != digest:
+                        return False
+            if not required.issubset(captured):
+                return False
+
+            by_id = {item.id: item for item in self.chapters}
+            current = {
+                chapter_id: scope_digest(self.config.settings.repo, by_id[chapter_id])
+                for chapter_id in required
             }
-        await self._save_fixup_graph(
-            graph,
-            clean,
-            build_generation=build_generation,
-        )
+            if any(captured[chapter_id] != digest for chapter_id, digest in current.items()):
+                return False
+
+            persisted = self.state.fixup_graph.get("clean", {})
+            records = persisted if isinstance(persisted, dict) else {}
+            clean = self._retain_fixup_clean(graph, records)
+            build_generation = int(self.state.fixup_graph.get("build_generation", 0))
+            for chapter_id in graph.order:
+                if chapter_id not in required:
+                    continue
+                source = captured[chapter_id]
+                certificate = self._fixup_certificate(
+                    source,
+                    graph.dependencies[chapter_id],
+                    clean,
+                )
+                record = clean.get(chapter_id)
+                if (
+                    isinstance(record, dict)
+                    and record.get("source_digest") == source
+                    and record.get("certificate") == certificate
+                ):
+                    continue
+                build_generation += 1
+                clean[chapter_id] = {
+                    "source_digest": source,
+                    "certificate": certificate,
+                    "build_generation": build_generation,
+                }
+            await self._save_fixup_graph(
+                graph,
+                clean,
+                build_generation=build_generation,
+            )
+            return True
+
+    async def _publish_validated_build(
+        self,
+        chapter: Chapter,
+        snapshot: ValidatedBuildSnapshot,
+    ) -> bool:
+        return await self._publish_validated_builds({chapter.id: snapshot})
 
     @staticmethod
     def _invalidate_fixup_descendants(
@@ -680,6 +724,7 @@ class Orchestrator:
                     await self._invalidate_build_records((chapter.id,))
                 if isolated.accepted:
                     if stage is Stage.PROVE:
+                        snapshots: dict[str, ValidatedBuildSnapshot] = {}
                         validation = (
                             await self._build_chapters(
                                 (chapter,),
@@ -688,8 +733,17 @@ class Orchestrator:
                                 stage=Stage.PROVE,
                                 priority=0.0,
                                 preemptible=True,
+                                snapshots=snapshots,
                             )
                         )[chapter.id]
+                        if validation.succeeded and not await self._publish_validated_build(
+                            chapter, snapshots[chapter.id]
+                        ):
+                            validation = ValidationResult(
+                                False,
+                                1,
+                                "Source scope changed after the coordinator build; retry required.",
+                            )
                     else:
                         validation = ValidationResult(
                             True,
@@ -718,8 +772,6 @@ class Orchestrator:
                     isolation=isolated.as_dict(),
                     validation=validation.as_dict(),
                 )
-                if stage is Stage.PROVE and validation.succeeded:
-                    await self._publish_validated_build(chapter)
             except BaseException as error:
                 if run.status == TaskStatus.RUNNING:
                     detail = str(error) or type(error).__name__
@@ -996,6 +1048,7 @@ class Orchestrator:
         stage: Stage = Stage.FIXUP,
         priority: float = 100.0,
         preemptible: bool = False,
+        snapshots: dict[str, ValidatedBuildSnapshot] | None = None,
     ) -> dict[str, ValidationResult]:
         """Build a deterministic target batch against the coordinator-owned cache."""
 
@@ -1099,6 +1152,21 @@ class Orchestrator:
                     and bool(results)
                     and all(result.succeeded for result in results.values())
                 )
+                if clean and snapshots is not None:
+                    graph = self._observed_chapter_graph()
+                    by_id = {item.id: item for item in self.chapters}
+                    captured = {
+                        chapter_id: scope_digest(self.config.settings.repo, by_id[chapter_id])
+                        for chapter_id in self._dependency_closure(graph, ids)
+                    }
+                    for chapter in selected:
+                        required = self._dependency_closure(graph, (chapter.id,))
+                        snapshots[chapter.id] = ValidatedBuildSnapshot(
+                            graph=graph,
+                            source_digests={
+                                chapter_id: captured[chapter_id] for chapter_id in required
+                            },
+                        )
                 await build_workspace.finish(
                     succeeded=clean,
                     publish=publish_if_clean and clean,
@@ -1620,13 +1688,14 @@ class Orchestrator:
             merge_feedback({handle.chapter.id: detail})
 
         async def build_chapter(chapter_id: str, graph: ChapterImportGraph) -> bool:
-            nonlocal build_generation
+            nonlocal build_generation, clean
             chapter = by_id[chapter_id]
             display_stage = (
                 Stage.FIXUP
                 if chapter_id in repaired
                 else display_stages.get(chapter_id, Stage.FIXUP)
             )
+            snapshots: dict[str, ValidatedBuildSnapshot] = {}
             result = (
                 await self._build_chapters(
                     (chapter,),
@@ -1636,28 +1705,28 @@ class Orchestrator:
                     maximum_iterations=maximum,
                     stage=display_stage,
                     priority=200.0 if display_stage is Stage.REVIEW else 100.0,
+                    snapshots=snapshots,
                 )
             )[chapter_id]
             if result.succeeded:
-                source = scope_digest(self.config.settings.repo, chapter)
-                certificate = self._fixup_certificate(
-                    source,
-                    graph.dependencies[chapter_id],
-                    clean,
+                published = await self._publish_validated_build(
+                    chapter, snapshots[chapter_id]
                 )
-                build_generation += 1
+                if not published:
+                    merge_feedback(
+                        {
+                            chapter_id: (
+                                "The source scope changed after its coordinator build; "
+                                "rebuild the fresh generation."
+                            )
+                        }
+                    )
+                    return False
+                persisted = self.state.fixup_graph.get("clean", {})
+                records = persisted if isinstance(persisted, dict) else {}
+                clean = self._retain_fixup_clean(self._observed_chapter_graph(), records)
+                build_generation = int(self.state.fixup_graph.get("build_generation", 0))
                 invalidated_clean.discard(chapter_id)
-                clean[chapter_id] = {
-                    "source_digest": source,
-                    "certificate": certificate,
-                    "build_generation": build_generation,
-                }
-                await self._save_fixup_graph(
-                    graph,
-                    clean,
-                    build_generation=build_generation,
-                    invalidated=invalidated_clean,
-                )
                 if display_stage is Stage.REVIEW:
                     await self.state.set_task(
                         chapter_id,
@@ -1789,12 +1858,14 @@ class Orchestrator:
                     and not running
                 ):
                     ordered = tuple(by_id[chapter_id] for chapter_id in graph.order)
+                    snapshots: dict[str, ValidatedBuildSnapshot] = {}
                     results = await self._build_chapters(
                         ordered,
                         publish_if_clean=True,
                         mode="stable-topological",
                         iteration=1,
                         maximum_iterations=1,
+                        snapshots=snapshots,
                     )
                     verified = self._observed_chapter_graph()
                     clean = self._retain_fixup_clean(verified, clean)
@@ -1802,17 +1873,17 @@ class Orchestrator:
                         all(result.succeeded for result in results.values())
                         and verified.edges == graph.edges
                         and len(clean) == len(by_id)
+                        and await self._publish_validated_builds(snapshots)
                     ):
-                        build_generation += 1
-                        invalidated_clean.clear()
-                        for record in clean.values():
-                            record["build_generation"] = build_generation
-                        await self._save_fixup_graph(
-                            verified,
-                            clean,
-                            build_generation=build_generation,
-                            invalidated=invalidated_clean,
+                        build_generation = int(
+                            self.state.fixup_graph.get("build_generation", 0)
                         )
+                        persisted = self.state.fixup_graph.get("clean", {})
+                        clean = self._retain_fixup_clean(
+                            verified,
+                            persisted if isinstance(persisted, dict) else {},
+                        )
+                        invalidated_clean.clear()
                         await self.state.set_tasks(
                             by_id,
                             Stage.FIXUP,
@@ -2429,6 +2500,7 @@ class Orchestrator:
         """Refresh an exact coordinator build before launching a proof agent."""
 
         await self.control.checkpoint()
+        snapshots: dict[str, ValidatedBuildSnapshot] = {}
         validation = (
             await self._build_chapters(
                 (chapter,),
@@ -2437,10 +2509,17 @@ class Orchestrator:
                 stage=Stage.PROVE,
                 priority=0.0,
                 preemptible=True,
+                snapshots=snapshots,
             )
         )[chapter.id]
-        if validation.succeeded:
-            await self._publish_validated_build(chapter)
+        if validation.succeeded and not await self._publish_validated_build(
+            chapter, snapshots[chapter.id]
+        ):
+            return ValidationResult(
+                False,
+                1,
+                "Source scope changed after the coordinator build; retry required.",
+            )
         return validation
 
     async def _prove(self, chapter: Chapter) -> bool:

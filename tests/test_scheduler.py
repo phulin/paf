@@ -1599,6 +1599,37 @@ async def test_coordinator_build_counts_only_errors_owned_by_each_target(
 
 
 @pytest.mark.asyncio
+async def test_validated_build_refuses_to_certify_a_newer_source_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = config.chapters[0]
+    source = tmp_path / "lean" / "Book" / "Chapter01.lean"
+    source.parent.mkdir(parents=True)
+    source.write_text("def built := 1\n", encoding="utf-8")
+    orchestrator = Orchestrator(config, StateStore(config))
+    await orchestrator.prepare()
+
+    async def validation(*_args: object, **_kwargs: object) -> ValidationResult:
+        return ValidationResult(True, 0, "ok")
+
+    monkeypatch.setattr(scheduler_module, "validate", validation)
+    snapshots = {}
+    results = await orchestrator._build_chapters(
+        (chapter,),
+        publish_if_clean=True,
+        snapshots=snapshots,
+    )
+    assert results[chapter.id].succeeded
+
+    source.write_text("def built := 2\n", encoding="utf-8")
+
+    assert not await orchestrator._publish_validated_build(chapter, snapshots[chapter.id])
+    assert chapter.id not in orchestrator.state.fixup_graph.get("clean", {})
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_agent_limiter_distinguishes_live_and_queued_runs(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
     config = replace(config, settings=replace(config.settings, max_agents=1))
