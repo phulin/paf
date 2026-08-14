@@ -779,6 +779,45 @@ async def test_unqueued_proof_finding_is_recovered_as_durable_review(
 
 
 @pytest.mark.asyncio
+async def test_recovery_restores_green_reviews_without_direct_findings(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    owner, downstream = config.chapters
+    state = StateStore(config)
+    await state.load_or_create()
+    run = await state.start_run(downstream.id, Stage.REVIEW)
+    await state.finish_run(
+        run,
+        status=TaskStatus.SUCCEEDED,
+        changed=False,
+        report={"complete": True, "fixup_findings": []},
+    )
+    await state.set_task(downstream.id, Stage.REVIEW, TaskStatus.SUCCEEDED, "reviewed")
+    await state.set_task(
+        downstream.id,
+        Stage.REVIEW,
+        TaskStatus.PENDING,
+        "review invalidated by the former closure-wide policy",
+    )
+    await state.set_task(owner.id, Stage.REVIEW, TaskStatus.SUCCEEDED, "reviewed")
+    await state.enqueue_proof_review_request(
+        {owner.id: "repair the owner statement"},
+        origin_run_id="proof-finding",
+    )
+    await state.close()
+
+    recovered = StateStore(config)
+    orchestrator = Orchestrator(config, recovered)
+    await orchestrator.prepare()
+    await orchestrator._recover_proof_review_requests()
+
+    assert recovered.task(owner.id, Stage.REVIEW).status == TaskStatus.PENDING
+    restored = recovered.task(downstream.id, Stage.REVIEW)
+    assert restored.status == TaskStatus.SUCCEEDED
+    assert restored.detail == "durable review remains green; no pending findings for this chapter"
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_review_build_preempts_running_proof_certification(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2516,7 +2555,7 @@ async def test_pending_review_is_not_recovered_from_historical_runs(
 
 
 @pytest.mark.asyncio
-async def test_statement_repair_invalidates_review_and_proof_closure(tmp_path: Path) -> None:
+async def test_statement_finding_invalidates_only_its_review(tmp_path: Path) -> None:
     config = with_lastlib_modules(
         load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
     )
@@ -2542,17 +2581,17 @@ async def test_statement_repair_invalidates_review_and_proof_closure(tmp_path: P
             source_digest=f"proof-source-{chapter.number}",
         )
 
-    invalidated = await orchestrator._invalidate_review_closure(
+    invalidated = await orchestrator._invalidate_reviews(
         {first.id}, detail="upstream statement changed"
     )
 
-    assert invalidated == {first.id, second.id}
+    assert invalidated == {first.id}
+    assert orchestrator.state.task(first.id, Stage.REVIEW).status == TaskStatus.PENDING
+    assert orchestrator.state.task(second.id, Stage.REVIEW).status == TaskStatus.SUCCEEDED
     for chapter in config.chapters:
-        review = orchestrator.state.task(chapter.id, Stage.REVIEW)
         proof = orchestrator.state.task(chapter.id, Stage.PROVE)
-        assert review.status == TaskStatus.PENDING
-        assert proof.status == TaskStatus.PENDING
-        assert proof.source_digest is None
+        assert proof.status == TaskStatus.SUCCEEDED
+        assert proof.source_digest == f"proof-source-{chapter.number}"
     await orchestrator.shutdown()
 
 
@@ -2566,7 +2605,7 @@ async def test_review_completion_cannot_resurrect_an_invalidated_generation(
     await orchestrator.prepare()
     started_generation = orchestrator._review_invalidation_generation(chapter.id)
 
-    await orchestrator._invalidate_review_closure(
+    await orchestrator._invalidate_reviews(
         {chapter.id}, detail="statement changed while review was running"
     )
 

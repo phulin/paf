@@ -38,8 +38,10 @@ build immediately releases its review. The coordinator remembers the source and 
 of successful builds so it can avoid rebuilding unchanged chapters. Review has no separate green
 flag: a successful review task is the whole state. Restarts and ordinary proof-body edits leave it
 succeeded; explicit review findings, proof-requested statement/API repairs, and forced review reopen
-the affected review/proof closure. Reviewers directly make scoped statement and
-API repairs. Fixup ends once the initial post-draft build has converged. Each dependency-ready chapter
+only the reviews that receive findings. Reviewers directly make scoped statement and API repairs.
+If a review edits source, transitive build certificates are invalidated and downstream proofs are
+kept green when a fresh coordinator build still succeeds. Fixup ends once the initial post-draft
+build has converged. Each dependency-ready chapter
 receives a prioritized coordinator verification build after a changed review; failures and structured
 findings return to review with the diagnostics attached. After at most five
 such cycles—or immediately after a no-change review—the chapter is
@@ -295,8 +297,9 @@ After the daemon exits, `status`, `snapshot`, and `wait` fall back to the persis
   branches keep running, while actual dependents are marked blocked. Unexpected coordinator
   exceptions still fail fast after draining live workers. There is no corpus-wide clean-build or
   review gate in the pipeline. Successful completion leaves the review task `succeeded`. An explicit
-  statement/API repair request or forced review moves it back to `pending`; ordinary proof edits and
-  restart reconciliation do not.
+  statement/API repair request moves only its owning review back to `pending`; forced review moves all
+  selected reviews back. Downstream reviews and proofs remain green unless an actual source edit makes
+  their coordinator build fail. Ordinary proof edits and restart reconciliation do not reopen review.
 - **Prove** sends one chapter to an agent and asks it to work directly on unresolved placeholders.
   A cumulative attempt ledger is prior inventory: later agents must refine an earlier proof using
   new evidence or try a materially different route instead of rereading the chapter, reconfirming
