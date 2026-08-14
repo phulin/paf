@@ -2449,6 +2449,31 @@ async def test_statement_repair_invalidates_review_and_proof_closure(tmp_path: P
 
 
 @pytest.mark.asyncio
+async def test_review_completion_cannot_resurrect_an_invalidated_generation(
+    tmp_path: Path,
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = config.chapters[0]
+    orchestrator = Orchestrator(config, StateStore(config))
+    await orchestrator.prepare()
+    started_generation = orchestrator._review_invalidation_generation(chapter.id)
+
+    await orchestrator._invalidate_review_closure(
+        {chapter.id}, detail="statement changed while review was running"
+    )
+
+    assert not await orchestrator._complete_review(
+        chapter,
+        "obsolete review finished",
+        expected_generation=started_generation,
+    )
+    review = orchestrator.state.task(chapter.id, Stage.REVIEW)
+    assert review.review_green is False
+    assert review.status == TaskStatus.PENDING
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_changed_source_revalidates_proofs_without_clearing_review_green(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -431,6 +431,8 @@ class Orchestrator:
         self._fixup_runner: asyncio.Task[None] | None = None
         self._fixup_requests_recovered = False
         self._invalidated_reviews: set[str] = set()
+        self._review_invalidation_generations: dict[str, int] = {}
+        self._review_generation_lock = asyncio.Lock()
 
     def scheduling_snapshot(self) -> dict[str, object]:
         return scheduling_snapshot(self.statement_schedule, self.proof_schedule)
@@ -2062,15 +2064,31 @@ class Orchestrator:
             complete=complete,
         )
 
-    async def _complete_review(self, chapter: Chapter, detail: str) -> None:
-        async with self.state.batch():
-            await self.state.set_review_green((chapter.id,), True)
-            await self.state.set_task(
-                chapter.id,
-                Stage.REVIEW,
-                TaskStatus.SUCCEEDED,
-                detail,
-            )
+    def _review_invalidation_generation(self, chapter_id: str) -> int:
+        return self._review_invalidation_generations.get(chapter_id, 0)
+
+    async def _complete_review(
+        self,
+        chapter: Chapter,
+        detail: str,
+        *,
+        expected_generation: int | None = None,
+    ) -> bool:
+        async with self._review_generation_lock:
+            if (
+                expected_generation is not None
+                and self._review_invalidation_generation(chapter.id) != expected_generation
+            ):
+                return False
+            async with self.state.batch():
+                await self.state.set_review_green((chapter.id,), True)
+                await self.state.set_task(
+                    chapter.id,
+                    Stage.REVIEW,
+                    TaskStatus.SUCCEEDED,
+                    detail,
+                )
+            return True
 
     async def _invalidate_review_closure(
         self,
@@ -2093,23 +2111,28 @@ class Orchestrator:
         invalidated.difference_update(exclude)
         if not invalidated:
             return set()
-        self._invalidated_reviews.update(invalidated)
-        async with self.state.batch():
-            await self.state.set_review_green(invalidated, False)
-            await self.state.set_tasks(
-                invalidated,
-                Stage.REVIEW,
-                TaskStatus.PENDING,
-                detail,
-                phase=TaskPhase.RECOVERING,
-            )
-            await self.state.set_tasks(
-                invalidated,
-                Stage.PROVE,
-                TaskStatus.PENDING,
-                "waiting for invalidated statement review",
-                phase=TaskPhase.WAITING_PREREQUISITES,
-            )
+        async with self._review_generation_lock:
+            for chapter_id in invalidated:
+                self._review_invalidation_generations[chapter_id] = (
+                    self._review_invalidation_generation(chapter_id) + 1
+                )
+            self._invalidated_reviews.update(invalidated)
+            async with self.state.batch():
+                await self.state.set_review_green(invalidated, False)
+                await self.state.set_tasks(
+                    invalidated,
+                    Stage.REVIEW,
+                    TaskStatus.PENDING,
+                    detail,
+                    phase=TaskPhase.RECOVERING,
+                )
+                await self.state.set_tasks(
+                    invalidated,
+                    Stage.PROVE,
+                    TaskStatus.PENDING,
+                    "waiting for invalidated statement review",
+                    phase=TaskPhase.WAITING_PREREQUISITES,
+                )
         return invalidated
 
     async def _review_chapter_to_clean(
@@ -2121,6 +2144,7 @@ class Orchestrator:
     ) -> bool:
         """Run at most five edit/rebuild cycles for one dependency-ready chapter."""
 
+        review_generation = self._review_invalidation_generation(chapter.id)
         # Durable green reviews do not depend on exact source/build hashes. A
         # chapter reaches this method only when review is genuinely required.
         if self.state.task(chapter.id, Stage.REVIEW).review_green is True:
@@ -2191,13 +2215,16 @@ class Orchestrator:
                 detail = "editing review found no actionable issues"
                 if findings:
                     detail = "no-change review findings reconciled by dependency-ordered fixup"
-                await self._complete_review(chapter, detail)
-                return True
-        await self._complete_review(
+                return await self._complete_review(
+                    chapter,
+                    detail,
+                    expected_generation=review_generation,
+                )
+        return await self._complete_review(
             chapter,
             f"review/rebuild cap reached after {maximum} cycles",
+            expected_generation=review_generation,
         )
-        return True
 
     async def _review_tree(self, *, rerun: bool = False, prove: bool = False) -> bool:
         """Release dependency-ready reviews and proofs without a corpus-wide review gate."""
