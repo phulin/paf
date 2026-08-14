@@ -300,8 +300,11 @@ After the daemon exits, `status`, `snapshot`, and `wait` fall back to the persis
   exceptions still fail fast after draining live workers. There is no corpus-wide clean-build or
   review gate in the pipeline. Successful completion leaves the review task `succeeded`. An explicit
   statement/API repair request moves only its owning review back to `pending`; forced review moves all
-  selected reviews back. Downstream reviews and proofs remain green unless an actual source edit makes
-  their coordinator build fail. Ordinary proof edits and restart reconciliation do not reopen review.
+  selected reviews back. Already-running downstream agents finish against their pinned clean snapshot
+  instead of being cancelled. Once that downstream frontier is quiescent, the owning review resumes
+  and any edit triggers the fresh coordinator build. Downstream reviews and proofs remain green unless
+  an actual source edit makes their coordinator build fail. Ordinary proof edits and restart
+  reconciliation do not reopen review.
 - **Prove** sends one chapter to an agent and asks it to work directly on unresolved placeholders.
   A cumulative attempt ledger is prior inventory: later agents must refine an earlier proof using
   new evidence or try a materially different route instead of rereading the chapter, reconfirming

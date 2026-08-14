@@ -2820,6 +2820,113 @@ async def test_upstream_proof_starts_before_downstream_review_finishes(
 
 
 @pytest.mark.asyncio
+async def test_review_finding_waits_for_downstream_agents_before_rebuild(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = write_project(tmp_path, chapters="chapters = [1, 2, 3]")
+    book = tmp_path / "books" / "book.md"
+    book.write_text(
+        book.read_text(encoding="utf-8") + "\n## 3. Third chapter\n",
+        encoding="utf-8",
+    )
+    config = with_lastlib_modules(load_config(project))
+    first, second, third = config.chapters
+    source_root = tmp_path / "lean" / "Book"
+    source_root.mkdir(parents=True)
+    (source_root / "Chapter01.lean").write_text("def first := 1\n", encoding="utf-8")
+    for chapter in (second, third):
+        (source_root / f"Chapter{chapter.number:02d}.lean").write_text(
+            f"import LastLib.Book.Chapter01\ndef value{chapter.number} := first + 1\n",
+            encoding="utf-8",
+        )
+
+    async def validation(*_args: object, **_kwargs: object) -> ValidationResult:
+        return ValidationResult(True, 0, "ok")
+
+    monkeypatch.setattr(scheduler_module, "validate", validation)
+    orchestrator = Orchestrator(config, StateStore(config))
+    await orchestrator.prepare()
+    assert await orchestrator._fixup_to_clean(
+        target_ids={chapter.id for chapter in config.chapters}
+    )
+
+    downstream_started = asyncio.Event()
+    finding_queued = asyncio.Event()
+    release_downstream = asyncio.Event()
+    downstream_finished = asyncio.Event()
+    downstream_cancelled = asyncio.Event()
+    reviews = {chapter.id: 0 for chapter in config.chapters}
+    rebuilds: list[str] = []
+
+    original_queue_feedback = orchestrator._queue_review_feedback
+
+    async def queue_feedback(*args: object, **kwargs: object) -> tuple[str, set[str]]:
+        queued = await original_queue_feedback(*args, **kwargs)
+        finding_queued.set()
+        return queued
+
+    async def review_once(
+        chapter: Chapter,
+        *,
+        rerun: bool = False,
+        feedback: str = "",
+    ) -> ReviewOutcome:
+        del rerun, feedback
+        reviews[chapter.id] += 1
+        if chapter.id == second.id and reviews[chapter.id] == 1:
+            await downstream_started.wait()
+            return ReviewOutcome(
+                True,
+                False,
+                {first.id: "upstream statement needs repair"},
+                run_id="downstream-finding",
+            )
+        if chapter.id == third.id and reviews[chapter.id] == 1:
+            downstream_started.set()
+            await finding_queued.wait()
+            try:
+                await release_downstream.wait()
+            except asyncio.CancelledError:
+                downstream_cancelled.set()
+                raise
+            downstream_finished.set()
+        if chapter.id == first.id and reviews[chapter.id] == 2:
+            return ReviewOutcome(True, True, {}, run_id="upstream-repair")
+        return ReviewOutcome(True, False, {}, run_id=f"review-{chapter.id}")
+
+    async def review_build(chapter: Chapter) -> dict[str, str]:
+        assert downstream_finished.is_set()
+        rebuilds.append(chapter.id)
+        return {}
+
+    monkeypatch.setattr(orchestrator, "_queue_review_feedback", queue_feedback)
+    monkeypatch.setattr(orchestrator, "_review_once", review_once)
+    monkeypatch.setattr(orchestrator, "_review_build", review_build)
+
+    review_tree = asyncio.create_task(orchestrator._review_tree())
+    await asyncio.wait_for(finding_queued.wait(), timeout=2)
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+    assert not downstream_cancelled.is_set()
+    assert reviews[first.id] == 1
+    assert rebuilds == []
+
+    release_downstream.set()
+    assert await asyncio.wait_for(review_tree, timeout=2)
+    assert not downstream_cancelled.is_set()
+    assert rebuilds == [first.id]
+    assert reviews[first.id] == 3
+    assert reviews[second.id] == 2
+    assert reviews[third.id] == 1
+    assert all(
+        orchestrator.state.task(chapter.id, Stage.REVIEW).status == TaskStatus.SUCCEEDED
+        for chapter in config.chapters
+    )
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_proof_finding_requeues_only_its_review_branch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

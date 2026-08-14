@@ -308,6 +308,7 @@ class Orchestrator:
         self.source_lock = asyncio.Lock()
         self._fixup_graph_lock = asyncio.Lock()
         self._invalidated_reviews: set[str] = set()
+        self._quiescent_review_rebuilds: set[str] = set()
         self._proof_rechecks: set[str] = set()
         self._review_invalidation_generations: dict[str, int] = {}
         self._review_generation_lock = asyncio.Lock()
@@ -850,6 +851,7 @@ class Orchestrator:
         return await self._invalidate_reviews(
             targets,
             detail="review invalidated by failed-proof findings",
+            quiesce_downstream=True,
         )
 
     def _has_completed_green_review(self, chapter_id: str) -> bool:
@@ -1842,6 +1844,7 @@ class Orchestrator:
         *,
         exclude: Iterable[str] = (),
         detail: str,
+        quiesce_downstream: bool = False,
     ) -> set[str]:
         """Invalidate only reviews that received new findings."""
 
@@ -1854,6 +1857,8 @@ class Orchestrator:
                     self._review_invalidation_generation(chapter_id) + 1
                 )
             self._invalidated_reviews.update(targets)
+            if quiesce_downstream:
+                self._quiescent_review_rebuilds.update(targets)
             await self.state.set_tasks(
                 targets,
                 Stage.REVIEW,
@@ -1901,7 +1906,7 @@ class Orchestrator:
         origin: str,
         exclude_from_invalidation: Iterable[str] = (),
     ) -> tuple[str, set[str]]:
-        """Persist follow-up review work and invalidate its affected review closure."""
+        """Persist follow-up work and reopen only its owners after descendants drain."""
 
         request_id, created = await self.state.enqueue_proof_review_request(
             feedback,
@@ -1913,6 +1918,7 @@ class Orchestrator:
             feedback,
             exclude=exclude_from_invalidation,
             detail="review invalidated by follow-up findings",
+            quiesce_downstream=True,
         )
         return request_id, invalidated
 
@@ -2243,12 +2249,14 @@ class Orchestrator:
                 for chapter_id in tuple(proof_results):
                     if chapter_id not in reviewed:
                         proof_results.pop(chapter_id, None)
+                # Findings reopen only their direct owners. Descendant agents
+                # that were already released against the previous clean build
+                # remain pinned to that snapshot and are allowed to drain.
                 stale_reviews = [
                     chapter_id
                     for chapter_id, handle in review_tasks.items()
                     if self.state.task(chapter_id, Stage.REVIEW).status
                     not in {TaskStatus.RUNNING, TaskStatus.SUCCEEDED}
-                    or not handle.dependencies.issubset(reviewed)
                 ]
                 cancelled_reviews: list[asyncio.Task[bool]] = []
                 for chapter_id in stale_reviews:
@@ -2270,7 +2278,15 @@ class Orchestrator:
                                     "prerequisite review was invalidated during review",
                                 )
 
+                active_chapters = review_tasks.keys() | proof_tasks.keys()
                 for chapter_id in graph.order:
+                    waiting_for_descendants = (
+                        chapter_id in self._quiescent_review_rebuilds
+                        and bool(
+                            self._successor_closure(graph, (chapter_id,)).difference({chapter_id})
+                            & active_chapters
+                        )
+                    )
                     if (
                         chapter_id not in reviewed
                         and chapter_id not in review_failures
@@ -2278,6 +2294,7 @@ class Orchestrator:
                         and chapter_id not in review_tasks
                         and fixup_ready(chapter_id)
                         and graph.dependencies[chapter_id].issubset(reviewed)
+                        and not waiting_for_descendants
                     ):
                         dependencies = graph.dependencies[chapter_id]
                         proof_feedback, proof_request_ids = self._proof_review_feedback(chapter_id)
@@ -2307,6 +2324,7 @@ class Orchestrator:
                             dependencies=dependencies,
                             proof_request_ids=proof_request_ids,
                         )
+                        self._quiescent_review_rebuilds.discard(chapter_id)
                         attempted.add(chapter_id)
 
                 if prove:
@@ -2390,7 +2408,12 @@ class Orchestrator:
                             proof_request_ids=handle.proof_request_ids,
                         )
                     reviewed.add(chapter_id)
-                    if prove and chapter_id not in proof_results and chapter_id not in proof_tasks:
+                    if (
+                        prove
+                        and chapter_id not in proof_results
+                        and chapter_id not in proof_tasks
+                        and current_dependencies.issubset(reviewed)
+                    ):
                         proof_tasks[chapter_id] = asyncio.create_task(
                             self._prove(by_id[chapter_id], defer_review=True)
                         )
