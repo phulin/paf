@@ -425,16 +425,19 @@ function chapterRows(state: SwarmState): ChapterRow[] {
     }
     rows.set(task.chapter_id, row);
   });
-  const priority = (row: ChapterRow) => {
-    const statuses = Object.values(row.stages).map((task) => task?.status);
-    if (statuses.includes("running")) return 0;
-    if (statuses.includes("failed") || statuses.includes("blocked")) return 1;
-    if (statuses.every((status) => status === "succeeded")) return 3;
-    return 2;
+  const bookSortKey = (bookId: string): [number, number | string] => {
+    const match = /^book(\d+)$/i.exec(bookId);
+    return match ? [0, Number(match[1])] : [1, bookId.toLocaleLowerCase()];
   };
-  return [...rows.values()].sort((left, right) =>
-    priority(left) - priority(right) || left.book.localeCompare(right.book) || left.number - right.number,
-  );
+  return [...rows.values()].sort((left, right) => {
+    const leftBook = bookSortKey(left.book);
+    const rightBook = bookSortKey(right.book);
+    if (leftBook[0] !== rightBook[0]) return leftBook[0] - rightBook[0];
+    const bookOrder = typeof leftBook[1] === "number" && typeof rightBook[1] === "number"
+      ? leftBook[1] - rightBook[1]
+      : String(leftBook[1]).localeCompare(String(rightBook[1]));
+    return bookOrder || left.number - right.number;
+  });
 }
 
 function ActivityBadge({ activity, task }: { activity?: AgentActivity; task?: Task }) {
