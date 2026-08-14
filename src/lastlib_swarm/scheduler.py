@@ -2,13 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import heapq
 import re
 from collections import deque
-from collections.abc import AsyncIterator, Coroutine, Iterable
-from contextlib import asynccontextmanager
+from collections.abc import Coroutine, Iterable
 from dataclasses import dataclass, replace
-from typing import Any, TypedDict
+from typing import Any
 from uuid import uuid4
 
 from lastlib_swarm.codex import (
@@ -20,6 +18,7 @@ from lastlib_swarm.codex import (
     scoped_files,
     validate,
 )
+from lastlib_swarm.coordination import CoordinatorBuildQueue, PriorityLimiter
 from lastlib_swarm.corpus import (
     ChapterImportGraph,
     build_chapter_import_graph,
@@ -118,22 +117,6 @@ class RunningFixupAgent:
     dependency_certificates: dict[str, str]
     feedback: str
     source_lock_held: bool = False
-
-
-@dataclass
-class CoordinatorBuildLease:
-    priority: float
-    label: str
-    stage: Stage
-    preemptible: bool
-    preempt_requested: asyncio.Event
-
-
-class CoordinatorBuildSnapshot(TypedDict):
-    owner: str
-    owner_stage: str
-    queued: int
-    queued_jobs: list[str]
 
 
 @dataclass(frozen=True)
@@ -251,129 +234,6 @@ class RunControl:
         self.stopping = True
         self.paused = False
         self._gate.set()
-
-
-class PriorityLimiter:
-    """A concurrency limiter that grants slots to the highest-priority waiter."""
-
-    def __init__(self, capacity: int) -> None:
-        self.capacity = capacity
-        self.available = capacity
-        self._sequence = 0
-        self._waiters: list[tuple[float, int, asyncio.Future[None]]] = []
-
-    def _wake(self) -> None:
-        while self.available and self._waiters:
-            _, _, waiter = heapq.heappop(self._waiters)
-            if waiter.done():
-                continue
-            self.available -= 1
-            waiter.set_result(None)
-
-    async def acquire(self, priority: float) -> None:
-        loop = asyncio.get_running_loop()
-        waiter: asyncio.Future[None] = loop.create_future()
-        self._sequence += 1
-        heapq.heappush(self._waiters, (-priority, self._sequence, waiter))
-        self._wake()
-        try:
-            await waiter
-        except asyncio.CancelledError:
-            # Cancellation can race with a grant. Return a granted slot; otherwise
-            # leave a cancelled future for _wake to discard lazily.
-            if waiter.done() and not waiter.cancelled():
-                self.release()
-            else:
-                waiter.cancel()
-            raise
-
-    def release(self) -> None:
-        if self.available >= self.capacity:
-            raise RuntimeError("priority limiter released without an acquired slot")
-        self.available += 1
-        self._wake()
-
-    @asynccontextmanager
-    async def slot(self, priority: float) -> AsyncIterator[None]:
-        await self.acquire(priority)
-        try:
-            yield
-        finally:
-            self.release()
-
-
-class CoordinatorBuildQueue:
-    """Priority gate acquired only by coordinator-owned Lake builds."""
-
-    def __init__(self) -> None:
-        self._sequence = 0
-        self._active: CoordinatorBuildLease | None = None
-        self._waiters: list[
-            tuple[float, int, asyncio.Future[CoordinatorBuildLease], CoordinatorBuildLease]
-        ] = []
-
-    def _wake(self) -> None:
-        if self._active is not None:
-            return
-        while self._waiters:
-            _, _, future, lease = heapq.heappop(self._waiters)
-            if future.done():
-                continue
-            self._active = lease
-            future.set_result(lease)
-            return
-
-    async def acquire(
-        self,
-        *,
-        priority: float,
-        label: str,
-        stage: Stage,
-        preemptible: bool = False,
-    ) -> CoordinatorBuildLease:
-        loop = asyncio.get_running_loop()
-        future: asyncio.Future[CoordinatorBuildLease] = loop.create_future()
-        lease = CoordinatorBuildLease(
-            priority=priority,
-            label=label,
-            stage=stage,
-            preemptible=preemptible,
-            preempt_requested=asyncio.Event(),
-        )
-        self._sequence += 1
-        heapq.heappush(self._waiters, (-priority, self._sequence, future, lease))
-        if (
-            self._active is not None
-            and self._active.preemptible
-            and priority > self._active.priority
-        ):
-            self._active.preempt_requested.set()
-        self._wake()
-        try:
-            return await future
-        except asyncio.CancelledError:
-            if future.done() and not future.cancelled() and self._active is lease:
-                self.release(lease)
-            else:
-                future.cancel()
-            raise
-
-    def release(self, lease: CoordinatorBuildLease) -> None:
-        if self._active is not lease:
-            raise RuntimeError("coordinator build lease released by a non-owner")
-        self._active = None
-        self._wake()
-
-    def snapshot(self) -> CoordinatorBuildSnapshot:
-        queued = [lease for _, _, future, lease in self._waiters if not future.done()]
-        return {
-            "owner": self._active.label if self._active is not None else "",
-            "owner_stage": self._active.stage.value if self._active is not None else "",
-            "queued": len(queued),
-            "queued_jobs": [
-                lease.label for lease in sorted(queued, key=lambda item: -item.priority)
-            ],
-        }
 
 
 def scaffold_directories(config: PipelineConfig, chapters: Iterable[Chapter]) -> tuple[str, ...]:
@@ -531,6 +391,20 @@ class Orchestrator:
                     pending.append(dependency)
         return required
 
+    @staticmethod
+    def _successor_closure(
+        graph: ChapterImportGraph, chapter_ids: Iterable[str]
+    ) -> set[str]:
+        affected = set(chapter_ids)
+        pending = list(affected)
+        while pending:
+            chapter_id = pending.pop()
+            for successor in graph.successors.get(chapter_id, frozenset()):
+                if successor not in affected:
+                    affected.add(successor)
+                    pending.append(successor)
+        return affected
+
     async def _publish_validated_builds(
         self,
         snapshots: dict[str, ValidatedBuildSnapshot],
@@ -607,14 +481,7 @@ class Orchestrator:
         clean: dict[str, dict[str, Any]],
         chapter_ids: Iterable[str],
     ) -> set[str]:
-        pending = list(chapter_ids)
-        invalidated: set[str] = set()
-        while pending:
-            chapter_id = pending.pop()
-            if chapter_id in invalidated:
-                continue
-            invalidated.add(chapter_id)
-            pending.extend(graph.successors.get(chapter_id, ()))
+        invalidated = Orchestrator._successor_closure(graph, chapter_ids)
         for chapter_id in invalidated:
             clean.pop(chapter_id, None)
         return invalidated
@@ -958,17 +825,6 @@ class Orchestrator:
         green = {chapter_id: False for chapter_id in legacy}
         events: list[tuple[str, str, str, set[str]]] = []
 
-        def closure(chapter_ids: Iterable[str]) -> set[str]:
-            result = set(chapter_ids)
-            pending = list(result)
-            while pending:
-                chapter_id = pending.pop()
-                for successor in graph.successors.get(chapter_id, frozenset()):
-                    if successor not in result:
-                        result.add(successor)
-                        pending.append(successor)
-            return result
-
         for chapter_id in legacy:
             task = self.state.task(chapter_id, Stage.REVIEW)
             if (
@@ -992,7 +848,12 @@ class Orchestrator:
                 if isinstance(findings, list) and findings:
                     owners = {chapter.id, *self._route_review_findings(chapter, report)}
                     events.append(
-                        (finished_at, "2-invalidate", run.id, closure(owners))
+                        (
+                            finished_at,
+                            "2-invalidate",
+                            run.id,
+                            self._successor_closure(graph, owners),
+                        )
                     )
                     continue
                 strict_review = (
@@ -1999,14 +1860,9 @@ class Orchestrator:
                     )
                     continue
 
-                needed = set(goals) | set(pending_feedback)
-                pending_needed = list(needed)
-                while pending_needed:
-                    required_by = pending_needed.pop()
-                    for dependency in graph.dependencies.get(required_by, frozenset()):
-                        if dependency not in needed:
-                            needed.add(dependency)
-                            pending_needed.append(dependency)
+                needed = self._dependency_closure(
+                    graph, set(goals) | set(pending_feedback)
+                )
                 buildable = [
                     chapter_id
                     for chapter_id in graph.order
@@ -2031,14 +1887,9 @@ class Orchestrator:
         finally:
             await cancel_running()
 
-        required = set(goals) if targeted else set(by_id)
-        pending_required = list(required)
-        while pending_required:
-            chapter_id = pending_required.pop()
-            for dependency in graph.dependencies.get(chapter_id, frozenset()):
-                if dependency not in required:
-                    required.add(dependency)
-                    pending_required.append(dependency)
+        required = self._dependency_closure(
+            graph, set(goals) if targeted else set(by_id)
+        )
         unresolved = required.difference(clean)
         blocked = unresolved.difference(failed)
         if blocked:
@@ -2165,14 +2016,7 @@ class Orchestrator:
         """Explicitly invalidate durable review and proof state for a repair closure."""
 
         graph = self._observed_chapter_graph()
-        invalidated = set(chapter_ids)
-        pending = list(invalidated)
-        while pending:
-            owner = pending.pop()
-            for successor in graph.successors.get(owner, frozenset()):
-                if successor not in invalidated:
-                    invalidated.add(successor)
-                    pending.append(successor)
+        invalidated = self._successor_closure(graph, chapter_ids)
         invalidated.difference_update(exclude)
         if not invalidated:
             return set()
