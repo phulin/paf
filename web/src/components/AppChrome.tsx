@@ -8,6 +8,8 @@ import {
   FileCode2,
   GitBranch,
   HardDrive,
+  Cpu,
+  MemoryStick,
   LayoutDashboard,
   Pause,
   Play,
@@ -17,7 +19,7 @@ import {
 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { timeAgo } from "../lib/format";
-import type { SwarmState, SwarmSummary } from "../types";
+import type { SwarmState, SwarmSummary, SystemLoad } from "../types";
 import { IconButton } from "./Controls";
 
 export type View = "overview" | "statements";
@@ -162,13 +164,21 @@ export function Rail({ view, setView }: NavigationProps) {
   );
 }
 
-export function StatusBar({ state, connected }: { state: SwarmState; connected: boolean }) {
+function gibibytes(bytes: number): string {
+  return (bytes / 1024 ** 3).toFixed(1);
+}
+
+export function StatusBar({ state, connected, systemLoad }: { state: SwarmState; connected: boolean; systemLoad: SystemLoad | null }) {
   return (
     <footer className="status-bar">
       <span><span className={`footer-dot ${connected ? "connected" : ""}`} /> {connected ? state.source : "demo snapshot"}</span>
       <span><Clock3 size={12} /> state {timeAgo(state.updated_at)}</span>
       <span><GitBranch size={12} /> critical path: {state.scheduling?.statements?.critical_path?.join(" → ") || "—"}</span>
       <span className="status-spacer" />
+      <span title="Host CPU utilization"><Cpu size={12} /> CPU {systemLoad?.cpu_percent == null ? "—" : `${systemLoad.cpu_percent.toFixed(0)}%`}</span>
+      <span title={systemLoad ? `${systemLoad.memory_percent.toFixed(1)}% of host memory in use` : "Host memory unavailable"}>
+        <MemoryStick size={12} /> RAM {systemLoad ? `${gibibytes(systemLoad.memory_used_bytes)} / ${gibibytes(systemLoad.memory_total_bytes)} GiB` : "—"}
+      </span>
       <span><HardDrive size={12} /> {state.isolation?.backend ?? "shared"}</span>
       <span><Command size={12} /> K search</span>
     </footer>

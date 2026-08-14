@@ -692,7 +692,7 @@ h1, h2, p { margin: 0; }
   .stage-card:nth-of-type(2), .stage-card:nth-of-type(3) { border-bottom: 1px solid var(--border); }
   .build-panel { grid-template-columns: 135px minmax(220px, 1fr) 145px; }
   .build-panel .build-target { display: none; }
-  .status-bar span:nth-child(3), .status-bar span:nth-child(5) { display: none; }
+  .status-bar span:nth-child(3), .status-bar span:nth-child(7) { display: none; }
   .browser-shell { grid-template-columns: 170px 310px 500px; }
   .statement-toolbar { grid-template-columns: 1fr 125px; }
   .statement-toolbar .select-wrap:last-child { display: none; }

@@ -72,6 +72,13 @@ export interface SwarmSummary {
   book_count: number;
 }
 
+export interface SystemLoad {
+  cpu_percent: number | null;
+  memory_used_bytes: number;
+  memory_total_bytes: number;
+  memory_percent: number;
+}
+
 export interface SwarmListResponse {
   swarms: SwarmSummary[];
 }

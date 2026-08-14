@@ -14,6 +14,7 @@ running swarms first, and remembers the selected run. The overview refreshes tha
 seconds. The statement browser indexes `lean/LastLib/**/*.lean`, caches unchanged files, and
 refreshes edited files on subsequent searches. A bundled demo snapshot keeps the production bundle
 usable when it is served without repository filesystem access.
+The status bar also reports live host CPU utilization and used/total RAM while the repository API is available.
 
 Other commands:
 

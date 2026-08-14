@@ -7,7 +7,7 @@ import { useSwarmState } from "./hooks/useSwarmState";
 export default function App() {
   const [view, setView] = useState<View>(window.location.hash === "#statements" ? "statements" : "overview");
   const [live, setLive] = useState(true);
-  const { state, swarms, selectedSwarm, selectSwarm, connected, fetching, refresh } = useSwarmState(live);
+  const { state, swarms, selectedSwarm, selectSwarm, connected, fetching, systemLoad, refresh } = useSwarmState(live);
 
   const navigate = (next: View) => {
     setView(next);
@@ -51,7 +51,7 @@ export default function App() {
       {view === "overview"
         ? <Overview state={state} connected={connected} />
         : <StatementBrowser close={() => navigate("overview")} connected={connected} />}
-      <StatusBar state={state} connected={connected} />
+      <StatusBar state={state} connected={connected} systemLoad={systemLoad} />
     </div>
   );
 }

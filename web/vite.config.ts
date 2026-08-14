@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import type { IncomingMessage, ServerResponse } from "node:http";
+import os from "node:os";
 import { defineConfig, type Plugin } from "vite";
 
 type DeclarationKind =
@@ -267,6 +268,34 @@ function json(response: ServerResponse, value: unknown, status = 200): void {
   response.end(JSON.stringify(value));
 }
 
+let previousCpuTimes: { idle: number; total: number } | null = null;
+
+function cpuTimes(): { idle: number; total: number } {
+  return os.cpus().reduce(
+    (sum, cpu) => {
+      const total = Object.values(cpu.times).reduce((value, time) => value + time, 0);
+      return { idle: sum.idle + cpu.times.idle, total: sum.total + total };
+    },
+    { idle: 0, total: 0 },
+  );
+}
+
+function serveSystem(response: ServerResponse): void {
+  const current = cpuTimes();
+  const elapsed = previousCpuTimes ? current.total - previousCpuTimes.total : 0;
+  const idle = previousCpuTimes ? current.idle - previousCpuTimes.idle : 0;
+  const cpuPercent = elapsed > 0 ? Math.max(0, Math.min(100, (1 - idle / elapsed) * 100)) : null;
+  previousCpuTimes = current;
+  const memoryTotalBytes = os.totalmem();
+  const memoryUsedBytes = memoryTotalBytes - os.freemem();
+  json(response, {
+    cpu_percent: cpuPercent,
+    memory_used_bytes: memoryUsedBytes,
+    memory_total_bytes: memoryTotalBytes,
+    memory_percent: memoryTotalBytes > 0 ? memoryUsedBytes / memoryTotalBytes * 100 : 0,
+  });
+}
+
 async function serveSwarms(response: ServerResponse): Promise<void> {
   const candidates = await swarmCandidates();
   json(response, {
@@ -373,6 +402,10 @@ function lastLibApi(): Plugin {
       }
       if (request.url?.startsWith("/api/swarm")) {
         await serveSwarm(request, response);
+        return;
+      }
+      if (request.url?.startsWith("/api/system")) {
+        serveSystem(response);
         return;
       }
       if (request.url?.startsWith("/api/statements")) {

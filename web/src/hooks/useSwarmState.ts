@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { demoState } from "../demo";
 import { corpusFromUrl, setCorpusUrl } from "../lib/urlState";
-import type { SwarmState, SwarmSummary } from "../types";
+import type { SwarmState, SwarmSummary, SystemLoad } from "../types";
 
 export function useSwarmState(live: boolean) {
   const [state, setState] = useState<SwarmState>(demoState);
@@ -11,12 +11,17 @@ export function useSwarmState(live: boolean) {
   );
   const [connected, setConnected] = useState(false);
   const [fetching, setFetching] = useState(true);
+  const [systemLoad, setSystemLoad] = useState<SystemLoad | null>(null);
 
   const refresh = useCallback(async () => {
     setFetching(true);
     try {
-      const listResponse = await fetch("/api/swarms", { cache: "no-store" });
+      const [listResponse, systemResponse] = await Promise.all([
+        fetch("/api/swarms", { cache: "no-store" }),
+        fetch("/api/system", { cache: "no-store" }),
+      ]);
       if (!listResponse.ok) throw new Error(`swarm list endpoint returned ${listResponse.status}`);
+      if (systemResponse.ok) setSystemLoad(await systemResponse.json() as SystemLoad);
       const list = (await listResponse.json() as { swarms: SwarmSummary[] }).swarms;
       setSwarms(list);
       const target = list.some((swarm) => swarm.id === selectedSwarm)
@@ -63,5 +68,5 @@ export function useSwarmState(live: boolean) {
     return () => window.clearInterval(timer);
   }, [live, refresh]);
 
-  return { state, swarms, selectedSwarm, selectSwarm, connected, fetching, refresh };
+  return { state, swarms, selectedSwarm, selectSwarm, connected, fetching, systemLoad, refresh };
 }
