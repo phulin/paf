@@ -440,6 +440,11 @@ function chapterRows(state: SwarmState): ChapterRow[] {
   });
 }
 
+function chapterLabel(row: ChapterRow): string {
+  const match = /^book(\d+)$/i.exec(row.book);
+  return `${match ? Number(match[1]) : row.book}.${row.number}`;
+}
+
 function ActivityBadge({ activity, task }: { activity?: AgentActivity; task?: Task }) {
   if (activity?.current) {
     return (
@@ -507,8 +512,8 @@ function TaskTable({
               <tr key={row.id} className={selected?.id === row.id ? "selected" : ""} onClick={() => setSelected(row)}>
                 <td>
                   <div className="chapter-cell">
-                    <span className="book-id">{row.book}</span>
-                    <div><strong>{String(row.number).padStart(2, "0")} · {row.title}</strong></div>
+                    <span className="chapter-index">{chapterLabel(row)}</span>
+                    <div><strong>{row.title}</strong></div>
                   </div>
                 </td>
                 {STAGES.map((stage) => (

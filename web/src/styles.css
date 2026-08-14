@@ -304,7 +304,7 @@ h1, h2, p { margin: 0; }
 .task-table tbody tr:hover, .task-table tr.selected { background: rgba(92, 207, 230, 0.035); }
 .task-table tr:hover .row-chevron { color: var(--cyan); transform: translateX(2px); }
 .chapter-cell { display: flex; align-items: center; gap: 10px; min-width: 0; }
-.book-id { flex: 0 0 auto; padding: 4px 5px; border: 1px solid #27323d; color: var(--cyan); background: rgba(92, 207, 230, .04); font: 650 8px/1 ui-monospace, monospace; text-transform: uppercase; }
+.chapter-index { flex: 0 0 39px; color: var(--cyan); font: 650 11px/1 ui-monospace, monospace; text-align: right; }
 .chapter-cell > div { min-width: 0; display: flex; flex-direction: column; gap: 4px; }
 .chapter-cell strong { color: var(--text); font-size: 10px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .chapter-cell div span { color: var(--muted-2); font: 500 8px/1 ui-monospace, monospace; }
@@ -566,7 +566,7 @@ h1, h2, p { margin: 0; }
 .compact-search input { font-size: 11px; }
 .task-table th { height: 32px; font-size: 10px; }
 .task-table td { height: 47px; }
-.book-id { font-size: 10px; }
+.chapter-index { font-size: 11px; }
 .chapter-cell strong { font-size: 12px; }
 .chapter-cell div span { font-size: 10px; }
 .status-pill { font-size: 9.5px; }
