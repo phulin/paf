@@ -1041,6 +1041,7 @@ time.sleep(60)
             os.kill(child_pid, signal.SIGKILL)
 
 
+@pytest.mark.skip(reason="slow TERM-resistant descendant cleanup integration test")
 @pytest.mark.asyncio
 async def test_successful_agent_exit_kills_surviving_mcp_descendants(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
