@@ -34,9 +34,11 @@ despite provisional imports. After all drafts finish, the coordinator discovers 
 regexes over the current `import LastLib...` lines. It then fixes dependency-ready chapters with Lean
 MCP concurrently. As soon as an agent finishes, the coordinator merges it, rescans imports, and
 rebuilds it once its refined predecessors are clean; unrelated agents keep running and a successful
-build immediately releases its review. The coordinator remembers the source and dependency digests
-of successful builds so it can avoid rebuilding unchanged chapters. Review has no separate green
-flag: a successful review task is the whole state. Restarts and ordinary proof-body edits leave it
+build immediately releases its review while fixup continues on other dependency-ready chapters.
+A review starts once its own fixup is clean and all of its observed dependencies have been reviewed;
+there is no corpus-wide barrier between fixup and review. The coordinator remembers the source and
+dependency digests of successful builds so it can avoid rebuilding unchanged chapters. Review has
+no separate green flag: a successful review task is the whole state. Restarts and ordinary proof-body edits leave it
 succeeded; explicit review findings, proof-requested statement/API repairs, and forced review reopen
 only the reviews that receive findings. Reviewers directly make scoped statement and API repairs.
 If a review edits source, transitive build certificates are invalidated and downstream proofs are

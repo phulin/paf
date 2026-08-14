@@ -1,7 +1,7 @@
 import asyncio
 import json
 import sqlite3
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -2090,6 +2090,7 @@ async def test_pipeline_reviews_each_chapter_as_soon_as_its_build_succeeds(
     orchestrator = Orchestrator(config, StateStore(config))
     await orchestrator.prepare()
     events: list[str] = []
+    first_review_started = asyncio.Event()
 
     async def formalize_all() -> bool:
         return True
@@ -2099,12 +2100,16 @@ async def test_pipeline_reviews_each_chapter_as_soon_as_its_build_succeeds(
         chapter: Chapter,
         **_kwargs: object,
     ) -> ValidationResult:
+        if chapter.id == second.id:
+            await asyncio.wait_for(first_review_started.wait(), timeout=1)
         events.append(f"build:{chapter.id}")
         return ValidationResult(True, 0, "ok")
 
     async def review(chapter: Chapter, *, rerun: bool = False) -> ReviewOutcome:
         assert not rerun
         events.append(f"review:{chapter.id}")
+        if chapter.id == first.id:
+            first_review_started.set()
         return ReviewOutcome(True, False, {})
 
     async def prove(chapter: Chapter, *, defer_review: bool = False) -> bool:
@@ -2124,7 +2129,8 @@ async def test_pipeline_reviews_each_chapter_as_soon_as_its_build_succeeds(
     ]
     assert events.index(f"build:{first.id}") < events.index(f"review:{first.id}")
     assert events.index(f"build:{second.id}") < events.index(f"review:{second.id}")
-    assert events.index(f"build:{second.id}") < events.index(f"review:{first.id}")
+    assert events.index(f"review:{first.id}") < events.index(f"build:{second.id}")
+    assert events.index(f"review:{first.id}") < events.index(f"review:{second.id}")
     await orchestrator.shutdown()
 
 
@@ -2170,6 +2176,76 @@ async def test_pipeline_quarantines_failed_formalization_but_reviews_independent
     monkeypatch.setattr(orchestrator, "_formalize_all", formalize_all)
     monkeypatch.setattr(scheduler_module, "validate", validation)
     monkeypatch.setattr(orchestrator, "_review_once", review)
+    monkeypatch.setattr(orchestrator, "_prove", prove)
+
+    assert not await orchestrator.run_pipeline()
+    assert reviewed == [second.id]
+    assert proved == [second.id]
+    assert orchestrator.state.task(first.id, Stage.REVIEW).status == TaskStatus.FAILED
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_pipeline_reviews_clean_branch_while_other_fixup_is_still_running(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    first, second = config.chapters
+    source_root = tmp_path / "lean" / "Book"
+    source_root.mkdir(parents=True)
+    for chapter in config.chapters:
+        (source_root / f"Chapter{chapter.number:02d}.lean").write_text(
+            f"def chapter{chapter.number} := {chapter.number}\n", encoding="utf-8"
+        )
+    orchestrator = Orchestrator(config, StateStore(config))
+    await orchestrator.prepare()
+    second_reviewed = asyncio.Event()
+    reviewed: list[str] = []
+    proved: list[str] = []
+
+    async def formalize_all() -> bool:
+        return True
+
+    async def fixup_to_clean(
+        _feedback: dict[str, str] | None = None,
+        *,
+        target_ids: Iterable[str] | None = None,
+        progress_event: asyncio.Event | None = None,
+    ) -> bool:
+        assert set(target_ids or ()) == {first.id, second.id}
+        assert progress_event is not None
+        await orchestrator.state.set_task(second.id, Stage.FIXUP, TaskStatus.SUCCEEDED, "clean")
+        progress_event.set()
+        await asyncio.wait_for(second_reviewed.wait(), timeout=1)
+        await orchestrator.state.set_task(
+            first.id, Stage.FIXUP, TaskStatus.FAILED, "did not converge"
+        )
+        return False
+
+    async def review(
+        chapter: Chapter,
+        _rounds_used: dict[str, int],
+        *,
+        rerun: bool = False,
+    ) -> bool:
+        assert not rerun
+        assert chapter.id == second.id
+        reviewed.append(chapter.id)
+        await orchestrator.state.set_task(
+            chapter.id, Stage.REVIEW, TaskStatus.SUCCEEDED, "reviewed"
+        )
+        second_reviewed.set()
+        return True
+
+    async def prove(chapter: Chapter, *, defer_review: bool = False) -> bool:
+        assert defer_review
+        assert chapter.id == second.id
+        proved.append(chapter.id)
+        return True
+
+    monkeypatch.setattr(orchestrator, "_formalize_all", formalize_all)
+    monkeypatch.setattr(orchestrator, "_fixup_to_clean", fixup_to_clean)
+    monkeypatch.setattr(orchestrator, "_review_chapter_to_clean", review)
     monkeypatch.setattr(orchestrator, "_prove", prove)
 
     assert not await orchestrator.run_pipeline()

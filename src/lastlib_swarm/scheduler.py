@@ -111,6 +111,13 @@ class RunningFixupAgent:
 
 
 @dataclass(frozen=True)
+class RunningFixupStage:
+    task: asyncio.Task[bool]
+    progress: asyncio.Event
+    target_ids: frozenset[str]
+
+
+@dataclass(frozen=True)
 class RunningReview:
     task: asyncio.Task[bool]
     dependencies: frozenset[str]
@@ -1268,7 +1275,8 @@ class Orchestrator:
                 handle.source_lock_held = False
             if isolated.accepted:
                 if agent.changed:
-                    await self._invalidate_build_records((handle.chapter.id,))
+                    invalidated_builds = await self._invalidate_build_records((handle.chapter.id,))
+                    self._proof_rechecks.update(invalidated_builds)
                 validation = ValidationResult(
                     True,
                     0,
@@ -1334,6 +1342,7 @@ class Orchestrator:
         feedback: dict[str, str] | None = None,
         *,
         target_ids: Iterable[str] | None = None,
+        progress_event: asyncio.Event | None = None,
     ) -> bool:
         """Converge globally or until selected targets are clean in the observed DAG."""
 
@@ -1450,6 +1459,8 @@ class Orchestrator:
                     TaskStatus.SUCCEEDED,
                     "clean coordinator build against observed imports",
                 )
+                if progress_event is not None:
+                    progress_event.set()
                 return True
 
             diagnostics = self._build_feedback({chapter_id: result}).actionable
@@ -1476,6 +1487,16 @@ class Orchestrator:
             build_generation=build_generation,
             invalidated=invalidated_clean,
         )
+        reusable = set(clean).intersection(goals if targeted else by_id)
+        if reusable:
+            await self.state.set_tasks(
+                reusable,
+                Stage.FIXUP,
+                TaskStatus.SUCCEEDED,
+                "clean initial build reused",
+            )
+            if progress_event is not None:
+                progress_event.set()
 
         try:
             while True:
@@ -1526,6 +1547,8 @@ class Orchestrator:
                         await discard_stale(handle, changed_dependencies)
                         continue
                     attempt = await self._integrate_fixup_agent(handle)
+                    if progress_event is not None:
+                        progress_event.set()
                     if attempt is None:
                         if attempts[chapter_id] < maximum:
                             merge_feedback(
@@ -1613,6 +1636,16 @@ class Orchestrator:
                     and graph.dependencies[chapter_id].issubset(clean)
                 ]
                 for chapter_id in actionable[: max(available, 0)]:
+                    if self.state.task(chapter_id, Stage.REVIEW).status in {
+                        TaskStatus.RUNNING,
+                        TaskStatus.SUCCEEDED,
+                    }:
+                        await self._invalidate_reviews(
+                            (chapter_id,),
+                            detail="review invalidated by later fixup findings",
+                        )
+                        if progress_event is not None:
+                            progress_event.set()
                     if attempts[chapter_id] >= maximum:
                         await self.state.set_task(
                             chapter_id,
@@ -2026,8 +2059,9 @@ class Orchestrator:
         rerun: bool = False,
         prove: bool = False,
         quarantined: Iterable[str] = (),
+        fixup: RunningFixupStage | None = None,
     ) -> bool:
-        """Release dependency-ready reviews and proofs without a corpus-wide review gate."""
+        """Release dependency-ready reviews and proofs without a corpus-wide fixup gate."""
 
         await self._recover_proof_review_requests()
         by_id = {chapter.id: chapter for chapter in self.chapters}
@@ -2076,6 +2110,14 @@ class Orchestrator:
             )
         }
         proof_reviews = {chapter_id: 0 for chapter_id in by_id}
+        fixup_failures_applied = False
+
+        def fixup_ready(chapter_id: str) -> bool:
+            return (
+                fixup is None
+                or chapter_id not in fixup.target_ids
+                or self.state.task(chapter_id, Stage.FIXUP).status == TaskStatus.SUCCEEDED
+            )
 
         async with self.state.batch():
             if quarantined_ids:
@@ -2093,14 +2135,22 @@ class Orchestrator:
                 )
             for chapter_id in initial_graph.order:
                 if chapter_id not in reviewed:
-                    missing = initial_graph.dependencies[chapter_id].difference(reviewed)
-                    if missing:
+                    if not fixup_ready(chapter_id):
                         await self.state.set_task(
                             chapter_id,
                             Stage.REVIEW,
                             TaskStatus.PENDING,
-                            "waiting for prerequisite reviews: " + ", ".join(sorted(missing)),
+                            "waiting for clean initial fixup",
                         )
+                    else:
+                        missing = initial_graph.dependencies[chapter_id].difference(reviewed)
+                        if missing:
+                            await self.state.set_task(
+                                chapter_id,
+                                Stage.REVIEW,
+                                TaskStatus.PENDING,
+                                "waiting for prerequisite reviews: " + ", ".join(sorted(missing)),
+                            )
                 if chapter_id not in reviewed:
                     await self.state.set_task(
                         chapter_id,
@@ -2117,6 +2167,10 @@ class Orchestrator:
 
         try:
             while True:
+                if fixup is not None:
+                    # Clear before inspecting state so a subsequent fixup
+                    # transition cannot be lost between the scan and wait.
+                    fixup.progress.clear()
                 try:
                     graph = self._observed_chapter_graph()
                 except ValueError as error:
@@ -2127,6 +2181,49 @@ class Orchestrator:
                         str(error),
                     )
                     return False
+
+                if fixup is not None and fixup.task.done() and not fixup_failures_applied:
+                    # Propagate orchestration failures, then quarantine only
+                    # chapters whose own fixup did not succeed. Independent
+                    # clean branches remain eligible for review and proof.
+                    fixup.task.result()
+                    failed_fixups = {
+                        chapter_id
+                        for chapter_id in fixup.target_ids
+                        if self.state.task(chapter_id, Stage.FIXUP).status != TaskStatus.SUCCEEDED
+                    }
+                    if failed_fixups:
+                        reviewed.difference_update(failed_fixups)
+                        review_failures.update(failed_fixups)
+                        cancelled_proofs = [
+                            proof_tasks.pop(chapter_id)
+                            for chapter_id in failed_fixups
+                            if chapter_id in proof_tasks
+                        ]
+                        for task in cancelled_proofs:
+                            task.cancel()
+                        await asyncio.gather(*cancelled_proofs, return_exceptions=True)
+                        for chapter_id in failed_fixups:
+                            proof_results.pop(chapter_id, None)
+                        await self._invalidate_reviews(
+                            failed_fixups,
+                            detail="review blocked by failed initial fixup",
+                        )
+                        async with self.state.batch():
+                            await self.state.set_tasks(
+                                failed_fixups,
+                                Stage.REVIEW,
+                                TaskStatus.FAILED,
+                                "initial fixup did not complete",
+                            )
+                            if prove:
+                                await self.state.set_tasks(
+                                    failed_fixups,
+                                    Stage.PROVE,
+                                    TaskStatus.BLOCKED,
+                                    "blocked because initial fixup did not complete",
+                                )
+                    fixup_failures_applied = True
 
                 # Pull durable successes into readiness and remove reviews with
                 # direct findings. Source edits separately trigger build rechecks.
@@ -2149,7 +2246,8 @@ class Orchestrator:
                 stale_reviews = [
                     chapter_id
                     for chapter_id, handle in review_tasks.items()
-                    if self.state.task(chapter_id, Stage.REVIEW).status != TaskStatus.RUNNING
+                    if self.state.task(chapter_id, Stage.REVIEW).status
+                    not in {TaskStatus.RUNNING, TaskStatus.SUCCEEDED}
                     or not handle.dependencies.issubset(reviewed)
                 ]
                 cancelled_reviews: list[asyncio.Task[bool]] = []
@@ -2178,6 +2276,7 @@ class Orchestrator:
                         and chapter_id not in review_failures
                         and chapter_id not in review_blocked
                         and chapter_id not in review_tasks
+                        and fixup_ready(chapter_id)
                         and graph.dependencies[chapter_id].issubset(reviewed)
                     ):
                         dependencies = graph.dependencies[chapter_id]
@@ -2215,6 +2314,7 @@ class Orchestrator:
                         if (
                             chapter_id not in proof_results
                             and chapter_id not in proof_tasks
+                            and fixup_ready(chapter_id)
                             and graph.dependencies[chapter_id].issubset(reviewed)
                         ):
                             proof_tasks[chapter_id] = asyncio.create_task(
@@ -2223,6 +2323,10 @@ class Orchestrator:
 
                 live_tasks = [handle.task for handle in review_tasks.values()]
                 live_tasks.extend(proof_tasks.values())
+                progress_waiter: asyncio.Task[bool] | None = None
+                if fixup is not None and not fixup.task.done():
+                    progress_waiter = asyncio.create_task(fixup.progress.wait())
+                    live_tasks.extend((fixup.task, progress_waiter))
                 if not live_tasks:
                     unresolved = set(by_id).difference(reviewed | review_failures | review_blocked)
                     if unresolved:
@@ -2251,6 +2355,9 @@ class Orchestrator:
                         "review scheduler has unfinished proofs but no runnable tasks"
                     )
                 done, _ = await asyncio.wait(live_tasks, return_when=asyncio.FIRST_COMPLETED)
+                if progress_waiter is not None and progress_waiter not in done:
+                    progress_waiter.cancel()
+                    await asyncio.gather(progress_waiter, return_exceptions=True)
 
                 completed_reviews = [
                     chapter_id for chapter_id, handle in review_tasks.items() if handle.task in done
@@ -2283,7 +2390,7 @@ class Orchestrator:
                             proof_request_ids=handle.proof_request_ids,
                         )
                     reviewed.add(chapter_id)
-                    if prove:
+                    if prove and chapter_id not in proof_results and chapter_id not in proof_tasks:
                         proof_tasks[chapter_id] = asyncio.create_task(
                             self._prove(by_id[chapter_id], defer_review=True)
                         )
@@ -2522,16 +2629,32 @@ class Orchestrator:
             }
         )
         initial_targets = {chapter.id for chapter in self.chapters}.difference(quarantined)
-        fixed = await self._fixup_to_clean(target_ids=initial_targets) if initial_targets else False
-        quarantined.update(
-            chapter_id
-            for chapter_id in initial_targets
-            if self.state.task(chapter_id, Stage.FIXUP).status != TaskStatus.SUCCEEDED
-        )
-        if quarantined:
-            await self._invalidate_reviews(
-                quarantined,
-                detail="review blocked by failed initial formalization or fixup",
+        if not initial_targets:
+            return False
+        fixup_progress = asyncio.Event()
+        fixup_task = asyncio.create_task(
+            self._fixup_to_clean(
+                target_ids=initial_targets,
+                progress_event=fixup_progress,
             )
-        reviewed = await self._review_tree(prove=True, quarantined=quarantined)
+        )
+        fixup = RunningFixupStage(
+            task=fixup_task,
+            progress=fixup_progress,
+            target_ids=frozenset(initial_targets),
+        )
+        review_task = asyncio.create_task(
+            self._review_tree(
+                prove=True,
+                quarantined=quarantined,
+                fixup=fixup,
+            )
+        )
+        try:
+            fixed, reviewed = await asyncio.gather(fixup_task, review_task)
+        except BaseException:
+            fixup_task.cancel()
+            review_task.cancel()
+            await asyncio.gather(fixup_task, review_task, return_exceptions=True)
+            raise
         return formalized and fixed and reviewed
