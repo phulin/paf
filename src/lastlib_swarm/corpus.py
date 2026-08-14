@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Literal
 
 from lastlib_swarm.models import BookConfig, Chapter
+from lastlib_swarm.scope import ScopeMatcher
 
 Phase = Literal["statements", "proofs"]
 
@@ -50,10 +51,7 @@ def observed_imports(text: str) -> tuple[str, ...]:
 
 
 def _chapter_source_files(repo: Path, chapter: Chapter) -> tuple[Path, ...]:
-    files: set[Path] = set()
-    for pattern in chapter.scope:
-        files.update(path for path in repo.glob(pattern) if path.is_file())
-    return tuple(sorted(files))
+    return tuple(ScopeMatcher(chapter.scope).files(repo))
 
 
 def _chapter_cycle(dependencies: dict[str, set[str]]) -> tuple[str, ...]:
