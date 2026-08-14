@@ -101,7 +101,7 @@ function StatusPill({ status = "pending", rounds }: { status?: TaskStatus; round
     <span className={`status-pill status-${status}`}>
       {statusIcon(status)}
       <span>{status === "succeeded" ? "done" : status}</span>
-      {Boolean(rounds) && <span className="round-count">{rounds}</span>}
+      {Boolean(rounds) && <span className="round-count">×{rounds}</span>}
     </span>
   );
 }
@@ -508,7 +508,7 @@ function TaskTable({
                 <td>
                   <div className="chapter-cell">
                     <span className="book-id">{row.book}</span>
-                    <div><strong>{String(row.number).padStart(2, "0")} · {row.title}</strong><span>{row.id}</span></div>
+                    <div><strong>{String(row.number).padStart(2, "0")} · {row.title}</strong></div>
                   </div>
                 </td>
                 {STAGES.map((stage) => (
