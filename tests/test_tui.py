@@ -549,6 +549,80 @@ async def test_agent_detail_adds_a_step_that_starts_while_open(tmp_path: Path) -
 
 
 @pytest.mark.asyncio
+async def test_agent_detail_refreshes_plan_from_live_activity(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    ready = asyncio.Event()
+    update_plan = asyncio.Event()
+    plan_updated = asyncio.Event()
+    finish = asyncio.Event()
+
+    initial_plan = [
+        {"text": "Inspect the current behavior", "completed": False},
+        {"text": "Implement the fix", "completed": False},
+    ]
+    revised_plan = [
+        {"text": "Inspect the current behavior", "completed": True},
+        {"text": "Implement the fix", "completed": False},
+    ]
+
+    def plan_event(items: list[dict[str, Any]]) -> dict[str, Any]:
+        return {
+            "type": "item.completed",
+            "item": {"id": "plan", "type": "todo_list", "items": items},
+        }
+
+    async def operation() -> bool:
+        run = await state.start_run(config.chapters[0].id, Stage.FORMALIZE)
+        activity = state.activities.start(run.id, run.chapter_id, run.stage)
+        initial_event = plan_event(initial_plan)
+        activity.consume(initial_event, workspace_root=tmp_path)
+        log_path = state.logs_dir / f"{run.id}.jsonl"
+        log_path.write_text(json.dumps(initial_event) + "\n", encoding="utf-8")
+        await state.update_run(run, log_path=str(log_path))
+        state.activities.save(activity)
+        ready.set()
+
+        await update_plan.wait()
+        revised_event = plan_event(revised_plan)
+        with log_path.open("a", encoding="utf-8") as log:
+            log.write(json.dumps(revised_event) + "\n")
+        activity.consume(revised_event, workspace_root=tmp_path)
+        state.activities.save(activity)
+        plan_updated.set()
+        await finish.wait()
+        return True
+
+    app = SwarmApp(orchestrator, operation, label="test")
+    async with app.run_test(size=(160, 50)) as pilot:
+        await ready.wait()
+        app.action_inspect_agent()
+        await pilot.pause(0.6)
+
+        app.screen.query_one("#agent-tabs", TabbedContent).active = "plan-pane"
+        await pilot.pause(0.1)
+        plan = app.screen.query_one("#agent-plan", RichLog)
+        assert [line.text for line in plan.lines] == [
+            "· Inspect the current behavior",
+            "· Implement the fix",
+        ]
+
+        update_plan.set()
+        await plan_updated.wait()
+        await pilot.pause(1.1)
+
+        assert [line.text for line in plan.lines] == [
+            "✓ Inspect the current behavior",
+            "· Implement the fix",
+        ]
+
+        await pilot.press("escape")
+        finish.set()
+        await pilot.pause(1.2)
+
+
+@pytest.mark.asyncio
 async def test_unchanged_dashboard_does_not_update_table_cells(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

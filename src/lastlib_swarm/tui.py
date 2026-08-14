@@ -595,6 +595,12 @@ class AgentDetailScreen(Screen[None]):
         timeline.updated_at = compact.updated_at
         timeline.latest_summary = compact.latest_summary
         timeline.latest_error = compact.latest_error
+        # Timeline entries do not retain enough detail to reconstruct these
+        # aggregate views. Keep them aligned with the live sidecar whenever we
+        # extend the cached replay, or the Plan and Files tabs remain stale
+        # until an eventual full replay.
+        timeline.todos = list(compact.todos)
+        timeline.files = list(compact.files)
         return timeline
 
     def _sync_run_tabs(self, runs: list[RunRecord]) -> None:
