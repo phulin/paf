@@ -847,6 +847,7 @@ class FuseOverlayIsolation:
                 staged: dict[str, Path] = {}
                 backups: dict[str, Path] = {}
                 committed: list[str] = []
+                committed_all = False
                 try:
                     # Complete every allocation and content verification before
                     # the first live path changes. In particular, ENOSPC while
@@ -860,10 +861,10 @@ class FuseOverlayIsolation:
                         temporary = destination.with_name(
                             f".{destination.name}.swarm-stage-{transaction}"
                         )
+                        staged[relative] = temporary
                         shutil.copy2(merged_root / relative, temporary)
                         if _fingerprint(temporary) != fingerprint:
                             raise OSError(f"staged source verification failed: {relative}")
-                        staged[relative] = temporary
 
                     for relative in changed:
                         destination = self.settings.repo / relative
@@ -877,6 +878,7 @@ class FuseOverlayIsolation:
                         committed.append(relative)
                         if relative in staged:
                             os.replace(staged[relative], destination)
+                    committed_all = True
                 except BaseException:
                     for relative in reversed(committed):
                         destination = self.settings.repo / relative
@@ -888,8 +890,9 @@ class FuseOverlayIsolation:
                 finally:
                     for temporary in staged.values():
                         temporary.unlink(missing_ok=True)
-                    for backup in backups.values():
-                        backup.unlink(missing_ok=True)
+                    if committed_all:
+                        for backup in backups.values():
+                            backup.unlink(missing_ok=True)
                 if changed:
                     self._revision += 1
                 return IsolationResult(
