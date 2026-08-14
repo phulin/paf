@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import hashlib
 import os
 import re
@@ -708,6 +709,7 @@ whole-file diagnostics in import order; do not prepare every file separately.
                 cwd=root,
                 start_new_session=True,
             )
+            process_tree = _ProcessTreeTracker(process.pid)
             await self.state.update_run(run, pid=process.pid, log_path=str(log_path))
             if process.stdin is None or process.stdout is None:
                 await _terminate(process)
@@ -769,6 +771,7 @@ whole-file diagnostics in import order; do not prepare every file separately.
                 pressure_wait = asyncio.create_task(
                     _wait_for_fd_pressure(
                         process,
+                        process_tree,
                         self.config.settings.codex_fd_recycle_threshold,
                         lambda: thread_id is not None,
                     )
@@ -778,20 +781,20 @@ whole-file diagnostics in import order; do not prepare every file separately.
                         (exit_wait, pressure_wait), return_when=asyncio.FIRST_COMPLETED
                     )
                     if pressure_wait in done and (fd_pressure := pressure_wait.result()):
-                        await _terminate(process)
+                        await _terminate(process, process_tree)
                         exit_code = 75
                     else:
                         exit_code = await exit_wait
             except TimeoutError:
                 timed_out = True
-                await _terminate(process)
+                await _terminate(process, process_tree)
                 exit_code = 124
             except BaseException:
                 stdin.close()
                 with suppress(BrokenPipeError, ConnectionResetError):
                     await stdin.wait_closed()
                 with suppress(BaseException):
-                    await _terminate(process)
+                    await _terminate(process, process_tree)
                 if not consumer.done():
                     consumer.cancel()
                 await asyncio.gather(consumer, return_exceptions=True)
@@ -808,9 +811,9 @@ whole-file diagnostics in import order; do not prepare every file separately.
                     await asyncio.gather(*pending, return_exceptions=True)
             if not timed_out:
                 # Codex can exit before its MCP/LSP descendants. Reap the complete
-                # process group before integration so no language server retains the
+                # process tree before integration so no language server retains the
                 # overlay or races the coordinator-owned build.
-                await _terminate(process)
+                await _terminate(process, process_tree)
             await consumer
             return exit_code, timed_out, capacity_failure, fd_pressure
 
@@ -989,35 +992,121 @@ async def _wait_for_parent_exit(process: asyncio.subprocess.Process) -> int:
     return process.returncode
 
 
+def _process_identity(pid: int) -> tuple[int, int, str] | None:
+    """Return ``(parent pid, start time, state)`` for a Linux process."""
+
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    except (FileNotFoundError, PermissionError, ProcessLookupError, OSError):
+        return None
+    end = stat.rfind(")")
+    if end < 0:
+        return None
+    fields = stat[end + 2 :].split()
+    try:
+        return int(fields[1]), int(fields[19]), fields[0]
+    except (IndexError, ValueError):
+        return None
+
+
+@dataclass
+class _ProcessTreeTracker:
+    """Track descendants even when they create new sessions or become orphaned."""
+
+    root_pid: int
+    known: dict[int, int] = field(default_factory=dict)
+
+    def scan(self) -> set[int]:
+        descendants: set[int] = set()
+        # Previously observed children remain traversal roots after reparenting.
+        # This lets a surviving code-mode host reveal newly spawned MCP/LSP
+        # grandchildren even after the direct Codex process has exited.
+        pending = [self.root_pid, *self.known]
+        while pending:
+            pid = pending.pop()
+            if pid in descendants:
+                continue
+            identity = _process_identity(pid)
+            if identity is None:
+                continue
+            if (
+                (known_start := self.known.get(pid)) is not None
+                and identity[1] != known_start
+            ):
+                continue
+            descendants.add(pid)
+            self.known[pid] = identity[1]
+            try:
+                children = Path(f"/proc/{pid}/task/{pid}/children").read_text(encoding="utf-8")
+            except (FileNotFoundError, PermissionError, ProcessLookupError, OSError):
+                continue
+            pending.extend(int(child) for child in children.split())
+        return descendants
+
+    def live_known(self) -> set[int]:
+        live: set[int] = set()
+        for pid, started in self.known.items():
+            identity = _process_identity(pid)
+            if identity is not None and identity[1] == started and identity[2] != "Z":
+                live.add(pid)
+        return live
+
+    def descriptor_count(self) -> int:
+        # Include remembered descendants that detached or were reparented after a
+        # previous scan; Codex's code-mode and Lean transports both use setsid().
+        processes = self.scan() | self.live_known()
+        return sum(_open_descriptor_count(pid) for pid in processes)
+
+
 def _open_descriptor_count(pid: int) -> int:
-    """Read a Linux process's live descriptor count without retaining handles."""
+    """Read one Linux process's descriptor count without retaining handles."""
 
     try:
         with os.scandir(f"/proc/{pid}/fd") as entries:
             return sum(1 for _ in entries)
     except (FileNotFoundError, PermissionError, ProcessLookupError):
         return 0
+    except OSError as exc:
+        # If even procfs cannot allocate a descriptor, force an immediate recycle
+        # instead of treating the failed observation as a healthy count of zero.
+        if exc.errno in {errno.EMFILE, errno.ENFILE}:
+            return 2**31 - 1
+        return 0
 
 
 async def _wait_for_fd_pressure(
     process: asyncio.subprocess.Process,
+    process_tree: _ProcessTreeTracker,
     threshold: int,
     resumable: Callable[[], bool],
 ) -> int:
-    """Return the observed count when a resumable Codex child approaches EMFILE."""
+    """Return when a Codex process tree approaches descriptor exhaustion."""
 
     if threshold <= 0:
         await process.wait()
         return 0
     while process.returncode is None:
-        count = _open_descriptor_count(process.pid)
+        count = process_tree.descriptor_count()
         if resumable() and count >= threshold:
             return count
         await asyncio.sleep(1)
     return 0
 
 
-async def _terminate(process: asyncio.subprocess.Process) -> None:
+def _signal_processes(pids: set[int], sig: signal.Signals) -> None:
+    for pid in pids:
+        with suppress(ProcessLookupError, PermissionError):
+            os.kill(pid, sig)
+
+
+async def _terminate(
+    process: asyncio.subprocess.Process,
+    process_tree: _ProcessTreeTracker | None = None,
+) -> None:
+    process_tree = process_tree or _ProcessTreeTracker(process.pid)
+    process_tree.scan()
+    descendants = process_tree.live_known() - {process.pid}
+    _signal_processes(descendants, signal.SIGTERM)
     process_group = process.pid
     with suppress(ProcessLookupError):
         os.killpg(process_group, signal.SIGTERM)
@@ -1025,28 +1114,19 @@ async def _terminate(process: asyncio.subprocess.Process) -> None:
         async with asyncio.timeout(10):
             await process.wait()
     except TimeoutError:
+        _signal_processes(process_tree.live_known(), signal.SIGKILL)
         with suppress(ProcessLookupError):
             os.killpg(process_group, signal.SIGKILL)
         await process.wait()
-        return
 
-    # Codex may exit before its MCP/LSP grandchildren. Those descendants keep the
-    # private overlay busy even after reparenting to PID 1, so wait for the entire
-    # process group—not only its original leader—then force-kill any survivors.
+    # Codex's code-mode host, MCP servers, and Lean watchdogs can each call
+    # setsid(). Remember their identities before the parent exits so they can be
+    # reaped after reparenting instead of escaping a process-group-only kill.
     loop = asyncio.get_running_loop()
     deadline = loop.time() + PROCESS_GROUP_GRACE_SECONDS
-    while _process_group_exists(process_group) and loop.time() < deadline:
+    while process_tree.live_known() and loop.time() < deadline:
         await asyncio.sleep(0.05)
-    if _process_group_exists(process_group):
-        with suppress(ProcessLookupError):
-            os.killpg(process_group, signal.SIGKILL)
-
-
-def _process_group_exists(process_group: int) -> bool:
-    try:
-        os.killpg(process_group, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
+    _signal_processes(process_tree.live_known(), signal.SIGKILL)
+    deadline = loop.time() + PROCESS_GROUP_GRACE_SECONDS
+    while process_tree.live_known() and loop.time() < deadline:
+        await asyncio.sleep(0.05)

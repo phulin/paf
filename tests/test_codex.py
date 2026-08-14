@@ -759,6 +759,7 @@ print(json.dumps({{"type": "item.completed", "item": {{
 
     async def fd_pressure(
         process: asyncio.subprocess.Process,
+        _process_tree: object,
         _threshold: int,
         resumable: object,
     ) -> int:
@@ -788,6 +789,66 @@ print(json.dumps({{"type": "item.completed", "item": {{
     activity = state.activities.get(run.id)
     assert activity is not None
     assert any("resource recycle" in entry.title for entry in activity.recent)
+
+
+@pytest.mark.asyncio
+async def test_fd_pressure_and_teardown_include_setsid_descendants(tmp_path: Path) -> None:
+    child_pid_path = tmp_path / "setsid-child.pid"
+    child = tmp_path / "descriptor-child"
+    child.write_text(
+        """#!/usr/bin/env python3
+import os
+import signal
+import sys
+import time
+from pathlib import Path
+
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+descriptors = [open("/dev/null", "rb") for _ in range(80)]
+Path(sys.argv[1]).write_text(str(os.getpid()))
+time.sleep(60)
+""",
+        encoding="utf-8",
+    )
+    child.chmod(0o755)
+    parent = tmp_path / "descriptor-parent"
+    parent.write_text(
+        f"""#!/usr/bin/env python3
+import subprocess
+import time
+
+subprocess.Popen([{str(child)!r}, {str(child_pid_path)!r}], start_new_session=True)
+time.sleep(60)
+""",
+        encoding="utf-8",
+    )
+    parent.chmod(0o755)
+    process = await asyncio.create_subprocess_exec(
+        str(parent),
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    process_tree = codex_module._ProcessTreeTracker(process.pid)
+    child_pid = 0
+    try:
+        for _ in range(200):
+            process_tree.scan()
+            if child_pid_path.is_file():
+                child_pid = int(child_pid_path.read_text(encoding="utf-8"))
+                break
+            await asyncio.sleep(0.01)
+        assert child_pid
+        pressure = await asyncio.wait_for(
+            codex_module._wait_for_fd_pressure(
+                process, process_tree, 64, lambda: True
+            ),
+            timeout=5,
+        )
+        assert pressure >= 64
+    finally:
+        await codex_module._terminate(process, process_tree)
+    assert not _process_is_running(child_pid)
 
 
 @pytest.mark.asyncio
@@ -918,7 +979,7 @@ import sys
 import time
 
 sys.stdin.read()
-subprocess.Popen([{str(child)!r}, {str(child_pid_path)!r}])
+subprocess.Popen([{str(child)!r}, {str(child_pid_path)!r}], start_new_session=True)
 print(json.dumps({{"type": "thread.started", "thread_id": "descendant-test"}}), flush=True)
 time.sleep(60)
 """,
@@ -981,7 +1042,7 @@ import time
 from pathlib import Path
 
 sys.stdin.read()
-subprocess.Popen([{str(child)!r}, {str(child_pid_path)!r}])
+subprocess.Popen([{str(child)!r}, {str(child_pid_path)!r}], start_new_session=True)
 for _ in range(200):
     if Path({str(child_pid_path)!r}).is_file():
         break
