@@ -661,12 +661,9 @@ async def test_fixup_builds_in_observed_chapter_import_order(
     monkeypatch.setattr(scheduler_module, "validate", successful_validation)
 
     assert await orchestrator.run_stage(Stage.FIXUP)
-    assert builds == [
-        second.id,
-        first.id,
-        second.id,
-        first.id,
-    ]
+    assert builds == [second.id, first.id]
+    assert orchestrator.state.task(first.id, Stage.FIXUP).rounds == 0
+    assert orchestrator.state.task(second.id, Stage.FIXUP).rounds == 0
     assert state.fixup_graph["edges"] == [[second.id, first.id]]
     await orchestrator.shutdown()
 
@@ -711,6 +708,39 @@ async def test_targeted_fixup_does_not_build_cleanliness_descendants(
     assert orchestrator.state.task(first.id, Stage.FIXUP).status == TaskStatus.SUCCEEDED
     assert orchestrator.state.task(first.id, Stage.FIXUP).detail == "clean initial build reused"
     assert orchestrator.state.task(second.id, Stage.FIXUP).status == TaskStatus.PENDING
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_optimistic_build_discards_stale_feedback_without_fixup_agent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = config.chapters[0]
+    orchestrator = Orchestrator(config, StateStore(config))
+    await orchestrator.prepare()
+    orchestrator.executor = FakeExecutor(orchestrator.state, [])
+    builds: list[str] = []
+
+    async def successful_validation(
+        _config: object,
+        built: Chapter,
+        **_kwargs: object,
+    ) -> ValidationResult:
+        builds.append(built.id)
+        return ValidationResult(True, 0, "ok")
+
+    monkeypatch.setattr(scheduler_module, "validate", successful_validation)
+
+    assert await orchestrator._fixup_to_clean(
+        {chapter.id: "stale diagnostic"}, target_ids={chapter.id}
+    )
+    assert builds == [chapter.id]
+    assert orchestrator.state.task(chapter.id, Stage.FIXUP).rounds == 0
+    assert (
+        orchestrator.state.task(chapter.id, Stage.FIXUP).detail
+        == "clean optimistic coordinator build; no fixup agent needed"
+    )
     await orchestrator.shutdown()
 
 
@@ -960,8 +990,9 @@ async def test_fixup_rescans_new_import_before_rebuilding_edited_chapter(
     monkeypatch.setattr(scheduler_module, "validate", validation)
 
     assert await orchestrator.run_stage(Stage.FIXUP)
-    assert events[:4] == [
+    assert events[:5] == [
         f"build:{first.id}",
+        f"build:{second.id}",
         f"agent:{first.id}",
         f"build:{second.id}",
         f"build:{first.id}",
@@ -1241,7 +1272,7 @@ async def test_fixup_reuses_valid_persisted_build_records(
     await first.prepare()
     assert await first.run_stage(Stage.FIXUP)
     await first.shutdown()
-    assert len(builds) == 4
+    assert builds == [chapter.id for chapter in config.chapters]
 
     builds.clear()
     second_state = StateStore(config)
@@ -1888,9 +1919,21 @@ async def test_fixup_failure_does_not_cancel_independent_fixup(
     await orchestrator.prepare()
     failed_agent = replace(result(changed=False), succeeded=False, error="local agent failure")
     orchestrator.executor = FakeExecutor(state, [failed_agent, result(changed=False)])
+    builds = {first.id: 0, second.id: 0}
 
-    async def validation(*_args: object, **_kwargs: object) -> ValidationResult:
-        return ValidationResult(True, 0, "ok")
+    async def validation(
+        _config: object,
+        chapter: Chapter,
+        **_kwargs: object,
+    ) -> ValidationResult:
+        builds[chapter.id] += 1
+        if chapter.id == second.id and builds[chapter.id] > 1:
+            return ValidationResult(True, 0, "ok")
+        return ValidationResult(
+            False,
+            1,
+            f"error: Book/Chapter{chapter.number:02d}.lean:1:1: broken",
+        )
 
     monkeypatch.setattr(scheduler_module, "validate", validation)
 
@@ -1967,7 +2010,7 @@ async def test_capacity_failure_consumes_a_review_round(
 
 @pytest.mark.asyncio
 async def test_fixup_cancellation_releases_shared_source_lock(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
     config = replace(config, settings=replace(config.settings, isolation="shared"))
@@ -1992,6 +2035,11 @@ async def test_fixup_cancellation_releases_shared_source_lock(
             raise AssertionError("unreachable")
 
     orchestrator.executor = BlockingExecutor(config, orchestrator.state)
+
+    async def failed_validation(*_args: object, **_kwargs: object) -> ValidationResult:
+        return ValidationResult(False, 1, "error: Book/Chapter01.lean:1:1: broken")
+
+    monkeypatch.setattr(scheduler_module, "validate", failed_validation)
     task = asyncio.create_task(
         orchestrator._fixup_to_clean({chapter.id: "repair"}, target_ids={chapter.id})
     )
@@ -2031,7 +2079,7 @@ async def test_capacity_failure_consumes_the_fixup_cap(
     orchestrator.executor = FakeExecutor(orchestrator.state, [capacity])
 
     async def validation(*_args: object, **_kwargs: object) -> ValidationResult:
-        return ValidationResult(True, 0, "ok")
+        return ValidationResult(False, 1, "error: Book/Chapter01.lean:1:1: broken")
 
     monkeypatch.setattr(scheduler_module, "validate", validation)
 

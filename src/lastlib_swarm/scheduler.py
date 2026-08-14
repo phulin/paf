@@ -1500,6 +1500,66 @@ class Orchestrator:
             if progress_event is not None:
                 progress_event.set()
 
+        if targeted and goals.issubset(clean) and not pending_feedback:
+            return True
+
+        # Drafting deliberately skips Lean validation. Before spending an
+        # agent slot on any resulting fixup feedback, optimistically build the
+        # complete selected closure once. A clean batch needs no fixup agent;
+        # a failed batch supplies the diagnostics for the ordinary
+        # dependency-ordered convergence loop below.
+        optimistic_ids = self._dependency_closure(graph, goals) if targeted else set(by_id)
+        optimistic = tuple(
+            by_id[chapter_id] for chapter_id in graph.order if chapter_id in optimistic_ids
+        )
+        snapshots: dict[str, ValidatedBuildSnapshot] = {}
+        results = await self._build_chapters(
+            optimistic,
+            publish_if_clean=True,
+            mode="optimistic",
+            iteration=1,
+            maximum_iterations=1,
+            stage=Stage.FIXUP,
+            priority=100.0,
+            snapshots=snapshots,
+        )
+        successful = {
+            chapter_id for chapter_id, result in results.items() if result.succeeded
+        }
+        for chapter_id in successful:
+            pending_feedback.pop(chapter_id, None)
+        diagnostics = self._build_feedback(results).actionable
+        merge_feedback(diagnostics)
+        invalidated_clean.update(
+            self._invalidate_fixup_descendants(graph, clean, diagnostics)
+        )
+
+        if (
+            results
+            and all(result.succeeded for result in results.values())
+            and await self._publish_validated_builds(snapshots)
+        ):
+            persisted = self.state.fixup_graph.get("clean", {})
+            clean = self._retain_fixup_clean(
+                self._observed_chapter_graph(),
+                persisted if isinstance(persisted, dict) else {},
+            )
+            build_generation = int(self.state.fixup_graph.get("build_generation", 0))
+            invalidated_clean.difference_update(optimistic_ids)
+            completed = goals if targeted else set(by_id)
+            await self.state.set_tasks(
+                completed,
+                Stage.FIXUP,
+                TaskStatus.SUCCEEDED,
+                "clean optimistic coordinator build; no fixup agent needed",
+            )
+            if progress_event is not None:
+                progress_event.set()
+            if (targeted and goals.issubset(clean)) or (
+                not targeted and len(clean) == len(by_id)
+            ):
+                return True
+
         try:
             while True:
                 await self.control.checkpoint()

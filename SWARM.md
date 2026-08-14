@@ -15,8 +15,10 @@ flowchart LR
     S[Scaffold directories] --> F[Formalize once]
     F -->|all drafts finished| I[Scan observed LastLib imports]
     I --> C{Source and dependencies already built?}
-    C -->|no| B[Build dependency-ready chapter]
+    C -->|no| O[Optimistic selected-scope build]
     C -->|yes| G{Review already succeeded?}
+    O -->|failed diagnostics| B[Build dependency-ready chapter]
+    O -->|clean| G
     B -->|initial build diagnostics| X[Fixup agents with MCP]
     X -->|patch merged| I
     B -->|clean| G
@@ -31,8 +33,10 @@ flowchart LR
 Scaffolding is deterministic and creates directories only. Formalization then runs once for every
 missing chapter scope without Lean or LSP validation, so chapters and books can draft concurrently
 despite provisional imports. After all drafts finish, the coordinator discovers chapter edges with
-regexes over the current `import LastLib...` lines. It then fixes dependency-ready chapters with Lean
-MCP concurrently. As soon as an agent finishes, the coordinator merges it, rescans imports, and
+regexes over the current `import LastLib...` lines and optimistically builds the complete selected
+scope once. A clean build skips fixup agents entirely. Otherwise it fixes dependency-ready chapters
+from the resulting diagnostics with Lean MCP concurrently. As soon as an agent finishes, the
+coordinator merges it, rescans imports, and
 rebuilds it once its refined predecessors are clean; unrelated agents keep running and a successful
 build immediately releases its review while fixup continues on other dependency-ready chapters.
 A review starts once its own fixup is clean and all of its observed dependencies have been reviewed;
@@ -277,8 +281,10 @@ After the daemon exits, `status`, `snapshot`, and `wait` fall back to the persis
   reports that its full chapter coverage pass is complete. Each completed scope immediately becomes
   eligible for targeted coordinator builds instead of waiting for the entire corpus to finish
   drafting.
-- **Fixup** groups targeted-build failures by chapter ownership and appends them verbatim to parallel
-  fixup prompts. Agents treat that feedback as starting evidence, read only the implicated context,
+- **Fixup** first optimistically builds the complete selected scope. A clean build publishes exact
+  build certificates and launches no fixup agents. Otherwise it groups build failures by chapter
+  ownership and appends them verbatim to parallel fixup prompts. Agents treat that feedback as
+  starting evidence, read only the implicated context,
   and let fresh MCP diagnostics account for prerequisite repairs that made an old diagnostic stale.
   A failure mentioning a scope whose formalizer is still active is deferred rather than assigned
   prematurely. Completed scopes cycle through build and fixup during the initial post-draft pass; the
