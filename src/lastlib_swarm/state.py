@@ -18,6 +18,9 @@ from lastlib_swarm.pricing import LEGACY_MODEL, CostEstimate, estimate_cost
 from lastlib_swarm.state_db import DATABASE_NAME, StateDatabase
 
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+LAKE_PROGRESS_RE = re.compile(
+    r"\[(?P<completed>\d+)/(?P<total>\d+)\]\s+\S+\s+(?P<target>\S+)"
+)
 
 
 def timestamp() -> str:
@@ -1022,6 +1025,19 @@ class StateStore:
         """Retain a small in-memory tail for live status displays."""
 
         output = ANSI_ESCAPE_RE.sub("", output)
+        if self.coordinator_build.active:
+            for match in LAKE_PROGRESS_RE.finditer(output):
+                completed = int(match.group("completed"))
+                total = int(match.group("total"))
+                if total > 0:
+                    if total != self.coordinator_build.total:
+                        self.coordinator_build.completed = completed
+                    else:
+                        self.coordinator_build.completed = max(
+                            self.coordinator_build.completed, completed
+                        )
+                    self.coordinator_build.total = total
+                    self.coordinator_build.current_chapter_id = match.group("target")
         errors, warnings = lean_diagnostic_counts(output)
         self.coordinator_build.error_count += errors if error_count is None else error_count
         self.coordinator_build.warning_count += warnings

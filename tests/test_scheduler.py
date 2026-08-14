@@ -68,6 +68,33 @@ def test_coordinator_build_output_shortens_diagnostic_paths(tmp_path: Path) -> N
     assert state.coordinator_build.error_count == 1
     assert state.coordinator_build.warning_count == 1
 
+@pytest.mark.asyncio
+async def test_coordinator_build_output_tracks_lake_progress(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path))
+    state = StateStore(config)
+    await state.start_coordinator_build(
+        mode="optimistic",
+        stage=Stage.FIXUP,
+        iteration=1,
+        maximum_iterations=10,
+        total=2,
+    )
+
+    state.append_coordinator_build_output(
+        "\x1b[32m✔ [7/12] Built LastLib.Book.Chapter01.Section\x1b[0m\n"
+    )
+    assert state.coordinator_build.completed == 7
+    assert state.coordinator_build.total == 12
+    assert (
+        state.coordinator_build.current_chapter_id
+        == "LastLib.Book.Chapter01.Section"
+    )
+
+    state.append_coordinator_build_output(
+        "✔ [5/12] Built LastLib.Book.Chapter02.Section\n"
+    )
+    assert state.coordinator_build.completed == 7
+
 
 def result(
     *,

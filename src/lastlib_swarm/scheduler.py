@@ -1114,7 +1114,11 @@ class Orchestrator:
                     results.update((chapter_id, result) for chapter_id in result_ids)
                     await self.state.advance_coordinator_build(
                         chapter_id=chapter.id,
-                        completed=completed,
+                        completed=(
+                            self.state.coordinator_build.total
+                            if combine_targets
+                            else completed
+                        ),
                     )
                 clean = (
                     not preempted
