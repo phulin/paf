@@ -33,12 +33,14 @@ flowchart LR
 Scaffolding is deterministic and creates directories only. Formalization then runs once for every
 missing chapter scope without Lean or LSP validation, so chapters and books can draft concurrently
 despite provisional imports. After all drafts finish, the coordinator discovers chapter edges with
-regexes over the current `import LastLib...` lines and optimistically builds the complete selected
-scope once. A clean build skips fixup agents entirely. Otherwise it fixes dependency-ready chapters
-from the resulting diagnostics with Lean MCP concurrently. As soon as an agent finishes, the
-coordinator merges it, rescans imports, and
-rebuilds it once its refined predecessors are clean; unrelated agents keep running and a successful
-build immediately releases its review while fixup continues on other dependency-ready chapters.
+regexes over the current `import LastLib...` lines and passes the complete dirty selected scope to
+one optimistic Lake invocation. Lake schedules those targets against the Lean import graph. A clean
+build publishes every selected certificate and skips fixup agents entirely. Otherwise the
+coordinator routes diagnostics to their owning chapters and fixes the dependency-ready owners with
+Lean MCP concurrently. As soon as an agent finishes, the coordinator merges it, rescans imports,
+and rebuilds it once its refined predecessors are clean; unrelated agents keep running and a
+successful repair build immediately releases its review while fixup continues on other
+dependency-ready chapters.
 A review starts once its own fixup is clean and all of its observed dependencies have been reviewed;
 there is no corpus-wide barrier between fixup and review. The coordinator remembers the source and
 dependency digests of successful builds so it can avoid rebuilding unchanged chapters. Review has

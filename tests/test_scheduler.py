@@ -648,20 +648,25 @@ async def test_fixup_builds_in_observed_chapter_import_order(
     state = StateStore(config)
     orchestrator = Orchestrator(config, state)
     await orchestrator.prepare()
-    builds: list[str] = []
+    builds: list[tuple[str, str]] = []
 
     async def successful_validation(
         _config: object,
         chapter: Chapter,
         **_kwargs: object,
     ) -> ValidationResult:
-        builds.append(chapter.id)
+        builds.append((chapter.id, chapter.build_command))
         return ValidationResult(True, 0, "ok")
 
     monkeypatch.setattr(scheduler_module, "validate", successful_validation)
 
     assert await orchestrator.run_stage(Stage.FIXUP)
-    assert builds == [second.id, first.id]
+    assert builds == [
+        (
+            second.id,
+            "cd lean && lake build +Book.Chapter02 +Book.Chapter01",
+        )
+    ]
     assert orchestrator.state.task(first.id, Stage.FIXUP).rounds == 0
     assert orchestrator.state.task(second.id, Stage.FIXUP).rounds == 0
     assert state.fixup_graph["edges"] == [[second.id, first.id]]
@@ -1022,8 +1027,8 @@ async def test_fixup_rescans_new_import_before_rebuilding_edited_chapter(
     assert await orchestrator.run_stage(Stage.FIXUP)
     assert events[:4] == [
         f"build:{first.id}",
-        f"build:{second.id}",
         f"agent:{first.id}",
+        f"build:{second.id}",
         f"build:{first.id}",
     ]
     assert state.fixup_graph["edges"] == [[second.id, first.id]]
@@ -1306,7 +1311,7 @@ async def test_fixup_reuses_valid_persisted_build_records(
     await first.prepare()
     assert await first.run_stage(Stage.FIXUP)
     await first.shutdown()
-    assert builds == [chapter.id for chapter in config.chapters]
+    assert builds == [config.chapters[0].id]
 
     builds.clear()
     second_state = StateStore(config)
@@ -1960,6 +1965,20 @@ async def test_fixup_failure_does_not_cancel_independent_fixup(
         chapter: Chapter,
         **_kwargs: object,
     ) -> ValidationResult:
+        if (
+            f"+{first.chapter_module}" in chapter.build_command
+            and f"+{second.chapter_module}" in chapter.build_command
+        ):
+            builds[first.id] += 1
+            builds[second.id] += 1
+            return ValidationResult(
+                False,
+                1,
+                "\n".join(
+                    f"error: Book/Chapter{item.number:02d}.lean:1:1: broken"
+                    for item in (first, second)
+                ),
+            )
         builds[chapter.id] += 1
         if chapter.id == second.id and builds[chapter.id] > 1:
             return ValidationResult(True, 0, "ok")
@@ -2153,7 +2172,7 @@ async def test_capacity_failure_stops_proof_work(
 
 
 @pytest.mark.asyncio
-async def test_pipeline_reviews_each_chapter_as_soon_as_its_build_succeeds(
+async def test_pipeline_reviews_chapters_after_combined_optimistic_build_succeeds(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = with_lastlib_modules(
@@ -2205,11 +2224,9 @@ async def test_pipeline_reviews_each_chapter_as_soon_as_its_build_succeeds(
     assert await orchestrator.run_pipeline()
     assert [event for event in events if event.startswith("build:")] == [
         f"build:{first.id}",
-        f"build:{second.id}",
     ]
     assert events.index(f"build:{first.id}") < events.index(f"review:{first.id}")
-    assert events.index(f"build:{second.id}") < events.index(f"review:{second.id}")
-    assert events.index(f"review:{first.id}") < events.index(f"build:{second.id}")
+    assert events.index(f"build:{first.id}") < events.index(f"review:{second.id}")
     assert events.index(f"review:{first.id}") < events.index(f"review:{second.id}")
     await orchestrator.shutdown()
 
@@ -2422,7 +2439,7 @@ async def test_review_restart_seeds_proofs_from_successful_reviews_without_rebui
         for chapter in config.chapters
     )
     await first_run.shutdown()
-    assert builds == [first.id, second.id]
+    assert builds == [first.id]
 
     builds.clear()
     proofs: list[str] = []

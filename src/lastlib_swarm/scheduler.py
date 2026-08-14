@@ -991,6 +991,7 @@ class Orchestrator:
         priority: float = 100.0,
         preemptible: bool = False,
         snapshots: dict[str, ValidatedBuildSnapshot] | None = None,
+        combine_targets: bool = False,
     ) -> dict[str, ValidationResult]:
         """Build a deterministic target batch against the coordinator-owned cache."""
 
@@ -1040,23 +1041,54 @@ class Orchestrator:
                         maximum_iterations=maximum_iterations,
                         total=len(selected),
                     )
-                for index, chapter in enumerate(selected):
+                if combine_targets and len(selected) > 1:
+                    targets = []
+                    prefixes = []
+                    for chapter in selected:
+                        command = chapter.build_command.strip()
+                        prefix, separator, target = command.rpartition(" ")
+                        if not separator or not target.startswith("+"):
+                            raise ValueError(
+                                "cannot combine optimistic build command without a trailing "
+                                f"Lake target: {command}"
+                            )
+                        prefixes.append(prefix.rstrip())
+                        targets.append(target)
+                    if len(set(prefixes)) != 1:
+                        raise ValueError("optimistic build commands do not share a common prefix")
+                    combined = f"{prefixes[0]} {' '.join(targets)}"
+                    build_units = ((selected[0], combined, ids, len(selected)),)
+                else:
+                    build_units = tuple(
+                        (chapter, chapter.build_command, (chapter.id,), index + 1)
+                        for index, chapter in enumerate(selected)
+                    )
+                for chapter, command, result_ids, completed in build_units:
                     await self.state.advance_coordinator_build(
                         chapter_id=chapter.id,
-                        completed=index,
-                        command=chapter.build_command,
+                        completed=0 if combine_targets else completed - 1,
+                        command=command,
                     )
 
                     def append_output(output: str, *, current: Chapter = chapter) -> None:
+                        error_count = (
+                            sum(
+                                diagnostic.severity == "error"
+                                and bool(set(self._diagnostic_owner_ids(diagnostic)) & set(ids))
+                                for diagnostic in _lean_diagnostics(output)
+                            )
+                            if combine_targets
+                            else self._target_error_count(current, output)
+                        )
                         self.state.append_coordinator_build_output(
                             output,
-                            error_count=self._target_error_count(current, output),
+                            error_count=error_count,
                         )
 
                     validation = asyncio.create_task(
                         validate(
                             self.config,
-                            chapter,
+                            replace(chapter, build_command=command),
                             workspace_root=build_workspace.root,
                             on_output=append_output,
                         )
@@ -1078,10 +1110,11 @@ class Orchestrator:
                         break
                     preemption.cancel()
                     await asyncio.gather(preemption, return_exceptions=True)
-                    results[chapter.id] = validation.result()
+                    result = validation.result()
+                    results.update((chapter_id, result) for chapter_id in result_ids)
                     await self.state.advance_coordinator_build(
                         chapter_id=chapter.id,
-                        completed=index + 1,
+                        completed=completed,
                     )
                 clean = (
                     not preempted
@@ -1566,15 +1599,54 @@ class Orchestrator:
 
         # Drafting deliberately skips Lean validation. Before spending an
         # agent slot on any resulting fixup feedback, optimistically build the
-        # complete selected closure once. Stream both successful chapters and
-        # dependency-ready diagnostics to their consumers as each build ends.
+        # complete dirty selected closure in one Lake invocation. Lake owns the
+        # dependency ordering and parallelism within this initial frontier.
         optimistic_ids = self._dependency_closure(graph, goals) if targeted else set(by_id)
         optimistic_ids.difference_update(clean)
-        for chapter_id in graph.order:
-            if chapter_id not in optimistic_ids:
-                continue
-            if await build_chapter(chapter_id, graph, mode="optimistic"):
-                pending_feedback.pop(chapter_id, None)
+        optimistic = tuple(
+            by_id[chapter_id] for chapter_id in graph.order if chapter_id in optimistic_ids
+        )
+        if optimistic:
+            snapshots: dict[str, ValidatedBuildSnapshot] = {}
+            results = await self._build_chapters(
+                optimistic,
+                publish_if_clean=True,
+                mode="optimistic",
+                iteration=1,
+                maximum_iterations=maximum,
+                snapshots=snapshots,
+                combine_targets=True,
+            )
+            if (
+                all(result.succeeded for result in results.values())
+                and await self._publish_validated_builds(snapshots)
+            ):
+                persisted = self.state.fixup_graph.get("clean", {})
+                clean = self._retain_fixup_clean(
+                    self._observed_chapter_graph(),
+                    persisted if isinstance(persisted, dict) else {},
+                )
+                build_generation = int(self.state.fixup_graph.get("build_generation", 0))
+            else:
+                diagnostics = self._build_feedback(results).actionable
+                if not diagnostics:
+                    diagnostics = {
+                        chapter.id: (
+                            "The source scope changed after the combined optimistic build; "
+                            "rebuild the fresh generation."
+                        )
+                        for chapter in optimistic
+                    }
+                merge_feedback(diagnostics)
+                invalidated_clean.update(
+                    self._invalidate_fixup_descendants(graph, clean, diagnostics)
+                )
+                await self._save_fixup_graph(
+                    graph,
+                    clean,
+                    build_generation=build_generation,
+                    invalidated=invalidated_clean,
+                )
             if self.isolation.name != "shared":
                 await start_actionable_fixups(graph)
 
