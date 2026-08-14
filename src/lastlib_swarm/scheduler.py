@@ -1487,6 +1487,56 @@ class Orchestrator:
             )
             return False
 
+        async def start_actionable_fixups(graph: ChapterImportGraph) -> None:
+            """Fill free agent slots from the dependency-ready feedback frontier."""
+
+            active = sum(not handle.task.done() for handle in running.values())
+            available = self.config.settings.max_agents - active
+            if self.isolation.name == "shared":
+                available = min(available, 1 - active)
+            actionable = [
+                chapter_id
+                for chapter_id in graph.order
+                if chapter_id in pending_feedback
+                and chapter_id not in running
+                and chapter_id not in failed
+                and graph.dependencies[chapter_id].issubset(clean)
+            ]
+            for chapter_id in actionable[: max(available, 0)]:
+                if self.state.task(chapter_id, Stage.REVIEW).status in {
+                    TaskStatus.RUNNING,
+                    TaskStatus.SUCCEEDED,
+                }:
+                    await self._invalidate_reviews(
+                        (chapter_id,),
+                        detail="review invalidated by later fixup findings",
+                    )
+                    if progress_event is not None:
+                        progress_event.set()
+                if attempts[chapter_id] >= maximum:
+                    await self.state.set_task(
+                        chapter_id,
+                        Stage.FIXUP,
+                        TaskStatus.FAILED,
+                        f"fixup did not converge in {maximum} attempts",
+                    )
+                    pending_feedback.pop(chapter_id, None)
+                    failed.add(chapter_id)
+                    invalidated_clean.update(
+                        self._invalidate_fixup_descendants(graph, clean, (chapter_id,))
+                    )
+                    continue
+                attempts[chapter_id] += 1
+                dependency_certificates = {
+                    dependency: str(clean[dependency]["certificate"])
+                    for dependency in graph.dependencies[chapter_id]
+                }
+                running[chapter_id] = await self._start_fixup_agent(
+                    by_id[chapter_id],
+                    pending_feedback.pop(chapter_id),
+                    dependency_certificates,
+                )
+
         try:
             graph = self._observed_chapter_graph()
         except ValueError as error:
@@ -1516,15 +1566,16 @@ class Orchestrator:
 
         # Drafting deliberately skips Lean validation. Before spending an
         # agent slot on any resulting fixup feedback, optimistically build the
-        # complete selected closure once. Successful chapters can release
-        # review immediately, but no fixup agent starts until the whole pass
-        # has supplied its diagnostics.
+        # complete selected closure once. Stream both successful chapters and
+        # dependency-ready diagnostics to their consumers as each build ends.
         optimistic_ids = self._dependency_closure(graph, goals) if targeted else set(by_id)
         for chapter_id in graph.order:
             if chapter_id not in optimistic_ids:
                 continue
             if await build_chapter(chapter_id, graph, mode="optimistic"):
                 pending_feedback.pop(chapter_id, None)
+            if self.isolation.name != "shared":
+                await start_actionable_fixups(graph)
 
         # A successful target can certify imported predecessors too. Reconcile
         # all records after the pass before deciding whether any feedback still
@@ -1679,51 +1730,7 @@ class Orchestrator:
                         break
                     continue
 
-                available = self.config.settings.max_agents - len(running)
-                if self.isolation.name == "shared":
-                    available = min(available, 1 - len(running))
-                actionable = [
-                    chapter_id
-                    for chapter_id in graph.order
-                    if chapter_id in pending_feedback
-                    and chapter_id not in running
-                    and chapter_id not in failed
-                    and graph.dependencies[chapter_id].issubset(clean)
-                ]
-                for chapter_id in actionable[: max(available, 0)]:
-                    if self.state.task(chapter_id, Stage.REVIEW).status in {
-                        TaskStatus.RUNNING,
-                        TaskStatus.SUCCEEDED,
-                    }:
-                        await self._invalidate_reviews(
-                            (chapter_id,),
-                            detail="review invalidated by later fixup findings",
-                        )
-                        if progress_event is not None:
-                            progress_event.set()
-                    if attempts[chapter_id] >= maximum:
-                        await self.state.set_task(
-                            chapter_id,
-                            Stage.FIXUP,
-                            TaskStatus.FAILED,
-                            f"fixup did not converge in {maximum} attempts",
-                        )
-                        pending_feedback.pop(chapter_id, None)
-                        failed.add(chapter_id)
-                        invalidated_clean.update(
-                            self._invalidate_fixup_descendants(graph, clean, (chapter_id,))
-                        )
-                        continue
-                    attempts[chapter_id] += 1
-                    dependency_certificates = {
-                        dependency: str(clean[dependency]["certificate"])
-                        for dependency in graph.dependencies[chapter_id]
-                    }
-                    running[chapter_id] = await self._start_fixup_agent(
-                        by_id[chapter_id],
-                        pending_feedback.pop(chapter_id),
-                        dependency_certificates,
-                    )
+                await start_actionable_fixups(graph)
 
                 if self.isolation.name == "shared" and running:
                     await asyncio.wait(

@@ -1019,6 +1019,7 @@ async def test_fixup_runs_dependency_ready_agent_frontier_concurrently(
     fixed: set[str] = set()
     active = 0
     maximum_active = 0
+    first_agent_started = asyncio.Event()
     wave_started = asyncio.Event()
 
     class FixingExecutor(FakeExecutor):
@@ -1037,6 +1038,8 @@ async def test_fixup_runs_dependency_ready_agent_frontier_concurrently(
             assert "broken" in feedback
             active += 1
             maximum_active = max(maximum_active, active)
+            if chapter.id == config.chapters[0].id:
+                first_agent_started.set()
             if active == len(config.chapters):
                 wave_started.set()
             await wave_started.wait()
@@ -1062,6 +1065,8 @@ async def test_fixup_runs_dependency_ready_agent_frontier_concurrently(
         chapter: Chapter,
         **_kwargs: object,
     ) -> ValidationResult:
+        if chapter.id == config.chapters[1].id:
+            await asyncio.wait_for(first_agent_started.wait(), timeout=1)
         if chapter.id not in fixed:
             return ValidationResult(
                 False,
