@@ -1449,6 +1449,12 @@ class Orchestrator:
                 )
 
                 if targeted and goals.issubset(clean) and not pending_feedback and not running:
+                    await self.state.set_tasks(
+                        goals,
+                        Stage.FIXUP,
+                        TaskStatus.SUCCEEDED,
+                        "clean initial build reused",
+                    )
                     return True
 
                 completed = [

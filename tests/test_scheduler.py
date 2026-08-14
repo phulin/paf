@@ -235,6 +235,21 @@ async def test_state_persists_fixup_graph(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_review_progress_reconciles_pending_initial_fixup(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = config.chapters[0]
+    state = StateStore(config)
+    await state.load_or_create()
+
+    await state.set_task(chapter.id, Stage.REVIEW, TaskStatus.RUNNING, "reviewing")
+
+    fixup = state.task(chapter.id, Stage.FIXUP)
+    assert fixup.status == TaskStatus.SUCCEEDED
+    assert fixup.detail == "initial fixup completed before review"
+    await state.close()
+
+
+@pytest.mark.asyncio
 async def test_proof_review_requests_persist_and_acknowledge_exact_findings(
     tmp_path: Path,
 ) -> None:
@@ -687,9 +702,15 @@ async def test_targeted_fixup_does_not_build_cleanliness_descendants(
 
     assert await orchestrator._fixup_to_clean(target_ids={first.id})
     assert builds == [first.id]
+    await orchestrator.state.set_task(first.id, Stage.FIXUP, TaskStatus.PENDING, "stale label")
+    assert await orchestrator._fixup_to_clean(target_ids={first.id})
+    assert builds == [first.id]
     clean = orchestrator.state.fixup_graph["clean"]
     assert first.id in clean
     assert second.id not in clean
+    assert orchestrator.state.task(first.id, Stage.FIXUP).status == TaskStatus.SUCCEEDED
+    assert orchestrator.state.task(first.id, Stage.FIXUP).detail == "clean initial build reused"
+    assert orchestrator.state.task(second.id, Stage.FIXUP).status == TaskStatus.PENDING
     await orchestrator.shutdown()
 
 

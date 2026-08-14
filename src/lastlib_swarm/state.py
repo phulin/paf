@@ -278,6 +278,18 @@ class StateStore:
             for stage in Stage:
                 key = self.key(chapter.id, stage)
                 self.tasks.setdefault(key, self._new_task(chapter, stage))
+            fixup = self.task(chapter.id, Stage.FIXUP)
+            review = self.task(chapter.id, Stage.REVIEW)
+            prove = self.task(chapter.id, Stage.PROVE)
+            if fixup.status == TaskStatus.PENDING and (
+                review.rounds > 0
+                or prove.rounds > 0
+                or review.status in (TaskStatus.RUNNING, TaskStatus.SUCCEEDED)
+                or prove.status in (TaskStatus.RUNNING, TaskStatus.SUCCEEDED)
+            ):
+                fixup.status = TaskStatus.SUCCEEDED
+                fixup.detail = "initial fixup completed before review"
+                fixup.updated_at = timestamp()
         for value in persisted_runs:
             if not isinstance(value, dict):
                 continue
@@ -845,6 +857,15 @@ class StateStore:
         source_digest: str | None = None,
     ) -> None:
         task = self.task(chapter_id, stage)
+        if stage in (Stage.REVIEW, Stage.PROVE) and status in (
+            TaskStatus.RUNNING,
+            TaskStatus.SUCCEEDED,
+        ):
+            fixup = self.task(chapter_id, Stage.FIXUP)
+            if fixup.status == TaskStatus.PENDING:
+                fixup.status = TaskStatus.SUCCEEDED
+                fixup.detail = "initial fixup completed before review"
+                fixup.updated_at = timestamp()
         task.status = status
         if stage is Stage.PROVE:
             task.source_digest = source_digest if status == TaskStatus.SUCCEEDED else None
@@ -868,6 +889,15 @@ class StateStore:
             if key not in self.tasks:
                 continue
             task = self.tasks[key]
+            if stage in (Stage.REVIEW, Stage.PROVE) and status in (
+                TaskStatus.RUNNING,
+                TaskStatus.SUCCEEDED,
+            ):
+                fixup = self.task(chapter_id, Stage.FIXUP)
+                if fixup.status == TaskStatus.PENDING:
+                    fixup.status = TaskStatus.SUCCEEDED
+                    fixup.detail = "initial fixup completed before review"
+                    fixup.updated_at = updated_at
             task.status = status
             if stage is Stage.PROVE and status != TaskStatus.SUCCEEDED:
                 task.source_digest = None
