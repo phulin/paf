@@ -652,9 +652,12 @@ async def test_dashboard_separates_agents_queues_and_coordinator_builds(
         assert "Building dependency graph" in status
         assert "Compiling Book.Chapter02" in status
         fixup = str(app.query_one("#stage-fixup", Static).content)
-        assert "agent 0 · running 1" in fixup
+        assert "agent 0 · running 1 · building 1" in fixup
         review = str(app.query_one("#stage-review", Static).content)
-        assert "agent 0 · running 1" in review
+        assert "agent 0 · running 1 · building 0" in review
+        row = app._row_values(config.chapters[1])
+        assert row[4] == "◆ building"
+        assert row[8] == f"{build_mode} coordinator build"
 
         finish_build.set()
         await build_finished.wait()
