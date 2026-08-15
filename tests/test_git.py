@@ -63,13 +63,8 @@ async def test_commits_only_agent_paths_with_summary_body(tmp_path: Path) -> Non
     git(tmp_path, "add", "staged.txt")
     unrelated_unstaged.write_text("unstaged\n", encoding="utf-8")
 
-    summary = (
-        "Updated `value` and added the chapter theorem.\n\n"
-        "Removed the obsolete declaration."
-    )
-    changed = tuple(
-        path.relative_to(tmp_path).as_posix() for path in (modified, deleted, created)
-    )
+    summary = "Updated `value` and added the chapter theorem.\n\nRemoved the obsolete declaration."
+    changed = tuple(path.relative_to(tmp_path).as_posix() for path in (modified, deleted, created))
     commit = await committer.commit(
         chapter,
         Stage.REVIEW,

@@ -18,9 +18,7 @@ from lastlib_swarm.pricing import LEGACY_MODEL, CostEstimate, estimate_cost
 from lastlib_swarm.state_db import DATABASE_NAME, StateDatabase
 
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
-LAKE_PROGRESS_RE = re.compile(
-    r"\[(?P<completed>\d+)/(?P<total>\d+)\]\s+\S+\s+(?P<target>\S+)"
-)
+LAKE_PROGRESS_RE = re.compile(r"\[(?P<completed>\d+)/(?P<total>\d+)\]\s+\S+\s+(?P<target>\S+)")
 
 
 def timestamp() -> str:
@@ -655,10 +653,7 @@ class StateStore:
             request
             for _, request in sorted(self.upstream_requests.items())
             if request.get("consumer_chapter_id") == chapter_id
-            and (
-                selected is None
-                or UpstreamRequestStatus(str(request.get("status"))) in selected
-            )
+            and (selected is None or UpstreamRequestStatus(str(request.get("status"))) in selected)
         )
 
     def _transition_upstream_request(
@@ -748,9 +743,7 @@ class StateStore:
             if isinstance(owner_paths, list)
             else [],
             "attempted_alternatives": [
-                str(item).strip()
-                for item in attempted
-                if isinstance(item, str) and item.strip()
+                str(item).strip() for item in attempted if isinstance(item, str) and item.strip()
             ]
             if isinstance(attempted, list)
             else [],
@@ -947,6 +940,58 @@ class StateStore:
                     request["escalated_at"] = timestamp()
             self._mark_dirty()
             await self._persist()
+
+    async def close_resolved_upstream_requests(
+        self,
+        request_ids: Iterable[str],
+        *,
+        detail: str,
+        run_id: str | None = None,
+    ) -> tuple[str, ...]:
+        """Close requests satisfied by externally or concurrently validated proof work."""
+
+        closed: list[str] = []
+        async with self.batch():
+            for request_id in request_ids:
+                request = self.upstream_requests.get(request_id)
+                if not isinstance(request, dict):
+                    continue
+                status = UpstreamRequestStatus(str(request.get("status")))
+                if status is UpstreamRequestStatus.CLOSED:
+                    continue
+                if status is UpstreamRequestStatus.OPEN:
+                    self._transition_upstream_request(
+                        request,
+                        UpstreamRequestStatus.MANUAL_ESCALATION,
+                        "request was resolved outside its queued repair",
+                        run_id=run_id,
+                    )
+                elif status is UpstreamRequestStatus.ANSWERED:
+                    self._transition_upstream_request(
+                        request,
+                        UpstreamRequestStatus.RETRYING,
+                        "request was resolved before its queued retry",
+                        run_id=run_id,
+                    )
+                elif status in {
+                    UpstreamRequestStatus.REPAIRING,
+                    UpstreamRequestStatus.RETRYING,
+                }:
+                    # Live orchestration owns these transitions; callers must not race it.
+                    continue
+                self._transition_upstream_request(
+                    request,
+                    UpstreamRequestStatus.CLOSED,
+                    detail,
+                    run_id=run_id,
+                )
+                request["closed_at"] = timestamp()
+                request["closed_by_run_id"] = run_id
+                closed.append(request_id)
+            if closed:
+                self._mark_dirty()
+                await self._persist()
+        return tuple(closed)
 
     async def reopen_escalated_upstream_requests(self, chapter_ids: Iterable[str]) -> list[str]:
         """Treat the explicit manual unblock command as authority to retry the handoff."""

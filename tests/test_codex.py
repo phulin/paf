@@ -11,17 +11,19 @@ import pytest
 import lastlib_swarm.codex as codex_module
 from lastlib_swarm.activity import EVENT_TIMESTAMP_FIELD
 from lastlib_swarm.codex import (
+    DOWNSTREAM_RETRY_ROLE,
     REPORT_SCHEMA,
-    REVIEW_SOURCE_BUNDLE_MAX_CHARS,
+    UPSTREAM_REPAIR_ROLE,
     CodexExecutor,
     _bounded_feedback,
     _capacity_resume_delay,
     _complete_lines,
     _is_capacity_failure,
-    _review_source_bundle,
     _rollout_usage,
     _tail_rollout_usage,
+    _upstream_source_bundle,
     count_placeholders,
+    declaration_uses_placeholder,
     lean_mcp_executable,
     lean_mcp_path,
     render_prompt,
@@ -43,6 +45,28 @@ def test_report_schema_uses_structured_fixup_findings() -> None:
     assert REPORT_SCHEMA["properties"]["summary"]["minLength"] == 1
     assert REPORT_SCHEMA["properties"]["summary"]["pattern"] == r"\S"
     assert "commit body" in REPORT_SCHEMA["properties"]["summary"]["description"]
+
+
+def test_report_schema_records_complete_upstream_handoffs() -> None:
+    assert "upstream_requests" in REPORT_SCHEMA["required"]
+    assert "upstream_answers" in REPORT_SCHEMA["required"]
+    request = REPORT_SCHEMA["properties"]["upstream_requests"]["items"]
+    assert set(request["required"]) == {
+        "blocked_declaration",
+        "consumer_path",
+        "residual_goal",
+        "needed_result",
+        "owner_chapter_id",
+        "owner_paths",
+        "attempted_alternatives",
+    }
+    assert request["properties"]["attempted_alternatives"]["minItems"] == 2
+    answer = REPORT_SCHEMA["properties"]["upstream_answers"]["items"]
+    assert answer["properties"]["disposition"]["enum"] == [
+        "added",
+        "existing",
+        "downstream",
+    ]
 
 
 def test_extracts_api_equivalent_usage() -> None:
@@ -425,51 +449,23 @@ def test_review_command_enables_lean_mcp(tmp_path: Path) -> None:
     assert any("lean_diagnostic_messages" in item for item in command)
 
 
-def test_review_source_bundle_contains_book_scoped_files_in_order(tmp_path: Path) -> None:
+def test_review_prompts_read_sources_dynamically(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
-    root = tmp_path / "lean" / "Book"
-    child = root / "Chapter01" / "Section02.lean"
-    child.parent.mkdir(parents=True)
-    (root / "Chapter01.lean").write_text(
-        "import Book.Chapter01.Section02\n\ndef chapter := section\n",
-        encoding="utf-8",
-    )
-    child.write_text("def section := 2\n", encoding="utf-8")
-    bundle = _review_source_bundle(tmp_path, config.chapters[0])
-
-    book_header = "## `books/book.md`"
-    root_header = "## `lean/Book/Chapter01.lean`"
-    child_header = "## `lean/Book/Chapter01/Section02.lean`"
-    assert (
-        bundle.index(book_header) < bundle.index(root_header) < bundle.index(child_header)
-    )
-
-
-def test_review_source_bundle_is_capped_at_500k_characters(tmp_path: Path) -> None:
-    assert REVIEW_SOURCE_BUNDLE_MAX_CHARS == 500_000
-    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
-    target = tmp_path / "lean" / "Book" / "Chapter01.lean"
-    target.parent.mkdir(parents=True)
-    target.write_text("x" * (REVIEW_SOURCE_BUNDLE_MAX_CHARS + 10_000), encoding="utf-8")
-
-    bundle = _review_source_bundle(tmp_path, config.chapters[0])
-
-    assert len(bundle) == REVIEW_SOURCE_BUNDLE_MAX_CHARS
-    assert bundle.endswith(
-        f"[Review source set truncated at {REVIEW_SOURCE_BUNDLE_MAX_CHARS:,} characters.]\n"
-    )
-
-
-def test_executor_can_disable_lean_mcp(tmp_path: Path) -> None:
-    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
-    config = replace(config, settings=replace(config.settings, lean_mcp=False))
     executor = CodexExecutor(config, StateStore(config))
 
-    command = executor.command(Stage.PROVE)
-    prompt = executor.build_prompt(config.chapters[0], Stage.PROVE)
+    review = executor.build_prompt(config.chapters[0], Stage.REVIEW)
+    proof_review = executor.build_prompt(
+        config.chapters[0], Stage.REVIEW, feedback="Check the reported obstruction."
+    )
 
-    assert not any("mcp_servers.lastlib_lean" in item for item in command)
-    assert "Attached Lean MCP" not in prompt
+    for prompt in (review, proof_review):
+        assert not prompt.startswith("# Line-numbered review source set")
+
+    prompt_root = Path(__file__).parents[1] / "src" / "lastlib_swarm" / "prompts"
+    for name in ("review.md", "proof_review.md"):
+        template = (prompt_root / name).read_text(encoding="utf-8")
+        assert "dynamically from its numbered heading" in template
+        assert "do not read the complete informal book" in " ".join(template.lower().split())
 
 
 def test_fixup_prompt_requires_diagnostics_and_sorry(tmp_path: Path) -> None:
@@ -480,6 +476,92 @@ def test_fixup_prompt_requires_diagnostics_and_sorry(tmp_path: Path) -> None:
     assert "Attached Lean MCP" in prompt
     assert "lean_prepare_dependencies" in prompt
     assert "maximal affected dependents" in " ".join(prompt.split())
+
+
+def test_upstream_repair_prompt_contains_batched_evidence_and_answer_contract(
+    tmp_path: Path,
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    owner, consumer = config.chapters
+    (tmp_path / "books" / "book.md").write_text(
+        "# Book\n\n## 1. First chapter\n\nOwner theorem text.\n\n"
+        "## 2. Second chapter\n\nConsumer theorem text.\n",
+        encoding="utf-8",
+    )
+    root = tmp_path / "lean" / "Book"
+    root.mkdir(parents=True)
+    (root / "Chapter01.lean").write_text(
+        "theorem existingBridge (n : Nat) : n = n := by rfl\n",
+        encoding="utf-8",
+    )
+    (root / "Chapter02.lean").write_text(
+        "import Book.Chapter01\n"
+        "theorem blockedTarget (n : Nat) : n = n := by sorry\n\n"
+        "theorem unrelated : True := by trivial\n",
+        encoding="utf-8",
+    )
+    request = {
+        "id": "request-one",
+        "consumer_chapter_id": consumer.id,
+        "blocked_declaration": "blockedTarget",
+        "consumer_path": "lean/Book/Chapter02.lean",
+        "residual_goal": "⊢ n = n",
+        "needed_result": "A reusable reflexivity bridge",
+        "owner_paths": ["lean/Book/Chapter01.lean"],
+        "attempted_alternatives": ["simp", "exact existingCandidate n"],
+        "previous_attempts": "Proof attempt 1 failed at the exact residual goal.",
+    }
+    executor = CodexExecutor(config, StateStore(config))
+
+    bundle = _upstream_source_bundle(tmp_path, owner, (request,), config.chapters)
+    prompt = executor.build_prompt(
+        owner,
+        Stage.PROVE,
+        role=UPSTREAM_REPAIR_ROLE,
+        upstream_requests=(request,),
+        workspace_root=tmp_path,
+    )
+
+    assert "request-one" in bundle
+    assert "Owner theorem text." in bundle
+    assert "Consumer theorem text." in bundle
+    assert "existingBridge" in bundle
+    assert "blockedTarget" in bundle
+    assert "unrelated : True" not in bundle
+    assert "Targeted upstream interface repair" in prompt
+    assert "one `upstream_answers` entry for every request id" in prompt
+    assert "fully qualified declaration names" in prompt
+    assert "leave `upstream_requests` empty" in prompt
+
+
+def test_declaration_placeholder_check_is_targeted_to_the_named_declaration(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "lean" / "Book" / "Chapter01.lean"
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        "theorem solved : True := by trivial\n\ntheorem blocked : True := by sorry\n",
+        encoding="utf-8",
+    )
+
+    assert (
+        declaration_uses_placeholder(tmp_path, "lean/Book/Chapter01.lean", "Book.solved") is False
+    )
+    assert declaration_uses_placeholder(tmp_path, "lean/Book/Chapter01.lean", "blocked") is True
+    assert declaration_uses_placeholder(tmp_path, "lean/Book/Chapter01.lean", "missing") is None
+
+
+def test_downstream_retry_prompt_labels_the_persisted_handoff(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    prompt = CodexExecutor(config, StateStore(config)).build_prompt(
+        config.chapters[0],
+        Stage.PROVE,
+        role=DOWNSTREAM_RETRY_ROLE,
+        feedback="Request request-one was answered by `Book.bridge`.",
+    )
+
+    assert "Targeted downstream retry handoff" in prompt
+    assert "Request request-one was answered" in prompt
 
 
 def test_shipped_prompts_have_consistent_stage_contracts() -> None:
@@ -496,8 +578,8 @@ def test_shipped_prompts_have_consistent_stage_contracts() -> None:
     assert "mathematically natural local dependency guess" in formalize
     assert "native `update_plan` tool" in formalize
     assert "one item for every numbered source section" in formalize
-    assert "expand its section item" in formalize
-    assert "individual results to formalize" in formalize
+    assert "native plan is flat" in formalize
+    assert "named result in the active section item" in formalize
 
     assert "authoritative starting evidence" in fixup
     assert "Do not reread the complete chapter or assigned file set" in fixup
@@ -530,15 +612,22 @@ warning: Book/Chapter.lean:24:2: a warning that merely mentions sorry
     )
 
 
-def test_bounded_feedback_preserves_first_and_last_diagnostics() -> None:
-    feedback = "FIRST DIAGNOSTIC\n" + ("middle\n" * 3000) + "LAST DIAGNOSTIC"
+def test_bounded_feedback_preserves_endpoints_and_indexes_omitted_diagnostics() -> None:
+    feedback = (
+        "FIRST DIAGNOSTIC\n"
+        + ("middle\n" * 4000)
+        + "error: Book/Chapter.lean:42:7: hidden failure\n"
+        + ("more middle\n" * 4000)
+        + "LAST DIAGNOSTIC"
+    )
 
     bounded = _bounded_feedback(feedback)
 
-    assert len(bounded) == 12000
+    assert len(bounded) == 48000
     assert bounded.startswith("FIRST DIAGNOSTIC")
     assert bounded.endswith("LAST DIAGNOSTIC")
-    assert "middle of coordinator feedback omitted" in bounded
+    assert "coordinator feedback body omitted" in bounded
+    assert "Book/Chapter.lean:42:7: hidden failure" in bounded
 
 
 @pytest.mark.asyncio

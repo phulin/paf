@@ -1014,13 +1014,10 @@ class SwarmApp(App[bool]):
         self._update_static("#alerts", alert)
         for stage in Stage:
             counts = stage_counts(self.state, stage)
-            build_targets = (
-                set(build.target_chapter_ids)
-                or ({build.current_chapter_id} if build.current_chapter_id else set())
+            build_targets = set(build.target_chapter_ids) or (
+                {build.current_chapter_id} if build.current_chapter_id else set()
             )
-            building = (
-                len(build_targets) if build.active and build.stage == stage.value else 0
-            )
+            building = len(build_targets) if build.active and build.stage == stage.value else 0
             running = max(0, counts["running"] - building)
             self._update_static(
                 f"#stage-{stage.value}",
@@ -1079,9 +1076,7 @@ class SwarmApp(App[bool]):
             mark = task_mark(
                 task,
                 building=(
-                    build.active
-                    and chapter.id in build_targets
-                    and build.stage == stage.value
+                    build.active and chapter.id in build_targets and build.stage == stage.value
                 ),
             )
             statuses.append(f"{mark} ({task.rounds})" if task.rounds else mark)

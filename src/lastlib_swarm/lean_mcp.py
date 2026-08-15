@@ -88,9 +88,7 @@ def _needs_dependency_refresh(document: Any) -> bool:
 
 def _require_fresh_dependencies(document: Any, path: str) -> Any:
     if _needs_dependency_refresh(document):
-        raise LeanClientError(
-            f"Lean could not prepare a usable dependency snapshot for {path}."
-        )
+        raise LeanClientError(f"Lean could not prepare a usable dependency snapshot for {path}.")
     return document
 
 

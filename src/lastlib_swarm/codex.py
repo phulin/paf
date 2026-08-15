@@ -8,7 +8,7 @@ import re
 import shutil
 import signal
 import sys
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
 from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -52,6 +52,73 @@ REPORT_SCHEMA: dict[str, Any] = {
                 "required": ["description", "owner_paths"],
             },
         },
+        "upstream_requests": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "blocked_declaration": {"type": "string", "minLength": 1},
+                    "consumer_path": {"type": "string", "minLength": 1},
+                    "residual_goal": {"type": "string", "minLength": 1},
+                    "needed_result": {"type": "string", "minLength": 1},
+                    "owner_chapter_id": {"type": "string", "minLength": 1},
+                    "owner_paths": {
+                        "type": "array",
+                        "items": {"type": "string", "minLength": 1},
+                        "minItems": 1,
+                        "uniqueItems": True,
+                    },
+                    "attempted_alternatives": {
+                        "type": "array",
+                        "items": {"type": "string", "minLength": 1},
+                        "minItems": 2,
+                    },
+                },
+                "required": [
+                    "blocked_declaration",
+                    "consumer_path",
+                    "residual_goal",
+                    "needed_result",
+                    "owner_chapter_id",
+                    "owner_paths",
+                    "attempted_alternatives",
+                ],
+            },
+        },
+        "upstream_answers": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "request_ids": {
+                        "type": "array",
+                        "items": {"type": "string", "minLength": 1},
+                        "minItems": 1,
+                        "uniqueItems": True,
+                    },
+                    "disposition": {
+                        "type": "string",
+                        "enum": ["added", "existing", "downstream"],
+                    },
+                    "declarations": {
+                        "type": "array",
+                        "items": {"type": "string", "minLength": 1},
+                        "uniqueItems": True,
+                    },
+                    "usage_guidance": {"type": "string"},
+                    "rejection_reason": {"type": "string"},
+                },
+                "required": [
+                    "request_ids",
+                    "disposition",
+                    "declarations",
+                    "usage_guidance",
+                    "rejection_reason",
+                ],
+            },
+        },
         "source_issues": {
             "type": "array",
             "items": {
@@ -78,6 +145,8 @@ REPORT_SCHEMA: dict[str, Any] = {
         "summary",
         "issues",
         "fixup_findings",
+        "upstream_requests",
+        "upstream_answers",
         "source_issues",
     ],
 }
@@ -110,8 +179,17 @@ ROLLOUT_READ_BYTES = 1024 * 1024
 PROCESS_GROUP_GRACE_SECONDS = 1.0
 COMMON_PROMPT_PATH = Path(__file__).with_name("prompts") / "common.md"
 PROOF_REVIEW_PROMPT_PATH = Path(__file__).with_name("prompts") / "proof_review.md"
+UPSTREAM_REPAIR_PROMPT_PATH = Path(__file__).with_name("prompts") / "upstream_repair.md"
+UPSTREAM_REPAIR_ROLE = "upstream_repair"
+DOWNSTREAM_RETRY_ROLE = "downstream_retry"
 CAPACITY_RESUME_PROMPT = "Continue from the interrupted turn and complete the assigned task."
-REVIEW_SOURCE_BUNDLE_MAX_CHARS = 500_000
+UPSTREAM_SOURCE_BUNDLE_MAX_CHARS = 240_000
+LEAN_DECLARATION_RE = re.compile(
+    r"^[ \t]*(?:(?:noncomputable|private|protected|unsafe|opaque)[ \t]+)*"
+    r"(?:theorem|lemma|def|abbrev|structure|class|instance)[ \t]+"
+    r"(?P<name>[^\s([{:=]+)",
+    re.MULTILINE,
+)
 
 
 def lean_mcp_executable() -> Path:
@@ -169,14 +247,35 @@ def render_prompt(template: str, chapter: Chapter) -> str:
     return template
 
 
-def _bounded_feedback(feedback: str, maximum: int = 12000) -> str:
-    """Bound feedback while retaining both its first and final diagnostics."""
+def _bounded_feedback(feedback: str, maximum: int = 48_000) -> str:
+    """Bound feedback while retaining endpoints and an index of omitted diagnostics."""
 
     if len(feedback) <= maximum:
         return feedback
-    omission = "\n\n... middle of coordinator feedback omitted ...\n\n"
+    provisional_head = maximum // 3
+    provisional_tail = maximum // 2
+    omitted = feedback[provisional_head : len(feedback) - provisional_tail]
+    identifying_lines: list[str] = []
+    for line in omitted.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped in identifying_lines:
+            continue
+        if (
+            stripped.startswith(("error:", "Proof attempt ", "Review finding "))
+            or "Requested edit paths" in stripped
+            or re.search(r"[^\s`]+\.lean(?::\d+)?", stripped)
+        ):
+            identifying_lines.append(stripped[:300])
+    index = "\n".join(identifying_lines)
+    if len(index) > maximum // 6:
+        index = index[: maximum // 6].rsplit("\n", 1)[0]
+        index += "\n... additional omitted identifiers ..."
+    omission = "\n\n... coordinator feedback body omitted ..."
+    if index:
+        omission += f"\nOmitted diagnostic/finding index:\n{index}"
+    omission += "\n\n"
     available = maximum - len(omission)
-    head = available // 2
+    head = available // 3
     return feedback[:head] + omission + feedback[-(available - head) :]
 
 
@@ -184,47 +283,161 @@ def scoped_files(repo: Path, chapter: Chapter) -> list[Path]:
     return ScopeMatcher(chapter.scope).files(repo)
 
 
-def _review_source_bundle(
-    repo: Path,
-    chapter: Chapter,
-    maximum: int = REVIEW_SOURCE_BUNDLE_MAX_CHARS,
-) -> str:
-    """Render the informal book and assigned files with line numbers and a hard size cap."""
+def _display_path(repo: Path, path: Path) -> str:
+    try:
+        return path.relative_to(repo).as_posix()
+    except ValueError:
+        return path.as_posix()
 
-    parts = [
-        "# Line-numbered review source set\n\n",
-        "This snapshot is supplied before the review instructions and counts as the initial "
-        "complete read of every file included in full. Do not reread complete files from the "
-        "filesystem. Read from the filesystem only when content is explicitly missing or "
-        "truncated, after you edit a file, or for a targeted search or lookup. Paths are "
-        "repository-relative.\n",
-    ]
+
+def _line_numbered(lines: list[str], *, start: int = 1) -> str:
+    if not lines:
+        return f"{start:6d} | \n"
+    return "".join(f"{number:6d} | {line}\n" for number, line in enumerate(lines, start))
+
+
+def _textbook_chapter_excerpt(repo: Path, chapter: Chapter) -> tuple[str, str]:
     source = chapter.source if chapter.source.is_absolute() else repo / chapter.source
-    files = {source, *scoped_files(repo, chapter)}
+    if not source.is_file():
+        return _display_path(repo, source), "[Textbook source is missing.]\n"
+    lines = source.read_text(encoding="utf-8", errors="replace").splitlines()
+    heading = re.compile(rf"^##\s+{chapter.number}\.\s+")
+    next_heading = re.compile(r"^##\s+\d+\.\s+")
+    start = next((index for index, line in enumerate(lines) if heading.match(line)), None)
+    if start is None:
+        return _display_path(repo, source), "[Configured chapter heading was not found.]\n"
+    stop = next(
+        (index for index in range(start + 1, len(lines)) if next_heading.match(lines[index])),
+        len(lines),
+    )
+    return _display_path(repo, source), _line_numbered(lines[start:stop], start=start + 1)
 
-    def display_path(path: Path) -> str:
-        try:
-            return path.relative_to(repo).as_posix()
-        except ValueError:
-            return path.as_posix()
 
-    for path in sorted(files, key=display_path):
-        relative = display_path(path)
-        parts.append(f"\n## `{relative}`\n\n")
-        if not path.is_file():
-            parts.append("[File is missing from this snapshot.]\n")
+def _declaration_excerpt(path: Path, declaration: str) -> tuple[int, list[str]] | None:
+    if not path.is_file():
+        return None
+    text = path.read_text(encoding="utf-8", errors="replace")
+    matches = list(LEAN_DECLARATION_RE.finditer(text))
+    short_name = declaration.rsplit(".", 1)[-1]
+    for index, match in enumerate(matches):
+        found = match.group("name")
+        if found not in {declaration, short_name} and not declaration.endswith("." + found):
             continue
-        contents = path.read_text(encoding="utf-8", errors="replace")
-        lines = contents.splitlines()
-        if not lines:
-            parts.append("     1 | \n")
-        else:
-            parts.extend(f"{number:6d} | {line}\n" for number, line in enumerate(lines, 1))
+        line_start = text.count("\n", 0, match.start())
+        # Include a small doc/attribute prelude, stopping at the previous declaration.
+        excerpt_start = max(line_start - 5, 0)
+        if index:
+            previous_end_line = text.count("\n", 0, matches[index - 1].start()) + 1
+            excerpt_start = max(excerpt_start, previous_end_line)
+        line_stop = (
+            text.count("\n", 0, matches[index + 1].start())
+            if index + 1 < len(matches)
+            else len(text.splitlines())
+        )
+        lines = text.splitlines()[excerpt_start:line_stop]
+        return excerpt_start + 1, lines
+    return None
+
+
+def declaration_uses_placeholder(repo: Path, path: str, declaration: str) -> bool | None:
+    """Return whether one named declaration still contains ``sorry``/``admit``."""
+
+    target = (repo / path).resolve()
+    try:
+        target.relative_to(repo.resolve())
+    except ValueError:
+        return None
+    excerpt = _declaration_excerpt(target, declaration)
+    if excerpt is None:
+        return None
+    _, lines = excerpt
+    return re.search(r"\b(?:sorry|admit)\b", _lean_code("\n".join(lines))) is not None
+
+
+def _upstream_source_bundle(
+    repo: Path,
+    owner: Chapter,
+    requests: Iterable[dict[str, Any]],
+    chapters: Iterable[Chapter],
+    maximum: int = UPSTREAM_SOURCE_BUNDLE_MAX_CHARS,
+) -> str:
+    """Supply exact requests and their relevant source evidence to one repair agent."""
+
+    selected = tuple(requests)
+    by_id = {chapter.id: chapter for chapter in chapters}
+    parts = [
+        "# Targeted upstream repair evidence\n\n",
+        "This line-numbered snapshot supplies the request batch, relevant owner files, consumer "
+        "statements, and textbook excerpts. Read other files only for focused dependency lookup.\n",
+        "\n## Durable request batch\n",
+    ]
+    for request in selected:
+        request_id = str(request.get("id", "unknown"))
+        parts.extend(
+            [
+                f"\n### Request `{request_id}`\n\n",
+                f"- Consumer chapter: `{request.get('consumer_chapter_id', '')}`\n",
+                f"- Blocked declaration: `{request.get('blocked_declaration', '')}`\n",
+                f"- Consumer path: `{request.get('consumer_path', '')}`\n",
+                f"- Residual goal: `{request.get('residual_goal', '')}`\n",
+                f"- Requested result: {request.get('needed_result', '')}\n",
+                "- Attempted alternatives:\n",
+            ]
+        )
+        attempted = request.get("attempted_alternatives")
+        if isinstance(attempted, list):
+            parts.extend(f"  - {item}\n" for item in attempted if isinstance(item, str))
+        previous = request.get("previous_attempts")
+        if isinstance(previous, str) and previous.strip():
+            parts.extend(["- Previous proof-attempt ledger:\n\n", "```text\n", previous, "\n```\n"])
+
+    excerpt_chapters = {owner.id}
+    excerpt_chapters.update(str(request.get("consumer_chapter_id", "")) for request in selected)
+    parts.append("\n## Relevant textbook excerpts\n")
+    for chapter_id in sorted(excerpt_chapters):
+        chapter = by_id.get(chapter_id)
+        if chapter is None:
+            continue
+        path, excerpt = _textbook_chapter_excerpt(repo, chapter)
+        parts.extend([f"\n### `{path}` — {chapter.id}\n\n", excerpt])
+
+    matcher = ScopeMatcher(owner.scope)
+    owner_path_set: set[str] = set()
+    for request in selected:
+        raw_paths = request.get("owner_paths")
+        if not isinstance(raw_paths, list):
+            continue
+        owner_path_set.update(
+            path for path in raw_paths if isinstance(path, str) and matcher.matches(path)
+        )
+    owner_paths = sorted(owner_path_set)
+    parts.append("\n## Requested upstream source paths\n")
+    for relative in owner_paths:
+        path = repo / relative
+        parts.append(f"\n### `{relative}`\n\n")
+        if not path.is_file():
+            parts.append("[File is missing; create it only if the normal owner scope permits.]\n")
+            continue
+        parts.append(
+            _line_numbered(path.read_text(encoding="utf-8", errors="replace").splitlines())
+        )
+
+    parts.append("\n## Relevant consumer declarations\n")
+    for request in selected:
+        relative = str(request.get("consumer_path", ""))
+        declaration = str(request.get("blocked_declaration", ""))
+        excerpt = _declaration_excerpt(repo / relative, declaration)
+        parts.append(f"\n### `{relative}` — `{declaration}`\n\n")
+        if excerpt is None:
+            parts.append("[The named consumer declaration could not be extracted.]\n")
+            continue
+        start, lines = excerpt
+        parts.append(_line_numbered(lines, start=start))
 
     bundle = "".join(parts)
     if len(bundle) <= maximum:
         return bundle
-    marker = f"\n[Review source set truncated at {maximum:,} characters.]\n"
+    marker = f"\n[Upstream repair evidence truncated at {maximum:,} characters.]\n"
     if len(marker) >= maximum:
         return marker[:maximum]
     return bundle[: maximum - len(marker)] + marker
@@ -322,6 +535,8 @@ def _find_report(event: Any) -> dict[str, Any] | None:
             key in value for key in ("changed", "complete", "summary", "issues")
         ):
             value.setdefault("fixup_findings", [])
+            value.setdefault("upstream_requests", [])
+            value.setdefault("upstream_answers", [])
             value.setdefault("source_issues", [])
             return value
     return None
@@ -465,18 +680,21 @@ class CodexExecutor:
         *,
         feedback: str = "",
         workspace_root: Path | None = None,
+        role: str = "",
+        upstream_requests: Iterable[dict[str, Any]] = (),
     ) -> str:
-        prompt_path = (
-            PROOF_REVIEW_PROMPT_PATH
-            if stage is Stage.REVIEW and feedback
-            else self.config.stages[stage].prompt
-        )
+        if role == UPSTREAM_REPAIR_ROLE:
+            prompt_path = UPSTREAM_REPAIR_PROMPT_PATH
+        elif stage is Stage.REVIEW and feedback:
+            prompt_path = PROOF_REVIEW_PROMPT_PATH
+        else:
+            prompt_path = self.config.stages[stage].prompt
         template = prompt_path.read_text(encoding="utf-8")
         base = render_prompt(template, chapter)
         common = render_prompt(COMMON_PROMPT_PATH.read_text(encoding="utf-8"), chapter)
         scope = "\n".join(f"- `{item}`" for item in chapter.scope)
         proof_retry_contract = ""
-        if stage is Stage.PROVE and feedback:
+        if stage is Stage.PROVE and feedback and role != UPSTREAM_REPAIR_ROLE:
             proof_retry_contract = """
 This is a retry. The cumulative attempt ledger appended below is prior inventory, not a conclusion
 to echo. Do not merely repeat its full-file reads, clean diagnostics, searches, or prior proof
@@ -488,8 +706,8 @@ structure. Persist through several checked approaches; a retry is not exhausted 
 tactic. Add and prove focused local or private helper lemmas when they unlock the result. Stop only
 after sustained concrete work exposes the same hard obstruction, or after a specific mathematical
 argument shows that the statement cannot follow from its assumptions. If the latter establishes
-that an earlier declaration or interface must change, return a minimal structured `fixup_findings`
-request instead of another unchanged \"no pinned API\" report."""
+that an earlier declaration or interface must change, return a minimal structured
+`upstream_requests` entry instead of another unchanged \"no pinned API\" report."""
         stage_contract = {
             Stage.FORMALIZE: """This is one optimistic drafting attempt. The coordinator merges
 accepted scoped changes without running Lean. Compiler failures are deferred to the global fixup
@@ -511,6 +729,11 @@ untouched files merely to reconfirm the clean build. After the attempt, the coor
 assigned chapter against its single writable cache."""
             + proof_retry_contract,
         }[stage]
+        if role == UPSTREAM_REPAIR_ROLE:
+            stage_contract = """This temporary agent owns one batched upstream-interface repair.
+Use the proof-capable Lean MCP, edit only the owner chapter, and fully prove every new declaration.
+The coordinator independently merges and builds the owner before releasing fresh consumer retries.
+Do not perform an ordinary owner-chapter placeholder pass."""
         validation_contract = {
             Stage.FORMALIZE: "The coordinator checks the scoped result but intentionally does not "
             "compile this optimistic drafting stage.",
@@ -521,6 +744,24 @@ assigned chapter against its single writable cache."""
             Stage.PROVE: "The coordinator independently checks scoped hashes, placeholders, "
             "diagnostics, and the chapter build.",
         }[stage]
+        if role == UPSTREAM_REPAIR_ROLE:
+            upstream_contract = """For this repair batch, leave `upstream_requests` empty and
+return an `upstream_answers` entry covering every supplied request id. For `added` or `existing`,
+give exact fully qualified declaration names and concrete usage guidance. For `downstream`, leave
+declaration names empty and give both downstream guidance and the precise rejection reason. Do not
+omit or discard a request merely because no upstream edit was appropriate."""
+        elif stage is Stage.PROVE:
+            upstream_contract = """When sustained checked work shows that one blocked declaration
+needs a specific reusable result from an earlier chapter, record it in `upstream_requests`,
+including the exact declaration and consumer path, residual Lean goal, minimal needed result,
+proposed earlier owner chapter and paths, and at least two materially different attempted
+alternatives. Continue through independent declarations before finishing. Use `fixup_findings`, not
+`upstream_requests`,
+for an inaccurate consumer statement or another statement/API defect that requires editing existing
+interfaces. Leave `upstream_answers` empty; only targeted repair agents answer requests."""
+        else:
+            upstream_contract = """This agent does not create or answer proof-to-upstream handoffs.
+Leave both `upstream_requests` and `upstream_answers` empty."""
         contract = f"""
 
 ## Runtime contract
@@ -545,7 +786,9 @@ the coordinator and use its single writable build cache. {stage_contract}
 
 ### Final response
 
-Return the required structured report. Set `changed` from the actual scoped diff and `complete` from
+Emit the required structured report exactly once, as the final response after tool use and edits
+have stopped. It must describe the stable on-disk state, never planned future work. Set `changed` to
+true exactly when you made a scoped filesystem edit that remains at the end, and set `complete` from
 the stage's definition of done. When `changed` is true, write a concise, self-contained `summary` in
 past tense that describes the actual scoped edits and their purpose, names the key files or
 declarations, and is suitable for use verbatim as a Git commit body. Keep progress, future work, and
@@ -559,6 +802,8 @@ repository-relative Lean paths that need edits, including paths outside this att
 prospective path when the repair requires creating a missing file. Split findings whose repairs have
 different owners. Leave `fixup_findings` empty exactly when no source edit is requested. The
 coordinator routes these entries to the chapters that own those paths.
+
+{upstream_contract}
 
 Record each genuine defect in the informal textbook in `source_issues`, with its precise heading or
 other location, an exact identifying excerpt, a mathematical explanation, and the smallest suggested
@@ -601,17 +846,29 @@ warms their complete imported closure with coalesced dependency preparation. The
 whole-file diagnostics in import order; do not prepare every file separately.
 """
         if feedback:
-            feedback_heading = {
-                Stage.FORMALIZE: "Coordinator feedback",
-                Stage.FIXUP: "Coordinator diagnostics and routed findings",
-                Stage.REVIEW: "Failed proof findings to evaluate",
-                Stage.PROVE: "Cumulative proof-attempt ledger",
-            }[stage]
+            feedback_heading = (
+                "Targeted downstream retry handoff"
+                if role == DOWNSTREAM_RETRY_ROLE
+                else {
+                    Stage.FORMALIZE: "Coordinator feedback",
+                    Stage.FIXUP: "Coordinator diagnostics and routed findings",
+                    Stage.REVIEW: "Failed proof findings to evaluate",
+                    Stage.PROVE: "Cumulative proof-attempt ledger",
+                }[stage]
+            )
             contract += f"\n## {feedback_heading}\n\n```text\n{_bounded_feedback(feedback)}\n```\n"
         prefix = ""
-        if stage is Stage.REVIEW:
+        if role == UPSTREAM_REPAIR_ROLE:
             root = workspace_root or self.config.settings.repo
-            prefix = _review_source_bundle(root, chapter).rstrip() + "\n\n"
+            prefix = (
+                _upstream_source_bundle(
+                    root,
+                    chapter,
+                    upstream_requests,
+                    self.config.chapters,
+                ).rstrip()
+                + "\n\n"
+            )
         return f"{prefix}{base.rstrip()}\n\n{common.rstrip()}\n{contract}"
 
     def command(
@@ -687,6 +944,53 @@ whole-file diagnostics in import order; do not prepare every file separately.
     ) -> AgentResult:
         root = workspace_root or self.config.settings.repo
         prompt = self.build_prompt(chapter, stage, feedback=feedback, workspace_root=root)
+        return await self._run_prompt(
+            chapter,
+            stage,
+            run,
+            prompt=prompt,
+            feedback=feedback,
+            workspace_root=root,
+        )
+
+    async def run_upstream_repair(
+        self,
+        chapter: Chapter,
+        run: RunRecord,
+        requests: Iterable[dict[str, Any]],
+        *,
+        workspace_root: Path | None = None,
+    ) -> AgentResult:
+        """Run one proof-capable temporary agent over an owner-grouped request batch."""
+
+        root = workspace_root or self.config.settings.repo
+        selected = tuple(requests)
+        prompt = self.build_prompt(
+            chapter,
+            Stage.PROVE,
+            workspace_root=root,
+            role=UPSTREAM_REPAIR_ROLE,
+            upstream_requests=selected,
+        )
+        return await self._run_prompt(
+            chapter,
+            Stage.PROVE,
+            run,
+            prompt=prompt,
+            workspace_root=root,
+        )
+
+    async def _run_prompt(
+        self,
+        chapter: Chapter,
+        stage: Stage,
+        run: RunRecord,
+        *,
+        prompt: str,
+        feedback: str = "",
+        workspace_root: Path | None = None,
+    ) -> AgentResult:
+        root = workspace_root or self.config.settings.repo
         prompt_path = self.state.logs_dir / f"{run.id}.prompt.md"
         prompt_path.write_text(prompt, encoding="utf-8")
         before = scope_digest(root, chapter)
@@ -694,7 +998,7 @@ whole-file diagnostics in import order; do not prepare every file separately.
         usage = TokenUsage()
         report: dict[str, Any] = {}
         thread_id: str | None = None
-        activity = self.state.activities.start(run.id, chapter.id, stage.value)
+        activity = self.state.activities.start(run.id, chapter.id, run.role or stage.value)
         usage_stop = asyncio.Event()
         usage_monitor: asyncio.Task[None] | None = None
         attempt_deadline = (

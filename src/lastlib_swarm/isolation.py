@@ -151,11 +151,7 @@ class SharedWorkspace:
         current = await asyncio.to_thread(scoped_manifest, self.root, chapter)
         base = self.base_manifest if self.base_manifest is not None else current
         changed = tuple(
-            sorted(
-                path
-                for path in set(base) | set(current)
-                if base.get(path) != current.get(path)
-            )
+            sorted(path for path in set(base) | set(current) if base.get(path) != current.get(path))
         )
         return IsolationResult(accepted=True, generation=0, changed_paths=changed)
 

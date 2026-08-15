@@ -66,10 +66,9 @@ Proof edits are validated by building their own chapter, but they do not invalid
 rebuild downstream chapters. Build freshness remains separate from review and proof task status.
 Proof findings reopen review without invalidating build freshness; a subsequent review edit is what
 marks the affected import closure stale.
-Every review prompt begins with the complete informal book and assigned Lean file set in path order
-with numbered lines, capped at 500,000 characters. The supplied snapshot counts as the reviewer's
-initial read; filesystem reads are reserved for missing or truncated content, post-edit content, and
-targeted searches or lookups. Fixup, review, and proof agents receive Lean MCP;
+Review agents read the assigned numbered textbook chapter and discover the assigned Lean files
+dynamically, then use targeted searches in earlier LastLib and pinned Mathlib sources as questions
+arise. They do not receive a prefabricated source packet. Fixup, review, and proof agents receive Lean MCP;
 reviewers trust the last clean build for untouched files and request whole-file diagnostics
 only for files they edit and the assigned transitive dependents invalidated by those edits. A
 no-change review therefore needs no diagnostic calls.
@@ -200,8 +199,6 @@ number would be ambiguous.
 
 CLI overrides such as `--model`, `--reasoning-effort`, and `--max-agents` work with both inferred and
 configured runs. `--isolation auto|fuse-overlay|shared` selects the execution backend.
-
-Use `--no-lean-mcp` to run fixup, review, and proof stages without the Lean MCP integration.
 
 After a foreground TUI closes with a failed result, the CLI prints the failed task details, compact
 agent/build diagnostics, blocked dependents, and persisted state path to standard output.
@@ -525,7 +522,6 @@ codex_fd_recycle_attempts = 20 # maximum transparent same-thread resource recycl
 validation_timeout_seconds = 1800
 isolation = "auto" # auto, fuse-overlay, or shared
 cache_compaction_layers = 32 # asynchronously compact immutable cache layer stacks at this size
-lean_mcp = true
 lean_project = "lean" # relative to swarm.repo; contains lakefile and lean-toolchain
 lean_mcp_tool_timeout_seconds = 300
 ```
