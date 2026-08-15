@@ -675,8 +675,8 @@ async def test_dashboard_separates_agents_queues_and_coordinator_builds(
         await state.set_task(
             config.chapters[1].id,
             Stage.FIXUP,
-            TaskStatus.RUNNING,
-            "streaming coordinator build",
+            TaskStatus.PENDING,
+            "waiting for a fresh build",
         )
         await state.set_task(
             config.chapters[1].id,

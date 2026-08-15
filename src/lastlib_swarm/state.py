@@ -285,7 +285,7 @@ class StateStore:
             fixup = self.task(chapter.id, Stage.FIXUP)
             review = self.task(chapter.id, Stage.REVIEW)
             prove = self.task(chapter.id, Stage.PROVE)
-            if fixup.status == TaskStatus.PENDING and (
+            if fixup.status != TaskStatus.SUCCEEDED and (
                 review.rounds > 0
                 or prove.rounds > 0
                 or review.status in (TaskStatus.RUNNING, TaskStatus.SUCCEEDED)
@@ -851,6 +851,15 @@ class StateStore:
     def task(self, chapter_id: str, stage: Stage) -> TaskRecord:
         return self.tasks[self.key(chapter_id, stage)]
 
+    def later_stage_started(self, chapter_id: str) -> bool:
+        return any(
+            task.rounds > 0 or task.status in (TaskStatus.RUNNING, TaskStatus.SUCCEEDED)
+            for task in (
+                self.task(chapter_id, Stage.REVIEW),
+                self.task(chapter_id, Stage.PROVE),
+            )
+        )
+
     async def set_task(
         self,
         chapter_id: str,
@@ -861,12 +870,19 @@ class StateStore:
         source_digest: str | None = None,
     ) -> None:
         task = self.task(chapter_id, stage)
+        if (
+            stage is Stage.FIXUP
+            and status != TaskStatus.SUCCEEDED
+            and self.later_stage_started(chapter_id)
+        ):
+            status = TaskStatus.SUCCEEDED
+            detail = "initial fixup completed before review"
         if stage in (Stage.REVIEW, Stage.PROVE) and status in (
             TaskStatus.RUNNING,
             TaskStatus.SUCCEEDED,
         ):
             fixup = self.task(chapter_id, Stage.FIXUP)
-            if fixup.status == TaskStatus.PENDING:
+            if fixup.status != TaskStatus.SUCCEEDED:
                 fixup.status = TaskStatus.SUCCEEDED
                 fixup.detail = "initial fixup completed before review"
                 fixup.updated_at = timestamp()
@@ -893,19 +909,28 @@ class StateStore:
             if key not in self.tasks:
                 continue
             task = self.tasks[key]
+            task_status = status
+            task_detail = detail
+            if (
+                stage is Stage.FIXUP
+                and status != TaskStatus.SUCCEEDED
+                and self.later_stage_started(chapter_id)
+            ):
+                task_status = TaskStatus.SUCCEEDED
+                task_detail = "initial fixup completed before review"
             if stage in (Stage.REVIEW, Stage.PROVE) and status in (
                 TaskStatus.RUNNING,
                 TaskStatus.SUCCEEDED,
             ):
                 fixup = self.task(chapter_id, Stage.FIXUP)
-                if fixup.status == TaskStatus.PENDING:
+                if fixup.status != TaskStatus.SUCCEEDED:
                     fixup.status = TaskStatus.SUCCEEDED
                     fixup.detail = "initial fixup completed before review"
                     fixup.updated_at = updated_at
-            task.status = status
-            if stage is Stage.PROVE and status != TaskStatus.SUCCEEDED:
+            task.status = task_status
+            if stage is Stage.PROVE and task_status != TaskStatus.SUCCEEDED:
                 task.source_digest = None
-            task.detail = detail
+            task.detail = task_detail
             task.updated_at = updated_at
             changed = True
         if changed:
@@ -932,6 +957,10 @@ class StateStore:
         return changed
 
     async def start_run(self, chapter_id: str, stage: Stage) -> RunRecord:
+        if stage is Stage.FIXUP and self.later_stage_started(chapter_id):
+            raise RuntimeError(
+                f"cannot start fixup for {chapter_id} after review or proof has begun"
+            )
         task = self.task(chapter_id, stage)
         task.status = TaskStatus.RUNNING
         if stage is Stage.PROVE:

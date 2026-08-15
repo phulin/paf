@@ -273,7 +273,29 @@ async def test_review_progress_reconciles_pending_initial_fixup(tmp_path: Path) 
     fixup = state.task(chapter.id, Stage.FIXUP)
     assert fixup.status == TaskStatus.SUCCEEDED
     assert fixup.detail == "initial fixup completed before review"
+
+    await state.set_task(
+        chapter.id,
+        Stage.FIXUP,
+        TaskStatus.RUNNING,
+        "late coordinator rebuild",
+    )
+    assert fixup.status == TaskStatus.SUCCEEDED
+    assert fixup.detail == "initial fixup completed before review"
+    with pytest.raises(RuntimeError, match="after review or proof has begun"):
+        await state.start_run(chapter.id, Stage.FIXUP)
+
+    fixup.status = TaskStatus.RUNNING
+    fixup.detail = "legacy coordinator build state"
+    await state.save()
     await state.close()
+
+    recovered = StateStore(config)
+    await recovered.load_or_create()
+    recovered_fixup = recovered.task(chapter.id, Stage.FIXUP)
+    assert recovered_fixup.status == TaskStatus.SUCCEEDED
+    assert recovered_fixup.detail == "initial fixup completed before review"
+    await recovered.close()
 
 
 @pytest.mark.asyncio
@@ -1120,8 +1142,8 @@ async def test_pending_review_and_proof_builds_share_a_cross_stage_command(
     assert commands == [f"cd lean && lake build {review_target} {proof_target}"]
     assert review[review_chapter.id].succeeded
     assert proof[proof_chapter.id].succeeded
-    assert state.task(review_chapter.id, Stage.REVIEW).status == TaskStatus.RUNNING
-    assert state.task(proof_chapter.id, Stage.PROVE).status == TaskStatus.RUNNING
+    assert state.task(review_chapter.id, Stage.REVIEW).status == TaskStatus.PENDING
+    assert state.task(proof_chapter.id, Stage.PROVE).status == TaskStatus.PENDING
     assert state.task(review_chapter.id, Stage.PROVE).status == TaskStatus.PENDING
     assert state.task(proof_chapter.id, Stage.REVIEW).status == TaskStatus.PENDING
     await orchestrator.shutdown()
@@ -1758,7 +1780,7 @@ async def test_coordinator_build_does_not_count_as_an_agent(
     assert state.coordinator_build.error_count == 1
     assert state.agent_summary()["active"] == 0
     assert all(
-        state.task(chapter.id, Stage.FIXUP).status == TaskStatus.RUNNING
+        state.task(chapter.id, Stage.FIXUP).status == TaskStatus.PENDING
         for chapter in config.chapters
     )
 
@@ -1774,7 +1796,7 @@ async def test_coordinator_build_does_not_count_as_an_agent(
     ]
     assert state.coordinator_build.error_count == 2
     assert all(
-        state.task(chapter.id, Stage.FIXUP).status == TaskStatus.RUNNING
+        state.task(chapter.id, Stage.FIXUP).status == TaskStatus.PENDING
         for chapter in config.chapters
     )
     await orchestrator.shutdown()
@@ -2309,6 +2331,12 @@ async def test_fixup_cancellation_releases_shared_source_lock(
 
     assert not orchestrator.source_lock.locked()
     assert orchestrator.agent_slots.available == orchestrator.agent_slots.capacity
+    fixup = orchestrator.state.task(chapter.id, Stage.FIXUP)
+    assert fixup.status == TaskStatus.PENDING
+    assert fixup.detail == "fixup agent interrupted; requeued"
+    assert fixup.runs[-1].status == TaskStatus.FAILED
+    assert fixup.runs[-1].finished_at is not None
+    assert orchestrator.state.agent_summary()["active"] == 0
     await orchestrator.shutdown()
 
 
@@ -2394,7 +2422,6 @@ async def test_pipeline_reviews_chapters_after_combined_optimistic_build_succeed
     orchestrator = Orchestrator(config, StateStore(config))
     await orchestrator.prepare()
     events: list[str] = []
-    first_review_started = asyncio.Event()
 
     async def formalize_all() -> bool:
         return True
@@ -2404,16 +2431,12 @@ async def test_pipeline_reviews_chapters_after_combined_optimistic_build_succeed
         chapter: Chapter,
         **_kwargs: object,
     ) -> ValidationResult:
-        if chapter.id == second.id:
-            await asyncio.wait_for(first_review_started.wait(), timeout=1)
         events.append(f"build:{chapter.id}")
         return ValidationResult(True, 0, "ok")
 
     async def review(chapter: Chapter, *, rerun: bool = False) -> ReviewOutcome:
         assert not rerun
         events.append(f"review:{chapter.id}")
-        if chapter.id == first.id:
-            first_review_started.set()
         return ReviewOutcome(True, False, {})
 
     async def prove(chapter: Chapter, *, defer_review: bool = False) -> bool:
@@ -2488,7 +2511,58 @@ async def test_pipeline_quarantines_failed_formalization_but_reviews_independent
 
 
 @pytest.mark.asyncio
-async def test_pipeline_reviews_clean_branch_while_other_fixup_is_still_running(
+async def test_pipeline_never_returns_reviewed_chapters_to_fixup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    reviewed_chapter, new_chapter = config.chapters
+    orchestrator = Orchestrator(config, StateStore(config))
+    await orchestrator.prepare()
+    await orchestrator.state.set_task(
+        reviewed_chapter.id,
+        Stage.REVIEW,
+        TaskStatus.SUCCEEDED,
+        "reviewed",
+    )
+    fixup_targets: set[str] = set()
+
+    async def formalize_all() -> bool:
+        return True
+
+    async def fixup_to_clean(
+        _feedback: dict[str, str] | None = None,
+        *,
+        target_ids: Iterable[str] | None = None,
+        progress_event: asyncio.Event | None = None,
+    ) -> bool:
+        assert progress_event is None
+        fixup_targets.update(target_ids or ())
+        await orchestrator.state.set_task(
+            new_chapter.id,
+            Stage.FIXUP,
+            TaskStatus.SUCCEEDED,
+            "clean",
+        )
+        return True
+
+    async def review_tree(**_kwargs: object) -> bool:
+        return True
+
+    monkeypatch.setattr(orchestrator, "_formalize_all", formalize_all)
+    monkeypatch.setattr(orchestrator, "_fixup_to_clean", fixup_to_clean)
+    monkeypatch.setattr(orchestrator, "_review_tree", review_tree)
+
+    assert await orchestrator.run_pipeline()
+    assert fixup_targets == {new_chapter.id}
+    assert (
+        orchestrator.state.task(reviewed_chapter.id, Stage.FIXUP).status
+        == TaskStatus.SUCCEEDED
+    )
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_pipeline_reviews_clean_branch_after_other_fixup_finishes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
@@ -2501,7 +2575,7 @@ async def test_pipeline_reviews_clean_branch_while_other_fixup_is_still_running(
         )
     orchestrator = Orchestrator(config, StateStore(config))
     await orchestrator.prepare()
-    second_reviewed = asyncio.Event()
+    fixup_finished = False
     reviewed: list[str] = []
     proved: list[str] = []
 
@@ -2514,14 +2588,14 @@ async def test_pipeline_reviews_clean_branch_while_other_fixup_is_still_running(
         target_ids: Iterable[str] | None = None,
         progress_event: asyncio.Event | None = None,
     ) -> bool:
+        nonlocal fixup_finished
         assert set(target_ids or ()) == {first.id, second.id}
-        assert progress_event is not None
+        assert progress_event is None
         await orchestrator.state.set_task(second.id, Stage.FIXUP, TaskStatus.SUCCEEDED, "clean")
-        progress_event.set()
-        await asyncio.wait_for(second_reviewed.wait(), timeout=1)
         await orchestrator.state.set_task(
             first.id, Stage.FIXUP, TaskStatus.FAILED, "did not converge"
         )
+        fixup_finished = True
         return False
 
     async def review(
@@ -2531,12 +2605,12 @@ async def test_pipeline_reviews_clean_branch_while_other_fixup_is_still_running(
         rerun: bool = False,
     ) -> bool:
         assert not rerun
+        assert fixup_finished
         assert chapter.id == second.id
         reviewed.append(chapter.id)
         await orchestrator.state.set_task(
             chapter.id, Stage.REVIEW, TaskStatus.SUCCEEDED, "reviewed"
         )
-        second_reviewed.set()
         return True
 
     async def prove(chapter: Chapter, *, defer_review: bool = False) -> bool:

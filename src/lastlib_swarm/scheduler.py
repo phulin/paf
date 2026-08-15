@@ -1126,12 +1126,6 @@ class Orchestrator:
                 modes = {request.mode for request in attempt_requests}
                 mode = next(iter(modes)) if len(modes) == 1 else "batched"
                 owner = max(attempt_requests, key=lambda request: request.priority)
-                target_stages = {
-                    chapter.id: frozenset(
-                        request.stage for request in attempt_requests if chapter in request.chapters
-                    )
-                    for chapter in selected
-                }
                 attempt_snapshots: dict[str, ValidatedBuildSnapshot] = {}
                 capture_snapshots = any(
                     request.snapshots is not None for request in attempt_requests
@@ -1148,7 +1142,6 @@ class Orchestrator:
                     priority=owner.priority,
                     preemptible=all(request.preemptible for request in attempt_requests),
                     snapshots=attempt_snapshots if capture_snapshots else None,
-                    target_stages=target_stages,
                 )
                 if all(result.succeeded for result in attempt_results.values()):
                     results_by_id.update(attempt_results)
@@ -1194,7 +1187,6 @@ class Orchestrator:
         priority: float = 100.0,
         preemptible: bool = False,
         snapshots: dict[str, ValidatedBuildSnapshot] | None = None,
-        target_stages: dict[str, frozenset[Stage]] | None = None,
     ) -> dict[str, ValidationResult]:
         """Execute one deterministic Lake invocation against the coordinator cache."""
 
@@ -1206,27 +1198,6 @@ class Orchestrator:
 
         while True:
             await self.control.checkpoint()
-            stages = target_stages or {chapter_id: frozenset((stage,)) for chapter_id in ids}
-
-            async def set_target_tasks(
-                status: TaskStatus,
-                detail: str,
-                *,
-                current_stages: dict[str, frozenset[Stage]] = stages,
-            ) -> None:
-                for target_stage in Stage:
-                    stage_ids = tuple(
-                        chapter_id
-                        for chapter_id in ids
-                        if target_stage in current_stages[chapter_id]
-                    )
-                    if stage_ids:
-                        await self.state.set_tasks(stage_ids, target_stage, status, detail)
-
-            await set_target_tasks(
-                TaskStatus.RUNNING,
-                f"queued for {mode} coordinator build",
-            )
             lease = await self.build_queue.acquire(
                 priority=priority,
                 label=label,
@@ -1248,10 +1219,6 @@ class Orchestrator:
                 source_held = True
                 build_workspace = await self.isolation.acquire_build(label)
                 async with self.state.batch():
-                    await set_target_tasks(
-                        TaskStatus.RUNNING,
-                        f"{mode} coordinator build {iteration}/{maximum_iterations}",
-                    )
                     await self.state.start_coordinator_build(
                         mode=mode,
                         stage=stage,
@@ -1357,11 +1324,6 @@ class Orchestrator:
                     publish=publish_if_clean and clean,
                 )
                 build_workspace = None
-                if not preempted:
-                    await set_target_tasks(
-                        TaskStatus.RUNNING,
-                        "coordinator build finished; reconciling result",
-                    )
             finally:
                 try:
                     if progress_flush is not None:
@@ -1455,8 +1417,8 @@ class Orchestrator:
         await self.state.set_task(
             chapter.id,
             Stage.FIXUP,
-            TaskStatus.RUNNING,
-            f"fixup run {task.rounds + 1} (repair-cycle cap {maximum})",
+            TaskStatus.PENDING,
+            f"queued for fixup run {task.rounds + 1} (repair-cycle cap {maximum})",
         )
         await self.control.checkpoint()
         await self.agent_slots.acquire(self.statement_schedule.priority(chapter.book_id))
@@ -1574,7 +1536,7 @@ class Orchestrator:
             await self.state.set_task(
                 handle.chapter.id,
                 Stage.FIXUP,
-                TaskStatus.RUNNING,
+                TaskStatus.PENDING,
                 "fixup complete; queued for coordinator verification",
             )
             return attempt
@@ -1679,6 +1641,21 @@ class Orchestrator:
                 handle.task.cancel()
             await asyncio.gather(*(handle.task for handle in handles), return_exceptions=True)
             for handle in handles:
+                if handle.run.status == TaskStatus.RUNNING:
+                    await self.state.finish_run(
+                        handle.run,
+                        status=TaskStatus.FAILED,
+                        isolation={
+                            "accepted": False,
+                            "error": "fixup agent cancelled by orchestrator",
+                        },
+                    )
+                await self.state.set_task(
+                    handle.chapter.id,
+                    Stage.FIXUP,
+                    TaskStatus.PENDING,
+                    "fixup agent interrupted; requeued",
+                )
                 await handle.workspace.close()
                 if handle.source_lock_held:
                     self.source_lock.release()
@@ -1699,7 +1676,7 @@ class Orchestrator:
             await self.state.set_task(
                 handle.chapter.id,
                 Stage.FIXUP,
-                TaskStatus.RUNNING,
+                TaskStatus.PENDING,
                 "stale dependency snapshot; fixup requeued",
             )
             merge_feedback({handle.chapter.id: detail})
@@ -1950,9 +1927,44 @@ class Orchestrator:
                     handle = running.pop(chapter_id)
                     try:
                         await handle.task
-                    except BaseException:
+                    except BaseException as error:
                         await handle.workspace.close()
+                        if handle.source_lock_held:
+                            self.source_lock.release()
+                            handle.source_lock_held = False
+                        if handle.run.status == TaskStatus.RUNNING:
+                            await self.state.finish_run(
+                                handle.run,
+                                status=TaskStatus.FAILED,
+                                isolation={
+                                    "accepted": False,
+                                    "error": (
+                                        str(error)
+                                        or "fixup agent interrupted before integration"
+                                    ),
+                                },
+                            )
+                        await self.state.set_task(
+                            chapter_id,
+                            Stage.FIXUP,
+                            (
+                                TaskStatus.PENDING
+                                if isinstance(error, asyncio.CancelledError)
+                                else TaskStatus.FAILED
+                            ),
+                            (
+                                "fixup agent interrupted; requeued"
+                                if isinstance(error, asyncio.CancelledError)
+                                else "fixup agent failed before integration"
+                            ),
+                        )
                         raise
+                    await self.state.set_task(
+                        chapter_id,
+                        Stage.FIXUP,
+                        TaskStatus.PENDING,
+                        "fixup agent complete; awaiting integration",
+                    )
                     changed_dependencies = tuple(
                         dependency
                         for dependency, certificate in handle.dependency_certificates.items()
@@ -3054,33 +3066,30 @@ class Orchestrator:
                 if self.state.task(chapter.id, Stage.FORMALIZE).status != TaskStatus.SUCCEEDED
             }
         )
-        initial_targets = {chapter.id for chapter in self.chapters}.difference(quarantined)
-        if not initial_targets:
-            return False
-        fixup_progress = asyncio.Event()
-        fixup_task = asyncio.create_task(
-            self._fixup_to_clean(
-                target_ids=initial_targets,
-                progress_event=fixup_progress,
+        initial_targets = {
+            chapter.id
+            for chapter in self.chapters
+            if chapter.id not in quarantined
+            and not self.state.later_stage_started(chapter.id)
+        }
+        fixed = (
+            await self._fixup_to_clean(target_ids=initial_targets)
+            if initial_targets
+            else True
+        )
+        failed_fixups = {
+            chapter_id
+            for chapter_id in initial_targets
+            if self.state.task(chapter_id, Stage.FIXUP).status != TaskStatus.SUCCEEDED
+        }
+        quarantined.update(failed_fixups)
+        if failed_fixups:
+            await self._invalidate_reviews(
+                failed_fixups,
+                detail="review blocked by failed initial fixup",
             )
+        reviewed = await self._review_tree(
+            prove=True,
+            quarantined=quarantined,
         )
-        fixup = RunningFixupStage(
-            task=fixup_task,
-            progress=fixup_progress,
-            target_ids=frozenset(initial_targets),
-        )
-        review_task = asyncio.create_task(
-            self._review_tree(
-                prove=True,
-                quarantined=quarantined,
-                fixup=fixup,
-            )
-        )
-        try:
-            fixed, reviewed = await asyncio.gather(fixup_task, review_task)
-        except BaseException:
-            fixup_task.cancel()
-            review_task.cancel()
-            await asyncio.gather(fixup_task, review_task, return_exceptions=True)
-            raise
         return formalized and fixed and reviewed
