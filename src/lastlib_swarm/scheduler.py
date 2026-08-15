@@ -18,6 +18,7 @@ from lastlib_swarm.codex import (
     ValidationResult,
     count_placeholders,
     declaration_uses_placeholder,
+    declaration_uses_placeholder_in_chapter,
     scope_digest,
     scoped_files,
     validate,
@@ -1143,6 +1144,77 @@ class Orchestrator:
             errors.append("missing answers for: " + ", ".join(sorted(missing)))
         return answers, "; ".join(errors)
 
+    def _validate_upstream_answer_declarations(
+        self,
+        owner: Chapter,
+        answers: dict[str, dict[str, Any]],
+        *,
+        agent_changed: bool,
+    ) -> tuple[dict[str, dict[str, Any]], str]:
+        """Reject claimed interfaces contradicted by the integrated Lean sources.
+
+        New declarations must resolve in the assigned owner chapter and be placeholder-free.
+        Existing declarations may come from pinned external dependencies; when they resolve in the
+        selected chronological LastLib prefix, they must likewise be placeholder-free. The fresh
+        downstream retry remains the semantic check for declarations supplied by Mathlib or an
+        unselected earlier book.
+        """
+
+        repo = self.config.settings.repo
+        chronological_prefix = tuple(
+            chapter
+            for chapter in self.chapters
+            if chapter.id == owner.id or self._is_earlier_chapter(chapter, owner)
+        )
+        accepted: dict[str, dict[str, Any]] = {}
+        errors: list[str] = []
+        for request_id, answer in answers.items():
+            disposition = str(answer.get("disposition", ""))
+            declarations = tuple(
+                declaration
+                for declaration in answer.get("declarations", [])
+                if isinstance(declaration, str)
+            )
+            request_errors: list[str] = []
+            if disposition == "added" and not agent_changed:
+                request_errors.append(
+                    "reported an added interface without an integrated source edit"
+                )
+            for declaration in declarations:
+                if disposition == "added":
+                    status = declaration_uses_placeholder_in_chapter(repo, owner, declaration)
+                    if status is None:
+                        request_errors.append(
+                            f"added declaration `{declaration}` was not found in {owner.id}"
+                        )
+                    elif status:
+                        request_errors.append(
+                            f"added declaration `{declaration}` still uses a placeholder"
+                        )
+                    continue
+                statuses = tuple(
+                    status
+                    for chapter in chronological_prefix
+                    if (
+                        status := declaration_uses_placeholder_in_chapter(
+                            repo,
+                            chapter,
+                            declaration,
+                        )
+                    )
+                    is not None
+                )
+                if any(statuses):
+                    request_errors.append(
+                        f"existing declaration `{declaration}` resolves to an unproved "
+                        "LastLib declaration"
+                    )
+            if request_errors:
+                errors.append(f"request {request_id}: " + ", ".join(request_errors))
+            else:
+                accepted[request_id] = answer
+        return accepted, "; ".join(errors)
+
     async def _repair_upstream_owner(self, owner_id: str) -> None:
         """Coalesce the current durable queue for one owner into one temporary agent."""
 
@@ -1206,6 +1278,14 @@ class Orchestrator:
             answers, answer_error = self._parse_upstream_answers(
                 attempt.agent.report,
                 started,
+            )
+            answers, declaration_error = self._validate_upstream_answer_declarations(
+                owner,
+                answers,
+                agent_changed=attempt.agent.changed,
+            )
+            answer_error = "; ".join(
+                error for error in (answer_error, declaration_error) if error
             )
             await self.state.finish_upstream_repair(
                 started,

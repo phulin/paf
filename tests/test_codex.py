@@ -24,6 +24,7 @@ from lastlib_swarm.codex import (
     _upstream_source_bundle,
     count_placeholders,
     declaration_uses_placeholder,
+    declaration_uses_placeholder_in_chapter,
     lean_mcp_executable,
     lean_mcp_path,
     render_prompt,
@@ -537,6 +538,8 @@ def test_upstream_repair_prompt_contains_batched_evidence_and_answer_contract(
 def test_declaration_placeholder_check_is_targeted_to_the_named_declaration(
     tmp_path: Path,
 ) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = config.chapters[0]
     path = tmp_path / "lean" / "Book" / "Chapter01.lean"
     path.parent.mkdir(parents=True)
     path.write_text(
@@ -549,6 +552,9 @@ def test_declaration_placeholder_check_is_targeted_to_the_named_declaration(
     )
     assert declaration_uses_placeholder(tmp_path, "lean/Book/Chapter01.lean", "blocked") is True
     assert declaration_uses_placeholder(tmp_path, "lean/Book/Chapter01.lean", "missing") is None
+    assert declaration_uses_placeholder_in_chapter(tmp_path, chapter, "Book.solved") is False
+    assert declaration_uses_placeholder_in_chapter(tmp_path, chapter, "blocked") is True
+    assert declaration_uses_placeholder_in_chapter(tmp_path, chapter, "missing") is None
 
 
 def test_downstream_retry_prompt_labels_the_persisted_handoff(tmp_path: Path) -> None:

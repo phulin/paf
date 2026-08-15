@@ -468,6 +468,78 @@ async def test_upstream_request_recovery_requeues_interrupted_substates(tmp_path
 
 
 @pytest.mark.asyncio
+async def test_upstream_request_recovery_normalizes_malformed_collection_fields(
+    tmp_path: Path,
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = config.chapters[0]
+    state = StateStore(config)
+    await state.load_or_create()
+    state.upstream_requests["damaged-request"] = {
+        "id": "damaged-request",
+        "status": UpstreamRequestStatus.REPAIRING,
+        "consumer_chapter_id": chapter.id,
+        "history": {"not": "a list"},
+        "origin_run_ids": "not a list",
+        "repair_attempts": None,
+        "answer": "not an answer object",
+        "previous_attempts": ["not text"],
+    }
+    await state.save()
+    await state.close()
+
+    recovered = StateStore(config)
+    await recovered.load_or_create()
+    request = recovered.upstream_requests["damaged-request"]
+
+    assert request["status"] == UpstreamRequestStatus.OPEN
+    assert request["origin_run_ids"] == []
+    assert request["repair_attempts"] == []
+    assert request["answer"] is None
+    assert request["previous_attempts"] == ""
+    assert request["history"][-1]["status"] == UpstreamRequestStatus.OPEN
+    await recovered.close()
+
+
+@pytest.mark.asyncio
+async def test_validated_external_proof_closes_request_without_false_escalation(
+    tmp_path: Path,
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    owner, consumer = config.chapters
+    state = StateStore(config)
+    await state.load_or_create()
+    request_id, _ = await state.enqueue_upstream_request(
+        {
+            "blocked_declaration": "consumerTarget",
+            "consumer_path": "lean/Book/Chapter02.lean",
+            "residual_goal": "⊢ True",
+            "needed_result": "a truth bridge",
+            "owner_chapter_id": owner.id,
+            "owner_paths": ["lean/Book/Chapter01.lean"],
+            "attempted_alternatives": ["simp", "constructor"],
+        },
+        consumer_chapter_id=consumer.id,
+        origin_run_id="proof-run",
+        owner_chapter_id=owner.id,
+        previous_attempts="attempt one",
+    )
+
+    assert await state.close_resolved_upstream_requests(
+        (request_id,),
+        detail="a concurrent validated proof solved the declaration",
+        run_id="concurrent-proof",
+    ) == (request_id,)
+    request = state.upstream_requests[request_id]
+    assert request["status"] == UpstreamRequestStatus.CLOSED
+    assert [entry["status"] for entry in request["history"]] == [
+        UpstreamRequestStatus.OPEN,
+        UpstreamRequestStatus.CLOSED,
+    ]
+    await state.close()
+
+
+@pytest.mark.asyncio
 async def test_state_persists_successful_review_status(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
     chapter = config.chapters[0]
@@ -3225,8 +3297,13 @@ async def test_noop_proof_cannot_reuse_failed_certification(
     proof = orchestrator.state.task(chapter.id, Stage.PROVE)
     assert proof.status == TaskStatus.FAILED
     assert proof.detail == "proof pass stalled with 0 placeholders"
-    assert [run.validation["succeeded"] for run in proof.runs] == [False, False, False]
-    assert proof.runs[-1].validation["output"] == (
+    assert all(run.validation is not None for run in proof.runs)
+    assert [
+        run.validation["succeeded"] for run in proof.runs if run.validation is not None
+    ] == [False, False, False]
+    final_validation = proof.runs[-1].validation
+    assert final_validation is not None
+    assert final_validation["output"] == (
         "unchanged proof source has no clean coordinator build"
     )
     await orchestrator.shutdown()
@@ -3280,6 +3357,54 @@ async def test_standalone_proof_fixup_finding_clears_durable_review(
     assert len(request_ids) == 1
     assert orchestrator.state.fixup_requests == {}
     await orchestrator.shutdown()
+
+
+def test_upstream_answers_validate_reported_declarations_against_sources(
+    tmp_path: Path,
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    owner, _consumer = config.chapters
+    path = tmp_path / "lean" / "Book" / "Chapter01.lean"
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        "theorem provedBridge : True := by trivial\n\n"
+        "theorem unprovedBridge : True := by sorry\n",
+        encoding="utf-8",
+    )
+    orchestrator = Orchestrator(config, StateStore(config))
+    base = {
+        "usage_guidance": "Apply the named bridge.",
+        "rejection_reason": "",
+    }
+    answers = {
+        "good-added": base
+        | {"disposition": "added", "declarations": ["Book.provedBridge"]},
+        "missing-added": base
+        | {"disposition": "added", "declarations": ["Book.missingBridge"]},
+        "unproved-added": base
+        | {"disposition": "added", "declarations": ["Book.unprovedBridge"]},
+        "unproved-existing": base
+        | {"disposition": "existing", "declarations": ["Book.unprovedBridge"]},
+        "external-existing": base
+        | {"disposition": "existing", "declarations": ["Mathlib.externalBridge"]},
+    }
+
+    accepted, error = orchestrator._validate_upstream_answer_declarations(
+        owner,
+        answers,
+        agent_changed=True,
+    )
+
+    assert set(accepted) == {"good-added", "external-existing"}
+    assert "Book.missingBridge" in error
+    assert "Book.unprovedBridge" in error
+    accepted, error = orchestrator._validate_upstream_answer_declarations(
+        owner,
+        {"good-added": answers["good-added"]},
+        agent_changed=False,
+    )
+    assert accepted == {}
+    assert "without an integrated source edit" in error
 
 
 @pytest.mark.asyncio
@@ -4103,8 +4228,17 @@ async def test_review_finding_rebuilds_upstream_while_downstream_agents_drain(
 
     original_queue_feedback = orchestrator._queue_review_feedback
 
-    async def queue_feedback(*args: object, **kwargs: object) -> tuple[str, set[str]]:
-        queued = await original_queue_feedback(*args, **kwargs)
+    async def queue_feedback(
+        feedback: dict[str, str],
+        *,
+        origin: str,
+        exclude_from_invalidation: Iterable[str] = (),
+    ) -> tuple[str, set[str]]:
+        queued = await original_queue_feedback(
+            feedback,
+            origin=origin,
+            exclude_from_invalidation=exclude_from_invalidation,
+        )
         finding_queued.set()
         return queued
 

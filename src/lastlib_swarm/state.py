@@ -46,7 +46,11 @@ class UpstreamRequestStatus(StrEnum):
 
 UPSTREAM_REQUEST_TRANSITIONS: dict[UpstreamRequestStatus, frozenset[UpstreamRequestStatus]] = {
     UpstreamRequestStatus.OPEN: frozenset(
-        {UpstreamRequestStatus.REPAIRING, UpstreamRequestStatus.MANUAL_ESCALATION}
+        {
+            UpstreamRequestStatus.REPAIRING,
+            UpstreamRequestStatus.CLOSED,
+            UpstreamRequestStatus.MANUAL_ESCALATION,
+        }
     ),
     UpstreamRequestStatus.REPAIRING: frozenset(
         {
@@ -56,7 +60,11 @@ UPSTREAM_REQUEST_TRANSITIONS: dict[UpstreamRequestStatus, frozenset[UpstreamRequ
         }
     ),
     UpstreamRequestStatus.ANSWERED: frozenset(
-        {UpstreamRequestStatus.RETRYING, UpstreamRequestStatus.MANUAL_ESCALATION}
+        {
+            UpstreamRequestStatus.RETRYING,
+            UpstreamRequestStatus.CLOSED,
+            UpstreamRequestStatus.MANUAL_ESCALATION,
+        }
     ),
     UpstreamRequestStatus.RETRYING: frozenset(
         {
@@ -591,15 +599,21 @@ class StateStore:
             request.setdefault("id", request_id)
             request.setdefault("created_at", created_at)
             request.setdefault("updated_at", created_at)
-            request.setdefault("origin_run_ids", [])
-            request.setdefault("owner_paths", [])
-            request.setdefault("attempted_alternatives", [])
-            request.setdefault("previous_attempts", "")
-            request.setdefault("repair_attempts", [])
-            request.setdefault("retry_attempts", [])
-            request.setdefault("answers", [])
-            request.setdefault("answer", None)
-            request.setdefault("history", [])
+            for name in (
+                "origin_run_ids",
+                "owner_paths",
+                "attempted_alternatives",
+                "repair_attempts",
+                "retry_attempts",
+                "answers",
+                "history",
+            ):
+                if not isinstance(request.get(name), list):
+                    request[name] = []
+            if not isinstance(request.get("previous_attempts"), str):
+                request["previous_attempts"] = ""
+            if request.get("answer") is not None and not isinstance(request.get("answer"), dict):
+                request["answer"] = None
             raw_status = str(request.get("status", UpstreamRequestStatus.OPEN.value))
             if raw_status == "requested":
                 raw_status = UpstreamRequestStatus.OPEN.value
@@ -959,21 +973,7 @@ class StateStore:
                 status = UpstreamRequestStatus(str(request.get("status")))
                 if status is UpstreamRequestStatus.CLOSED:
                     continue
-                if status is UpstreamRequestStatus.OPEN:
-                    self._transition_upstream_request(
-                        request,
-                        UpstreamRequestStatus.MANUAL_ESCALATION,
-                        "request was resolved outside its queued repair",
-                        run_id=run_id,
-                    )
-                elif status is UpstreamRequestStatus.ANSWERED:
-                    self._transition_upstream_request(
-                        request,
-                        UpstreamRequestStatus.RETRYING,
-                        "request was resolved before its queued retry",
-                        run_id=run_id,
-                    )
-                elif status in {
+                if status in {
                     UpstreamRequestStatus.REPAIRING,
                     UpstreamRequestStatus.RETRYING,
                 }:

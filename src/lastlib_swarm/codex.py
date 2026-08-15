@@ -354,6 +354,26 @@ def declaration_uses_placeholder(repo: Path, path: str, declaration: str) -> boo
     return re.search(r"\b(?:sorry|admit)\b", _lean_code("\n".join(lines))) is not None
 
 
+def declaration_uses_placeholder_in_chapter(
+    repo: Path,
+    chapter: Chapter,
+    declaration: str,
+) -> bool | None:
+    """Resolve a reported declaration inside one chapter's configured source scope.
+
+    ``None`` means that no matching declaration was found. Multiple short-name matches are
+    treated conservatively: any unresolved match makes the reported interface unresolved too.
+    """
+
+    matches: list[bool] = []
+    for path in scoped_files(repo, chapter):
+        relative = path.relative_to(repo).as_posix()
+        status = declaration_uses_placeholder(repo, relative, declaration)
+        if status is not None:
+            matches.append(status)
+    return any(matches) if matches else None
+
+
 def _upstream_source_bundle(
     repo: Path,
     owner: Chapter,
@@ -391,6 +411,20 @@ def _upstream_source_bundle(
         if isinstance(previous, str) and previous.strip():
             parts.extend(["- Previous proof-attempt ledger:\n\n", "```text\n", previous, "\n```\n"])
 
+    # Keep the exact consumer declarations ahead of potentially large textbook and owner-source
+    # excerpts so the bounded evidence packet cannot truncate the statements the repair must serve.
+    parts.append("\n## Relevant consumer declarations\n")
+    for request in selected:
+        relative = str(request.get("consumer_path", ""))
+        declaration = str(request.get("blocked_declaration", ""))
+        excerpt = _declaration_excerpt(repo / relative, declaration)
+        parts.append(f"\n### `{relative}` — `{declaration}`\n\n")
+        if excerpt is None:
+            parts.append("[The named consumer declaration could not be extracted.]\n")
+            continue
+        start, lines = excerpt
+        parts.append(_line_numbered(lines, start=start))
+
     excerpt_chapters = {owner.id}
     excerpt_chapters.update(str(request.get("consumer_chapter_id", "")) for request in selected)
     parts.append("\n## Relevant textbook excerpts\n")
@@ -421,18 +455,6 @@ def _upstream_source_bundle(
         parts.append(
             _line_numbered(path.read_text(encoding="utf-8", errors="replace").splitlines())
         )
-
-    parts.append("\n## Relevant consumer declarations\n")
-    for request in selected:
-        relative = str(request.get("consumer_path", ""))
-        declaration = str(request.get("blocked_declaration", ""))
-        excerpt = _declaration_excerpt(repo / relative, declaration)
-        parts.append(f"\n### `{relative}` — `{declaration}`\n\n")
-        if excerpt is None:
-            parts.append("[The named consumer declaration could not be extracted.]\n")
-            continue
-        start, lines = excerpt
-        parts.append(_line_numbered(lines, start=start))
 
     bundle = "".join(parts)
     if len(bundle) <= maximum:
