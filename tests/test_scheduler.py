@@ -14,7 +14,13 @@ from lastlib_swarm.config import load_config
 from lastlib_swarm.isolation import IsolationResult
 from lastlib_swarm.models import Chapter, PipelineConfig, Stage
 from lastlib_swarm.scheduler import FormalizeOutcome, Orchestrator, ReviewOutcome
-from lastlib_swarm.state import RunRecord, StateStore, TaskStatus, TokenUsage
+from lastlib_swarm.state import (
+    RunRecord,
+    StateStore,
+    TaskStatus,
+    TokenUsage,
+    UpstreamRequestStatus,
+)
 from tests.support import write_project
 
 
@@ -259,7 +265,7 @@ async def test_state_persists_fixup_graph(tmp_path: Path) -> None:
     await reloaded.load_or_create()
 
     assert reloaded.fixup_graph == state.fixup_graph
-    assert reloaded.snapshot()["version"] == 11
+    assert reloaded.snapshot()["version"] == 12
 
 
 @pytest.mark.asyncio
@@ -328,6 +334,141 @@ async def test_proof_review_requests_persist_and_acknowledge_exact_findings(
         chapter.id: "new finding that arrived during review"
     }
     await reloaded.close()
+
+
+@pytest.mark.asyncio
+async def test_upstream_requests_persist_answers_and_batch_by_owner(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    owner, consumer = config.chapters
+    state = StateStore(config)
+    await state.load_or_create()
+    request = {
+        "blocked_declaration": "consumerTarget",
+        "consumer_path": "lean/Book/Chapter02.lean",
+        "residual_goal": "⊢ Result x",
+        "needed_result": "A transport lemma from Input x to Result x",
+        "owner_chapter_id": owner.id,
+        "owner_paths": ["lean/Book/Chapter01.lean"],
+        "attempted_alternatives": ["simp [Result]", "exact existingCandidate x"],
+    }
+    request_id, created = await state.enqueue_upstream_request(
+        request,
+        consumer_chapter_id=consumer.id,
+        origin_run_id="proof-run",
+        owner_chapter_id=owner.id,
+        previous_attempts="Proof attempt 1 left ⊢ Result x.",
+    )
+
+    assert created
+    assert state.upstream_request_batches() == {owner.id: [request_id]}
+    assert state.hot_snapshot()["upstream_request_batches"] == {owner.id: [request_id]}
+
+    assert await state.begin_upstream_repair((request_id,), batch_id="batch-one") == (
+        request_id,
+    )
+    answer = {
+        "disposition": "existing",
+        "declarations": ["Book.transport_input_result"],
+        "usage_guidance": "Apply `Book.transport_input_result x`.",
+        "rejection_reason": "",
+    }
+    await state.finish_upstream_repair(
+        (request_id,),
+        run_id="repair-run",
+        answers={request_id: answer},
+    )
+    assert await state.begin_downstream_retry((request_id,)) == (request_id,)
+    await state.finish_downstream_retry(
+        (request_id,),
+        run_id="retry-run",
+        succeeded_ids=(),
+        error="the residual goal remained",
+    )
+    await state.set_task(
+        consumer.id,
+        Stage.PROVE,
+        TaskStatus.BLOCKED,
+        "upstream request requires manual escalation",
+    )
+    await state.close()
+
+    reloaded = StateStore(config)
+    await reloaded.load_or_create()
+    persisted = reloaded.upstream_requests[request_id]
+    assert persisted["status"] == UpstreamRequestStatus.MANUAL_ESCALATION
+    assert persisted["answer"]["declarations"] == ["Book.transport_input_result"]
+    assert persisted["answers"][0]["repair_run_id"] == "repair-run"
+    assert persisted["retry_attempts"][0]["run_id"] == "retry-run"
+    assert reloaded.upstream_request_batches() == {}
+
+    assert await reloaded.unblock() == [f"{consumer.id}:prove"]
+    assert reloaded.upstream_requests[request_id]["status"] == UpstreamRequestStatus.ANSWERED
+    assert reloaded.upstream_requests[request_id]["answer"] == persisted["answer"]
+    await reloaded.close()
+
+
+@pytest.mark.asyncio
+async def test_upstream_request_recovery_requeues_interrupted_substates(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    owner, consumer = config.chapters
+    state = StateStore(config)
+    await state.load_or_create()
+    base = {
+        "blocked_declaration": "consumerTarget",
+        "consumer_path": "lean/Book/Chapter02.lean",
+        "residual_goal": "⊢ Result x",
+        "needed_result": "transport Input to Result",
+        "owner_chapter_id": owner.id,
+        "owner_paths": ["lean/Book/Chapter01.lean"],
+        "attempted_alternatives": ["simp", "exact candidate"],
+    }
+    repair_id, _ = await state.enqueue_upstream_request(
+        base,
+        consumer_chapter_id=consumer.id,
+        origin_run_id="proof-one",
+        owner_chapter_id=owner.id,
+        previous_attempts="attempt one",
+    )
+    await state.begin_upstream_repair((repair_id,), batch_id="interrupted")
+
+    retry_request = dict(base)
+    retry_request["blocked_declaration"] = "secondTarget"
+    retry_id, _ = await state.enqueue_upstream_request(
+        retry_request,
+        consumer_chapter_id=consumer.id,
+        origin_run_id="proof-two",
+        owner_chapter_id=owner.id,
+        previous_attempts="attempt two",
+    )
+    await state.begin_upstream_repair((retry_id,), batch_id="answered")
+    await state.finish_upstream_repair(
+        (retry_id,),
+        run_id="repair-run",
+        answers={
+            retry_id: {
+                "disposition": "downstream",
+                "declarations": [],
+                "usage_guidance": "Prove the bridge in the consumer.",
+                "rejection_reason": "The construction depends on consumer-only hypotheses.",
+            }
+        },
+    )
+    await state.begin_downstream_retry((retry_id,))
+    await state.close()
+
+    recovered = StateStore(config)
+    await recovered.load_or_create()
+
+    assert recovered.upstream_requests[repair_id]["status"] == UpstreamRequestStatus.OPEN
+    assert recovered.upstream_requests[retry_id]["status"] == UpstreamRequestStatus.ANSWERED
+    assert recovered.upstream_request_batches() == {owner.id: [repair_id]}
+    assert "interrupted targeted upstream repair" in (
+        recovered.upstream_requests[repair_id]["history"][-1]["detail"]
+    )
+    assert "interrupted targeted downstream retry" in (
+        recovered.upstream_requests[retry_id]["history"][-1]["detail"]
+    )
+    await recovered.close()
 
 
 @pytest.mark.asyncio

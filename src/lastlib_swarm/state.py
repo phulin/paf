@@ -35,6 +35,49 @@ class TaskStatus(StrEnum):
     BLOCKED = "blocked"
 
 
+class UpstreamRequestStatus(StrEnum):
+    """Durable proof sub-state for a missing interface in an earlier chapter."""
+
+    OPEN = "open"
+    REPAIRING = "repairing"
+    ANSWERED = "answered"
+    RETRYING = "retrying"
+    CLOSED = "closed"
+    MANUAL_ESCALATION = "manual_escalation"
+
+
+UPSTREAM_REQUEST_TRANSITIONS: dict[UpstreamRequestStatus, frozenset[UpstreamRequestStatus]] = {
+    UpstreamRequestStatus.OPEN: frozenset(
+        {UpstreamRequestStatus.REPAIRING, UpstreamRequestStatus.MANUAL_ESCALATION}
+    ),
+    UpstreamRequestStatus.REPAIRING: frozenset(
+        {
+            UpstreamRequestStatus.OPEN,
+            UpstreamRequestStatus.ANSWERED,
+            UpstreamRequestStatus.MANUAL_ESCALATION,
+        }
+    ),
+    UpstreamRequestStatus.ANSWERED: frozenset(
+        {UpstreamRequestStatus.RETRYING, UpstreamRequestStatus.MANUAL_ESCALATION}
+    ),
+    UpstreamRequestStatus.RETRYING: frozenset(
+        {
+            UpstreamRequestStatus.ANSWERED,
+            UpstreamRequestStatus.CLOSED,
+            UpstreamRequestStatus.MANUAL_ESCALATION,
+        }
+    ),
+    UpstreamRequestStatus.CLOSED: frozenset(),
+    UpstreamRequestStatus.MANUAL_ESCALATION: frozenset(
+        {
+            UpstreamRequestStatus.OPEN,
+            UpstreamRequestStatus.ANSWERED,
+            UpstreamRequestStatus.CLOSED,
+        }
+    ),
+}
+
+
 @dataclass
 class TokenUsage:
     input_tokens: int = 0
@@ -115,6 +158,9 @@ class RunRecord:
     isolation: dict[str, Any] | None = None
     usage: TokenUsage = field(default_factory=TokenUsage)
     log_path: str | None = None
+    role: str = ""
+    auxiliary: bool = False
+    request_ids: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -199,6 +245,7 @@ class StateStore:
         self.fixup_graph: dict[str, Any] = {}
         self.fixup_requests: dict[str, dict[str, Any]] = {}
         self.proof_review_requests: dict[str, dict[str, Any]] = {}
+        self.upstream_requests: dict[str, dict[str, Any]] = {}
         self.isolation: dict[str, Any] = {}
         self.coordinator_build = CoordinatorBuildRecord()
         self.created_at = timestamp()
@@ -231,6 +278,13 @@ class StateStore:
                 self.proof_review_requests = {
                     request_id: dict(value)
                     for request_id, value in raw_proof_review_requests.items()
+                    if isinstance(request_id, str) and isinstance(value, dict)
+                }
+            raw_upstream_requests = raw.get("upstream_requests")
+            if isinstance(raw_upstream_requests, dict):
+                self.upstream_requests = {
+                    request_id: dict(value)
+                    for request_id, value in raw_upstream_requests.items()
                     if isinstance(request_id, str) and isinstance(value, dict)
                 }
             if not self.isolation and isinstance(raw.get("isolation"), dict):
@@ -332,6 +386,7 @@ class StateStore:
             self.coordinator_build.active = False
             self.coordinator_build.current_chapter_id = ""
             self.coordinator_build.updated_at = timestamp()
+        self._recover_upstream_request_state()
         self._invalidate_aggregates()
         self._invalidate_status_summaries()
         self._checkpoint_dirty = True
@@ -375,6 +430,9 @@ class StateStore:
             "placeholders": run.placeholders,
             "usage": self._usage_dict(run.usage),
             "log_path": run.log_path,
+            "role": run.role,
+            "auxiliary": run.auxiliary,
+            "request_ids": list(run.request_ids),
         }
         if include_payload:
             value |= {
@@ -413,7 +471,7 @@ class StateStore:
         cost = self.total_cost()
         invocation_cost = self.invocation_cost()
         return {
-            "version": 11,
+            "version": 12,
             "history_database": DATABASE_NAME,
             "config": str(self.config.path),
             "created_at": self.created_at,
@@ -428,6 +486,8 @@ class StateStore:
             "fixup_graph": self.fixup_graph,
             "fixup_requests": self.fixup_requests,
             "proof_review_requests": self.proof_review_requests,
+            "upstream_requests": self.upstream_requests,
+            "upstream_request_batches": self.upstream_request_batches(),
             "isolation": self.isolation,
             "coordinator_build": self._build_dict(self.coordinator_build),
             "tasks": {
@@ -507,6 +567,415 @@ class StateStore:
     async def save(self) -> None:
         self._mark_dirty()
         await self._persist()
+
+    @staticmethod
+    def _upstream_history_entry(
+        status: UpstreamRequestStatus,
+        detail: str,
+        *,
+        run_id: str | None = None,
+    ) -> dict[str, Any]:
+        entry: dict[str, Any] = {
+            "status": status.value,
+            "at": timestamp(),
+            "detail": detail,
+        }
+        if run_id:
+            entry["run_id"] = run_id
+        return entry
+
+    def _recover_upstream_request_state(self) -> None:
+        """Normalize durable requests and rewind interrupted transitions to a safe queue."""
+
+        valid_statuses = {status.value for status in UpstreamRequestStatus}
+        for request_id, request in self.upstream_requests.items():
+            created_at = str(request.get("created_at") or timestamp())
+            request.setdefault("id", request_id)
+            request.setdefault("created_at", created_at)
+            request.setdefault("updated_at", created_at)
+            request.setdefault("origin_run_ids", [])
+            request.setdefault("owner_paths", [])
+            request.setdefault("attempted_alternatives", [])
+            request.setdefault("previous_attempts", "")
+            request.setdefault("repair_attempts", [])
+            request.setdefault("retry_attempts", [])
+            request.setdefault("answers", [])
+            request.setdefault("answer", None)
+            request.setdefault("history", [])
+            raw_status = str(request.get("status", UpstreamRequestStatus.OPEN.value))
+            if raw_status == "requested":
+                raw_status = UpstreamRequestStatus.OPEN.value
+            if raw_status not in valid_statuses:
+                raw_status = UpstreamRequestStatus.MANUAL_ESCALATION.value
+                request["escalation_reason"] = "recovered an unknown upstream-request state"
+            status = UpstreamRequestStatus(raw_status)
+            if status is UpstreamRequestStatus.REPAIRING:
+                status = UpstreamRequestStatus.OPEN
+                request["history"].append(
+                    self._upstream_history_entry(
+                        status,
+                        "requeued after an interrupted targeted upstream repair",
+                    )
+                )
+            elif status is UpstreamRequestStatus.RETRYING:
+                status = (
+                    UpstreamRequestStatus.ANSWERED
+                    if isinstance(request.get("answer"), dict)
+                    else UpstreamRequestStatus.OPEN
+                )
+                request["history"].append(
+                    self._upstream_history_entry(
+                        status,
+                        "requeued after an interrupted targeted downstream retry",
+                    )
+                )
+            request["status"] = status.value
+            request["updated_at"] = timestamp()
+
+    def upstream_request_batches(self) -> dict[str, list[str]]:
+        """Group the durable open queue by its proposed owning chapter."""
+
+        batches: dict[str, list[str]] = {}
+        for request_id, request in sorted(self.upstream_requests.items()):
+            if request.get("status") != UpstreamRequestStatus.OPEN.value:
+                continue
+            owner = request.get("owner_chapter_id")
+            if isinstance(owner, str) and owner:
+                batches.setdefault(owner, []).append(request_id)
+        return batches
+
+    def upstream_requests_for_consumer(
+        self,
+        chapter_id: str,
+        *,
+        statuses: Iterable[UpstreamRequestStatus] | None = None,
+    ) -> tuple[dict[str, Any], ...]:
+        selected = set(statuses) if statuses is not None else None
+        return tuple(
+            request
+            for _, request in sorted(self.upstream_requests.items())
+            if request.get("consumer_chapter_id") == chapter_id
+            and (
+                selected is None
+                or UpstreamRequestStatus(str(request.get("status"))) in selected
+            )
+        )
+
+    def _transition_upstream_request(
+        self,
+        request: dict[str, Any],
+        status: UpstreamRequestStatus,
+        detail: str,
+        *,
+        run_id: str | None = None,
+    ) -> None:
+        current = UpstreamRequestStatus(str(request["status"]))
+        if status is not current and status not in UPSTREAM_REQUEST_TRANSITIONS[current]:
+            raise RuntimeError(
+                f"invalid upstream-request transition {current.value} -> {status.value} "
+                f"for {request.get('id', 'unknown request')}"
+            )
+        request["status"] = status.value
+        request["updated_at"] = timestamp()
+        history = request.setdefault("history", [])
+        if isinstance(history, list):
+            history.append(self._upstream_history_entry(status, detail, run_id=run_id))
+
+    async def enqueue_upstream_request(
+        self,
+        request: dict[str, Any],
+        *,
+        consumer_chapter_id: str,
+        origin_run_id: str,
+        owner_chapter_id: str,
+        previous_attempts: str,
+        escalation_reason: str = "",
+    ) -> tuple[str, bool]:
+        """Persist one proof-to-upstream handoff without collapsing its evidence."""
+
+        fingerprint_fields = (
+            consumer_chapter_id,
+            str(request.get("blocked_declaration", "")).strip(),
+            str(request.get("consumer_path", "")).strip(),
+            str(request.get("needed_result", "")).strip(),
+            owner_chapter_id,
+        )
+        fingerprint = hashlib.sha256("\0".join(fingerprint_fields).encode()).hexdigest()[:16]
+        for request_id, existing in self.upstream_requests.items():
+            if existing.get("fingerprint") != fingerprint:
+                continue
+            if existing.get("status") == UpstreamRequestStatus.CLOSED.value:
+                continue
+            origin_run_ids = existing.setdefault("origin_run_ids", [])
+            if isinstance(origin_run_ids, list) and origin_run_id not in origin_run_ids:
+                origin_run_ids.append(origin_run_id)
+            existing["sightings"] = int(existing.get("sightings", 1)) + 1
+            existing["updated_at"] = timestamp()
+            self._mark_dirty()
+            await self._persist()
+            return request_id, False
+
+        request_id = uuid4().hex[:12]
+        now = timestamp()
+        status = (
+            UpstreamRequestStatus.MANUAL_ESCALATION
+            if escalation_reason
+            else UpstreamRequestStatus.OPEN
+        )
+        attempted = request.get("attempted_alternatives")
+        owner_paths = request.get("owner_paths")
+        record: dict[str, Any] = {
+            "id": request_id,
+            "fingerprint": fingerprint,
+            "status": status.value,
+            "consumer_chapter_id": consumer_chapter_id,
+            "origin_run_ids": [origin_run_id],
+            "blocked_declaration": str(request.get("blocked_declaration", "")).strip(),
+            "consumer_path": str(request.get("consumer_path", "")).strip(),
+            "residual_goal": str(request.get("residual_goal", "")).strip(),
+            "needed_result": str(request.get("needed_result", "")).strip(),
+            "owner_chapter_id": owner_chapter_id,
+            "proposed_owner_chapter_id": str(
+                request.get("owner_chapter_id", owner_chapter_id)
+            ).strip(),
+            "owner_paths": sorted(
+                {
+                    str(path).strip()
+                    for path in owner_paths
+                    if isinstance(path, str) and path.strip()
+                }
+            )
+            if isinstance(owner_paths, list)
+            else [],
+            "attempted_alternatives": [
+                str(item).strip()
+                for item in attempted
+                if isinstance(item, str) and item.strip()
+            ]
+            if isinstance(attempted, list)
+            else [],
+            "previous_attempts": previous_attempts,
+            "repair_attempts": [],
+            "retry_attempts": [],
+            "answers": [],
+            "answer": None,
+            "sightings": 1,
+            "created_at": now,
+            "updated_at": now,
+            "history": [
+                self._upstream_history_entry(
+                    status,
+                    escalation_reason or "proof agent requested an earlier interface",
+                    run_id=origin_run_id,
+                )
+            ],
+        }
+        if escalation_reason:
+            record["escalation_reason"] = escalation_reason
+            record["escalated_at"] = now
+        self.upstream_requests[request_id] = record
+        self._mark_dirty()
+        await self._persist()
+        return request_id, True
+
+    async def begin_upstream_repair(
+        self,
+        request_ids: Iterable[str],
+        *,
+        batch_id: str,
+    ) -> tuple[str, ...]:
+        started: list[str] = []
+        async with self.batch():
+            for request_id in request_ids:
+                request = self.upstream_requests.get(request_id)
+                if (
+                    not isinstance(request, dict)
+                    or request.get("status") != UpstreamRequestStatus.OPEN.value
+                ):
+                    continue
+                self._transition_upstream_request(
+                    request,
+                    UpstreamRequestStatus.REPAIRING,
+                    f"targeted upstream repair batch {batch_id} started",
+                )
+                attempts = request.setdefault("repair_attempts", [])
+                if isinstance(attempts, list):
+                    attempts.append(
+                        {
+                            "batch_id": batch_id,
+                            "status": "running",
+                            "started_at": timestamp(),
+                        }
+                    )
+                started.append(request_id)
+            if started:
+                self._mark_dirty()
+                await self._persist()
+        return tuple(started)
+
+    async def finish_upstream_repair(
+        self,
+        request_ids: Iterable[str],
+        *,
+        run_id: str,
+        answers: dict[str, dict[str, Any]],
+        error: str = "",
+    ) -> None:
+        async with self.batch():
+            for request_id in request_ids:
+                request = self.upstream_requests.get(request_id)
+                if not isinstance(request, dict):
+                    continue
+                attempts = request.setdefault("repair_attempts", [])
+                if isinstance(attempts, list) and attempts:
+                    attempt = attempts[-1]
+                    if isinstance(attempt, dict) and attempt.get("status") == "running":
+                        attempt.update(
+                            {
+                                "run_id": run_id,
+                                "status": "succeeded" if request_id in answers else "failed",
+                                "finished_at": timestamp(),
+                            }
+                        )
+                        if error:
+                            attempt["error"] = error
+                answer = answers.get(request_id)
+                if answer is None:
+                    if request.get("status") == UpstreamRequestStatus.REPAIRING.value:
+                        self._transition_upstream_request(
+                            request,
+                            UpstreamRequestStatus.MANUAL_ESCALATION,
+                            error or "targeted upstream repair returned no usable answer",
+                            run_id=run_id,
+                        )
+                        request["escalation_reason"] = (
+                            error or "targeted upstream repair returned no usable answer"
+                        )
+                        request["escalated_at"] = timestamp()
+                    continue
+                persisted_answer = dict(answer) | {
+                    "repair_run_id": run_id,
+                    "answered_at": timestamp(),
+                }
+                request["answer"] = persisted_answer
+                answer_history = request.setdefault("answers", [])
+                if isinstance(answer_history, list):
+                    answer_history.append(persisted_answer)
+                self._transition_upstream_request(
+                    request,
+                    UpstreamRequestStatus.ANSWERED,
+                    "targeted upstream repair supplied a durable answer",
+                    run_id=run_id,
+                )
+            self._mark_dirty()
+            await self._persist()
+
+    async def begin_downstream_retry(self, request_ids: Iterable[str]) -> tuple[str, ...]:
+        started: list[str] = []
+        async with self.batch():
+            for request_id in request_ids:
+                request = self.upstream_requests.get(request_id)
+                if (
+                    not isinstance(request, dict)
+                    or request.get("status") != UpstreamRequestStatus.ANSWERED.value
+                ):
+                    continue
+                self._transition_upstream_request(
+                    request,
+                    UpstreamRequestStatus.RETRYING,
+                    "fresh targeted downstream proof retry started",
+                )
+                attempts = request.setdefault("retry_attempts", [])
+                if isinstance(attempts, list):
+                    attempts.append({"status": "running", "started_at": timestamp()})
+                started.append(request_id)
+            if started:
+                self._mark_dirty()
+                await self._persist()
+        return tuple(started)
+
+    async def finish_downstream_retry(
+        self,
+        request_ids: Iterable[str],
+        *,
+        run_id: str,
+        succeeded_ids: Iterable[str],
+        error: str = "",
+    ) -> None:
+        succeeded = set(succeeded_ids)
+        async with self.batch():
+            for request_id in request_ids:
+                request = self.upstream_requests.get(request_id)
+                if not isinstance(request, dict):
+                    continue
+                attempts = request.setdefault("retry_attempts", [])
+                if isinstance(attempts, list) and attempts:
+                    attempt = attempts[-1]
+                    if isinstance(attempt, dict) and attempt.get("status") == "running":
+                        attempt.update(
+                            {
+                                "run_id": run_id,
+                                "status": "succeeded" if request_id in succeeded else "failed",
+                                "finished_at": timestamp(),
+                            }
+                        )
+                        if error:
+                            attempt["error"] = error
+                if request.get("status") != UpstreamRequestStatus.RETRYING.value:
+                    continue
+                if request_id in succeeded:
+                    self._transition_upstream_request(
+                        request,
+                        UpstreamRequestStatus.CLOSED,
+                        "blocked declaration succeeded in the targeted downstream retry",
+                        run_id=run_id,
+                    )
+                    request["closed_at"] = timestamp()
+                    request["closed_by_run_id"] = run_id
+                else:
+                    reason = error or (
+                        "blocked declaration remained unresolved after its targeted "
+                        "downstream retry"
+                    )
+                    self._transition_upstream_request(
+                        request,
+                        UpstreamRequestStatus.MANUAL_ESCALATION,
+                        reason,
+                        run_id=run_id,
+                    )
+                    request["escalation_reason"] = reason
+                    request["escalated_at"] = timestamp()
+            self._mark_dirty()
+            await self._persist()
+
+    async def reopen_escalated_upstream_requests(self, chapter_ids: Iterable[str]) -> list[str]:
+        """Treat the explicit manual unblock command as authority to retry the handoff."""
+
+        selected = set(chapter_ids)
+        reopened: list[str] = []
+        for request_id, request in self.upstream_requests.items():
+            if (
+                request.get("consumer_chapter_id") not in selected
+                or request.get("status") != UpstreamRequestStatus.MANUAL_ESCALATION.value
+            ):
+                continue
+            target = (
+                UpstreamRequestStatus.ANSWERED
+                if isinstance(request.get("answer"), dict)
+                else UpstreamRequestStatus.OPEN
+            )
+            self._transition_upstream_request(
+                request,
+                target,
+                "manually unblocked for another targeted attempt",
+            )
+            request.pop("escalation_reason", None)
+            request.pop("escalated_at", None)
+            reopened.append(request_id)
+        if reopened:
+            self._mark_dirty()
+            await self._persist()
+        return reopened
 
     async def enqueue_fixup_request(
         self,
@@ -704,15 +1173,19 @@ class StateStore:
         if self._agent_summary_cache is not None:
             return self._agent_summary_cache
         by_stage = {stage.value: 0 for stage in Stage}
+        by_role: dict[str, int] = {}
         for task in self.tasks.values():
             for run in task.runs:
                 if run.status == TaskStatus.RUNNING and run.stage in by_stage:
                     by_stage[run.stage] += 1
+                    role = run.role or run.stage
+                    by_role[role] = by_role.get(role, 0) + 1
         self._agent_summary_cache = {
             "active": sum(by_stage.values()),
             "maximum": self.config.settings.max_agents,
             "queued": 0,
             "by_stage": by_stage,
+            "by_role": by_role,
         }
         return self._agent_summary_cache
 
@@ -941,15 +1414,18 @@ class StateStore:
     async def unblock(self) -> list[str]:
         """Reset blocked tasks to pending without discarding attempt history."""
         changed: list[str] = []
+        proof_chapters: set[str] = set()
         for key, task in self.tasks.items():
             if task.status != TaskStatus.BLOCKED:
                 continue
             task.status = TaskStatus.PENDING
             if task.stage == Stage.PROVE:
                 task.source_digest = None
+                proof_chapters.add(task.chapter_id)
             task.detail = "manually unblocked"
             task.updated_at = timestamp()
             changed.append(key)
+        await self.reopen_escalated_upstream_requests(proof_chapters)
         if changed:
             self._invalidate_status_summaries()
             self._mark_dirty()
@@ -973,6 +1449,38 @@ class StateStore:
             stage=stage.value,
             round=task.rounds,
             model=self.config.settings.model,
+            role=stage.value,
+        )
+        task.runs.append(run)
+        self._index_run(run)
+        self._payload_loaded_run_ids.add(run.id)
+        self._invalidate_aggregates()
+        self._invalidate_status_summaries()
+        self._mark_dirty(run=run)
+        await self._persist()
+        return run
+
+    async def start_auxiliary_run(
+        self,
+        chapter_id: str,
+        stage: Stage,
+        *,
+        role: str,
+        request_ids: Iterable[str],
+    ) -> RunRecord:
+        """Record a temporary agent without mutating the owner's chapter-stage state."""
+
+        task = self.task(chapter_id, stage)
+        role_round = 1 + sum((run.role or run.stage) == role for run in task.runs)
+        run = RunRecord(
+            id=uuid4().hex[:12],
+            chapter_id=chapter_id,
+            stage=stage.value,
+            round=role_round,
+            model=self.config.settings.model,
+            role=role,
+            auxiliary=True,
+            request_ids=list(dict.fromkeys(request_ids)),
         )
         task.runs.append(run)
         self._index_run(run)
