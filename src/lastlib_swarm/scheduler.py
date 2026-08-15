@@ -566,6 +566,17 @@ class Orchestrator:
     def _scope_exists(self, chapter: Chapter) -> bool:
         return ScopeMatcher(chapter.scope).has_match_for_each_pattern(self.config.settings.repo)
 
+    def _proof_build_is_fresh(self, chapter: Chapter) -> bool:
+        """Whether the current chapter source belongs to a retained clean build."""
+
+        graph = self._observed_chapter_graph()
+        persisted = self.state.fixup_graph.get("clean", {})
+        clean = self._retain_fixup_clean(
+            graph,
+            persisted if isinstance(persisted, dict) else {},
+        )
+        return chapter.id in clean
+
     async def _integrate_interrupted_workspace(
         self,
         chapter: Chapter,
@@ -683,10 +694,15 @@ class Orchestrator:
                             "Source scope changed after the coordinator build; retry required.",
                         )
                 elif stage is Stage.PROVE:
+                    build_fresh = self._proof_build_is_fresh(chapter)
                     validation = ValidationResult(
-                        True,
-                        0,
-                        "unchanged proof source reused the incoming clean build",
+                        build_fresh,
+                        0 if build_fresh else 1,
+                        (
+                            "unchanged proof source reused the incoming clean build"
+                            if build_fresh
+                            else "unchanged proof source has no clean coordinator build"
+                        ),
                     )
                 else:
                     validation = ValidationResult(
@@ -3058,6 +3074,8 @@ class Orchestrator:
                             "Coordinator validation of the current sources failed before proof "
                             "work:\n" + revalidation.output
                         )
+                        if placeholders == 0:
+                            return False
                     else:
                         build_fresh = True
                         if placeholders > 0:

@@ -3032,6 +3032,79 @@ async def test_stale_build_is_refreshed_before_proof_agent_with_placeholders(
 
 
 @pytest.mark.asyncio
+async def test_placeholder_free_proof_does_not_run_agent_after_failed_refresh(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = with_lastlib_modules(load_config(write_project(tmp_path, chapters="chapters = [1]")))
+    chapter = config.chapters[0]
+    source = tmp_path / "lean" / "Book" / "Chapter01.lean"
+    source.parent.mkdir(parents=True)
+    source.write_text("theorem target : True := by trivial\n", encoding="utf-8")
+    builds = 0
+
+    async def validation(*_args: object, **_kwargs: object) -> ValidationResult:
+        nonlocal builds
+        builds += 1
+        return ValidationResult(False, 1, "error: dependency is broken")
+
+    async def forbidden_agent(*_args: object, **_kwargs: object) -> AgentResult:
+        raise AssertionError("a placeholder-free failed refresh must not launch a proof agent")
+
+    monkeypatch.setattr(scheduler_module, "validate", validation)
+    orchestrator = Orchestrator(config, StateStore(config))
+    await orchestrator.prepare()
+    monkeypatch.setattr(orchestrator.executor, "run", forbidden_agent)
+
+    assert not await orchestrator._prove(chapter)
+    assert builds == 1
+    proof = orchestrator.state.task(chapter.id, Stage.PROVE)
+    assert proof.status == TaskStatus.PENDING
+    assert proof.detail == "current sources failed coordinator build refresh"
+    assert proof.rounds == 0
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_noop_proof_cannot_reuse_failed_certification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = with_lastlib_modules(load_config(write_project(tmp_path, chapters="chapters = [1]")))
+    chapter = config.chapters[0]
+    source = tmp_path / "lean" / "Book" / "Chapter01.lean"
+    source.parent.mkdir(parents=True)
+    source.write_text("theorem target : True := by sorry\n", encoding="utf-8")
+    builds = 0
+
+    async def validation(*_args: object, **_kwargs: object) -> ValidationResult:
+        nonlocal builds
+        builds += 1
+        return ValidationResult(False, 1, "error: dependency is broken")
+
+    monkeypatch.setattr(scheduler_module, "validate", validation)
+    orchestrator = Orchestrator(config, StateStore(config))
+    await orchestrator.prepare()
+    orchestrator.executor = FakeExecutor(
+        orchestrator.state,
+        [
+            result(changed=True, placeholders=0),
+            result(changed=False, placeholders=0),
+            result(changed=False, placeholders=0),
+        ],
+    )
+
+    assert not await orchestrator._prove(chapter)
+    assert builds == 2
+    proof = orchestrator.state.task(chapter.id, Stage.PROVE)
+    assert proof.status == TaskStatus.FAILED
+    assert proof.detail == "proof pass stalled with 0 placeholders"
+    assert [run.validation["succeeded"] for run in proof.runs] == [False, False, False]
+    assert proof.runs[-1].validation["output"] == (
+        "unchanged proof source has no clean coordinator build"
+    )
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_standalone_proof_fixup_finding_clears_durable_review(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
