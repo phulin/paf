@@ -119,6 +119,12 @@ Proof agents must clear every MCP warning except “declaration uses `sorry`” 
 attempted but could not prove. Disabling a linter or warning option is not an acceptable fix.
 
 Codex is invoked in its documented noninteractive JSONL mode with a strict final-report schema.
+Every worker returns a nonempty, change-focused `summary`. For an accepted source change, the
+coordinator copies that summary verbatim into the body of a path-scoped Conventional Commit such as
+`chore(book07): changes from review agent on book 7 chapter 2`, and records the resulting commit SHA
+with the run. The coordinator refuses to launch a worker whose exclusive scope already contains
+uncommitted files, preventing earlier work from being folded into the worker's commit. Unrelated
+staged and unstaged files remain outside the commit.
 All swarm workers, including review workers, default to
 `--dangerously-bypass-approvals-and-sandbox`, giving them full host access for unattended
 formalization. The coordinator accepts review changes only inside the chapter's exclusive scope. To

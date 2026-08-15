@@ -27,6 +27,7 @@ from lastlib_swarm.corpus import (
     scheduling_snapshot,
 )
 from lastlib_swarm.diagnostics import unexpected_lean_warnings
+from lastlib_swarm.git import GitCommitter
 from lastlib_swarm.isolation import IsolationResult, create_isolation
 from lastlib_swarm.models import Chapter, PipelineConfig, Stage
 from lastlib_swarm.scope import ScopeMatcher
@@ -286,6 +287,7 @@ class Orchestrator:
         self.control = control or RunControl()
         self.executor = CodexExecutor(config, state)
         self.isolation = create_isolation(config.settings)
+        self.git = GitCommitter(config.settings.repo)
         self.state.isolation = {
             "configured": config.settings.isolation,
             "backend": self.isolation.name,
@@ -347,6 +349,32 @@ class Orchestrator:
                 )
         await self.executor.prepare()
         await self.isolation.prepare()
+        await self.git.prepare()
+
+    async def _commit_agent_changes(
+        self,
+        chapter: Chapter,
+        stage: Stage,
+        agent: AgentResult | None,
+        isolated: IsolationResult,
+    ) -> IsolationResult:
+        if not isolated.accepted or not isolated.changed_paths:
+            return isolated
+        summary = (
+            agent.report.get("summary", "")
+            if agent is not None
+            else (
+                "Integrated partial scoped changes recovered after the agent was interrupted "
+                "before returning its final summary."
+            )
+        )
+        commit = await self.git.commit(
+            chapter,
+            stage,
+            summary=summary if isinstance(summary, str) else "",
+            changed_paths=isolated.changed_paths,
+        )
+        return replace(isolated, commit=commit)
 
     async def shutdown(self) -> None:
         try:
@@ -588,11 +616,13 @@ class Orchestrator:
     ) -> dict[str, object]:
         """Best-effort import of a stable workspace after a requested stop."""
 
+        acquired = False
         try:
-            isolated = collected or await workspace.collect(
-                chapter,
-                integration_lock=None if source_lock_held else self.source_lock,
-            )
+            if not source_lock_held:
+                await self.source_lock.acquire()
+                acquired = True
+            isolated = collected or await workspace.collect(chapter, integration_lock=None)
+            isolated = await self._commit_agent_changes(chapter, stage, None, isolated)
         except BaseException as error:
             detail = str(error) or type(error).__name__
             return {
@@ -600,6 +630,9 @@ class Orchestrator:
                 "interrupted": True,
                 "error": f"best-effort stop integration failed: {detail}",
             }
+        finally:
+            if acquired:
+                self.source_lock.release()
 
         payload = isolated.as_dict()
         payload["interrupted"] = True
@@ -644,8 +677,14 @@ class Orchestrator:
             if self.isolation.name == "shared":
                 await self.source_lock.acquire()
                 source_held = True
+                await self.git.ensure_clean(chapter)
                 workspace = await self.isolation.acquire(run.id)
+                snapshot = getattr(workspace, "snapshot", None)
+                if snapshot is not None:
+                    await snapshot(chapter)
             else:
+                async with self.source_lock:
+                    await self.git.ensure_clean(chapter)
                 workspace = await self.isolation.acquire(run.id)
             agent = await self.executor.run(
                 chapter,
@@ -658,10 +697,11 @@ class Orchestrator:
             slot_held = False
             # Agent capacity covers live Codex processes, not integration or a
             # potentially preempted coordinator build queued after they exit.
-            isolated = await workspace.collect(
-                chapter,
-                integration_lock=None if source_held else self.source_lock,
-            )
+            if not source_held:
+                await self.source_lock.acquire()
+                source_held = True
+            isolated = await workspace.collect(chapter, integration_lock=None)
+            isolated = await self._commit_agent_changes(chapter, stage, agent, isolated)
             await workspace.close()
             workspace = None
             if source_held:
@@ -751,19 +791,23 @@ class Orchestrator:
                 if source_held:
                     self.source_lock.release()
                     source_held = False
-            if run is not None and run.status == TaskStatus.RUNNING:
+            if run is not None:
                 detail = str(error) or type(error).__name__
+                failure_isolation = interrupted_isolation
+                if failure_isolation is None and isolated is not None:
+                    failure_isolation = isolated.as_dict()
+                    failure_isolation["error"] = (
+                        f"changes integrated but orchestration failed before completion: {detail}"
+                    )
                 await self.state.finish_run(
                     run,
                     status=TaskStatus.FAILED,
-                    isolation=interrupted_isolation
+                    isolation=failure_isolation
                     or {
                         "accepted": False,
                         "error": f"orchestration failed before completion: {detail}",
                     },
                 )
-            elif run is not None and interrupted_isolation is not None:
-                await self.state.update_run(run, isolation=interrupted_isolation)
             raise
         finally:
             if slot_held:
@@ -1484,8 +1528,14 @@ class Orchestrator:
             if self.isolation.name == "shared":
                 await self.source_lock.acquire()
                 source_held = True
+                await self.git.ensure_clean(chapter)
                 workspace = await self.isolation.acquire(run.id)
+                snapshot = getattr(workspace, "snapshot", None)
+                if snapshot is not None:
+                    await snapshot(chapter)
             else:
+                async with self.source_lock:
+                    await self.git.ensure_clean(chapter)
                 workspace = await self.isolation.acquire(run.id)
 
             async def execute() -> AgentResult:
@@ -1534,9 +1584,15 @@ class Orchestrator:
         isolated: IsolationResult | None = None
         try:
             agent = await handle.task
-            isolated = await workspace.collect(
+            if not handle.source_lock_held:
+                await self.source_lock.acquire()
+                handle.source_lock_held = True
+            isolated = await workspace.collect(handle.chapter, integration_lock=None)
+            isolated = await self._commit_agent_changes(
                 handle.chapter,
-                integration_lock=None if handle.source_lock_held else self.source_lock,
+                Stage.FIXUP,
+                agent,
+                isolated,
             )
             await workspace.close()
             workspace = None
@@ -1587,22 +1643,22 @@ class Orchestrator:
             if handle.source_lock_held:
                 self.source_lock.release()
                 handle.source_lock_held = False
-            if handle.run.status == TaskStatus.RUNNING:
+            if handle.run is not None:
                 detail = str(error) or type(error).__name__
+                failure_isolation = interrupted_isolation
+                if failure_isolation is None and isolated is not None:
+                    failure_isolation = isolated.as_dict()
+                    failure_isolation["error"] = (
+                        f"changes integrated but orchestration failed before completion: {detail}"
+                    )
                 await self.state.finish_run(
                     handle.run,
                     status=TaskStatus.FAILED,
-                    isolation={
+                    isolation=failure_isolation
+                    or {
                         "accepted": False,
                         "error": f"orchestration failed before integration: {detail}",
-                    }
-                    if interrupted_isolation is None
-                    else interrupted_isolation,
-                )
-            elif interrupted_isolation is not None:
-                await self.state.update_run(
-                    handle.run,
-                    isolation=interrupted_isolation,
+                    },
                 )
             raise
 

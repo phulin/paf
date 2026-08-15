@@ -29,7 +29,12 @@ REPORT_SCHEMA: dict[str, Any] = {
     "properties": {
         "changed": {"type": "boolean"},
         "complete": {"type": "boolean"},
-        "summary": {"type": "string"},
+        "summary": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "\\S",
+            "description": "Self-contained, change-focused prose suitable for a commit body.",
+        },
         "issues": {"type": "array", "items": {"type": "string"}},
         "fixup_findings": {
             "type": "array",
@@ -541,7 +546,11 @@ the coordinator and use its single writable build cache. {stage_contract}
 ### Final response
 
 Return the required structured report. Set `changed` from the actual scoped diff and `complete` from
-the stage's definition of done. Summarize the work concisely and list every unresolved issue.
+the stage's definition of done. When `changed` is true, write a concise, self-contained `summary` in
+past tense that describes the actual scoped edits and their purpose, names the key files or
+declarations, and is suitable for use verbatim as a Git commit body. Keep progress, future work, and
+unresolved problems out of the summary and list them in `issues` instead. When `changed` is false,
+briefly explain why no edit was needed.
 
 For every unresolved actionable issue that requires another source edit, add one `fixup_findings`
 entry. Its

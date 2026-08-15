@@ -30,6 +30,7 @@ class IsolationResult:
     promoted_cache_paths: tuple[str, ...] = ()
     out_of_scope_paths: tuple[str, ...] = ()
     error: str = ""
+    commit: str = ""
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -40,6 +41,7 @@ class IsolationResult:
             "promoted_cache_paths": list(self.promoted_cache_paths),
             "out_of_scope_paths": list(self.out_of_scope_paths),
             "error": self.error,
+            "commit": self.commit,
         }
 
 
@@ -134,15 +136,28 @@ def _matches_scope(relative: str, chapter: Chapter) -> bool:
 class SharedWorkspace:
     def __init__(self, repo: Path) -> None:
         self.root = repo
+        self.base_manifest: dict[str, FileFingerprint] | None = None
+
+    async def snapshot(self, chapter: Chapter) -> None:
+        self.base_manifest = await asyncio.to_thread(scoped_manifest, self.root, chapter)
 
     async def collect(
         self,
-        _chapter: Chapter,
+        chapter: Chapter,
         *,
         integration_lock: asyncio.Lock | None = None,
     ) -> IsolationResult:
         del integration_lock
-        return IsolationResult(accepted=True, generation=0)
+        current = await asyncio.to_thread(scoped_manifest, self.root, chapter)
+        base = self.base_manifest if self.base_manifest is not None else current
+        changed = tuple(
+            sorted(
+                path
+                for path in set(base) | set(current)
+                if base.get(path) != current.get(path)
+            )
+        )
+        return IsolationResult(accepted=True, generation=0, changed_paths=changed)
 
     async def close(self) -> None:
         return

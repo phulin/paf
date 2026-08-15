@@ -39,6 +39,10 @@ def test_report_schema_uses_structured_fixup_findings() -> None:
     assert "needs_fixup" not in REPORT_SCHEMA["properties"]
     assert "needs_fixup" not in REPORT_SCHEMA["required"]
     assert "fixup_findings" in REPORT_SCHEMA["required"]
+    assert "summary" in REPORT_SCHEMA["required"]
+    assert REPORT_SCHEMA["properties"]["summary"]["minLength"] == 1
+    assert REPORT_SCHEMA["properties"]["summary"]["pattern"] == r"\S"
+    assert "commit body" in REPORT_SCHEMA["properties"]["summary"]["description"]
 
 
 def test_extracts_api_equivalent_usage() -> None:
@@ -280,6 +284,17 @@ def test_every_agent_prompt_explains_that_git_is_unavailable(tmp_path: Path, sta
 
     assert "filesystem is not a Git repository" in prompt
     assert "Do not run `git` commands" in prompt
+
+
+@pytest.mark.parametrize("stage", list(Stage))
+def test_every_agent_prompt_requests_a_commit_body_summary(tmp_path: Path, stage: Stage) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    executor = CodexExecutor(config, StateStore(config))
+
+    prompt = " ".join(executor.build_prompt(config.chapters[0], stage).split())
+
+    assert "describes the actual scoped edits and their purpose" in prompt
+    assert "suitable for use verbatim as a Git commit body" in prompt
 
 
 @pytest.mark.parametrize("stage", list(Stage))
