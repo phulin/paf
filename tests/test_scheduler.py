@@ -3379,14 +3379,14 @@ async def test_noop_proof_cannot_reuse_failed_certification(
     assert proof.status == TaskStatus.FAILED
     assert proof.detail == "proof pass stalled with 0 placeholders"
     assert all(run.validation is not None for run in proof.runs)
-    assert [
-        run.validation["succeeded"] for run in proof.runs if run.validation is not None
-    ] == [False, False, False]
+    assert [run.validation["succeeded"] for run in proof.runs if run.validation is not None] == [
+        False,
+        False,
+        False,
+    ]
     final_validation = proof.runs[-1].validation
     assert final_validation is not None
-    assert final_validation["output"] == (
-        "unchanged proof source has no clean coordinator build"
-    )
+    assert final_validation["output"] == ("unchanged proof source has no clean coordinator build")
     await orchestrator.shutdown()
 
 
@@ -3448,8 +3448,7 @@ def test_upstream_answers_validate_reported_declarations_against_sources(
     path = tmp_path / "lean" / "Book" / "Chapter01.lean"
     path.parent.mkdir(parents=True)
     path.write_text(
-        "theorem provedBridge : True := by trivial\n\n"
-        "theorem unprovedBridge : True := by sorry\n",
+        "theorem provedBridge : True := by trivial\n\ntheorem unprovedBridge : True := by sorry\n",
         encoding="utf-8",
     )
     orchestrator = Orchestrator(config, StateStore(config))
@@ -3458,12 +3457,9 @@ def test_upstream_answers_validate_reported_declarations_against_sources(
         "rejection_reason": "",
     }
     answers = {
-        "good-added": base
-        | {"disposition": "added", "declarations": ["Book.provedBridge"]},
-        "missing-added": base
-        | {"disposition": "added", "declarations": ["Book.missingBridge"]},
-        "unproved-added": base
-        | {"disposition": "added", "declarations": ["Book.unprovedBridge"]},
+        "good-added": base | {"disposition": "added", "declarations": ["Book.provedBridge"]},
+        "missing-added": base | {"disposition": "added", "declarations": ["Book.missingBridge"]},
+        "unproved-added": base | {"disposition": "added", "declarations": ["Book.unprovedBridge"]},
         "unproved-existing": base
         | {"disposition": "existing", "declarations": ["Book.unprovedBridge"]},
         "external-existing": base
@@ -3615,9 +3611,7 @@ async def test_proof_upstream_request_runs_repair_then_targeted_retry(
         assert chapter.id == owner.id
         assert workspace_root is not None
         selected = tuple(requests)
-        assert all(
-            request["status"] == UpstreamRequestStatus.REQUESTED for request in selected
-        )
+        assert all(request["status"] == UpstreamRequestStatus.REQUESTED for request in selected)
         repair_batches.append(tuple(str(request["id"]) for request in selected))
         target = workspace_root / "lean" / "Book" / "Chapter01.lean"
         target.write_text(

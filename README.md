@@ -82,8 +82,10 @@ reviewers trust the last clean build for untouched files and request whole-file 
 only for files they edit and the assigned transitive dependents invalidated by those edits. A
 no-change review therefore needs no diagnostic calls.
 
-For a conventional numbered corpus, point the CLI at the book directory. It discovers all direct
-Markdown children and automatically reads `BOOK_DEPENDENCIES.md` from the repository root:
+Point the CLI at source files or directories. Directories are scanned recursively for Markdown,
+LaTeX, and plain-text documents; metadata directories, hidden directories, build outputs, and
+symlinked directories are skipped. A conventional numbered corpus also automatically reads
+`BOOK_DEPENDENCIES.md` from the repository root:
 
 ```console
 uv run paf plan books/
@@ -105,6 +107,33 @@ uv sync --all-groups
 uv run paf plan books/02-finite-extensions-of-local-fields.md
 uv run paf books/02-finite-extensions-of-local-fields.md
 ```
+
+Install the command from a checkout with:
+
+```console
+uv tool install .
+```
+
+The distribution name is `paf`; after a release is published to the configured Python package
+index, install that published release with:
+
+```console
+uv tool install paf
+```
+
+The distribution includes the prompt library and a prebuilt React UI. A normal wheel or sdist
+installation does not require Node or npm.
+
+Serve the installed dashboard and its project-scoped API from any directory with:
+
+```console
+paf web /absolute/path/to/project
+```
+
+It listens on `127.0.0.1:5173` by default. Network exposure is opt-in: pass
+`--host 0.0.0.0` explicitly (and choose a different port with `--port`). The service reads source,
+target, and durable run state only from the paths resolved by that project's `paf.toml`, including
+an external `state_dir`.
 
 Passing a `.md` as the first argument is shorthand for `pipeline <target>`. Zero-config runs default
 to `gpt-5.6-luna`, reasoning effort `max`, the packaged generic prompt library under
@@ -211,6 +240,40 @@ configured runs. `--isolation auto|fuse-overlay|shared` selects the execution ba
 
 After a foreground TUI closes with a failed result, the CLI prints the failed task details, compact
 agent/build diagnostics, blocked dependents, and persisted state path to standard output.
+
+## Frontend release bundle
+
+Node is needed only by contributors rebuilding the React app. After changing `web/src`, frontend
+configuration, or npm package metadata, prepare and verify the committed package assets with:
+
+```console
+cd web
+npm ci
+npm run release:bundle
+cd ..
+python scripts/web_bundle.py check
+```
+
+The release command writes content-hashed assets and a content manifest under
+`src/paf/web_dist/`. The check compares SHA-256 digests rather than filesystem mtimes, so it detects
+stale sources and edited build output consistently in fresh Git checkouts. To validate package
+contents during release preparation:
+
+```console
+uv build
+python scripts/check_distribution.py dist/*.whl dist/*.tar.gz
+```
+
+The full installed-package check builds both archive types, inspects their contents, installs each
+one into a separate temporary virtual environment, and exercises the CLI and live web server from
+outside this checkout:
+
+```console
+uv run python scripts/check_installed_distribution.py
+```
+
+It removes `PYTHONPATH`, disables user site packages, and verifies the imported `paf` location, so
+the checkout cannot accidentally satisfy an installed-package probe.
 
 ## Lean LSP MCP proof loop
 
@@ -536,8 +599,17 @@ slot, while the independent build queue guarantees that at most one Lake build r
 ## Configuration
 
 No configuration is required for a conventional numbered LastLib Markdown book. If `paf.toml`
-exists and no target or `--config` is supplied, it is loaded automatically. Explicit top-level
-settings override these defaults:
+exists in the current directory or any ancestor and no target or `--config` is supplied, the nearest
+one is loaded automatically. Every command accepts `--project /absolute/path/to/project` (or a path
+to its `paf.toml`), so status and agent-control commands can be run from an unrelated directory.
+An explicit source target continues to select that source directly; its project is resolved from an
+ancestor `paf.toml`, then an ancestor Git checkout. With neither an explicit project nor target nor
+discoverable configuration, the current directory is the project root.
+
+Project-relative state remains under `.paf/` by default. `state_dir` is resolved relative to
+`swarm.repo` and may also be an absolute path outside the project. Checkpoints and new run records
+store the resolved project root, allowing project-local state to rebind correctly after the whole
+project is moved. Explicit top-level settings override these defaults:
 
 ```toml
 [swarm]
@@ -600,6 +672,37 @@ scope = [
 
 Every `depends_on` id must appear in the same configuration. When a CLI selection excludes an
 otherwise configured prerequisite, that prerequisite is treated as pre-existing and satisfied.
+
+As an alternative to explicit `[[books]]` entries, `[sources]` can discover a mixed-format corpus.
+Paths are normalized relative to `swarm.repo`, de-duplicated, and sorted before the optional
+manifest order is applied. Include and exclude entries are evaluated in order; prefix a later
+exclude with `!` to restore a path.
+
+```toml
+[sources]
+roots = ["notes", "appendices/overview.txt"]
+include = ["**/*.md", "**/*.tex", "**/*.txt"]
+exclude = ["**/drafts/**", "**/generated/**", "!notes/drafts/released.md"]
+manifest = ["notes/introduction.md", "appendices/overview.txt"]
+
+[sources.dependencies]
+"appendices/overview.txt" = ["notes/introduction.md"]
+
+[[sources.rules]]
+glob = "lecture-notes/**/*.tex"
+format = "latex"
+unit = "section"
+follow_includes = true
+
+[[sources.rules]]
+glob = "appendices/*.txt"
+format = "text"
+heading_pattern = "^CHAPTER (?P<number>\\d+): (?P<title>.+)$"
+```
+
+The manifest may be a list as above or a path to a newline-delimited (or JSON-list) manifest.
+Listed documents come first; discovered documents omitted from a partial manifest retain their
+stable repository-relative order afterward.
 
 ## Development checks
 

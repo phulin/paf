@@ -13,7 +13,12 @@ export function IconButton({
   active?: boolean;
 }) {
   return (
-    <button className={`icon-button ${active ? "active" : ""}`} onClick={onClick} title={label} aria-label={label}>
+    <button
+      className={`icon-button ${active ? "active" : ""}`}
+      onClick={onClick}
+      title={label}
+      aria-label={label}
+    >
       {children}
     </button>
   );
@@ -22,7 +27,12 @@ export function IconButton({
 export function ProgressBar({ value, color }: { value: number; color?: string }) {
   return (
     <div className="progress-track">
-      <div className="progress-fill" style={{ width: `${Math.min(100, Math.max(0, value))}%`, background: color } as CSSProperties} />
+      <div
+        className="progress-fill"
+        style={
+          { width: `${Math.min(100, Math.max(0, value))}%`, background: color } as CSSProperties
+        }
+      />
     </div>
   );
 }
@@ -40,7 +50,9 @@ export function Select({
 }) {
   return (
     <label className="select-wrap" title={label}>
-      <select value={value} onChange={(event) => onChange(event.target.value)} aria-label={label}>{children}</select>
+      <select value={value} onChange={(event) => onChange(event.target.value)} aria-label={label}>
+        {children}
+      </select>
       <ChevronDown size={14} />
     </label>
   );

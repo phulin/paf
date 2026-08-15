@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-from paf.models import BookConfig, Chapter
+from paf.models import SourceDocumentLike, WorkUnitLike
 from paf.scope import ScopeMatcher
 
 Phase = Literal["statements", "proofs"]
@@ -19,8 +19,8 @@ LEAN_MODULE_RE = re.compile(r"\bLastLib(?:\.[A-Za-z0-9_']+)+\b")
 
 
 @dataclass(frozen=True)
-class ChapterImportGraph:
-    """The current cross-chapter graph observed directly in Lean imports."""
+class WorkUnitImportGraph:
+    """The current cross-unit graph observed directly in target imports."""
 
     dependencies: dict[str, frozenset[str]]
     successors: dict[str, frozenset[str]]
@@ -33,8 +33,8 @@ class ChapterImportGraph:
             "order": list(self.order),
             "edges": [list(edge) for edge in self.edges],
             "dependencies": {
-                chapter_id: sorted(required)
-                for chapter_id, required in sorted(self.dependencies.items())
+                work_unit_id: sorted(required)
+                for work_unit_id, required in sorted(self.dependencies.items())
             },
         }
 
@@ -50,8 +50,8 @@ def observed_imports(text: str) -> tuple[str, ...]:
     return tuple(modules)
 
 
-def _chapter_source_files(repo: Path, chapter: Chapter) -> tuple[Path, ...]:
-    return tuple(ScopeMatcher(chapter.scope).files(repo))
+def _work_unit_target_files(repo: Path, work_unit: WorkUnitLike) -> tuple[Path, ...]:
+    return tuple(ScopeMatcher(work_unit.scope).files(repo))
 
 
 def _chapter_cycle(dependencies: dict[str, set[str]]) -> tuple[str, ...]:
@@ -81,13 +81,23 @@ def _chapter_cycle(dependencies: dict[str, set[str]]) -> tuple[str, ...]:
     return ()
 
 
-def build_chapter_import_graph(repo: Path, chapters: tuple[Chapter, ...]) -> ChapterImportGraph:
-    """Build a deterministic chapter DAG solely from currently observed imports."""
+def build_work_unit_import_graph(
+    repo: Path, work_units: tuple[WorkUnitLike, ...]
+) -> WorkUnitImportGraph:
+    """Build a deterministic work-unit DAG from currently observed imports."""
 
-    by_id = {chapter.id: chapter for chapter in chapters}
-    dependencies = {chapter.id: set() for chapter in chapters}
+    by_id = {work_unit.id: work_unit for work_unit in work_units}
+    dependencies = {work_unit.id: set(work_unit.depends_on) for work_unit in work_units}
+    missing = {
+        dependency
+        for required in dependencies.values()
+        for dependency in required
+        if dependency not in by_id
+    }
+    if missing:
+        raise ValueError(f"work units depend on unknown ids: {', '.join(sorted(missing))}")
     module_owners = sorted(
-        ((chapter.chapter_module, chapter.id) for chapter in chapters),
+        ((work_unit.chapter_module, work_unit.id) for work_unit in work_units),
         key=lambda item: len(item[0]),
         reverse=True,
     )
@@ -98,14 +108,14 @@ def build_chapter_import_graph(repo: Path, chapters: tuple[Chapter, ...]) -> Cha
                 return chapter_id
         return None
 
-    for dependent in chapters:
-        for path in _chapter_source_files(repo, dependent):
+    for dependent in work_units:
+        for path in _work_unit_target_files(repo, dependent):
             for module in observed_imports(path.read_text(encoding="utf-8")):
                 prerequisite = owner(module)
                 if prerequisite is not None and prerequisite != dependent.id:
                     dependencies[dependent.id].add(prerequisite)
 
-    successors = {chapter.id: set() for chapter in chapters}
+    successors = {work_unit.id: set() for work_unit in work_units}
     for dependent, required in dependencies.items():
         for prerequisite in required:
             successors[prerequisite].add(dependent)
@@ -134,12 +144,17 @@ def build_chapter_import_graph(repo: Path, chapters: tuple[Chapter, ...]) -> Cha
             for prerequisite in required
         )
     )
-    return ChapterImportGraph(
+    return WorkUnitImportGraph(
         dependencies={key: frozenset(value) for key, value in dependencies.items()},
         successors={key: frozenset(value) for key, value in successors.items()},
         order=tuple(order),
         edges=edges,
     )
+
+
+# Compatibility names for callers that still construct ``Chapter`` adapters.
+ChapterImportGraph = WorkUnitImportGraph
+build_chapter_import_graph = build_work_unit_import_graph
 
 
 @dataclass(frozen=True)
@@ -154,8 +169,8 @@ class CorpusSchedule:
     order: tuple[str, ...]
     critical_path: tuple[str, ...]
 
-    def priority(self, book_id: str) -> float:
-        return self.rank[book_id]
+    def priority(self, document_id: str) -> float:
+        return self.rank[document_id]
 
     def snapshot(self) -> dict[str, object]:
         return {
@@ -213,10 +228,11 @@ def _cycle_path(dependencies: dict[str, set[str]]) -> tuple[str, ...]:
 
 
 def build_corpus_schedule(
-    books: tuple[BookConfig, ...],
-    chapters: tuple[Chapter, ...],
+    documents: tuple[SourceDocumentLike, ...],
+    work_units: tuple[WorkUnitLike, ...],
     *,
     phase: Phase,
+    selected_documents: set[str] | None = None,
     selected_books: set[str] | None = None,
 ) -> CorpusSchedule:
     """Compute weighted bottom-level ranks and a priority topological order.
@@ -226,11 +242,14 @@ def build_corpus_schedule(
     standard critical-path list-scheduling heuristic.
     """
 
-    by_id = {book.id: book for book in books}
-    selected = set(by_id) if selected_books is None else set(selected_books)
+    if selected_documents is not None and selected_books is not None:
+        raise ValueError("pass selected_documents or legacy selected_books, not both")
+    selected_ids = selected_documents if selected_documents is not None else selected_books
+    by_id = {document.id: document for document in documents}
+    selected = set(by_id) if selected_ids is None else set(selected_ids)
     unknown = selected - set(by_id)
     if unknown:
-        raise ValueError(f"unknown selected books: {', '.join(sorted(unknown))}")
+        raise ValueError(f"unknown selected documents: {', '.join(sorted(unknown))}")
 
     dependencies = {book_id: set(by_id[book_id].depends_on) & selected for book_id in selected}
     successors = {book_id: set() for book_id in selected}
@@ -255,9 +274,9 @@ def build_corpus_schedule(
         raise ValueError(f"book dependency graph contains a cycle: {detail}")
 
     chapter_counts = {book_id: 0 for book_id in selected}
-    for chapter in chapters:
-        if chapter.book_id in chapter_counts:
-            chapter_counts[chapter.book_id] += 1
+    for work_unit in work_units:
+        if work_unit.document_id in chapter_counts:
+            chapter_counts[work_unit.document_id] += 1
     effort: dict[str, float] = {}
     for book_id in selected:
         configured = (

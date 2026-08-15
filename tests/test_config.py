@@ -210,3 +210,69 @@ def test_infers_multiple_books_and_chained_mermaid_dependencies(tmp_path: Path) 
     assert [book.id for book in config.books] == ["book01", "book02", "book03"]
     assert config.books[2].depends_on == ("book02",)
     assert config.settings.state_dir.parent == tmp_path / ".paf"
+
+
+def test_loads_recursive_sources_only_config_with_rules_dependencies_and_manifest(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / ".git").mkdir()
+    (tmp_path / "notes" / "nested").mkdir(parents=True)
+    (tmp_path / "notes" / "nested" / "lecture.tex").write_text(
+        "\\chapter{Ignored}\n\\section{Lecture}\n", encoding="utf-8"
+    )
+    (tmp_path / "notes" / "intro.md").write_text("# Intro\n## Start\n", encoding="utf-8")
+    config_path = tmp_path / "paf.toml"
+    config_path.write_text(
+        """[swarm]
+repo = "."
+isolation = "shared"
+
+[sources]
+roots = ["notes"]
+include = ["**/*.md", "**/*.tex"]
+exclude = ["**/drafts/**"]
+manifest = ["notes/nested/lecture.tex", "notes/intro.md"]
+
+[sources.dependencies]
+"notes/nested/lecture.tex" = ["notes/intro.md"]
+
+[[sources.rules]]
+glob = "notes/**/*.tex"
+format = "latex"
+unit = "section"
+""",
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+
+    assert [book.source.as_posix() for book in config.books] == [
+        "notes/nested/lecture.tex",
+        "notes/intro.md",
+    ]
+    assert config.books[0].depends_on == (config.books[1].id,)
+    assert [unit.title for unit in config.work_units] == ["Lecture", "Start"]
+    assert config.source_roots == (Path("notes"),)
+
+
+def test_inferred_directory_recurses_over_mixed_formats_but_direct_markdown_stays_legacy(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / ".git").mkdir()
+    (tmp_path / "sources" / "deep").mkdir(parents=True)
+    markdown = tmp_path / "sources" / "deep" / "01-notes.md"
+    markdown.write_text("# Notes\n## Unnumbered heading\n", encoding="utf-8")
+    (tmp_path / "sources" / "appendix.txt").write_text("plain\n", encoding="utf-8")
+    (tmp_path / "sources" / "theory.tex").write_text("\\section{Theory}\n", encoding="utf-8")
+
+    corpus = infer_corpus((tmp_path / "sources",))
+    direct = infer_config(markdown)
+
+    assert [book.format for book in corpus.books] == ["text", "markdown", "latex"]
+    assert [unit.title for unit in corpus.work_units] == [
+        "Appendix",
+        "Unnumbered heading",
+        "Theory",
+    ]
+    assert direct.books[0].adapter_profile == "numbered-chapters"
+    assert direct.work_units == ()

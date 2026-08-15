@@ -32,8 +32,9 @@ from paf.corpus import (
     scheduling_summary,
 )
 from paf.isolation import fuse_overlay_available
-from paf.models import Chapter, PipelineConfig, Stage
+from paf.models import PipelineConfig, Stage, WorkUnitLike
 from paf.pricing import LEGACY_MODEL, CostEstimate, estimate_cost, format_usd
+from paf.project import Project, ProjectResolver
 from paf.scheduler import Orchestrator, scaffold_directories
 from paf.state import StateStore, TaskRecord, TaskStatus
 from paf.state_db import read_checkpoint, read_full_snapshot
@@ -43,6 +44,17 @@ RIPGREP_WARNING = (
     "ripgrep (`rg`) was not found on PATH. Swarm agents rely on fast source search and may be "
     "substantially slower. Install ripgrep and ensure `rg` is on PATH before launching a large run."
 )
+COMMAND_NAMES = {
+    "plan",
+    "status",
+    "source-issues",
+    "web",
+    "scaffold",
+    "stage",
+    "pipeline",
+    "corpus",
+    "agent",
+}
 
 
 def _starts_workers(args: argparse.Namespace) -> bool:
@@ -63,9 +75,13 @@ def _warn_missing_ripgrep() -> None:
 
 def _add_source(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
+        "--project",
+        help="project directory or paf.toml; defaults to target or ancestor discovery",
+    )
+    parser.add_argument(
         "target",
         nargs="?",
-        help="informal book Markdown file or corpus directory; inferred without --config",
+        help="informal .md, .tex, or .txt file or corpus directory; inferred without --config",
     )
     parser.add_argument(
         "--config",
@@ -112,7 +128,9 @@ def parser() -> argparse.ArgumentParser:
     root.add_argument("--version", action="version", version="paf 0.7.0")
     commands = root.add_subparsers(dest="command", required=True)
 
-    plan = commands.add_parser("plan", help="show discovered books, chapters, and stage settings")
+    plan = commands.add_parser(
+        "plan", help="show discovered documents, work units, target scopes, and stage settings"
+    )
     _add_source(plan)
     _add_overrides(plan)
 
@@ -126,8 +144,21 @@ def parser() -> argparse.ArgumentParser:
     _add_source(source_issues)
     source_issues.add_argument("--json", action="store_true", help="print the raw ledger")
 
+    web = commands.add_parser("web", help="serve the project dashboard and JSON API")
+    web.add_argument(
+        "project",
+        nargs="?",
+        help="project directory or paf.toml; defaults to ancestor discovery",
+    )
+    web.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="bind address (default: 127.0.0.1; use 0.0.0.0 explicitly for network access)",
+    )
+    web.add_argument("--port", type=int, default=5173, help="TCP port (default: 5173)")
+
     scaffold = commands.add_parser(
-        "scaffold", help="deterministically create configured chapter directories"
+        "scaffold", help="deterministically create configured target directories"
     )
     _add_source(scaffold)
     scaffold.add_argument("--book", action="append", default=[], help="book id")
@@ -143,12 +174,16 @@ def parser() -> argparse.ArgumentParser:
     _add_run_options(pipeline)
 
     corpus = commands.add_parser(
-        "corpus", help="run a dependency-scheduled collection of Markdown books"
+        "corpus", help="run a recursively discovered, dependency-scheduled source collection"
     )
     corpus.add_argument(
         "targets",
         nargs="*",
-        help="Markdown files and/or directories (directories expand to their direct *.md files)",
+        help=".md, .tex, and .txt files and/or recursively scanned directories",
+    )
+    corpus.add_argument(
+        "--project",
+        help="project directory or paf.toml; defaults to target or ancestor discovery",
     )
     corpus.add_argument("--config", help="use an explicit multi-book TOML configuration")
     corpus.add_argument(
@@ -203,7 +238,15 @@ def parser() -> argparse.ArgumentParser:
 
 
 def _config_from_args(args: argparse.Namespace) -> PipelineConfig:
-    if args.command == "corpus":
+    project: Project = args.resolved_project
+    if args.command == "web":
+        config = resolve_config(
+            config=None,
+            target=None,
+            dependency_file=None,
+            project=project,
+        )
+    elif args.command == "corpus":
         if args.config is not None:
             if args.targets:
                 raise ValueError("pass either --config or corpus targets, not both")
@@ -211,14 +254,25 @@ def _config_from_args(args: argparse.Namespace) -> PipelineConfig:
                 config=args.config,
                 target=None,
                 dependency_file=args.dependencies,
+                project=project,
+            )
+        elif args.targets:
+            config = infer_corpus(
+                tuple(args.targets), dependency_file=args.dependencies, project=project
             )
         else:
-            config = infer_corpus(tuple(args.targets), dependency_file=args.dependencies)
+            config = resolve_config(
+                config=None,
+                target=None,
+                dependency_file=args.dependencies,
+                project=project,
+            )
     else:
         config = resolve_config(
             config=args.config,
             target=args.target,
             dependency_file=getattr(args, "dependencies", None),
+            project=project,
         )
     model = getattr(args, "model", None)
     reasoning_effort = getattr(args, "reasoning_effort", None)
@@ -243,32 +297,47 @@ def _config_from_args(args: argparse.Namespace) -> PipelineConfig:
     return config
 
 
+def select_work_units(
+    config: PipelineConfig,
+    *,
+    document_ids: Sequence[str],
+    unit_selectors: Sequence[str],
+) -> tuple[WorkUnitLike, ...]:
+    work_units = list(config.work_units)
+    if document_ids:
+        unknown = set(document_ids) - {document.id for document in config.documents}
+        if unknown:
+            raise ValueError(f"unknown document ids: {', '.join(sorted(unknown))}")
+        work_units = [unit for unit in work_units if unit.document_id in document_ids]
+    if unit_selectors:
+        selected: list[WorkUnitLike] = []
+        for selector in unit_selectors:
+            matches = [unit for unit in work_units if unit.id == selector]
+            if not matches and selector.isdigit():
+                matches = [unit for unit in work_units if unit.ordinal == int(selector)]
+            if not matches:
+                raise ValueError(f"work-unit selector matched nothing: {selector}")
+            selected.extend(matches)
+        selected_ids = {unit.id for unit in selected}
+        work_units = [unit for unit in work_units if unit.id in selected_ids]
+    if not work_units:
+        raise ValueError("selection contains no work units")
+    return tuple(work_units)
+
+
 def select_chapters(
     config: PipelineConfig,
     *,
     books: Sequence[str],
     chapter_selectors: Sequence[str],
-) -> tuple[Chapter, ...]:
-    chapters = list(config.chapters)
-    if books:
-        unknown = set(books) - {book.id for book in config.books}
-        if unknown:
-            raise ValueError(f"unknown book ids: {', '.join(sorted(unknown))}")
-        chapters = [chapter for chapter in chapters if chapter.book_id in books]
-    if chapter_selectors:
-        selected: list[Chapter] = []
-        for selector in chapter_selectors:
-            matches = [chapter for chapter in chapters if chapter.id == selector]
-            if not matches and selector.isdigit():
-                matches = [chapter for chapter in chapters if chapter.number == int(selector)]
-            if not matches:
-                raise ValueError(f"chapter selector matched nothing: {selector}")
-            selected.extend(matches)
-        selected_ids = {chapter.id for chapter in selected}
-        chapters = [chapter for chapter in chapters if chapter.id in selected_ids]
-    if not chapters:
-        raise ValueError("selection contains no chapters")
-    return tuple(chapters)
+) -> tuple[WorkUnitLike, ...]:
+    """Compatibility adapter for the original CLI selector names."""
+
+    return select_work_units(
+        config,
+        document_ids=books,
+        unit_selectors=chapter_selectors,
+    )
 
 
 def print_plan(config: PipelineConfig, console: Console) -> None:
@@ -290,10 +359,15 @@ def print_plan(config: PipelineConfig, console: Console) -> None:
         if config.settings.bypass_approvals_and_sandbox
         else config.settings.sandbox
     )
+    mcp_status = "enabled" if getattr(config.backend, "mcp_enabled", True) else "disabled"
+    backend_project = getattr(config.backend, "project", config.settings.lean_project)
+    console.print(f"[bold]Codex access:[/bold] {access}")
     console.print(
-        f"[bold]Codex access:[/bold] {access}  "
-        f"[bold]Lean MCP:[/bold] enabled  "
-        f"[bold]Project:[/bold] {config.settings.lean_project}  "
+        f"[bold]Backend:[/bold] {getattr(config.backend, 'kind', 'lean')}  "
+        f"[bold]Lean MCP:[/bold] {mcp_status}"
+    )
+    console.print(
+        f"[bold]Project:[/bold] {backend_project}  "
         f"[bold]Tool timeout:[/bold] {config.settings.lean_mcp_tool_timeout_seconds:g}s"
     )
     stages = Table(title="Stages")
@@ -304,30 +378,52 @@ def print_plan(config: PipelineConfig, console: Console) -> None:
         settings = config.stages[stage]
         stages.add_row(stage.value, str(settings.prompt), str(settings.max_rounds))
     console.print(stages)
-    statement_schedule = build_corpus_schedule(config.books, config.chapters, phase="statements")
-    proof_schedule = build_corpus_schedule(config.books, config.chapters, phase="proofs")
-    books = Table(title="Corpus (critical-path priority order)")
-    books.add_column("Book")
-    books.add_column("Chapters", justify="right")
+    statement_schedule = build_corpus_schedule(
+        config.documents, config.work_units, phase="statements"
+    )
+    proof_schedule = build_corpus_schedule(config.documents, config.work_units, phase="proofs")
+    books = Table(title="Documents (critical-path priority order)")
+    books.add_column("Document")
+    books.add_column("Format")
+    books.add_column("Units", justify="right")
     books.add_column("Depends on")
     books.add_column("Statement rank", justify="right")
     books.add_column("Proof rank", justify="right")
     books.add_column("Source")
-    by_id = {book.id: book for book in config.books}
+    by_id = {document.id: document for document in config.documents}
     critical = set(statement_schedule.critical_path) | set(proof_schedule.critical_path)
     for book_id in statement_schedule.order:
         book = by_id[book_id]
-        count = sum(chapter.book_id == book.id for chapter in config.chapters)
+        count = sum(unit.document_id == book.id for unit in config.work_units)
         label = f"★ {book.id}" if book.id in critical else book.id
         books.add_row(
             label,
+            book.format,
             str(count),
             ", ".join(book.depends_on) or "—",
             f"{statement_schedule.rank[book.id]:g}",
             f"{proof_schedule.rank[book.id]:g}",
-            str(book.source),
+            str(book.path),
         )
     console.print(books)
+    units = Table(title="Work units and target scopes")
+    units.add_column("Work unit")
+    units.add_column("Title")
+    units.add_column("Dependencies")
+    units.add_column("Source span")
+    units.add_column("Target module")
+    units.add_column("Target scope")
+    for unit in config.work_units:
+        dependencies = (*unit.document.depends_on, *unit.depends_on)
+        units.add_row(
+            unit.id,
+            unit.title,
+            ", ".join(dict.fromkeys(dependencies)) or "—",
+            f"{unit.source}:{unit.source_span.start_line}-{unit.source_span.end_line}",
+            unit.chapter_module,
+            "\n".join(unit.scope),
+        )
+    console.print(units)
     console.print(
         "After drafting, every dependency-ready fixup runs concurrently from observed LastLib "
         "imports. Each completed patch is merged and rebuilt as soon as its refined predecessors "
@@ -556,13 +652,13 @@ async def _headless(
 
 
 def _run(args: argparse.Namespace, config: PipelineConfig, console: Console) -> int:
-    chapters = select_chapters(
+    chapters = select_work_units(
         config,
-        books=args.book,
-        chapter_selectors=args.chapter,
+        document_ids=args.book,
+        unit_selectors=args.chapter,
     )
     state = StateStore(config)
-    orchestrator = Orchestrator(config, state, chapters=chapters, force=args.force)
+    orchestrator = Orchestrator(config, state, work_units=chapters, force=args.force)
     if args.command == "stage":
         stage = Stage(args.stage)
 
@@ -628,21 +724,22 @@ def _managed_operation(
 
 
 def _serve_agent(args: argparse.Namespace, config: PipelineConfig) -> int:
-    chapters = select_chapters(config, books=[], chapter_selectors=[])
+    chapters = select_work_units(config, document_ids=[], unit_selectors=[])
     state = StateStore(config)
-    orchestrator = Orchestrator(config, state, chapters=chapters, force=args.force)
+    orchestrator = Orchestrator(config, state, work_units=chapters, force=args.force)
     operation = _managed_operation(orchestrator, args.stage)
     succeeded = asyncio.run(ControlServer(orchestrator, operation).run())
     return 0 if succeeded else 1
 
 
 def _agent_source_args(args: argparse.Namespace) -> list[str]:
+    values = ["--project", str(args.resolved_project.root)]
     if args.config is not None:
-        values = ["--config", str(Path(args.config).resolve())]
+        values.extend(["--config", str(Path(args.config).resolve())])
     elif args.target is not None:
-        values = [str(Path(args.target).resolve())]
-    else:
-        values = []
+        values.append(str(Path(args.target).resolve()))
+    elif args.resolved_project.config_path is not None:
+        values.extend(["--config", str(args.resolved_project.config_path)])
     if args.dependencies is not None:
         values.extend(["--dependencies", str(Path(args.dependencies).resolve())])
     if args.model is not None:
@@ -921,8 +1018,8 @@ def _control_response(command: str, config: PipelineConfig) -> dict[str, object]
                 f"no managed pipeline is running at {config.settings.state_dir}"
             ) from None
     if not response.get("scheduling"):
-        statements = build_corpus_schedule(config.books, config.chapters, phase="statements")
-        proofs = build_corpus_schedule(config.books, config.chapters, phase="proofs")
+        statements = build_corpus_schedule(config.documents, config.work_units, phase="statements")
+        proofs = build_corpus_schedule(config.documents, config.work_units, phase="proofs")
         schedule = scheduling_snapshot(statements, proofs)
         response["scheduling"] = schedule if command == "snapshot" else scheduling_summary(schedule)
     return response
@@ -983,8 +1080,13 @@ def _agent_command(args: argparse.Namespace, config: PipelineConfig) -> int:
 
 def main(argv: Sequence[str] | None = None) -> int:
     raw_arguments = list(argv) if argv is not None else sys.argv[1:]
-    if raw_arguments and (
-        raw_arguments[0].lower().endswith(".md") or Path(raw_arguments[0]).is_dir()
+    if (
+        raw_arguments
+        and raw_arguments[0] not in COMMAND_NAMES
+        and (
+            Path(raw_arguments[0]).suffix.casefold() in {".md", ".tex", ".txt"}
+            or Path(raw_arguments[0]).is_dir()
+        )
     ):
         raw_arguments.insert(0, "pipeline")
     arguments = parser().parse_args(raw_arguments)
@@ -994,7 +1096,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         arguments.startup_warning = RIPGREP_WARNING if missing_ripgrep else ""
         if missing_ripgrep and getattr(arguments, "no_tui", True):
             _warn_missing_ripgrep()
+        if arguments.command == "corpus":
+            raw_targets: tuple[str | Path, ...] = tuple(arguments.targets)
+        else:
+            target = getattr(arguments, "target", None)
+            raw_targets = (target,) if target is not None else ()
+        arguments.resolved_project = ProjectResolver().resolve(
+            project=getattr(arguments, "project", None),
+            targets=raw_targets,
+            config=getattr(arguments, "config", None),
+        )
         config = _config_from_args(arguments)
+        if arguments.command == "web":
+            from paf.web import run_web
+
+            run_web(config, host=arguments.host, port=arguments.port)
+            return 0
         if arguments.command == "agent":
             return _agent_command(arguments, config)
         if arguments.command == "plan":
@@ -1005,10 +1122,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         if arguments.command == "source-issues":
             return print_source_issues(config, console, raw_json=arguments.json)
         if arguments.command == "scaffold":
-            chapters = select_chapters(
+            chapters = select_work_units(
                 config,
-                books=arguments.book,
-                chapter_selectors=arguments.chapter,
+                document_ids=arguments.book,
+                unit_selectors=arguments.chapter,
             )
             created = scaffold_directories(config, chapters)
             noun = "directory" if len(created) == 1 else "directories"

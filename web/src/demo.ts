@@ -15,10 +15,18 @@ chapters.forEach(([book, chapter, title], chapterIndex) => {
   (["formalize", "fixup", "review", "prove"] as const).forEach((stage, stageIndex) => {
     const statuses = ["succeeded", "succeeded", "running", "pending"] as const;
     const status =
-      chapterIndex === 0 ? statuses[stageIndex] :
-      chapterIndex === 1 && stageIndex < 2 ? "succeeded" :
-      chapterIndex === 2 && stageIndex === 0 ? "running" : "pending";
+      chapterIndex === 0
+        ? statuses[stageIndex]
+        : chapterIndex === 1 && stageIndex < 2
+          ? "succeeded"
+          : chapterIndex === 2 && stageIndex === 0
+            ? "running"
+            : "pending";
     demoTasks[`${book}/chapter-${String(chapter).padStart(2, "0")}:${stage}`] = {
+      work_unit_id: `${book}/chapter-${String(chapter).padStart(2, "0")}`,
+      document_id: book,
+      ordinal: chapter,
+      unit_title: title,
       chapter_id: `${book}/chapter-${String(chapter).padStart(2, "0")}`,
       book_id: book,
       chapter_number: chapter,
@@ -71,6 +79,8 @@ export const demoState: SwarmState = {
     maximum_iterations: 4,
     error_count: 0,
     warning_count: 2,
+    current_work_unit_id: "book03/chapter-08",
+    target_work_unit_ids: ["book03/chapter-08"],
     current_chapter_id: "book03/chapter-08",
     target_chapter_ids: ["book03/chapter-08"],
     output_tail: [
@@ -97,9 +107,27 @@ export const demoState: SwarmState = {
       ],
       latest_summary: "Closed two proof holes; checking the remaining minpoly identity.",
       recent: [
-        { at: now, kind: "mcp_tool_call", status: "completed", title: "Lean diagnostics", detail: "0 errors · 1 declaration uses sorry" },
-        { at: now, kind: "file_change", status: "completed", title: "Edited discriminant formula", detail: "Section02PolynomialDiscriminantsAndTheIndexCorrection.lean" },
-        { at: now, kind: "reasoning", status: "updated", title: "Comparing power-basis normalizations", detail: "The Mathlib theorem uses the same sign convention." },
+        {
+          at: now,
+          kind: "mcp_tool_call",
+          status: "completed",
+          title: "Lean diagnostics",
+          detail: "0 errors · 1 declaration uses sorry",
+        },
+        {
+          at: now,
+          kind: "file_change",
+          status: "completed",
+          title: "Edited discriminant formula",
+          detail: "Section02PolynomialDiscriminantsAndTheIndexCorrection.lean",
+        },
+        {
+          at: now,
+          kind: "reasoning",
+          status: "updated",
+          title: "Comparing power-basis normalizations",
+          detail: "The Mathlib theorem uses the same sign convention.",
+        },
       ],
     },
     "demo-2": {
@@ -118,8 +146,19 @@ export const demoState: SwarmState = {
         { completed: false, text: "Audit coverage and unresolved dependencies" },
       ],
       recent: [
-        { at: now, kind: "file_change", status: "completed", title: "Created Section03PrimeAndDiscriminantTerms.lean" },
-        { at: now, kind: "todo", status: "updated", title: "Plan 3/6", detail: "State the finite-prime contribution." },
+        {
+          at: now,
+          kind: "file_change",
+          status: "completed",
+          title: "Created Section03PrimeAndDiscriminantTerms.lean",
+        },
+        {
+          at: now,
+          kind: "todo",
+          status: "updated",
+          title: "Plan 3/6",
+          detail: "State the finite-prime contribution.",
+        },
       ],
     },
   },

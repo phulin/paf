@@ -9,6 +9,8 @@ from itertools import pairwise
 from pathlib import Path
 from typing import Any
 
+from paf.adapters import LatexAdapter, MarkdownAdapter, TextAdapter, format_for_path
+from paf.backends import LeanBackend, lean_backend_from_config
 from paf.corpus import build_corpus_schedule
 from paf.models import (
     BookConfig,
@@ -17,8 +19,11 @@ from paf.models import (
     Stage,
     StageConfig,
     SwarmSettings,
+    WorkUnit,
     as_string_dict,
 )
+from paf.project import Project, ProjectResolver
+from paf.resolver import DEFAULT_INCLUDES, SourceResolver, glob_matches
 
 
 def _resolve(base: Path, value: str) -> Path:
@@ -88,7 +93,132 @@ def _stage_configs(raw_stages: dict[str, Any], base: Path) -> dict[Stage, StageC
     return stages
 
 
-def _read_books(raw_books: Any) -> tuple[BookConfig, ...]:
+_SOURCE_RULE_KEYS = {
+    "glob",
+    "format",
+    "profile",
+    "unit",
+    "follow_includes",
+    "heading_pattern",
+    "delimiter",
+    "verbatim_environments",
+}
+
+_SOURCE_DISCOVERY_KEYS = {
+    "roots",
+    "include",
+    "exclude",
+    "dependencies",
+    "manifest",
+    "ignore_defaults",
+}
+
+
+def _read_source_settings(
+    data: dict[str, Any],
+) -> tuple[dict[str, Any], tuple[dict[str, Any], ...], dict[str, Any]]:
+    raw = data.get("sources", {})
+    if not isinstance(raw, dict):
+        raise ValueError("sources must be a TOML table")
+    rules_raw = raw.get("rules", [])
+    if not isinstance(rules_raw, list):
+        raise ValueError("sources.rules must be an array of tables")
+    defaults = {key: value for key, value in raw.items() if key in _SOURCE_RULE_KEYS - {"glob"}}
+    unknown_source_keys = set(raw) - _SOURCE_RULE_KEYS - _SOURCE_DISCOVERY_KEYS - {"rules"}
+    if unknown_source_keys:
+        raise ValueError(f"unknown sources keys: {', '.join(sorted(unknown_source_keys))}")
+    discovery = {key: raw[key] for key in _SOURCE_DISCOVERY_KEYS if key in raw}
+    rules: list[dict[str, Any]] = []
+    for rule in rules_raw:
+        if not isinstance(rule, dict):
+            raise ValueError("each sources.rules item must be a table")
+        unknown = set(rule) - _SOURCE_RULE_KEYS
+        if unknown:
+            raise ValueError(f"unknown sources.rules keys: {', '.join(sorted(unknown))}")
+        if not isinstance(rule.get("glob"), str) or not rule["glob"]:
+            raise ValueError("sources.rules.glob is required and must be a non-empty string")
+        rules.append(dict(rule))
+    for options, name in ((defaults, "sources"), *((rule, "sources.rules") for rule in rules)):
+        format_value = options.get("format")
+        if format_value is not None and str(format_value).casefold() not in {
+            "markdown",
+            "md",
+            "latex",
+            "tex",
+            "text",
+            "txt",
+            "plain-text",
+            "plaintext",
+        }:
+            raise ValueError(f"{name}.format is unsupported: {format_value}")
+        if "follow_includes" in options and not isinstance(options["follow_includes"], bool):
+            raise ValueError(f"{name}.follow_includes must be a boolean")
+        for key in ("profile", "unit", "heading_pattern", "delimiter"):
+            if key in options and not isinstance(options[key], str):
+                raise ValueError(f"{name}.{key} must be a string")
+        heading_pattern = options.get("heading_pattern")
+        if isinstance(heading_pattern, str):
+            try:
+                re.compile(heading_pattern)
+            except re.error as error:
+                raise ValueError(f"{name}.heading_pattern is not a valid regex") from error
+        if options.get("delimiter") == "":
+            raise ValueError(f"{name}.delimiter must not be empty")
+        environments = options.get("verbatim_environments")
+        if environments is not None and (
+            not isinstance(environments, list)
+            or not all(isinstance(item, str) for item in environments)
+        ):
+            raise ValueError(f"{name}.verbatim_environments must be a list of strings")
+    for key in ("roots", "include", "exclude"):
+        value = discovery.get(key)
+        if value is not None and (
+            not isinstance(value, list) or not all(isinstance(item, str) and item for item in value)
+        ):
+            raise ValueError(f"sources.{key} must be a list of non-empty strings")
+    dependencies = discovery.get("dependencies")
+    if dependencies is not None and (
+        not isinstance(dependencies, dict)
+        or not all(
+            isinstance(key, str)
+            and key
+            and isinstance(value, list)
+            and all(isinstance(item, str) and item for item in value)
+            for key, value in dependencies.items()
+        )
+    ):
+        raise ValueError(
+            "sources.dependencies must map document paths or ids to lists of documents"
+        )
+    manifest = discovery.get("manifest")
+    if manifest is not None and not (
+        isinstance(manifest, str)
+        or (isinstance(manifest, list) and all(isinstance(item, str) and item for item in manifest))
+    ):
+        raise ValueError("sources.manifest must be a path or a list of document paths")
+    if "ignore_defaults" in discovery and not isinstance(discovery["ignore_defaults"], bool):
+        raise ValueError("sources.ignore_defaults must be a boolean")
+    return defaults, tuple(rules), discovery
+
+
+def _source_options(
+    source: str, raw: dict[str, Any], defaults: dict[str, Any], rules: tuple[dict[str, Any], ...]
+) -> dict[str, Any]:
+    options = dict(defaults)
+    options.update({key: raw[key] for key in _SOURCE_RULE_KEYS - {"glob"} if key in raw})
+    normalized = Path(source).as_posix()
+    for rule in rules:
+        if glob_matches(normalized, str(rule["glob"])):
+            options.update({key: value for key, value in rule.items() if key != "glob"})
+    return options
+
+
+def _read_books(
+    raw_books: Any,
+    *,
+    source_defaults: dict[str, Any] | None = None,
+    source_rules: tuple[dict[str, Any], ...] = (),
+) -> tuple[BookConfig, ...]:
     if not isinstance(raw_books, list) or not raw_books:
         raise ValueError("configuration must contain at least one [[books]] table")
     books: list[BookConfig] = []
@@ -98,6 +228,17 @@ def _read_books(raw_books: Any) -> tuple[BookConfig, ...]:
         for key in ("id", "title", "source", "lean_root", "module"):
             if not isinstance(raw.get(key), str) or not raw[key]:
                 raise ValueError(f"books.{key} is required and must be a non-empty string")
+        options = _source_options(raw["source"], raw, source_defaults or {}, source_rules)
+        source_format = str(options.get("format") or format_for_path(raw["source"])).casefold()
+        source_format = {
+            "md": "markdown",
+            "tex": "latex",
+            "txt": "text",
+            "plain-text": "text",
+            "plaintext": "text",
+        }.get(source_format, source_format)
+        default_profile = "numbered-chapters" if source_format == "markdown" else "default"
+        adapter_profile = str(options.get("profile", default_profile))
         chapter_numbers = raw.get("chapters", [])
         if not isinstance(chapter_numbers, list) or not all(
             isinstance(number, int) and number > 0 for number in chapter_numbers
@@ -131,7 +272,19 @@ def _read_books(raw_books: Any) -> tuple[BookConfig, ...]:
                 statement_effort=efforts["statement_effort"],
                 proof_effort=efforts["proof_effort"],
                 chapters=tuple(chapter_numbers),
-                heading_pattern=str(raw.get("heading_pattern", BookConfig.heading_pattern)),
+                format=source_format,
+                adapter_profile=adapter_profile,
+                unit=str(options["unit"]) if "unit" in options else None,
+                follow_includes=bool(options.get("follow_includes", False)),
+                delimiter=str(options["delimiter"]) if "delimiter" in options else None,
+                verbatim_environments=tuple(options.get("verbatim_environments", ())),
+                heading_pattern=(
+                    str(options["heading_pattern"])
+                    if "heading_pattern" in options
+                    else BookConfig.heading_pattern
+                    if source_format == "markdown" and adapter_profile == "numbered-chapters"
+                    else None
+                ),
                 chapter_path=str(raw.get("chapter_path", "Chapter{chapter_number_padded}")),
                 chapter_module=str(
                     raw.get("chapter_module", "{module}.Chapter{chapter_number_padded}")
@@ -156,17 +309,52 @@ def _read_books(raw_books: Any) -> tuple[BookConfig, ...]:
 
 
 def _discover_chapters(repo: Path, book: BookConfig) -> list[Chapter]:
-    source_path = repo / book.source
-    try:
-        source_text = source_path.read_text(encoding="utf-8")
-    except OSError as error:
-        raise ValueError(f"cannot read source for {book.id}: {source_path}") from error
-    pattern = re.compile(book.heading_pattern, re.MULTILINE)
-    discovered: dict[int, str] = {}
-    for match in pattern.finditer(source_text):
-        number = int(match.group("number"))
-        discovered[number] = match.group("title").strip()
-    selected = book.chapters or tuple(sorted(discovered))
+    if book.format == "markdown":
+        markdown_level = {
+            "part": 1,
+            "chapter": 2,
+            "section": 2,
+            "subsection": 3,
+            "h1": 1,
+            "h2": 2,
+            "h3": 3,
+            "h4": 4,
+            "h5": 5,
+            "h6": 6,
+        }.get(book.unit or "section", 2)
+        adapter = MarkdownAdapter(
+            root=repo,
+            document_id=book.id,
+            document_title=book.title,
+            profile=book.adapter_profile,
+            heading_levels=(markdown_level,),
+            heading_pattern=book.heading_pattern,
+        )
+    elif book.format == "latex":
+        adapter = LatexAdapter(
+            root=repo,
+            document_id=book.id,
+            document_title=book.title,
+            unit=book.unit or "section",
+            follow_includes=book.follow_includes,
+            verbatim_environments=book.verbatim_environments or None,
+        )
+    elif book.format == "text":
+        adapter = TextAdapter(
+            root=repo,
+            document_id=book.id,
+            document_title=book.title,
+            heading_pattern=book.heading_pattern,
+            delimiter=book.delimiter,
+        )
+    else:
+        raise ValueError(f"unsupported source format for {book.id}: {book.format}")
+    document = adapter.read_document(repo / book.source)
+    discovered_units = adapter.discover_units(document)
+    discovered = {unit.ordinal: unit for unit in discovered_units}
+    if len(discovered) != len(discovered_units):
+        raise ValueError(f"source {book.id} has duplicate unit ordinals")
+    selected = book.chapters or tuple(unit.ordinal for unit in discovered_units)
     missing = [number for number in selected if number not in discovered]
     if missing:
         raise ValueError(f"book {book.id} is missing source headings for chapters {missing}")
@@ -177,7 +365,7 @@ def _discover_chapters(repo: Path, book: BookConfig) -> list[Chapter]:
             "book_title": book.title,
             "chapter_number": str(number),
             "chapter_number_padded": f"{number:02d}",
-            "chapter_title": discovered[number],
+            "chapter_title": discovered[number].title,
             "source": book.source.as_posix(),
             "lean_root": book.lean_root.as_posix(),
             "module": book.module,
@@ -194,8 +382,8 @@ def _discover_chapters(repo: Path, book: BookConfig) -> list[Chapter]:
                 book_id=book.id,
                 book_title=book.title,
                 number=number,
-                title=discovered[number],
-                source=book.source,
+                title=discovered[number].title,
+                source=discovered[number].source,
                 lean_root=book.lean_root,
                 module=book.module,
                 chapter_path=chapter_path,
@@ -204,21 +392,46 @@ def _discover_chapters(repo: Path, book: BookConfig) -> list[Chapter]:
                 scope=tuple(_render(item, variables) for item in book.scope),
                 depends_on_books=book.depends_on,
                 context=book.context,
+                source_span=discovered[number].source_span,
             )
         )
     return chapters
 
 
-def load_config(path: str | Path) -> PipelineConfig:
+def _chapter_from_work_unit(unit: WorkUnit) -> Chapter:
+    """Expose a canonical target-mapped unit to legacy extension call sites."""
+
+    target = unit._target()
+    return Chapter(
+        book_id=unit.document_id,
+        book_title=unit.document.title,
+        number=unit.ordinal,
+        title=unit.title,
+        source=unit.source,
+        lean_root=target.root,
+        module=target.module,
+        chapter_path=target.path,
+        chapter_module=target.unit_module,
+        build_command=target.build_command,
+        scope=target.scope,
+        depends_on_books=unit.document.depends_on,
+        context=unit.context,
+        source_span=unit.source_span,
+    )
+
+
+def load_config(path: str | Path, *, project: Project | None = None) -> PipelineConfig:
     config_path = Path(path).resolve()
+    project = project or ProjectResolver().resolve(config=config_path)
     with config_path.open("rb") as handle:
         data = tomllib.load(handle)
     base = config_path.parent
     swarm = _table(data, "swarm")
     if "lean_mcp" in swarm:
         raise ValueError("swarm.lean_mcp was removed; Lean MCP is always enabled")
-    repo = _resolve(base, str(swarm.get("repo", ".")))
-    state_dir = _resolve(repo, str(swarm.get("state_dir", ".paf")))
+    repo = project.repository_path(str(swarm.get("repo", ".")), base=base)
+    project = project.bind(root=repo, config_path=config_path)
+    state_dir = project.state_path(str(swarm.get("state_dir", ".paf")))
     settings = SwarmSettings(
         repo=repo,
         state_dir=state_dir,
@@ -268,28 +481,123 @@ def load_config(path: str | Path) -> PipelineConfig:
 
     stages = _stage_configs(_table(data, "stages"), base)
 
-    books = _read_books(data.get("books"))
+    source_defaults, source_rules, source_discovery = _read_source_settings(data)
+    if "backend" in data and "target" in data:
+        raise ValueError("configure [backend] or the [target] alias, not both")
+    raw_backend = data.get("backend", data.get("target", {}))
+    if not isinstance(raw_backend, dict):
+        raise ValueError("backend must be a TOML table")
+    backend = lean_backend_from_config(
+        raw_backend,
+        repo=repo,
+        legacy_project=settings.lean_project,
+        legacy_timeout=settings.lean_mcp_tool_timeout_seconds,
+    )
+    settings = replace(
+        settings,
+        lean_project=backend.project,
+        lean_mcp_tool_timeout_seconds=backend.mcp_tool_timeout_seconds,
+    )
+    raw_books = data.get("books")
+    source_roots = tuple(Path(item) for item in source_discovery.get("roots", ()))
+    source_include = tuple(source_discovery.get("include", DEFAULT_INCLUDES))
+    source_exclude = tuple(source_discovery.get("exclude", ()))
+    if raw_books is None:
+        if not source_roots:
+            raise ValueError("configuration must contain [[books]] or non-empty sources.roots")
+        resolver = SourceResolver(
+            repo,
+            include=source_include,
+            exclude=source_exclude,
+            rules=({"glob": "**/*", **source_defaults}, *source_rules),
+            dependencies=source_discovery.get("dependencies"),
+            manifest=source_discovery.get("manifest"),
+            ignore_defaults=bool(source_discovery.get("ignore_defaults", True)),
+        )
+        resolved_sources = resolver.resolve_all(source_roots)
+        documents = resolved_sources.documents
+        books = tuple(
+            _inferred_book_from_document(
+                repo,
+                document,
+                _source_options(document.path.as_posix(), {}, source_defaults, source_rules),
+            )
+            for document in documents
+        )
+        books = tuple(
+            replace(
+                book,
+                id=document.id,
+                depends_on=document.depends_on,
+            )
+            for document, book in zip(documents, books, strict=True)
+        )
+    else:
+        books = tuple(
+            replace(
+                book,
+                source=_repo_relative(repo, book.source.as_posix(), name=f"books.{book.id}.source"),
+            )
+            for book in _read_books(
+                raw_books, source_defaults=source_defaults, source_rules=source_rules
+            )
+        )
     chapters = tuple(chapter for book in books for chapter in _discover_chapters(repo, book))
-    # Validate the complete graph while loading, before any agents are launched.
-    build_corpus_schedule(books, chapters, phase="statements")
-    return PipelineConfig(
+    canonical_documents = None
+    canonical_work_units = None
+    if raw_books is None:
+        canonical_documents = documents
+        canonical_work_units = backend.map_units(resolved_sources.work_units)
+        chapters = tuple(_chapter_from_work_unit(unit) for unit in canonical_work_units)
+    elif set(raw_backend).intersection(
+        {
+            "root",
+            "module",
+            "path",
+            "unit_module",
+            "build_command",
+            "scope",
+            "target_root",
+            "target_path",
+            "target_module",
+            "scope_templates",
+            "build_command_template",
+            "chapter_path",
+            "chapter_module",
+            "manifest",
+            "mappings",
+            "targets",
+        }
+    ):
+        legacy_documents = {book.id: book.as_source_document() for book in books}
+        units = tuple(
+            chapter.as_work_unit(legacy_documents[chapter.book_id]) for chapter in chapters
+        )
+        canonical_documents = tuple(legacy_documents.values())
+        canonical_work_units = backend.map_units(units)
+        chapters = tuple(_chapter_from_work_unit(unit) for unit in canonical_work_units)
+    config = PipelineConfig(
         path=config_path,
         settings=settings,
         stages=stages,
         books=books,
         chapters=chapters,
+        source_rules=source_rules,
+        source_roots=source_roots,
+        source_include=source_include,
+        source_exclude=source_exclude,
+        backend=backend,
+        canonical_documents=canonical_documents,
+        canonical_work_units=canonical_work_units,
+        project=project.bind(
+            source_paths=(repo / book.source for book in books),
+            target_dir=repo / backend.project,
+            state_dir=state_dir,
+        ),
     )
-
-
-def _repository_root(target: Path) -> Path:
-    for candidate in (target.parent, *target.parents):
-        if (candidate / ".git").exists():
-            return candidate
-    current = Path.cwd().resolve()
-    for candidate in (current, *current.parents):
-        if (candidate / ".git").exists():
-            return candidate
-    return current
+    # Validate the complete graph while loading, before any agents are launched.
+    build_corpus_schedule(config.documents, config.work_units, phase="statements")
+    return config
 
 
 def _pascal_case(value: str) -> str:
@@ -298,10 +606,11 @@ def _pascal_case(value: str) -> str:
 
 
 def _source_title(target: Path) -> str:
-    text = target.read_text(encoding="utf-8")
-    match = re.search(r"^#\s+(.+?)\s*$", text, re.MULTILINE)
-    if match:
-        return match.group(1).strip()
+    source_format = format_for_path(target)
+    if source_format == "markdown":
+        return MarkdownAdapter(root=target.parent).read_document(target).title
+    if source_format == "latex":
+        return LatexAdapter(root=target.parent).read_document(target).title
     name = re.sub(r"^\d+[-_]", "", target.stem)
     return name.replace("-", " ").replace("_", " ").title()
 
@@ -312,7 +621,13 @@ def _existing_lean_stem(repo: Path, number: int) -> str | None:
     return next(iter(stems)) if len(stems) == 1 else None
 
 
-def _infer_book(repo: Path, source_path: Path) -> BookConfig:
+def _infer_book(
+    repo: Path,
+    source_path: Path,
+    *,
+    options: dict[str, Any] | None = None,
+    markdown_profile: str = "numbered-chapters",
+) -> BookConfig:
     try:
         source = source_path.relative_to(repo)
     except ValueError:
@@ -326,22 +641,70 @@ def _infer_book(repo: Path, source_path: Path) -> BookConfig:
     else:
         book_id = re.sub(r"[^a-z0-9]+", "-", source_path.stem.lower()).strip("-")
         lean_stem = f"Book{_pascal_case(title)}"
+    selected = options or {}
+    source_format = str(selected.get("format") or format_for_path(source_path)).casefold()
+    source_format = {
+        "md": "markdown",
+        "tex": "latex",
+        "txt": "text",
+        "plain-text": "text",
+        "plaintext": "text",
+    }.get(source_format, source_format)
+    profile = str(
+        selected.get("profile", markdown_profile if source_format == "markdown" else "default")
+    )
     return BookConfig(
         id=book_id,
         title=title,
         source=source,
         lean_root=Path("lean") / "LastLib" / lean_stem,
         module=f"LastLib.{lean_stem}",
+        format=source_format,
+        adapter_profile=profile,
+        unit=(
+            str(selected["unit"])
+            if "unit" in selected
+            else "section"
+            if source_format == "latex"
+            else None
+        ),
+        follow_includes=bool(selected.get("follow_includes", False)),
+        delimiter=str(selected["delimiter"]) if "delimiter" in selected else None,
+        verbatim_environments=tuple(selected.get("verbatim_environments", ())),
+        heading_pattern=(
+            str(selected["heading_pattern"])
+            if "heading_pattern" in selected
+            else BookConfig.heading_pattern
+            if source_format == "markdown" and profile == "numbered-chapters"
+            else None
+        ),
     )
 
 
-def infer_config(target: str | Path) -> PipelineConfig:
+def _inferred_book_from_document(repo: Path, document: Any, options: dict[str, Any]) -> BookConfig:
+    book = _infer_book(
+        repo,
+        repo / document.path,
+        options=options,
+        markdown_profile="atx",
+    )
+    return replace(book, title=document.title)
+
+
+def infer_config(target: str | Path, *, project: Project | None = None) -> PipelineConfig:
     source_path = Path(target).resolve()
     if source_path.is_dir():
-        return infer_corpus((source_path,))
-    if not source_path.is_file() or source_path.suffix.lower() != ".md":
-        raise ValueError(f"target must be an existing Markdown file or directory: {source_path}")
-    repo = _repository_root(source_path)
+        return infer_corpus((source_path,), project=project)
+    if not source_path.is_file():
+        raise ValueError(f"target must be an existing .md, .tex, or .txt file: {source_path}")
+    try:
+        format_for_path(source_path)
+    except ValueError as error:
+        raise ValueError(
+            f"target must be an existing .md, .tex, or .txt file: {source_path}"
+        ) from error
+    project = project or ProjectResolver().resolve(targets=(source_path,))
+    repo = project.root
     book = _infer_book(repo, source_path)
     settings = SwarmSettings(
         repo=repo,
@@ -356,26 +719,39 @@ def infer_config(target: str | Path) -> PipelineConfig:
         stages=_stage_configs({}, repo),
         books=(book,),
         chapters=chapters,
+        backend=LeanBackend(
+            project=settings.lean_project,
+            mcp_tool_timeout_seconds=settings.lean_mcp_tool_timeout_seconds,
+        ),
+        project=project.bind(
+            root=repo,
+            source_paths=(source_path,),
+            target_dir=repo / settings.lean_project,
+            state_dir=settings.state_dir,
+        ),
     )
 
 
-def _expand_markdown_targets(targets: tuple[str | Path, ...]) -> tuple[Path, ...]:
-    expanded: list[Path] = []
-    for target in targets:
-        path = Path(target).resolve()
-        if path.is_dir():
-            matches = sorted(item for item in path.glob("*.md") if item.is_file())
-            if not matches:
-                raise ValueError(f"directory contains no Markdown books: {path}")
-            expanded.extend(matches)
-        elif path.is_file() and path.suffix.lower() == ".md":
-            expanded.append(path)
-        else:
-            raise ValueError(f"target must be an existing Markdown file or directory: {path}")
-    unique = tuple(dict.fromkeys(expanded))
-    if not unique:
-        raise ValueError("corpus requires at least one Markdown target")
-    return unique
+def _expand_source_targets(
+    targets: tuple[str | Path, ...],
+    *,
+    project: Project | None = None,
+) -> tuple[Path, tuple[Path, ...], frozenset[Path]]:
+    if not targets:
+        raise ValueError("corpus requires at least one source file or directory")
+    supplied = tuple(Path(target).resolve() for target in targets)
+    for path in supplied:
+        if not path.exists():
+            raise ValueError(f"source target does not exist: {path}")
+    repo = (
+        project.root
+        if project is not None
+        else ProjectResolver().resolve(targets=(supplied[0],)).root
+    )
+    resolver = SourceResolver(repo)
+    relative = resolver.discover_paths(supplied)
+    direct_files = frozenset(path for path in supplied if path.is_file())
+    return repo, tuple(repo / path for path in relative), direct_files
 
 
 def parse_book_dependencies(path: str | Path) -> dict[str, tuple[str, ...]]:
@@ -401,17 +777,38 @@ def infer_corpus(
     targets: tuple[str | Path, ...],
     *,
     dependency_file: str | Path | None = None,
+    project: Project | None = None,
 ) -> PipelineConfig:
-    source_paths = _expand_markdown_targets(targets)
-    repo = _repository_root(source_paths[0])
-    for source_path in source_paths[1:]:
-        if _repository_root(source_path) != repo:
-            raise ValueError("all corpus targets must belong to the same repository")
-
-    books = tuple(_infer_book(repo, source_path) for source_path in source_paths)
+    project = project or ProjectResolver().resolve(targets=targets)
+    repo, source_paths, direct_files = _expand_source_targets(targets, project=project)
+    books = tuple(
+        _infer_book(
+            repo,
+            source_path,
+            markdown_profile=("numbered-chapters" if source_path in direct_files else "atx"),
+        )
+        for source_path in source_paths
+    )
     ids = [book.id for book in books]
     if len(ids) != len(set(ids)):
-        raise ValueError("inferred book ids must be unique; use a TOML config to disambiguate")
+        duplicates = {item for item in ids if ids.count(item) > 1}
+        books = tuple(
+            replace(
+                book,
+                id=(
+                    re.sub(
+                        r"[^a-z0-9]+",
+                        "-",
+                        book.source.with_suffix("").as_posix().casefold(),
+                    ).strip("-")
+                    if book.id in duplicates
+                    else book.id
+                ),
+            )
+            for book in books
+        )
+        if len({book.id for book in books}) != len(books):
+            raise ValueError("inferred source document ids must be unique")
 
     graph_path = Path(dependency_file).resolve() if dependency_file is not None else None
     if graph_path is None and (repo / "BOOK_DEPENDENCIES.md").is_file():
@@ -423,8 +820,9 @@ def infer_corpus(
         for book in books
     )
     chapters = tuple(chapter for book in books for chapter in _discover_chapters(repo, book))
-    build_corpus_schedule(books, chapters, phase="statements")
-    identity = "\n".join(sorted(source_path.as_posix() for source_path in source_paths))
+    identity = "\n".join(
+        sorted(source_path.relative_to(repo).as_posix() for source_path in source_paths)
+    )
     corpus_id = sha256(identity.encode()).hexdigest()[:10]
     settings = SwarmSettings(
         repo=repo,
@@ -432,13 +830,27 @@ def infer_corpus(
         model="gpt-5.6-luna",
         reasoning_effort="max",
     )
-    return PipelineConfig(
+    config = PipelineConfig(
         path=graph_path or repo,
         settings=settings,
         stages=_stage_configs({}, repo),
         books=books,
         chapters=chapters,
+        source_roots=tuple(Path(target).resolve().relative_to(repo) for target in targets),
+        source_include=DEFAULT_INCLUDES,
+        backend=LeanBackend(
+            project=settings.lean_project,
+            mcp_tool_timeout_seconds=settings.lean_mcp_tool_timeout_seconds,
+        ),
+        project=project.bind(
+            root=repo,
+            source_paths=source_paths,
+            target_dir=repo / settings.lean_project,
+            state_dir=settings.state_dir,
+        ),
     )
+    build_corpus_schedule(config.documents, config.work_units, phase="statements")
+    return config
 
 
 def resolve_config(
@@ -446,21 +858,25 @@ def resolve_config(
     config: str | Path | None,
     target: str | Path | None,
     dependency_file: str | Path | None = None,
+    project: Project | None = None,
 ) -> PipelineConfig:
+    project = project or ProjectResolver().resolve(
+        targets=((target,) if target is not None else ()), config=config
+    )
     if config is not None and target is not None:
-        raise ValueError("pass either --config or a Markdown target, not both")
+        raise ValueError("pass either --config or a source target, not both")
     if config is not None:
         if dependency_file is not None:
-            raise ValueError("--dependencies is only used with inferred Markdown targets")
-        return load_config(config)
+            raise ValueError("--dependencies is only used with inferred source targets")
+        return load_config(config, project=project)
     if target is not None:
         path = Path(target)
         if path.is_dir():
-            return infer_corpus((path,), dependency_file=dependency_file)
+            return infer_corpus((path,), dependency_file=dependency_file, project=project)
         if dependency_file is not None:
-            return infer_corpus((path,), dependency_file=dependency_file)
-        return infer_config(path)
-    default = Path("paf.toml")
-    if default.is_file():
-        return load_config(default)
-    raise ValueError("pass a target .md or --config; no paf.toml was found")
+            return infer_corpus((path,), dependency_file=dependency_file, project=project)
+        return infer_config(path, project=project)
+    default = project.config_path
+    if default is not None and default.is_file():
+        return load_config(default, project=project)
+    raise ValueError("pass a .md, .tex, or .txt target or --config; no paf.toml was found")

@@ -7,7 +7,9 @@ requires-python = ">=3.12"
 dependencies = [
   "lean-lsp-mcp==0.29.0",
   "orjson>=3.11.0",
+  "starlette>=0.47.0",
   "textual>=6.0.0",
+  "uvicorn>=0.35.0",
 ]
 
 [project.scripts]
@@ -27,8 +29,23 @@ dev = [
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+[tool.hatch.build]
+# These non-Python resources are runtime inputs. Listing them as artifacts makes
+# their inclusion explicit even if a future build exclude becomes broader.
+artifacts = [
+  "src/paf/prompts/*.md",
+  "src/paf/web_dist/**",
+]
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/paf"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "/README.md",
+  "/pyproject.toml",
+  "/src/paf",
+]
 
 [tool.pytest.ini_options]
 addopts = "-q"

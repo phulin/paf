@@ -2,10 +2,15 @@ export type Stage = "formalize" | "fixup" | "review" | "prove";
 export type TaskStatus = "pending" | "running" | "succeeded" | "failed" | "blocked";
 
 export interface Task {
-  chapter_id: string;
-  book_id: string;
-  chapter_number: number;
-  chapter_title: string;
+  work_unit_id: string;
+  document_id: string;
+  ordinal: number;
+  unit_title: string;
+  /** Legacy state aliases, retained while old snapshots remain readable. */
+  chapter_id?: string;
+  book_id?: string;
+  chapter_number?: number;
+  chapter_title?: string;
   stage: Stage;
   status: TaskStatus;
   phase: string;
@@ -31,10 +36,12 @@ export interface CoordinatorBuild {
   total: number;
   iteration: number;
   maximum_iterations: number;
-  target_chapter_ids?: string[];
+  target_work_unit_ids?: string[];
   error_count: number;
   warning_count: number;
-  current_chapter_id: string | null;
+  current_work_unit_id: string | null;
+  target_chapter_ids?: string[];
+  current_chapter_id?: string | null;
   output_tail: string[];
 }
 
@@ -70,7 +77,8 @@ export interface SwarmSummary {
   queued_agents: number;
   running_tasks: number;
   task_count: number;
-  book_count: number;
+  document_count: number;
+  book_count?: number;
 }
 
 export interface SystemLoad {

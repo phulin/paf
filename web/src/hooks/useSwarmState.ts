@@ -6,8 +6,8 @@ import type { SwarmState, SwarmSummary, SystemLoad } from "../types";
 export function useSwarmState(live: boolean) {
   const [state, setState] = useState<SwarmState>(demoState);
   const [swarms, setSwarms] = useState<SwarmSummary[]>([]);
-  const [selectedSwarm, setSelectedSwarm] = useState<string | null>(() =>
-    corpusFromUrl() ?? window.localStorage.getItem("paf.selectedSwarm"),
+  const [selectedSwarm, setSelectedSwarm] = useState<string | null>(
+    () => corpusFromUrl() ?? window.localStorage.getItem("paf.selectedSwarm"),
   );
   const [connected, setConnected] = useState(false);
   const [fetching, setFetching] = useState(true);
@@ -21,12 +21,12 @@ export function useSwarmState(live: boolean) {
         fetch("/api/system", { cache: "no-store" }),
       ]);
       if (!listResponse.ok) throw new Error(`swarm list endpoint returned ${listResponse.status}`);
-      if (systemResponse.ok) setSystemLoad(await systemResponse.json() as SystemLoad);
-      const list = (await listResponse.json() as { swarms: SwarmSummary[] }).swarms;
+      if (systemResponse.ok) setSystemLoad((await systemResponse.json()) as SystemLoad);
+      const list = ((await listResponse.json()) as { swarms: SwarmSummary[] }).swarms;
       setSwarms(list);
       const target = list.some((swarm) => swarm.id === selectedSwarm)
         ? selectedSwarm
-        : list.find((swarm) => swarm.active)?.id ?? list[0]?.id ?? null;
+        : (list.find((swarm) => swarm.active)?.id ?? list[0]?.id ?? null);
       if (target !== selectedSwarm) setSelectedSwarm(target);
       if (target) {
         window.localStorage.setItem("paf.selectedSwarm", target);
@@ -35,7 +35,7 @@ export function useSwarmState(live: boolean) {
       const params = target ? `?swarm=${encodeURIComponent(target)}` : "";
       const response = await fetch(`/api/swarm${params}`, { cache: "no-store" });
       if (!response.ok) throw new Error(`state endpoint returned ${response.status}`);
-      setState(await response.json() as SwarmState);
+      setState((await response.json()) as SwarmState);
       setConnected(true);
     } catch {
       setConnected(false);
@@ -44,12 +44,15 @@ export function useSwarmState(live: boolean) {
     }
   }, [selectedSwarm]);
 
-  const selectSwarm = useCallback((swarmId: string) => {
-    if (swarmId === selectedSwarm) return;
-    window.localStorage.setItem("paf.selectedSwarm", swarmId);
-    setCorpusUrl(swarmId, "push");
-    setSelectedSwarm(swarmId);
-  }, [selectedSwarm]);
+  const selectSwarm = useCallback(
+    (swarmId: string) => {
+      if (swarmId === selectedSwarm) return;
+      window.localStorage.setItem("paf.selectedSwarm", swarmId);
+      setCorpusUrl(swarmId, "push");
+      setSelectedSwarm(swarmId);
+    },
+    [selectedSwarm],
+  );
 
   useEffect(() => {
     const restoreCorpus = () => {

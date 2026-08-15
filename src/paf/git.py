@@ -5,7 +5,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-from paf.models import Chapter, Stage
+from paf.models import Stage, WorkUnitLike
 from paf.scope import ScopeMatcher
 
 
@@ -24,7 +24,7 @@ def _book_label(book_id: str) -> str:
     return str(int(match.group())) if match else book_id
 
 
-def agent_commit_subject(chapter: Chapter, stage: Stage) -> str:
+def agent_commit_subject(chapter: WorkUnitLike, stage: Stage) -> str:
     """Build the stable Conventional Commit subject for one agent patch."""
 
     book = _book_label(chapter.book_id)
@@ -78,7 +78,7 @@ class GitCommitter:
         await self._checked("rev-parse", "--verify", "HEAD")
         self.enabled = True
 
-    async def dirty_paths(self, chapter: Chapter) -> tuple[str, ...]:
+    async def dirty_paths(self, chapter: WorkUnitLike) -> tuple[str, ...]:
         if not self.enabled:
             return ()
         tracked, untracked = await asyncio.gather(
@@ -94,7 +94,7 @@ class GitCommitter:
         }
         return tuple(sorted(paths))
 
-    async def ensure_clean(self, chapter: Chapter) -> None:
+    async def ensure_clean(self, chapter: WorkUnitLike) -> None:
         dirty = await self.dirty_paths(chapter)
         if dirty:
             raise GitCommitError(
@@ -104,7 +104,7 @@ class GitCommitter:
 
     async def commit(
         self,
-        chapter: Chapter,
+        chapter: WorkUnitLike,
         stage: Stage,
         *,
         summary: str,

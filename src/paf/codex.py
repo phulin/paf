@@ -12,13 +12,15 @@ from collections.abc import Awaitable, Callable, Iterable
 from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from importlib.resources import files
 from pathlib import Path
 from typing import Any
 
 from paf import json_codec as json
 from paf.activity import EVENT_TIMESTAMP_FIELD, activity_timestamp
+from paf.backends import LeanBackend
 from paf.diagnostics import unexpected_lean_warnings
-from paf.models import Chapter, PipelineConfig, Stage
+from paf.models import PipelineConfig, Stage, WorkUnitLike
 from paf.scope import ScopeMatcher
 from paf.state import RunRecord, StateStore, TaskStatus, TokenUsage
 
@@ -174,9 +176,10 @@ LEAN_MCP_FIXUP_TOOLS = (
 USAGE_POLL_SECONDS = 1.0
 ROLLOUT_READ_BYTES = 1024 * 1024
 PROCESS_GROUP_GRACE_SECONDS = 1.0
-COMMON_PROMPT_PATH = Path(__file__).with_name("prompts") / "common.md"
-PROOF_REVIEW_PROMPT_PATH = Path(__file__).with_name("prompts") / "proof_review.md"
-UPSTREAM_REPAIR_PROMPT_PATH = Path(__file__).with_name("prompts") / "upstream_repair.md"
+_PROMPT_RESOURCES = files("paf.prompts")
+COMMON_PROMPT_PATH = Path(str(_PROMPT_RESOURCES.joinpath("common.md")))
+PROOF_REVIEW_PROMPT_PATH = Path(str(_PROMPT_RESOURCES.joinpath("proof_review.md")))
+UPSTREAM_REPAIR_PROMPT_PATH = Path(str(_PROMPT_RESOURCES.joinpath("upstream_repair.md")))
 UPSTREAM_REPAIR_ROLE = "upstream_repair"
 DOWNSTREAM_RETRY_ROLE = "downstream_retry"
 CAPACITY_RESUME_PROMPT = "Continue from the interrupted turn and complete the assigned task."
@@ -242,7 +245,7 @@ class FatalCodexInvocationError(RuntimeError):
     """A non-retryable Codex request/configuration failure."""
 
 
-def render_prompt(template: str, chapter: Chapter) -> str:
+def render_prompt(template: str, chapter: WorkUnitLike) -> str:
     for key, value in chapter.variables().items():
         template = template.replace("{" + key + "}", value)
     return template
@@ -280,7 +283,7 @@ def _bounded_feedback(feedback: str, maximum: int = 48_000) -> str:
     return feedback[:head] + omission + feedback[-(available - head) :]
 
 
-def scoped_files(repo: Path, chapter: Chapter) -> list[Path]:
+def scoped_files(repo: Path, chapter: WorkUnitLike) -> list[Path]:
     return ScopeMatcher(chapter.scope).files(repo)
 
 
@@ -297,20 +300,27 @@ def _line_numbered(lines: list[str], *, start: int = 1) -> str:
     return "".join(f"{number:6d} | {line}\n" for number, line in enumerate(lines, start))
 
 
-def _textbook_chapter_excerpt(repo: Path, chapter: Chapter) -> tuple[str, str]:
+def _textbook_chapter_excerpt(repo: Path, chapter: WorkUnitLike) -> tuple[str, str]:
     source = chapter.source if chapter.source.is_absolute() else repo / chapter.source
     if not source.is_file():
         return _display_path(repo, source), "[Textbook source is missing.]\n"
     lines = source.read_text(encoding="utf-8", errors="replace").splitlines()
-    heading = re.compile(rf"^##\s+{chapter.number}\.\s+")
-    next_heading = re.compile(r"^##\s+\d+\.\s+")
-    start = next((index for index, line in enumerate(lines) if heading.match(line)), None)
-    if start is None:
-        return _display_path(repo, source), "[Configured chapter heading was not found.]\n"
-    stop = next(
-        (index for index in range(start + 1, len(lines)) if next_heading.match(lines[index])),
-        len(lines),
-    )
+    start = max(chapter.source_span.start_line - 1, 0)
+    stop = min(chapter.source_span.end_line, len(lines))
+    # A legacy numbered-Markdown source may have changed after discovery. Keep
+    # its historical heading-to-heading excerpt behavior while all other
+    # adapters use the format-neutral recorded span.
+    if start < len(lines) and re.match(r"^##\s+\d+\.\s+", lines[start]):
+        stop = next(
+            (
+                index
+                for index in range(start + 1, len(lines))
+                if re.match(r"^##\s+\d+\.\s+", lines[index])
+            ),
+            len(lines),
+        )
+    if start >= len(lines) or stop <= start:
+        return _display_path(repo, source), "[Configured source span was not found.]\n"
     return _display_path(repo, source), _line_numbered(lines[start:stop], start=start + 1)
 
 
@@ -357,7 +367,7 @@ def declaration_uses_placeholder(repo: Path, path: str, declaration: str) -> boo
 
 def declaration_uses_placeholder_in_chapter(
     repo: Path,
-    chapter: Chapter,
+    chapter: WorkUnitLike,
     declaration: str,
 ) -> bool | None:
     """Resolve a reported declaration inside one chapter's configured source scope.
@@ -377,9 +387,9 @@ def declaration_uses_placeholder_in_chapter(
 
 def _upstream_source_bundle(
     repo: Path,
-    owner: Chapter,
+    owner: WorkUnitLike,
     requests: Iterable[dict[str, Any]],
-    chapters: Iterable[Chapter],
+    chapters: Iterable[WorkUnitLike],
     maximum: int = UPSTREAM_SOURCE_BUNDLE_MAX_CHARS,
 ) -> str:
     """Supply exact requests and their relevant source evidence to one repair agent."""
@@ -466,7 +476,7 @@ def _upstream_source_bundle(
     return bundle[: maximum - len(marker)] + marker
 
 
-def scope_digest(repo: Path, chapter: Chapter) -> str:
+def scope_digest(repo: Path, chapter: WorkUnitLike) -> str:
     digest = hashlib.sha256()
     for path in scoped_files(repo, chapter):
         digest.update(path.relative_to(repo).as_posix().encode())
@@ -518,7 +528,7 @@ def _lean_code(text: str) -> str:
     return "".join(result)
 
 
-def count_placeholders(repo: Path, chapter: Chapter) -> int:
+def count_placeholders(repo: Path, chapter: WorkUnitLike) -> int:
     pattern = re.compile(r"\b(?:sorry|admit)\b")
     return sum(
         len(pattern.findall(_lean_code(path.read_text(encoding="utf-8"))))
@@ -728,7 +738,7 @@ class CodexExecutor:
 
     def build_prompt(
         self,
-        chapter: Chapter,
+        chapter: Any,
         stage: Stage,
         *,
         feedback: str = "",
@@ -929,7 +939,7 @@ whole-file diagnostics in import order; do not prepare every file separately.
         stage: Stage,
         workspace_root: Path | None = None,
         *,
-        chapter: Chapter | None = None,
+        chapter: WorkUnitLike | None = None,
         feedback: str = "",
         resume_thread_id: str | None = None,
     ) -> list[str]:
@@ -956,29 +966,11 @@ whole-file diagnostics in import order; do not prepare every file separately.
         if settings.reasoning_effort:
             command.extend(["--config", f'model_reasoning_effort="{settings.reasoning_effort}"'])
         if stage in (Stage.FIXUP, Stage.REVIEW, Stage.PROVE):
-            lean_project = (root / settings.lean_project).resolve()
-            enabled_tools = (
-                LEAN_MCP_FIXUP_TOOLS
-                if stage in (Stage.FIXUP, Stage.REVIEW)
-                else LEAN_MCP_PROOF_TOOLS
+            backend = self.config.backend or LeanBackend(
+                project=settings.lean_project,
+                mcp_tool_timeout_seconds=settings.lean_mcp_tool_timeout_seconds,
             )
-            mcp_config = {
-                "mcp_servers.paf_lean.command": str(lean_mcp_executable()),
-                "mcp_servers.paf_lean.args": ["-m", "paf.lean_mcp"],
-                "mcp_servers.paf_lean.cwd": str(lean_project),
-                "mcp_servers.paf_lean.required": True,
-                "mcp_servers.paf_lean.startup_timeout_sec": 60,
-                "mcp_servers.paf_lean.tool_timeout_sec": (
-                    settings.lean_mcp_tool_timeout_seconds
-                ),
-                "mcp_servers.paf_lean.default_tools_approval_mode": "auto",
-                "mcp_servers.paf_lean.enabled_tools": list(enabled_tools),
-                "mcp_servers.paf_lean.env.PATH": lean_mcp_path(),
-                "mcp_servers.paf_lean.env.LEAN_PROJECT_PATH": str(lean_project),
-                "mcp_servers.paf_lean.env.LEAN_MCP_SCRATCH_SLOTS": "1",
-                "mcp_servers.paf_lean.env.LEAN_LOG_LEVEL": "NONE",
-                "mcp_servers.paf_lean.env.PYTHONWARNINGS": "ignore",
-            }
+            mcp_config = backend.mcp_config(root, stage)
             for key, value in mcp_config.items():
                 command.extend(["--config", f"{key}={json.dumps(value)}"])
         if resume_thread_id is not None:
@@ -988,7 +980,7 @@ whole-file diagnostics in import order; do not prepare every file separately.
 
     async def run(
         self,
-        chapter: Chapter,
+        chapter: Any,
         stage: Stage,
         run: RunRecord,
         *,
@@ -1008,7 +1000,7 @@ whole-file diagnostics in import order; do not prepare every file separately.
 
     async def run_upstream_repair(
         self,
-        chapter: Chapter,
+        chapter: WorkUnitLike,
         run: RunRecord,
         requests: Iterable[dict[str, Any]],
         *,
@@ -1035,7 +1027,7 @@ whole-file diagnostics in import order; do not prepare every file separately.
 
     async def _run_prompt(
         self,
-        chapter: Chapter,
+        chapter: WorkUnitLike,
         stage: Stage,
         run: RunRecord,
         *,
@@ -1340,7 +1332,7 @@ whole-file diagnostics in import order; do not prepare every file separately.
 
 async def validate(
     config: PipelineConfig,
-    chapter: Chapter,
+    chapter: WorkUnitLike,
     *,
     workspace_root: Path | None = None,
     on_output: Callable[[str], None] | None = None,

@@ -18,6 +18,30 @@ cache_compaction_layers = 32
 lean_project = "lean"
 lean_mcp_tool_timeout_seconds = 300
 
+# The backend owns all Lean target layout and toolchain settings. Target templates
+# apply to [sources]-discovered corpora and can migrate legacy [[books]] entries;
+# omit the target template fields to retain each book's target fields unchanged.
+# Templates may use document/source/unit fields.
+[backend]
+kind = "lean"
+project = "lean"
+root = "lean/Formalization"
+module = "Formalization"
+path = "{document_module}/Unit{unit_ordinal_padded}"
+unit_module = "{module}.{document_module}.Unit{unit_ordinal_padded}"
+build_command = "cd lean && lake build +{unit_module}"
+scope = ["{root}/{path}.lean", "{root}/{path}/**/*.lean"]
+mcp_enabled = true
+mcp_tool_timeout_seconds = 300
+
+# Explicit entries override any template field for one stable work-unit id.
+# They can also be loaded from a JSON or TOML file with backend.manifest.
+# [[backend.mappings]]
+# work_unit = "lecture-notes/week-1/unit-01"
+# path = "Flat/Opening"
+# unit_module = "Formalization.Opening"
+# scope = ["lean/Formalization/Flat/Opening.lean"]
+
 [stages.formalize]
 max_rounds = 1
 
@@ -29,6 +53,22 @@ max_rounds = 5
 
 [stages.prove]
 max_rounds = 12
+
+# Adapter defaults apply to every configured source. Ordered path rules can
+# override the format or splitting mode for a mixed corpus.
+[sources]
+profile = "numbered-chapters"
+
+# [[sources.rules]]
+# glob = "lecture-notes/**/*.tex"
+# format = "latex"
+# unit = "section"
+# follow_includes = true
+
+# [[sources.rules]]
+# glob = "appendices/*.txt"
+# format = "text"
+# heading_pattern = "^CHAPTER (?P<number>\\d+): (?P<title>.+)$"
 
 [[books]]
 id = "book02"

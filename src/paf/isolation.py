@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
 
-from paf.models import Chapter, SwarmSettings
+from paf.models import SwarmSettings, WorkUnitLike
 from paf.scope import ScopeMatcher
 
 
@@ -120,7 +120,7 @@ def tree_manifest(root: Path, *, excluded: tuple[str, ...]) -> dict[str, FileFin
     return result
 
 
-def scoped_manifest(root: Path, chapter: Chapter) -> dict[str, FileFingerprint]:
+def scoped_manifest(root: Path, chapter: WorkUnitLike) -> dict[str, FileFingerprint]:
     """Fingerprint only a chapter's exclusive scope in the live worktree."""
 
     return {
@@ -129,7 +129,7 @@ def scoped_manifest(root: Path, chapter: Chapter) -> dict[str, FileFingerprint]:
     }
 
 
-def _matches_scope(relative: str, chapter: Chapter) -> bool:
+def _matches_scope(relative: str, chapter: WorkUnitLike) -> bool:
     return ScopeMatcher(chapter.scope).matches(relative)
 
 
@@ -138,12 +138,12 @@ class SharedWorkspace:
         self.root = repo
         self.base_manifest: dict[str, FileFingerprint] | None = None
 
-    async def snapshot(self, chapter: Chapter) -> None:
+    async def snapshot(self, chapter: WorkUnitLike) -> None:
         self.base_manifest = await asyncio.to_thread(scoped_manifest, self.root, chapter)
 
     async def collect(
         self,
-        chapter: Chapter,
+        chapter: WorkUnitLike,
         *,
         integration_lock: asyncio.Lock | None = None,
     ) -> IsolationResult:
@@ -217,7 +217,7 @@ class FuseWorkspace:
 
     async def collect(
         self,
-        chapter: Chapter,
+        chapter: WorkUnitLike,
         *,
         integration_lock: asyncio.Lock | None = None,
     ) -> IsolationResult:
@@ -809,7 +809,7 @@ class FuseOverlayIsolation:
 
     async def import_changes(
         self,
-        chapter: Chapter,
+        chapter: WorkUnitLike,
         *,
         generation: int,
         cache_generation: int,

@@ -50,13 +50,24 @@ function SwarmMenuItem({
   onSelect: (swarmId: string) => void;
 }) {
   return (
-    <button className={`paf-menu-item ${selected ? "selected" : ""}`} onClick={() => onSelect(swarm.id)}>
-      <span className={`paf-item-mark ${swarm.active ? "active" : ""}`}>{swarm.active ? <Play size={10} fill="currentColor" /> : <Pause size={10} />}</span>
+    <button
+      className={`paf-menu-item ${selected ? "selected" : ""}`}
+      onClick={() => onSelect(swarm.id)}
+    >
+      <span className={`paf-item-mark ${swarm.active ? "active" : ""}`}>
+        {swarm.active ? <Play size={10} fill="currentColor" /> : <Pause size={10} />}
+      </span>
       <span className="paf-item-copy">
         <strong>{swarm.id}</strong>
-        <small>{swarm.book_count} books · {swarm.task_count} tasks · updated {timeAgo(swarm.updated_at)}</small>
+        <small>
+          {swarm.document_count ?? swarm.book_count ?? 0} documents · {swarm.task_count} tasks ·
+          updated {timeAgo(swarm.updated_at)}
+        </small>
       </span>
-      <span className="paf-item-agents"><strong>{swarm.active_agents}</strong><small>agents</small></span>
+      <span className="paf-item-agents">
+        <strong>{swarm.active_agents}</strong>
+        <small>agents</small>
+      </span>
       {selected && <Check size={14} />}
     </button>
   );
@@ -99,22 +110,51 @@ export function SwarmSwitcher({
 
   return (
     <div className="paf-switcher" ref={rootRef}>
-      <button className={`paf-trigger ${open ? "open" : ""}`} onClick={() => setOpen(!open)} aria-expanded={open}>
+      <button
+        className={`paf-trigger ${open ? "open" : ""}`}
+        onClick={() => setOpen(!open)}
+        aria-expanded={open}
+      >
         <span className={`paf-status-dot ${selected?.active ? "active" : ""}`} />
-        <span className="paf-trigger-copy"><small>Watching swarm</small><strong>{selected?.id ?? "demo-snapshot"}</strong></span>
-        {selected && <span className="paf-agent-count">{selected.active_agents}<em>/{selected.maximum_agents}</em></span>}
+        <span className="paf-trigger-copy">
+          <small>Watching swarm</small>
+          <strong>{selected?.id ?? "demo-snapshot"}</strong>
+        </span>
+        {selected && (
+          <span className="paf-agent-count">
+            {selected.active_agents}
+            <em>/{selected.maximum_agents}</em>
+          </span>
+        )}
         <ChevronDown size={14} />
       </button>
       {open && (
         <div className="paf-menu">
           <div className="paf-menu-head">
-            <div><span className="eyebrow">Swarm processes</span><strong>{active.length} currently running</strong></div>
+            <div>
+              <span className="eyebrow">Swarm processes</span>
+              <strong>{active.length} currently running</strong>
+            </div>
             <Activity size={16} />
           </div>
           {active.length > 0 && <div className="paf-menu-label">Running now</div>}
-          {active.map((swarm) => <SwarmMenuItem key={swarm.id} swarm={swarm} selected={swarm.id === selected?.id} onSelect={choose} />)}
+          {active.map((swarm) => (
+            <SwarmMenuItem
+              key={swarm.id}
+              swarm={swarm}
+              selected={swarm.id === selected?.id}
+              onSelect={choose}
+            />
+          ))}
           {recent.length > 0 && <div className="paf-menu-label recent">Recent state</div>}
-          {recent.map((swarm) => <SwarmMenuItem key={swarm.id} swarm={swarm} selected={swarm.id === selected?.id} onSelect={choose} />)}
+          {recent.map((swarm) => (
+            <SwarmMenuItem
+              key={swarm.id}
+              swarm={swarm}
+              selected={swarm.id === selected?.id}
+              onSelect={choose}
+            />
+          ))}
           {!swarms.length && <div className="paf-menu-empty">Repository API unavailable</div>}
         </div>
       )}
@@ -123,26 +163,60 @@ export function SwarmSwitcher({
 }
 
 export function Header(props: HeaderProps) {
-  const { view, setView, live, setLive, connected, fetching, refresh, swarms, selectedSwarm, selectSwarm } = props;
+  const {
+    view,
+    setView,
+    live,
+    setLive,
+    connected,
+    fetching,
+    refresh,
+    swarms,
+    selectedSwarm,
+    selectSwarm,
+  } = props;
   return (
     <header className="app-header">
       <div className="brand" onClick={() => setView("overview")} role="button" tabIndex={0}>
-        <div className="brand-glyph" aria-hidden="true"><span>λ</span></div>
-        <div><div className="brand-name">PAF</div><div className="brand-sub">FORMALIZATION OBSERVATORY</div></div>
+        <div className="brand-glyph" aria-hidden="true">
+          <span>λ</span>
+        </div>
+        <div>
+          <div className="brand-name">PAF</div>
+          <div className="brand-sub">FORMALIZATION OBSERVATORY</div>
+        </div>
       </div>
       <SwarmSwitcher swarms={swarms} selectedSwarm={selectedSwarm} onSelect={selectSwarm} />
       <nav className="top-nav" aria-label="Primary navigation">
-        <button className={view === "overview" ? "active" : ""} onClick={() => setView("overview")}><LayoutDashboard size={14} /> Overview</button>
-        <button className={view === "statements" ? "active" : ""} onClick={() => setView("statements")}><Code2 size={15} /> Statement browser</button>
+        <button className={view === "overview" ? "active" : ""} onClick={() => setView("overview")}>
+          <LayoutDashboard size={14} /> Overview
+        </button>
+        <button
+          className={view === "statements" ? "active" : ""}
+          onClick={() => setView("statements")}
+        >
+          <Code2 size={15} /> Statement browser
+        </button>
       </nav>
       <div className="header-actions">
-        <div className={`connection ${connected ? "connected" : "demo"}`} title={connected ? "Reading live repository state" : "Repository API unavailable; showing a demo snapshot"}>
-          <span className="connection-dot" /><span>{connected ? "repository" : "demo mode"}</span>
+        <div
+          className={`connection ${connected ? "connected" : "demo"}`}
+          title={
+            connected
+              ? "Reading live repository state"
+              : "Repository API unavailable; showing a demo snapshot"
+          }
+        >
+          <span className="connection-dot" />
+          <span>{connected ? "repository" : "demo mode"}</span>
         </div>
         <button className={`live-control ${live ? "on" : ""}`} onClick={() => setLive(!live)}>
-          {live ? <Pause size={12} /> : <Play size={12} />}{live ? "Live" : "Paused"}
+          {live ? <Pause size={12} /> : <Play size={12} />}
+          {live ? "Live" : "Paused"}
         </button>
-        <IconButton label="Refresh now" onClick={() => void refresh()}><RefreshCw size={16} className={fetching ? "spinning" : ""} /></IconButton>
+        <IconButton label="Refresh now" onClick={() => void refresh()}>
+          <RefreshCw size={16} className={fetching ? "spinning" : ""} />
+        </IconButton>
       </div>
     </header>
   );
@@ -152,14 +226,34 @@ export function Rail({ view, setView }: NavigationProps) {
   return (
     <aside className="rail">
       <div className="rail-main">
-        <IconButton label="Overview" active={view === "overview"} onClick={() => setView("overview")}><LayoutDashboard size={19} /></IconButton>
-        <IconButton label="Lean statements" active={view === "statements"} onClick={() => setView("statements")}><FileCode2 size={19} /></IconButton>
+        <IconButton
+          label="Overview"
+          active={view === "overview"}
+          onClick={() => setView("overview")}
+        >
+          <LayoutDashboard size={19} />
+        </IconButton>
+        <IconButton
+          label="Lean statements"
+          active={view === "statements"}
+          onClick={() => setView("statements")}
+        >
+          <FileCode2 size={19} />
+        </IconButton>
         <div className="rail-divider" />
-        <IconButton label="Agents"><Users size={19} /></IconButton>
-        <IconButton label="Build queue"><TerminalSquare size={19} /></IconButton>
-        <IconButton label="Dependency graph"><GitBranch size={19} /></IconButton>
+        <IconButton label="Agents">
+          <Users size={19} />
+        </IconButton>
+        <IconButton label="Build queue">
+          <TerminalSquare size={19} />
+        </IconButton>
+        <IconButton label="Dependency graph">
+          <GitBranch size={19} />
+        </IconButton>
       </div>
-      <div className="rail-foot"><span className="lean-version">L4</span></div>
+      <div className="rail-foot">
+        <span className="lean-version">L4</span>
+      </div>
     </aside>
   );
 }
@@ -168,19 +262,51 @@ function gibibytes(bytes: number): string {
   return (bytes / 1024 ** 3).toFixed(1);
 }
 
-export function StatusBar({ state, connected, systemLoad }: { state: SwarmState; connected: boolean; systemLoad: SystemLoad | null }) {
+export function StatusBar({
+  state,
+  connected,
+  systemLoad,
+}: {
+  state: SwarmState;
+  connected: boolean;
+  systemLoad: SystemLoad | null;
+}) {
   return (
     <footer className="status-bar">
-      <span><span className={`footer-dot ${connected ? "connected" : ""}`} /> {connected ? state.source : "demo snapshot"}</span>
-      <span><Clock3 size={12} /> state {timeAgo(state.updated_at)}</span>
-      <span><GitBranch size={12} /> critical path: {state.scheduling?.statements?.critical_path?.join(" → ") || "—"}</span>
-      <span className="status-spacer" />
-      <span title="Host CPU utilization"><Cpu size={12} /> CPU {systemLoad?.cpu_percent == null ? "—" : `${systemLoad.cpu_percent.toFixed(0)}%`}</span>
-      <span title={systemLoad ? `${systemLoad.memory_percent.toFixed(1)}% of host memory in use` : "Host memory unavailable"}>
-        <MemoryStick size={12} /> RAM {systemLoad ? `${gibibytes(systemLoad.memory_used_bytes)} / ${gibibytes(systemLoad.memory_total_bytes)} GiB` : "—"}
+      <span>
+        <span className={`footer-dot ${connected ? "connected" : ""}`} />{" "}
+        {connected ? state.source : "demo snapshot"}
       </span>
-      <span><HardDrive size={12} /> {state.isolation?.backend ?? "shared"}</span>
-      <span><Command size={12} /> K search</span>
+      <span>
+        <Clock3 size={12} /> state {timeAgo(state.updated_at)}
+      </span>
+      <span>
+        <GitBranch size={12} /> critical path:{" "}
+        {state.scheduling?.statements?.critical_path?.join(" → ") || "—"}
+      </span>
+      <span className="status-spacer" />
+      <span title="Host CPU utilization">
+        <Cpu size={12} /> CPU{" "}
+        {systemLoad?.cpu_percent == null ? "—" : `${systemLoad.cpu_percent.toFixed(0)}%`}
+      </span>
+      <span
+        title={
+          systemLoad
+            ? `${systemLoad.memory_percent.toFixed(1)}% of host memory in use`
+            : "Host memory unavailable"
+        }
+      >
+        <MemoryStick size={12} /> RAM{" "}
+        {systemLoad
+          ? `${gibibytes(systemLoad.memory_used_bytes)} / ${gibibytes(systemLoad.memory_total_bytes)} GiB`
+          : "—"}
+      </span>
+      <span>
+        <HardDrive size={12} /> {state.isolation?.backend ?? "shared"}
+      </span>
+      <span>
+        <Command size={12} /> K search
+      </span>
     </footer>
   );
 }

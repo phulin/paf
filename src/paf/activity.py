@@ -458,6 +458,10 @@ class AgentActivity:
     recent_limit: int | None = field(default=MAX_RECENT_EVENTS, repr=False, compare=False)
 
     @property
+    def work_unit_id(self) -> str:
+        return self.chapter_id
+
+    @property
     def failures(self) -> int:
         return self.command_failures + self.mcp_failures
 
@@ -674,6 +678,7 @@ class AgentActivity:
 
     def as_dict(self) -> dict[str, Any]:
         value = asdict(self)
+        value["work_unit_id"] = self.work_unit_id
         value["failures"] = self.failures
         value["todo_completed"], value["todo_total"] = self.todo_progress
         value.pop("active_items", None)
@@ -683,6 +688,8 @@ class AgentActivity:
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> AgentActivity:
         fields = dict(value)
+        fields.setdefault("chapter_id", fields.get("work_unit_id"))
+        fields.pop("work_unit_id", None)
         fields.pop("failures", None)
         fields.pop("todo_completed", None)
         fields.pop("todo_total", None)

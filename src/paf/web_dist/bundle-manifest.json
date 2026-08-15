@@ -1,0 +1,38 @@
+{
+  "files": {
+    "assets/index-DNdHXVLc.js": "afbdc7877f352df10bf51b3e686a6c74a4f8eb1b0dc7803721d5faadb4bc8e29",
+    "assets/index-DNw0HH-x.css": "7250926ace2037f585a634e92dedf7205fdf23237710029aa8f2ce45e96b0196",
+    "index.html": "504bc2e9bc422fed0a65b6729dd3170a27321fecdd7d27eb155cf5c27aa7e2bc"
+  },
+  "format": 1,
+  "inputs": {
+    "web/index.html": "1bf17cb943e567669cf700169585fd22cb1103a6ff16489ca67ab266beb0e652",
+    "web/package-lock.json": "d764459baac4bff692e2e55c90c315618ecdc083b4dde2f29a816adf7340aa6f",
+    "web/package.json": "ed5caadce79fe7a9d179166a07a3771dce14143999661de554cdca07966febfd",
+    "web/src/App.tsx": "852cfac145104ee96650e67438ad3e56573a44df18e65a5789aad93c4120ccce",
+    "web/src/components/AppChrome.tsx": "6b3370d4bd10884ac8d8277a9a0b82eafd526fd4e814f3688f5827a2b3b9a91c",
+    "web/src/components/Controls.tsx": "a3c1352cfef3cdf5624ee9f984ce18bfc35facd756a357137ae2b231f0ea64ad",
+    "web/src/demo.ts": "510af2f7efdcf79ebadc24e18a544fff8049bc07f613ae0dc2639a627c215ae8",
+    "web/src/features/overview/AgentReport.tsx": "f6fea91eea0b70968ab82d0ecc4149eff5029a4db38900ab91e5806d3b7de9d2",
+    "web/src/features/overview/ChapterInspector.tsx": "5778625168220294f749a2b88bfca2d90afa3d6e23fdbef19147953fa65e898f",
+    "web/src/features/overview/DashboardSummary.tsx": "d360dfeaf85c5b7c3e2c35fc242ce2633bdc1a7186775577aaf85c961a848011",
+    "web/src/features/overview/Overview.tsx": "0c9ab4307bf21357bad479037c33daf971378424b1fa9a852c1eb3efc3951aa7",
+    "web/src/features/overview/TaskStatus.tsx": "ea8f18853e73e7fab73a3d25f48b38d1f8afd8204b3307150f4d5650672af643",
+    "web/src/features/overview/TaskTable.tsx": "667e0d580ec3c0a04c15173b84db66f761172212346bcc49b4ebe4534c720b50",
+    "web/src/features/overview/Timeline.tsx": "30918776490329146fd86daa5ea6daaf535ba120c2e84658b81b0b6adc9c0c64",
+    "web/src/features/overview/model.ts": "76feb90bfec87e2364aab44088e4bc8fb25ff6079443175cbdf0a9d453641b0a",
+    "web/src/features/statements/LeanCode.tsx": "459485c2267dba15bcc2824774323af1df901798d8e0efbf9504517186f91893",
+    "web/src/features/statements/StatementBrowser.tsx": "299089cf73380c6c0bb71cb3349a1bfb4fba339a570b293e8facb0312bd7e5bb",
+    "web/src/hooks/useSwarmState.ts": "be8c492fc2365cfd6c2d413387f5b49f3999e7eb4a6078a89cc233364c351bf5",
+    "web/src/lib/format.ts": "29a51a5600e8069d640f56a4e822d866b3ef60cded71da74c537873d4333840c",
+    "web/src/lib/urlState.ts": "da0a659c894efa261cb366c6cc12da9ff1a4dc094d9a4a3e325b5a33e5c2d69f",
+    "web/src/main.tsx": "41431cb94a112ca05f90ca6037229d09d4bb8ecc1c27ae3bb3740ace8f01d2a6",
+    "web/src/styles.css": "e77e576fffe672bb79dffecd8297a808193782da224e3e87191a1caf9aeda892",
+    "web/src/types.ts": "5a0425b753be468e94a8f2f79e24231dc5c1c371c64dd84eacdd314a5eb8e5cf",
+    "web/src/vite-env.d.ts": "65996936fbb042915f7b74a200fcdde7e410f32a669b1ab9597cfaa4b0faddb5",
+    "web/tsconfig.app.json": "a7266d1c85fa6947c70073256d9a73e4c459e97b0b4ef24b5c48dcab498ef4c5",
+    "web/tsconfig.json": "e8d6f7b50828db3953e21c7e92584f9206b3cd2551b4012507372afbb7fe9ce3",
+    "web/tsconfig.node.json": "59a81a906071520bcb114b584b526f9475b86ceffeb380a80d2a209a9cecf630",
+    "web/vite.config.ts": "7126f45e7c48db09a456e4e66b200e264e60d51d9740d58a1491ec25df525b82"
+  }
+}

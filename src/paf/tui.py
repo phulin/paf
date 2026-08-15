@@ -30,7 +30,7 @@ from textual.worker import WorkerCancelled
 
 from paf import json_codec as json
 from paf.activity import AgentActivity, reportable_error, systemic_errors
-from paf.models import Chapter, Stage
+from paf.models import Stage, WorkUnitLike
 from paf.pricing import format_usd
 from paf.scheduler import Orchestrator
 from paf.state import RunRecord, StateStore, TaskRecord, TaskStatus, TokenUsage
@@ -106,13 +106,13 @@ STATUS_MARKS = {
 BOOK_ID = re.compile(r"^book(?P<number>\d+)$", re.IGNORECASE)
 
 
-def chapter_display_sort_key(chapter: Chapter) -> tuple[tuple[int, int | str], int]:
+def chapter_display_sort_key(chapter: WorkUnitLike) -> tuple[tuple[int, int | str], int]:
     """Sort canonical book ids numerically, then sort chapters numerically."""
 
-    match = BOOK_ID.fullmatch(chapter.book_id)
+    match = BOOK_ID.fullmatch(chapter.document_id)
     if match is None:
-        return (1, chapter.book_id.casefold()), chapter.number
-    return (0, int(match.group("number"))), chapter.number
+        return (1, chapter.document_id.casefold()), chapter.ordinal
+    return (0, int(match.group("number"))), chapter.ordinal
 
 
 def format_count(value: int) -> str:
@@ -137,7 +137,7 @@ def format_usage(usage: TokenUsage, *, label: str = "Tokens") -> str:
     )
 
 
-def chapter_usage(state: StateStore, chapter: Chapter) -> TokenUsage:
+def chapter_usage(state: StateStore, chapter: WorkUnitLike) -> TokenUsage:
     return state.invocation_usage(chapter.id)
 
 
@@ -184,11 +184,11 @@ def seconds_since(value: str) -> float:
         return 0
 
 
-def latest_run(state: StateStore, chapter: Chapter) -> RunRecord | None:
+def latest_run(state: StateStore, chapter: WorkUnitLike) -> RunRecord | None:
     return state.latest_run(chapter.id)
 
 
-def chapter_runs(state: StateStore, chapter: Chapter) -> list[RunRecord]:
+def chapter_runs(state: StateStore, chapter: WorkUnitLike) -> list[RunRecord]:
     """Return every agent step for a chapter in chronological order."""
 
     return list(state.chapter_runs(chapter.id))
@@ -354,7 +354,7 @@ class AgentDetailScreen(Screen[None]):
     #agent-path { height: 3; padding: 1 2; color: $text-muted; }
     """
 
-    def __init__(self, state: StateStore, chapter: Chapter) -> None:
+    def __init__(self, state: StateStore, chapter: WorkUnitLike) -> None:
         super().__init__()
         self.state = state
         self.chapter = chapter
@@ -831,7 +831,13 @@ class SwarmApp(App[bool]):
         self._rows_added: set[str] = set()
         self._row_cache: dict[str, tuple[str, ...]] = {}
         self._static_cache: dict[str, str] = {}
-        self.chapters = tuple(sorted(orchestrator.chapters, key=chapter_display_sort_key))
+        self.work_units = tuple(sorted(orchestrator.work_units, key=chapter_display_sort_key))
+
+    @property
+    def chapters(self) -> tuple[WorkUnitLike, ...]:
+        """Compatibility view for integrations using the previous TUI name."""
+
+        return self.work_units
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -861,11 +867,11 @@ class SwarmApp(App[bool]):
 
     def action_inspect_agent(self) -> None:
         table: DataTable[Any] = self.query_one("#tasks", DataTable)
-        if not self.chapters or not table.row_count:
+        if not self.work_units or not table.row_count:
             return
         row = table.cursor_row
-        if 0 <= row < len(self.chapters):
-            self.push_screen(AgentDetailScreen(self.state, self.chapters[row]))
+        if 0 <= row < len(self.work_units):
+            self.push_screen(AgentDetailScreen(self.state, self.work_units[row]))
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
         if action == "inspect_agent" and isinstance(self.screen, AgentDetailScreen):
@@ -876,7 +882,7 @@ class SwarmApp(App[bool]):
         if event.data_table.id != "tasks":
             return
         chapter_id = str(event.row_key.value)
-        chapter = next((item for item in self.chapters if item.id == chapter_id), None)
+        chapter = next((item for item in self.work_units if item.id == chapter_id), None)
         if chapter is not None:
             self.push_screen(AgentDetailScreen(self.state, chapter))
 
@@ -953,8 +959,8 @@ class SwarmApp(App[bool]):
                 f"iter {build.iteration}/{build.maximum_iterations} · "
                 f"err {build.error_count} · warn {build.warning_count}"
             )
-            if build.current_chapter_id:
-                build_status += f" · {build.current_chapter_id}"
+            if build.current_work_unit_id:
+                build_status += f" · {build.current_work_unit_id}"
         else:
             owner = str(build_queue["owner"])
             build_status = (
@@ -971,8 +977,8 @@ class SwarmApp(App[bool]):
                 f"iter {build.iteration}/{build.maximum_iterations} · "
                 f"err {build.error_count} · warn {build.warning_count}"
             )
-            if build.current_chapter_id:
-                footer_status += f" · {build.current_chapter_id}"
+            if build.current_work_unit_id:
+                footer_status += f" · {build.current_work_unit_id}"
             if build.output_tail:
                 status_width = self.query_one("#status", Static).size.width
                 line_width = max(20, status_width - 6)
@@ -996,7 +1002,7 @@ class SwarmApp(App[bool]):
             f"Lean MCP: on    Codex access: {codex_access}",
         )
         activities: list[AgentActivity] = []
-        for chapter in self.chapters:
+        for chapter in self.work_units:
             run = latest_run(self.state, chapter)
             if (
                 run is not None
@@ -1014,8 +1020,8 @@ class SwarmApp(App[bool]):
         self._update_static("#alerts", alert)
         for stage in Stage:
             counts = stage_counts(self.state, stage)
-            build_targets = set(build.target_chapter_ids) or (
-                {build.current_chapter_id} if build.current_chapter_id else set()
+            build_targets = set(build.target_work_unit_ids) or (
+                {build.current_work_unit_id} if build.current_work_unit_id else set()
             )
             building = len(build_targets) if build.active and build.stage == stage.value else 0
             running = max(0, counts["running"] - building)
@@ -1028,7 +1034,7 @@ class SwarmApp(App[bool]):
                 f"✗ {counts['failed']}  · {counts['pending']}  ! {counts['blocked']}",
             )
         table: DataTable[Any] = self.query_one("#tasks", DataTable)
-        for chapter in self.chapters:
+        for chapter in self.work_units:
             values = self._row_values(chapter)
             if chapter.id not in self._rows_added:
                 table.add_row(*values, key=chapter.id)
@@ -1065,12 +1071,12 @@ class SwarmApp(App[bool]):
         self._show_build_progress = show_build_progress
         self._update_static("#status", content)
 
-    def _row_values(self, chapter: Chapter) -> tuple[str, ...]:
+    def _row_values(self, chapter: WorkUnitLike) -> tuple[str, ...]:
         statuses = []
         build = self.state.coordinator_build
-        build_targets = set(build.target_chapter_ids)
-        if not build_targets and build.current_chapter_id:
-            build_targets.add(build.current_chapter_id)
+        build_targets = set(build.target_work_unit_ids)
+        if not build_targets and build.current_work_unit_id:
+            build_targets.add(build.current_work_unit_id)
         for stage in Stage:
             task = self.state.task(chapter.id, stage)
             mark = task_mark(
@@ -1106,10 +1112,10 @@ class SwarmApp(App[bool]):
             else:
                 prior_activity = self.state.activities.get(run.id) if run is not None else None
                 current_activity = activity_label(prior_activity, run)
-        statement_rank = self.orchestrator.statement_schedule.rank[chapter.book_id]
-        proof_rank = self.orchestrator.proof_schedule.rank[chapter.book_id]
-        critical = chapter.book_id in self.orchestrator.statement_schedule.critical_path
-        book = f"★ {chapter.book_id}" if critical else chapter.book_id
+        statement_rank = self.orchestrator.statement_schedule.rank[chapter.document_id]
+        proof_rank = self.orchestrator.proof_schedule.rank[chapter.document_id]
+        critical = chapter.document_id in self.orchestrator.statement_schedule.critical_path
+        book = f"★ {chapter.document_id}" if critical else chapter.document_id
         clean = self.state.fixup_graph.get("clean", {})
         build_freshness = (
             "✓ fresh" if isinstance(clean, dict) and chapter.id in clean else "○ stale"
@@ -1117,7 +1123,7 @@ class SwarmApp(App[bool]):
         return (
             book,
             f"{statement_rank:g}/{proof_rank:g}",
-            f"{chapter.number:02d} {chapter.title}",
+            f"{chapter.ordinal:02d} {chapter.title}",
             *statuses,
             build_freshness,
             current_activity,

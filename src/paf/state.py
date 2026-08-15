@@ -13,7 +13,7 @@ from uuid import uuid4
 
 from paf.activity import ActivityStore, shorten_book_paths
 from paf.diagnostics import lean_diagnostic_counts
-from paf.models import Chapter, PipelineConfig, Stage
+from paf.models import PipelineConfig, Stage, WorkUnitLike
 from paf.pricing import LEGACY_MODEL, CostEstimate, estimate_cost
 from paf.state_db import DATABASE_NAME, StateDatabase
 
@@ -125,6 +125,14 @@ class RunRecord:
     role: str = ""
     auxiliary: bool = False
     request_ids: list[str] = field(default_factory=list)
+    source: str = ""
+    source_start_line: int = 1
+    source_end_line: int = 1
+    project_root: str = ""
+
+    @property
+    def work_unit_id(self) -> str:
+        return self.chapter_id
 
 
 @dataclass
@@ -134,6 +142,9 @@ class TaskRecord:
     chapter_number: int
     chapter_title: str
     stage: str
+    source: str = ""
+    source_start_line: int = 1
+    source_end_line: int = 1
     status: str = TaskStatus.PENDING
     detail: str = ""
     # Proof completion is tied to the exact validated chapter sources. This is
@@ -142,6 +153,22 @@ class TaskRecord:
     rounds: int = 0
     updated_at: str = field(default_factory=timestamp)
     runs: list[RunRecord] = field(default_factory=list)
+
+    @property
+    def work_unit_id(self) -> str:
+        return self.chapter_id
+
+    @property
+    def document_id(self) -> str:
+        return self.book_id
+
+    @property
+    def ordinal(self) -> int:
+        return self.chapter_number
+
+    @property
+    def unit_title(self) -> str:
+        return self.chapter_title
 
 
 @dataclass
@@ -160,6 +187,22 @@ class CoordinatorBuildRecord:
     output_tail: list[str] = field(default_factory=list)
     updated_at: str = field(default_factory=timestamp)
 
+    @property
+    def target_work_unit_ids(self) -> list[str]:
+        return self.target_chapter_ids
+
+    @target_work_unit_ids.setter
+    def target_work_unit_ids(self, value: list[str]) -> None:
+        self.target_chapter_ids = value
+
+    @property
+    def current_work_unit_id(self) -> str:
+        return self.current_chapter_id
+
+    @current_work_unit_id.setter
+    def current_work_unit_id(self, value: str) -> None:
+        self.current_chapter_id = value
+
 
 @dataclass
 class SourceIssueRecord:
@@ -173,12 +216,30 @@ class SourceIssueRecord:
     source_excerpt: str
     description: str
     suggested_correction: str
+    source_start_line: int = 1
+    source_end_line: int = 1
     status: str = "open"
     first_seen_at: str = field(default_factory=timestamp)
     last_seen_at: str = field(default_factory=timestamp)
     sightings: int = 1
     stages: list[str] = field(default_factory=list)
     run_ids: list[str] = field(default_factory=list)
+
+    @property
+    def work_unit_id(self) -> str:
+        return self.chapter_id
+
+    @property
+    def document_id(self) -> str:
+        return self.book_id
+
+    @property
+    def ordinal(self) -> int:
+        return self.chapter_number
+
+    @property
+    def unit_title(self) -> str:
+        return self.chapter_title
 
 
 class StateStore:
@@ -255,6 +316,13 @@ class StateStore:
                 self.isolation = raw["isolation"]
             raw_build = raw.get("coordinator_build")
             if isinstance(raw_build, dict):
+                raw_build = dict(raw_build)
+                raw_build.setdefault(
+                    "target_chapter_ids", raw_build.get("target_work_unit_ids", [])
+                )
+                raw_build.setdefault(
+                    "current_chapter_id", raw_build.get("current_work_unit_id", "")
+                )
                 self.coordinator_build = CoordinatorBuildRecord(
                     **{
                         name: value
@@ -276,6 +344,10 @@ class StateStore:
                         for name, item in value.items()
                         if name in TaskRecord.__dataclass_fields__ and name != "runs"
                     }
+                    task_value.setdefault("chapter_id", value.get("work_unit_id"))
+                    task_value.setdefault("book_id", value.get("document_id"))
+                    task_value.setdefault("chapter_number", value.get("ordinal"))
+                    task_value.setdefault("chapter_title", value.get("unit_title"))
                     if task_value.get("stage") == "repair":
                         task_value["stage"] = "fixup"
                     legacy_review_green = value.get("review_green")
@@ -290,16 +362,32 @@ class StateStore:
                     self.tasks[key] = TaskRecord(**task_value)
         for value in persisted_source_issues:
             if isinstance(value, dict):
-                issue = SourceIssueRecord(**value)
+                issue_value = dict(value)
+                issue_value.setdefault("chapter_id", issue_value.get("work_unit_id"))
+                issue_value.setdefault("book_id", issue_value.get("document_id"))
+                issue_value.setdefault("chapter_number", issue_value.get("ordinal"))
+                issue_value.setdefault("chapter_title", issue_value.get("unit_title"))
+                issue = SourceIssueRecord(
+                    **{
+                        name: item
+                        for name, item in issue_value.items()
+                        if name in SourceIssueRecord.__dataclass_fields__
+                    }
+                )
                 self.source_issues[issue.id] = issue
-        configured = {chapter.id for chapter in self.config.chapters}
+        configured = {chapter.id for chapter in self.config.work_units}
         self.tasks = {
             key: task for key, task in self.tasks.items() if task.chapter_id in configured
         }
-        for chapter in self.config.chapters:
+        for chapter in self.config.work_units:
             for stage in Stage:
                 key = self.key(chapter.id, stage)
                 self.tasks.setdefault(key, self._new_task(chapter, stage))
+                task = self.tasks[key]
+                if not task.source:
+                    task.source = chapter.source.as_posix()
+                    task.source_start_line = chapter.source_span.start_line
+                    task.source_end_line = chapter.source_span.end_line
             fixup = self.task(chapter.id, Stage.FIXUP)
             review = self.task(chapter.id, Stage.REVIEW)
             prove = self.task(chapter.id, Stage.PROVE)
@@ -317,6 +405,7 @@ class StateStore:
                 continue
             if value.get("stage") == "repair":
                 value["stage"] = "fixup"
+            value.setdefault("chapter_id", value.get("work_unit_id"))
             if str(value.get("chapter_id", "")) not in configured:
                 continue
             usage_value = value.get("usage")
@@ -328,6 +417,11 @@ class StateStore:
                 and name not in {"usage", "report", "validation", "isolation"}
             }
             run = RunRecord(**fields, usage=usage)
+            chapter = self.config.work_unit(run.chapter_id)
+            if not run.source:
+                run.source = chapter.source.as_posix()
+                run.source_start_line = chapter.source_span.start_line
+                run.source_end_line = chapter.source_span.end_line
             task = self.task(run.chapter_id, Stage(run.stage))
             task.runs.append(run)
             self._index_run(run)
@@ -358,13 +452,16 @@ class StateStore:
         self._dirty_run_ids.update(run.id for run in recovered_runs)
         await self.flush()
 
-    def _new_task(self, chapter: Chapter, stage: Stage) -> TaskRecord:
+    def _new_task(self, chapter: WorkUnitLike, stage: Stage) -> TaskRecord:
         return TaskRecord(
             chapter_id=chapter.id,
             book_id=chapter.book_id,
             chapter_number=chapter.number,
             chapter_title=chapter.title,
             stage=stage.value,
+            source=chapter.source.as_posix(),
+            source_start_line=chapter.source_span.start_line,
+            source_end_line=chapter.source_span.end_line,
         )
 
     @staticmethod
@@ -380,6 +477,7 @@ class StateStore:
     def _run_dict(self, run: RunRecord, *, include_payload: bool = True) -> dict[str, Any]:
         value = {
             "id": run.id,
+            "work_unit_id": run.work_unit_id,
             "chapter_id": run.chapter_id,
             "stage": str(run.stage),
             "round": run.round,
@@ -397,6 +495,10 @@ class StateStore:
             "role": run.role,
             "auxiliary": run.auxiliary,
             "request_ids": list(run.request_ids),
+            "source": run.source,
+            "source_start_line": run.source_start_line,
+            "source_end_line": run.source_end_line,
+            "project_root": run.project_root,
         }
         if include_payload:
             value |= {
@@ -409,6 +511,10 @@ class StateStore:
     @staticmethod
     def _task_dict(task: TaskRecord) -> dict[str, Any]:
         return {
+            "work_unit_id": task.work_unit_id,
+            "document_id": task.document_id,
+            "ordinal": task.ordinal,
+            "unit_title": task.unit_title,
             "chapter_id": task.chapter_id,
             "book_id": task.book_id,
             "chapter_number": task.chapter_number,
@@ -419,15 +525,28 @@ class StateStore:
             "source_digest": task.source_digest,
             "rounds": task.rounds,
             "updated_at": task.updated_at,
+            "source": task.source,
+            "source_start_line": task.source_start_line,
+            "source_end_line": task.source_end_line,
         }
 
     @staticmethod
     def _issue_dict(issue: SourceIssueRecord) -> dict[str, Any]:
-        return {name: getattr(issue, name) for name in SourceIssueRecord.__dataclass_fields__}
+        return {name: getattr(issue, name) for name in SourceIssueRecord.__dataclass_fields__} | {
+            "work_unit_id": issue.work_unit_id,
+            "document_id": issue.document_id,
+            "ordinal": issue.ordinal,
+            "unit_title": issue.unit_title,
+        }
 
     @staticmethod
     def _build_dict(build: CoordinatorBuildRecord) -> dict[str, Any]:
-        return {name: getattr(build, name) for name in CoordinatorBuildRecord.__dataclass_fields__}
+        return {
+            name: getattr(build, name) for name in CoordinatorBuildRecord.__dataclass_fields__
+        } | {
+            "target_work_unit_ids": list(build.target_work_unit_ids),
+            "current_work_unit_id": build.current_work_unit_id,
+        }
 
     def hot_snapshot(self) -> dict[str, Any]:
         usage = self.total_usage()
@@ -437,6 +556,11 @@ class StateStore:
         return {
             "version": 13,
             "history_database": DATABASE_NAME,
+            "project_root": str(
+                self.config.project.root
+                if self.config.project is not None
+                else self.config.settings.repo
+            ),
             "config": str(self.config.path),
             "created_at": self.created_at,
             "updated_at": self.updated_at,
@@ -454,6 +578,30 @@ class StateStore:
             "upstream_request_batches": self.upstream_request_batches(),
             "isolation": self.isolation,
             "coordinator_build": self._build_dict(self.coordinator_build),
+            "documents": [
+                {
+                    "id": document.id,
+                    "path": document.path.as_posix(),
+                    "format": document.format,
+                    "title": document.title,
+                    "depends_on": list(document.depends_on),
+                }
+                for document in self.config.documents
+            ],
+            "work_units": [
+                {
+                    "id": unit.id,
+                    "document_id": unit.document_id,
+                    "title": unit.title,
+                    "ordinal": unit.ordinal,
+                    "source": unit.source.as_posix(),
+                    "source_start_line": unit.source_span.start_line,
+                    "source_end_line": unit.source_span.end_line,
+                    "depends_on": list(unit.depends_on),
+                    "target_scope": list(unit.scope),
+                }
+                for unit in self.config.work_units
+            ],
             "tasks": {
                 key: self._task_dict(task)
                 | {
@@ -1043,7 +1191,7 @@ class StateStore:
         raw_issues = report.get("source_issues", [])
         if not isinstance(raw_issues, list):
             return []
-        chapter = self.config.chapter(run.chapter_id)
+        chapter = self.config.work_unit(run.chapter_id)
         required = ("location", "source_excerpt", "description", "suggested_correction")
         issue_ids: list[str] = []
         for raw in raw_issues:
@@ -1085,6 +1233,8 @@ class StateStore:
                 source_excerpt=excerpt,
                 description=description,
                 suggested_correction=correction,
+                source_start_line=chapter.source_span.start_line,
+                source_end_line=chapter.source_span.end_line,
                 first_seen_at=seen_at,
                 last_seen_at=seen_at,
                 stages=[run.stage],
@@ -1105,7 +1255,7 @@ class StateStore:
         if key in self._usage_cache:
             return self._usage_cache[key]
 
-        by_chapter = {chapter.id: TokenUsage() for chapter in self.config.chapters}
+        by_chapter = {chapter.id: TokenUsage() for chapter in self.config.work_units}
         for run in self._runs_by_id.values():
             if invocation_only and run.id in self._prior_run_ids:
                 continue
@@ -1125,7 +1275,7 @@ class StateStore:
         if key in self._cost_cache:
             return self._cost_cache[key]
 
-        by_chapter = {chapter.id: CostEstimate() for chapter in self.config.chapters}
+        by_chapter = {chapter.id: CostEstimate() for chapter in self.config.work_units}
         for run in self._runs_by_id.values():
             if invocation_only and run.id in self._prior_run_ids:
                 continue
@@ -1276,6 +1426,7 @@ class StateStore:
                 f"cannot start fixup for {chapter_id} after review or proof has begun"
             )
         task = self.task(chapter_id, stage)
+        chapter = self.config.work_unit(chapter_id)
         task.status = TaskStatus.RUNNING
         if stage is Stage.PROVE:
             task.source_digest = None
@@ -1288,6 +1439,14 @@ class StateStore:
             round=task.rounds,
             model=self.config.settings.model,
             role=stage.value,
+            source=chapter.source.as_posix(),
+            source_start_line=chapter.source_span.start_line,
+            source_end_line=chapter.source_span.end_line,
+            project_root=str(
+                self.config.project.root
+                if self.config.project is not None
+                else self.config.settings.repo
+            ),
         )
         task.runs.append(run)
         self._index_run(run)
@@ -1319,6 +1478,11 @@ class StateStore:
             role=role,
             auxiliary=True,
             request_ids=list(dict.fromkeys(request_ids)),
+            project_root=str(
+                self.config.project.root
+                if self.config.project is not None
+                else self.config.settings.repo
+            ),
         )
         task.runs.append(run)
         self._index_run(run)
@@ -1365,7 +1529,9 @@ class StateStore:
         maximum_iterations: int,
         total: int,
         target_chapter_ids: Iterable[str] = (),
+        target_work_unit_ids: Iterable[str] | None = None,
     ) -> None:
+        targets = target_chapter_ids if target_work_unit_ids is None else target_work_unit_ids
         self.coordinator_build = CoordinatorBuildRecord(
             active=True,
             mode=mode,
@@ -1373,7 +1539,7 @@ class StateStore:
             iteration=iteration,
             maximum_iterations=maximum_iterations,
             total=total,
-            target_chapter_ids=list(target_chapter_ids),
+            target_chapter_ids=list(targets),
         )
         self._mark_dirty()
         await self._persist()
@@ -1381,11 +1547,15 @@ class StateStore:
     async def advance_coordinator_build(
         self,
         *,
-        chapter_id: str,
+        work_unit_id: str | None = None,
+        chapter_id: str | None = None,
         completed: int,
         command: str | None = None,
     ) -> None:
-        self.coordinator_build.current_chapter_id = chapter_id
+        unit_id = work_unit_id or chapter_id
+        if not unit_id:
+            raise ValueError("advance_coordinator_build requires a work-unit id")
+        self.coordinator_build.current_work_unit_id = unit_id
         self.coordinator_build.completed = completed
         if command is not None:
             self.append_coordinator_build_output(f"$ {command}")
@@ -1416,7 +1586,11 @@ class StateStore:
                         )
                     self.coordinator_build.total = total
                     self.coordinator_build.current_chapter_id = match.group("target")
-        errors, warnings = lean_diagnostic_counts(output)
+        errors, warnings = (
+            self.config.backend.diagnostic_counts(output)
+            if self.config.backend is not None
+            else lean_diagnostic_counts(output)
+        )
         self.coordinator_build.error_count += errors if error_count is None else error_count
         self.coordinator_build.warning_count += warnings
         lines = [

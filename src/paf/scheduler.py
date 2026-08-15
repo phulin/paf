@@ -25,15 +25,15 @@ from paf.codex import (
 )
 from paf.coordination import CoordinatorBuildQueue, PriorityLimiter
 from paf.corpus import (
-    ChapterImportGraph,
-    build_chapter_import_graph,
+    WorkUnitImportGraph,
     build_corpus_schedule,
+    build_work_unit_import_graph,
     scheduling_snapshot,
 )
 from paf.diagnostics import unexpected_lean_warnings
 from paf.git import GitCommitter
 from paf.isolation import IsolationResult, create_isolation
-from paf.models import Chapter, PipelineConfig, Stage
+from paf.models import PipelineConfig, Stage, WorkUnit, WorkUnitLike
 from paf.scope import ScopeMatcher
 from paf.state import (
     RunRecord,
@@ -105,13 +105,13 @@ class BuildDiagnostics:
 
 @dataclass(frozen=True)
 class ValidatedBuildSnapshot:
-    graph: ChapterImportGraph
+    graph: WorkUnitImportGraph
     source_digests: dict[str, str]
 
 
 @dataclass(frozen=True)
 class PendingBuildRequest:
-    chapters: tuple[Chapter, ...]
+    chapters: tuple[WorkUnitLike, ...]
     publish_if_clean: bool
     mode: str
     iteration: int
@@ -125,7 +125,7 @@ class PendingBuildRequest:
 
 @dataclass
 class RunningFixupAgent:
-    chapter: Chapter
+    chapter: WorkUnitLike
     run: RunRecord
     workspace: Any
     task: asyncio.Task[AgentResult]
@@ -267,16 +267,33 @@ class RunControl:
         self._gate.set()
 
 
-def scaffold_directories(config: PipelineConfig, chapters: Iterable[Chapter]) -> tuple[str, ...]:
+def scaffold_directories(
+    config: PipelineConfig, chapters: Iterable[WorkUnitLike]
+) -> tuple[str, ...]:
     """Create chapter directories deterministically without creating Lean files."""
 
     created: list[str] = []
     for chapter in chapters:
-        directory = config.settings.repo / chapter.lean_root / chapter.chapter_path
-        if not directory.is_dir():
-            directory.mkdir(parents=True, exist_ok=True)
-            created.append(directory.relative_to(config.settings.repo).as_posix())
+        paths = (
+            config.backend.scaffold_paths(chapter)
+            if config.backend is not None and isinstance(chapter, WorkUnit)
+            else (chapter.lean_root / chapter.chapter_path,)
+        )
+        for relative in paths:
+            directory = config.settings.repo / relative
+            if not directory.is_dir():
+                directory.mkdir(parents=True, exist_ok=True)
+                created.append(directory.relative_to(config.settings.repo).as_posix())
     return tuple(created)
+
+
+def _with_build_command(work_unit: WorkUnitLike, command: str) -> WorkUnitLike:
+    if isinstance(work_unit, WorkUnit):
+        return replace(
+            work_unit,
+            target=replace(work_unit._target(), build_command=command),
+        )
+    return replace(work_unit, build_command=command)
 
 
 class Orchestrator:
@@ -285,13 +302,17 @@ class Orchestrator:
         config: PipelineConfig,
         state: StateStore,
         *,
-        chapters: Iterable[Chapter] | None = None,
+        work_units: Iterable[WorkUnitLike] | None = None,
+        chapters: Iterable[WorkUnitLike] | None = None,
         force: bool = False,
         control: RunControl | None = None,
     ) -> None:
         self.config = config
         self.state = state
-        self.chapters = tuple(chapters if chapters is not None else config.chapters)
+        if work_units is not None and chapters is not None:
+            raise ValueError("pass work_units or legacy chapters, not both")
+        selected_units = work_units if work_units is not None else chapters
+        self.work_units = tuple(selected_units if selected_units is not None else config.work_units)
         self.force = force
         self.control = control or RunControl()
         self.executor = CodexExecutor(config, state)
@@ -312,18 +333,18 @@ class Orchestrator:
                 else "coordinator-owned-shared-worktree"
             ),
         }
-        selected_books = {chapter.book_id for chapter in self.chapters}
+        selected_documents = {work_unit.document_id for work_unit in self.work_units}
         self.statement_schedule = build_corpus_schedule(
-            config.books,
-            self.chapters,
+            config.documents,
+            self.work_units,
             phase="statements",
-            selected_books=selected_books,
+            selected_documents=selected_documents,
         )
         self.proof_schedule = build_corpus_schedule(
-            config.books,
-            self.chapters,
+            config.documents,
+            self.work_units,
             phase="proofs",
-            selected_books=selected_books,
+            selected_documents=selected_documents,
         )
         self.state.scheduling = self.scheduling_snapshot()
         self.agent_slots = PriorityLimiter(config.settings.max_agents)
@@ -341,8 +362,14 @@ class Orchestrator:
         self._proof_rechecks: set[str] = set()
         self._review_invalidation_generations: dict[str, int] = {}
         self._review_generation_lock = asyncio.Lock()
-        self._chapter_agent_locks = {chapter.id: asyncio.Lock() for chapter in self.chapters}
+        self._chapter_agent_locks = {chapter.id: asyncio.Lock() for chapter in self.work_units}
         self._upstream_repair_tasks: dict[str, asyncio.Task[None]] = {}
+
+    @property
+    def chapters(self) -> tuple[WorkUnitLike, ...]:
+        """Compatibility view for callers using the previous domain name."""
+
+        return self.work_units
 
     def scheduling_snapshot(self) -> dict[str, object]:
         return scheduling_snapshot(self.statement_schedule, self.proof_schedule)
@@ -365,7 +392,7 @@ class Orchestrator:
 
     async def _commit_agent_changes(
         self,
-        chapter: Chapter,
+        chapter: WorkUnitLike,
         stage: Stage,
         agent: AgentResult | None,
         isolated: IsolationResult,
@@ -411,25 +438,25 @@ class Orchestrator:
         finally:
             await self.state.close()
 
-    def _already_done(self, chapter: Chapter, stage: Stage) -> bool:
+    def _already_done(self, chapter: WorkUnitLike, stage: Stage) -> bool:
         return not self.force and self.state.task(chapter.id, stage).status == TaskStatus.SUCCEEDED
 
     def scaffold(self) -> None:
         """Create configured chapter directories without creating Lean files."""
 
-        scaffold_directories(self.config, self.chapters)
+        scaffold_directories(self.config, self.work_units)
 
-    def _observed_chapter_graph(self) -> ChapterImportGraph:
-        return build_chapter_import_graph(self.config.settings.repo, self.chapters)
+    def _observed_work_unit_graph(self) -> WorkUnitImportGraph:
+        return build_work_unit_import_graph(self.config.settings.repo, self.work_units)
 
     def _retain_fixup_clean(
         self,
-        graph: ChapterImportGraph,
+        graph: WorkUnitImportGraph,
         records: dict[str, Any],
     ) -> dict[str, dict[str, Any]]:
         """Retain build records whose own source is unchanged."""
 
-        by_id = {chapter.id: chapter for chapter in self.chapters}
+        by_id = {chapter.id: chapter for chapter in self.work_units}
         retained: dict[str, dict[str, Any]] = {}
         for chapter_id in graph.order:
             if not graph.dependencies[chapter_id].issubset(retained):
@@ -446,7 +473,7 @@ class Orchestrator:
         return retained
 
     @staticmethod
-    def _dependency_closure(graph: ChapterImportGraph, chapter_ids: Iterable[str]) -> set[str]:
+    def _dependency_closure(graph: WorkUnitImportGraph, chapter_ids: Iterable[str]) -> set[str]:
         required = set(chapter_ids)
         pending = list(required)
         while pending:
@@ -458,7 +485,7 @@ class Orchestrator:
         return required
 
     @staticmethod
-    def _successor_closure(graph: ChapterImportGraph, chapter_ids: Iterable[str]) -> set[str]:
+    def _successor_closure(graph: WorkUnitImportGraph, chapter_ids: Iterable[str]) -> set[str]:
         affected = set(chapter_ids)
         pending = list(affected)
         while pending:
@@ -478,7 +505,7 @@ class Orchestrator:
         if not snapshots:
             return False
         async with self.source_lock:
-            graph = self._observed_chapter_graph()
+            graph = self._observed_work_unit_graph()
             captured: dict[str, str] = {}
             required = self._dependency_closure(graph, snapshots)
             for snapshot in snapshots.values():
@@ -491,7 +518,7 @@ class Orchestrator:
             if not required.issubset(captured):
                 return False
 
-            by_id = {item.id: item for item in self.chapters}
+            by_id = {item.id: item for item in self.work_units}
             current = {
                 chapter_id: scope_digest(self.config.settings.repo, by_id[chapter_id])
                 for chapter_id in required
@@ -525,14 +552,14 @@ class Orchestrator:
 
     async def _publish_validated_build(
         self,
-        chapter: Chapter,
+        chapter: WorkUnitLike,
         snapshot: ValidatedBuildSnapshot,
     ) -> bool:
         return await self._publish_validated_builds({chapter.id: snapshot})
 
     @staticmethod
     def _invalidate_fixup_descendants(
-        graph: ChapterImportGraph,
+        graph: WorkUnitImportGraph,
         clean: dict[str, dict[str, Any]],
         chapter_ids: Iterable[str],
     ) -> set[str]:
@@ -544,7 +571,7 @@ class Orchestrator:
     async def _invalidate_build_records(self, chapter_ids: Iterable[str]) -> set[str]:
         """Mark an edited source closure stale before any verification is queued."""
 
-        graph = self._observed_chapter_graph()
+        graph = self._observed_work_unit_graph()
         persisted = self.state.fixup_graph.get("clean", {})
         clean = self._retain_fixup_clean(graph, persisted if isinstance(persisted, dict) else {})
         invalidated = self._invalidate_fixup_descendants(graph, clean, chapter_ids)
@@ -558,7 +585,7 @@ class Orchestrator:
 
     async def _save_fixup_graph(
         self,
-        graph: ChapterImportGraph,
+        graph: WorkUnitImportGraph,
         clean: dict[str, dict[str, Any]],
         *,
         build_generation: int,
@@ -608,13 +635,13 @@ class Orchestrator:
             await self.state.save()
             return revision
 
-    def _scope_exists(self, chapter: Chapter) -> bool:
+    def _scope_exists(self, chapter: WorkUnitLike) -> bool:
         return ScopeMatcher(chapter.scope).has_match_for_each_pattern(self.config.settings.repo)
 
-    def _proof_build_is_fresh(self, chapter: Chapter) -> bool:
+    def _proof_build_is_fresh(self, chapter: WorkUnitLike) -> bool:
         """Whether the current chapter source belongs to a retained clean build."""
 
-        graph = self._observed_chapter_graph()
+        graph = self._observed_work_unit_graph()
         persisted = self.state.fixup_graph.get("clean", {})
         clean = self._retain_fixup_clean(
             graph,
@@ -624,7 +651,7 @@ class Orchestrator:
 
     async def _integrate_interrupted_workspace(
         self,
-        chapter: Chapter,
+        chapter: WorkUnitLike,
         stage: Stage,
         workspace: Any,
         *,
@@ -665,7 +692,7 @@ class Orchestrator:
 
     async def _attempt(
         self,
-        chapter: Chapter,
+        chapter: WorkUnitLike,
         stage: Stage,
         *,
         feedback: str = "",
@@ -696,7 +723,7 @@ class Orchestrator:
         slot_held = False
         try:
             await self.control.checkpoint()
-            await self.agent_slots.acquire(schedule.priority(chapter.book_id))
+            await self.agent_slots.acquire(schedule.priority(chapter.document_id))
             slot_held = True
         except BaseException:
             chapter_lock.release()
@@ -880,7 +907,7 @@ class Orchestrator:
         assert run is not None
         return Attempt(agent=agent, validation=validation, run=run)
 
-    async def _formalize(self, chapter: Chapter, *, rerun: bool = False) -> FormalizeOutcome:
+    async def _formalize(self, chapter: WorkUnitLike, *, rerun: bool = False) -> FormalizeOutcome:
         if self._already_done(chapter, Stage.FORMALIZE):
             return FormalizeOutcome(True)
         if not rerun and not self.force and self._scope_exists(chapter):
@@ -925,7 +952,7 @@ class Orchestrator:
         )
         return FormalizeOutcome(False)
 
-    def _chapter_identifiers(self, chapter: Chapter) -> tuple[str, ...]:
+    def _chapter_identifiers(self, chapter: WorkUnitLike) -> tuple[str, ...]:
         root = (chapter.lean_root / chapter.chapter_path).as_posix()
         lean_prefix = self.config.settings.lean_project.as_posix().rstrip("/") + "/"
         without_project = root.removeprefix(lean_prefix)
@@ -945,7 +972,7 @@ class Orchestrator:
         repo_prefix = self.config.settings.repo.as_posix().rstrip("/") + "/"
         normalized = normalized.removeprefix(repo_prefix).removeprefix("./")
         owners: list[str] = []
-        for chapter in self.chapters:
+        for chapter in self.work_units:
             root = (chapter.lean_root / chapter.chapter_path).as_posix()
             lean_prefix = self.config.settings.lean_project.as_posix().rstrip("/") + "/"
             roots = (root, root.removeprefix(lean_prefix))
@@ -955,15 +982,19 @@ class Orchestrator:
                 owners.append(chapter.id)
         return tuple(dict.fromkeys(owners))
 
-    def _is_earlier_chapter(self, owner: Chapter, consumer: Chapter) -> bool:
-        if owner.book_id == consumer.book_id:
+    def _is_earlier_work_unit(self, owner: WorkUnitLike, consumer: WorkUnitLike) -> bool:
+        if owner.document_id == consumer.document_id:
             return owner.number < consumer.number
-        book_order = {book.id: index for index, book in enumerate(self.config.books)}
-        return book_order.get(owner.book_id, -1) < book_order.get(consumer.book_id, -1)
+        document_order = {
+            document.id: index for index, document in enumerate(self.config.documents)
+        }
+        return document_order.get(owner.document_id, -1) < document_order.get(
+            consumer.document_id, -1
+        )
 
     def _normalize_upstream_request(
         self,
-        consumer: Chapter,
+        consumer: WorkUnitLike,
         raw: Any,
     ) -> tuple[dict[str, Any], str, str]:
         """Resolve one proposed owner and retain a reason for every rejected handoff."""
@@ -1031,11 +1062,11 @@ class Orchestrator:
                 owner_id,
                 (f"proposed owner {proposed_owner!r} disagrees with path owner {owner_id!r}"),
             )
-        by_id = {chapter.id: chapter for chapter in self.chapters}
+        by_id = {chapter.id: chapter for chapter in self.work_units}
         owner = by_id.get(owner_id)
         if owner is None:
             return request, owner_id, "proposed owner chapter is outside this swarm selection"
-        if not self._is_earlier_chapter(owner, consumer):
+        if not self._is_earlier_work_unit(owner, consumer):
             return (
                 request,
                 owner_id,
@@ -1048,7 +1079,7 @@ class Orchestrator:
 
     async def _record_upstream_requests(
         self,
-        chapter: Chapter,
+        chapter: WorkUnitLike,
         run: RunRecord,
         report: dict[str, Any],
         *,
@@ -1146,7 +1177,7 @@ class Orchestrator:
 
     def _validate_upstream_answer_declarations(
         self,
-        owner: Chapter,
+        owner: WorkUnitLike,
         answers: dict[str, dict[str, Any]],
         *,
         agent_changed: bool,
@@ -1163,8 +1194,8 @@ class Orchestrator:
         repo = self.config.settings.repo
         chronological_prefix = tuple(
             chapter
-            for chapter in self.chapters
-            if chapter.id == owner.id or self._is_earlier_chapter(chapter, owner)
+            for chapter in self.work_units
+            if chapter.id == owner.id or self._is_earlier_work_unit(chapter, owner)
         )
         accepted: dict[str, dict[str, Any]] = {}
         errors: list[str] = []
@@ -1222,7 +1253,7 @@ class Orchestrator:
         request_ids = tuple(self.state.upstream_request_batches().get(owner_id, ()))
         if not request_ids:
             return
-        by_id = {chapter.id: chapter for chapter in self.chapters}
+        by_id = {chapter.id: chapter for chapter in self.work_units}
         owner = by_id.get(owner_id)
         run_id: str | None = None
 
@@ -1274,9 +1305,7 @@ class Orchestrator:
                 answers,
                 agent_changed=attempt.agent.changed,
             )
-            answer_error = "; ".join(
-                error for error in (answer_error, declaration_error) if error
-            )
+            answer_error = "; ".join(error for error in (answer_error, declaration_error) if error)
             await self.state.record_upstream_answers(
                 request_ids,
                 run_id=run_id,
@@ -1392,7 +1421,7 @@ class Orchestrator:
 
     async def _close_previously_satisfied_upstream_requests(
         self,
-        chapter: Chapter,
+        chapter: WorkUnitLike,
         *,
         build_fresh: bool,
     ) -> tuple[str, ...]:
@@ -1421,7 +1450,7 @@ class Orchestrator:
 
     def _route_review_findings(
         self,
-        chapter: Chapter,
+        chapter: WorkUnitLike,
         report: dict[str, Any],
     ) -> dict[str, str]:
         """Route structured review findings to the chapters owning their requested edit paths."""
@@ -1483,7 +1512,7 @@ class Orchestrator:
 
     async def _queue_proof_review(
         self,
-        chapter: Chapter,
+        chapter: WorkUnitLike,
         report: dict[str, Any],
         *,
         origin_run_id: str,
@@ -1538,7 +1567,7 @@ class Orchestrator:
             "formalization failed; quarantined from review",
             "formalization failed; quarantined from proof",
         }
-        for chapter in self.chapters:
+        for chapter in self.work_units:
             if chapter.id in pending_owners:
                 continue
             task = self.state.task(chapter.id, Stage.REVIEW)
@@ -1564,7 +1593,7 @@ class Orchestrator:
             if not isinstance(origin_run_ids, list):
                 continue
             persisted_origins.update(origin for origin in origin_run_ids if isinstance(origin, str))
-        for chapter in self.chapters:
+        for chapter in self.work_units:
             for run in self.state.task(chapter.id, Stage.PROVE).runs:
                 if run.auxiliary or run.id in persisted_origins:
                     continue
@@ -1594,7 +1623,7 @@ class Orchestrator:
             for value in self.state.proof_review_requests.values()
             if isinstance(value, dict)
         }
-        for chapter in self.chapters:
+        for chapter in self.work_units:
             proof_runs = [
                 run for run in self.state.task(chapter.id, Stage.PROVE).runs if not run.auxiliary
             ]
@@ -1617,7 +1646,7 @@ class Orchestrator:
             await self._queue_proof_review(chapter, report, origin_run_id=run.id)
             persisted_origins.add(run.id)
 
-        by_id = {chapter.id: chapter for chapter in self.chapters}
+        by_id = {chapter.id: chapter for chapter in self.work_units}
         pending_owners = {
             chapter_id
             for value in self.state.proof_review_requests.values()
@@ -1642,7 +1671,7 @@ class Orchestrator:
     def _module_owner_ids(self, module: str) -> tuple[str, ...]:
         return tuple(
             chapter.id
-            for chapter in self.chapters
+            for chapter in self.work_units
             if module == chapter.chapter_module or module.startswith(chapter.chapter_module + ".")
         )
 
@@ -1656,7 +1685,7 @@ class Orchestrator:
         # intentional: matching the complete Lake transcript over-assigns every
         # replayed dependency and permitted `sorry` warning.
         owners: list[str] = []
-        for chapter in self.chapters:
+        for chapter in self.work_units:
             for identifier in self._chapter_identifiers(chapter):
                 pattern = rf"(?<![A-Za-z0-9_]){re.escape(identifier)}(?![A-Za-z0-9_])"
                 if re.search(pattern, diagnostic.text):
@@ -1666,7 +1695,7 @@ class Orchestrator:
 
     async def _build_chapters(
         self,
-        chapters: Iterable[Chapter],
+        chapters: Iterable[WorkUnitLike],
         *,
         publish_if_clean: bool,
         mode: str = "targeted",
@@ -1682,7 +1711,7 @@ class Orchestrator:
         selected = tuple(dict.fromkeys(chapter.id for chapter in chapters))
         if not selected:
             return {}
-        by_id = {chapter.id: chapter for chapter in self.chapters}
+        by_id = {chapter.id: chapter for chapter in self.work_units}
         request_chapters = tuple(by_id[chapter_id] for chapter_id in selected)
         loop = asyncio.get_running_loop()
         future: asyncio.Future[dict[str, ValidationResult]] = loop.create_future()
@@ -1761,7 +1790,7 @@ class Orchestrator:
                 }
                 if not candidate_ids:
                     break
-                selected_by_id: dict[str, Chapter] = {}
+                selected_by_id: dict[str, WorkUnitLike] = {}
                 for request in active:
                     for chapter in request.chapters:
                         if chapter.id in candidate_ids:
@@ -1807,7 +1836,7 @@ class Orchestrator:
                     continue
 
                 owners = set(self._build_feedback(attempt_results).actionable)
-                graph = self._observed_chapter_graph()
+                graph = self._observed_work_unit_graph()
                 affected = {
                     chapter_id
                     for chapter_id in active_ids
@@ -1833,7 +1862,7 @@ class Orchestrator:
 
     async def _execute_build_chapters(
         self,
-        chapters: Iterable[Chapter],
+        chapters: Iterable[WorkUnitLike],
         *,
         publish_if_clean: bool,
         mode: str = "targeted",
@@ -1881,7 +1910,7 @@ class Orchestrator:
                         iteration=iteration,
                         maximum_iterations=maximum_iterations,
                         total=len(selected),
-                        target_chapter_ids=ids,
+                        target_work_unit_ids=ids,
                     )
                 if len(selected) > 1:
                     targets = []
@@ -1905,7 +1934,7 @@ class Orchestrator:
                     build_units = ((chapter, chapter.build_command, (chapter.id,), 1),)
                 for chapter, command, result_ids, _completed in build_units:
                     await self.state.advance_coordinator_build(
-                        chapter_id=chapter.id,
+                        work_unit_id=chapter.id,
                         completed=0,
                         command=command,
                     )
@@ -1927,7 +1956,7 @@ class Orchestrator:
                     validation = asyncio.create_task(
                         validate(
                             self.config,
-                            replace(chapter, build_command=command),
+                            _with_build_command(chapter, command),
                             workspace_root=build_workspace.root,
                             on_output=append_output,
                         )
@@ -1952,7 +1981,7 @@ class Orchestrator:
                     result = validation.result()
                     results.update((chapter_id, result) for chapter_id in result_ids)
                     await self.state.advance_coordinator_build(
-                        chapter_id=chapter.id,
+                        work_unit_id=chapter.id,
                         completed=self.state.coordinator_build.total,
                     )
                 clean = (
@@ -1961,8 +1990,8 @@ class Orchestrator:
                     and all(result.succeeded for result in results.values())
                 )
                 if clean and snapshots is not None:
-                    graph = self._observed_chapter_graph()
-                    by_id = {item.id: item for item in self.chapters}
+                    graph = self._observed_work_unit_graph()
+                    by_id = {item.id: item for item in self.work_units}
                     captured = {
                         chapter_id: scope_digest(self.config.settings.repo, by_id[chapter_id])
                         for chapter_id in self._dependency_closure(graph, ids)
@@ -2003,7 +2032,7 @@ class Orchestrator:
         """Build the full selection and publish only a globally clean cache snapshot."""
 
         return await self._build_chapters(
-            self.chapters,
+            self.work_units,
             publish_if_clean=True,
             mode="global",
             iteration=iteration,
@@ -2017,7 +2046,12 @@ class Orchestrator:
         blocked_owner_ids: set[str] | frozenset[str] = frozenset(),
     ) -> BuildDiagnostics:
         feedback: dict[str, dict[str, None]] = {}
-        by_id = {chapter.id: chapter for chapter in self.chapters}
+        by_id = {chapter.id: chapter for chapter in self.work_units}
+
+        def source_location(owner_id: str) -> str:
+            owner = by_id[owner_id]
+            return f"{owner.source}:{owner.source_span.start_line}-{owner.source_span.end_line}"
+
         for target_id, result in results.items():
             if result.succeeded:
                 continue
@@ -2027,8 +2061,11 @@ class Orchestrator:
                 if not owners:
                     continue
                 routed = True
-                block = f"Coordinator diagnostic:\n{diagnostic.text}"
                 for owner in owners:
+                    block = (
+                        f"Informal source: {source_location(owner)}\n"
+                        f"Coordinator diagnostic:\n{diagnostic.text}"
+                    )
                     feedback.setdefault(owner, {})[block] = None
 
             # A truncated Lake log can retain its failed-module summary while
@@ -2039,12 +2076,16 @@ class Orchestrator:
                 if not owners:
                     continue
                 routed = True
-                block = f"Coordinator reported failed module `{module}`."
                 for owner in owners:
+                    block = (
+                        f"Informal source: {source_location(owner)}\n"
+                        f"Coordinator reported failed module `{module}`."
+                    )
                     feedback.setdefault(owner, {})[block] = None
 
             if not routed:
                 block = (
+                    f"Informal source: {source_location(target_id)}\n"
                     f"Coordinator build of {by_id[target_id].chapter_module} failed without a "
                     f"source-located diagnostic:\n{result.output[-12000:]}"
                 )
@@ -2062,7 +2103,7 @@ class Orchestrator:
 
     async def _start_fixup_agent(
         self,
-        chapter: Chapter,
+        chapter: WorkUnitLike,
         feedback: str,
         dependency_source_digests: dict[str, str],
     ) -> RunningFixupAgent:
@@ -2077,7 +2118,7 @@ class Orchestrator:
             f"queued for fixup run {task.rounds + 1} (repair-cycle cap {maximum})",
         )
         await self.control.checkpoint()
-        await self.agent_slots.acquire(self.statement_schedule.priority(chapter.book_id))
+        await self.agent_slots.acquire(self.statement_schedule.priority(chapter.document_id))
         run = None
         workspace = None
         source_held = False
@@ -2252,7 +2293,7 @@ class Orchestrator:
 
         incoming_feedback = dict(feedback or {})
         pending_feedback: dict[str, str] = {}
-        by_id = {chapter.id: chapter for chapter in self.chapters}
+        by_id = {chapter.id: chapter for chapter in self.work_units}
         targeted = target_ids is not None
         goals = set(target_ids or ())
         unknown_goals = goals.difference(by_id)
@@ -2330,7 +2371,7 @@ class Orchestrator:
                 return set()
             persisted = self.state.fixup_graph.get("clean", {})
             records = persisted if isinstance(persisted, dict) else {}
-            clean = self._retain_fixup_clean(self._observed_chapter_graph(), records)
+            clean = self._retain_fixup_clean(self._observed_work_unit_graph(), records)
             build_generation = int(self.state.fixup_graph.get("build_generation", 0))
             published = set(successful).intersection(clean)
             invalidated_clean.difference_update(published)
@@ -2426,7 +2467,7 @@ class Orchestrator:
 
         async def build_chapters(
             chapter_ids: Iterable[str],
-            graph: ChapterImportGraph,
+            graph: WorkUnitImportGraph,
             *,
             mode: str = "topological",
         ) -> bool:
@@ -2481,7 +2522,7 @@ class Orchestrator:
             )
             return False
 
-        async def start_actionable_fixups(graph: ChapterImportGraph) -> None:
+        async def start_actionable_fixups(graph: WorkUnitImportGraph) -> None:
             """Fill free agent slots from the dependency-ready feedback frontier."""
 
             active = sum(not handle.task.done() for handle in running.values())
@@ -2525,7 +2566,7 @@ class Orchestrator:
                 )
 
         try:
-            graph = self._observed_chapter_graph()
+            graph = self._observed_work_unit_graph()
         except ValueError as error:
             return await fail_graph(error)
 
@@ -2603,7 +2644,7 @@ class Orchestrator:
         # A successful target can certify imported predecessors too. Reconcile
         # all records after the pass before deciding whether any feedback still
         # warrants an agent.
-        graph = self._observed_chapter_graph()
+        graph = self._observed_work_unit_graph()
         persisted = self.state.fixup_graph.get("clean", {})
         clean = self._retain_fixup_clean(
             graph,
@@ -2631,7 +2672,7 @@ class Orchestrator:
             while True:
                 await self.control.checkpoint()
                 try:
-                    rescanned = self._observed_chapter_graph()
+                    rescanned = self._observed_work_unit_graph()
                 except ValueError as error:
                     return await fail_graph(error)
 
@@ -2731,7 +2772,7 @@ class Orchestrator:
                         continue
                     clean.pop(chapter_id, None)
                     try:
-                        graph = self._observed_chapter_graph()
+                        graph = self._observed_work_unit_graph()
                     except ValueError as error:
                         return await fail_graph(error)
                     clean = self._retain_fixup_clean(graph, clean)
@@ -2753,7 +2794,7 @@ class Orchestrator:
                         maximum_iterations=1,
                         snapshots=snapshots,
                     )
-                    verified = self._observed_chapter_graph()
+                    verified = self._observed_work_unit_graph()
                     clean = self._retain_fixup_clean(verified, clean)
                     if (
                         all(result.succeeded for result in results.values())
@@ -2847,7 +2888,7 @@ class Orchestrator:
         """Run every formalizer once and retain chapter-local failures."""
 
         running = {
-            asyncio.create_task(self._formalize(chapter)): chapter for chapter in self.chapters
+            asyncio.create_task(self._formalize(chapter)): chapter for chapter in self.work_units
         }
         had_failure = False
         try:
@@ -2867,7 +2908,7 @@ class Orchestrator:
 
     async def _review_once(
         self,
-        chapter: Chapter,
+        chapter: WorkUnitLike,
         *,
         rerun: bool = False,
         feedback: str = "",
@@ -2936,7 +2977,7 @@ class Orchestrator:
 
     async def _complete_review(
         self,
-        chapter: Chapter,
+        chapter: WorkUnitLike,
         detail: str,
         *,
         expected_generation: int | None = None,
@@ -2987,7 +3028,7 @@ class Orchestrator:
             )
         return targets
 
-    async def _review_build(self, chapter: Chapter) -> dict[str, str]:
+    async def _review_build(self, chapter: WorkUnitLike) -> dict[str, str]:
         """Build review output once, returning diagnostics to review rather than fixup."""
 
         snapshots: dict[str, ValidatedBuildSnapshot] = {}
@@ -3043,7 +3084,7 @@ class Orchestrator:
 
     async def _review_chapter_to_clean(
         self,
-        chapter: Chapter,
+        chapter: WorkUnitLike,
         rounds_used: dict[str, int],
         *,
         rerun: bool = False,
@@ -3055,7 +3096,7 @@ class Orchestrator:
         review_generation = self._review_invalidation_generation(chapter.id)
         if self.state.task(chapter.id, Stage.REVIEW).status == TaskStatus.SUCCEEDED:
             return True
-        graph = self._observed_chapter_graph()
+        graph = self._observed_work_unit_graph()
         request_ids = list(proof_request_ids)
         review_feedback = feedback
 
@@ -3188,10 +3229,10 @@ class Orchestrator:
         """Release dependency-ready reviews and proofs without a corpus-wide fixup gate."""
 
         await self._recover_proof_review_requests()
-        by_id = {chapter.id: chapter for chapter in self.chapters}
+        by_id = {chapter.id: chapter for chapter in self.work_units}
         quarantined_ids = set(quarantined).intersection(by_id)
         try:
-            initial_graph = self._observed_chapter_graph()
+            initial_graph = self._observed_work_unit_graph()
         except ValueError as error:
             await self.state.set_tasks(
                 by_id,
@@ -3207,7 +3248,7 @@ class Orchestrator:
             )
         reviewed = {
             chapter.id
-            for chapter in self.chapters
+            for chapter in self.work_units
             if chapter.id not in quarantined_ids
             and self.state.task(chapter.id, Stage.REVIEW).status == TaskStatus.SUCCEEDED
         }
@@ -3302,7 +3343,7 @@ class Orchestrator:
                     # transition cannot be lost between the scan and wait.
                     fixup.progress.clear()
                 try:
-                    graph = self._observed_chapter_graph()
+                    graph = self._observed_work_unit_graph()
                 except ValueError as error:
                     await self.state.set_tasks(
                         by_id,
@@ -3539,7 +3580,7 @@ class Orchestrator:
                                 "chapter-local review failed; unrelated branches continue",
                             )
                         continue
-                    current_graph = self._observed_chapter_graph()
+                    current_graph = self._observed_work_unit_graph()
                     current_dependencies = current_graph.dependencies[chapter_id]
                     if not current_dependencies.issubset(handle.dependencies):
                         continue
@@ -3617,7 +3658,7 @@ class Orchestrator:
 
     async def _refresh_stale_proof_build(
         self,
-        chapter: Chapter,
+        chapter: WorkUnitLike,
     ) -> ValidationResult:
         """Refresh an exact coordinator build before launching a proof agent."""
 
@@ -3644,17 +3685,17 @@ class Orchestrator:
             )
         return validation
 
-    async def _rebuild_dirty_chapter(self, chapter: Chapter) -> bool:
+    async def _rebuild_dirty_chapter(self, chapter: WorkUnitLike) -> bool:
         """Refresh one invalidated exact build while its chapter has no agent."""
 
         validation = await self._refresh_stale_proof_build(chapter)
         return validation.succeeded
 
-    async def _prove(self, chapter: Chapter, *, defer_review: bool = False) -> bool:
+    async def _prove(self, chapter: WorkUnitLike, *, defer_review: bool = False) -> bool:
         initial_feedback = ""
         build_fresh = False
         if not self.force:
-            graph = self._observed_chapter_graph()
+            graph = self._observed_work_unit_graph()
             persisted = self.state.fixup_graph.get("clean", {})
             clean = self._retain_fixup_clean(
                 graph,
@@ -3930,7 +3971,9 @@ class Orchestrator:
             return await self._review_until_clean()
         if stage is Stage.FORMALIZE:
             return await self._formalize_all()
-        return all(await _gather_cancel_on_error(self._prove(chapter) for chapter in self.chapters))
+        return all(
+            await _gather_cancel_on_error(self._prove(chapter) for chapter in self.work_units)
+        )
 
     async def run_pipeline(self) -> bool:
         formalized = await self._formalize_all()
@@ -3939,13 +3982,13 @@ class Orchestrator:
             if formalized
             else {
                 chapter.id
-                for chapter in self.chapters
+                for chapter in self.work_units
                 if self.state.task(chapter.id, Stage.FORMALIZE).status != TaskStatus.SUCCEEDED
             }
         )
         initial_targets = {
             chapter.id
-            for chapter in self.chapters
+            for chapter in self.work_units
             if chapter.id not in quarantined and not self.state.later_stage_started(chapter.id)
         }
         fixed = await self._fixup_to_clean(target_ids=initial_targets) if initial_targets else True

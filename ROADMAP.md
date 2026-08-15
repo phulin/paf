@@ -1,5 +1,8 @@
 # PAF portability roadmap
 
+Status: complete. All eight sections shipped with compatibility, security, packaging, and
+outside-directory installation tests.
+
 This plan separates two concerns that are currently coupled to the original repository: how PAF
 discovers informal mathematics, and how the Python package and web UI find a project at runtime.
 The existing Markdown-to-Lean workflow should remain available as a compatibility profile while
@@ -8,6 +11,8 @@ these boundaries are introduced.
 ## 1. Flexible informal-math inputs
 
 ### 1.1 Introduce a source model
+
+Status: complete.
 
 Add format-neutral `SourceDocument` and `WorkUnit` types. A document records its path, format,
 title, and source metadata; a work unit records a stable id, title, ordinal, source span, and any
@@ -22,6 +27,8 @@ Acceptance criteria:
 - Existing Markdown configurations load with the same unit boundaries and state ids.
 
 ### 1.2 Put parsing behind adapters
+
+Status: complete.
 
 Define a `SourceAdapter` interface with `supports(path)`, `read_document(path)`, and
 `discover_units(document)`. Ship three adapters:
@@ -40,6 +47,8 @@ corpora. Parsing tests should cover comments, duplicate headings, empty sections
 and deterministic ids.
 
 ### 1.3 Make directory discovery explicit and recursive
+
+Status: complete.
 
 Replace the current direct-children `*.md` scan with a `SourceResolver` that accepts files or
 directories, recursively discovers `.md`, `.tex`, and `.txt`, and applies ordered include/exclude
@@ -69,6 +78,8 @@ heading_pattern = "^CHAPTER (?P<number>\\d+): (?P<title>.+)$"
 
 ### 1.4 Separate source structure from target layout
 
+Status: complete.
+
 Move Lean paths, module names, scope templates, build commands, diagnostics, and MCP setup behind a
 target/backend interface. The first backend remains Lean, but source files no longer need to mirror
 `lean/<namespace>/BookNN/ChapterNN`. Each work unit receives its target mapping from templates or an
@@ -87,6 +98,8 @@ Acceptance criteria:
 
 ### 2.1 Make project resolution independent of PAF's checkout
 
+Status: complete.
+
 Add one project resolver used by every command. Resolution order should be: explicit `--project` or
 target path, nearest ancestor `paf.toml`, then the current directory. Resolve repository, source,
 target, and state paths from that project object. Do not derive project paths from `__file__`, the
@@ -98,6 +111,8 @@ can safely locate live state.
 
 ### 2.2 Package the frontend
 
+Status: complete.
+
 Build the React app during release preparation and place its hashed assets under
 `src/paf/web_dist/`. Include that directory and the prompt Markdown files as wheel package data.
 Normal installation must not require Node; Node remains a contributor-only dependency for rebuilding
@@ -105,6 +120,9 @@ the frontend. Add a release check that fails when `web/src` is newer than the co
 bundle.
 
 ### 2.3 Serve UI and API from the installed command
+
+Status: complete. Vite remains the frontend build and development server; it proxies API requests
+to the same Starlette application that Uvicorn serves for installed use.
 
 Move the filesystem/state API out of `web/vite.config.ts` into Python. Add:
 
@@ -119,6 +137,10 @@ development server should proxy to the same Python API so development and instal
 one backend.
 
 ### 2.4 Complete packaging and outside-directory tests
+
+Status: complete. `scripts/check_installed_distribution.py` builds and inspects both archives, then
+installs each into its own clean temporary environment and exercises every case below without the
+checkout on `PYTHONPATH`.
 
 Keep `paf = "paf.cli:main"` as the console entry point and document `uv tool install .` (plus a
 published-package form once a distribution name is chosen). Add wheel/sdist builds and test them in
