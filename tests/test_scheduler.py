@@ -250,7 +250,7 @@ async def test_state_persists_fixup_graph(tmp_path: Path) -> None:
         "algorithm": "observed-lean-imports",
         "revision": 3,
         "edges": [],
-        "clean": {config.chapters[0].id: {"certificate": "abc"}},
+        "clean": {config.chapters[0].id: {"source_digest": "abc"}},
     }
     await state.save()
 
@@ -2694,7 +2694,7 @@ async def test_proof_releases_agent_slot_before_coordinator_build(
     orchestrator = Orchestrator(config, StateStore(config))
     await orchestrator.prepare()
     orchestrator.executor = FakeExecutor(
-        orchestrator.state, [result(changed=False, placeholders=0)]
+        orchestrator.state, [result(changed=True, placeholders=0)]
     )
 
     async def build(
@@ -2929,7 +2929,7 @@ async def test_stale_build_is_refreshed_before_proof_agent_with_placeholders(
 
     assert await orchestrator._prove(chapter)
     assert events[:2] == ["build", "agent"]
-    assert events.count("build") == 2
+    assert events.count("build") == 1
     await orchestrator.shutdown()
 
 
@@ -3196,6 +3196,110 @@ async def test_changed_source_revalidates_proofs_without_clearing_review_success
     )
     assert restarted.state.task(second.id, Stage.PROVE).status == TaskStatus.SUCCEEDED
     await restarted.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_proof_edit_keeps_downstream_build_fresh(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = with_lastlib_modules(
+        load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    )
+    first, second = config.chapters
+    source_root = tmp_path / "lean" / "Book"
+    source_root.mkdir(parents=True)
+    (source_root / "Chapter01.lean").write_text(
+        "theorem first : True := by sorry\n",
+        encoding="utf-8",
+    )
+    (source_root / "Chapter02.lean").write_text(
+        "import LastLib.Book.Chapter01\ntheorem second : True := first\n",
+        encoding="utf-8",
+    )
+    builds: list[str] = []
+
+    async def validation(
+        _config: object,
+        chapter: Chapter,
+        **_kwargs: object,
+    ) -> ValidationResult:
+        builds.append(chapter.id)
+        return ValidationResult(True, 0, "ok")
+
+    monkeypatch.setattr(scheduler_module, "validate", validation)
+    orchestrator = Orchestrator(config, StateStore(config))
+    await orchestrator.prepare()
+    assert await orchestrator._fixup_to_clean(target_ids={first.id, second.id})
+    builds.clear()
+
+    orchestrator.executor = FakeExecutor(
+        orchestrator.state,
+        [result(changed=True, placeholders=0)],
+    )
+    original_run = orchestrator.executor.run
+
+    async def fill_proof(
+        chapter: Chapter,
+        stage: Stage,
+        run: RunRecord,
+        *,
+        feedback: str = "",
+        workspace_root: Path | None = None,
+    ) -> AgentResult:
+        assert chapter.id == first.id
+        assert stage is Stage.PROVE
+        assert workspace_root is not None
+        (workspace_root / "lean" / "Book" / "Chapter01.lean").write_text(
+            "theorem first : True := by trivial\n",
+            encoding="utf-8",
+        )
+        return await original_run(
+            chapter,
+            stage,
+            run,
+            feedback=feedback,
+            workspace_root=workspace_root,
+        )
+
+    monkeypatch.setattr(orchestrator.executor, "run", fill_proof)
+
+    assert await orchestrator._prove(first)
+    clean = orchestrator.state.fixup_graph["clean"]
+    assert set(clean) == {first.id, second.id}
+    assert orchestrator.state.fixup_graph["dirty"] == []
+    assert all(set(record) == {"source_digest", "build_generation"} for record in clean.values())
+    assert builds == [first.id]
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_background_build_does_not_change_proof_stage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = config.chapters[0]
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await orchestrator.prepare()
+    await state.set_task(
+        chapter.id,
+        Stage.PROVE,
+        TaskStatus.SUCCEEDED,
+        "proved",
+        source_digest="proved-source",
+    )
+
+    async def refresh(_chapter: Chapter) -> ValidationResult:
+        return ValidationResult(True, 0, "ok")
+
+    monkeypatch.setattr(orchestrator, "_refresh_stale_proof_build", refresh)
+
+    assert await orchestrator._rebuild_dirty_chapter(chapter)
+    proof = state.task(chapter.id, Stage.PROVE)
+    assert proof.status == TaskStatus.SUCCEEDED
+    assert proof.detail == "proved"
+    assert proof.source_digest == "proved-source"
+    await orchestrator.shutdown()
 
 
 @pytest.mark.asyncio
@@ -3660,7 +3764,7 @@ async def test_proof_finding_requeues_only_its_review_branch(
     assert (reviews, proofs) == (2, 2)
     assert review_feedback[0] == ""
     assert "statement needs a hypothesis" in review_feedback[1]
-    assert build_invalidations == [(chapter.id,)]
+    assert build_invalidations == []
     assert state.fixup_requests == {}
     assert state.proof_review_requests == {}
     assert state.task(chapter.id, Stage.REVIEW).status == TaskStatus.SUCCEEDED

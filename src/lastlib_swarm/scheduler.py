@@ -119,7 +119,7 @@ class RunningFixupAgent:
     run: RunRecord
     workspace: Any
     task: asyncio.Task[AgentResult]
-    dependency_certificates: dict[str, str]
+    dependency_source_digests: dict[str, str]
     feedback: str
     source_lock_held: bool = False
 
@@ -375,41 +375,27 @@ class Orchestrator:
     def _observed_chapter_graph(self) -> ChapterImportGraph:
         return build_chapter_import_graph(self.config.settings.repo, self.chapters)
 
-    @staticmethod
-    def _fixup_certificate(
-        source: str,
-        dependencies: frozenset[str],
-        clean: dict[str, dict[str, Any]],
-    ) -> str:
-        digest = hashlib.sha256()
-        digest.update(source.encode())
-        for dependency in sorted(dependencies):
-            digest.update(b"\0")
-            digest.update(dependency.encode())
-            digest.update(b"\0")
-            digest.update(str(clean[dependency]["certificate"]).encode())
-        return digest.hexdigest()
-
     def _retain_fixup_clean(
         self,
         graph: ChapterImportGraph,
         records: dict[str, Any],
     ) -> dict[str, dict[str, Any]]:
-        """Retain build certificates whose sources and observed prerequisites still match."""
+        """Retain build records whose own source is unchanged."""
 
         by_id = {chapter.id: chapter for chapter in self.chapters}
         retained: dict[str, dict[str, Any]] = {}
         for chapter_id in graph.order:
-            required = graph.dependencies[chapter_id]
-            if not required.issubset(retained):
+            if not graph.dependencies[chapter_id].issubset(retained):
                 continue
             record = records.get(chapter_id)
             if not isinstance(record, dict):
                 continue
             source = scope_digest(self.config.settings.repo, by_id[chapter_id])
-            certificate = self._fixup_certificate(source, required, retained)
-            if record.get("source_digest") == source and record.get("certificate") == certificate:
-                retained[chapter_id] = dict(record)
+            if record.get("source_digest") == source:
+                retained[chapter_id] = {
+                    "source_digest": source,
+                    "build_generation": int(record.get("build_generation", 0)),
+                }
         return retained
 
     @staticmethod
@@ -474,22 +460,12 @@ class Orchestrator:
                 if chapter_id not in required:
                     continue
                 source = captured[chapter_id]
-                certificate = self._fixup_certificate(
-                    source,
-                    graph.dependencies[chapter_id],
-                    clean,
-                )
                 record = clean.get(chapter_id)
-                if (
-                    isinstance(record, dict)
-                    and record.get("source_digest") == source
-                    and record.get("certificate") == certificate
-                ):
+                if isinstance(record, dict) and record.get("source_digest") == source:
                     continue
                 build_generation += 1
                 clean[chapter_id] = {
                     "source_digest": source,
-                    "certificate": certificate,
                     "build_generation": build_generation,
                 }
             await self._save_fixup_graph(
@@ -641,14 +617,12 @@ class Orchestrator:
             if source_held:
                 self.source_lock.release()
                 source_held = False
-            if isolated.accepted and agent.changed:
+            if isolated.accepted and agent.changed and stage is not Stage.PROVE:
                 invalidated_builds = await self._invalidate_build_records((chapter.id,))
                 if stage is Stage.REVIEW:
                     self._proof_rechecks.update(invalidated_builds)
-                elif stage is Stage.PROVE:
-                    self._proof_rechecks.update(invalidated_builds.difference({chapter.id}))
             if isolated.accepted:
-                if stage is Stage.PROVE:
+                if stage is Stage.PROVE and (agent.changed or self.force):
                     snapshots: dict[str, ValidatedBuildSnapshot] = {}
                     validation = (
                         await self._build_chapters(
@@ -669,6 +643,12 @@ class Orchestrator:
                             1,
                             "Source scope changed after the coordinator build; retry required.",
                         )
+                elif stage is Stage.PROVE:
+                    validation = ValidationResult(
+                        True,
+                        0,
+                        "unchanged proof source reused the incoming clean build",
+                    )
                 else:
                     validation = ValidationResult(
                         True,
@@ -887,8 +867,6 @@ class Orchestrator:
             targets,
             detail="review invalidated by failed-proof findings",
         )
-        invalidated_builds = await self._invalidate_build_records(targets)
-        self._proof_rechecks.update(invalidated_builds)
         return invalidated_reviews
 
     def _has_completed_green_review(self, chapter_id: str) -> bool:
@@ -1408,7 +1386,7 @@ class Orchestrator:
         self,
         chapter: Chapter,
         feedback: str,
-        dependency_certificates: dict[str, str],
+        dependency_source_digests: dict[str, str],
     ) -> RunningFixupAgent:
         """Start an isolated fixup agent without waiting for or merging its result."""
 
@@ -1451,7 +1429,7 @@ class Orchestrator:
                 run=run,
                 workspace=workspace,
                 task=asyncio.create_task(execute()),
-                dependency_certificates=dependency_certificates,
+                dependency_source_digests=dependency_source_digests,
                 feedback=feedback,
                 source_lock_held=source_held,
             )
@@ -1807,14 +1785,14 @@ class Orchestrator:
                     )
                     continue
                 attempts[chapter_id] += 1
-                dependency_certificates = {
-                    dependency: str(clean[dependency]["certificate"])
+                dependency_source_digests = {
+                    dependency: str(clean[dependency]["source_digest"])
                     for dependency in graph.dependencies[chapter_id]
                 }
                 running[chapter_id] = await self._start_fixup_agent(
                     by_id[chapter_id],
                     pending_feedback.pop(chapter_id),
-                    dependency_certificates,
+                    dependency_source_digests,
                 )
 
         try:
@@ -1996,9 +1974,9 @@ class Orchestrator:
                     )
                     changed_dependencies = tuple(
                         dependency
-                        for dependency, certificate in handle.dependency_certificates.items()
+                        for dependency, source_digest in handle.dependency_source_digests.items()
                         if dependency not in clean
-                        or clean[dependency].get("certificate") != certificate
+                        or clean[dependency].get("source_digest") != source_digest
                     )
                     if changed_dependencies:
                         await discard_stale(handle, changed_dependencies)
@@ -2943,16 +2921,6 @@ class Orchestrator:
         """Refresh one invalidated exact build while its chapter has no agent."""
 
         validation = await self._refresh_stale_proof_build(chapter)
-        await self.state.set_task(
-            chapter.id,
-            Stage.PROVE,
-            TaskStatus.PENDING,
-            (
-                "dependency-sensitive coordinator rebuild completed"
-                if validation.succeeded
-                else "dependency-sensitive coordinator rebuild failed"
-            ),
-        )
         return validation.succeeded
 
     async def _prove(self, chapter: Chapter, *, defer_review: bool = False) -> bool:

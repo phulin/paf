@@ -35,7 +35,7 @@ missing chapter scope without Lean or LSP validation, so chapters and books can 
 despite provisional imports. After all drafts finish, the coordinator discovers chapter edges with
 regexes over the current `import LastLib...` lines and passes the complete dirty selected scope to
 one optimistic Lake invocation. Lake schedules those targets against the Lean import graph. A clean
-build publishes every selected certificate and skips fixup agents entirely. Otherwise the
+build records every selected source as fresh and skips fixup agents entirely. Otherwise the
 coordinator routes diagnostics to their owning chapters and fixes the dependency-ready owners with
 Lean MCP concurrently. As soon as an agent finishes, the coordinator merges it, rescans imports,
 and rebuilds it once its refined predecessors are clean. After a partially failing grouped build,
@@ -48,20 +48,24 @@ certification requests that are pending together contribute targets to one Lake 
 across stages. The highest-priority request supplies the batch priority, and any non-preemptible
 request makes the shared command non-preemptible. If the command fails, diagnostics are routed to
 their owning chapters and affected import descendants while independent targets are retried as one
-smaller batch and retain their successful certificates.
+smaller batch and retain their successful freshness records.
 A review starts once its own fixup is clean and all of its observed dependencies have been reviewed;
-there is no corpus-wide barrier between fixup and review. The coordinator remembers the source and
-dependency digests of successful builds so it can avoid rebuilding unchanged chapters. Review has
+there is no corpus-wide barrier between fixup and review. The coordinator remembers the source
+digests of successful builds so it can avoid rebuilding unchanged chapters. Review has
 no separate green flag: a successful review task is the whole state. Restarts and ordinary proof-body edits leave it
 succeeded; explicit review findings, proof-requested statement/API repairs, and forced review reopen
 only the reviews that receive findings. Reviewers directly make scoped statement and API repairs.
-If a review edits source, transitive build certificates are invalidated and downstream proofs are
+If a review edits source, transitive build freshness is invalidated and downstream proofs are
 kept green when a fresh coordinator build still succeeds. Fixup ends once the initial post-draft
 build has converged. Dependency-ready chapters receive prioritized, coalesced coordinator
 verification after changed reviews; failures and structured findings return to review with the
 diagnostics attached. After at most five
 such cycles—or immediately after a no-change review—the chapter is
 released to proving without waiting for reviews of its descendants.
+Proof edits are validated by building their own chapter, but they do not invalidate or proactively
+rebuild downstream chapters. Build freshness remains separate from review and proof task status.
+Proof findings reopen review without invalidating build freshness; a subsequent review edit is what
+marks the affected import closure stale.
 Every review prompt begins with the complete informal book and assigned Lean file set in path order
 with numbered lines, capped at 500,000 characters. The supplied snapshot counts as the reviewer's
 initial read; filesystem reads are reserved for missing or truncated content, post-edit content, and
@@ -292,7 +296,7 @@ After the daemon exits, `status`, `snapshot`, and `wait` fall back to the persis
   eligible for targeted coordinator builds instead of waiting for the entire corpus to finish
   drafting.
 - **Fixup** first optimistically builds the complete selected scope. A clean build publishes exact
-  build certificates and launches no fixup agents. Otherwise it groups build failures by chapter
+  build freshness and launches no fixup agents. Otherwise it groups build failures by chapter
   ownership and appends them verbatim to parallel fixup prompts. Agents treat that feedback as
   starting evidence, read only the implicated context,
   and let fresh MCP diagnostics account for prerequisite repairs that made an old diagnostic stale.
