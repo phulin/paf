@@ -498,6 +498,8 @@ def test_shipped_prompts_have_consistent_stage_contracts() -> None:
     assert "one item for every file that contains work" in prove
     assert "in that dependency order" in prove
     assert "never check off files out of order" in prove
+    assert "Report issues with other chapters ONLY if you find a false statement" in prove
+    assert "A theorem that you wish existed is not a reportable issue" in prove
 
 
 def test_warning_filter_allows_only_declaration_uses_sorry() -> None:

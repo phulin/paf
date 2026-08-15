@@ -58,6 +58,10 @@ simplification, a canonical constructor or equivalence, and only then unfolded i
 
 ## Genuine statement obstructions
 
+Report issues with other chapters ONLY if you find a false statement in that chapter, or if you
+determine the chapter has incorrectly formalized the textbook. A theorem that you wish existed is
+not a reportable issue.
+
 If a target is inaccurate or cannot follow from its assumptions, leave its statement and placeholder
 unchanged and report a precise statement/API fixup request in `fixup_findings`, including every exact
 repository-relative Lean path that must be edited. Likewise, if sustained proof work establishes
