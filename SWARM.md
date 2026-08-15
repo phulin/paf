@@ -27,13 +27,13 @@ flowchart LR
     R -->|changed, findings, or build failure| R
     R -->|succeeded| P
     P -->|statement/API problem; reopen affected reviews| R
-    P -->|missing earlier interface| UO[Upstream request: open]
-    UO --> UR[Targeted owner repair: repairing]
+    P -->|missing earlier interface| UQ[Upstream request: requested]
+    UQ --> UR[Temporary owner repair run]
     UR -->|exact answer persisted| UA[answered]
-    UA --> UT[Fresh consumer proof: retrying]
+    UA --> UT[Fresh consumer proof run]
     UT -->|named declaration proved + Lean valid| UC[closed]
     UC --> P
-    UO -->|invalid request| UM[manual escalation]
+    UQ -->|invalid request| UM[escalated]
     UR -->|no clean durable answer| UM
     UT -->|named declaration still blocked| UM
     P -->|no placeholders + Lean valid| D[Done]
@@ -355,21 +355,23 @@ After the daemon exits, `status`, `snapshot`, and `wait` fall back to the persis
   records the blocked declaration and consumer path, exact residual goal, minimal result needed,
   proposed owner chapter and paths, and at least two materially different attempted alternatives.
   It keeps working on independent declarations. The coordinator persists the request before doing
-  anything else and batches all open requests by owner chapter. One temporary proof-capable owner
+  anything else and batches all requested records by owner chapter. One temporary proof-capable owner
   agent receives the complete batch, consumer declaration excerpts, residual goals, prior attempts,
   upstream source paths, and relevant textbook excerpts. Owner and ordinary chapter agents share the
   same per-chapter lock, while this auxiliary run leaves the owner's ordinary proof task and round
   count untouched. A clean repair either adds and proves the interface, identifies an existing exact
   declaration, or records why the bridge belongs downstream. Reported additions and in-corpus
   declarations are checked against the integrated placeholder-free sources before their answers are
-  accepted.
-- Every accepted answer is retained verbatim in durable state, including exact declaration names,
+  accepted. The request remains `requested` while this agent runs and becomes `answered` only after
+  that completed answer is durably stored.
+- Every accepted answer is retained in durable state, including exact declaration names,
   application guidance, or the downstream-placement rejection. The consumer then gets exactly one
   fresh targeted proof agent with the original request, durable answer, and previous attempt ledger.
+  The request remains `answered` while that retry runs.
   Only a clean coordinator build in which the named blocked declaration no longer contains a
   placeholder closes the request. A malformed request, failed owner repair, unusable answer, or failed
-  targeted retry moves the proof task and request to manual escalation; ordinary `unblock` explicitly
-  authorizes another targeted attempt without erasing history.
+  targeted retry blocks the proof task and marks the request `escalated`; ordinary `unblock` explicitly
+  authorizes another targeted attempt without erasing run history.
 - A proof agent may change proof bodies but not declaration interfaces. A genuine statement/API
   problem is reported through a structured `fixup_findings` entry; despite the legacy field name,
   the pipeline returns directly to editing review before proving resumes.
@@ -473,13 +475,15 @@ explicit state batches, and JSON/database work runs off the TUI event loop. Task
 status (`pending`, `running`, `succeeded`, `failed`, or `blocked`) plus a short detail describing what
 a running or pending task is doing. Statement repair requests are checkpointed before entering the
 in-memory batching queue and removed only after their dependency-aware review pass returns. Upstream
-proof requests instead remain in the checkpoint permanently and carry an explicit sub-state:
-`open`, `repairing`, `answered`, `retrying`, `closed`, or `manual_escalation`. Their owner-grouped open
-batches are exported in the snapshot. Restart recovery rewinds an interrupted repair to `open` and an
-interrupted consumer retry to `answered` (or `open` if no answer was persisted), then reconstructs a
-handoff from a completed proof report if the process stopped between those two durable writes. It also
-reconstructs proof-requested statement repairs written by older orchestrators that invalidated review
-state before checkpointing the handoff. The chapter table displays exact-build
+proof requests instead remain in the checkpoint permanently and record only completed facts:
+`requested`, `answered`, `closed`, or `escalated`. Their owner-grouped requested batches are exported
+in the snapshot. Active repair and retry work exists only as ordinary persisted run records. Because a
+request changes state only after that work completes, generic interrupted-run recovery naturally
+leaves an interrupted repair `requested` and an interrupted consumer retry `answered`; no separate
+request-state rewind is needed. Recovery also reconstructs both a handoff from a completed proof report
+when the process stopped between those two durable writes and proof-requested statement repairs written
+by older orchestrators that invalidated review state before checkpointing the handoff. The chapter table
+displays exact-build
 freshness independently of whether a past fixup task succeeded. A coordinator-build record tracks the
 single serialized Lake build, and the TUI also shows its owner and queued jobs. Running run records—not
 chapter-stage records—are the authoritative live-agent count.

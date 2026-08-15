@@ -1216,7 +1216,7 @@ class Orchestrator:
         return accepted, "; ".join(errors)
 
     async def _repair_upstream_owner(self, owner_id: str) -> None:
-        """Coalesce the current durable queue for one owner into one temporary agent."""
+        """Coalesce one owner's requested records without persisting an in-flight state."""
 
         await asyncio.sleep(0)
         request_ids = tuple(self.state.upstream_request_batches().get(owner_id, ()))
@@ -1224,39 +1224,34 @@ class Orchestrator:
             return
         by_id = {chapter.id: chapter for chapter in self.chapters}
         owner = by_id.get(owner_id)
-        batch_id = uuid4().hex[:12]
-        started = await self.state.begin_upstream_repair(request_ids, batch_id=batch_id)
-        if not started:
-            return
-        if owner is None:
-            await self.state.finish_upstream_repair(
-                started,
-                run_id=batch_id,
+        run_id: str | None = None
+
+        async def escalate(message: str) -> None:
+            await self.state.record_upstream_answers(
+                request_ids,
+                run_id=run_id,
                 answers={},
-                error="upstream owner is outside this swarm selection",
+                error=message,
             )
+
+        if owner is None:
+            await escalate("upstream owner is outside this swarm selection")
             return
-        requests = tuple(self.state.upstream_requests[request_id] for request_id in started)
-        run_id = batch_id
+        requests = tuple(self.state.upstream_requests[request_id] for request_id in request_ids)
         try:
             if not self._proof_build_is_fresh(owner):
                 refresh = await self._refresh_stale_proof_build(owner)
                 if not refresh.succeeded:
-                    await self.state.finish_upstream_repair(
-                        started,
-                        run_id=run_id,
-                        answers={},
-                        error=(
-                            "owner sources failed coordinator refresh before targeted repair: "
-                            + refresh.output[-4000:]
-                        ),
+                    await escalate(
+                        "owner sources failed coordinator refresh before targeted repair: "
+                        + refresh.output[-4000:]
                     )
                     return
             attempt = await self._attempt(
                 owner,
                 Stage.PROVE,
                 role=UPSTREAM_REPAIR_ROLE,
-                request_ids=started,
+                request_ids=request_ids,
                 upstream_requests=requests,
             )
             run_id = attempt.run.id
@@ -1265,19 +1260,14 @@ class Orchestrator:
                 and attempt.validation.succeeded
                 and attempt.agent.report.get("complete") is True
             ):
-                await self.state.finish_upstream_repair(
-                    started,
-                    run_id=run_id,
-                    answers={},
-                    error=(
-                        "targeted upstream repair did not complete with a clean owner build:\n"
-                        + attempt.feedback()[-6000:]
-                    ),
+                await escalate(
+                    "targeted upstream repair did not complete with a clean owner build:\n"
+                    + attempt.feedback()[-6000:]
                 )
                 return
             answers, answer_error = self._parse_upstream_answers(
                 attempt.agent.report,
-                started,
+                request_ids,
             )
             answers, declaration_error = self._validate_upstream_answer_declarations(
                 owner,
@@ -1287,8 +1277,8 @@ class Orchestrator:
             answer_error = "; ".join(
                 error for error in (answer_error, declaration_error) if error
             )
-            await self.state.finish_upstream_repair(
-                started,
+            await self.state.record_upstream_answers(
+                request_ids,
                 run_id=run_id,
                 answers=answers,
                 error=answer_error,
@@ -1307,32 +1297,27 @@ class Orchestrator:
                     source_digest=scope_digest(self.config.settings.repo, owner),
                 )
         except Exception as error:
-            await self.state.finish_upstream_repair(
-                started,
-                run_id=run_id,
-                answers={},
-                error=f"targeted upstream repair orchestration failed: {error}",
-            )
+            await escalate(f"targeted upstream repair orchestration failed: {error}")
 
     async def _ensure_upstream_answers(self, request_ids: Iterable[str]) -> tuple[str, ...]:
         """Run owner batches until every supplied request is answered or escalated."""
 
         selected = tuple(dict.fromkeys(request_ids))
         while True:
-            open_by_owner: dict[str, list[str]] = {}
+            requested_by_owner: dict[str, list[str]] = {}
             for request_id in selected:
                 request = self.state.upstream_requests.get(request_id)
                 if not isinstance(request, dict):
                     continue
-                if request.get("status") != UpstreamRequestStatus.OPEN.value:
+                if request.get("status") != UpstreamRequestStatus.REQUESTED.value:
                     continue
                 owner_id = str(request.get("owner_chapter_id", ""))
                 if owner_id:
-                    open_by_owner.setdefault(owner_id, []).append(request_id)
-            if not open_by_owner:
+                    requested_by_owner.setdefault(owner_id, []).append(request_id)
+            if not requested_by_owner:
                 break
             tasks: list[asyncio.Task[None]] = []
-            for owner_id in open_by_owner:
+            for owner_id in requested_by_owner:
                 task = self._upstream_repair_tasks.get(owner_id)
                 if task is None or task.done():
                     task = asyncio.create_task(self._repair_upstream_owner(owner_id))
@@ -1424,9 +1409,13 @@ class Orchestrator:
             ValidationResult(True, 0, "existing clean coordinator build"),
         )
         if succeeded:
-            await self.state.close_resolved_upstream_requests(
+            await self.state.finish_upstream_requests(
                 succeeded,
-                detail="blocked declaration was already proved in validated current sources",
+                run_id=None,
+                succeeded_ids=succeeded,
+                success_detail=(
+                    "blocked declaration was already proved in validated current sources"
+                ),
             )
         return succeeded
 
@@ -3739,9 +3728,9 @@ class Orchestrator:
         durable_requests = self.state.upstream_requests_for_consumer(
             chapter.id,
             statuses=(
-                UpstreamRequestStatus.OPEN,
+                UpstreamRequestStatus.REQUESTED,
                 UpstreamRequestStatus.ANSWERED,
-                UpstreamRequestStatus.MANUAL_ESCALATION,
+                UpstreamRequestStatus.ESCALATED,
             ),
         )
         durable_ids = tuple(str(request["id"]) for request in durable_requests)
@@ -3750,7 +3739,7 @@ class Orchestrator:
             request_id
             for request_id in durable_ids
             if self.state.upstream_requests[request_id].get("status")
-            == UpstreamRequestStatus.MANUAL_ESCALATION.value
+            == UpstreamRequestStatus.ESCALATED.value
         )
         if escalated:
             await self.state.set_task(
@@ -3769,8 +3758,15 @@ class Orchestrator:
         while proof_round < proof_maximum or targeted_request_ids:
             targeted_retry = bool(targeted_request_ids)
             if targeted_retry:
-                targeted_request_ids = await self.state.begin_downstream_retry(targeted_request_ids)
-                if not targeted_request_ids:
+                # The durable fact remains `answered` until this fresh run has a terminal result.
+                targeted_request_ids = tuple(
+                    request_id
+                    for request_id in targeted_request_ids
+                    if self.state.upstream_requests[request_id].get("status")
+                    == UpstreamRequestStatus.ANSWERED.value
+                )
+                targeted_retry = bool(targeted_request_ids)
+                if not targeted_retry:
                     continue
             attempt = await self._attempt(
                 chapter,
@@ -3787,7 +3783,7 @@ class Orchestrator:
             )
             if attempt.agent.capacity_exhausted:
                 if targeted_retry:
-                    await self.state.finish_downstream_retry(
+                    await self.state.finish_upstream_requests(
                         targeted_request_ids,
                         run_id=attempt.run.id,
                         succeeded_ids=(),
@@ -3818,7 +3814,7 @@ class Orchestrator:
                         if attempt.validation.succeeded
                         else "targeted retry did not validate: " + attempt.validation.output[-4000:]
                     )
-                await self.state.finish_downstream_retry(
+                await self.state.finish_upstream_requests(
                     targeted_request_ids,
                     run_id=attempt.run.id,
                     succeeded_ids=succeeded_request_ids,
@@ -3888,7 +3884,7 @@ class Orchestrator:
                     request_id
                     for request_id in upstream_request_ids
                     if self.state.upstream_requests[request_id].get("status")
-                    == UpstreamRequestStatus.MANUAL_ESCALATION.value
+                    == UpstreamRequestStatus.ESCALATED.value
                 )
                 if escalated:
                     await self.state.set_task(

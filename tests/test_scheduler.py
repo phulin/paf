@@ -261,7 +261,7 @@ async def test_state_persists_fixup_graph(tmp_path: Path) -> None:
     await reloaded.load_or_create()
 
     assert reloaded.fixup_graph == state.fixup_graph
-    assert reloaded.snapshot()["version"] == 12
+    assert reloaded.snapshot()["version"] == 13
 
 
 @pytest.mark.asyncio
@@ -356,23 +356,23 @@ async def test_upstream_requests_persist_answers_and_batch_by_owner(tmp_path: Pa
     )
 
     assert created
+    assert state.upstream_requests[request_id]["status"] == UpstreamRequestStatus.REQUESTED
     assert state.upstream_request_batches() == {owner.id: [request_id]}
     assert state.hot_snapshot()["upstream_request_batches"] == {owner.id: [request_id]}
 
-    assert await state.begin_upstream_repair((request_id,), batch_id="batch-one") == (request_id,)
     answer = {
         "disposition": "existing",
         "declarations": ["Book.transport_input_result"],
         "usage_guidance": "Apply `Book.transport_input_result x`.",
         "rejection_reason": "",
     }
-    await state.finish_upstream_repair(
+    await state.record_upstream_answers(
         (request_id,),
         run_id="repair-run",
         answers={request_id: answer},
     )
-    assert await state.begin_downstream_retry((request_id,)) == (request_id,)
-    await state.finish_downstream_retry(
+    assert state.upstream_requests[request_id]["status"] == UpstreamRequestStatus.ANSWERED
+    await state.finish_upstream_requests(
         (request_id,),
         run_id="retry-run",
         succeeded_ids=(),
@@ -389,10 +389,12 @@ async def test_upstream_requests_persist_answers_and_batch_by_owner(tmp_path: Pa
     reloaded = StateStore(config)
     await reloaded.load_or_create()
     persisted = reloaded.upstream_requests[request_id]
-    assert persisted["status"] == UpstreamRequestStatus.MANUAL_ESCALATION
+    assert persisted["status"] == UpstreamRequestStatus.ESCALATED
     assert persisted["answer"]["declarations"] == ["Book.transport_input_result"]
-    assert persisted["answers"][0]["repair_run_id"] == "repair-run"
-    assert persisted["retry_attempts"][0]["run_id"] == "retry-run"
+    assert persisted["repair_run_id"] == "repair-run"
+    assert persisted["retry_run_id"] == "retry-run"
+    assert persisted["escalation_reason"] == "the residual goal remained"
+    assert not {"answers", "repair_attempts", "retry_attempts", "history"}.intersection(persisted)
     assert reloaded.upstream_request_batches() == {}
 
     assert await reloaded.unblock() == [f"{consumer.id}:prove"]
@@ -402,7 +404,7 @@ async def test_upstream_requests_persist_answers_and_batch_by_owner(tmp_path: Pa
 
 
 @pytest.mark.asyncio
-async def test_upstream_request_recovery_requeues_interrupted_substates(tmp_path: Path) -> None:
+async def test_interrupted_runs_leave_requests_at_last_completed_fact(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
     owner, consumer = config.chapters
     state = StateStore(config)
@@ -423,7 +425,12 @@ async def test_upstream_request_recovery_requeues_interrupted_substates(tmp_path
         owner_chapter_id=owner.id,
         previous_attempts="attempt one",
     )
-    await state.begin_upstream_repair((repair_id,), batch_id="interrupted")
+    repair_run = await state.start_auxiliary_run(
+        owner.id,
+        Stage.PROVE,
+        role="upstream_repair",
+        request_ids=(repair_id,),
+    )
 
     retry_request = dict(base)
     retry_request["blocked_declaration"] = "secondTarget"
@@ -434,8 +441,7 @@ async def test_upstream_request_recovery_requeues_interrupted_substates(tmp_path
         owner_chapter_id=owner.id,
         previous_attempts="attempt two",
     )
-    await state.begin_upstream_repair((retry_id,), batch_id="answered")
-    await state.finish_upstream_repair(
+    await state.record_upstream_answers(
         (retry_id,),
         run_id="repair-run",
         answers={
@@ -447,23 +453,24 @@ async def test_upstream_request_recovery_requeues_interrupted_substates(tmp_path
             }
         },
     )
-    await state.begin_downstream_retry((retry_id,))
+    retry_run = await state.start_run(consumer.id, Stage.PROVE)
+    await state.update_run(
+        retry_run,
+        role="downstream_retry",
+        request_ids=[retry_id],
+    )
     await state.close()
 
     recovered = StateStore(config)
     await recovered.load_or_create()
 
-    assert recovered.upstream_requests[repair_id]["status"] == UpstreamRequestStatus.OPEN
+    assert recovered.upstream_requests[repair_id]["status"] == UpstreamRequestStatus.REQUESTED
     assert recovered.upstream_requests[retry_id]["status"] == UpstreamRequestStatus.ANSWERED
     assert recovered.upstream_request_batches() == {owner.id: [repair_id]}
-    assert (
-        "interrupted targeted upstream repair"
-        in (recovered.upstream_requests[repair_id]["history"][-1]["detail"])
-    )
-    assert (
-        "interrupted targeted downstream retry"
-        in (recovered.upstream_requests[retry_id]["history"][-1]["detail"])
-    )
+    assert recovered.task(owner.id, Stage.PROVE).runs[-1].id == repair_run.id
+    assert recovered.task(owner.id, Stage.PROVE).runs[-1].status == TaskStatus.FAILED
+    assert recovered.task(consumer.id, Stage.PROVE).runs[-1].id == retry_run.id
+    assert recovered.task(consumer.id, Stage.PROVE).runs[-1].status == TaskStatus.FAILED
     await recovered.close()
 
 
@@ -477,13 +484,31 @@ async def test_upstream_request_recovery_normalizes_malformed_collection_fields(
     await state.load_or_create()
     state.upstream_requests["damaged-request"] = {
         "id": "damaged-request",
-        "status": UpstreamRequestStatus.REPAIRING,
+        "status": "repairing",
         "consumer_chapter_id": chapter.id,
         "history": {"not": "a list"},
         "origin_run_ids": "not a list",
         "repair_attempts": None,
         "answer": "not an answer object",
         "previous_attempts": ["not text"],
+    }
+    state.upstream_requests["interrupted-retry"] = {
+        "id": "interrupted-retry",
+        "status": "retrying",
+        "consumer_chapter_id": chapter.id,
+        "answer": {
+            "disposition": "existing",
+            "declarations": ["Book.bridge"],
+            "usage_guidance": "Apply the bridge.",
+            "rejection_reason": "",
+        },
+        "history": [{"status": "retrying"}],
+    }
+    state.upstream_requests["manual-escalation"] = {
+        "id": "manual-escalation",
+        "status": "manual_escalation",
+        "consumer_chapter_id": chapter.id,
+        "escalation_reason": "legacy failure",
     }
     await state.save()
     await state.close()
@@ -492,12 +517,19 @@ async def test_upstream_request_recovery_normalizes_malformed_collection_fields(
     await recovered.load_or_create()
     request = recovered.upstream_requests["damaged-request"]
 
-    assert request["status"] == UpstreamRequestStatus.OPEN
+    assert request["status"] == UpstreamRequestStatus.REQUESTED
     assert request["origin_run_ids"] == []
-    assert request["repair_attempts"] == []
     assert request["answer"] is None
     assert request["previous_attempts"] == ""
-    assert request["history"][-1]["status"] == UpstreamRequestStatus.OPEN
+    assert "repair_attempts" not in request
+    assert "history" not in request
+    retry = recovered.upstream_requests["interrupted-retry"]
+    assert retry["status"] == UpstreamRequestStatus.ANSWERED
+    assert "history" not in retry
+    assert (
+        recovered.upstream_requests["manual-escalation"]["status"]
+        == UpstreamRequestStatus.ESCALATED
+    )
     await recovered.close()
 
 
@@ -525,17 +557,17 @@ async def test_validated_external_proof_closes_request_without_false_escalation(
         previous_attempts="attempt one",
     )
 
-    assert await state.close_resolved_upstream_requests(
+    assert await state.finish_upstream_requests(
         (request_id,),
-        detail="a concurrent validated proof solved the declaration",
         run_id="concurrent-proof",
+        succeeded_ids=(request_id,),
+        success_detail="a concurrent validated proof solved the declaration",
     ) == (request_id,)
     request = state.upstream_requests[request_id]
     assert request["status"] == UpstreamRequestStatus.CLOSED
-    assert [entry["status"] for entry in request["history"]] == [
-        UpstreamRequestStatus.OPEN,
-        UpstreamRequestStatus.CLOSED,
-    ]
+    assert request["closed_by_run_id"] == "concurrent-proof"
+    assert request["closed_reason"] == "a concurrent validated proof solved the declaration"
+    assert "history" not in request
     await state.close()
 
 
@@ -611,7 +643,7 @@ async def test_hot_checkpoint_does_not_grow_with_run_payload_history(tmp_path: P
 
     hot = json.loads(state.path.read_text(encoding="utf-8"))
     task = hot["tasks"][f"{config.chapters[0].id}:formalize"]
-    assert hot["version"] == 12
+    assert hot["version"] == 13
     assert "source_issues" not in hot
     assert "runs" not in task
     assert task["run_count"] == 25
@@ -3472,6 +3504,8 @@ async def test_proof_upstream_request_runs_repair_then_targeted_retry(
         assert workspace_root is not None
         proof_roles.append(run.role)
         if run.role == "downstream_retry":
+            request = next(iter(orchestrator.state.upstream_requests.values()))
+            assert request["status"] == UpstreamRequestStatus.ANSWERED
             assert "earlierBridge" in feedback
             assert "blockedTarget" in feedback
             target = workspace_root / "lean" / "Book" / "Chapter02.lean"
@@ -3532,6 +3566,9 @@ async def test_proof_upstream_request_runs_repair_then_targeted_retry(
         assert chapter.id == owner.id
         assert workspace_root is not None
         selected = tuple(requests)
+        assert all(
+            request["status"] == UpstreamRequestStatus.REQUESTED for request in selected
+        )
         repair_batches.append(tuple(str(request["id"]) for request in selected))
         target = workspace_root / "lean" / "Book" / "Chapter01.lean"
         target.write_text(
@@ -3699,15 +3736,16 @@ async def test_upstream_request_escalates_only_after_failed_targeted_retry(
     assert not await orchestrator._prove(consumer)
     assert proof_attempts == 2
     request = next(iter(orchestrator.state.upstream_requests.values()))
-    assert request["status"] == UpstreamRequestStatus.MANUAL_ESCALATION
+    assert request["status"] == UpstreamRequestStatus.ESCALATED
     assert request["answer"]["disposition"] == "downstream"
-    assert request["retry_attempts"][0]["status"] == "failed"
+    assert request["retry_run_id"] == orchestrator.state.task(consumer.id, Stage.PROVE).runs[-1].id
+    assert "blocked declaration remained unresolved" in request["escalation_reason"]
     assert orchestrator.state.task(consumer.id, Stage.PROVE).status == TaskStatus.BLOCKED
     await orchestrator.shutdown()
 
 
 @pytest.mark.asyncio
-async def test_open_upstream_requests_for_one_owner_share_one_repair_agent(
+async def test_requested_upstream_requests_for_one_owner_share_one_repair_agent(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

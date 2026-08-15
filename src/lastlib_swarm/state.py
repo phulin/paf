@@ -34,54 +34,12 @@ class TaskStatus(StrEnum):
 
 
 class UpstreamRequestStatus(StrEnum):
-    """Durable proof sub-state for a missing interface in an earlier chapter."""
+    """Completed durable facts for a missing interface in an earlier chapter."""
 
-    OPEN = "open"
-    REPAIRING = "repairing"
+    REQUESTED = "requested"
     ANSWERED = "answered"
-    RETRYING = "retrying"
     CLOSED = "closed"
-    MANUAL_ESCALATION = "manual_escalation"
-
-
-UPSTREAM_REQUEST_TRANSITIONS: dict[UpstreamRequestStatus, frozenset[UpstreamRequestStatus]] = {
-    UpstreamRequestStatus.OPEN: frozenset(
-        {
-            UpstreamRequestStatus.REPAIRING,
-            UpstreamRequestStatus.CLOSED,
-            UpstreamRequestStatus.MANUAL_ESCALATION,
-        }
-    ),
-    UpstreamRequestStatus.REPAIRING: frozenset(
-        {
-            UpstreamRequestStatus.OPEN,
-            UpstreamRequestStatus.ANSWERED,
-            UpstreamRequestStatus.MANUAL_ESCALATION,
-        }
-    ),
-    UpstreamRequestStatus.ANSWERED: frozenset(
-        {
-            UpstreamRequestStatus.RETRYING,
-            UpstreamRequestStatus.CLOSED,
-            UpstreamRequestStatus.MANUAL_ESCALATION,
-        }
-    ),
-    UpstreamRequestStatus.RETRYING: frozenset(
-        {
-            UpstreamRequestStatus.ANSWERED,
-            UpstreamRequestStatus.CLOSED,
-            UpstreamRequestStatus.MANUAL_ESCALATION,
-        }
-    ),
-    UpstreamRequestStatus.CLOSED: frozenset(),
-    UpstreamRequestStatus.MANUAL_ESCALATION: frozenset(
-        {
-            UpstreamRequestStatus.OPEN,
-            UpstreamRequestStatus.ANSWERED,
-            UpstreamRequestStatus.CLOSED,
-        }
-    ),
-}
+    ESCALATED = "escalated"
 
 
 @dataclass
@@ -392,7 +350,7 @@ class StateStore:
             self.coordinator_build.active = False
             self.coordinator_build.current_chapter_id = ""
             self.coordinator_build.updated_at = timestamp()
-        self._recover_upstream_request_state()
+        self._normalize_upstream_request_state()
         self._invalidate_aggregates()
         self._invalidate_status_summaries()
         self._checkpoint_dirty = True
@@ -477,7 +435,7 @@ class StateStore:
         cost = self.total_cost()
         invocation_cost = self.invocation_cost()
         return {
-            "version": 12,
+            "version": 13,
             "history_database": DATABASE_NAME,
             "config": str(self.config.path),
             "created_at": self.created_at,
@@ -574,82 +532,55 @@ class StateStore:
         self._mark_dirty()
         await self._persist()
 
-    @staticmethod
-    def _upstream_history_entry(
-        status: UpstreamRequestStatus,
-        detail: str,
-        *,
-        run_id: str | None = None,
-    ) -> dict[str, Any]:
-        entry: dict[str, Any] = {
-            "status": status.value,
-            "at": timestamp(),
-            "detail": detail,
+    def _normalize_upstream_request_state(self) -> None:
+        """Migrate legacy request records to completed-fact durable states."""
+
+        legacy_statuses = {
+            "open": UpstreamRequestStatus.REQUESTED,
+            "repairing": UpstreamRequestStatus.REQUESTED,
+            "retrying": UpstreamRequestStatus.ANSWERED,
+            "manual_escalation": UpstreamRequestStatus.ESCALATED,
         }
-        if run_id:
-            entry["run_id"] = run_id
-        return entry
-
-    def _recover_upstream_request_state(self) -> None:
-        """Normalize durable requests and rewind interrupted transitions to a safe queue."""
-
-        valid_statuses = {status.value for status in UpstreamRequestStatus}
+        valid_statuses = {status.value: status for status in UpstreamRequestStatus}
         for request_id, request in self.upstream_requests.items():
             created_at = str(request.get("created_at") or timestamp())
             request.setdefault("id", request_id)
             request.setdefault("created_at", created_at)
             request.setdefault("updated_at", created_at)
-            for name in (
-                "origin_run_ids",
-                "owner_paths",
-                "attempted_alternatives",
-                "repair_attempts",
-                "retry_attempts",
-                "answers",
-                "history",
-            ):
+            for name in ("origin_run_ids", "owner_paths", "attempted_alternatives"):
                 if not isinstance(request.get(name), list):
                     request[name] = []
             if not isinstance(request.get("previous_attempts"), str):
                 request["previous_attempts"] = ""
             if request.get("answer") is not None and not isinstance(request.get("answer"), dict):
                 request["answer"] = None
-            raw_status = str(request.get("status", UpstreamRequestStatus.OPEN.value))
-            if raw_status == "requested":
-                raw_status = UpstreamRequestStatus.OPEN.value
-            if raw_status not in valid_statuses:
-                raw_status = UpstreamRequestStatus.MANUAL_ESCALATION.value
+
+            raw_status = str(request.get("status", UpstreamRequestStatus.REQUESTED.value))
+            status = valid_statuses.get(raw_status) or legacy_statuses.get(raw_status)
+            if status is None:
+                status = UpstreamRequestStatus.ESCALATED
                 request["escalation_reason"] = "recovered an unknown upstream-request state"
-            status = UpstreamRequestStatus(raw_status)
-            if status is UpstreamRequestStatus.REPAIRING:
-                status = UpstreamRequestStatus.OPEN
-                request["history"].append(
-                    self._upstream_history_entry(
-                        status,
-                        "requeued after an interrupted targeted upstream repair",
-                    )
-                )
-            elif status is UpstreamRequestStatus.RETRYING:
-                status = (
-                    UpstreamRequestStatus.ANSWERED
-                    if isinstance(request.get("answer"), dict)
-                    else UpstreamRequestStatus.OPEN
-                )
-                request["history"].append(
-                    self._upstream_history_entry(
-                        status,
-                        "requeued after an interrupted targeted downstream retry",
-                    )
-                )
+                request.setdefault("escalated_at", timestamp())
+            if status is UpstreamRequestStatus.ANSWERED and not isinstance(
+                request.get("answer"), dict
+            ):
+                status = UpstreamRequestStatus.REQUESTED
+            elif status is UpstreamRequestStatus.REQUESTED and isinstance(
+                request.get("answer"), dict
+            ):
+                status = UpstreamRequestStatus.ANSWERED
             request["status"] = status.value
-            request["updated_at"] = timestamp()
+
+            # Older snapshots duplicated execution history that is already retained by RunRecord.
+            for legacy_field in ("repair_attempts", "retry_attempts", "answers", "history"):
+                request.pop(legacy_field, None)
 
     def upstream_request_batches(self) -> dict[str, list[str]]:
-        """Group the durable open queue by its proposed owning chapter."""
+        """Group unanswered durable requests by their proposed owning chapter."""
 
         batches: dict[str, list[str]] = {}
         for request_id, request in sorted(self.upstream_requests.items()):
-            if request.get("status") != UpstreamRequestStatus.OPEN.value:
+            if request.get("status") != UpstreamRequestStatus.REQUESTED.value:
                 continue
             owner = request.get("owner_chapter_id")
             if isinstance(owner, str) and owner:
@@ -669,26 +600,6 @@ class StateStore:
             if request.get("consumer_chapter_id") == chapter_id
             and (selected is None or UpstreamRequestStatus(str(request.get("status"))) in selected)
         )
-
-    def _transition_upstream_request(
-        self,
-        request: dict[str, Any],
-        status: UpstreamRequestStatus,
-        detail: str,
-        *,
-        run_id: str | None = None,
-    ) -> None:
-        current = UpstreamRequestStatus(str(request["status"]))
-        if status is not current and status not in UPSTREAM_REQUEST_TRANSITIONS[current]:
-            raise RuntimeError(
-                f"invalid upstream-request transition {current.value} -> {status.value} "
-                f"for {request.get('id', 'unknown request')}"
-            )
-        request["status"] = status.value
-        request["updated_at"] = timestamp()
-        history = request.setdefault("history", [])
-        if isinstance(history, list):
-            history.append(self._upstream_history_entry(status, detail, run_id=run_id))
 
     async def enqueue_upstream_request(
         self,
@@ -727,9 +638,9 @@ class StateStore:
         request_id = uuid4().hex[:12]
         now = timestamp()
         status = (
-            UpstreamRequestStatus.MANUAL_ESCALATION
+            UpstreamRequestStatus.ESCALATED
             if escalation_reason
-            else UpstreamRequestStatus.OPEN
+            else UpstreamRequestStatus.REQUESTED
         )
         attempted = request.get("attempted_alternatives")
         owner_paths = request.get("owner_paths")
@@ -762,209 +673,81 @@ class StateStore:
             if isinstance(attempted, list)
             else [],
             "previous_attempts": previous_attempts,
-            "repair_attempts": [],
-            "retry_attempts": [],
-            "answers": [],
             "answer": None,
             "sightings": 1,
             "created_at": now,
             "updated_at": now,
-            "history": [
-                self._upstream_history_entry(
-                    status,
-                    escalation_reason or "proof agent requested an earlier interface",
-                    run_id=origin_run_id,
-                )
-            ],
         }
         if escalation_reason:
             record["escalation_reason"] = escalation_reason
             record["escalated_at"] = now
+            record["escalated_by_run_id"] = origin_run_id
         self.upstream_requests[request_id] = record
         self._mark_dirty()
         await self._persist()
         return request_id, True
 
-    async def begin_upstream_repair(
+    async def record_upstream_answers(
         self,
         request_ids: Iterable[str],
         *,
-        batch_id: str,
-    ) -> tuple[str, ...]:
-        started: list[str] = []
-        async with self.batch():
-            for request_id in request_ids:
-                request = self.upstream_requests.get(request_id)
-                if (
-                    not isinstance(request, dict)
-                    or request.get("status") != UpstreamRequestStatus.OPEN.value
-                ):
-                    continue
-                self._transition_upstream_request(
-                    request,
-                    UpstreamRequestStatus.REPAIRING,
-                    f"targeted upstream repair batch {batch_id} started",
-                )
-                attempts = request.setdefault("repair_attempts", [])
-                if isinstance(attempts, list):
-                    attempts.append(
-                        {
-                            "batch_id": batch_id,
-                            "status": "running",
-                            "started_at": timestamp(),
-                        }
-                    )
-                started.append(request_id)
-            if started:
-                self._mark_dirty()
-                await self._persist()
-        return tuple(started)
-
-    async def finish_upstream_repair(
-        self,
-        request_ids: Iterable[str],
-        *,
-        run_id: str,
+        run_id: str | None,
         answers: dict[str, dict[str, Any]],
         error: str = "",
     ) -> None:
-        async with self.batch():
-            for request_id in request_ids:
-                request = self.upstream_requests.get(request_id)
-                if not isinstance(request, dict):
-                    continue
-                attempts = request.setdefault("repair_attempts", [])
-                if isinstance(attempts, list) and attempts:
-                    attempt = attempts[-1]
-                    if isinstance(attempt, dict) and attempt.get("status") == "running":
-                        attempt.update(
-                            {
-                                "run_id": run_id,
-                                "status": "succeeded" if request_id in answers else "failed",
-                                "finished_at": timestamp(),
-                            }
-                        )
-                        if error:
-                            attempt["error"] = error
-                answer = answers.get(request_id)
-                if answer is None:
-                    if request.get("status") == UpstreamRequestStatus.REPAIRING.value:
-                        self._transition_upstream_request(
-                            request,
-                            UpstreamRequestStatus.MANUAL_ESCALATION,
-                            error or "targeted upstream repair returned no usable answer",
-                            run_id=run_id,
-                        )
-                        request["escalation_reason"] = (
-                            error or "targeted upstream repair returned no usable answer"
-                        )
-                        request["escalated_at"] = timestamp()
-                    continue
-                persisted_answer = dict(answer) | {
-                    "repair_run_id": run_id,
-                    "answered_at": timestamp(),
-                }
-                request["answer"] = persisted_answer
-                answer_history = request.setdefault("answers", [])
-                if isinstance(answer_history, list):
-                    answer_history.append(persisted_answer)
-                self._transition_upstream_request(
-                    request,
-                    UpstreamRequestStatus.ANSWERED,
-                    "targeted upstream repair supplied a durable answer",
-                    run_id=run_id,
-                )
-            self._mark_dirty()
-            await self._persist()
+        """Persist completed repair answers or terminal repair failures."""
 
-    async def begin_downstream_retry(self, request_ids: Iterable[str]) -> tuple[str, ...]:
-        started: list[str] = []
+        changed = False
         async with self.batch():
             for request_id in request_ids:
                 request = self.upstream_requests.get(request_id)
                 if (
                     not isinstance(request, dict)
-                    or request.get("status") != UpstreamRequestStatus.ANSWERED.value
+                    or request.get("status") != UpstreamRequestStatus.REQUESTED.value
                 ):
                     continue
-                self._transition_upstream_request(
-                    request,
-                    UpstreamRequestStatus.RETRYING,
-                    "fresh targeted downstream proof retry started",
-                )
-                attempts = request.setdefault("retry_attempts", [])
-                if isinstance(attempts, list):
-                    attempts.append({"status": "running", "started_at": timestamp()})
-                started.append(request_id)
-            if started:
-                self._mark_dirty()
-                await self._persist()
-        return tuple(started)
-
-    async def finish_downstream_retry(
-        self,
-        request_ids: Iterable[str],
-        *,
-        run_id: str,
-        succeeded_ids: Iterable[str],
-        error: str = "",
-    ) -> None:
-        succeeded = set(succeeded_ids)
-        async with self.batch():
-            for request_id in request_ids:
-                request = self.upstream_requests.get(request_id)
-                if not isinstance(request, dict):
-                    continue
-                attempts = request.setdefault("retry_attempts", [])
-                if isinstance(attempts, list) and attempts:
-                    attempt = attempts[-1]
-                    if isinstance(attempt, dict) and attempt.get("status") == "running":
-                        attempt.update(
-                            {
-                                "run_id": run_id,
-                                "status": "succeeded" if request_id in succeeded else "failed",
-                                "finished_at": timestamp(),
-                            }
-                        )
-                        if error:
-                            attempt["error"] = error
-                if request.get("status") != UpstreamRequestStatus.RETRYING.value:
-                    continue
-                if request_id in succeeded:
-                    self._transition_upstream_request(
-                        request,
-                        UpstreamRequestStatus.CLOSED,
-                        "blocked declaration succeeded in the targeted downstream retry",
-                        run_id=run_id,
-                    )
-                    request["closed_at"] = timestamp()
-                    request["closed_by_run_id"] = run_id
-                else:
-                    reason = error or (
-                        "blocked declaration remained unresolved after its targeted "
-                        "downstream retry"
-                    )
-                    self._transition_upstream_request(
-                        request,
-                        UpstreamRequestStatus.MANUAL_ESCALATION,
-                        reason,
-                        run_id=run_id,
-                    )
+                answer = answers.get(request_id)
+                if answer is None:
+                    reason = error or "targeted upstream repair returned no usable answer"
+                    request["status"] = UpstreamRequestStatus.ESCALATED.value
                     request["escalation_reason"] = reason
                     request["escalated_at"] = timestamp()
-            self._mark_dirty()
-            await self._persist()
+                    if run_id is not None:
+                        request["escalated_by_run_id"] = run_id
+                        request["repair_run_id"] = run_id
+                    request["updated_at"] = timestamp()
+                    changed = True
+                    continue
+                persisted_answer = dict(answer) | {"answered_at": timestamp()}
+                if run_id is not None:
+                    persisted_answer["repair_run_id"] = run_id
+                request["answer"] = persisted_answer
+                if run_id is not None:
+                    request["repair_run_id"] = run_id
+                request["status"] = UpstreamRequestStatus.ANSWERED.value
+                request["updated_at"] = timestamp()
+                request.pop("escalation_reason", None)
+                request.pop("escalated_at", None)
+                request.pop("escalated_by_run_id", None)
+                changed = True
+            if changed:
+                self._mark_dirty()
+                await self._persist()
 
-    async def close_resolved_upstream_requests(
+    async def finish_upstream_requests(
         self,
         request_ids: Iterable[str],
         *,
-        detail: str,
-        run_id: str | None = None,
+        run_id: str | None,
+        succeeded_ids: Iterable[str],
+        error: str = "",
+        success_detail: str = "blocked declaration succeeded in the targeted downstream retry",
     ) -> tuple[str, ...]:
-        """Close requests satisfied by externally or concurrently validated proof work."""
+        """Persist terminal proof success or escalation after a completed retry."""
 
+        succeeded = set(succeeded_ids)
         closed: list[str] = []
+        changed = False
         async with self.batch():
             for request_id in request_ids:
                 request = self.upstream_requests.get(request_id)
@@ -973,22 +756,34 @@ class StateStore:
                 status = UpstreamRequestStatus(str(request.get("status")))
                 if status is UpstreamRequestStatus.CLOSED:
                     continue
-                if status in {
-                    UpstreamRequestStatus.REPAIRING,
-                    UpstreamRequestStatus.RETRYING,
-                }:
-                    # Live orchestration owns these transitions; callers must not race it.
+                if request_id in succeeded:
+                    request["status"] = UpstreamRequestStatus.CLOSED.value
+                    request["closed_at"] = timestamp()
+                    request["closed_by_run_id"] = run_id
+                    request["closed_reason"] = success_detail
+                    if run_id is not None:
+                        request["retry_run_id"] = run_id
+                    request["updated_at"] = timestamp()
+                    request.pop("escalation_reason", None)
+                    request.pop("escalated_at", None)
+                    request.pop("escalated_by_run_id", None)
+                    closed.append(request_id)
+                    changed = True
                     continue
-                self._transition_upstream_request(
-                    request,
-                    UpstreamRequestStatus.CLOSED,
-                    detail,
-                    run_id=run_id,
+                if status is not UpstreamRequestStatus.ANSWERED:
+                    continue
+                reason = error or (
+                    "blocked declaration remained unresolved after its targeted downstream retry"
                 )
-                request["closed_at"] = timestamp()
-                request["closed_by_run_id"] = run_id
-                closed.append(request_id)
-            if closed:
+                request["status"] = UpstreamRequestStatus.ESCALATED.value
+                request["escalation_reason"] = reason
+                request["escalated_at"] = timestamp()
+                if run_id is not None:
+                    request["escalated_by_run_id"] = run_id
+                    request["retry_run_id"] = run_id
+                request["updated_at"] = timestamp()
+                changed = True
+            if changed:
                 self._mark_dirty()
                 await self._persist()
         return tuple(closed)
@@ -1001,21 +796,19 @@ class StateStore:
         for request_id, request in self.upstream_requests.items():
             if (
                 request.get("consumer_chapter_id") not in selected
-                or request.get("status") != UpstreamRequestStatus.MANUAL_ESCALATION.value
+                or request.get("status") != UpstreamRequestStatus.ESCALATED.value
             ):
                 continue
             target = (
                 UpstreamRequestStatus.ANSWERED
                 if isinstance(request.get("answer"), dict)
-                else UpstreamRequestStatus.OPEN
+                else UpstreamRequestStatus.REQUESTED
             )
-            self._transition_upstream_request(
-                request,
-                target,
-                "manually unblocked for another targeted attempt",
-            )
+            request["status"] = target.value
+            request["updated_at"] = timestamp()
             request.pop("escalation_reason", None)
             request.pop("escalated_at", None)
+            request.pop("escalated_by_run_id", None)
             reopened.append(request_id)
         if reopened:
             self._mark_dirty()
