@@ -2,12 +2,13 @@ import asyncio
 import json
 from dataclasses import replace
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from textual.widgets import DataTable, RichLog, Static, Tab, TabbedContent, Tabs, TextArea
 
 from lastlib_swarm.config import load_config
+from lastlib_swarm.isolation import IsolationResult
 from lastlib_swarm.models import Stage
 from lastlib_swarm.scheduler import Orchestrator
 from lastlib_swarm.state import StateStore, TaskStatus, TokenUsage
@@ -267,6 +268,94 @@ async def test_quit_drains_pipeline_before_app_exit(
 
     assert operation_cleaned.is_set()
     assert shutdown_finished.is_set()
+
+
+@pytest.mark.asyncio
+async def test_quit_integrates_partial_changes_from_active_isolated_agent(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    orchestrator = Orchestrator(config, StateStore(config))
+    chapter = config.chapters[0]
+    relative = Path("lean/Book/Chapter01.lean")
+    isolated_root = tmp_path / "isolated"
+    isolated_path = isolated_root / relative
+    isolated_path.parent.mkdir(parents=True)
+    started = asyncio.Event()
+
+    class EditingExecutor:
+        async def prepare(self) -> None:
+            return
+
+        async def run(self, *_args: object, workspace_root: Path, **_kwargs: object) -> None:
+            assert workspace_root == isolated_root
+            isolated_path.write_text("def partial := 1\n", encoding="utf-8")
+            started.set()
+            await asyncio.Future()
+
+    class Workspace:
+        root = isolated_root
+        closed = False
+        collected = False
+
+        async def collect(
+            self,
+            _chapter: object,
+            *,
+            integration_lock: asyncio.Lock | None = None,
+        ) -> IsolationResult:
+            self.collected = True
+            if integration_lock is not None:
+                await integration_lock.acquire()
+            try:
+                destination = config.settings.repo / relative
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_text(isolated_path.read_text(encoding="utf-8"), encoding="utf-8")
+            finally:
+                if integration_lock is not None:
+                    integration_lock.release()
+            return IsolationResult(
+                accepted=True,
+                generation=0,
+                changed_paths=(relative.as_posix(),),
+            )
+
+        async def close(self) -> None:
+            self.closed = True
+
+    workspace = Workspace()
+
+    class Isolation:
+        name = "fuse-overlay"
+
+        async def prepare(self) -> None:
+            return
+
+        async def acquire(self, _run_id: str) -> Workspace:
+            return workspace
+
+        async def close(self) -> None:
+            assert workspace.closed
+
+    orchestrator.executor = cast(Any, EditingExecutor())
+    orchestrator.isolation = cast(Any, Isolation())
+
+    async def operation() -> bool:
+        await orchestrator._attempt(chapter, Stage.FORMALIZE)
+        return True
+
+    app = SwarmApp(orchestrator, operation, label="test")
+    async with app.run_test() as pilot:
+        await started.wait()
+        await pilot.press("q")
+
+    assert workspace.collected
+    assert workspace.closed
+    assert (config.settings.repo / relative).read_text(encoding="utf-8") == "def partial := 1\n"
+    run = orchestrator.state.task(chapter.id, Stage.FORMALIZE).runs[-1]
+    assert run.status == TaskStatus.FAILED
+    assert run.isolation is not None
+    assert run.isolation["accepted"] is True
+    assert run.isolation["interrupted"] is True
+    assert run.isolation["changed_paths"] == [relative.as_posix()]
 
 
 @pytest.mark.asyncio

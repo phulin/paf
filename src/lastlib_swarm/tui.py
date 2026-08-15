@@ -884,8 +884,8 @@ class SwarmApp(App[bool]):
         """Cancel and drain the pipeline before closing the terminal app."""
 
         self._quit_requested = True
-        self.orchestrator.control.stop()
-        self._set_status("Stopping workers and cleaning workspaces…")
+        self.orchestrator.control.stop(integrate_interrupted_workspaces=True)
+        self._set_status("Stopping workers and integrating workspace changes…")
         workers = self.workers.cancel_group(self, "pipeline")
         with suppress(WorkerCancelled):
             await self.workers.wait_for_complete(workers)

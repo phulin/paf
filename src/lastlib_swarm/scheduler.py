@@ -27,7 +27,7 @@ from lastlib_swarm.corpus import (
     scheduling_snapshot,
 )
 from lastlib_swarm.diagnostics import unexpected_lean_warnings
-from lastlib_swarm.isolation import create_isolation
+from lastlib_swarm.isolation import IsolationResult, create_isolation
 from lastlib_swarm.models import Chapter, PipelineConfig, Stage
 from lastlib_swarm.scope import ScopeMatcher
 from lastlib_swarm.state import RunRecord, StateStore, TaskStatus
@@ -233,6 +233,7 @@ class RunControl:
         self._gate.set()
         self.paused = False
         self.stopping = False
+        self.integrate_interrupted_workspaces = False
 
     async def checkpoint(self) -> None:
         await self._gate.wait()
@@ -249,8 +250,9 @@ class RunControl:
             self.paused = False
             self._gate.set()
 
-    def stop(self) -> None:
+    def stop(self, *, integrate_interrupted_workspaces: bool = False) -> None:
         self.stopping = True
+        self.integrate_interrupted_workspaces |= integrate_interrupted_workspaces
         self.paused = False
         self._gate.set()
 
@@ -564,6 +566,42 @@ class Orchestrator:
     def _scope_exists(self, chapter: Chapter) -> bool:
         return ScopeMatcher(chapter.scope).has_match_for_each_pattern(self.config.settings.repo)
 
+    async def _integrate_interrupted_workspace(
+        self,
+        chapter: Chapter,
+        stage: Stage,
+        workspace: Any,
+        *,
+        source_lock_held: bool,
+        collected: IsolationResult | None = None,
+    ) -> dict[str, object]:
+        """Best-effort import of a stable workspace after a requested stop."""
+
+        try:
+            isolated = collected or await workspace.collect(
+                chapter,
+                integration_lock=None if source_lock_held else self.source_lock,
+            )
+        except BaseException as error:
+            detail = str(error) or type(error).__name__
+            return {
+                "accepted": False,
+                "interrupted": True,
+                "error": f"best-effort stop integration failed: {detail}",
+            }
+
+        payload = isolated.as_dict()
+        payload["interrupted"] = True
+        if isolated.accepted and isolated.changed_paths and stage is not Stage.PROVE:
+            try:
+                invalidated_builds = await self._invalidate_build_records((chapter.id,))
+                if stage in (Stage.FIXUP, Stage.REVIEW):
+                    self._proof_rechecks.update(invalidated_builds)
+            except BaseException as error:
+                detail = str(error) or type(error).__name__
+                payload["warning"] = f"changes integrated but invalidation failed: {detail}"
+        return payload
+
     async def _attempt(
         self,
         chapter: Chapter,
@@ -589,6 +627,7 @@ class Orchestrator:
         run = None
         workspace = None
         source_held = False
+        isolated: IsolationResult | None = None
         try:
             run = await self.state.start_run(chapter.id, stage)
             if self.isolation.name == "shared":
@@ -678,16 +717,37 @@ class Orchestrator:
                 validation=validation.as_dict(),
             )
         except BaseException as error:
+            interrupted_isolation: dict[str, object] | None = None
+            if (
+                isinstance(error, asyncio.CancelledError)
+                and self.control.integrate_interrupted_workspaces
+                and workspace is not None
+            ):
+                interrupted_isolation = await self._integrate_interrupted_workspace(
+                    chapter,
+                    stage,
+                    workspace,
+                    source_lock_held=source_held,
+                    collected=isolated,
+                )
+                await workspace.close()
+                workspace = None
+                if source_held:
+                    self.source_lock.release()
+                    source_held = False
             if run is not None and run.status == TaskStatus.RUNNING:
                 detail = str(error) or type(error).__name__
                 await self.state.finish_run(
                     run,
                     status=TaskStatus.FAILED,
-                    isolation={
+                    isolation=interrupted_isolation
+                    or {
                         "accepted": False,
                         "error": f"orchestration failed before completion: {detail}",
                     },
                 )
+            elif run is not None and interrupted_isolation is not None:
+                await self.state.update_run(run, isolation=interrupted_isolation)
             raise
         finally:
             if slot_held:
@@ -1455,6 +1515,7 @@ class Orchestrator:
         """Merge one completed agent while no other source integration can interleave."""
 
         workspace = handle.workspace
+        isolated: IsolationResult | None = None
         try:
             agent = await handle.task
             isolated = await workspace.collect(
@@ -1492,6 +1553,19 @@ class Orchestrator:
                 validation=validation.as_dict(),
             )
         except BaseException as error:
+            interrupted_isolation: dict[str, object] | None = None
+            if (
+                isinstance(error, asyncio.CancelledError)
+                and self.control.integrate_interrupted_workspaces
+                and workspace is not None
+            ):
+                interrupted_isolation = await self._integrate_interrupted_workspace(
+                    handle.chapter,
+                    Stage.FIXUP,
+                    workspace,
+                    source_lock_held=handle.source_lock_held,
+                    collected=isolated,
+                )
             if workspace is not None:
                 await workspace.close()
             if handle.source_lock_held:
@@ -1505,7 +1579,14 @@ class Orchestrator:
                     isolation={
                         "accepted": False,
                         "error": f"orchestration failed before integration: {detail}",
-                    },
+                    }
+                    if interrupted_isolation is None
+                    else interrupted_isolation,
+                )
+            elif interrupted_isolation is not None:
+                await self.state.update_run(
+                    handle.run,
+                    isolation=interrupted_isolation,
                 )
             raise
 
@@ -1653,20 +1734,40 @@ class Orchestrator:
                 handle.task.cancel()
             await asyncio.gather(*(handle.task for handle in handles), return_exceptions=True)
             for handle in handles:
+                interrupted_isolation: dict[str, object] | None = None
+                if self.control.integrate_interrupted_workspaces:
+                    interrupted_isolation = await self._integrate_interrupted_workspace(
+                        handle.chapter,
+                        Stage.FIXUP,
+                        handle.workspace,
+                        source_lock_held=handle.source_lock_held,
+                    )
                 if handle.run.status == TaskStatus.RUNNING:
                     await self.state.finish_run(
                         handle.run,
                         status=TaskStatus.FAILED,
-                        isolation={
+                        isolation=interrupted_isolation
+                        or {
                             "accepted": False,
                             "error": "fixup agent cancelled by orchestrator",
                         },
+                    )
+                elif interrupted_isolation is not None:
+                    await self.state.update_run(
+                        handle.run,
+                        isolation=interrupted_isolation,
                     )
                 await self.state.set_task(
                     handle.chapter.id,
                     Stage.FIXUP,
                     TaskStatus.PENDING,
-                    "fixup agent interrupted; requeued",
+                    (
+                        "fixup agent interrupted; partial changes integrated; requeued"
+                        if interrupted_isolation is not None
+                        and interrupted_isolation.get("accepted")
+                        and interrupted_isolation.get("changed_paths")
+                        else "fixup agent interrupted; requeued"
+                    ),
                 )
                 await handle.workspace.close()
                 if handle.source_lock_held:

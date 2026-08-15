@@ -11,6 +11,7 @@ import pytest
 import lastlib_swarm.scheduler as scheduler_module
 from lastlib_swarm.codex import AgentResult, CodexExecutor, ValidationResult, scope_digest
 from lastlib_swarm.config import load_config
+from lastlib_swarm.isolation import IsolationResult
 from lastlib_swarm.models import Chapter, PipelineConfig, Stage
 from lastlib_swarm.scheduler import FormalizeOutcome, Orchestrator, ReviewOutcome
 from lastlib_swarm.state import RunRecord, StateStore, TaskStatus, TokenUsage
@@ -2390,6 +2391,103 @@ async def test_fixup_cancellation_releases_shared_source_lock(
     assert fixup.runs[-1].status == TaskStatus.FAILED
     assert fixup.runs[-1].finished_at is not None
     assert orchestrator.state.agent_summary()["active"] == 0
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_requested_stop_integrates_partial_fixup_workspace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = config.chapters[0]
+    orchestrator = Orchestrator(config, StateStore(config))
+    await orchestrator.prepare()
+    orchestrator.isolation.name = "fuse-overlay"
+    relative = Path("lean/Book/Chapter01.lean")
+    isolated_root = tmp_path / "isolated-fixup"
+    isolated_path = isolated_root / relative
+    isolated_path.parent.mkdir(parents=True)
+    started = asyncio.Event()
+
+    class BlockingExecutor(CodexExecutor):
+        async def run(
+            self,
+            chapter: Chapter,
+            stage: Stage,
+            run: RunRecord,
+            *,
+            feedback: str = "",
+            workspace_root: Path | None = None,
+        ) -> AgentResult:
+            del chapter, stage, run, feedback
+            assert workspace_root == isolated_root
+            isolated_path.write_text("def partialFixup := 1\n", encoding="utf-8")
+            started.set()
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+    class Workspace:
+        root = isolated_root
+        collected = False
+        closed = False
+
+        async def collect(
+            self,
+            _chapter: Chapter,
+            *,
+            integration_lock: asyncio.Lock | None = None,
+        ) -> IsolationResult:
+            self.collected = True
+            if integration_lock is not None:
+                await integration_lock.acquire()
+            try:
+                destination = config.settings.repo / relative
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_text(isolated_path.read_text(encoding="utf-8"), encoding="utf-8")
+            finally:
+                if integration_lock is not None:
+                    integration_lock.release()
+            return IsolationResult(
+                accepted=True,
+                generation=0,
+                changed_paths=(relative.as_posix(),),
+            )
+
+        async def close(self) -> None:
+            self.closed = True
+
+    workspace = Workspace()
+
+    async def acquire(_run_id: str) -> Workspace:
+        return workspace
+
+    async def failed_validation(*_args: object, **_kwargs: object) -> ValidationResult:
+        return ValidationResult(False, 1, "error: Book/Chapter01.lean:1:1: broken")
+
+    orchestrator.executor = BlockingExecutor(config, orchestrator.state)
+    monkeypatch.setattr(orchestrator.isolation, "acquire", acquire)
+    monkeypatch.setattr(scheduler_module, "validate", failed_validation)
+    task = asyncio.create_task(
+        orchestrator._fixup_to_clean({chapter.id: "repair"}, target_ids={chapter.id})
+    )
+    await started.wait()
+
+    orchestrator.control.stop(integrate_interrupted_workspaces=True)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert workspace.collected
+    assert workspace.closed
+    assert (config.settings.repo / relative).read_text(encoding="utf-8") == (
+        "def partialFixup := 1\n"
+    )
+    fixup = orchestrator.state.task(chapter.id, Stage.FIXUP)
+    assert fixup.status == TaskStatus.PENDING
+    assert fixup.detail == "fixup agent interrupted; partial changes integrated; requeued"
+    assert fixup.runs[-1].isolation is not None
+    assert fixup.runs[-1].isolation["accepted"] is True
+    assert fixup.runs[-1].isolation["interrupted"] is True
     await orchestrator.shutdown()
 
 
