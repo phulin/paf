@@ -1561,27 +1561,37 @@ class Orchestrator:
     ) -> bool:
         """Converge globally or until selected targets are clean in the observed DAG."""
 
-        pending_feedback = dict(feedback or {})
+        incoming_feedback = dict(feedback or {})
+        pending_feedback: dict[str, str] = {}
         by_id = {chapter.id: chapter for chapter in self.chapters}
         targeted = target_ids is not None
         goals = set(target_ids or ())
         unknown_goals = goals.difference(by_id)
         if unknown_goals:
             raise ValueError(f"unknown fixup targets: {', '.join(sorted(unknown_goals))}")
-        goals.update(chapter_id for chapter_id in pending_feedback if chapter_id in by_id)
+        goals.difference_update(
+            chapter_id for chapter_id in goals if self.state.later_stage_started(chapter_id)
+        )
         maximum = self.config.stages[Stage.FIXUP].max_rounds
         attempts = {chapter_id: 0 for chapter_id in by_id}
         running: dict[str, RunningFixupAgent] = {}
         failed: set[str] = set()
+        review_deferred: set[str] = set()
         persisted_clean = self.state.fixup_graph.get("clean", {})
         clean_records = persisted_clean if isinstance(persisted_clean, dict) else {}
         clean: dict[str, dict[str, Any]] = {}
         invalidated_clean: set[str] = set()
         build_generation = int(self.state.fixup_graph.get("build_generation", 0))
 
-        def merge_feedback(items: dict[str, str]) -> None:
+        async def merge_feedback(items: dict[str, str]) -> None:
+            review_feedback: dict[str, str] = {}
             for chapter_id, diagnostic in items.items():
                 if chapter_id not in by_id:
+                    continue
+                if self.state.later_stage_started(chapter_id):
+                    review_feedback[chapter_id] = diagnostic
+                    goals.discard(chapter_id)
+                    pending_feedback.pop(chapter_id, None)
                     continue
                 if targeted:
                     goals.add(chapter_id)
@@ -1590,6 +1600,30 @@ class Orchestrator:
                     pending_feedback[chapter_id] = (
                         f"{existing}\n\n{diagnostic}" if existing else diagnostic
                     )
+            if review_feedback:
+                feedback_fingerprint = hashlib.sha256(
+                    "\0".join(
+                        f"{chapter_id}\0{diagnostic}"
+                        for chapter_id, diagnostic in sorted(review_feedback.items())
+                    ).encode()
+                ).hexdigest()[:16]
+                await self._queue_review_feedback(
+                    review_feedback,
+                    origin=f"fixup-build:{feedback_fingerprint}",
+                )
+                invalidated_builds = await self._invalidate_build_records(review_feedback)
+                self._proof_rechecks.update(invalidated_builds)
+                review_deferred.update(review_feedback)
+                await self.state.set_tasks(
+                    review_feedback,
+                    Stage.FIXUP,
+                    TaskStatus.SUCCEEDED,
+                    "later build diagnostics routed to review",
+                )
+                if progress_event is not None:
+                    progress_event.set()
+
+        await merge_feedback(incoming_feedback)
 
         async def publish_successful_builds(
             results: dict[str, ValidationResult],
@@ -1679,7 +1713,7 @@ class Orchestrator:
                 TaskStatus.PENDING,
                 "stale dependency snapshot; fixup requeued",
             )
-            merge_feedback({handle.chapter.id: detail})
+            await merge_feedback({handle.chapter.id: detail})
 
         async def build_chapters(
             chapter_ids: Iterable[str],
@@ -1722,7 +1756,7 @@ class Orchestrator:
                     if result.succeeded and chapter_id not in published
                 }
             )
-            merge_feedback(diagnostics)
+            await merge_feedback(diagnostics)
             invalidated_clean.update(
                 self._invalidate_fixup_descendants(
                     graph,
@@ -1754,16 +1788,11 @@ class Orchestrator:
                 and graph.dependencies[chapter_id].issubset(clean)
             ]
             for chapter_id in actionable[: max(available, 0)]:
-                if self.state.task(chapter_id, Stage.REVIEW).status in {
-                    TaskStatus.RUNNING,
-                    TaskStatus.SUCCEEDED,
-                }:
-                    await self._invalidate_reviews(
-                        (chapter_id,),
-                        detail="review invalidated by later fixup findings",
+                if self.state.later_stage_started(chapter_id):
+                    await merge_feedback(
+                        {chapter_id: pending_feedback.pop(chapter_id)}
                     )
-                    if progress_event is not None:
-                        progress_event.set()
+                    continue
                 if attempts[chapter_id] >= maximum:
                     await self.state.set_task(
                         chapter_id,
@@ -1851,7 +1880,7 @@ class Orchestrator:
                         if result.succeeded and chapter_id not in published
                     }
                 )
-                merge_feedback(diagnostics)
+                await merge_feedback(diagnostics)
                 invalidated_clean.update(
                     self._invalidate_fixup_descendants(graph, clean, diagnostics)
                 )
@@ -1979,7 +2008,7 @@ class Orchestrator:
                         progress_event.set()
                     if attempt is None:
                         if attempts[chapter_id] < maximum:
-                            merge_feedback(
+                            await merge_feedback(
                                 {
                                     chapter_id: (
                                         "The previous fixup agent failed or exhausted its capacity "
@@ -2042,7 +2071,7 @@ class Orchestrator:
                         return True
                     graph = verified
                     diagnostics = self._build_feedback(results).actionable
-                    merge_feedback(diagnostics)
+                    await merge_feedback(diagnostics)
                     invalidated_clean.update(
                         self._invalidate_fixup_descendants(graph, clean, diagnostics)
                     )
@@ -2060,7 +2089,9 @@ class Orchestrator:
                     continue
 
                 needed = self._dependency_closure(graph, set(goals) | set(pending_feedback))
-                blocked_roots = set(pending_feedback) | set(running) | failed
+                blocked_roots = (
+                    set(pending_feedback) | set(running) | failed | review_deferred
+                )
                 unavailable = (
                     self._successor_closure(graph, blocked_roots) if blocked_roots else set()
                 )
@@ -2089,14 +2120,21 @@ class Orchestrator:
         unresolved = required.difference(clean)
         blocked = unresolved.difference(failed)
         if blocked:
+            waiting_for_review = bool(
+                self._successor_closure(graph, review_deferred).intersection(blocked)
+            )
             await self.state.set_tasks(
                 blocked,
                 Stage.FIXUP,
-                TaskStatus.BLOCKED if failed else TaskStatus.FAILED,
+                TaskStatus.BLOCKED if failed or waiting_for_review else TaskStatus.FAILED,
                 (
                     "blocked by a failed prerequisite fixup; unrelated branches completed"
                     if failed
-                    else "observed-import fixup could not select dependency-ready work"
+                    else (
+                        "waiting for diagnostics routed to an existing review"
+                        if waiting_for_review
+                        else "observed-import fixup could not select dependency-ready work"
+                    )
                 ),
             )
         return False

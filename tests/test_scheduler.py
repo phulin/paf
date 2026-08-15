@@ -902,6 +902,59 @@ async def test_post_review_fixup_request_is_migrated_back_to_review(tmp_path: Pa
 
 
 @pytest.mark.asyncio
+async def test_fixup_build_routes_reviewed_diagnostic_owner_back_to_review(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = with_lastlib_modules(
+        load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    )
+    reviewed, new = config.chapters
+    source_root = tmp_path / "lean" / "Book"
+    source_root.mkdir(parents=True)
+    (source_root / "Chapter01.lean").write_text("def first := 1\n", encoding="utf-8")
+    (source_root / "Chapter02.lean").write_text(
+        "import LastLib.Book.Chapter01\ndef second := first + 1\n",
+        encoding="utf-8",
+    )
+    orchestrator = Orchestrator(config, StateStore(config))
+    await orchestrator.prepare()
+    orchestrator.executor = FakeExecutor(orchestrator.state, [])
+    await orchestrator.state.set_task(
+        reviewed.id,
+        Stage.REVIEW,
+        TaskStatus.SUCCEEDED,
+        "reviewed",
+    )
+    orchestrator.state.task(reviewed.id, Stage.REVIEW).rounds = 1
+
+    async def validation(*_args: object, **_kwargs: object) -> ValidationResult:
+        return ValidationResult(
+            False,
+            1,
+            "error: Book/Chapter01.lean:1:1: reviewed declaration is broken",
+        )
+
+    monkeypatch.setattr(scheduler_module, "validate", validation)
+
+    assert not await orchestrator._fixup_to_clean(target_ids={new.id})
+    assert orchestrator.state.task(reviewed.id, Stage.FIXUP).status == TaskStatus.SUCCEEDED
+    assert orchestrator.state.task(reviewed.id, Stage.REVIEW).status == TaskStatus.PENDING
+    assert orchestrator.state.task(reviewed.id, Stage.FIXUP).rounds == 0
+    assert orchestrator.state.task(new.id, Stage.FIXUP).status == TaskStatus.BLOCKED
+    assert (
+        orchestrator.state.task(new.id, Stage.FIXUP).detail
+        == "waiting for diagnostics routed to an existing review"
+    )
+    queued_feedback = [
+        request["feedback"]
+        for request in orchestrator.state.proof_review_requests.values()
+    ]
+    assert len(queued_feedback) == 1
+    assert "reviewed declaration is broken" in queued_feedback[0][reviewed.id]
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_unqueued_proof_finding_is_recovered_as_durable_review(
     tmp_path: Path,
 ) -> None:
