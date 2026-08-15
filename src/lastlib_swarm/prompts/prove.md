@@ -11,7 +11,9 @@ is the work of this stage, not by itself a reason to leave the placeholder unres
 
 Existing statements are immutable during this pass. Do not change declaration kinds, names,
 namespaces, binders, hypotheses, result types, attributes, or section behavior to make a proof easier.
-Focused imports required by a valid proof are permitted under the common import policy.
+Do not change the bodies of existing definitions, structures, or instances. You may edit proof bodies,
+add focused imports required by a valid proof, and add proved helper declarations under the common
+import policy.
 
 ## Workflow
 
@@ -51,12 +53,14 @@ Focused imports required by a valid proof are permitted under the common import 
    file; never check off files out of order or batch-complete unvisited files.
 10. After every file is checked off, diagnose edited files and affected dependents as needed and
     check off the final diagnostic item. Do not spend time running final diagnostics on untouched
-    files, whose incoming build is already certified clean.
+    files, whose incoming build is already certified clean. Before finishing, revert any speculative
+    proof edit that has not reached clean diagnostics; every retained proof or helper must be
+    kernel-checked.
 
 Prefer, in order, definitional equality, an exact earlier theorem, focused rewriting or
 simplification, a canonical constructor or equivalence, and only then unfolded infrastructure.
 
-## Genuine statement obstructions
+## Genuine statement and upstream obstructions
 
 Report issues with other chapters ONLY if you find a false statement in that chapter, or if you
 determine the chapter has incorrectly formalized the textbook. A theorem that you wish existed is
@@ -66,17 +70,21 @@ If a target is inaccurate or cannot follow from its assumptions, leave its state
 unchanged and report a precise statement/API fixup request in `fixup_findings`, including every exact
 repository-relative Lean path that must be edited. Likewise, if sustained proof work establishes
 that the proof genuinely requires a missing earlier LastLib interface which cannot be added within
-scope, request the minimal interface addition there instead of repeatedly reporting "no pinned API"
-as an ordinary issue. A failed search, guessed theorem name, tactic failure, coercion error, timeout,
-unfinished proof, or difficulty finding a library lemma alone is not evidence that the statement
-needs fixup or that the proof is impossible.
+scope, record a dedicated `upstream_requests` entry rather than a `fixup_findings` entry. Name the
+blocked declaration and consumer path, preserve the exact residual goal, state the minimal reusable
+result needed, propose its earlier owner chapter and files, and summarize at least two materially
+different checked alternatives. Then continue proving every independent declaration in the assigned
+scope. A failed search, guessed theorem name, tactic failure, coercion error, timeout, unfinished
+proof, or difficulty finding a library lemma alone is not evidence that an upstream request is
+warranted or that the proof is impossible.
 
 ## Definition of done
 
 All provable placeholders have been replaced by kernel-checked proofs. Every remaining placeholder is
-identified as either an ordinary unresolved proof or a concrete statement/interface obstruction in
-`fixup_findings`. For each ordinary unresolved proof, add an `issues` entry containing its exact path
-and declaration, the several materially different candidate terms, tactics, helper lemmas, or
-reductions tried in this attempt, and the residual goal or recurring obstruction. A thin attempt does
-not become acceptable merely by documenting it. Never put a required source edit in `issues`. Set
-`complete` to `true` only when no placeholder remains.
+identified as an ordinary unresolved proof, a consumer statement/interface obstruction in
+`fixup_findings`, or a concrete earlier-interface obstruction in `upstream_requests`. For each
+ordinary unresolved proof, add an `issues` entry containing its exact path and declaration, the
+several materially different candidate terms, tactics, helper lemmas, or reductions tried in this
+attempt, and the residual goal or recurring obstruction. A thin attempt does not become acceptable
+merely by documenting it. Never put a required source edit in `issues`. Set `complete` to `true` only
+when no placeholder remains.

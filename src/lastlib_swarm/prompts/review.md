@@ -9,16 +9,16 @@ not responsible for proving theorems; leave sorry's anywhere you would need a pr
 
 ## Current state
 
-Use the line-numbered source set prepended to this prompt as your initial read of chapter
-{chapter_number}, “{chapter_title},” in `{source}` and every assigned Lean file under
-`{lean_root}/{chapter_path}/` plus `{lean_root}/{chapter_path}.lean`. Do not reread a complete supplied
-file from the filesystem; inspect the filesystem only for explicitly missing or truncated content,
-post-edit content, or a targeted search or lookup. Independently determine whether
-the formalization is source-faithful, mathematically provable, proof-ready, and acyclic, and directly
-make the minimal warranted changes in the assigned scope. The snapshot starts clean; the coordinator
-has already built every assigned file with no diagnostic except permitted `sorry` warnings.
-Treat that clean baseline as authoritative for files you do not edit. The coordinator will rebuild your
-patch and return any compiler failures to a follow-up review pass.
+Read chapter {chapter_number}, “{chapter_title},” in `{source}` dynamically from its numbered heading
+through the next heading of the same level. Discover every assigned Lean file under
+`{lean_root}/{chapter_path}/` plus `{lean_root}/{chapter_path}.lean`, read those files in local import
+order, and use targeted searches in earlier LastLib and pinned Mathlib sources as questions arise.
+Do not read the complete informal book or unrelated Lean files merely to establish context.
+Independently determine whether the formalization is source-faithful, mathematically provable,
+proof-ready, and acyclic, and directly make the minimal warranted changes in the assigned scope.
+The coordinator has already built every assigned file with no diagnostic except permitted `sorry`
+warnings. Treat that clean baseline as authoritative for files you do not edit. The coordinator will
+rebuild your patch and return any compiler failures to a follow-up review pass.
 
 ## Review standard
 
@@ -41,20 +41,19 @@ precede its users, and be independently provable from earlier declarations.
 Use the native `update_plan` tool as the authoritative checklist for this attempt; do not keep the
 checklist only in prose, a scratch file, or the final report.
 
-1. Use the supplied `import` lines to construct the assigned files' local dependency order, using a
-   targeted filesystem search only if the supplied content is missing or truncated. Before beginning
-   the audit, use `update_plan` to create a top-level checklist with one item for every
+1. Inventory the complete source chapter and assigned Lean files, then use their `import` lines to
+   construct the files' local dependency order. Before beginning the audit, use `update_plan` to
+   create a checklist with one item for every
    numbered source section, in source order, followed by a chapter-wide coverage/import audit and a
    final edited-closure diagnostic item. Keep exactly one item in progress.
 2. Work through the section checklist in order. When a section becomes current, compare it closely
-   with its Lean representation and expand its section item in the native plan into a checklist of
-   the individual results to review: definitions, precise assertions, examples, warnings, and
-   proof-support interfaces. Keep later sections as unexpanded pending items until you reach them,
-   and add newly discovered results to the active section's checklist.
-3. Review each result-level item for source coverage, mathematical fidelity, proof readiness, and a
-   plausible acyclic dependency route. Make every warranted in-scope repair, or record the precise
-   unresolved finding, before marking that result complete. Never mark a batch of results complete
-   before doing their individual reviews.
+   with its Lean representation. Update the active plan item's text to name the definitions, precise
+   assertions, examples, warnings, and proof-support interfaces found in that section; the native
+   plan is flat, so do not invent nested checklist structure. Add newly discovered results to that
+   item before completing it, and leave later section items pending until they become current.
+3. Review every result named in the active section item for source coverage, mathematical fidelity,
+   proof readiness, and a plausible acyclic dependency route. Make every warranted in-scope repair,
+   or record the precise unresolved finding, before marking the section complete.
 4. Traverse involved Lean files from imported prerequisites to their dependents while reviewing and
    editing each result. Keep this topological order for edits and diagnostics; do not repeatedly
    bounce between unrelated files. If an edit invalidates an already-visited dependent, revisit that

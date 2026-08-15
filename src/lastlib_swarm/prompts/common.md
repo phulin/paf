@@ -19,7 +19,9 @@ section must not import a book or chapter aggregator when a focused module provi
 must not import another section merely to mirror prose order. Aggregators may import leaves; leaves
 must not import aggregators. Preserve chronological dependencies: a chapter may import only earlier
 chapters in the same book and chapters from earlier books, never a later chapter or later book. Put
-genuinely shared chapter interfaces in `Dependencies.lean` or `Core.lean` when either exists.
+genuinely shared chapter prerequisites in `Dependencies.lean` or `Core.lean` when either exists, but
+only when they logically precede every section that imports them. Do not move a result arising later
+in the source into a shared prerequisite merely because several later declarations use it.
 
 ### Diagnostics and deliverables
 

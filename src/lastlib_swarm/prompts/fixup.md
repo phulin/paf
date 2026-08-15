@@ -5,8 +5,8 @@
 Start from the coordinator build or review feedback appended below. Read the implicated declarations,
 their required prerequisites and affected dependents, and the relevant part of chapter
 {chapter_number}, “{chapter_title},” in `{source}` when mathematical intent is needed. Do not reread
-the complete chapter or assigned file set merely because this is a new attempt. Make one minimal edit
-transaction that moves the project toward a clean Lake build and a faithful common API.
+the complete chapter or assigned file set merely because this is a new attempt. Make one scoped pass
+of minimal edits that moves the project toward a clean Lake build and a faithful common API.
 
 This is an elaboration-only stage. Never prove a theorem, lemma, or other proposition. Replace an
 obstructing proof body in its entirety with `by sorry`. Spend effort only on imports, declaration

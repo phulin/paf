@@ -16,14 +16,17 @@ translate motivation, history, proof narration, or redundant paraphrases into de
 Represent every precise assertion: labeled declarations, displayed identities and diagrams, exact
 sequences, compatibility results, hypotheses embedded in prose, examples, and mathematically precise
 warnings. Read informal proofs for dependency planning even though their narration is not itself
-formalized.
+formalized. Coverage is semantic rather than one-declaration-per-sentence: when an assertion follows
+immediately from a definition or is already represented by a stronger source-faithful declaration,
+account for it in the active checklist instead of adding a redundant theorem.
 
 For every principal result, trace a plausible route through earlier project declarations and pinned
 Mathlib. Add genuinely missing intermediate interfaces, especially basic `↔` lemmas; equivalences
 between book-facing and canonical formulations; constructor, eliminator, and extensionality facts;
 membership, coercion, map, restriction, and normalization lemmas; and closure or functoriality
-bridges. Search for a canonical declaration first. A new bridge must use the weakest natural
-assumptions, precede its users, and be independently provable from earlier material.
+bridges. Search for a canonical declaration first. A new bridge must have a named intended consumer,
+use the weakest natural assumptions, precede its users, and be independently provable from earlier
+material. Do not add speculative helper APIs for a proof route that no drafted declaration uses.
 
 Match finiteness, separation, completeness, characteristic, normalization, and typeclass assumptions
 exactly. For a genuine false or underspecified source assertion, make only the minimal principled
@@ -38,25 +41,23 @@ Use the native `update_plan` tool as the authoritative checklist for this attemp
 checklist only in prose, a scratch file, or the final report.
 
 1. Inventory the complete source chapter and the existing assigned Lean files. Before drafting any
-   declaration, use `update_plan` to create a top-level checklist with one item for every
+   declaration, use `update_plan` to create a checklist with one item for every
    numbered source section, in source order, followed by a chapter-wide coverage and proof-readiness
    audit. Keep exactly one item in progress.
 2. Work through that section checklist in order. When a section becomes current, inspect it closely
-   and expand its section item in the native plan into a checklist of the individual results to
-   formalize: definitions, precise assertions, examples, warnings, and any proof-support interfaces
-   the section requires. Keep later sections as unexpanded pending items until you reach them, and
-   add newly discovered results to the active section's checklist instead of silently absorbing
-   them into a broad task.
-3. For each result-level item, inspect canonical earlier LastLib and pinned Mathlib interfaces, then
-   create or repair its declarations. Mark that item complete as soon as the result is accurately
-   represented or explicitly accounted for; never mark a batch of results complete before doing
-   their individual work.
+   and update the active plan item's text to name the definitions, precise assertions, examples,
+   warnings, and proof-support interfaces it requires; the native plan is flat, so do not invent
+   nested checklist structure. Keep later sections pending until you reach them, and add newly
+   discovered results to the active item instead of silently absorbing them into a broad task.
+3. For each named result in the active section item, inspect canonical earlier LastLib and pinned
+   Mathlib interfaces, then create or repair its declarations. Mark the section complete only after
+   every named result is accurately represented or explicitly accounted for.
 4. Finish every result in the active section before moving to the next section. Preserve source and
    dependency order while completing the statement and definition pass.
 5. After all sections are checked off, perform the planned chapter-wide audit, add only genuinely
    missing reusable bridges, and record unresolved dependency guesses and API conflicts for the
-   later fixup pass. Check off the audit only after reconciling its findings with the result
-   checklist.
+   later fixup pass. Put unresolved dependency guesses, API conflicts, and coverage gaps in `issues`.
+   Check off the audit only after reconciling its findings with the section checklist.
 
 Do not run Lean, Lake, or a language server, and do not request LSP diagnostics. The coordinator will
 reconcile all chapter drafts in the repeated global fixup pass.

@@ -10,11 +10,12 @@ assume a reported finding is correct, and do not limit the audit to the cited de
 
 ## Current state
 
-Use the line-numbered source set prepended to this prompt as your initial read of `{source}` and every
-assigned Lean file under `{lean_root}/{chapter_path}/` plus `{lean_root}/{chapter_path}.lean`. Review
-that complete scope even when the proof findings mention only one item. Do not reread a complete
-supplied file from the filesystem; inspect the filesystem only for explicitly missing or truncated
-content, post-edit content, or a targeted search or lookup.
+Read chapter {chapter_number}, “{chapter_title},” in `{source}` dynamically from its numbered heading
+through the next heading of the same level. Discover every assigned Lean file under
+`{lean_root}/{chapter_path}/` plus `{lean_root}/{chapter_path}.lean`, and read those files in local
+import order. Review that complete scope even when the proof findings mention only one item. Use
+targeted searches in earlier LastLib and pinned Mathlib sources as questions arise; do not read the
+complete informal book or unrelated Lean files merely to establish context.
 
 The coordinator findings record obstacles observed by a proof agent. Treat them as evidence to
 investigate, not instructions to apply mechanically. For each finding, decide whether the problem is
