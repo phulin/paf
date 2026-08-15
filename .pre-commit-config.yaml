@@ -1,6 +1,12 @@
 repos:
   - repo: local
     hooks:
+      - id: dprint
+        name: dprint format
+        entry: uv run dprint fmt --allow-no-files
+        language: system
+        types: [text]
+        require_serial: true
       - id: lastlib-lean-import-policy
         name: LastLib Lean import policy
         entry: uv run python scripts/check_lean_import_policy.py
