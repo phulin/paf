@@ -567,7 +567,7 @@ source issue is not a reason to stop: make the minimal principled accommodation 
 stage, clearly preserve or report the obstruction, and continue as far as possible through every
 unaffected part of the chapter. {validation_contract}
 """
-        if self.config.settings.lean_mcp and stage in (Stage.FIXUP, Stage.REVIEW, Stage.PROVE):
+        if stage in (Stage.FIXUP, Stage.REVIEW, Stage.PROVE):
             capabilities = (
                 "dependency preparation, whole-file diagnostics, hover, declaration lookup, "
                 "local search, completions, and code actions"
@@ -645,7 +645,7 @@ whole-file diagnostics in import order; do not prepare every file separately.
             command.extend(["--model", settings.model])
         if settings.reasoning_effort:
             command.extend(["--config", f'model_reasoning_effort="{settings.reasoning_effort}"'])
-        if settings.lean_mcp and stage in (Stage.FIXUP, Stage.REVIEW, Stage.PROVE):
+        if stage in (Stage.FIXUP, Stage.REVIEW, Stage.PROVE):
             lean_project = (root / settings.lean_project).resolve()
             enabled_tools = (
                 LEAN_MCP_FIXUP_TOOLS

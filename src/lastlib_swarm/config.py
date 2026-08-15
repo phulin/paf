@@ -215,6 +215,8 @@ def load_config(path: str | Path) -> PipelineConfig:
         data = tomllib.load(handle)
     base = config_path.parent
     swarm = _table(data, "swarm")
+    if "lean_mcp" in swarm:
+        raise ValueError("swarm.lean_mcp was removed; Lean MCP is always enabled")
     repo = _resolve(base, str(swarm.get("repo", ".")))
     state_dir = _resolve(repo, str(swarm.get("state_dir", ".swarm")))
     settings = SwarmSettings(
@@ -238,7 +240,6 @@ def load_config(path: str | Path) -> PipelineConfig:
         validation_timeout_seconds=float(swarm.get("validation_timeout_seconds", 1800)),
         isolation=str(swarm.get("isolation", "auto")),
         cache_compaction_layers=int(swarm.get("cache_compaction_layers", 32)),
-        lean_mcp=bool(swarm.get("lean_mcp", True)),
         lean_project=_repo_relative(
             repo,
             str(swarm.get("lean_project", "lean")),

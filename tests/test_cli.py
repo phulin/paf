@@ -273,12 +273,11 @@ def test_worker_startup_warns_prominently_when_ripgrep_is_missing(
     assert captured.out == ""
 
 
-def test_plan_can_disable_lean_mcp(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+def test_plan_rejects_removed_no_lean_mcp_option(tmp_path: Path) -> None:
     path = write_project(tmp_path)
 
-    assert main(["plan", "--config", str(path), "--no-lean-mcp"]) == 0
-
-    assert "Lean MCP: disabled" in capsys.readouterr().out
+    with pytest.raises(SystemExit):
+        main(["plan", "--config", str(path), "--no-lean-mcp"])
 
 
 def test_plan_accepts_just_a_markdown_target(

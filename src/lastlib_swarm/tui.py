@@ -932,7 +932,6 @@ class SwarmApp(App[bool]):
         active_agents = sum(agents.values())
         queued_agents = int(self.state.agent_summary().get("queued", 0))
         maximum = self.orchestrator.config.settings.max_agents
-        lean_mcp = "on" if self.orchestrator.config.settings.lean_mcp else "off"
         codex_access = (
             "full"
             if self.orchestrator.config.settings.bypass_approvals_and_sandbox
@@ -994,7 +993,7 @@ class SwarmApp(App[bool]):
             f"Agents {active_agents}/{maximum} · {agent_breakdown} · queued {queued_agents}    "
             f"{build_status}\n"
             f"Statement critical path: {critical}    isolation: {isolation}  "
-            f"Lean MCP: {lean_mcp}    Codex access: {codex_access}",
+            f"Lean MCP: on    Codex access: {codex_access}",
         )
         activities: list[AgentActivity] = []
         for chapter in self.chapters:

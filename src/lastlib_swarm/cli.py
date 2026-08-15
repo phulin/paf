@@ -87,13 +87,6 @@ def _add_overrides(parser: argparse.ArgumentParser) -> None:
         choices=("auto", "fuse-overlay", "shared"),
         help="execution isolation backend",
     )
-    parser.add_argument(
-        "--lean-mcp",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-        help="provide fixup, review, and proof attempts with an isolated Lean LSP MCP "
-        "(default: enabled)",
-    )
 
 
 def _add_run_options(parser: argparse.ArgumentParser) -> None:
@@ -231,7 +224,6 @@ def _config_from_args(args: argparse.Namespace) -> PipelineConfig:
     reasoning_effort = getattr(args, "reasoning_effort", None)
     max_agents = getattr(args, "max_agents", None)
     isolation = getattr(args, "isolation", None)
-    lean_mcp = getattr(args, "lean_mcp", None)
     if max_agents is not None and max_agents < 1:
         raise ValueError("--max-agents must be positive")
     if (
@@ -239,7 +231,6 @@ def _config_from_args(args: argparse.Namespace) -> PipelineConfig:
         or reasoning_effort is not None
         or max_agents is not None
         or isolation is not None
-        or lean_mcp is not None
     ):
         settings = replace(
             config.settings,
@@ -247,7 +238,6 @@ def _config_from_args(args: argparse.Namespace) -> PipelineConfig:
             reasoning_effort=reasoning_effort or config.settings.reasoning_effort,
             max_agents=max_agents or config.settings.max_agents,
             isolation=isolation or config.settings.isolation,
-            lean_mcp=config.settings.lean_mcp if lean_mcp is None else lean_mcp,
         )
         config = replace(config, settings=settings)
     return config
@@ -302,7 +292,7 @@ def print_plan(config: PipelineConfig, console: Console) -> None:
     )
     console.print(
         f"[bold]Codex access:[/bold] {access}  "
-        f"[bold]Lean MCP:[/bold] {'enabled' if config.settings.lean_mcp else 'disabled'}  "
+        f"[bold]Lean MCP:[/bold] enabled  "
         f"[bold]Project:[/bold] {config.settings.lean_project}  "
         f"[bold]Tool timeout:[/bold] {config.settings.lean_mcp_tool_timeout_seconds:g}s"
     )

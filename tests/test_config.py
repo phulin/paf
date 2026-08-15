@@ -26,7 +26,6 @@ def test_discovers_chapters_and_renders_paths(tmp_path: Path) -> None:
     assert config.stages[Stage.FIXUP].max_rounds == 10
     assert config.stages[Stage.REVIEW].max_rounds == 5
     assert config.settings.state_dir == tmp_path / ".swarm"
-    assert config.settings.lean_mcp
     assert config.settings.lean_project == Path("lean")
     assert config.settings.lean_mcp_tool_timeout_seconds == 300
     assert config.settings.capacity_resume_attempts == 10
@@ -96,7 +95,7 @@ def test_loads_lean_mcp_settings(tmp_path: Path) -> None:
     path.write_text(
         path.read_text(encoding="utf-8").replace(
             'isolation = "shared"',
-            'isolation = "shared"\nlean_mcp = false\nlean_project = "lean-project"\n'
+            'isolation = "shared"\nlean_project = "lean-project"\n'
             "lean_mcp_tool_timeout_seconds = 45",
         ),
         encoding="utf-8",
@@ -104,9 +103,21 @@ def test_loads_lean_mcp_settings(tmp_path: Path) -> None:
 
     settings = load_config(path).settings
 
-    assert not settings.lean_mcp
     assert settings.lean_project == Path("lean-project")
     assert settings.lean_mcp_tool_timeout_seconds == 45
+
+
+def test_rejects_removed_lean_mcp_setting(tmp_path: Path) -> None:
+    path = write_project(tmp_path)
+    path.write_text(
+        path.read_text(encoding="utf-8").replace(
+            'isolation = "shared"', 'isolation = "shared"\nlean_mcp = false'
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match=r"swarm\.lean_mcp was removed"):
+        load_config(path)
 
 
 def test_rejects_lean_project_outside_repository(tmp_path: Path) -> None:
