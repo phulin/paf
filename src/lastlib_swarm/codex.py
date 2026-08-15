@@ -67,7 +67,6 @@ REPORT_SCHEMA: dict[str, Any] = {
                         "type": "array",
                         "items": {"type": "string", "minLength": 1},
                         "minItems": 1,
-                        "uniqueItems": True,
                     },
                     "attempted_alternatives": {
                         "type": "array",
@@ -96,7 +95,6 @@ REPORT_SCHEMA: dict[str, Any] = {
                         "type": "array",
                         "items": {"type": "string", "minLength": 1},
                         "minItems": 1,
-                        "uniqueItems": True,
                     },
                     "disposition": {
                         "type": "string",
@@ -105,7 +103,6 @@ REPORT_SCHEMA: dict[str, Any] = {
                     "declarations": {
                         "type": "array",
                         "items": {"type": "string", "minLength": 1},
-                        "uniqueItems": True,
                     },
                     "usage_guidance": {"type": "string"},
                     "rejection_reason": {"type": "string"},
@@ -239,6 +236,10 @@ class AgentResult:
     thread_id: str | None = None
     error: str = ""
     capacity_exhausted: bool = False
+
+
+class FatalCodexInvocationError(RuntimeError):
+    """A non-retryable Codex request/configuration failure."""
 
 
 def render_prompt(template: str, chapter: Chapter) -> str:
@@ -564,23 +565,53 @@ def _find_report(event: Any) -> dict[str, Any] | None:
     return None
 
 
-def _is_capacity_failure(event: Any) -> bool:
+def _event_error_messages(event: Any) -> tuple[str, ...]:
     if not isinstance(event, dict) or event.get("type") not in {"error", "turn.failed"}:
-        return False
+        return ()
+    values: list[Any] = [event.get("message")]
     error = event.get("error")
-    messages = [event.get("message")]
     if isinstance(error, dict):
-        messages.append(error.get("message"))
+        values.append(error.get("message"))
     elif isinstance(error, str):
-        messages.append(error)
+        values.append(error)
+    return tuple(value for value in values if isinstance(value, str) and value.strip())
+
+
+def _event_error_message(event: Any) -> str:
+    """Extract the most useful human-readable error from a Codex JSONL event."""
+
+    messages = _event_error_messages(event)
+    for message in messages:
+        try:
+            payload = json.loads(message)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        error = payload.get("error")
+        if isinstance(error, dict) and isinstance(error.get("message"), str):
+            return str(error["message"])
+    return messages[-1] if messages else ""
+
+
+def _is_fatal_invocation_failure(event: Any) -> bool:
+    """Whether Codex rejected the invocation itself and retrying cannot help."""
+
     return any(
-        isinstance(message, str)
-        and (
+        "invalid_json_schema" in message
+        or "invalid schema for response_format" in message.casefold()
+        for message in _event_error_messages(event)
+    )
+
+
+def _is_capacity_failure(event: Any) -> bool:
+    return any(
+        (
             "at capacity" in message.casefold()
             or "too many requests" in message.casefold()
             or re.search(r"\b(?:http(?:/\S+)?\s+)?429\b", message, re.IGNORECASE) is not None
         )
-        for message in messages
+        for message in _event_error_messages(event)
     )
 
 
@@ -1020,6 +1051,8 @@ whole-file diagnostics in import order; do not prepare every file separately.
         usage = TokenUsage()
         report: dict[str, Any] = {}
         thread_id: str | None = None
+        invocation_error = ""
+        fatal_invocation_failure = False
         activity = self.state.activities.start(run.id, chapter.id, run.role or stage.value)
         usage_stop = asyncio.Event()
         usage_monitor: asyncio.Task[None] | None = None
@@ -1045,6 +1078,7 @@ whole-file diagnostics in import order; do not prepare every file separately.
             command: list[str], input_text: str, *, append_log: bool
         ) -> tuple[int, bool, bool, int]:
             nonlocal usage, report, thread_id, usage_monitor
+            nonlocal invocation_error, fatal_invocation_failure
             process = await asyncio.create_subprocess_exec(
                 *command,
                 stdin=asyncio.subprocess.PIPE,
@@ -1072,12 +1106,14 @@ whole-file diagnostics in import order; do not prepare every file separately.
 
             async def consume() -> None:
                 nonlocal usage, report, thread_id, usage_monitor, capacity_failure
+                nonlocal invocation_error, fatal_invocation_failure
                 mode = "ab" if append_log else "wb"
                 with log_path.open(mode, buffering=0) as log:
                     pending = bytearray()
 
                     async def consume_line(line: bytes, *, terminated: bool = True) -> None:
                         nonlocal usage, report, thread_id, usage_monitor, capacity_failure
+                        nonlocal invocation_error, fatal_invocation_failure
                         try:
                             event = json.loads(line)
                         except (json.JSONDecodeError, UnicodeDecodeError):
@@ -1092,6 +1128,11 @@ whole-file diagnostics in import order; do not prepare every file separately.
                         activity.consume(event, workspace_root=root, at=received_at)
                         self.state.activities.save_throttled(activity)
                         capacity_failure = capacity_failure or _is_capacity_failure(event)
+                        fatal_invocation_failure = (
+                            fatal_invocation_failure or _is_fatal_invocation_failure(event)
+                        )
+                        if found_error := _event_error_message(event):
+                            invocation_error = found_error
                         if found := _find_thread_id(event):
                             thread_id = found
                             await self.state.update_run(run, thread_id=found)
@@ -1264,6 +1305,8 @@ whole-file diagnostics in import order; do not prepare every file separately.
             )
         if capacity_failure and exit_code != 0:
             error = "Codex capacity retries exhausted"
+        elif exit_code != 0 and invocation_error and not timed_out:
+            error = invocation_error
         if exit_code == 0 and not report:
             error = "Codex returned no structured final report"
         succeeded = exit_code == 0 and bool(report)
@@ -1279,7 +1322,7 @@ whole-file diagnostics in import order; do not prepare every file separately.
             usage=usage,
             thread_id=thread_id,
         )
-        return AgentResult(
+        result = AgentResult(
             succeeded=succeeded,
             exit_code=exit_code,
             changed=changed,
@@ -1290,6 +1333,9 @@ whole-file diagnostics in import order; do not prepare every file separately.
             error=error,
             capacity_exhausted=capacity_failure and exit_code != 0,
         )
+        if fatal_invocation_failure and exit_code != 0:
+            raise FatalCodexInvocationError(error or "Codex rejected the invocation")
+        return result
 
 
 async def validate(

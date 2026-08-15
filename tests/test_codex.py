@@ -15,10 +15,12 @@ from lastlib_swarm.codex import (
     REPORT_SCHEMA,
     UPSTREAM_REPAIR_ROLE,
     CodexExecutor,
+    FatalCodexInvocationError,
     _bounded_feedback,
     _capacity_resume_delay,
     _complete_lines,
     _is_capacity_failure,
+    _is_fatal_invocation_failure,
     _rollout_usage,
     _tail_rollout_usage,
     _upstream_source_bundle,
@@ -68,6 +70,17 @@ def test_report_schema_records_complete_upstream_handoffs() -> None:
         "existing",
         "downstream",
     ]
+
+
+def test_report_schema_avoids_unsupported_codex_keywords() -> None:
+    def mappings(value: object) -> list[dict[str, object]]:
+        if isinstance(value, dict):
+            return [value, *(item for child in value.values() for item in mappings(child))]
+        if isinstance(value, list):
+            return [item for child in value for item in mappings(child)]
+        return []
+
+    assert all("uniqueItems" not in value for value in mappings(REPORT_SCHEMA))
 
 
 def test_extracts_api_equivalent_usage() -> None:
@@ -377,6 +390,20 @@ def test_detects_capacity_failures(event: dict[str, object]) -> None:
 def test_does_not_retry_unrelated_turn_failures() -> None:
     assert not _is_capacity_failure(
         {"type": "turn.failed", "error": {"message": "authentication failed"}}
+    )
+
+
+def test_detects_invalid_output_schema_as_fatal() -> None:
+    assert _is_fatal_invocation_failure(
+        {
+            "type": "turn.failed",
+            "error": {
+                "message": (
+                    "Invalid schema for response_format 'codex_output_schema': "
+                    "'uniqueItems' is not permitted."
+                )
+            },
+        }
     )
 
 
@@ -818,6 +845,49 @@ print(json.dumps({{"type": "item.completed", "item": {{
     assert activity is not None
     assert activity.current == "agent succeeded"
     assert any(entry.status == "retrying" for entry in activity.recent)
+
+
+@pytest.mark.asyncio
+async def test_executor_aborts_invalid_output_schema_with_visible_error(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    fake_codex = tmp_path / "invalid-schema-codex"
+    fake_codex.write_text(
+        """#!/usr/bin/env python3
+import json
+import sys
+
+sys.stdin.read()
+print(json.dumps({"type": "thread.started", "thread_id": "schema-thread"}))
+message = json.dumps({
+    "type": "error",
+    "error": {
+        "type": "invalid_request_error",
+        "code": "invalid_json_schema",
+        "message": "Invalid schema: 'uniqueItems' is not permitted.",
+    },
+    "status": 400,
+})
+print(json.dumps({"type": "error", "message": message}))
+print(json.dumps({"type": "turn.failed", "error": {"message": message}}))
+raise SystemExit(1)
+""",
+        encoding="utf-8",
+    )
+    fake_codex.chmod(0o755)
+    config = replace(config, settings=replace(config.settings, codex_bin=str(fake_codex)))
+    state = StateStore(config)
+    await state.load_or_create()
+    executor = CodexExecutor(config, state)
+    await executor.prepare()
+    run = await state.start_run(config.chapters[0].id, Stage.FORMALIZE)
+
+    with pytest.raises(FatalCodexInvocationError, match=r"uniqueItems.*not permitted"):
+        await executor.run(config.chapters[0], Stage.FORMALIZE, run)
+
+    activity = state.activities.get(run.id)
+    assert activity is not None
+    assert activity.current == "agent failed"
+    assert activity.latest_error == "Invalid schema: 'uniqueItems' is not permitted."
 
 
 @pytest.mark.asyncio

@@ -9,7 +9,13 @@ from typing import Any
 import pytest
 
 import lastlib_swarm.scheduler as scheduler_module
-from lastlib_swarm.codex import AgentResult, CodexExecutor, ValidationResult, scope_digest
+from lastlib_swarm.codex import (
+    AgentResult,
+    CodexExecutor,
+    FatalCodexInvocationError,
+    ValidationResult,
+    scope_digest,
+)
 from lastlib_swarm.config import load_config
 from lastlib_swarm.isolation import IsolationResult
 from lastlib_swarm.models import Chapter, PipelineConfig, Stage
@@ -2759,6 +2765,49 @@ async def test_capacity_failure_consumes_the_fixup_cap(
 
     assert not await orchestrator._fixup_to_clean({chapter.id: "repair"}, target_ids={chapter.id})
     assert len(orchestrator.executor.feedbacks) == 1
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_fatal_codex_invocation_aborts_fixup_without_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    config = replace(config, settings=replace(config.settings, isolation="shared"))
+    chapter = config.chapters[0]
+    orchestrator = Orchestrator(config, StateStore(config))
+    await orchestrator.prepare()
+    feedbacks: list[str] = []
+
+    async def fatal_run(
+        _chapter: Chapter,
+        _stage: Stage,
+        run: RunRecord,
+        *,
+        feedback: str = "",
+        workspace_root: Path | None = None,
+    ) -> AgentResult:
+        del workspace_root
+        feedbacks.append(feedback)
+        await orchestrator.state.finish_run(
+            run,
+            status=TaskStatus.FAILED,
+            exit_code=1,
+        )
+        raise FatalCodexInvocationError("invalid output schema")
+
+    monkeypatch.setattr(orchestrator.executor, "run", fatal_run)
+
+    async def validation(*_args: object, **_kwargs: object) -> ValidationResult:
+        return ValidationResult(False, 1, "error: Book/Chapter01.lean:1:1: broken")
+
+    monkeypatch.setattr(scheduler_module, "validate", validation)
+
+    with pytest.raises(FatalCodexInvocationError, match="invalid output schema"):
+        await orchestrator._fixup_to_clean({chapter.id: "repair"}, target_ids={chapter.id})
+
+    assert len(feedbacks) == 1
+    assert orchestrator.state.task(chapter.id, Stage.FIXUP).rounds == 1
     await orchestrator.shutdown()
 
 
