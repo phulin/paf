@@ -10,7 +10,7 @@ from dataclasses import dataclass, replace
 from typing import Any
 from uuid import uuid4
 
-from lastlib_swarm.codex import (
+from paf.codex import (
     DOWNSTREAM_RETRY_ROLE,
     UPSTREAM_REPAIR_ROLE,
     AgentResult,
@@ -23,19 +23,19 @@ from lastlib_swarm.codex import (
     scoped_files,
     validate,
 )
-from lastlib_swarm.coordination import CoordinatorBuildQueue, PriorityLimiter
-from lastlib_swarm.corpus import (
+from paf.coordination import CoordinatorBuildQueue, PriorityLimiter
+from paf.corpus import (
     ChapterImportGraph,
     build_chapter_import_graph,
     build_corpus_schedule,
     scheduling_snapshot,
 )
-from lastlib_swarm.diagnostics import unexpected_lean_warnings
-from lastlib_swarm.git import GitCommitter
-from lastlib_swarm.isolation import IsolationResult, create_isolation
-from lastlib_swarm.models import Chapter, PipelineConfig, Stage
-from lastlib_swarm.scope import ScopeMatcher
-from lastlib_swarm.state import (
+from paf.diagnostics import unexpected_lean_warnings
+from paf.git import GitCommitter
+from paf.isolation import IsolationResult, create_isolation
+from paf.models import Chapter, PipelineConfig, Stage
+from paf.scope import ScopeMatcher
+from paf.state import (
     RunRecord,
     StateStore,
     TaskStatus,

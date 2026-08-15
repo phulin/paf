@@ -7,12 +7,12 @@ from typing import Any, cast
 import pytest
 from textual.widgets import DataTable, RichLog, Static, Tab, TabbedContent, Tabs, TextArea
 
-from lastlib_swarm.config import load_config
-from lastlib_swarm.isolation import IsolationResult
-from lastlib_swarm.models import Stage
-from lastlib_swarm.scheduler import Orchestrator
-from lastlib_swarm.state import StateStore, TaskStatus, TokenUsage
-from lastlib_swarm.tui import (
+from paf.config import load_config
+from paf.isolation import IsolationResult
+from paf.models import Stage
+from paf.scheduler import Orchestrator
+from paf.state import StateStore, TaskStatus, TokenUsage
+from paf.tui import (
     ACTIVITY_KIND_ALIASES,
     ACTIVITY_KIND_DISPLAYS,
     TUI_THEME,
@@ -417,7 +417,7 @@ async def test_selected_chapter_opens_live_agent_detail(tmp_path: Path) -> None:
                     "item": {
                         "id": "mcp",
                         "type": "mcp_tool_call",
-                        "server": "lastlib_lean",
+                        "server": "paf_lean",
                         "tool": "lean_goal",
                         "status": "failed",
                         "result": {"content": [{"type": "text", "text": "diagnostic failed"}]},

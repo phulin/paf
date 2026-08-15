@@ -8,9 +8,9 @@ from pathlib import Path
 
 import pytest
 
-import lastlib_swarm.codex as codex_module
-from lastlib_swarm.activity import EVENT_TIMESTAMP_FIELD
-from lastlib_swarm.codex import (
+import paf.codex as codex_module
+from paf.activity import EVENT_TIMESTAMP_FIELD
+from paf.codex import (
     DOWNSTREAM_RETRY_ROLE,
     REPORT_SCHEMA,
     UPSTREAM_REPAIR_ROLE,
@@ -33,10 +33,10 @@ from lastlib_swarm.codex import (
     unexpected_lean_warnings,
     validate,
 )
-from lastlib_swarm.config import load_config
-from lastlib_swarm.models import Stage
-from lastlib_swarm.state import StateStore, TokenUsage
-from lastlib_swarm.state_db import read_full_snapshot
+from paf.config import load_config
+from paf.models import Stage
+from paf.state import StateStore, TokenUsage
+from paf.state_db import read_full_snapshot
 from tests.support import write_project
 
 
@@ -140,7 +140,7 @@ def test_frames_complete_lines_without_discarding_a_partial_record() -> None:
 async def test_rollout_tail_skips_large_non_usage_records_before_json_decode(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from lastlib_swarm import codex as codex_module
+    from paf import codex as codex_module
 
     rollout = tmp_path / "rollout.jsonl"
     irrelevant = b'{"type":"response_item","payload":"' + b"x" * (2 * 1024 * 1024) + b'"}\n'
@@ -223,20 +223,20 @@ def test_executor_uses_machine_readable_codex_mode(tmp_path: Path) -> None:
         for index, item in enumerate(isolated_command[:-1])
         if item == "--config"
     }
-    assert overrides["mcp_servers.lastlib_lean.command"] == f'"{lean_mcp_executable()}"'
-    assert json.loads(overrides["mcp_servers.lastlib_lean.args"]) == [
+    assert overrides["mcp_servers.paf_lean.command"] == f'"{lean_mcp_executable()}"'
+    assert json.loads(overrides["mcp_servers.paf_lean.args"]) == [
         "-m",
-        "lastlib_swarm.lean_mcp",
+        "paf.lean_mcp",
     ]
-    assert overrides["mcp_servers.lastlib_lean.cwd"] == f'"{isolated / "lean"}"'
-    assert json.loads(overrides["mcp_servers.lastlib_lean.env.PATH"]) == lean_mcp_path()
-    assert json.loads(overrides["mcp_servers.lastlib_lean.env.LEAN_MCP_SCRATCH_SLOTS"]) == "1"
-    assert "mcp_servers.lastlib_lean.env.LEAN_MCP_PREWARM_FILES" not in overrides
-    assert "lean_diagnostic_messages" in overrides["mcp_servers.lastlib_lean.enabled_tools"]
-    assert "lean_prepare_dependencies" in overrides["mcp_servers.lastlib_lean.enabled_tools"]
-    assert "lean_multi_attempt" in overrides["mcp_servers.lastlib_lean.enabled_tools"]
-    assert "lean_file_outline" not in overrides["mcp_servers.lastlib_lean.enabled_tools"]
-    assert "lean_build" not in overrides["mcp_servers.lastlib_lean.enabled_tools"]
+    assert overrides["mcp_servers.paf_lean.cwd"] == f'"{isolated / "lean"}"'
+    assert json.loads(overrides["mcp_servers.paf_lean.env.PATH"]) == lean_mcp_path()
+    assert json.loads(overrides["mcp_servers.paf_lean.env.LEAN_MCP_SCRATCH_SLOTS"]) == "1"
+    assert "mcp_servers.paf_lean.env.LEAN_MCP_PREWARM_FILES" not in overrides
+    assert "lean_diagnostic_messages" in overrides["mcp_servers.paf_lean.enabled_tools"]
+    assert "lean_prepare_dependencies" in overrides["mcp_servers.paf_lean.enabled_tools"]
+    assert "lean_multi_attempt" in overrides["mcp_servers.paf_lean.enabled_tools"]
+    assert "lean_file_outline" not in overrides["mcp_servers.paf_lean.enabled_tools"]
+    assert "lean_build" not in overrides["mcp_servers.paf_lean.enabled_tools"]
     assert render_prompt(
         "Chapter {chapter_number_padded}: {chapter_title}", config.chapters[0]
     ) == ("Chapter 01: First chapter")
@@ -249,25 +249,25 @@ def test_executor_uses_machine_readable_codex_mode(tmp_path: Path) -> None:
         for index, item in enumerate(review_command[:-1])
         if item == "--config"
     }
-    assert "lean_diagnostic_messages" in review_overrides["mcp_servers.lastlib_lean.enabled_tools"]
-    assert "lean_prepare_dependencies" in review_overrides["mcp_servers.lastlib_lean.enabled_tools"]
-    assert "lean_code_actions" in review_overrides["mcp_servers.lastlib_lean.enabled_tools"]
-    assert "lean_file_outline" not in review_overrides["mcp_servers.lastlib_lean.enabled_tools"]
-    assert "lean_multi_attempt" not in review_overrides["mcp_servers.lastlib_lean.enabled_tools"]
-    assert "lean_build" not in review_overrides["mcp_servers.lastlib_lean.enabled_tools"]
+    assert "lean_diagnostic_messages" in review_overrides["mcp_servers.paf_lean.enabled_tools"]
+    assert "lean_prepare_dependencies" in review_overrides["mcp_servers.paf_lean.enabled_tools"]
+    assert "lean_code_actions" in review_overrides["mcp_servers.paf_lean.enabled_tools"]
+    assert "lean_file_outline" not in review_overrides["mcp_servers.paf_lean.enabled_tools"]
+    assert "lean_multi_attempt" not in review_overrides["mcp_servers.paf_lean.enabled_tools"]
+    assert "lean_build" not in review_overrides["mcp_servers.paf_lean.enabled_tools"]
     fixup_command = executor.command(Stage.FIXUP, isolated)
     fixup_overrides = {
         fixup_command[index + 1].split("=", 1)[0]: fixup_command[index + 1].split("=", 1)[1]
         for index, item in enumerate(fixup_command[:-1])
         if item == "--config"
     }
-    assert "lean_diagnostic_messages" in fixup_overrides["mcp_servers.lastlib_lean.enabled_tools"]
-    assert "lean_code_actions" in fixup_overrides["mcp_servers.lastlib_lean.enabled_tools"]
-    assert "lean_file_outline" not in fixup_overrides["mcp_servers.lastlib_lean.enabled_tools"]
-    assert "lean_multi_attempt" not in fixup_overrides["mcp_servers.lastlib_lean.enabled_tools"]
-    assert "lean_goal" not in fixup_overrides["mcp_servers.lastlib_lean.enabled_tools"]
+    assert "lean_diagnostic_messages" in fixup_overrides["mcp_servers.paf_lean.enabled_tools"]
+    assert "lean_code_actions" in fixup_overrides["mcp_servers.paf_lean.enabled_tools"]
+    assert "lean_file_outline" not in fixup_overrides["mcp_servers.paf_lean.enabled_tools"]
+    assert "lean_multi_attempt" not in fixup_overrides["mcp_servers.paf_lean.enabled_tools"]
+    assert "lean_goal" not in fixup_overrides["mcp_servers.paf_lean.enabled_tools"]
 
-    assert not any("mcp_servers.lastlib_lean" in item for item in executor.command(Stage.FORMALIZE))
+    assert not any("mcp_servers.paf_lean" in item for item in executor.command(Stage.FORMALIZE))
 
     resumed = executor.command(Stage.FORMALIZE, isolated, resume_thread_id="capacity-thread")
     assert resumed[:3] == ["codex", "exec", "resume"]
@@ -309,8 +309,8 @@ def test_lean_mcp_does_not_prewarm_files(tmp_path: Path) -> None:
         for index, item in enumerate(command[:-1])
         if item == "--config"
     }
-    assert "mcp_servers.lastlib_lean.env.LEAN_MCP_PREWARM_FILES" not in overrides
-    assert json.loads(overrides["mcp_servers.lastlib_lean.env.LEAN_MCP_SCRATCH_SLOTS"]) == "1"
+    assert "mcp_servers.paf_lean.env.LEAN_MCP_PREWARM_FILES" not in overrides
+    assert json.loads(overrides["mcp_servers.paf_lean.env.LEAN_MCP_SCRATCH_SLOTS"]) == "1"
 
 
 @pytest.mark.parametrize("stage", list(Stage))
@@ -473,7 +473,7 @@ def test_review_command_enables_lean_mcp(tmp_path: Path) -> None:
     executor = CodexExecutor(config, StateStore(config))
 
     command = executor.command(Stage.REVIEW)
-    assert any("mcp_servers.lastlib_lean.command" in item for item in command)
+    assert any("mcp_servers.paf_lean.command" in item for item in command)
     assert any("lean_diagnostic_messages" in item for item in command)
 
 
@@ -489,7 +489,7 @@ def test_review_prompts_read_sources_dynamically(tmp_path: Path) -> None:
     for prompt in (review, proof_review):
         assert not prompt.startswith("# Line-numbered review source set")
 
-    prompt_root = Path(__file__).parents[1] / "src" / "lastlib_swarm" / "prompts"
+    prompt_root = Path(__file__).parents[1] / "src" / "paf" / "prompts"
     for name in ("review.md", "proof_review.md"):
         template = (prompt_root / name).read_text(encoding="utf-8")
         assert "dynamically from its numbered heading" in template
@@ -598,7 +598,7 @@ def test_downstream_retry_prompt_labels_the_persisted_handoff(tmp_path: Path) ->
 
 
 def test_shipped_prompts_have_consistent_stage_contracts() -> None:
-    prompt_root = Path(__file__).parents[1] / "src" / "lastlib_swarm" / "prompts"
+    prompt_root = Path(__file__).parents[1] / "src" / "paf" / "prompts"
     formalize = " ".join((prompt_root / "formalize.md").read_text().split())
     fixup = " ".join((prompt_root / "fixup.md").read_text().split())
     prove = " ".join((prompt_root / "prove.md").read_text().split())

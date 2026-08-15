@@ -2,13 +2,13 @@ from pathlib import Path
 
 import pytest
 
-from lastlib_swarm.config import (
+from paf.config import (
     infer_config,
     infer_corpus,
     load_config,
     parse_book_dependencies,
 )
-from lastlib_swarm.models import Stage
+from paf.models import Stage
 from tests.support import write_project
 
 
@@ -25,7 +25,7 @@ def test_discovers_chapters_and_renders_paths(tmp_path: Path) -> None:
     assert config.stages[Stage.FORMALIZE].max_rounds == 1
     assert config.stages[Stage.FIXUP].max_rounds == 10
     assert config.stages[Stage.REVIEW].max_rounds == 5
-    assert config.settings.state_dir == tmp_path / ".swarm"
+    assert config.settings.state_dir == tmp_path / ".paf"
     assert config.settings.lean_project == Path("lean")
     assert config.settings.lean_mcp_tool_timeout_seconds == 300
     assert config.settings.capacity_resume_attempts == 10
@@ -162,7 +162,7 @@ def test_infers_zero_config_project_from_markdown(tmp_path: Path) -> None:
     assert config.settings.reasoning_effort == "max"
     assert config.settings.bypass_approvals_and_sandbox
     assert config.settings.isolation == "auto"
-    assert config.settings.state_dir == tmp_path / ".swarm" / "book07"
+    assert config.settings.state_dir == tmp_path / ".paf" / "book07"
     assert config.books[0].module == "LastLib.Book07ExistingAPI"
     assert [chapter.number for chapter in config.chapters] == [1, 2]
     assert all(stage.prompt.is_file() for stage in config.stages.values())
@@ -209,4 +209,4 @@ def test_infers_multiple_books_and_chained_mermaid_dependencies(tmp_path: Path) 
 
     assert [book.id for book in config.books] == ["book01", "book02", "book03"]
     assert config.books[2].depends_on == ("book02",)
-    assert config.settings.state_dir.parent == tmp_path / ".swarm"
+    assert config.settings.state_dir.parent == tmp_path / ".paf"

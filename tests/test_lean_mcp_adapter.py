@@ -8,7 +8,7 @@ from typing import Any
 import pytest
 from leanclient.aio import LeanClientError
 
-from lastlib_swarm.lean_mcp import (
+from paf.lean_mcp import (
     barrier_with_dependency_refresh,
     record_stale_dependency,
     reload_with_dependencies_when_stale,

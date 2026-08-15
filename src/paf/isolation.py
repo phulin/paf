@@ -10,8 +10,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
 
-from lastlib_swarm.models import Chapter, SwarmSettings
-from lastlib_swarm.scope import ScopeMatcher
+from paf.models import Chapter, SwarmSettings
+from paf.scope import ScopeMatcher
 
 
 @dataclass(frozen=True)
@@ -310,7 +310,7 @@ class FuseOverlayIsolation:
         lean_cache = (settings.lean_project / ".lake").as_posix()
         excluded = {
             ".git",
-            ".swarm",
+            ".paf",
             ".venv",
             ".pytest_cache",
             ".lake",
@@ -875,7 +875,7 @@ class FuseOverlayIsolation:
                         destination = self.settings.repo / relative
                         destination.parent.mkdir(parents=True, exist_ok=True)
                         temporary = destination.with_name(
-                            f".{destination.name}.swarm-stage-{transaction}"
+                            f".{destination.name}.paf-stage-{transaction}"
                         )
                         staged[relative] = temporary
                         shutil.copy2(merged_root / relative, temporary)
@@ -887,7 +887,7 @@ class FuseOverlayIsolation:
                         destination.parent.mkdir(parents=True, exist_ok=True)
                         if os.path.lexists(destination):
                             backup = destination.with_name(
-                                f".{destination.name}.swarm-backup-{transaction}"
+                                f".{destination.name}.paf-backup-{transaction}"
                             )
                             os.replace(destination, backup)
                             backups[relative] = backup

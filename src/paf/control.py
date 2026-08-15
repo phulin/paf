@@ -10,11 +10,11 @@ from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
-from lastlib_swarm import json_codec as json
-from lastlib_swarm.corpus import scheduling_summary
-from lastlib_swarm.scheduler import Orchestrator
-from lastlib_swarm.state import TaskStatus, timestamp
-from lastlib_swarm.state_db import read_checkpoint
+from paf import json_codec as json
+from paf.corpus import scheduling_summary
+from paf.scheduler import Orchestrator
+from paf.state import TaskStatus, timestamp
+from paf.state_db import read_checkpoint
 
 PROTOCOL_VERSION = 2
 SOCKET_NAME = "control.sock"

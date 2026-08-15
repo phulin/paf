@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import TypedDict
 
-from lastlib_swarm.models import Stage
+from paf.models import Stage
 
 
 class PriorityLimiter:

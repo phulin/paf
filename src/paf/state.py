@@ -11,11 +11,11 @@ from enum import StrEnum
 from typing import Any
 from uuid import uuid4
 
-from lastlib_swarm.activity import ActivityStore, shorten_book_paths
-from lastlib_swarm.diagnostics import lean_diagnostic_counts
-from lastlib_swarm.models import Chapter, PipelineConfig, Stage
-from lastlib_swarm.pricing import LEGACY_MODEL, CostEstimate, estimate_cost
-from lastlib_swarm.state_db import DATABASE_NAME, StateDatabase
+from paf.activity import ActivityStore, shorten_book_paths
+from paf.diagnostics import lean_diagnostic_counts
+from paf.models import Chapter, PipelineConfig, Stage
+from paf.pricing import LEGACY_MODEL, CostEstimate, estimate_cost
+from paf.state_db import DATABASE_NAME, StateDatabase
 
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 LAKE_PROGRESS_RE = re.compile(r"\[(?P<completed>\d+)/(?P<total>\d+)\]\s+\S+\s+(?P<target>\S+)")

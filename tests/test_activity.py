@@ -3,8 +3,8 @@ from pathlib import Path
 
 import pytest
 
-import lastlib_swarm.activity as activity_module
-from lastlib_swarm.activity import (
+import paf.activity as activity_module
+from paf.activity import (
     EVENT_TIMESTAMP_FIELD,
     ActivityStore,
     AgentActivity,
@@ -183,7 +183,7 @@ def test_summarizes_agent_events_and_persists_compact_activity(tmp_path: Path) -
             "item": {
                 "id": "mcp-1",
                 "type": "mcp_tool_call",
-                "server": "lastlib_lean",
+                "server": "paf_lean",
                 "tool": "lean_diagnostic_messages",
                 "status": "in_progress",
             },
@@ -199,7 +199,7 @@ def test_summarizes_agent_events_and_persists_compact_activity(tmp_path: Path) -
             "item": {
                 "id": "mcp-1",
                 "type": "mcp_tool_call",
-                "server": "lastlib_lean",
+                "server": "paf_lean",
                 "tool": "lean_diagnostic_messages",
                 "status": "failed",
                 "error": None,
@@ -255,7 +255,7 @@ def test_summarizes_lean_mcp_queries_and_results_on_one_line(tmp_path: Path) -> 
         "item": {
             "id": "goal",
             "type": "mcp_tool_call",
-            "server": "lastlib_lean",
+            "server": "paf_lean",
             "tool": "lean_goal",
             "arguments": arguments,
             "status": "in_progress",
@@ -301,7 +301,7 @@ def test_lean_mcp_result_falls_back_from_null_structured_content(tmp_path: Path)
             "item": {
                 "id": "diagnostics",
                 "type": "mcp_tool_call",
-                "server": "lastlib_lean",
+                "server": "paf_lean",
                 "tool": "lean_diagnostic_messages",
                 "arguments": {"file_path": "Broken.lean"},
                 "status": "failed",
@@ -334,7 +334,7 @@ def test_large_lean_mcp_query_does_not_hide_result(tmp_path: Path) -> None:
             "item": {
                 "id": "attempt",
                 "type": "mcp_tool_call",
-                "server": "lastlib_lean",
+                "server": "paf_lean",
                 "tool": "lean_multi_attempt",
                 "arguments": {
                     "file_path": "Proof.lean",
@@ -429,7 +429,7 @@ def test_summarizes_each_enabled_lean_mcp_query(
             "item": {
                 "id": tool,
                 "type": "mcp_tool_call",
-                "server": "lastlib_lean",
+                "server": "paf_lean",
                 "tool": tool,
                 "arguments": arguments,
                 "status": "in_progress",
@@ -525,7 +525,7 @@ def test_summarizes_each_enabled_lean_mcp_result(
             "item": {
                 "id": tool,
                 "type": "mcp_tool_call",
-                "server": "lastlib_lean",
+                "server": "paf_lean",
                 "tool": tool,
                 "status": "completed",
                 "result": {"structured_content": value},

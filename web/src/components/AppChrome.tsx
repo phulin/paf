@@ -50,13 +50,13 @@ function SwarmMenuItem({
   onSelect: (swarmId: string) => void;
 }) {
   return (
-    <button className={`swarm-menu-item ${selected ? "selected" : ""}`} onClick={() => onSelect(swarm.id)}>
-      <span className={`swarm-item-mark ${swarm.active ? "active" : ""}`}>{swarm.active ? <Play size={10} fill="currentColor" /> : <Pause size={10} />}</span>
-      <span className="swarm-item-copy">
+    <button className={`paf-menu-item ${selected ? "selected" : ""}`} onClick={() => onSelect(swarm.id)}>
+      <span className={`paf-item-mark ${swarm.active ? "active" : ""}`}>{swarm.active ? <Play size={10} fill="currentColor" /> : <Pause size={10} />}</span>
+      <span className="paf-item-copy">
         <strong>{swarm.id}</strong>
         <small>{swarm.book_count} books · {swarm.task_count} tasks · updated {timeAgo(swarm.updated_at)}</small>
       </span>
-      <span className="swarm-item-agents"><strong>{swarm.active_agents}</strong><small>agents</small></span>
+      <span className="paf-item-agents"><strong>{swarm.active_agents}</strong><small>agents</small></span>
       {selected && <Check size={14} />}
     </button>
   );
@@ -98,24 +98,24 @@ export function SwarmSwitcher({
   };
 
   return (
-    <div className="swarm-switcher" ref={rootRef}>
-      <button className={`swarm-trigger ${open ? "open" : ""}`} onClick={() => setOpen(!open)} aria-expanded={open}>
-        <span className={`swarm-status-dot ${selected?.active ? "active" : ""}`} />
-        <span className="swarm-trigger-copy"><small>Watching swarm</small><strong>{selected?.id ?? "demo-snapshot"}</strong></span>
-        {selected && <span className="swarm-agent-count">{selected.active_agents}<em>/{selected.maximum_agents}</em></span>}
+    <div className="paf-switcher" ref={rootRef}>
+      <button className={`paf-trigger ${open ? "open" : ""}`} onClick={() => setOpen(!open)} aria-expanded={open}>
+        <span className={`paf-status-dot ${selected?.active ? "active" : ""}`} />
+        <span className="paf-trigger-copy"><small>Watching swarm</small><strong>{selected?.id ?? "demo-snapshot"}</strong></span>
+        {selected && <span className="paf-agent-count">{selected.active_agents}<em>/{selected.maximum_agents}</em></span>}
         <ChevronDown size={14} />
       </button>
       {open && (
-        <div className="swarm-menu">
-          <div className="swarm-menu-head">
+        <div className="paf-menu">
+          <div className="paf-menu-head">
             <div><span className="eyebrow">Swarm processes</span><strong>{active.length} currently running</strong></div>
             <Activity size={16} />
           </div>
-          {active.length > 0 && <div className="swarm-menu-label">Running now</div>}
+          {active.length > 0 && <div className="paf-menu-label">Running now</div>}
           {active.map((swarm) => <SwarmMenuItem key={swarm.id} swarm={swarm} selected={swarm.id === selected?.id} onSelect={choose} />)}
-          {recent.length > 0 && <div className="swarm-menu-label recent">Recent state</div>}
+          {recent.length > 0 && <div className="paf-menu-label recent">Recent state</div>}
           {recent.map((swarm) => <SwarmMenuItem key={swarm.id} swarm={swarm} selected={swarm.id === selected?.id} onSelect={choose} />)}
-          {!swarms.length && <div className="swarm-menu-empty">Repository API unavailable</div>}
+          {!swarms.length && <div className="paf-menu-empty">Repository API unavailable</div>}
         </div>
       )}
     </div>
@@ -128,7 +128,7 @@ export function Header(props: HeaderProps) {
     <header className="app-header">
       <div className="brand" onClick={() => setView("overview")} role="button" tabIndex={0}>
         <div className="brand-glyph" aria-hidden="true"><span>λ</span></div>
-        <div><div className="brand-name">LASTLIB</div><div className="brand-sub">FORMALIZATION OBSERVATORY</div></div>
+        <div><div className="brand-name">PAF</div><div className="brand-sub">FORMALIZATION OBSERVATORY</div></div>
       </div>
       <SwarmSwitcher swarms={swarms} selectedSwarm={selectedSwarm} onSelect={selectSwarm} />
       <nav className="top-nav" aria-label="Primary navigation">

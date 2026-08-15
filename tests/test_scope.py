@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from lastlib_swarm.scope import ScopeMatcher
+from paf.scope import ScopeMatcher
 
 
 def test_single_star_never_crosses_a_directory_boundary(tmp_path: Path) -> None:

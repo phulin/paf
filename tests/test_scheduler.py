@@ -8,19 +8,19 @@ from typing import Any
 
 import pytest
 
-import lastlib_swarm.scheduler as scheduler_module
-from lastlib_swarm.codex import (
+import paf.scheduler as scheduler_module
+from paf.codex import (
     AgentResult,
     CodexExecutor,
     FatalCodexInvocationError,
     ValidationResult,
     scope_digest,
 )
-from lastlib_swarm.config import load_config
-from lastlib_swarm.isolation import IsolationResult
-from lastlib_swarm.models import Chapter, PipelineConfig, Stage
-from lastlib_swarm.scheduler import FormalizeOutcome, Orchestrator, ReviewOutcome
-from lastlib_swarm.state import (
+from paf.config import load_config
+from paf.isolation import IsolationResult
+from paf.models import Chapter, PipelineConfig, Stage
+from paf.scheduler import FormalizeOutcome, Orchestrator, ReviewOutcome
+from paf.state import (
     RunRecord,
     StateStore,
     TaskStatus,
@@ -911,7 +911,7 @@ async def test_fixup_repeats_coordinator_build_and_hands_back_diagnostics(
     await orchestrator.shutdown()
 
 
-def with_lastlib_modules(config: PipelineConfig) -> PipelineConfig:
+def with_example_modules(config: PipelineConfig) -> PipelineConfig:
     return replace(
         config,
         chapters=tuple(
@@ -928,7 +928,7 @@ def with_lastlib_modules(config: PipelineConfig) -> PipelineConfig:
 async def test_fixup_builds_in_observed_chapter_import_order(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    config = with_lastlib_modules(
+    config = with_example_modules(
         load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
     )
     first, second = config.chapters
@@ -974,7 +974,7 @@ async def test_fixup_builds_in_observed_chapter_import_order(
 async def test_targeted_fixup_does_not_build_cleanliness_descendants(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    config = with_lastlib_modules(
+    config = with_example_modules(
         load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
     )
     first, second = config.chapters
@@ -1083,7 +1083,7 @@ async def test_partial_optimistic_failure_batches_remaining_topological_builds(
     project = write_project(tmp_path, chapters="chapters = [1, 2, 3]")
     with (tmp_path / "books" / "book.md").open("a", encoding="utf-8") as source:
         source.write("\n## 3. Third chapter\n")
-    config = with_lastlib_modules(load_config(project))
+    config = with_example_modules(load_config(project))
     first, second, third = config.chapters
     orchestrator = Orchestrator(config, StateStore(config))
     await orchestrator.prepare()
@@ -1153,7 +1153,7 @@ async def test_post_review_fixup_request_is_migrated_back_to_review(tmp_path: Pa
 async def test_fixup_build_routes_reviewed_diagnostic_owner_back_to_review(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    config = with_lastlib_modules(
+    config = with_example_modules(
         load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
     )
     reviewed, new = config.chapters
@@ -1453,7 +1453,7 @@ async def test_pending_review_and_proof_builds_share_a_cross_stage_command(
 async def test_fixup_rescans_new_import_before_rebuilding_edited_chapter(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    config = with_lastlib_modules(
+    config = with_example_modules(
         load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
     )
     first, second = config.chapters
@@ -1623,7 +1623,7 @@ async def test_fixup_runs_dependency_ready_agent_frontier_concurrently(
 async def test_fixup_does_not_launch_agent_before_observed_predecessor_is_clean(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    config = with_lastlib_modules(
+    config = with_example_modules(
         load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
     )
     first, second = config.chapters
@@ -1714,7 +1714,7 @@ async def test_fixup_unlocks_descendant_before_slow_independent_agent_finishes(
         "chapters = [1, 2, 3]",
     )
     config_path.write_text(config_text, encoding="utf-8")
-    config = with_lastlib_modules(load_config(config_path))
+    config = with_example_modules(load_config(config_path))
     first, second, third = config.chapters
     source_root = tmp_path / "lean" / "Book"
     source_root.mkdir(parents=True)
@@ -2404,7 +2404,7 @@ async def test_review_failure_quarantines_branch_without_cancelling_unrelated_wo
     project = write_project(tmp_path, chapters="chapters = [1, 2, 3]")
     with (tmp_path / "books" / "book.md").open("a", encoding="utf-8") as source:
         source.write("\n## 3. Third chapter\n")
-    config = with_lastlib_modules(load_config(project))
+    config = with_example_modules(load_config(project))
     first, second, third = config.chapters
     source_root = tmp_path / "lean" / "Book"
     source_root.mkdir(parents=True)
@@ -2845,7 +2845,7 @@ async def test_capacity_failure_stops_proof_work(
 async def test_pipeline_reviews_chapters_after_combined_optimistic_build_succeeds(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    config = with_lastlib_modules(
+    config = with_example_modules(
         load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
     )
     first, second = config.chapters
@@ -3110,7 +3110,7 @@ def test_proof_feedback_is_bounded_and_retains_latest_diagnostics() -> None:
 async def test_review_restart_seeds_proofs_from_successful_reviews_without_rebuilding(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    config = with_lastlib_modules(
+    config = with_example_modules(
         load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
     )
     first, second = config.chapters
@@ -3178,7 +3178,7 @@ async def test_review_restart_seeds_proofs_from_successful_reviews_without_rebui
 async def test_restart_after_proof_adds_lemma_preserves_review_success(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    config = with_lastlib_modules(load_config(write_project(tmp_path, chapters="chapters = [1]")))
+    config = with_example_modules(load_config(write_project(tmp_path, chapters="chapters = [1]")))
     chapter = config.chapters[0]
     source = tmp_path / "lean" / "Book" / "Chapter01.lean"
     source.parent.mkdir(parents=True)
@@ -3265,7 +3265,7 @@ async def test_restart_after_proof_adds_lemma_preserves_review_success(
 async def test_stale_build_is_refreshed_before_proof_agent_with_placeholders(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    config = with_lastlib_modules(load_config(write_project(tmp_path, chapters="chapters = [1]")))
+    config = with_example_modules(load_config(write_project(tmp_path, chapters="chapters = [1]")))
     chapter = config.chapters[0]
     source = tmp_path / "lean" / "Book" / "Chapter01.lean"
     source.parent.mkdir(parents=True)
@@ -3316,7 +3316,7 @@ async def test_stale_build_is_refreshed_before_proof_agent_with_placeholders(
 async def test_placeholder_free_proof_does_not_run_agent_after_failed_refresh(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    config = with_lastlib_modules(load_config(write_project(tmp_path, chapters="chapters = [1]")))
+    config = with_example_modules(load_config(write_project(tmp_path, chapters="chapters = [1]")))
     chapter = config.chapters[0]
     source = tmp_path / "lean" / "Book" / "Chapter01.lean"
     source.parent.mkdir(parents=True)
@@ -3349,7 +3349,7 @@ async def test_placeholder_free_proof_does_not_run_agent_after_failed_refresh(
 async def test_noop_proof_cannot_reuse_failed_certification(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    config = with_lastlib_modules(load_config(write_project(tmp_path, chapters="chapters = [1]")))
+    config = with_example_modules(load_config(write_project(tmp_path, chapters="chapters = [1]")))
     chapter = config.chapters[0]
     source = tmp_path / "lean" / "Book" / "Chapter01.lean"
     source.parent.mkdir(parents=True)
@@ -3394,7 +3394,7 @@ async def test_noop_proof_cannot_reuse_failed_certification(
 async def test_standalone_proof_fixup_finding_clears_durable_review(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    config = with_lastlib_modules(load_config(write_project(tmp_path, chapters="chapters = [1]")))
+    config = with_example_modules(load_config(write_project(tmp_path, chapters="chapters = [1]")))
     chapter = config.chapters[0]
     source = tmp_path / "lean" / "Book" / "Chapter01.lean"
     source.parent.mkdir(parents=True)
@@ -3493,7 +3493,7 @@ async def test_proof_upstream_request_runs_repair_then_targeted_retry(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    config = with_lastlib_modules(
+    config = with_example_modules(
         load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
     )
     owner, consumer = config.chapters
@@ -3673,7 +3673,7 @@ async def test_upstream_request_escalates_only_after_failed_targeted_retry(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    config = with_lastlib_modules(
+    config = with_example_modules(
         load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
     )
     owner, consumer = config.chapters
@@ -3804,7 +3804,7 @@ async def test_requested_upstream_requests_for_one_owner_share_one_repair_agent(
         "## 2. Second chapter\n\nText.\n\n## 3. Third chapter\n\nText.\n",
         encoding="utf-8",
     )
-    config = with_lastlib_modules(load_config(config_path))
+    config = with_example_modules(load_config(config_path))
     owner, *consumers = config.chapters
     root = tmp_path / "lean" / "Book"
     root.mkdir(parents=True)
@@ -3902,7 +3902,7 @@ async def test_requested_upstream_requests_for_one_owner_share_one_repair_agent(
 async def test_pending_review_is_not_recovered_from_historical_runs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    config = with_lastlib_modules(load_config(write_project(tmp_path, chapters="chapters = [1]")))
+    config = with_example_modules(load_config(write_project(tmp_path, chapters="chapters = [1]")))
     chapter = config.chapters[0]
     source = tmp_path / "lean" / "Book" / "Chapter01.lean"
     source.parent.mkdir(parents=True)
@@ -3976,7 +3976,7 @@ async def test_pending_review_is_not_recovered_from_historical_runs(
 
 @pytest.mark.asyncio
 async def test_statement_finding_invalidates_only_its_review(tmp_path: Path) -> None:
-    config = with_lastlib_modules(
+    config = with_example_modules(
         load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
     )
     first, second = config.chapters
@@ -4043,7 +4043,7 @@ async def test_review_completion_cannot_resurrect_an_invalidated_generation(
 async def test_changed_source_revalidates_proofs_without_clearing_review_success(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    config = with_lastlib_modules(
+    config = with_example_modules(
         load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
     )
     first, second = config.chapters
@@ -4117,7 +4117,7 @@ async def test_changed_source_revalidates_proofs_without_clearing_review_success
 async def test_proof_edit_keeps_downstream_build_fresh(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    config = with_lastlib_modules(
+    config = with_example_modules(
         load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
     )
     first, second = config.chapters
@@ -4221,7 +4221,7 @@ async def test_background_build_does_not_change_proof_stage(
 async def test_upstream_proof_starts_before_downstream_review_finishes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    config = with_lastlib_modules(
+    config = with_example_modules(
         load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
     )
     first, second = config.chapters
@@ -4281,7 +4281,7 @@ async def test_review_finding_rebuilds_upstream_while_downstream_agents_drain(
         book.read_text(encoding="utf-8") + "\n## 3. Third chapter\n",
         encoding="utf-8",
     )
-    config = with_lastlib_modules(load_config(project))
+    config = with_example_modules(load_config(project))
     first, second, third = config.chapters
     source_root = tmp_path / "lean" / "Book"
     source_root.mkdir(parents=True)
@@ -4407,7 +4407,7 @@ async def test_invalidated_review_allows_descendant_proofs_to_run_optimistically
         book.read_text(encoding="utf-8") + "\n## 3. Third chapter\n",
         encoding="utf-8",
     )
-    config = with_lastlib_modules(load_config(project))
+    config = with_example_modules(load_config(project))
     first, second, third = config.chapters
     source_root = tmp_path / "lean" / "Book"
     source_root.mkdir(parents=True)
@@ -4480,7 +4480,7 @@ async def test_initial_review_waits_for_transitive_review_dependencies(
         book.read_text(encoding="utf-8") + "\n## 3. Third chapter\n",
         encoding="utf-8",
     )
-    config = with_lastlib_modules(load_config(project))
+    config = with_example_modules(load_config(project))
     first, second, third = config.chapters
     source_root = tmp_path / "lean" / "Book"
     source_root.mkdir(parents=True)
@@ -4546,7 +4546,7 @@ async def test_initial_review_waits_for_transitive_review_dependencies(
 async def test_dirty_rebuilds_wait_only_for_an_agent_on_the_same_chapter(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    config = with_lastlib_modules(
+    config = with_example_modules(
         load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
     )
     first, second = config.chapters

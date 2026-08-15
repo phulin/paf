@@ -16,28 +16,28 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from lastlib_swarm import json_codec as json
-from lastlib_swarm.activity import ActivityStore, reportable_error
-from lastlib_swarm.config import infer_corpus, resolve_config
-from lastlib_swarm.control import (
+from paf import json_codec as json
+from paf.activity import ActivityStore, reportable_error
+from paf.config import infer_corpus, resolve_config
+from paf.control import (
     LOG_NAME,
     ControlServer,
     control_socket,
     offline_status,
     send_command,
 )
-from lastlib_swarm.corpus import (
+from paf.corpus import (
     build_corpus_schedule,
     scheduling_snapshot,
     scheduling_summary,
 )
-from lastlib_swarm.isolation import fuse_overlay_available
-from lastlib_swarm.models import Chapter, PipelineConfig, Stage
-from lastlib_swarm.pricing import LEGACY_MODEL, CostEstimate, estimate_cost, format_usd
-from lastlib_swarm.scheduler import Orchestrator, scaffold_directories
-from lastlib_swarm.state import StateStore, TaskRecord, TaskStatus
-from lastlib_swarm.state_db import read_checkpoint, read_full_snapshot
-from lastlib_swarm.tui import activity_kind_badge, format_count, format_usage, run_tui
+from paf.isolation import fuse_overlay_available
+from paf.models import Chapter, PipelineConfig, Stage
+from paf.pricing import LEGACY_MODEL, CostEstimate, estimate_cost, format_usd
+from paf.scheduler import Orchestrator, scaffold_directories
+from paf.state import StateStore, TaskRecord, TaskStatus
+from paf.state_db import read_checkpoint, read_full_snapshot
+from paf.tui import activity_kind_badge, format_count, format_usage, run_tui
 
 RIPGREP_WARNING = (
     "ripgrep (`rg`) was not found on PATH. Swarm agents rely on fast source search and may be "
@@ -70,7 +70,7 @@ def _add_source(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--config",
         default=None,
-        help="optional pipeline TOML; defaults to target inference or ./swarm.toml",
+        help="optional pipeline TOML; defaults to target inference or ./paf.toml",
     )
     parser.add_argument(
         "--dependencies",
@@ -108,8 +108,8 @@ def _add_run_options(parser: argparse.ArgumentParser) -> None:
 
 
 def parser() -> argparse.ArgumentParser:
-    root = argparse.ArgumentParser(prog="lastlib-swarm", description=__doc__)
-    root.add_argument("--version", action="version", version="lastlib-swarm 0.7.0")
+    root = argparse.ArgumentParser(prog="paf", description=__doc__)
+    root.add_argument("--version", action="version", version="paf 0.7.0")
     commands = root.add_subparsers(dest="command", required=True)
 
     plan = commands.add_parser("plan", help="show discovered books, chapters, and stage settings")
@@ -466,7 +466,7 @@ def print_status(config: PipelineConfig, console: Console, *, raw_json: bool) ->
         return 0
     usage = snapshot.get("usage", {})
     if isinstance(usage, dict):
-        from lastlib_swarm.state import TokenUsage
+        from paf.state import TokenUsage
 
         measured = bool(usage.get("measured"))
         token_usage = TokenUsage(
@@ -668,7 +668,7 @@ def _start_agent(args: argparse.Namespace, config: PipelineConfig) -> int:
     command = [
         sys.executable,
         "-m",
-        "lastlib_swarm.cli",
+        "paf.cli",
         "agent",
         "serve",
         *_agent_source_args(args),

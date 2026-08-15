@@ -15,12 +15,12 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from lastlib_swarm import json_codec as json
-from lastlib_swarm.activity import EVENT_TIMESTAMP_FIELD, activity_timestamp
-from lastlib_swarm.diagnostics import unexpected_lean_warnings
-from lastlib_swarm.models import Chapter, PipelineConfig, Stage
-from lastlib_swarm.scope import ScopeMatcher
-from lastlib_swarm.state import RunRecord, StateStore, TaskStatus, TokenUsage
+from paf import json_codec as json
+from paf.activity import EVENT_TIMESTAMP_FIELD, activity_timestamp
+from paf.diagnostics import unexpected_lean_warnings
+from paf.models import Chapter, PipelineConfig, Stage
+from paf.scope import ScopeMatcher
+from paf.state import RunRecord, StateStore, TaskStatus, TokenUsage
 
 REPORT_SCHEMA: dict[str, Any] = {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -826,7 +826,7 @@ Your exclusive edit scope is:
 
 This is a hard write boundary: edit only the paths listed above. You may read files elsewhere for
 context, but do not create, modify, move, delete, format, or otherwise write any path outside this
-scope. In particular, do not edit `.swarm`, `SWARM.md`, repository-level documentation, prompts,
+scope. In particular, do not edit `.paf`, `README.md`, repository-level documentation, prompts,
 scripts, orchestration code, configuration, or tests, even if changing them seems useful for this
 task. If a source repair requires an out-of-scope write, do not make that edit; report it in
 `fixup_findings` with its exact owner path. Report tooling or infrastructure problems that require
@@ -886,7 +886,7 @@ fresh diagnostics as needed to establish that the changed proof is clean.""",
 
 ### Attached Lean MCP
 
-A private `lastlib_lean` MCP server is attached to this attempt. It points at the attempt's private
+A private `paf_lean` MCP server is attached to this attempt. It points at the attempt's private
 Lean project. Use its {capabilities}. It intentionally does not expose `lean_build` or remote
 search. Paths passed to its tools are relative to the Lean project root: use `LastLib/...`, not
 `lean/LastLib/...`.
@@ -963,21 +963,21 @@ whole-file diagnostics in import order; do not prepare every file separately.
                 else LEAN_MCP_PROOF_TOOLS
             )
             mcp_config = {
-                "mcp_servers.lastlib_lean.command": str(lean_mcp_executable()),
-                "mcp_servers.lastlib_lean.args": ["-m", "lastlib_swarm.lean_mcp"],
-                "mcp_servers.lastlib_lean.cwd": str(lean_project),
-                "mcp_servers.lastlib_lean.required": True,
-                "mcp_servers.lastlib_lean.startup_timeout_sec": 60,
-                "mcp_servers.lastlib_lean.tool_timeout_sec": (
+                "mcp_servers.paf_lean.command": str(lean_mcp_executable()),
+                "mcp_servers.paf_lean.args": ["-m", "paf.lean_mcp"],
+                "mcp_servers.paf_lean.cwd": str(lean_project),
+                "mcp_servers.paf_lean.required": True,
+                "mcp_servers.paf_lean.startup_timeout_sec": 60,
+                "mcp_servers.paf_lean.tool_timeout_sec": (
                     settings.lean_mcp_tool_timeout_seconds
                 ),
-                "mcp_servers.lastlib_lean.default_tools_approval_mode": "auto",
-                "mcp_servers.lastlib_lean.enabled_tools": list(enabled_tools),
-                "mcp_servers.lastlib_lean.env.PATH": lean_mcp_path(),
-                "mcp_servers.lastlib_lean.env.LEAN_PROJECT_PATH": str(lean_project),
-                "mcp_servers.lastlib_lean.env.LEAN_MCP_SCRATCH_SLOTS": "1",
-                "mcp_servers.lastlib_lean.env.LEAN_LOG_LEVEL": "NONE",
-                "mcp_servers.lastlib_lean.env.PYTHONWARNINGS": "ignore",
+                "mcp_servers.paf_lean.default_tools_approval_mode": "auto",
+                "mcp_servers.paf_lean.enabled_tools": list(enabled_tools),
+                "mcp_servers.paf_lean.env.PATH": lean_mcp_path(),
+                "mcp_servers.paf_lean.env.LEAN_PROJECT_PATH": str(lean_project),
+                "mcp_servers.paf_lean.env.LEAN_MCP_SCRATCH_SLOTS": "1",
+                "mcp_servers.paf_lean.env.LEAN_LOG_LEVEL": "NONE",
+                "mcp_servers.paf_lean.env.PYTHONWARNINGS": "ignore",
             }
             for key, value in mcp_config.items():
                 command.extend(["--config", f"{key}={json.dumps(value)}"])

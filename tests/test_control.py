@@ -3,11 +3,11 @@ from pathlib import Path
 
 import pytest
 
-from lastlib_swarm.config import load_config
-from lastlib_swarm.control import ControlServer, control_socket, offline_status, send_command
-from lastlib_swarm.models import Stage
-from lastlib_swarm.scheduler import Orchestrator, RunControl
-from lastlib_swarm.state import StateStore, TaskStatus
+from paf.config import load_config
+from paf.control import ControlServer, control_socket, offline_status, send_command
+from paf.models import Stage
+from paf.scheduler import Orchestrator, RunControl
+from paf.state import StateStore, TaskStatus
 from tests.support import write_project
 
 

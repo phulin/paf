@@ -9,7 +9,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from lastlib_swarm import json_codec as json
+from paf import json_codec as json
 
 MAX_RECENT_EVENTS = 80
 MAX_DETAIL_CHARS = 800
@@ -167,7 +167,7 @@ def _counted_items(
 
 
 def _lean_mcp_query(item: dict[str, Any]) -> str:
-    if item.get("server") != "lastlib_lean" or "arguments" not in item:
+    if item.get("server") != "paf_lean" or "arguments" not in item:
         return ""
     arguments = item["arguments"]
     if not isinstance(arguments, dict):
@@ -340,7 +340,7 @@ def _multi_attempt_result(value: dict[str, Any]) -> str:
 
 
 def _lean_mcp_result(item: dict[str, Any]) -> str:
-    if item.get("server") != "lastlib_lean":
+    if item.get("server") != "paf_lean":
         return ""
     value = _lean_mcp_result_value(item)
     if value is None:
@@ -412,7 +412,7 @@ def error_signature(message: str) -> str:
 
     if "No such file or directory: 'lake'" in message:
         return "Lean MCP cannot find lake"
-    message = re.sub(r"/tmp/lastlib-swarm-[^\s:'\"]+", "<workspace>", message)
+    message = re.sub(r"/tmp/paf-[^\s:'\"]+", "<workspace>", message)
     return _compact(message, limit=180)
 
 
@@ -636,7 +636,7 @@ class AgentActivity:
         if item_type == "mcp_tool_call":
             server = str(item.get("server", "MCP"))
             tool = str(item.get("tool", "tool"))
-            title = LEAN_MCP_TITLES.get(tool) if server == "lastlib_lean" else None
+            title = LEAN_MCP_TITLES.get(tool) if server == "paf_lean" else None
             return title or f"MCP {server}.{tool}", _lean_mcp_query(item)
         if item_type == "file_change":
             changes = item.get("changes")

@@ -10,14 +10,14 @@ from typing import Any
 
 import pytest
 
-import lastlib_swarm.isolation as isolation_module
-import lastlib_swarm.scheduler as scheduler_module
-from lastlib_swarm.codex import ValidationResult
-from lastlib_swarm.config import load_config
-from lastlib_swarm.isolation import FuseOverlayIsolation, fuse_overlay_available
-from lastlib_swarm.models import Chapter, Stage
-from lastlib_swarm.scheduler import Orchestrator
-from lastlib_swarm.state import StateStore
+import paf.isolation as isolation_module
+import paf.scheduler as scheduler_module
+from paf.codex import ValidationResult
+from paf.config import load_config
+from paf.isolation import FuseOverlayIsolation, fuse_overlay_available
+from paf.models import Chapter, Stage
+from paf.scheduler import Orchestrator
+from paf.state import StateStore
 from tests.support import write_project
 
 pytestmark = pytest.mark.skipif(
@@ -34,7 +34,7 @@ def fuse_manager(config_path: Path) -> tuple[FuseOverlayIsolation, Chapter]:
 def test_fuse_overlay_workspace_lives_in_swarm_state_directory(tmp_path: Path) -> None:
     manager, _ = fuse_manager(write_project(tmp_path, chapters="chapters = [1]"))
 
-    assert manager.parent == tmp_path / ".swarm" / "isolation"
+    assert manager.parent == tmp_path / ".paf" / "isolation"
     assert manager.root.parent == manager.parent
     build = manager._create_cache_workspace(manager.cache_builds, "build")
     compact = manager._create_cache_workspace(manager.cache_compactions, "compact")
@@ -339,7 +339,7 @@ async def test_scope_import_stages_every_file_before_touching_live_sources(
     assert first.read_text(encoding="utf-8") == "def first := 1\n"
     assert second.read_text(encoding="utf-8") == "def second := 1\n"
     assert manager._revision == 0
-    assert not list(tmp_path.rglob("*.swarm-stage-*"))
+    assert not list(tmp_path.rglob("*.paf-stage-*"))
 
 
 @pytest.mark.asyncio
@@ -649,7 +649,7 @@ print(json.dumps({"type": "item.completed", "item": {
 @pytest.mark.asyncio
 async def test_fuse_overlay_supports_a_large_concurrent_slot_pool(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
-    slot_count = int(os.environ.get("LASTLIB_SWARM_STRESS_SLOTS", "12"))
+    slot_count = int(os.environ.get("PAF_STRESS_SLOTS", "12"))
     manager = FuseOverlayIsolation(
         replace(config.settings, isolation="fuse-overlay", max_agents=slot_count)
     )

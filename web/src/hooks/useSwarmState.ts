@@ -7,7 +7,7 @@ export function useSwarmState(live: boolean) {
   const [state, setState] = useState<SwarmState>(demoState);
   const [swarms, setSwarms] = useState<SwarmSummary[]>([]);
   const [selectedSwarm, setSelectedSwarm] = useState<string | null>(() =>
-    corpusFromUrl() ?? window.localStorage.getItem("lastlib.selectedSwarm"),
+    corpusFromUrl() ?? window.localStorage.getItem("paf.selectedSwarm"),
   );
   const [connected, setConnected] = useState(false);
   const [fetching, setFetching] = useState(true);
@@ -29,7 +29,7 @@ export function useSwarmState(live: boolean) {
         : list.find((swarm) => swarm.active)?.id ?? list[0]?.id ?? null;
       if (target !== selectedSwarm) setSelectedSwarm(target);
       if (target) {
-        window.localStorage.setItem("lastlib.selectedSwarm", target);
+        window.localStorage.setItem("paf.selectedSwarm", target);
         if (corpusFromUrl() !== target) setCorpusUrl(target, "replace");
       }
       const params = target ? `?swarm=${encodeURIComponent(target)}` : "";
@@ -46,7 +46,7 @@ export function useSwarmState(live: boolean) {
 
   const selectSwarm = useCallback((swarmId: string) => {
     if (swarmId === selectedSwarm) return;
-    window.localStorage.setItem("lastlib.selectedSwarm", swarmId);
+    window.localStorage.setItem("paf.selectedSwarm", swarmId);
     setCorpusUrl(swarmId, "push");
     setSelectedSwarm(swarmId);
   }, [selectedSwarm]);
@@ -54,7 +54,7 @@ export function useSwarmState(live: boolean) {
   useEffect(() => {
     const restoreCorpus = () => {
       const corpus = corpusFromUrl();
-      if (corpus) window.localStorage.setItem("lastlib.selectedSwarm", corpus);
+      if (corpus) window.localStorage.setItem("paf.selectedSwarm", corpus);
       setSelectedSwarm(corpus);
     };
     window.addEventListener("popstate", restoreCorpus);

@@ -17,7 +17,7 @@ export function setCorpusUrl(corpus: string, mode: HistoryMode): void {
   const url = new URL(window.location.href);
   url.searchParams.set(CORPUS_QUERY_PARAM, corpus);
   const historyState = { ...(window.history.state ?? {}), corpus };
-  delete historyState.lastlibChapterView;
+  delete historyState.pafChapterView;
   updateHistory(url, historyState, mode);
 }
 
@@ -32,10 +32,10 @@ export function setChapterUrl(chapter: string | null, mode: HistoryMode): void {
   const historyState = { ...(window.history.state ?? {}) };
   if (chapter) {
     historyState.chapter = chapter;
-    historyState.lastlibChapterView = mode === "push";
+    historyState.pafChapterView = mode === "push";
   } else {
     delete historyState.chapter;
-    delete historyState.lastlibChapterView;
+    delete historyState.pafChapterView;
   }
   updateHistory(url, historyState, mode);
 }

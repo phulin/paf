@@ -1,1 +1,1 @@
-"""Tests for lastlib-swarm."""
+"""Tests for paf."""

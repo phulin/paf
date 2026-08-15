@@ -21,7 +21,7 @@ export function Overview({ state, connected }: { state: SwarmState; connected: b
 
   const closeChapter = () => {
     setSelectedChapter(null);
-    if (chapterFromUrl() && window.history.state?.lastlibChapterView === true) window.history.back();
+    if (chapterFromUrl() && window.history.state?.pafChapterView === true) window.history.back();
     else setChapterUrl(null, "replace");
   };
 

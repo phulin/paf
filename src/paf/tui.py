@@ -28,12 +28,12 @@ from textual.widgets import (
 )
 from textual.worker import WorkerCancelled
 
-from lastlib_swarm import json_codec as json
-from lastlib_swarm.activity import AgentActivity, reportable_error, systemic_errors
-from lastlib_swarm.models import Chapter, Stage
-from lastlib_swarm.pricing import format_usd
-from lastlib_swarm.scheduler import Orchestrator
-from lastlib_swarm.state import RunRecord, StateStore, TaskRecord, TaskStatus, TokenUsage
+from paf import json_codec as json
+from paf.activity import AgentActivity, reportable_error, systemic_errors
+from paf.models import Chapter, Stage
+from paf.pricing import format_usd
+from paf.scheduler import Orchestrator
+from paf.state import RunRecord, StateStore, TaskRecord, TaskStatus, TokenUsage
 
 TUI_THEME = "ansi-dark"
 MAX_TIMELINE_EVENTS = 10_000

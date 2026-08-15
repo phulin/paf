@@ -8,12 +8,12 @@ from pathlib import Path
 import pytest
 from rich.console import Console
 
-import lastlib_swarm.cli as cli_module
-from lastlib_swarm.cli import main, select_chapters
-from lastlib_swarm.config import load_config
-from lastlib_swarm.models import PipelineConfig, Stage
-from lastlib_swarm.state import StateStore, TaskStatus
-from lastlib_swarm.state_db import read_full_snapshot
+import paf.cli as cli_module
+from paf.cli import main, select_chapters
+from paf.config import load_config
+from paf.models import PipelineConfig, Stage
+from paf.state import StateStore, TaskStatus
+from paf.state_db import read_full_snapshot
 from tests.support import write_project
 
 

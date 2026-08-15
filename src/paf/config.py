@@ -9,8 +9,8 @@ from itertools import pairwise
 from pathlib import Path
 from typing import Any
 
-from lastlib_swarm.corpus import build_corpus_schedule
-from lastlib_swarm.models import (
+from paf.corpus import build_corpus_schedule
+from paf.models import (
     BookConfig,
     Chapter,
     PipelineConfig,
@@ -57,7 +57,7 @@ STAGE_ROUNDS = {
 
 
 def standard_prompt_path(stage: Stage) -> Path:
-    resource = files("lastlib_swarm.prompts").joinpath(f"{stage.value}.md")
+    resource = files("paf.prompts").joinpath(f"{stage.value}.md")
     path = Path(str(resource))
     if not path.is_file():
         raise ValueError(f"packaged standard prompt is missing: {stage.value}")
@@ -218,7 +218,7 @@ def load_config(path: str | Path) -> PipelineConfig:
     if "lean_mcp" in swarm:
         raise ValueError("swarm.lean_mcp was removed; Lean MCP is always enabled")
     repo = _resolve(base, str(swarm.get("repo", ".")))
-    state_dir = _resolve(repo, str(swarm.get("state_dir", ".swarm")))
+    state_dir = _resolve(repo, str(swarm.get("state_dir", ".paf")))
     settings = SwarmSettings(
         repo=repo,
         state_dir=state_dir,
@@ -345,7 +345,7 @@ def infer_config(target: str | Path) -> PipelineConfig:
     book = _infer_book(repo, source_path)
     settings = SwarmSettings(
         repo=repo,
-        state_dir=repo / ".swarm" / book.id,
+        state_dir=repo / ".paf" / book.id,
         model="gpt-5.6-luna",
         reasoning_effort="max",
     )
@@ -428,7 +428,7 @@ def infer_corpus(
     corpus_id = sha256(identity.encode()).hexdigest()[:10]
     settings = SwarmSettings(
         repo=repo,
-        state_dir=repo / ".swarm" / f"corpus-{corpus_id}",
+        state_dir=repo / ".paf" / f"corpus-{corpus_id}",
         model="gpt-5.6-luna",
         reasoning_effort="max",
     )
@@ -460,7 +460,7 @@ def resolve_config(
         if dependency_file is not None:
             return infer_corpus((path,), dependency_file=dependency_file)
         return infer_config(path)
-    default = Path("swarm.toml")
+    default = Path("paf.toml")
     if default.is_file():
         return load_config(default)
-    raise ValueError("pass a target .md or --config; no swarm.toml was found")
+    raise ValueError("pass a target .md or --config; no paf.toml was found")

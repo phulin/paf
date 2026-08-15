@@ -5,8 +5,8 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-from lastlib_swarm.models import Chapter, Stage
-from lastlib_swarm.scope import ScopeMatcher
+from paf.models import Chapter, Stage
+from paf.scope import ScopeMatcher
 
 
 class GitCommitError(RuntimeError):

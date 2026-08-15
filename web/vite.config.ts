@@ -36,7 +36,7 @@ interface IndexedDeclaration {
 const webRoot = path.dirname(new URL(import.meta.url).pathname);
 const repositoryRoot = path.resolve(webRoot, "..");
 const leanRoot = path.join(repositoryRoot, "lean", "LastLib");
-const swarmRoot = path.join(repositoryRoot, ".swarm");
+const swarmRoot = path.join(repositoryRoot, ".paf");
 const declarationPattern =
   /^\s*(?:(?:noncomputable|private|protected|unsafe|opaque)\s+)*(theorem|lemma|def|abbrev|structure|class|instance)\s+([^\s([{:=]+)/;
 
@@ -313,7 +313,7 @@ async function serveSwarm(request: IncomingMessage, response: ServerResponse): P
     ? candidates.find((item) => item.id === requested)
     : candidates.find((item) => swarmSummary(item).active) ?? candidates[0];
   if (!candidate) {
-    json(response, { error: "No .swarm state found" }, 404);
+    json(response, { error: "No .paf state found" }, 404);
     return;
   }
   if (requested && candidate.id !== requested) {
@@ -393,7 +393,7 @@ async function serveStatements(request: IncomingMessage, response: ServerRespons
   });
 }
 
-function lastLibApi(): Plugin {
+function pafApi(): Plugin {
   const middleware = () => async (request: IncomingMessage, response: ServerResponse, next: () => void) => {
     try {
       if (request.url?.startsWith("/api/swarms")) {
@@ -418,7 +418,7 @@ function lastLibApi(): Plugin {
     }
   };
   return {
-    name: "lastlib-repository-api",
+    name: "paf-repository-api",
     configureServer(server) {
       server.middlewares.use(middleware());
     },
@@ -429,7 +429,7 @@ function lastLibApi(): Plugin {
 }
 
 export default defineConfig({
-  plugins: [react(), lastLibApi()],
+  plugins: [react(), pafApi()],
   server: { port: 5173 },
   preview: { port: 4173 },
 });

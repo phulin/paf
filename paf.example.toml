@@ -1,6 +1,6 @@
 [swarm]
 repo = "."
-state_dir = ".swarm"
+state_dir = ".paf"
 max_agents = 24
 codex_bin = "codex"
 model = "gpt-5.6-luna"

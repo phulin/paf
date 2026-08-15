@@ -355,7 +355,7 @@ wheels = [
 ]
 
 [[package]]
-name = "lastlib-swarm"
+name = "paf"
 version = "0.7.0"
 source = { editable = "." }
 dependencies = [

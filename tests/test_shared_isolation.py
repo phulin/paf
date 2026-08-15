@@ -2,8 +2,8 @@ from pathlib import Path
 
 import pytest
 
-from lastlib_swarm.config import load_config
-from lastlib_swarm.isolation import SharedIsolation
+from paf.config import load_config
+from paf.isolation import SharedIsolation
 from tests.support import write_project
 
 

@@ -6,12 +6,12 @@ from pathlib import Path
 
 import pytest
 
-from lastlib_swarm.codex import AgentResult, CodexExecutor
-from lastlib_swarm.config import load_config
-from lastlib_swarm.git import GitCommitError, GitCommitter, agent_commit_subject
-from lastlib_swarm.models import Chapter, Stage
-from lastlib_swarm.scheduler import Orchestrator
-from lastlib_swarm.state import RunRecord, StateStore, TaskStatus, TokenUsage
+from paf.codex import AgentResult, CodexExecutor
+from paf.config import load_config
+from paf.git import GitCommitError, GitCommitter, agent_commit_subject
+from paf.models import Chapter, Stage
+from paf.scheduler import Orchestrator
+from paf.state import RunRecord, StateStore, TaskStatus, TokenUsage
 from tests.support import write_project
 
 
@@ -27,8 +27,8 @@ def git(repo: Path, *arguments: str) -> str:
 
 def initialize(repo: Path) -> None:
     git(repo, "init", "-q")
-    git(repo, "config", "user.name", "LastLib Test")
-    git(repo, "config", "user.email", "lastlib@example.com")
+    git(repo, "config", "user.name", "PAF Test")
+    git(repo, "config", "user.email", "paf@example.com")
     git(repo, "add", "-A")
     git(repo, "commit", "-qm", "chore: initialize fixture")
 

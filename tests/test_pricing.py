@@ -1,6 +1,6 @@
 import pytest
 
-from lastlib_swarm.pricing import LEGACY_MODEL, estimate_cost, format_usd, model_price
+from paf.pricing import LEGACY_MODEL, estimate_cost, format_usd, model_price
 
 
 def test_prices_uncached_cached_and_output_tokens_separately() -> None:

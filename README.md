@@ -1,6 +1,6 @@
-# LastLib Swarm
+# PAF
 
-`lastlib-swarm` orchestrates a large population of noninteractive Codex workers over an informal
+`paf` orchestrates a large population of noninteractive Codex workers over an informal
 mathematics corpus and its Lean translation. It combines an optimistic parallel drafting pass with
 coordinator-driven build convergence, MCP-backed fixup, editing mathematical review, and
 LSP-backed proving.
@@ -86,8 +86,8 @@ For a conventional numbered corpus, point the CLI at the book directory. It disc
 Markdown children and automatically reads `BOOK_DEPENDENCIES.md` from the repository root:
 
 ```console
-uv run lastlib-swarm plan books/
-uv run lastlib-swarm corpus books/
+uv run paf plan books/
+uv run paf corpus books/
 ```
 
 Dependency documents use Mermaid edges such as `B01 --> B02 --> B03`; chained edges are expanded.
@@ -97,21 +97,21 @@ the selected target set are treated as already satisfied.
 ## Quick start
 
 The project is managed with [uv](https://docs.astral.sh/uv/). A config file is optional: pass one
-informal book Markdown file and LastLib Swarm infers its title, numbered chapters, existing matching
+informal book Markdown file and PAF infers its title, numbered chapters, existing matching
 Lean book module, validation commands, and isolated state directory.
 
 ```console
 uv sync --all-groups
-uv run lastlib-swarm plan books/02-finite-extensions-of-local-fields.md
-uv run lastlib-swarm books/02-finite-extensions-of-local-fields.md
+uv run paf plan books/02-finite-extensions-of-local-fields.md
+uv run paf books/02-finite-extensions-of-local-fields.md
 ```
 
 Passing a `.md` as the first argument is shorthand for `pipeline <target>`. Zero-config runs default
 to `gpt-5.6-luna`, reasoning effort `max`, the packaged generic prompt library under
-`src/lastlib_swarm/prompts/`, automatic execution isolation, and a state directory at
-`.swarm/<inferred-book-id>/`. Fixup, review, and proof attempts attach a private Lean LSP MCP server;
+`src/paf/prompts/`, automatic execution isolation, and a state directory at
+`.paf/<inferred-book-id>/`. Fixup, review, and proof attempts attach a private Lean LSP MCP server;
 drafting does not. Use
-`swarm.example.toml` when the inferred layout is not appropriate or when coordinating multiple books.
+`paf.example.toml` when the inferred layout is not appropriate or when coordinating multiple books.
 
 Any stage may point at a specialized prompt template. Supported replacement fields include
 `{book_title}`, `{chapter_number}`, `{chapter_number_padded}`, `{chapter_title}`, `{source}`,
@@ -151,30 +151,30 @@ remaining drafting work before reporting failure.
 Inspect discovery and configuration without launching agents:
 
 ```console
-uv run lastlib-swarm plan books/02-finite-extensions-of-local-fields.md
-uv run lastlib-swarm plan --config swarm.toml
+uv run paf plan books/02-finite-extensions-of-local-fields.md
+uv run paf plan --config paf.toml
 ```
 
 Run an individual stage over the whole configured corpus or a selection:
 
 ```console
-uv run lastlib-swarm stage formalize books/02-finite-extensions-of-local-fields.md
-uv run lastlib-swarm stage fixup books/02-finite-extensions-of-local-fields.md
-uv run lastlib-swarm stage review --config swarm.toml --book book02
-uv run lastlib-swarm stage prove --config swarm.toml --book book02 --chapter 3
+uv run paf stage formalize books/02-finite-extensions-of-local-fields.md
+uv run paf stage fixup books/02-finite-extensions-of-local-fields.md
+uv run paf stage review --config paf.toml --book book02
+uv run paf stage prove --config paf.toml --book book02 --chapter 3
 ```
 
 Create the deterministic directory scaffold without launching Codex:
 
 ```console
-uv run lastlib-swarm scaffold books/02-finite-extensions-of-local-fields.md
+uv run paf scaffold books/02-finite-extensions-of-local-fields.md
 ```
 
 Run the complete pipeline:
 
 ```console
-uv run lastlib-swarm pipeline books/02-finite-extensions-of-local-fields.md
-uv run lastlib-swarm corpus books/ --max-agents 24
+uv run paf pipeline books/02-finite-extensions-of-local-fields.md
+uv run paf corpus books/ --max-agents 24
 ```
 
 The TUI is the default for stage and pipeline runs. Add `--no-tui` for CI, a process supervisor, or
@@ -184,21 +184,21 @@ successful stages are resumable and skipped.
 Inspect durable status without starting or mutating a run:
 
 ```console
-uv run lastlib-swarm status books/02-finite-extensions-of-local-fields.md
-uv run lastlib-swarm status --config swarm.toml --json
+uv run paf status books/02-finite-extensions-of-local-fields.md
+uv run paf status --config paf.toml --json
 ```
 
 Inspect the accumulated informal-textbook issue ledger:
 
 ```console
-uv run lastlib-swarm source-issues books/02-finite-extensions-of-local-fields.md
-uv run lastlib-swarm source-issues --config swarm.toml --json
+uv run paf source-issues books/02-finite-extensions-of-local-fields.md
+uv run paf source-issues --config paf.toml --json
 ```
 
 Every agent report has a structured `source_issues` field. Genuine textbook defects are recorded
 with a precise location, exact identifying excerpt, mathematical explanation, and minimal suggested
 replacement. The coordinator enriches each sighting with book, chapter, stage, and run provenance,
-deduplicates repeated sightings, and persists the ledger at `.swarm/.../source-issues.json` as well
+deduplicates repeated sightings, and persists the ledger at `.paf/.../source-issues.json` as well
 as in the state snapshot. Detection does not stop an agent: it must make the principled accommodation
 allowed by its stage and continue through all unaffected work. The ledger is evidence for a later
 reviewed textbook patch; swarm workers do not rewrite the Markdown automatically.
@@ -259,15 +259,15 @@ detached pipeline, then issue one-shot Bash commands over its Unix control socke
 
 ```console
 TARGET=books/02-finite-extensions-of-local-fields.md
-uv run lastlib-swarm agent start "$TARGET"
-uv run lastlib-swarm agent status "$TARGET"
-uv run lastlib-swarm agent pause "$TARGET"
-uv run lastlib-swarm agent resume "$TARGET"
-uv run lastlib-swarm agent unblock "$TARGET"
-uv run lastlib-swarm agent snapshot "$TARGET"
-uv run lastlib-swarm agent inspect "$TARGET" --chapter 8
-uv run lastlib-swarm agent inspect "$TARGET" --chapter book02/chapter-08 --follow
-uv run lastlib-swarm agent wait "$TARGET"
+uv run paf agent start "$TARGET"
+uv run paf agent status "$TARGET"
+uv run paf agent pause "$TARGET"
+uv run paf agent resume "$TARGET"
+uv run paf agent unblock "$TARGET"
+uv run paf agent snapshot "$TARGET"
+uv run paf agent inspect "$TARGET" --chapter 8
+uv run paf agent inspect "$TARGET" --chapter book02/chapter-08 --follow
+uv run paf agent wait "$TARGET"
 ```
 
 `TARGET=books` manages the inferred corpus through the same detached protocol; the directory and
@@ -289,7 +289,7 @@ returns one JSON response per line:
 
 ```console
 printf '%s\n' '{"command":"status"}' '{"command":"snapshot"}' \
-  | uv run lastlib-swarm agent rpc "$TARGET"
+  | uv run paf agent rpc "$TARGET"
 ```
 
 Accepted RPC commands are `status`, `snapshot`, `pause`, `resume`, `unblock`, `stop`, `wait`, and
@@ -450,8 +450,8 @@ estimate.
 
 ## State, logs, and interruption
 
-Configured state defaults to `.swarm/`; inferred single-target state uses `.swarm/<book-id>/`, and
-inferred corpora use a deterministic `.swarm/corpus-<id>/`. `state.sqlite3` is the canonical WAL
+Configured state defaults to `.paf/`; inferred single-target state uses `.paf/<book-id>/`, and
+inferred corpora use a deterministic `.paf/corpus-<id>/`. `state.sqlite3` is the canonical WAL
 database. Its compact checkpoint contains current task/build state, aggregate usage, and pointers to
 run history; immutable run payloads occupy independent rows and are loaded only for inspection or a
 full `snapshot` request. `state.json` remains a small atomic compatibility export of the checkpoint,
@@ -535,14 +535,14 @@ slot, while the independent build queue guarantees that at most one Lake build r
 
 ## Configuration
 
-No configuration is required for a conventional numbered LastLib Markdown book. If `swarm.toml`
+No configuration is required for a conventional numbered LastLib Markdown book. If `paf.toml`
 exists and no target or `--config` is supplied, it is loaded automatically. Explicit top-level
 settings override these defaults:
 
 ```toml
 [swarm]
 repo = "."
-state_dir = ".swarm"
+state_dir = ".paf"
 max_agents = 24
 codex_bin = "codex"
 model = "gpt-5.6-luna"

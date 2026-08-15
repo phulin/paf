@@ -3,13 +3,13 @@ from pathlib import Path
 
 import pytest
 
-from lastlib_swarm.corpus import (
+from paf.corpus import (
     build_chapter_import_graph,
     build_corpus_schedule,
     observed_imports,
 )
-from lastlib_swarm.models import BookConfig, Chapter
-from lastlib_swarm.scheduler import PriorityLimiter
+from paf.models import BookConfig, Chapter
+from paf.scheduler import PriorityLimiter
 
 
 def book(

@@ -6,8 +6,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-from lastlib_swarm.models import BookConfig, Chapter
-from lastlib_swarm.scope import ScopeMatcher
+from paf.models import BookConfig, Chapter
+from paf.scope import ScopeMatcher
 
 Phase = Literal["statements", "proofs"]
 

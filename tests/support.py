@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from lastlib_swarm.models import Stage
+from paf.models import Stage
 
 
 def write_project(tmp_path: Path, *, chapters: str = "") -> Path:
@@ -14,7 +14,7 @@ def write_project(tmp_path: Path, *, chapters: str = "") -> Path:
         (tmp_path / "prompts" / f"{stage}.md").write_text(
             "Do {book_title} chapter {chapter_number_padded}", encoding="utf-8"
         )
-    config = tmp_path / "swarm.toml"
+    config = tmp_path / "paf.toml"
     config.write_text(
         f"""
 [swarm]

@@ -7,16 +7,16 @@ import pytest
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
-from lastlib_swarm.codex import LEAN_MCP_PROOF_TOOLS, lean_mcp_executable
+from paf.codex import LEAN_MCP_PROOF_TOOLS, lean_mcp_executable
 
 
 @pytest.mark.skipif(
-    os.environ.get("LASTLIB_SWARM_MCP_SMOKE") != "1",
-    reason="set LASTLIB_SWARM_MCP_SMOKE=1 to launch the real Lean MCP server",
+    os.environ.get("PAF_MCP_SMOKE") != "1",
+    reason="set PAF_MCP_SMOKE=1 to launch the real Lean MCP server",
 )
 @pytest.mark.asyncio
 async def test_real_lean_mcp_advertises_required_tools() -> None:
-    project = Path(os.environ.get("LASTLIB_SWARM_MCP_PROJECT", Path.cwd() / "lean")).resolve()
+    project = Path(os.environ.get("PAF_MCP_PROJECT", Path.cwd() / "lean")).resolve()
     environment = {
         **os.environ,
         "LEAN_PROJECT_PATH": str(project),
@@ -25,7 +25,7 @@ async def test_real_lean_mcp_advertises_required_tools() -> None:
     }
     parameters = StdioServerParameters(
         command=str(lean_mcp_executable()),
-        args=["-m", "lastlib_swarm.lean_mcp"],
+        args=["-m", "paf.lean_mcp"],
         cwd=project,
         env=environment,
     )
@@ -37,7 +37,7 @@ async def test_real_lean_mcp_advertises_required_tools() -> None:
         await session.initialize()
         response = await session.list_tools()
         available = {tool.name for tool in response.tools}
-        diagnostic_file = os.environ.get("LASTLIB_SWARM_MCP_DIAGNOSTIC_FILE")
+        diagnostic_file = os.environ.get("PAF_MCP_DIAGNOSTIC_FILE")
         diagnostic = (
             await session.call_tool(
                 "lean_diagnostic_messages",
