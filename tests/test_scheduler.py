@@ -1870,6 +1870,114 @@ async def test_validated_build_refuses_to_certify_a_newer_source_generation(
 
 
 @pytest.mark.asyncio
+async def test_overlay_build_releases_source_barrier_and_rejects_concurrent_edit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = config.chapters[0]
+    source = tmp_path / "lean" / "Book" / "Chapter01.lean"
+    source.parent.mkdir(parents=True)
+    source.write_text("def built := 1\n", encoding="utf-8")
+    orchestrator = Orchestrator(config, StateStore(config))
+    await orchestrator.prepare()
+    monkeypatch.setattr(orchestrator.isolation, "name", "fuse-overlay")
+    validation_started = asyncio.Event()
+    release_validation = asyncio.Event()
+
+    async def validation(*_args: object, **_kwargs: object) -> ValidationResult:
+        validation_started.set()
+        await release_validation.wait()
+        return ValidationResult(True, 0, "ok")
+
+    monkeypatch.setattr(scheduler_module, "validate", validation)
+    build = asyncio.create_task(orchestrator._build_chapters((chapter,), publish_if_clean=True))
+    await validation_started.wait()
+
+    await asyncio.wait_for(orchestrator.source_lock.acquire(), timeout=0.5)
+    source.write_text("def built := 2\n", encoding="utf-8")
+    orchestrator.source_lock.release()
+    release_validation.set()
+
+    result = (await build)[chapter.id]
+    assert not result.succeeded
+    assert "changed during the coordinator build" in result.output
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_build_dispatch_bounds_batches_waiting_behind_coordinator(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = write_project(tmp_path, chapters="chapters = [1, 2, 3]")
+    with (tmp_path / "books" / "book.md").open("a", encoding="utf-8") as source:
+        source.write("\n## 3. Third chapter\n")
+    config = load_config(project)
+    orchestrator = Orchestrator(config, StateStore(config))
+    await orchestrator.prepare()
+    release = asyncio.Event()
+    maximum_active = 0
+    active = 0
+
+    async def held_batch(requests: tuple[scheduler_module.PendingBuildRequest, ...]) -> None:
+        nonlocal active, maximum_active
+        active += 1
+        maximum_active = max(maximum_active, active)
+        try:
+            await release.wait()
+            for request in requests:
+                request.future.set_result(
+                    {chapter.id: ValidationResult(True, 0, "ok") for chapter in request.chapters}
+                )
+        finally:
+            active -= 1
+
+    monkeypatch.setattr(orchestrator, "_run_build_batch", held_batch)
+    builds = [
+        asyncio.create_task(
+            orchestrator._build_chapters(
+                (config.chapters[0],),
+                publish_if_clean=False,
+            )
+        )
+    ]
+    while len(orchestrator._build_batch_tasks) < 1:
+        await asyncio.sleep(0)
+    builds.extend(
+        asyncio.create_task(
+            orchestrator._build_chapters(
+                (config.chapters[index % len(config.chapters)],),
+                publish_if_clean=False,
+            )
+        )
+        for index in range(1, 6)
+    )
+    for _ in range(20):
+        if len(orchestrator._build_batch_tasks) == 2:
+            break
+        await asyncio.sleep(0)
+
+    assert len(orchestrator._build_batch_tasks) == 2
+    builds.extend(
+        asyncio.create_task(
+            orchestrator._build_chapters(
+                (config.chapters[index % len(config.chapters)],),
+                publish_if_clean=False,
+            )
+        )
+        for index in range(6, 12)
+    )
+    for _ in range(10):
+        if orchestrator._pending_build_requests:
+            break
+        await asyncio.sleep(0)
+    assert orchestrator._pending_build_requests
+    release.set()
+    await asyncio.gather(*builds)
+    assert maximum_active == 2
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_agent_summary_separates_started_and_queued_runs(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
     config = replace(config, settings=replace(config.settings, max_agents=1))

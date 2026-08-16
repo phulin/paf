@@ -536,6 +536,14 @@ class FuseOverlayIsolation:
         destination = self.generations / f"{generation:08d}"
         destination.mkdir(parents=True, exist_ok=False)
         command = ["rsync", "-a"]
+        previous_revision = max(self._generation_paths, default=None)
+        if previous_revision is not None:
+            previous = self._generation_paths[previous_revision]
+            # Both paths are immutable. Reusing unchanged inodes avoids
+            # rewriting the complete repository for every accepted chapter.
+            # Agent integrations may preserve same-second mtimes and sizes, so
+            # checksum comparison is required before linking an old inode.
+            command.extend(("--checksum", f"--link-dest={previous}"))
         command.extend(f"--exclude=/{path}" for path in self.excluded)
         # Source generations must not share inodes with the live worktree. A
         # hard-linked snapshot can change underneath an active FUSE mount when
@@ -546,6 +554,11 @@ class FuseOverlayIsolation:
         await self._run(*command)
         self._generation_paths[generation] = destination
         self._generation_references[generation] = 0
+        for revision, path in tuple(self._generation_paths.items()):
+            if revision != generation and self._generation_references[revision] == 0:
+                self._generation_paths.pop(revision)
+                self._generation_references.pop(revision)
+                self._schedule_remove_tree(path)
         return generation, destination
 
     def _cache_prefixes(self) -> tuple[str, ...]:
@@ -748,7 +761,10 @@ class FuseOverlayIsolation:
             return promoted
         finally:
             if build_root.exists():
-                await asyncio.to_thread(shutil.rmtree, build_root)
+                # Failed Lake builds can leave very large private .lake trees.
+                # They are already detached and cannot affect correctness, so
+                # reclaim them behind the serialized cleanup worker.
+                self._schedule_remove_tree(build_root)
             async with self._lock:
                 self._generation_references[workspace.generation] -= 1
                 self._active_build_layers.difference_update(workspace.layers)
@@ -1026,17 +1042,21 @@ class FuseOverlayIsolation:
             if os.path.ismount(workspace.root):
                 await self._unmount(workspace.root)
             slot_root = workspace.root.parent
-            await asyncio.to_thread(shutil.rmtree, slot_root, ignore_errors=False)
+            # The detached upper may contain a large private Lake cache. Slot
+            # paths include the run id, so the numeric slot can be reused while
+            # serialized background cleanup reclaims this unique directory.
+            self._schedule_remove_tree(slot_root)
         finally:
             async with self._lock:
                 self._generation_references[workspace.generation] -= 1
                 if (
                     workspace.generation != self._revision
                     and self._generation_references[workspace.generation] == 0
+                    and workspace.generation != max(self._generation_paths)
                 ):
                     path = self._generation_paths.pop(workspace.generation)
                     self._generation_references.pop(workspace.generation)
-                    await asyncio.to_thread(shutil.rmtree, path)
+                    self._schedule_remove_tree(path)
                 self._cache_generations[workspace.cache_generation].references -= 1
                 self._drop_unused_cache_generations_locked()
             self._available.put_nowait(workspace.slot)

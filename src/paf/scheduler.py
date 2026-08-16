@@ -44,6 +44,9 @@ from paf.state import (
 )
 
 
+MAXIMUM_IN_FLIGHT_BUILD_BATCHES = 2
+
+
 async def _gather_cancel_on_error[T](
     operations: Iterable[Coroutine[Any, Any, T]],
 ) -> list[T]:
@@ -2057,9 +2060,12 @@ class Orchestrator:
         return await future
 
     async def _dispatch_build_requests(self) -> None:
-        """Let concurrent callers enqueue, then launch one shared build transaction."""
+        """Coalesce callers while bounding build batches queued behind the coordinator."""
 
         await asyncio.sleep(0)
+        if len(self._build_batch_tasks) >= MAXIMUM_IN_FLIGHT_BUILD_BATCHES:
+            self._build_dispatch_task = None
+            return
         requests = tuple(
             request for request in self._pending_build_requests if not request.future.cancelled()
         )
@@ -2069,7 +2075,15 @@ class Orchestrator:
             return
         task = asyncio.create_task(self._run_build_batch(requests))
         self._build_batch_tasks.add(task)
-        task.add_done_callback(self._build_batch_tasks.discard)
+
+        def finished(completed: asyncio.Task[None]) -> None:
+            self._build_batch_tasks.discard(completed)
+            if self._pending_build_requests and (
+                self._build_dispatch_task is None or self._build_dispatch_task.done()
+            ):
+                self._build_dispatch_task = asyncio.create_task(self._dispatch_build_requests())
+
+        task.add_done_callback(finished)
 
     async def _run_build_batch(self, requests: tuple[PendingBuildRequest, ...]) -> None:
         """Execute and partition a coalesced batch until every caller has a precise result."""
@@ -2236,6 +2250,21 @@ class Orchestrator:
                         total=len(selected),
                         target_work_unit_ids=ids,
                     )
+                build_graph = self._observed_work_unit_graph()
+                by_id = {item.id: item for item in self.work_units}
+                build_required_ids = self._dependency_closure(build_graph, ids)
+                build_source_digests = await asyncio.to_thread(
+                    lambda: {
+                        chapter_id: scope_digest(self.config.settings.repo, by_id[chapter_id])
+                        for chapter_id in build_required_ids
+                    }
+                )
+                # A FUSE build reads an immutable source generation. Source
+                # integrations therefore do not need to wait for Lake; the
+                # barrier is reacquired below before accepting the result.
+                if self.isolation.name != "shared":
+                    self.source_lock.release()
+                    source_held = False
                 if len(selected) > 1:
                     targets = []
                     prefixes = []
@@ -2313,24 +2342,40 @@ class Orchestrator:
                     and bool(results)
                     and all(result.succeeded for result in results.values())
                 )
-                if clean and snapshots is not None:
-                    graph = self._observed_work_unit_graph()
-                    by_id = {item.id: item for item in self.work_units}
-                    required_ids = self._dependency_closure(graph, ids)
-                    captured = await asyncio.to_thread(
+                if clean:
+                    if not source_held:
+                        await self.source_lock.acquire()
+                        source_held = True
+                    current_graph = self._observed_work_unit_graph()
+                    current_source_digests = await asyncio.to_thread(
                         lambda: {
                             chapter_id: scope_digest(self.config.settings.repo, by_id[chapter_id])
-                            for chapter_id in required_ids
+                            for chapter_id in build_required_ids
                         }
                     )
-                    for chapter in selected:
-                        required = self._dependency_closure(graph, (chapter.id,))
-                        snapshots[chapter.id] = ValidatedBuildSnapshot(
-                            graph=graph,
-                            source_digests={
-                                chapter_id: captured[chapter_id] for chapter_id in required
-                            },
+                    source_is_current = (
+                        current_graph.edges == build_graph.edges
+                        and current_source_digests == build_source_digests
+                    )
+                    if not source_is_current:
+                        stale = ValidationResult(
+                            False,
+                            1,
+                            "Source dependency scope changed during the coordinator build; "
+                            "retry required.",
                         )
+                        results = {chapter_id: stale for chapter_id in results}
+                        clean = False
+                    elif snapshots is not None:
+                        for chapter in selected:
+                            required = self._dependency_closure(build_graph, (chapter.id,))
+                            snapshots[chapter.id] = ValidatedBuildSnapshot(
+                                graph=build_graph,
+                                source_digests={
+                                    chapter_id: build_source_digests[chapter_id]
+                                    for chapter_id in required
+                                },
+                            )
                 await build_workspace.finish(
                     succeeded=clean,
                     publish=publish_if_clean and clean,

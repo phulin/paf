@@ -142,6 +142,64 @@ async def test_cache_layer_cleanup_is_serialized_and_releases_finished_tasks(
 
 
 @pytest.mark.asyncio
+async def test_failed_build_returns_before_recursive_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager, _ = fuse_manager(write_project(tmp_path, chapters="chapters = [1]"))
+    await manager.prepare()
+    build = await manager.acquire_build("failed-cleanup")
+    artifact = build.root / "lean" / ".lake" / "build" / "large.olean"
+    artifact.parent.mkdir(parents=True)
+    artifact.write_bytes(b"artifact")
+    build_root = build.root.parent
+    cleanup_started = threading.Event()
+    release_cleanup = threading.Event()
+    original_rmtree = shutil.rmtree
+
+    def held_rmtree(path: Any, **kwargs: Any) -> None:
+        if Path(path) == build_root:
+            cleanup_started.set()
+            release_cleanup.wait(timeout=5)
+        original_rmtree(path, **kwargs)
+
+    monkeypatch.setattr(shutil, "rmtree", held_rmtree)
+    try:
+        assert await build.finish(succeeded=False, publish=False) == ()
+        await asyncio.to_thread(cleanup_started.wait, 1)
+        assert build_root.exists()
+    finally:
+        release_cleanup.set()
+        await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_source_generations_link_unchanged_files_to_previous_snapshot(
+    tmp_path: Path,
+) -> None:
+    manager, _ = fuse_manager(write_project(tmp_path, chapters="chapters = [1]"))
+    unchanged = tmp_path / "orchestrator.py"
+    changed = tmp_path / "lean" / "Book" / "Chapter01.lean"
+    unchanged.write_text("stable = True\n", encoding="utf-8")
+    changed.parent.mkdir(parents=True)
+    changed.write_text("def version := 1\n", encoding="utf-8")
+    await manager.prepare()
+    first = manager._generation_paths[0]
+    first_unchanged = (first / unchanged.relative_to(tmp_path)).stat().st_ino
+    first_changed = (first / changed.relative_to(tmp_path)).stat().st_ino
+
+    changed.write_text("def version := 2\n", encoding="utf-8")
+    manager._revision = 1
+    workspace = await manager.acquire("linked-generation")
+    second = workspace.base
+    try:
+        assert (second / unchanged.relative_to(tmp_path)).stat().st_ino == first_unchanged
+        assert (second / changed.relative_to(tmp_path)).stat().st_ino != first_changed
+    finally:
+        await workspace.close()
+        await manager.close()
+
+
+@pytest.mark.asyncio
 async def test_fuse_overlay_rejects_out_of_scope_changes(tmp_path: Path) -> None:
     manager, chapter = fuse_manager(write_project(tmp_path, chapters="chapters = [1]"))
     await manager.prepare()
