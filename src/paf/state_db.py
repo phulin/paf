@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import shutil
 import sqlite3
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -10,7 +11,8 @@ from paf import json_codec as json
 
 DATABASE_NAME = "state.sqlite3"
 LEGACY_BACKUP_NAME = "state.legacy-v6.json"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+CHANGE_RETENTION = 10_000
 
 
 def _connect(path: Path) -> sqlite3.Connection:
@@ -21,7 +23,7 @@ def _connect(path: Path) -> sqlite3.Connection:
     return connection
 
 
-def _create_schema(connection: sqlite3.Connection) -> None:
+def _create_v1_schema(connection: sqlite3.Connection) -> None:
     connection.executescript(
         """
         CREATE TABLE IF NOT EXISTS checkpoint (
@@ -48,7 +50,221 @@ def _create_schema(connection: sqlite3.Connection) -> None:
         );
         """
     )
+    connection.execute("PRAGMA user_version=1")
+
+
+def _create_schema(connection: sqlite3.Connection) -> None:
+    """Create the normalized current-state schema.
+
+    The v1 checkpoint table is intentionally retained as a migration aid. New
+    writes never update it; normalized rows are authoritative in schema v2.
+    """
+
+    _create_v1_schema(connection)
+    connection.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS meta (
+            singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+            schema_version INTEGER NOT NULL,
+            revision INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            config_fingerprint TEXT NOT NULL DEFAULT ''
+        );
+        CREATE TABLE IF NOT EXISTS documents (
+            id TEXT PRIMARY KEY,
+            ordinal INTEGER NOT NULL,
+            payload BLOB NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS work_units (
+            id TEXT PRIMARY KEY,
+            document_id TEXT NOT NULL,
+            ordinal INTEGER NOT NULL,
+            title TEXT NOT NULL,
+            source TEXT NOT NULL,
+            payload BLOB NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS work_units_document_ordinal
+            ON work_units(document_id, ordinal, id);
+        CREATE TABLE IF NOT EXISTS tasks (
+            task_key TEXT PRIMARY KEY,
+            work_unit_id TEXT NOT NULL,
+            stage TEXT NOT NULL,
+            status TEXT NOT NULL,
+            queued INTEGER NOT NULL,
+            detail TEXT NOT NULL,
+            rounds INTEGER NOT NULL,
+            source_digest TEXT,
+            updated_at TEXT NOT NULL,
+            latest_run_id TEXT,
+            run_count INTEGER NOT NULL,
+            payload BLOB NOT NULL,
+            UNIQUE(work_unit_id, stage)
+        );
+        CREATE INDEX IF NOT EXISTS tasks_stage_status
+            ON tasks(stage, status, queued);
+        CREATE TABLE IF NOT EXISTS globals (
+            key TEXT PRIMARY KEY,
+            revision INTEGER NOT NULL,
+            payload BLOB NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS changes (
+            revision INTEGER NOT NULL,
+            entity_type TEXT NOT NULL,
+            entity_id TEXT NOT NULL,
+            PRIMARY KEY(revision, entity_type, entity_id)
+        );
+        CREATE INDEX IF NOT EXISTS changes_entity
+            ON changes(entity_type, entity_id, revision);
+        """
+    )
+    columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(runs)").fetchall()}
+    for name, declaration in (
+        ("work_unit_id", "TEXT NOT NULL DEFAULT ''"),
+        ("stage", "TEXT NOT NULL DEFAULT ''"),
+        ("role", "TEXT NOT NULL DEFAULT ''"),
+        ("finished_at", "TEXT"),
+        ("usage", "BLOB NOT NULL DEFAULT '{}'"),
+    ):
+        if name not in columns:
+            connection.execute(f"ALTER TABLE runs ADD COLUMN {name} {declaration}")
     connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+
+
+def _split_checkpoint(
+    checkpoint: dict[str, Any],
+) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]], dict[str, dict[str, Any]]]:
+    header = {
+        key: value
+        for key, value in checkpoint.items()
+        if key not in {"documents", "work_units", "tasks", "source_issues"}
+    }
+    documents = [value for value in checkpoint.get("documents", []) if isinstance(value, dict)]
+    work_units = [value for value in checkpoint.get("work_units", []) if isinstance(value, dict)]
+    raw_tasks = checkpoint.get("tasks", {})
+    tasks = (
+        {str(key): value for key, value in raw_tasks.items() if isinstance(value, dict)}
+        if isinstance(raw_tasks, dict)
+        else {}
+    )
+    return header, documents, work_units, tasks
+
+
+def _upsert_normalized_checkpoint(
+    connection: sqlite3.Connection,
+    checkpoint: dict[str, Any],
+    *,
+    revision: int,
+) -> None:
+    header, documents, work_units, tasks = _split_checkpoint(checkpoint)
+    connection.execute(
+        """
+        INSERT INTO globals(key, revision, payload) VALUES('state', ?, ?)
+        ON CONFLICT(key) DO UPDATE SET revision=excluded.revision, payload=excluded.payload
+        """,
+        (revision, json.dumpb(header)),
+    )
+    connection.executemany(
+        """
+        INSERT INTO documents(id, ordinal, payload) VALUES(?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET ordinal=excluded.ordinal, payload=excluded.payload
+        """,
+        (
+            (str(value.get("id", "")), ordinal, json.dumpb(value))
+            for ordinal, value in enumerate(documents)
+        ),
+    )
+    connection.executemany(
+        """
+        INSERT INTO work_units(id, document_id, ordinal, title, source, payload)
+        VALUES(?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            document_id=excluded.document_id,
+            ordinal=excluded.ordinal,
+            title=excluded.title,
+            source=excluded.source,
+            payload=excluded.payload
+        """,
+        (
+            (
+                str(value.get("id", "")),
+                str(value.get("document_id", value.get("book_id", ""))),
+                int(value.get("ordinal", value.get("chapter_number", 0))),
+                str(value.get("title", value.get("unit_title", ""))),
+                str(value.get("source", "")),
+                json.dumpb(value),
+            )
+            for value in work_units
+        ),
+    )
+    connection.executemany(
+        """
+        INSERT INTO tasks(
+            task_key, work_unit_id, stage, status, queued, detail, rounds,
+            source_digest, updated_at, latest_run_id, run_count, payload
+        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(task_key) DO UPDATE SET
+            work_unit_id=excluded.work_unit_id,
+            stage=excluded.stage,
+            status=excluded.status,
+            queued=excluded.queued,
+            detail=excluded.detail,
+            rounds=excluded.rounds,
+            source_digest=excluded.source_digest,
+            updated_at=excluded.updated_at,
+            latest_run_id=excluded.latest_run_id,
+            run_count=excluded.run_count,
+            payload=excluded.payload
+        """,
+        (_task_row(key, value) for key, value in tasks.items()),
+    )
+
+
+def _task_row(task_key: str, task: dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        task_key,
+        str(task.get("work_unit_id", task.get("chapter_id", ""))),
+        str(task.get("stage", "")),
+        str(task.get("status", "pending")),
+        int(bool(task.get("queued", False))),
+        str(task.get("detail", "")),
+        int(task.get("rounds", 0)),
+        task.get("source_digest"),
+        str(task.get("updated_at", "")),
+        task.get("latest_run_id"),
+        int(task.get("run_count", 0)),
+        json.dumpb(task),
+    )
+
+
+def _migrate_v1(connection: sqlite3.Connection) -> None:
+    row = connection.execute("SELECT payload FROM checkpoint WHERE singleton=1").fetchone()
+    checkpoint = json.loads(row[0]) if row is not None else None
+    _create_schema(connection)
+    now = str(checkpoint.get("updated_at", "")) if isinstance(checkpoint, dict) else ""
+    created = str(checkpoint.get("created_at", now)) if isinstance(checkpoint, dict) else now
+    connection.execute(
+        """
+        INSERT OR IGNORE INTO meta(
+            singleton, schema_version, revision, created_at, updated_at, config_fingerprint
+        ) VALUES(1, ?, 0, ?, ?, '')
+        """,
+        (SCHEMA_VERSION, created, now),
+    )
+    if isinstance(checkpoint, dict):
+        _upsert_normalized_checkpoint(connection, checkpoint, revision=0)
+    connection.execute(
+        """
+        UPDATE runs SET
+            work_unit_id=chapter_id,
+            stage=CASE
+                WHEN instr(task_key, ':') > 0
+                THEN substr(task_key, instr(task_key, ':') + 1)
+                ELSE ''
+            END
+        WHERE work_unit_id=''
+        """
+    )
 
 
 def _run_summary(run: dict[str, Any]) -> dict[str, Any]:
@@ -134,7 +350,10 @@ def initialize_database(state_dir: Path) -> Path:
     if database_path.is_file():
         with _connect(database_path) as connection:
             version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-            if version != SCHEMA_VERSION:
+            if version == 1:
+                with connection:
+                    _migrate_v1(connection)
+            elif version != SCHEMA_VERSION:
                 raise ValueError(
                     f"unsupported swarm database schema {version}; expected {SCHEMA_VERSION}"
                 )
@@ -148,7 +367,7 @@ def initialize_database(state_dir: Path) -> Path:
     temporary.unlink(missing_ok=True)
     try:
         with _connect(temporary) as connection:
-            _create_schema(connection)
+            _create_v1_schema(connection)
             with connection:
                 if raw is not None:
                     checkpoint = dict(raw)
@@ -208,6 +427,7 @@ def initialize_database(state_dir: Path) -> Path:
                         "INSERT INTO source_issues(id, payload) VALUES(?, ?)",
                         (str(issue["id"]), json.dumpb(issue)),
                     )
+                _migrate_v1(connection)
             migrated_runs = int(connection.execute("SELECT count(*) FROM runs").fetchone()[0])
             migrated_issues = int(
                 connection.execute("SELECT count(*) FROM source_issues").fetchone()[0]
@@ -236,6 +456,21 @@ def initialize_database(state_dir: Path) -> Path:
     return database_path
 
 
+@dataclass(frozen=True)
+class DatabaseWrite:
+    """A serialized, immutable delta ready for the writer thread."""
+
+    updated_at: str
+    globals: dict[str, bytes] = field(default_factory=dict)
+    tasks: dict[str, bytes] = field(default_factory=dict)
+    runs: dict[str, tuple[str, bytes]] = field(default_factory=dict)
+    source_issues: dict[str, bytes] = field(default_factory=dict)
+    replace_source_issues: bool = False
+    documents: dict[str, tuple[int, bytes]] = field(default_factory=dict)
+    work_units: dict[str, tuple[str, int, str, str, bytes]] = field(default_factory=dict)
+    changes: frozenset[tuple[str, str]] = frozenset()
+
+
 class StateDatabase:
     def __init__(self, state_dir: Path) -> None:
         self.state_dir = state_dir
@@ -244,12 +479,203 @@ class StateDatabase:
     def initialize(self) -> None:
         initialize_database(self.state_dir)
 
+    def connect_writer(self) -> sqlite3.Connection:
+        """Return the long-lived connection owned by a StateWriter thread."""
+
+        return _connect(self.path)
+
+    def write_delta(
+        self, write: DatabaseWrite, *, connection: sqlite3.Connection | None = None
+    ) -> int:
+        owned = connection is None
+        connection = connection or _connect(self.path)
+        try:
+            with connection:
+                revision = self._next_revision(connection, write.updated_at)
+                for key, payload in write.globals.items():
+                    connection.execute(
+                        """
+                        INSERT INTO globals(key, revision, payload) VALUES(?, ?, ?)
+                        ON CONFLICT(key) DO UPDATE SET
+                            revision=excluded.revision, payload=excluded.payload
+                        """,
+                        (key, revision, payload),
+                    )
+                for key, payload in write.tasks.items():
+                    value = json.loads(payload)
+                    if not isinstance(value, dict):
+                        raise ValueError(f"invalid task delta for {key}")
+                    connection.execute(
+                        """
+                        INSERT INTO tasks(
+                            task_key, work_unit_id, stage, status, queued, detail, rounds,
+                            source_digest, updated_at, latest_run_id, run_count, payload
+                        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(task_key) DO UPDATE SET
+                            work_unit_id=excluded.work_unit_id,
+                            stage=excluded.stage,
+                            status=excluded.status,
+                            queued=excluded.queued,
+                            detail=excluded.detail,
+                            rounds=excluded.rounds,
+                            source_digest=excluded.source_digest,
+                            updated_at=excluded.updated_at,
+                            latest_run_id=excluded.latest_run_id,
+                            run_count=excluded.run_count,
+                            payload=excluded.payload
+                        """,
+                        _task_row(key, value),
+                    )
+                for run_id, (task_key, serialized) in write.runs.items():
+                    run = json.loads(serialized)
+                    if not isinstance(run, dict):
+                        raise ValueError(f"invalid run delta for {run_id}")
+                    existing = connection.execute(
+                        "SELECT payload FROM runs WHERE id=?", (run_id,)
+                    ).fetchone()
+                    payload = run
+                    if existing is not None and not any(
+                        name in run for name in ("report", "validation", "isolation")
+                    ):
+                        existing_payload = json.loads(existing[0])
+                        if isinstance(existing_payload, dict):
+                            payload = existing_payload | run
+                    connection.execute(
+                        """
+                        INSERT INTO runs(
+                            id, task_key, chapter_id, started_at, status, summary, payload,
+                            work_unit_id, stage, role, finished_at, usage
+                        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(id) DO UPDATE SET
+                            task_key=excluded.task_key,
+                            chapter_id=excluded.chapter_id,
+                            started_at=excluded.started_at,
+                            status=excluded.status,
+                            summary=excluded.summary,
+                            payload=excluded.payload,
+                            work_unit_id=excluded.work_unit_id,
+                            stage=excluded.stage,
+                            role=excluded.role,
+                            finished_at=excluded.finished_at,
+                            usage=excluded.usage
+                        """,
+                        (
+                            run_id,
+                            task_key,
+                            str(run.get("chapter_id", run.get("work_unit_id", ""))),
+                            str(run.get("started_at", "")),
+                            str(run.get("status", "pending")),
+                            json.dumpb(_run_summary(run)),
+                            json.dumpb(payload),
+                            str(run.get("work_unit_id", run.get("chapter_id", ""))),
+                            str(run.get("stage", "")),
+                            str(run.get("role", "")),
+                            run.get("finished_at"),
+                            json.dumpb(run.get("usage", {})),
+                        ),
+                    )
+                if write.replace_source_issues:
+                    connection.execute("DELETE FROM source_issues")
+                for issue_id, payload in write.source_issues.items():
+                    connection.execute(
+                        """
+                        INSERT INTO source_issues(id, payload) VALUES(?, ?)
+                        ON CONFLICT(id) DO UPDATE SET payload=excluded.payload
+                        """,
+                        (issue_id, payload),
+                    )
+                for document_id, (ordinal, payload) in write.documents.items():
+                    connection.execute(
+                        """
+                        INSERT INTO documents(id, ordinal, payload) VALUES(?, ?, ?)
+                        ON CONFLICT(id) DO UPDATE SET
+                            ordinal=excluded.ordinal, payload=excluded.payload
+                        """,
+                        (document_id, ordinal, payload),
+                    )
+                for unit_id, row in write.work_units.items():
+                    connection.execute(
+                        """
+                        INSERT INTO work_units(
+                            id, document_id, ordinal, title, source, payload
+                        ) VALUES(?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(id) DO UPDATE SET
+                            document_id=excluded.document_id,
+                            ordinal=excluded.ordinal,
+                            title=excluded.title,
+                            source=excluded.source,
+                            payload=excluded.payload
+                        """,
+                        (unit_id, *row),
+                    )
+                for entity_type, entity_id in write.changes:
+                    connection.execute(
+                        "INSERT OR IGNORE INTO changes VALUES(?, ?, ?)",
+                        (revision, entity_type, entity_id),
+                    )
+                self._prune_changes(connection, revision)
+            return revision
+        finally:
+            if owned:
+                connection.close()
+
+    def revision(self) -> int:
+        with _connect(self.path) as connection:
+            row = connection.execute("SELECT revision FROM meta WHERE singleton=1").fetchone()
+        return int(row[0]) if row is not None else 0
+
+    def changes_since(self, revision: int) -> dict[str, Any]:
+        with _connect(self.path) as connection:
+            current_row = connection.execute(
+                "SELECT revision FROM meta WHERE singleton=1"
+            ).fetchone()
+            current = int(current_row[0]) if current_row is not None else 0
+            oldest_row = connection.execute("SELECT min(revision) FROM changes").fetchone()
+            oldest = int(oldest_row[0]) if oldest_row and oldest_row[0] is not None else current
+            if revision < oldest - 1:
+                return {"revision": current, "resync_required": True, "changes": []}
+            rows = connection.execute(
+                """
+                SELECT revision, entity_type, entity_id
+                FROM changes WHERE revision > ? ORDER BY revision, entity_type, entity_id
+                """,
+                (revision,),
+            ).fetchall()
+        return {
+            "revision": current,
+            "resync_required": False,
+            "changes": [
+                {"revision": int(item[0]), "entity_type": str(item[1]), "entity_id": str(item[2])}
+                for item in rows
+            ],
+        }
+
     def load(self) -> tuple[dict[str, Any] | None, list[dict[str, Any]], list[dict[str, Any]]]:
         with _connect(self.path) as connection:
-            checkpoint_row = connection.execute(
-                "SELECT payload FROM checkpoint WHERE singleton = 1"
+            global_row = connection.execute(
+                "SELECT payload FROM globals WHERE key='state'"
             ).fetchone()
-            checkpoint = json.loads(checkpoint_row[0]) if checkpoint_row is not None else None
+            checkpoint = json.loads(global_row[0]) if global_row is not None else None
+            if isinstance(checkpoint, dict):
+                checkpoint = dict(checkpoint)
+                checkpoint["documents"] = [
+                    json.loads(row[0])
+                    for row in connection.execute(
+                        "SELECT payload FROM documents ORDER BY ordinal, id"
+                    )
+                ]
+                checkpoint["work_units"] = [
+                    json.loads(row[0])
+                    for row in connection.execute(
+                        "SELECT payload FROM work_units ORDER BY document_id, ordinal, id"
+                    )
+                ]
+                checkpoint["tasks"] = {
+                    str(key): json.loads(payload)
+                    for key, payload in connection.execute(
+                        "SELECT task_key, payload FROM tasks ORDER BY task_key"
+                    )
+                }
             summaries = [
                 json.loads(row[0])
                 for row in connection.execute("SELECT summary FROM runs ORDER BY started_at, id")
@@ -269,15 +695,8 @@ class StateDatabase:
         issues: list[dict[str, Any]] | None,
     ) -> None:
         with _connect(self.path) as connection, connection:
-            connection.execute(
-                """
-                INSERT INTO checkpoint(singleton, updated_at, payload) VALUES(1, ?, ?)
-                ON CONFLICT(singleton) DO UPDATE SET
-                    updated_at = excluded.updated_at,
-                    payload = excluded.payload
-                """,
-                (str(checkpoint["updated_at"]), json.dumpb(checkpoint)),
-            )
+            revision = self._next_revision(connection, str(checkpoint["updated_at"]))
+            _upsert_normalized_checkpoint(connection, checkpoint, revision=revision)
             for task_key, run in runs:
                 summary = _run_summary(run)
                 payload = run
@@ -292,15 +711,21 @@ class StateDatabase:
                 connection.execute(
                     """
                     INSERT INTO runs(
-                        id, task_key, chapter_id, started_at, status, summary, payload
-                    ) VALUES(?, ?, ?, ?, ?, ?, ?)
+                        id, task_key, chapter_id, started_at, status, summary, payload,
+                        work_unit_id, stage, role, finished_at, usage
+                    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(id) DO UPDATE SET
                         task_key = excluded.task_key,
                         chapter_id = excluded.chapter_id,
                         started_at = excluded.started_at,
                         status = excluded.status,
                         summary = excluded.summary,
-                        payload = excluded.payload
+                        payload = excluded.payload,
+                        work_unit_id = excluded.work_unit_id,
+                        stage = excluded.stage,
+                        role = excluded.role,
+                        finished_at = excluded.finished_at,
+                        usage = excluded.usage
                     """,
                     (
                         str(run["id"]),
@@ -310,7 +735,16 @@ class StateDatabase:
                         str(run.get("status", "pending")),
                         json.dumpb(summary),
                         json.dumpb(payload),
+                        str(run.get("work_unit_id", run.get("chapter_id", ""))),
+                        str(run.get("stage", "")),
+                        str(run.get("role", "")),
+                        run.get("finished_at"),
+                        json.dumpb(run.get("usage", {})),
                     ),
+                )
+                connection.execute(
+                    "INSERT OR IGNORE INTO changes VALUES(?, 'run', ?)",
+                    (revision, str(run["id"])),
                 )
             if issues is not None:
                 connection.execute("DELETE FROM source_issues")
@@ -318,6 +752,14 @@ class StateDatabase:
                     "INSERT INTO source_issues(id, payload) VALUES(?, ?)",
                     ((str(issue["id"]), json.dumpb(issue)) for issue in issues),
                 )
+                connection.execute(
+                    "INSERT OR IGNORE INTO changes VALUES(?, 'source_issues', '*')",
+                    (revision,),
+                )
+            connection.execute(
+                "INSERT OR IGNORE INTO changes VALUES(?, 'global', 'state')", (revision,)
+            )
+            self._prune_changes(connection, revision)
 
         self._write_export(self.state_dir / "state.json", checkpoint)
         if issues is not None:
@@ -327,6 +769,33 @@ class StateDatabase:
                 "issues": issues,
             }
             self._write_export(self.state_dir / "source-issues.json", ledger, indent=True)
+
+    @staticmethod
+    def _next_revision(connection: sqlite3.Connection, updated_at: str) -> int:
+        row = connection.execute("SELECT revision FROM meta WHERE singleton=1").fetchone()
+        revision = (int(row[0]) if row is not None else 0) + 1
+        if row is None:
+            connection.execute(
+                """
+                INSERT INTO meta(
+                    singleton, schema_version, revision, created_at, updated_at,
+                    config_fingerprint
+                ) VALUES(1, ?, ?, ?, ?, '')
+                """,
+                (SCHEMA_VERSION, revision, updated_at, updated_at),
+            )
+        else:
+            connection.execute(
+                "UPDATE meta SET revision=?, updated_at=? WHERE singleton=1",
+                (revision, updated_at),
+            )
+        return revision
+
+    @staticmethod
+    def _prune_changes(connection: sqlite3.Connection, revision: int) -> None:
+        cutoff = revision - CHANGE_RETENTION
+        if cutoff > 0:
+            connection.execute("DELETE FROM changes WHERE revision <= ?", (cutoff,))
 
     @staticmethod
     def _write_export(path: Path, value: dict[str, Any], *, indent: bool = False) -> None:
