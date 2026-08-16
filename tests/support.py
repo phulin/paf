@@ -6,6 +6,9 @@ from paf.models import Stage
 def write_project(tmp_path: Path, *, chapters: str = "") -> Path:
     (tmp_path / "books").mkdir()
     (tmp_path / "prompts").mkdir()
+    (tmp_path / "lean").mkdir()
+    (tmp_path / "lean" / "lean-toolchain").write_text("leanprover/lean4:stable\n", encoding="utf-8")
+    (tmp_path / "lean" / "lakefile.toml").write_text('name = "test"\n', encoding="utf-8")
     (tmp_path / "books" / "book.md").write_text(
         "# Book\n\n## 1. First chapter\n\nText.\n\n## 2. Second chapter\n",
         encoding="utf-8",

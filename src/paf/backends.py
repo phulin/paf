@@ -4,6 +4,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 import tomllib
 from collections.abc import Iterable, Mapping, Sequence
@@ -28,6 +29,8 @@ class TargetBackend(Protocol):
 
     def diagnostic_counts(self, output: str) -> tuple[int, int]: ...
 
+    def prepare_project(self, root: Path, *, timeout_seconds: float) -> bool: ...
+
     def mcp_config(self, root: Path, stage: Stage) -> dict[str, Any]: ...
 
 
@@ -47,6 +50,7 @@ LEAN_MCP_PROOF_TOOLS = (
     "lean_code_actions",
 )
 LEAN_MCP_FIXUP_TOOLS = (*LEAN_MCP_BASE_TOOLS, "lean_completions", "lean_code_actions")
+LEAN_PROJECT_BOOTSTRAP_MARKER = ".paf-bootstrap-pending"
 
 
 def _module_component(value: str) -> str:
@@ -200,6 +204,110 @@ class LeanBackend:
 
     def diagnostic_counts(self, output: str) -> tuple[int, int]:
         return lean_diagnostic_counts(output)
+
+    def prepare_project(self, root: Path, *, timeout_seconds: float) -> bool:
+        """Create and resolve a default Mathlib Lake project when one is absent."""
+
+        if not self.mcp_enabled:
+            return False
+        project = (root / self.project).resolve()
+        marker = project / LEAN_PROJECT_BOOTSTRAP_MARKER
+        has_toolchain = (project / "lean-toolchain").is_file()
+        has_lakefile = (project / "lakefile.lean").is_file() or (
+            project / "lakefile.toml"
+        ).is_file()
+        if has_toolchain and has_lakefile and not marker.is_file():
+            return False
+
+        project.mkdir(parents=True, exist_ok=True)
+        marker.touch(exist_ok=True)
+        mcp_path = self._mcp_path()
+        lake = shutil.which("lake", path=mcp_path)
+        if lake is None:
+            raise ValueError(
+                f"cannot bootstrap Lean backend project '{project}': lake was not found on PATH"
+            )
+        environment = os.environ.copy()
+        environment["PATH"] = mcp_path
+        version_output = self._run_lake(
+            lake,
+            "--version",
+            project=project,
+            environment=environment,
+            timeout_seconds=timeout_seconds,
+        )
+        match = re.search(r"Lean version ([^)\s]+)", version_output)
+        if match is None:
+            raise ValueError(
+                f"cannot determine the Lean version while bootstrapping '{project}': "
+                f"{version_output.strip()}"
+            )
+        version = match.group(1)
+        if not has_toolchain:
+            (project / "lean-toolchain").write_text(
+                f"leanprover/lean4:v{version}\n", encoding="utf-8"
+            )
+        if not has_lakefile:
+            library = self.templates.module.split(".", 1)[0]
+            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_']*", library) is None:
+                library = "Formalization"
+            (project / "lakefile.toml").write_text(
+                "\n".join(
+                    (
+                        'name = "paf_formalization"',
+                        'version = "0.1.0"',
+                        f'defaultTargets = ["{library}"]',
+                        "",
+                        "[[require]]",
+                        'name = "mathlib"',
+                        'scope = "leanprover-community"',
+                        f'rev = "v{version}"',
+                        "",
+                        "[[lean_lib]]",
+                        f'name = "{library}"',
+                        "",
+                    )
+                ),
+                encoding="utf-8",
+            )
+        self._run_lake(
+            lake,
+            "update",
+            project=project,
+            environment=environment,
+            timeout_seconds=timeout_seconds,
+        )
+        marker.unlink(missing_ok=True)
+        return True
+
+    @staticmethod
+    def _run_lake(
+        lake: str,
+        argument: str,
+        *,
+        project: Path,
+        environment: Mapping[str, str],
+        timeout_seconds: float,
+    ) -> str:
+        try:
+            result = subprocess.run(
+                [lake, argument],
+                cwd=project,
+                env=environment,
+                capture_output=True,
+                text=True,
+                timeout=timeout_seconds,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise ValueError(
+                f"timed out bootstrapping Lean backend project '{project}' with lake {argument}"
+            ) from error
+        output = "\n".join(part.strip() for part in (result.stdout, result.stderr) if part.strip())
+        if result.returncode:
+            excerpt = output[-4000:] or f"lake {argument} exited with status {result.returncode}"
+            raise ValueError(f"cannot bootstrap Lean backend project '{project}': {excerpt}")
+        return output
 
     @staticmethod
     def _mcp_path() -> str:

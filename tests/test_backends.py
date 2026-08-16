@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import subprocess
 from pathlib import Path
 from typing import Any
 
+import pytest
 from rich.console import Console
 
+from paf.backends import LeanBackend
 from paf.cli import print_plan
 from paf.codex import CodexExecutor, ValidationResult
 from paf.config import load_config
@@ -71,6 +74,61 @@ def test_backend_templates_map_nested_mixed_sources_to_flat_targets(tmp_path: Pa
     assert tex.chapter_module == "Flat.Sources.Nested.Notes.U1"
     assert tex.scope == ("generated/targets/Unit01_notes.lean",)
     assert tex.build_command == "true"
+
+
+def test_backend_bootstraps_mathlib_project_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[tuple[list[str], Path]] = []
+
+    def run(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        calls.append((command, kwargs["cwd"]))
+        stdout = "Lake version test (Lean version 4.33.0-rc2)" if "--version" in command else ""
+        return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
+
+    monkeypatch.setattr("paf.backends.shutil.which", lambda *_args, **_kwargs: "/bin/lake")
+    monkeypatch.setattr("paf.backends.subprocess.run", run)
+    backend = LeanBackend()
+
+    assert backend.prepare_project(tmp_path, timeout_seconds=30)
+    project = tmp_path / "lean"
+    assert (project / "lean-toolchain").read_text(encoding="utf-8") == (
+        "leanprover/lean4:v4.33.0-rc2\n"
+    )
+    lakefile = (project / "lakefile.toml").read_text(encoding="utf-8")
+    assert 'rev = "v4.33.0-rc2"' in lakefile
+    assert 'name = "mathlib"' in lakefile
+    assert 'name = "Formalization"' in lakefile
+    assert calls == [
+        (["/bin/lake", "--version"], project),
+        (["/bin/lake", "update"], project),
+    ]
+
+    assert not backend.prepare_project(tmp_path, timeout_seconds=30)
+    assert len(calls) == 2
+
+
+def test_backend_retries_interrupted_bootstrap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = tmp_path / "lean"
+    project.mkdir()
+    (project / "lean-toolchain").write_text("leanprover/lean4:v4.33.0-rc2\n", encoding="utf-8")
+    (project / "lakefile.lean").write_text("package Paf\n", encoding="utf-8")
+    (project / ".paf-bootstrap-pending").touch()
+    commands: list[list[str]] = []
+
+    def run(command: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        commands.append(command)
+        stdout = "Lake version test (Lean version 4.33.0-rc2)" if "--version" in command else ""
+        return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
+
+    monkeypatch.setattr("paf.backends.shutil.which", lambda *_args, **_kwargs: "/bin/lake")
+    monkeypatch.setattr("paf.backends.subprocess.run", run)
+
+    assert LeanBackend().prepare_project(tmp_path, timeout_seconds=30)
+    assert commands[-1] == ["/bin/lake", "update"]
+    assert not (project / ".paf-bootstrap-pending").exists()
 
 
 def test_explicit_backend_mapping_overrides_arbitrary_layout(tmp_path: Path) -> None:

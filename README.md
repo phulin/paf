@@ -635,6 +635,11 @@ lean_project = "lean" # relative to swarm.repo; contains lakefile and lean-toolc
 lean_mcp_tool_timeout_seconds = 300
 ```
 
+When Lean MCP is enabled, orchestrator startup bootstraps `lean_project` if it does not already
+contain both `lean-toolchain` and a Lake file. PAF pins the active Lean version, creates a matching
+Mathlib dependency and Lean library, and runs `lake update` before starting any agents. Existing
+valid Lake projects are left unchanged. An interrupted bootstrap is retried on the next startup.
+
 Every stage automatically uses its packaged standard prompt and default retry bound. It inherits
 the swarm model and reasoning effort unless the stage has an override; discovery defaults to
 `gpt-5.6-luna` at `medium`. A stage table may override any of these settings independently:

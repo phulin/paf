@@ -24,6 +24,8 @@ lean_mcp_tool_timeout_seconds = 300
 # Templates may use document/source/unit fields.
 [backend]
 kind = "lean"
+# If this project is absent at startup, PAF creates a Mathlib Lake project here
+# and resolves its dependencies before starting agents.
 project = "lean"
 root = "lean/Formalization"
 module = "Formalization"

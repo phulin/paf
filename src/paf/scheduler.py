@@ -369,6 +369,12 @@ class Orchestrator:
         return scheduling_snapshot(self.statement_schedule, self.proof_schedule)
 
     async def prepare(self) -> None:
+        if self.config.backend is not None:
+            await asyncio.to_thread(
+                self.config.backend.prepare_project,
+                self.config.settings.repo,
+                timeout_seconds=self.config.settings.validation_timeout_seconds,
+            )
         await self.state.load_or_create()
         await self.state.requeue_interrupted(resume_agents=self.resume_agents)
         self.scaffold()
