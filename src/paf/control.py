@@ -21,6 +21,7 @@ SOCKET_NAME = "control.sock"
 PID_NAME = "daemon.pid"
 RESULT_NAME = "daemon-result.json"
 LOG_NAME = "daemon.log"
+DASHBOARD_FRAME_INTERVAL_SECONDS = 1 / 60
 
 
 def control_socket(state_dir: Path) -> Path:
@@ -250,11 +251,14 @@ class ControlServer:
                 globals_ = set(change.globals)
                 stages = set(change.stages)
                 full_resync = change.full_resync
-                # One terminal frame does not benefit from rendering every mutation in a
-                # scheduler burst. Coalesce only already-queued changes; this adds no timer or
-                # polling latency to the first update.
-                while not changes.empty():
-                    item = changes.get_nowait()
+                # Cap stream traffic at one update per terminal frame while retaining the
+                # trailing event in a burst. This is push debouncing, not state polling.
+                deadline = asyncio.get_running_loop().time() + DASHBOARD_FRAME_INTERVAL_SECONDS
+                while (remaining := deadline - asyncio.get_running_loop().time()) > 0:
+                    try:
+                        item = await asyncio.wait_for(changes.get(), remaining)
+                    except TimeoutError:
+                        break
                     work_units.update(item.work_units)
                     runs.update(item.runs)
                     globals_.update(item.globals)

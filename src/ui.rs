@@ -143,29 +143,33 @@ fn draw_stage_cards(frame: &mut Frame<'_>, model: &DashboardModel, area: Rect) {
         .constraints(STAGES.map(|_| Constraint::Ratio(1, 4)))
         .split(area);
     let targets = model.build_targets();
+    let mut statistics = [StageStatistics::default(); 4];
+    for task in model.state.tasks.values() {
+        let Some(index) = STAGES.iter().position(|stage| *stage == task.stage) else {
+            continue;
+        };
+        let current = &mut statistics[index];
+        match task.status.as_str() {
+            "succeeded" => current.succeeded += 1,
+            "failed" => current.failed += 1,
+            "blocked" => current.blocked += 1,
+            "interrupted" => current.interrupted += 1,
+            "pending" if task.queued => current.queued += 1,
+            "pending" => current.pending += 1,
+            _ => {}
+        }
+        if task.phase == "postprocess" && !targets.contains(task.work_unit_id.as_str()) {
+            current.postprocess += 1;
+        }
+        if model.state.coordinator_build.active
+            && model.state.coordinator_build.stage == task.stage
+            && targets.contains(task.work_unit_id.as_str())
+        {
+            current.building += 1;
+        }
+    }
     for (index, stage) in STAGES.iter().enumerate() {
-        let tasks: Vec<&Task> = model
-            .state
-            .tasks
-            .values()
-            .filter(|task| task.stage == *stage)
-            .collect();
-        let count = |status: &str| tasks.iter().filter(|task| task.status == status).count();
-        let queued = tasks.iter().filter(|task| task.queued).count();
-        let postprocess = tasks
-            .iter()
-            .filter(|task| {
-                task.phase == "postprocess" && !targets.contains(task.work_unit_id.as_str())
-            })
-            .count();
-        let building = tasks
-            .iter()
-            .filter(|task| {
-                model.state.coordinator_build.active
-                    && model.state.coordinator_build.stage == **stage
-                    && targets.contains(task.work_unit_id.as_str())
-            })
-            .count();
+        let statistics = statistics[index];
         let agents = model
             .state
             .agents
@@ -175,23 +179,28 @@ fn draw_stage_cards(frame: &mut Frame<'_>, model: &DashboardModel, area: Rect) {
             .unwrap_or_default();
         let content = vec![
             Line::from(format!(
-                "agent {agents} · post {postprocess} · build {building}"
+                "agent {agents} · post {} · build {}",
+                statistics.postprocess, statistics.building
             )),
             Line::from(vec![
                 Span::styled(
-                    format!("✓ {}", count("succeeded")),
+                    format!("✓ {}", statistics.succeeded),
                     Style::default().fg(GREEN),
                 ),
-                Span::styled(format!("  ✗ {}", count("failed")), Style::default().fg(RED)),
-                Span::raw(format!(
-                    "  · {}",
-                    count("pending") - queued.min(count("pending"))
-                )),
                 Span::styled(
-                    format!("  ! {}", count("blocked")),
+                    format!("  ✗ {}", statistics.failed),
+                    Style::default().fg(RED),
+                ),
+                Span::raw(format!("  · {}", statistics.pending)),
+                Span::styled(
+                    format!("  ! {}", statistics.blocked),
                     Style::default().fg(YELLOW),
                 ),
             ]),
+            Line::from(format!(
+                "queued {} · Ⅱ {}",
+                statistics.queued, statistics.interrupted
+            )),
         ];
         frame.render_widget(
             Paragraph::new(content).block(
@@ -207,6 +216,12 @@ fn draw_stage_cards(frame: &mut Frame<'_>, model: &DashboardModel, area: Rect) {
 
 fn draw_task_table(frame: &mut Frame<'_>, model: &DashboardModel, area: Rect) {
     let rows = model.rows();
+    let viewport = usize::from(area.height.saturating_sub(3).max(1));
+    let start = model
+        .selected
+        .saturating_sub(viewport / 2)
+        .min(rows.len().saturating_sub(viewport));
+    let end = (start + viewport).min(rows.len());
     let targets = model.build_targets();
     let critical: std::collections::HashSet<&str> = model
         .state
@@ -216,7 +231,7 @@ fn draw_task_table(frame: &mut Frame<'_>, model: &DashboardModel, area: Rect) {
         .iter()
         .map(String::as_str)
         .collect();
-    let rendered = rows.iter().map(|row| {
+    let rendered = rows[start..end].iter().map(|row| {
         let activity = row.activity(&model.state);
         let book = if critical.contains(row.unit.document_id.as_str()) {
             format!("★ {}", row.unit.document_id)
@@ -304,14 +319,27 @@ fn draw_task_table(frame: &mut Frame<'_>, model: &DashboardModel, area: Rect) {
         )
         .row_highlight_style(Style::default().bg(SURFACE).add_modifier(Modifier::BOLD))
         .highlight_symbol("▸ ")
-        .block(
-            Block::default()
-                .borders(Borders::TOP)
-                .title(format!(" Work units · {} ", rows.len())),
-        );
-    let mut state =
-        TableState::default().with_selected((!rows.is_empty()).then_some(model.selected));
+        .block(Block::default().borders(Borders::TOP).title(format!(
+            " Work units · {}-{} of {} ",
+            if rows.is_empty() { 0 } else { start + 1 },
+            end,
+            rows.len()
+        )));
+    let mut state = TableState::default()
+        .with_selected((!rows.is_empty()).then_some(model.selected.saturating_sub(start)));
     frame.render_stateful_widget(table, area, &mut state);
+}
+
+#[derive(Clone, Copy, Default)]
+struct StageStatistics {
+    succeeded: usize,
+    failed: usize,
+    pending: usize,
+    queued: usize,
+    blocked: usize,
+    interrupted: usize,
+    postprocess: usize,
+    building: usize,
 }
 
 fn draw_status(frame: &mut Frame<'_>, model: &DashboardModel, area: Rect) {
@@ -689,11 +717,13 @@ fn kind_color(kind: &str) -> Color {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
     use super::*;
-    use crate::model::{DashboardModel, WireEvent};
+    use crate::model::{DashboardModel, Task, WireEvent, WorkUnit};
 
     #[test]
     fn renders_dashboard_and_agent_detail() {
@@ -735,5 +765,47 @@ mod tests {
         let detail = terminal.backend().to_string();
         assert!(detail.contains("Agent detail"));
         assert!(detail.contains("[edit] success"));
+    }
+
+    #[test]
+    fn renders_a_ten_thousand_unit_viewport_without_materializing_table_rows() {
+        let mut model = DashboardModel::loading("scale test".into(), String::new());
+        for ordinal in 0..10_000 {
+            let id = format!("book/chapter-{ordinal:05}");
+            model.state.work_units.push(WorkUnit {
+                id: id.clone(),
+                document_id: "book".into(),
+                title: format!("Unit {ordinal}"),
+                ordinal,
+                source_start_line: ordinal,
+            });
+            for stage in STAGES {
+                model.state.tasks.insert(
+                    format!("{id}:{stage}"),
+                    Task {
+                        work_unit_id: id.clone(),
+                        document_id: "book".into(),
+                        ordinal,
+                        unit_title: format!("Unit {ordinal}"),
+                        stage: stage.into(),
+                        ..Task::default()
+                    },
+                );
+            }
+        }
+        model.selected = 9_999;
+        let backend = TestBackend::new(180, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        let started = Instant::now();
+        terminal.draw(|frame| draw(frame, &model)).unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "large draw took {elapsed:?}"
+        );
+        assert!(terminal.backend().to_string().contains("of 10000"));
+        eprintln!("10,000-unit dashboard draw: {elapsed:?}");
     }
 }

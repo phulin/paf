@@ -131,7 +131,6 @@ async def test_dashboard_subscription_pushes_snapshot_and_live_deltas(tmp_path: 
 
     # Activity notifications are push events even when no durable state revision changes.
     revision = delta["revision"]
-    await asyncio.sleep(0.11)
     activity.current = "proving the final goal"
     state.activities.save(activity)
     activity_event = await _read_stream_event(reader)

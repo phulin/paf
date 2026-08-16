@@ -712,7 +712,6 @@ class ActivityStore:
         self._cache: dict[str, AgentActivity] = {}
         self._last_saved: dict[str, float] = {}
         self._visible: dict[str, tuple[object, ...]] = {}
-        self._last_notification = 0.0
         self.on_visible_change = on_visible_change
 
     def path(self, run_id: str) -> Path:
@@ -788,10 +787,8 @@ class ActivityStore:
         if self._visible.get(activity.run_id) == visible:
             return
         self._visible[activity.run_id] = visible
-        now = time.monotonic()
-        if self.on_visible_change is None or now - self._last_notification < 0.1:
+        if self.on_visible_change is None:
             return
-        self._last_notification = now
         self.on_visible_change(activity)
 
     def get(self, run_id: str) -> AgentActivity | None:

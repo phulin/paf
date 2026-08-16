@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
-use serde_json::{Map, Value};
+use serde_json::Value;
 
 pub const STAGES: [&str; 4] = ["discover", "formalize", "review", "prove"];
 
@@ -178,10 +178,26 @@ pub struct WireEvent {
 pub struct DashboardDelta {
     pub revision: u64,
     pub resync_required: bool,
-    pub tasks: HashMap<String, Value>,
+    pub tasks: HashMap<String, Task>,
     pub removed_task_ids: Vec<String>,
-    pub globals: Map<String, Value>,
-    pub activities: HashMap<String, Value>,
+    pub globals: GlobalDelta,
+    pub activities: HashMap<String, Activity>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct GlobalDelta {
+    pub updated_at: Option<String>,
+    pub source: Option<String>,
+    pub invocation_usage: Option<Usage>,
+    pub usage: Option<Usage>,
+    pub invocation_cost: Option<Cost>,
+    pub cost: Option<Cost>,
+    pub agents: Option<Agents>,
+    pub coordinator_build: Option<CoordinatorBuild>,
+    pub scheduling: Option<Scheduling>,
+    pub isolation: Option<Isolation>,
+    pub formalize_graph: Option<Value>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -208,7 +224,6 @@ impl DetailTab {
 
 #[derive(Clone, Debug)]
 pub struct DashboardModel {
-    raw: Value,
     pub state: SwarmState,
     pub daemon_status: String,
     pub result: Option<bool>,
@@ -224,7 +239,6 @@ pub struct DashboardModel {
 impl DashboardModel {
     pub fn loading(label: String, startup_warning: String) -> Self {
         Self {
-            raw: Value::Object(Map::new()),
             state: SwarmState::default(),
             daemon_status: "connecting".into(),
             result: None,
@@ -250,8 +264,10 @@ impl DashboardModel {
         }
         match event.event.as_str() {
             "snapshot" => {
-                self.raw = event.snapshot.context("snapshot event has no snapshot")?;
-                self.decode()?;
+                self.state = serde_json::from_value(
+                    event.snapshot.context("snapshot event has no snapshot")?,
+                )
+                .context("invalid dashboard model")?;
             }
             "delta" => self.apply_delta(event.delta.context("delta event has no delta")?)?,
             "complete" => self.result = event.result,
@@ -261,37 +277,40 @@ impl DashboardModel {
         Ok(())
     }
 
-    fn decode(&mut self) -> Result<()> {
-        self.state = serde_json::from_value(self.raw.clone()).context("invalid dashboard model")?;
-        Ok(())
-    }
-
     fn apply_delta(&mut self, delta: DashboardDelta) -> Result<()> {
         if delta.resync_required {
             bail!("server requested a full dashboard resynchronization")
         }
-        let root = self
-            .raw
-            .as_object_mut()
-            .context("dashboard snapshot root is not an object")?;
-        root.extend(delta.globals);
-        root.insert("revision".into(), Value::from(delta.revision));
-        let tasks = root
-            .entry("tasks")
-            .or_insert_with(|| Value::Object(Map::new()))
-            .as_object_mut()
-            .context("dashboard tasks are not an object")?;
-        tasks.extend(delta.tasks);
+        self.state.revision = delta.revision;
+        self.state.tasks.extend(delta.tasks);
         for task_id in delta.removed_task_ids {
-            tasks.remove(&task_id);
+            self.state.tasks.remove(&task_id);
         }
-        let activities = root
-            .entry("activities")
-            .or_insert_with(|| Value::Object(Map::new()))
-            .as_object_mut()
-            .context("dashboard activities are not an object")?;
-        activities.extend(delta.activities);
-        self.decode()
+        self.state.activities.extend(delta.activities);
+        apply_optional(&mut self.state.updated_at, delta.globals.updated_at);
+        apply_optional(&mut self.state.source, delta.globals.source);
+        apply_optional(
+            &mut self.state.invocation_usage,
+            delta.globals.invocation_usage,
+        );
+        apply_optional(&mut self.state.usage, delta.globals.usage);
+        apply_optional(
+            &mut self.state.invocation_cost,
+            delta.globals.invocation_cost,
+        );
+        apply_optional(&mut self.state.cost, delta.globals.cost);
+        apply_optional(&mut self.state.agents, delta.globals.agents);
+        apply_optional(
+            &mut self.state.coordinator_build,
+            delta.globals.coordinator_build,
+        );
+        apply_optional(&mut self.state.scheduling, delta.globals.scheduling);
+        apply_optional(&mut self.state.isolation, delta.globals.isolation);
+        apply_optional(
+            &mut self.state.formalize_graph,
+            delta.globals.formalize_graph,
+        );
+        Ok(())
     }
 
     pub fn rows(&self) -> Vec<RowModel<'_>> {
@@ -302,24 +321,13 @@ impl DashboardModel {
                 .or_default()
                 .insert(task.stage.as_str(), task);
         }
-        let mut units: Vec<&WorkUnit> = self
-            .state
+        self.state
             .work_units
             .iter()
-            .filter(|unit| task_groups.contains_key(unit.id.as_str()))
-            .collect();
-        units.sort_by_key(|unit| {
-            self.state
-                .work_units
-                .iter()
-                .position(|candidate| candidate.id == unit.id)
-                .unwrap_or(usize::MAX)
-        });
-        units
-            .into_iter()
-            .map(|unit| RowModel {
-                unit,
-                tasks: task_groups.remove(unit.id.as_str()).unwrap_or_default(),
+            .filter_map(|unit| {
+                task_groups
+                    .remove(unit.id.as_str())
+                    .map(|tasks| RowModel { unit, tasks })
             })
             .collect()
     }
@@ -381,6 +389,12 @@ impl DashboardModel {
             targets.insert(current);
         }
         targets
+    }
+}
+
+fn apply_optional<T>(target: &mut T, value: Option<T>) {
+    if let Some(value) = value {
+        *target = value;
     }
 }
 
@@ -456,7 +470,11 @@ mod tests {
                     revision: 4,
                     activities: HashMap::from([(
                         "run-1".into(),
-                        serde_json::json!({"run_id": "run-1", "current": "checking goals"}),
+                        Activity {
+                            run_id: "run-1".into(),
+                            current: "checking goals".into(),
+                            ..Activity::default()
+                        },
                     )]),
                     ..DashboardDelta::default()
                 }),
