@@ -34,9 +34,7 @@ export function TaskTable({
     if (filter === "issues")
       return tasks.some(
         (task) =>
-          task?.status === "failed" ||
-          task?.status === "blocked" ||
-          task?.status === "interrupted",
+          task?.status === "failed" || task?.status === "blocked" || task?.status === "interrupted",
       );
     if (filter === "active") return tasks.some((task) => task?.status !== "succeeded");
     return true;
