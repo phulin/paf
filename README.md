@@ -532,7 +532,9 @@ stage, round, timestamps, scoped-change result, placeholder count, final report,
 usage. Lifecycle transitions await a durability ticket; high-frequency usage is coalesced for 500 ms.
 Each transaction advances a bounded revision/change feed used by status and web readers. The TUI
 subscribes to the same in-process changes and recomputes only affected rows and aggregate cards;
-repository hashing, JSON export, and database work run off its event loop. Task records persist one
+the web dashboard bootstraps once, then merges only changed work-unit rows, global projections, and
+bounded active-run activity. A stale web cursor or static corpus change requests one full resync.
+Repository hashing, JSON export, and database work run off the TUI event loop. Task records persist one
 status (`pending`, `running`, `succeeded`, `failed`, `blocked`, or `interrupted`) plus a short detail
 describing what
 a running or pending task is doing. A transient `queued` marker distinguishes runnable pending stages

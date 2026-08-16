@@ -9,7 +9,7 @@ from starlette.testclient import TestClient
 import paf.web as web_module
 from paf.cli import main
 from paf.config import load_config
-from paf.models import PipelineConfig
+from paf.models import PipelineConfig, Stage
 from paf.state import StateStore
 from tests.support import write_project
 
@@ -24,8 +24,10 @@ def static_dir(tmp_path: Path) -> Path:
     return root
 
 
-def _project(tmp_path: Path, *, external_state: Path | None = None):
-    config_path = write_project(tmp_path, chapters="chapters = [1]")
+def _project(
+    tmp_path: Path, *, external_state: Path | None = None, chapters: str = "chapters = [1]"
+):
+    config_path = write_project(tmp_path, chapters=chapters)
     if external_state is not None:
         config_path.write_text(
             config_path.read_text().replace(
@@ -93,6 +95,63 @@ def test_state_list_snapshot_and_system_contracts(tmp_path: Path, static_dir: Pa
         assert system["cpu_percent"] is None or 0 <= system["cpu_percent"] <= 100
         assert 0 <= system["memory_used_bytes"] <= system["memory_total_bytes"]
         assert 0 <= system["memory_percent"] <= 100
+
+
+def test_dashboard_changes_return_only_changed_rows_and_live_activity(
+    tmp_path: Path, static_dir: Path
+) -> None:
+    config = _project(tmp_path, chapters="chapters = [1, 2]")
+    state = StateStore(config)
+
+    async def populate() -> tuple[int, str]:
+        await state.load_or_create()
+        baseline = state.revision
+        run = await state.start_run(config.chapters[0].id, Stage.FORMALIZE)
+        activity = state.activities.start(run.id, run.chapter_id, run.stage)
+        activity.consume(
+            {
+                "type": "item.completed",
+                "item": {
+                    "id": "message",
+                    "type": "agent_message",
+                    "text": "working on the changed chapter",
+                },
+            },
+            workspace_root=tmp_path,
+        )
+        state.activities.save(activity)
+        return baseline, run.id
+
+    baseline, run_id = asyncio.run(populate())
+    with TestClient(web_module.create_app(config, static_dir=static_dir)) as client:
+        summary = client.get("/api/swarms").json()["swarms"][0]
+        assert summary["task_count"] == 8
+        swarm_id = summary["id"]
+        delta = client.get(
+            "/api/changes",
+            params={"swarm": swarm_id, "after": baseline, "view": "dashboard"},
+        ).json()
+
+        assert delta["resync_required"] is False
+        assert set(delta["tasks"]) == {f"{config.chapters[0].id}:{stage.value}" for stage in Stage}
+        assert delta["tasks"][f"{config.chapters[0].id}:formalize"]["status"] == "running"
+        assert delta["globals"]["agents"]["active"] == 1
+        assert delta["active_run_ids"] == [run_id]
+        assert delta["activities"][run_id]["latest_summary"] == ("working on the changed chapter")
+
+        unchanged = client.get(
+            "/api/changes",
+            params={"swarm": swarm_id, "after": delta["revision"], "view": "dashboard"},
+        ).json()
+        assert unchanged["tasks"] == {}
+        assert unchanged["globals"] == {}
+        assert unchanged["activities"][run_id]["latest_summary"]
+
+        future = client.get(
+            "/api/changes",
+            params={"swarm": swarm_id, "after": delta["revision"] + 1, "view": "dashboard"},
+        ).json()
+        assert future["resync_required"] is True
 
 
 def test_external_state_directory_is_the_only_state_root(tmp_path: Path, static_dir: Path) -> None:

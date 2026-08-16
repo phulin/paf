@@ -902,6 +902,8 @@ class StateStore:
                 changes.add(("global", "state"))
             if issues_dirty:
                 changes.add(("source_issues", "*"))
+            if static_dirty:
+                changes.add(("resync", "*"))
             write = DatabaseWrite(
                 updated_at=self.updated_at,
                 globals={"state": json.dumpb(self._global_snapshot())} if globals_dirty else {},

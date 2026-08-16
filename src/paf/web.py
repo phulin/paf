@@ -498,11 +498,33 @@ def create_app(
             return _json_error("after must be an integer revision", 400)
         database = StateDatabase(candidate.directory)
         if not database.path.is_file():
-            return JSONResponse(
-                {"revision": 0, "resync_required": True, "changes": []},
-                headers={"Cache-Control": "no-store"},
-            )
-        return JSONResponse(database.changes_since(after), headers={"Cache-Control": "no-store"})
+            result: dict[str, Any] = {
+                "revision": 0,
+                "resync_required": True,
+                "changes": [],
+            }
+        elif request.query_params.get("view") == "dashboard":
+            result = database.dashboard_delta(after)
+            run_ids = {
+                *result.get("run_ids", []),
+                *result.get("active_run_ids", []),
+            }
+            tasks = result.get("tasks", {})
+            if isinstance(tasks, dict):
+                run_ids.update(
+                    run_id
+                    for task in tasks.values()
+                    if isinstance(task, dict)
+                    and isinstance((run_id := task.get("latest_run_id")), str)
+                )
+            result["activities"] = {
+                run_id: activity
+                for run_id in sorted(run_ids)
+                if (activity := _activity(candidate, run_id)) is not None
+            }
+        else:
+            result = database.changes_since(after)
+        return JSONResponse(result, headers={"Cache-Control": "no-store"})
 
     async def system(_request: Request) -> Response:
         used, total = _memory()

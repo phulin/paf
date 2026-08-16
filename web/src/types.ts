@@ -70,6 +70,22 @@ export interface SwarmState {
   activities?: Record<string, AgentActivity>;
 }
 
+export interface DashboardDelta {
+  revision: number;
+  resync_required: boolean;
+  changes: Array<{
+    revision: number;
+    entity_type: string;
+    entity_id: string;
+  }>;
+  tasks: Record<string, Task>;
+  removed_task_ids: string[];
+  globals: Partial<Omit<SwarmState, "tasks" | "activities">>;
+  run_ids: string[];
+  active_run_ids: string[];
+  activities: Record<string, AgentActivity>;
+}
+
 export interface SwarmSummary {
   id: string;
   revision: number;

@@ -819,7 +819,7 @@ class StateDatabase:
             current = int(current_row[0]) if current_row is not None else 0
             oldest_row = connection.execute("SELECT min(revision) FROM changes").fetchone()
             oldest = int(oldest_row[0]) if oldest_row and oldest_row[0] is not None else current
-            if revision < oldest - 1:
+            if revision > current or revision < oldest - 1:
                 return {"revision": current, "resync_required": True, "changes": []}
             rows = connection.execute(
                 """
@@ -828,13 +828,127 @@ class StateDatabase:
                 """,
                 (revision,),
             ).fetchall()
+        changes = [
+            {
+                "revision": int(item[0]),
+                "entity_type": str(item[1]),
+                "entity_id": str(item[2]),
+            }
+            for item in rows
+        ]
+        return {
+            "revision": current,
+            "resync_required": any(change["entity_type"] == "resync" for change in changes),
+            "changes": changes,
+        }
+
+    def dashboard_delta(self, revision: int) -> dict[str, Any]:
+        """Load changed dashboard projections from one consistent read transaction."""
+
+        with _connect(self.path) as connection:
+            connection.execute("BEGIN")
+            current_row = connection.execute(
+                "SELECT revision, updated_at FROM meta WHERE singleton=1"
+            ).fetchone()
+            current = int(current_row[0]) if current_row is not None else 0
+            oldest_row = connection.execute("SELECT min(revision) FROM changes").fetchone()
+            oldest = int(oldest_row[0]) if oldest_row and oldest_row[0] is not None else current
+            if revision > current or revision < oldest - 1:
+                return {
+                    "revision": current,
+                    "resync_required": True,
+                    "changes": [],
+                    "tasks": {},
+                    "removed_task_ids": [],
+                    "globals": {},
+                    "run_ids": [],
+                    "active_run_ids": [],
+                }
+            rows = connection.execute(
+                """
+                SELECT revision, entity_type, entity_id
+                FROM changes WHERE revision > ? ORDER BY revision, entity_type, entity_id
+                """,
+                (revision,),
+            ).fetchall()
+            changes = [
+                {
+                    "revision": int(item[0]),
+                    "entity_type": str(item[1]),
+                    "entity_id": str(item[2]),
+                }
+                for item in rows
+            ]
+            if any(change["entity_type"] == "resync" for change in changes):
+                return {
+                    "revision": current,
+                    "resync_required": True,
+                    "changes": changes,
+                    "tasks": {},
+                    "removed_task_ids": [],
+                    "globals": {},
+                    "run_ids": [],
+                    "active_run_ids": [],
+                }
+
+            task_keys = sorted(
+                {str(change["entity_id"]) for change in changes if change["entity_type"] == "task"}
+            )
+            work_unit_ids = sorted(
+                {
+                    str(change["entity_id"])
+                    for change in changes
+                    if change["entity_type"] == "work_unit"
+                }
+            )
+            clauses: list[str] = []
+            parameters: list[str] = []
+            if task_keys:
+                clauses.append(f"task_key IN ({','.join('?' for _ in task_keys)})")
+                parameters.extend(task_keys)
+            if work_unit_ids:
+                clauses.append(f"work_unit_id IN ({','.join('?' for _ in work_unit_ids)})")
+                parameters.extend(work_unit_ids)
+            task_rows = (
+                connection.execute(
+                    f"SELECT task_key, payload FROM tasks WHERE {' OR '.join(clauses)}",
+                    parameters,
+                ).fetchall()
+                if clauses
+                else []
+            )
+            tasks = {str(key): json.loads(payload) for key, payload in task_rows}
+            globals_: dict[str, Any] = {}
+            if any(change["entity_type"] == "global" for change in changes):
+                global_row = connection.execute(
+                    "SELECT payload FROM globals WHERE key='state'"
+                ).fetchone()
+                if global_row is not None:
+                    value = json.loads(global_row[0])
+                    if not isinstance(value, dict):
+                        raise ValueError(f"invalid global state in {self.path}")
+                    globals_ = dict(value)
+                    globals_["revision"] = current
+                    if current_row is not None:
+                        globals_["updated_at"] = str(current_row[1])
+            active_run_ids = [
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT id FROM runs WHERE status='running' ORDER BY started_at, id"
+                )
+            ]
+        loaded_task_keys = set(tasks)
         return {
             "revision": current,
             "resync_required": False,
-            "changes": [
-                {"revision": int(item[0]), "entity_type": str(item[1]), "entity_id": str(item[2])}
-                for item in rows
-            ],
+            "changes": changes,
+            "tasks": tasks,
+            "removed_task_ids": sorted(set(task_keys).difference(loaded_task_keys)),
+            "globals": globals_,
+            "run_ids": sorted(
+                {str(change["entity_id"]) for change in changes if change["entity_type"] == "run"}
+            ),
+            "active_run_ids": active_run_ids,
         }
 
     def load(self) -> tuple[dict[str, Any] | None, list[dict[str, Any]], list[dict[str, Any]]]:
