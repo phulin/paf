@@ -8,12 +8,19 @@ from pathlib import Path
 from typing import Any
 from weakref import WeakKeyDictionary
 
-from lean_lsp_mcp import main as upstream_main
-from lean_lsp_mcp import server
-from lean_lsp_mcp.client_utils import open_synced
 from leanclient.aio import AsyncLeanLSPClient, LeanClientError
 from mcp.server.fastmcp import Context
+from mcp.server.fastmcp.server import Settings as FastMCPSettings
 from mcp.types import ToolAnnotations
+
+# pydantic-settings 2.15 detects the forward reference to FastMCP in the MCP
+# SDK's generic settings model.  Rebuild it after its module has finished
+# defining FastMCP, but before lean-lsp-mcp constructs its server at import time.
+FastMCPSettings.model_rebuild()
+
+from lean_lsp_mcp import main as upstream_main  # noqa: E402
+from lean_lsp_mcp import server  # noqa: E402
+from lean_lsp_mcp.client_utils import open_synced  # noqa: E402
 
 Reload = Callable[[AsyncLeanLSPClient, str, bool], Awaitable[Any]]
 Barrier = Callable[[AsyncLeanLSPClient, str, float | None], Awaitable[None]]
