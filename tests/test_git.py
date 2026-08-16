@@ -121,7 +121,6 @@ def agent_result(summary: str) -> AgentResult:
             "complete": True,
             "summary": summary,
             "issues": [],
-            "fixup_findings": [],
             "source_issues": [],
         },
     )

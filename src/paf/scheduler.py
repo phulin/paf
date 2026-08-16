@@ -43,9 +43,9 @@ from paf.state import (
 )
 
 
-async def _gather_cancel_on_error(
-    operations: Iterable[Coroutine[Any, Any, bool]],
-) -> list[bool]:
+async def _gather_cancel_on_error[T](
+    operations: Iterable[Coroutine[Any, Any, T]],
+) -> list[T]:
     """Cancel and drain sibling operations when any one raises."""
 
     tasks = [asyncio.create_task(operation) for operation in operations]
@@ -92,7 +92,6 @@ class FormalizeOutcome:
 class ReviewOutcome:
     succeeded: bool
     changed: bool
-    feedback_by_owner: dict[str, str]
     complete: bool = True
     run_id: str = ""
 
@@ -851,9 +850,14 @@ class Orchestrator:
             if source_held:
                 self.source_lock.release()
                 source_held = False
-            if isolated.accepted and agent.changed and stage in (
-                Stage.FORMALIZE,
-                Stage.REVIEW,
+            if (
+                isolated.accepted
+                and agent.changed
+                and stage
+                in (
+                    Stage.FORMALIZE,
+                    Stage.REVIEW,
+                )
             ):
                 invalidated_builds = await self._invalidate_build_records((chapter.id,))
                 if stage is Stage.REVIEW or auxiliary:
@@ -1630,52 +1634,36 @@ class Orchestrator:
             )
         return succeeded
 
-    def _route_review_findings(
-        self,
-        chapter: WorkUnitLike,
-        report: dict[str, Any],
-    ) -> dict[str, str]:
-        """Route structured review findings to the chapters owning their requested edit paths."""
+    @staticmethod
+    def _failed_attempt_feedback(report: dict[str, Any]) -> str:
+        """Render structured proof failures for an independent chapter review."""
 
-        routed: dict[str, dict[str, None]] = {}
-        findings = report.get("fixup_findings")
-        if isinstance(findings, list):
-            for finding in findings:
-                if not isinstance(finding, dict):
-                    continue
-                description = finding.get("description")
-                paths = finding.get("owner_paths")
-                if not isinstance(description, str) or not description.strip():
-                    continue
-                if not isinstance(paths, list):
-                    paths = []
-                owner_paths = tuple(
-                    path for path in paths if isinstance(path, str) and path.strip()
-                )
-                paths_by_owner: dict[str, dict[str, None]] = {}
-                for path in owner_paths:
-                    owners = self._path_owner_ids(path)
-                    # Preserve compatibility with repository-wide findings that cannot be assigned
-                    # from a chapter scope. The reviewing chapter will retain them as blockers.
-                    if not owners:
-                        owners = (chapter.id,)
-                    for owner in owners:
-                        paths_by_owner.setdefault(owner, {})[path] = None
-                if not paths_by_owner:
-                    paths_by_owner[chapter.id] = {}
-                for owner, owned_paths in paths_by_owner.items():
-                    paths_block = "\n".join(f"- `{path}`" for path in owned_paths)
-                    block = (
-                        f"Review finding reported while auditing `{chapter.id}`:\n"
-                        f"{description.strip()}"
-                    )
-                    if paths_block:
-                        block += f"\nRequested edit paths owned by `{owner}`:\n{paths_block}"
-                    routed.setdefault(owner, {})[block] = None
-
-        if routed:
-            return {owner: "\n\n".join(blocks) for owner, blocks in routed.items()}
-        return {}
+        raw_attempts = report.get("failed_attempts")
+        if not isinstance(raw_attempts, list):
+            return ""
+        blocks: list[str] = []
+        for raw in raw_attempts:
+            if not isinstance(raw, dict):
+                continue
+            path = str(raw.get("path", "")).strip()
+            declaration = str(raw.get("declaration", "")).strip()
+            remaining_goal = str(raw.get("remaining_goal", "")).strip()
+            obstruction = str(raw.get("obstruction", "")).strip()
+            attempts = raw.get("attempts")
+            checked = (
+                [str(item).strip() for item in attempts if str(item).strip()]
+                if isinstance(attempts, list)
+                else []
+            )
+            if not (path and declaration and remaining_goal and obstruction and checked):
+                continue
+            blocks.append(
+                f"Failed proof `{declaration}` in `{path}`:\n"
+                + "Checked attempts:\n"
+                + "\n".join(f"- {item}" for item in checked)
+                + f"\nRemaining goal:\n{remaining_goal}\nObserved obstruction:\n{obstruction}"
+            )
+        return "\n\n".join(blocks)
 
     def _proof_review_feedback(
         self,
@@ -1699,24 +1687,22 @@ class Orchestrator:
         *,
         origin_run_id: str,
     ) -> set[str]:
-        """Durably hand proof findings to full-scope statement reviews."""
+        """Durably hand failed proof evidence to a full-scope chapter review."""
 
-        routed = self._route_review_findings(chapter, report)
-        if not routed:
+        attempt_feedback = self._failed_attempt_feedback(report)
+        if not attempt_feedback:
             return set()
-        origin_blocks = tuple(dict.fromkeys(routed.values()))
-        origin_feedback = (
-            f"Proof of `{chapter.id}` failed with possible statement or interface defects. "
-            "Evaluate these findings while re-reviewing the complete assigned scope:\n\n"
-            + "\n\n".join(origin_blocks)
-        )
-        feedback = dict(routed)
-        feedback[chapter.id] = origin_feedback
+        feedback = {
+            chapter.id: (
+                f"Proof work in `{chapter.id}` left checked failures. Evaluate this evidence while "
+                "re-reviewing the complete assigned scope:\n\n" + attempt_feedback
+            )
+        }
         _, created = await self.state.enqueue_proof_review_request(
             feedback,
             origin_run_id=origin_run_id,
         )
-        targets = {chapter.id, *routed}
+        targets = {chapter.id}
         if not created:
             return targets
         invalidated_reviews = await self._invalidate_reviews(
@@ -1814,7 +1800,7 @@ class Orchestrator:
             run = proof_runs[-1]
             self.state.load_run_details(run)
             report = run.report if isinstance(run.report, dict) else {}
-            if not report.get("fixup_findings") or run.id in persisted_origins:
+            if not report.get("failed_attempts") or run.id in persisted_origins:
                 continue
             review_runs = self.state.task(chapter.id, Stage.REVIEW).runs
             reviewed_after = any(
@@ -2322,8 +2308,7 @@ class Orchestrator:
                 succeeded = {
                     chapter_id
                     for chapter_id in by_id
-                    if self.state.task(chapter_id, Stage.FORMALIZE).status
-                    == TaskStatus.SUCCEEDED
+                    if self.state.task(chapter_id, Stage.FORMALIZE).status == TaskStatus.SUCCEEDED
                 }
                 for chapter_id in graph.order:
                     if (
@@ -2402,7 +2387,7 @@ class Orchestrator:
         feedback: str = "",
     ) -> ReviewOutcome:
         if not rerun and self._already_done(chapter, Stage.REVIEW):
-            return ReviewOutcome(True, False, {}, complete=True)
+            return ReviewOutcome(True, False, complete=True)
         attempt = await self._attempt(
             chapter,
             Stage.REVIEW,
@@ -2423,14 +2408,12 @@ class Orchestrator:
             return ReviewOutcome(
                 False,
                 attempt.agent.changed,
-                {},
                 complete=False,
                 run_id=attempt.run.id,
             )
         succeeded = attempt.agent.succeeded and attempt.validation.succeeded
         complete = bool(attempt.agent.report.get("complete"))
-        routed = self._route_review_findings(chapter, attempt.agent.report)
-        if succeeded and complete and not routed:
+        if succeeded and complete:
             if attempt.agent.changed:
                 await self.state.set_task(
                     chapter.id,
@@ -2441,21 +2424,18 @@ class Orchestrator:
             return ReviewOutcome(
                 True,
                 attempt.agent.changed,
-                {},
                 complete=True,
                 run_id=attempt.run.id,
             )
-        detail = "review left follow-up findings" if routed else "editing review failed"
         await self.state.set_task(
             chapter.id,
             Stage.REVIEW,
             TaskStatus.FAILED,
-            detail,
+            "editing review failed",
         )
         return ReviewOutcome(
             succeeded,
             attempt.agent.changed,
-            routed,
             complete=complete,
             run_id=attempt.run.id,
         )
@@ -2640,15 +2620,6 @@ class Orchestrator:
             review_feedback = ""
             if not outcome.succeeded:
                 return False
-            findings_by_owner: dict[str, dict[str, None]] = {}
-            for owner, feedback in outcome.feedback_by_owner.items():
-                findings_by_owner.setdefault(owner, {})[feedback] = None
-            findings = {owner: "\n\n".join(blocks) for owner, blocks in findings_by_owner.items()}
-            if findings and not await route_feedback(
-                findings,
-                origin=f"review:{outcome.run_id or uuid4().hex[:12]}",
-            ):
-                return False
             build_feedback: dict[str, str] = {}
             if outcome.changed:
                 build_feedback = await self._review_build(chapter)
@@ -2668,7 +2639,7 @@ class Orchestrator:
                     return False
                 continue
             if not outcome.complete:
-                if not outcome.changed and not findings and not build_feedback:
+                if not outcome.changed and not build_feedback:
                     await self.state.set_task(
                         chapter.id,
                         Stage.REVIEW,
@@ -3107,7 +3078,7 @@ class Orchestrator:
                     proof_task = self.state.task(chapter_id, Stage.PROVE)
                     primary_runs = [run for run in proof_task.runs if not run.auxiliary]
                     report = primary_runs[-1].report if primary_runs else None
-                    if not isinstance(report, dict) or not report.get("fixup_findings"):
+                    if not isinstance(report, dict) or not report.get("failed_attempts"):
                         proof_results[chapter_id] = False
                         continue
                     if proof_reviews[chapter_id] >= self.config.stages[Stage.REVIEW].max_rounds:
@@ -3398,12 +3369,12 @@ class Orchestrator:
                 attempt.agent.report,
                 previous_attempts=feedback,
             )
-            if bool(attempt.agent.report.get("fixup_findings")):
+            if bool(attempt.agent.report.get("failed_attempts")):
                 await self.state.set_task(
                     chapter.id,
                     Stage.PROVE,
                     TaskStatus.PENDING,
-                    "proof reported a possible statement issue; waiting for targeted review",
+                    "proof left checked failures; waiting for independent review",
                 )
                 if not defer_review:
                     await self._queue_proof_review(

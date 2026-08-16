@@ -1,24 +1,43 @@
 # Discover source dependencies: {book_title}, chapter {chapter_number}
 
-## Mission
+## Goal
 
-Read chapter {chapter_number}, “{chapter_title},” in `{source}` from its source span through the end
-of the assigned input node. Build the direct source dependency tree needed to formalize this chapter.
-This is source analysis, not target-code import discovery.
+Determine which earlier chapters this chapter directly needs. Read chapter {chapter_number},
+“{chapter_title},” in `{source}` from the start of its assigned span to the end. Return the ids of its
+direct prerequisites so PAF can process the chapters in the right order.
+
+This stage only studies the book source. It does not write Lean code, inspect generated Lean imports,
+or edit any files.
 
 ## Workflow
 
-1. Inventory the definitions, constructions, hypotheses, and named results introduced by this input.
-2. Trace each item to the earlier input nodes whose mathematical content it directly requires.
-3. Compare those prerequisites with the work-unit ids in the runtime input catalog.
-4. Return the minimal direct prerequisite ids in `source_dependencies`. Omit transitive ancestors and
-   incidental citations. Preserve configured dependencies even when the source is terse.
-5. Summarize the dependency tree and any ambiguous source references in the report.
+1. Read the complete assigned source span.
+2. List the definitions, constructions, assumptions, and named results introduced in this chapter.
+3. For each item, identify the earlier chapters whose mathematical content it directly uses.
+4. Match those chapters to ids in the input catalog supplied below.
+5. Return those ids in `source_dependencies`, and briefly explain the dependency relationships and
+   any ambiguous references in the report.
 
-Do not inspect generated Lean imports to infer source dependencies. Do not create or edit files, run
-Lean, or attempt formalization.
+## Guardrails
+
+A direct prerequisite is one this chapter actually uses, not merely one that an earlier prerequisite
+uses. Do not include those indirect ancestors or incidental citations. Keep dependencies explicitly
+provided by the project even when the book leaves them implicit.
+
+Do not infer dependencies from chapter numbers or from Lean `import` lines. Do not create or edit
+files, run Lean, or attempt any formalization.
 
 ## Definition of done
 
-The complete assigned source span has been inspected and every direct cross-input prerequisite is
-represented by a valid catalog id. Set `complete` to `true` only then. Set `changed` to `false`.
+The full source span has been inspected, and every direct prerequisite is represented by a valid
+catalog id. Set `complete` to `true` only then.
+
+## Output format
+
+Return the structured report once, after the analysis is finished. Use only these fields:
+
+- `complete`: `true` only when the definition of done is met.
+- `summary`: a short explanation of the direct dependency relationships.
+- `issues`: unresolved ambiguities or source-access problems; otherwise an empty list.
+- `source_dependencies`: the direct prerequisite chapter ids from the supplied catalog. Do not
+  include this chapter, indirect prerequisites, Lean imports, or guesses based on chapter numbering.

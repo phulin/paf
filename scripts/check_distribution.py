@@ -16,7 +16,6 @@ PROMPTS = {
     "proof_review.md",
     "prove.md",
     "review.md",
-    "upstream_repair.md",
 }
 
 

@@ -1,90 +1,89 @@
-# Proof implementation: {book_title}, chapter {chapter_number}
+# Prove theorems: {book_title}, chapter {chapter_number}
 
-## Mission
+## Goal
 
-Replace every mathematically sound `sorry` or `admit` placeholder you can reach with a
-kernel-checked proof. This is an implementation task, not a chapter audit: spend the attempt
-constructing and testing proofs, not merely inventorying obstacles. Be tenacious. A difficult proof
-is the work of this stage, not by itself a reason to leave the placeholder unresolved.
+Replace as many `sorry` or `admit` placeholders as possible with proofs that Lean checks. Spend the
+attempt constructing, testing, and improving proofs. A difficult proof is the work of this stage, not
+by itself a reason to stop.
 
-## Immutable constraints
-
-Existing statements are immutable during this pass. Do not change declaration kinds, names,
-namespaces, binders, hypotheses, result types, attributes, or section behavior to make a proof easier.
-Do not change the bodies of existing definitions, structures, or instances. You may edit proof bodies,
-add focused imports required by a valid proof, and add proved helper declarations under the common
-import policy.
+Do not change theorem statements or existing definitions to make proofs easier. You may change proof
+bodies, add focused imports, and add fully proved helper lemmas when they are genuinely needed.
 
 ## Workflow
 
-1. Locate the unresolved placeholders from the supplied assigned source and use the supplied imports
-   to order their files from prerequisites to dependents. Before editing a proof, use the native
-   `update_plan` tool to create an authoritative checklist with one item for every file that contains work
-   for this attempt, in that dependency order, followed by a final edited-closure diagnostic item.
-   Keep exactly one file in progress and do not keep this checklist only in prose or a scratch file.
-2. Work through the file checklist in order. For the active file, record its unresolved declaration
-   names in the plan item, then read each proof's surrounding declaration and the relevant part of
-   chapter {chapter_number} in `{source}`. Do not read the complete book or unrelated assigned files
-   unless a target genuinely requires that context. If proof work requires an additional assigned
-   helper file, add it to the checklist at its dependency-correct position before editing it.
-3. Use the informal chapter's proof as the default mathematical plan. Translate its intermediate
-   constructions and reductions into Lean whenever they are sound and compatible with pinned APIs.
-   Depart materially from that plan only when Lean's library structure makes another proof
-   substantially clearer or the informal argument omits a necessary step; record the reason.
-4. Within the active file, choose a tractable or prerequisite placeholder and work on it concretely.
-   Confirm exact theorem signatures from source, try candidate terms or tactics, inspect the
-   resulting goal, and iterate.
-5. Prove intermediate facts when the final result does not yield directly. You may add focused
-   local or private helper lemmas in the assigned files, derive a reusable missing lemma at the
-   earliest chronologically valid location in scope, and refactor the target proof around those
-   stepping stones. Every added helper must itself be proved and used; do not add new placeholders.
-6. Keep every clean proof and mathematically reusable helper even when another placeholder remains.
-   Do not create cosmetic edits or unused scaffolding solely to register a change.
-7. Stay with a plausible target through elaboration failures and incomplete proof states. Inspect
-   the exact residual goals, search declarations and existing uses, simplify the target into helper
-   lemmas, and try several materially different proof shapes. A guessed theorem name, a failed
-   tactic, or one unsuccessful approach is only evidence for the next experiment.
-8. Give up on a target only after sustained concrete effort with multiple checked experiments that
-   expose the same hard obstruction, or when you have a specific mathematical argument that the
-   statement is false or cannot follow from its assumptions. When one target has genuinely reached
-   that point, preserve the useful work and continue to independent placeholders.
-9. Mark the active file complete only after every placeholder in it is either proved or has received
-   the sustained concrete attempt and precise reporting required below. Then advance to the next
-   file; never check off files out of order or batch-complete unvisited files.
-10. After every file is checked off, diagnose edited files and affected dependents as needed and
-    check off the final diagnostic item. Do not spend time running final diagnostics on untouched
-    files, whose incoming build is already certified clean. Before finishing, revert any speculative
-    proof edit that has not reached clean diagnostics; every retained proof or helper must be
-    kernel-checked.
+1. Find every unresolved placeholder in the assigned files and order those files from prerequisites
+   to dependents using their imports. Use `update_plan` to create one checklist item for each file that
+   contains work, in that order, followed by a final diagnostic check. Keep exactly one item in
+   progress.
+2. For the active file, add the unresolved declaration names to its checklist item. Read each
+   declaration, its surrounding code, and the relevant part of chapter {chapter_number} in `{source}`.
+3. Use the book's informal proof as the default mathematical plan. Search earlier project chapters
+   and the project's Mathlib version for the definitions and lemmas that carry out each step. Search
+   by concept and type signature, inspect existing uses, and confirm exact theorem signatures before
+   relying on them.
+4. Choose a tractable placeholder or one needed by later proofs. Try a concrete proof term or tactic,
+   inspect the resulting goals, and iterate. Prefer, in order, direct computation, an exact earlier
+   theorem, focused rewriting or simplification, a standard constructor or equivalence, and only then
+   lower-level implementation details.
+5. When the final result does not follow directly, prove smaller intermediate facts. Add a local,
+   private, or reusable helper only when existing APIs do not already provide it. Every new helper must
+   be proved, used, and placed at the earliest valid point in the assigned files.
+6. Stay with a plausible proof through several meaningfully different checked attempts. Search for a
+   different earlier result, unfold the local definition, prove a focused helper, construct the object
+   directly, or change the tactic structure. One guessed name or failed tactic is not enough reason to
+   stop.
+7. If repeated concrete attempts expose the same obstruction, preserve every clean proof and useful
+   helper, record the exact remaining goal and attempts, and continue with independent placeholders.
+8. Complete each file before moving to the next. After all files have been visited, check every edited
+   file and the assigned files that depend on it. Remove or revert any speculative edit that does not
+   pass diagnostics; every retained proof and helper must be accepted by Lean.
 
-Prefer, in order, definitional equality, an exact earlier theorem, focused rewriting or
-simplification, a canonical constructor or equivalence, and only then unfolded infrastructure.
+## Guardrails
 
-## Genuine statement and upstream obstructions
+Existing declaration interfaces are fixed during this stage. Do not change declaration kinds, names,
+namespaces, arguments, hypotheses, result types, attributes, section behavior, or the bodies of
+existing definitions, structures, and instances.
 
-Report issues with other chapters ONLY if you find a false statement in that chapter, or if you
-determine the chapter has incorrectly formalized the textbook. A theorem that you wish existed is
-not a reportable issue.
+Do not add a helper merely because it would be convenient. First search Mathlib and earlier chapters,
+and reuse an existing result whenever it provides the required mathematics. Do not add placeholders,
+axioms, unsafe declarations, or unused scaffolding.
 
-If a target is inaccurate or cannot follow from its assumptions, leave its statement and placeholder
-unchanged and report a precise statement/API fixup request in `fixup_findings`, including every exact
-repository-relative Lean path that must be edited. Likewise, if sustained proof work establishes
-that the proof genuinely requires a missing earlier LastLib interface which cannot be added within
-scope, record a dedicated `upstream_requests` entry rather than a `fixup_findings` entry. Name the
-blocked declaration and consumer path, preserve the exact residual goal, state the minimal reusable
-result needed, propose its earlier owner chapter and files, and summarize at least two materially
-different checked alternatives. Then continue proving every independent declaration in the assigned
-scope. A failed search, guessed theorem name, tactic failure, coercion error, timeout, unfinished
-proof, or difficulty finding a library lemma alone is not evidence that an upstream request is
-warranted or that the proof is impossible.
+Report a problem with a statement only when you have concrete mathematical evidence that it is false,
+does not match the book, or cannot follow from its assumptions. A failed search, unknown theorem name,
+tactic failure, coercion error, timeout, or unfinished proof is not enough evidence.
+
+If an assigned statement really must change, leave it unchanged and record the evidence with the
+failed attempt. If the proof needs a specific reusable result that belongs in an earlier chapter and
+cannot be added here, use `upstream_requests`. Include the blocked
+declaration, file, remaining Lean goal, smallest needed result, proposed earlier owner and paths, and
+at least two meaningfully different attempts. Continue proving independent declarations.
 
 ## Definition of done
 
-All provable placeholders have been replaced by kernel-checked proofs. Every remaining placeholder is
-identified as an ordinary unresolved proof, a consumer statement/interface obstruction in
-`fixup_findings`, or a concrete earlier-interface obstruction in `upstream_requests`. For each
-ordinary unresolved proof, add an `issues` entry containing its exact path and declaration, the
-several materially different candidate terms, tactics, helper lemmas, or reductions tried in this
-attempt, and the residual goal or recurring obstruction. A thin attempt does not become acceptable
-merely by documenting it. Never put a required source edit in `issues`. Set `complete` to `true` only
+All placeholders that this attempt can prove have been replaced by Lean-checked proofs. For each
+remaining proof, report its checked attempts and exact residual goal. Set `complete` to `true` only
 when no placeholder remains.
+
+## Output format
+
+Return the structured report once, after tool use and edits have stopped. It must describe the stable
+files on disk, not planned work. Use only these fields:
+
+- `changed`: `true` exactly when an allowed edit remains.
+- `complete`: `true` only when no placeholder remains.
+- `summary`: when files changed, concise past-tense prose naming the proved declarations and important
+  helpers, suitable for a commit body; otherwise, why no edit was retained.
+- `issues`: tooling, diagnostic, or out-of-scope problems that are not individual proof attempts;
+  otherwise an empty list.
+- `source_issues`: genuine defects in the informal textbook; otherwise an empty list. Each entry must
+  give `location`, an exact identifying `source_excerpt`, a mathematical `description`, and the
+  smallest `suggested_correction`. Do not use this field for an ordinary failed proof or missing Lean
+  interface.
+- `failed_attempts`: every unresolved assigned proof; otherwise an empty list. Each entry must give
+  its repository-relative `path`, fully qualified `declaration`, at least two meaningfully different
+  checked `attempts`, exact `remaining_goal`, and concrete `obstruction`. State suspected statement or
+  interface problems as evidence, not conclusions; PAF sends these entries to an independent review.
+- `upstream_requests`: only missing reusable results that belong in an earlier chapter; otherwise an
+  empty list. Each entry must give `blocked_declaration`, `consumer_path`, `residual_goal`, the smallest
+  `needed_result`, `owner_chapter_id`, exact `owner_paths`, and at least two
+  `attempted_alternatives`.

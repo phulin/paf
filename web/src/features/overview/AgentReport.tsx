@@ -15,7 +15,13 @@ interface StructuredAgentReport {
   complete: boolean;
   summary: string;
   issues: string[];
-  fixupFindings: Array<{ description: string; ownerPaths: string[] }>;
+  failedAttempts: Array<{
+    path: string;
+    declaration: string;
+    attempts: string[];
+    remainingGoal: string;
+    obstruction: string;
+  }>;
   sourceIssues: Array<{
     location: string;
     sourceExcerpt: string;
@@ -31,12 +37,21 @@ export function parseAgentReport(value?: string): StructuredAgentReport | null {
     if (typeof report.summary !== "string") return null;
     const strings = (item: unknown) =>
       Array.isArray(item) ? item.filter((entry): entry is string => typeof entry === "string") : [];
-    const fixupFindings = Array.isArray(report.fixup_findings)
-      ? report.fixup_findings.flatMap((item) => {
+    const failedAttempts = Array.isArray(report.failed_attempts)
+      ? report.failed_attempts.flatMap((item) => {
           if (!item || typeof item !== "object") return [];
-          const finding = item as Record<string, unknown>;
-          if (typeof finding.description !== "string") return [];
-          return [{ description: finding.description, ownerPaths: strings(finding.owner_paths) }];
+          const attempt = item as Record<string, unknown>;
+          if (typeof attempt.obstruction !== "string") return [];
+          return [
+            {
+              path: typeof attempt.path === "string" ? attempt.path : "",
+              declaration: typeof attempt.declaration === "string" ? attempt.declaration : "",
+              attempts: strings(attempt.attempts),
+              remainingGoal:
+                typeof attempt.remaining_goal === "string" ? attempt.remaining_goal : "",
+              obstruction: attempt.obstruction,
+            },
+          ];
         })
       : [];
     const sourceIssues = Array.isArray(report.source_issues)
@@ -63,7 +78,7 @@ export function parseAgentReport(value?: string): StructuredAgentReport | null {
       complete: report.complete === true,
       summary: report.summary,
       issues: strings(report.issues),
-      fixupFindings,
+      failedAttempts,
       sourceIssues,
     };
   } catch {
@@ -83,7 +98,7 @@ export function AgentUpdate({ activity }: { activity?: AgentActivity }) {
       </div>
     );
   const findingCount =
-    report.issues.length + report.fixupFindings.length + report.sourceIssues.length;
+    report.issues.length + report.failedAttempts.length + report.sourceIssues.length;
   return (
     <div className="agent-report">
       <div className="agent-report-status">
@@ -117,23 +132,30 @@ export function AgentUpdate({ activity }: { activity?: AgentActivity }) {
           </ul>
         </div>
       )}
-      {report.fixupFindings.length > 0 && (
+      {report.failedAttempts.length > 0 && (
         <div className="report-group fixups">
           <div className="report-group-title">
             <GitBranch size={13} />
-            <span>Fixup findings</span>
-            <em>{report.fixupFindings.length}</em>
+            <span>Failed attempts</span>
+            <em>{report.failedAttempts.length}</em>
           </div>
-          {report.fixupFindings.map((finding, index) => (
+          {report.failedAttempts.map((attempt, index) => (
             <div className="report-finding" key={index}>
-              <p>{finding.description}</p>
-              {finding.ownerPaths.length > 0 && (
+              <p>{attempt.obstruction}</p>
+              {(attempt.path || attempt.declaration) && (
                 <div className="owner-paths">
-                  {finding.ownerPaths.map((path) => (
-                    <code key={path}>{path}</code>
-                  ))}
+                  {attempt.path && <code>{attempt.path}</code>}
+                  {attempt.declaration && <code>{attempt.declaration}</code>}
                 </div>
               )}
+              {attempt.attempts.length > 0 && (
+                <ul>
+                  {attempt.attempts.map((checkedAttempt, attemptIndex) => (
+                    <li key={attemptIndex}>{checkedAttempt}</li>
+                  ))}
+                </ul>
+              )}
+              {attempt.remainingGoal && <pre>{attempt.remainingGoal}</pre>}
             </div>
           ))}
         </div>

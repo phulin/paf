@@ -1,74 +1,89 @@
 # Formalize statements: {book_title}, chapter {chapter_number}
 
-## Mission
+## Goal
 
-Read chapter {chapter_number}, “{chapter_title},” in `{source}` from its numbered heading through the
-next heading of the same level. Create or update `{lean_root}/{chapter_path}/` and its aggregator
-`{lean_root}/{chapter_path}.lean` so the chapter exposes an accurate, proof-ready Lean API in source
-order.
+Turn every precise mathematical statement in chapter {chapter_number}, “{chapter_title},” into an
+accurate, usable Lean declaration. Create or update the chapter files under
+`{lean_root}/{chapter_path}/` and the top-level file `{lean_root}/{chapter_path}.lean` that imports
+them.
 
-Proofs may use `by sorry`; definitions should have genuine bodies whenever the canonical
-construction is clear. Every declaration and definition must elaborate. Do not
-translate motivation, history, proof narration, or redundant paraphrases into declarations.
-
-## Coverage and proof readiness
-
-Represent every precise assertion: labeled declarations, displayed identities and diagrams, exact
-sequences, compatibility results, hypotheses embedded in prose, examples, and mathematically precise
-warnings. Read informal proofs for dependency planning even though their narration is not itself
-formalized. Coverage is semantic rather than one-declaration-per-sentence: when an assertion follows
-immediately from a definition or is already represented by a stronger source-faithful declaration,
-account for it in the active checklist instead of adding a redundant theorem.
-
-For every principal result, trace a plausible route through earlier project declarations and pinned
-Mathlib. Add genuinely missing intermediate interfaces, especially basic `↔` lemmas; equivalences
-between book-facing and canonical formulations; constructor, eliminator, and extensionality facts;
-membership, coercion, map, restriction, and normalization lemmas; and closure or functoriality
-bridges. Search for a canonical declaration first. A new bridge must have a named intended consumer,
-use the weakest natural assumptions, precede its users, and be independently provable from earlier
-material. Do not add speculative helper APIs for a proof route that no drafted declaration uses.
-
-Match finiteness, separation, completeness, characteristic, normalization, and typeclass assumptions
-exactly. For a genuine false or underspecified source assertion, make only the minimal principled
-correction and record the defect in the structured `source_issues` ledger rather than leaving a
-source-issue comment in Lean. If an unavailable earlier result is essential, add only a clearly
-marked, mathematically natural local dependency guess—not one engineered to imply the desired
-conclusion.
+This stage builds the chapter's definitions and theorem statements; it does not prove the theorems.
+Theorem proofs may be `by sorry`, but every definition must have a real body when the construction is
+clear, and every file must be free of errors and warnings other than Lean's exact warning for a
+declaration that uses `sorry`.
 
 ## Workflow
 
-Use the native `update_plan` tool as the authoritative checklist for this attempt; do not keep the
-checklist only in prose, a scratch file, or the final report.
+1. Read the complete chapter in `{source}`, from its numbered heading through the next heading of the
+   same level, together with the existing assigned Lean files. Use `update_plan` to make one checklist
+   item for each numbered source section, in source order, followed by a final chapter-wide coverage
+   and diagnostic check. Keep exactly one item in progress.
+2. Before creating a definition, notation, instance, theorem interface, or helper lemma, search the
+   project's Mathlib version and earlier project chapters for an existing version. Search by concept
+   and type signature, not only by a guessed name, and inspect constructors, elimination rules,
+   equivalences, coercions, instances, and existing uses. Reuse the established declaration whenever
+   it expresses the required mathematics.
+3. Work through the source sections in order. Expand the active checklist item to name every precise
+   definition, assertion, displayed identity or diagram, exact sequence, example, hypothesis, and
+   mathematically meaningful warning in that section.
+4. Create or repair the Lean declarations for the active section. Account explicitly for an assertion
+   that needs no separate theorem because it follows immediately from a definition or is already
+   covered by a stronger, source-faithful result.
+5. For each main theorem, read its informal proof and identify a plausible route through declarations
+   that already exist in Mathlib or earlier chapters. Add a new supporting interface only when that
+   search shows a real gap and the new declaration has a named user in this chapter.
+6. Preserve source order and dependency order. Finish and check the active section before moving to
+   the next one. After all sections are complete, perform the planned chapter-wide coverage check.
+7. Use the attached Lean tools after editing. Prepare the affected dependent files once, then request
+   whole-file diagnostics from prerequisites to dependents. Fix every error and every warning except
+   the exact warning that a declaration uses `sorry`. Replace time-consuming proposition proofs with
+   `by sorry`; proving them belongs to the prove stage.
+8. If PAF returns build diagnostics for another attempt, address every finding that still applies and
+   repeat the final focused diagnostic check.
 
-1. Inventory the complete source chapter and the existing assigned Lean files. Before drafting any
-   declaration, use `update_plan` to create a checklist with one item for every
-   numbered source section, in source order, followed by a chapter-wide coverage and proof-readiness
-   audit. Keep exactly one item in progress.
-2. Work through that section checklist in order. When a section becomes current, inspect it closely
-   and update the active plan item's text to name the definitions, precise assertions, examples,
-   warnings, and proof-support interfaces it requires; the native plan is flat, so do not invent
-   nested checklist structure. Keep later sections pending until you reach them, and add newly
-   discovered results to the active item instead of silently absorbing them into a broad task.
-3. For each named result in the active section item, inspect canonical earlier LastLib and pinned
-   Mathlib interfaces, then create or repair its declarations. Mark the section complete only after
-   every named result is accurately represented or explicitly accounted for.
-4. Finish every result in the active section before moving to the next section. Preserve source and
-   dependency order while completing the statement and definition pass.
-5. After all sections are checked off, perform the planned chapter-wide audit and add only genuinely
-   missing reusable bridges.
-6. Use the attached Lean MCP after edits. Prepare the maximal affected dependents once, then request
-   whole-file diagnostics in dependency order. Repair every error and every warning other than the
-   exact declaration-uses-`sorry` warning. Replace obstructing proposition proofs with `by sorry`;
-   do not spend this stage proving them.
-7. When coordinator diagnostics are appended on a retry, address all still-applicable findings and
-   repeat the focused final diagnostic pass.
+## Guardrails
 
-Do not run Lean, Lake, or another language server. The coordinator performs the authoritative build
-after each attempt and will return cleanly attributed failures to this stage.
+Do not reinvent mathematics or local infrastructure that Mathlib or an earlier chapter already
+provides. A differently named existing declaration is still the preferred choice when a small,
+standard adaptation makes it usable. Do not introduce a parallel definition merely because its
+surface syntax resembles the book more closely. Add a bridge lemma or equivalence only when the
+canonical API cannot express a needed book-facing statement directly; use the weakest natural
+assumptions, place it before its users, and make sure it can be proved from earlier material.
+
+Represent all substantive mathematical content, but do not translate motivation, history, proof
+narration, or redundant paraphrases into declarations. Match hypotheses, types, coercions,
+normalization conventions, and assumptions such as finiteness, separation, completeness, and
+characteristic exactly.
+
+If the source contains a genuinely false or underspecified assertion, make only the smallest
+mathematically principled correction and record the problem in `source_issues`. If an essential
+earlier fact is missing, add only a natural dependency that belongs at that earlier point—never an
+assumption designed simply to imply the desired conclusion.
+
+Do not run Lean, Lake, or another language server directly. Use the attached Lean tools; PAF performs
+the authoritative build after each attempt.
 
 ## Definition of done
 
-Every substantive source assertion is represented or explicitly accounted for, declarations follow
-source order, definitions have real bodies where practical, and diagnostics are clean except for
-declarations using `sorry`. Report coverage gaps, source issues, and important interface choices.
-Set `complete` to `true` only when both the full coverage pass and clean diagnostic pass are finished.
+Every substantive source assertion is represented or explicitly accounted for. Existing Mathlib and
+earlier-chapter APIs have been reused wherever possible, new interfaces fill demonstrated gaps, the
+declarations follow source and dependency order, definitions have real bodies where practical, and
+diagnostics are clean except for declarations using `sorry`. Report remaining coverage gaps, source
+problems, and important interface choices. Set `complete` to `true` only after both the full coverage
+check and the clean diagnostic check are finished.
+
+## Output format
+
+Return the structured report once, after tool use and edits have stopped. It must describe the stable
+files on disk, not planned work. Use only these fields:
+
+- `changed`: `true` exactly when an allowed edit remains.
+- `complete`: `true` only when the definition of done is met.
+- `summary`: when files changed, concise past-tense prose naming the main files or declarations and
+  the purpose of the edits, suitable for a commit body; otherwise, why no edit was needed.
+- `issues`: precise remaining coverage, Lean-interface, diagnostic, tooling, or out-of-scope blockers;
+  otherwise an empty list.
+- `source_issues`: genuine defects in the informal textbook; otherwise an empty list. Each entry must
+  give `location`, an exact identifying `source_excerpt`, a mathematical `description`, and the
+  smallest `suggested_correction`. Do not use this field for a Lean API gap or proof failure. A source
+  issue is not a reason to stop; make the smallest principled accommodation and continue elsewhere.

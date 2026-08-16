@@ -33,7 +33,7 @@ from importlib.resources import files
 from pathlib import Path
 
 import paf
-from paf.codex import COMMON_PROMPT_PATH, PROOF_REVIEW_PROMPT_PATH, UPSTREAM_REPAIR_PROMPT_PATH
+from paf.codex import COMMON_PROMPT_PATH, PROOF_REVIEW_PROMPT_PATH
 from paf.config import load_config, standard_prompt_path
 from paf.models import Stage
 from paf.state import StateStore
@@ -52,7 +52,6 @@ for stage in Stage:
 for actual, name in (
     (COMMON_PROMPT_PATH, "common.md"),
     (PROOF_REVIEW_PROMPT_PATH, "proof_review.md"),
-    (UPSTREAM_REPAIR_PROMPT_PATH, "upstream_repair.md"),
 ):
     assert actual == Path(str(prompts.joinpath(name))) and actual.is_file(), actual
 index = Path(str(web.joinpath("index.html")))

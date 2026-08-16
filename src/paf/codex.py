@@ -24,136 +24,203 @@ from paf.models import PipelineConfig, Stage, WorkUnitLike
 from paf.scope import ScopeMatcher
 from paf.state import RunRecord, StateStore, TaskStatus, TokenUsage
 
-REPORT_SCHEMA: dict[str, Any] = {
-    "$schema": "https://json-schema.org/draft/2020-12/schema",
-    "type": "object",
-    "additionalProperties": False,
-    "properties": {
-        "changed": {"type": "boolean"},
-        "complete": {"type": "boolean"},
-        "summary": {
-            "type": "string",
-            "minLength": 1,
-            "pattern": "\\S",
-            "description": "Self-contained, change-focused prose suitable for a commit body.",
-        },
-        "issues": {"type": "array", "items": {"type": "string"}},
-        "source_dependencies": {
-            "type": "array",
-            "items": {"type": "string", "minLength": 1},
-            "description": "Direct prerequisite work-unit ids found during source discovery.",
-        },
-        "fixup_findings": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "additionalProperties": False,
-                "properties": {
-                    "description": {"type": "string", "minLength": 1},
-                    "owner_paths": {
-                        "type": "array",
-                        "items": {"type": "string", "minLength": 1},
-                        "minItems": 1,
-                    },
-                },
-                "required": ["description", "owner_paths"],
-            },
-        },
-        "upstream_requests": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "additionalProperties": False,
-                "properties": {
-                    "blocked_declaration": {"type": "string", "minLength": 1},
-                    "consumer_path": {"type": "string", "minLength": 1},
-                    "residual_goal": {"type": "string", "minLength": 1},
-                    "needed_result": {"type": "string", "minLength": 1},
-                    "owner_chapter_id": {"type": "string", "minLength": 1},
-                    "owner_paths": {
-                        "type": "array",
-                        "items": {"type": "string", "minLength": 1},
-                        "minItems": 1,
-                    },
-                    "attempted_alternatives": {
-                        "type": "array",
-                        "items": {"type": "string", "minLength": 1},
-                        "minItems": 2,
-                    },
-                },
-                "required": [
-                    "blocked_declaration",
-                    "consumer_path",
-                    "residual_goal",
-                    "needed_result",
-                    "owner_chapter_id",
-                    "owner_paths",
-                    "attempted_alternatives",
-                ],
-            },
-        },
-        "upstream_answers": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "additionalProperties": False,
-                "properties": {
-                    "request_ids": {
-                        "type": "array",
-                        "items": {"type": "string", "minLength": 1},
-                        "minItems": 1,
-                    },
-                    "disposition": {
-                        "type": "string",
-                        "enum": ["added", "existing", "downstream"],
-                    },
-                    "declarations": {
-                        "type": "array",
-                        "items": {"type": "string", "minLength": 1},
-                    },
-                    "usage_guidance": {"type": "string"},
-                    "rejection_reason": {"type": "string"},
-                },
-                "required": [
-                    "request_ids",
-                    "disposition",
-                    "declarations",
-                    "usage_guidance",
-                    "rejection_reason",
-                ],
-            },
-        },
-        "source_issues": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "additionalProperties": False,
-                "properties": {
-                    "location": {"type": "string", "minLength": 1},
-                    "source_excerpt": {"type": "string", "minLength": 1},
-                    "description": {"type": "string", "minLength": 1},
-                    "suggested_correction": {"type": "string", "minLength": 1},
-                },
-                "required": [
-                    "location",
-                    "source_excerpt",
-                    "description",
-                    "suggested_correction",
-                ],
-            },
-        },
+_REPORT_BASE_PROPERTIES: dict[str, Any] = {
+    "changed": {"type": "boolean"},
+    "complete": {"type": "boolean"},
+    "summary": {
+        "type": "string",
+        "minLength": 1,
+        "pattern": "\\S",
+        "description": "Self-contained, change-focused prose suitable for a commit body.",
     },
-    "required": [
-        "changed",
-        "complete",
-        "summary",
-        "issues",
-        "source_dependencies",
-        "fixup_findings",
-        "upstream_requests",
-        "upstream_answers",
-        "source_issues",
-    ],
+    "issues": {"type": "array", "items": {"type": "string"}},
+}
+
+_SOURCE_DEPENDENCIES_PROPERTY: dict[str, Any] = {
+    "type": "array",
+    "items": {"type": "string", "minLength": 1},
+    "description": "Ids of the earlier chapters directly required by this chapter.",
+}
+
+_SOURCE_ISSUES_PROPERTY: dict[str, Any] = {
+    "type": "array",
+    "items": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "location": {"type": "string", "minLength": 1},
+            "source_excerpt": {"type": "string", "minLength": 1},
+            "description": {"type": "string", "minLength": 1},
+            "suggested_correction": {"type": "string", "minLength": 1},
+        },
+        "required": ["location", "source_excerpt", "description", "suggested_correction"],
+    },
+}
+
+_FAILED_ATTEMPTS_PROPERTY: dict[str, Any] = {
+    "type": "array",
+    "items": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "path": {"type": "string", "minLength": 1},
+            "declaration": {"type": "string", "minLength": 1},
+            "attempts": {
+                "type": "array",
+                "items": {"type": "string", "minLength": 1},
+                "minItems": 2,
+            },
+            "remaining_goal": {"type": "string", "minLength": 1},
+            "obstruction": {"type": "string", "minLength": 1},
+        },
+        "required": ["path", "declaration", "attempts", "remaining_goal", "obstruction"],
+    },
+}
+
+_UPSTREAM_REQUESTS_PROPERTY: dict[str, Any] = {
+    "type": "array",
+    "items": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "blocked_declaration": {"type": "string", "minLength": 1},
+            "consumer_path": {"type": "string", "minLength": 1},
+            "residual_goal": {"type": "string", "minLength": 1},
+            "needed_result": {"type": "string", "minLength": 1},
+            "owner_chapter_id": {"type": "string", "minLength": 1},
+            "owner_paths": {
+                "type": "array",
+                "items": {"type": "string", "minLength": 1},
+                "minItems": 1,
+            },
+            "attempted_alternatives": {
+                "type": "array",
+                "items": {"type": "string", "minLength": 1},
+                "minItems": 2,
+            },
+        },
+        "required": [
+            "blocked_declaration",
+            "consumer_path",
+            "residual_goal",
+            "needed_result",
+            "owner_chapter_id",
+            "owner_paths",
+            "attempted_alternatives",
+        ],
+    },
+}
+
+_UPSTREAM_ANSWERS_PROPERTY: dict[str, Any] = {
+    "type": "array",
+    "items": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "request_ids": {
+                "type": "array",
+                "items": {"type": "string", "minLength": 1},
+                "minItems": 1,
+            },
+            "disposition": {
+                "type": "string",
+                "enum": ["added", "existing", "downstream"],
+            },
+            "declarations": {
+                "type": "array",
+                "items": {"type": "string", "minLength": 1},
+            },
+            "usage_guidance": {"type": "string"},
+            "rejection_reason": {"type": "string"},
+        },
+        "required": [
+            "request_ids",
+            "disposition",
+            "declarations",
+            "usage_guidance",
+            "rejection_reason",
+        ],
+    },
+}
+
+_FINDING_ASSESSMENTS_PROPERTY: dict[str, Any] = {
+    "type": "array",
+    "items": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "finding": {"type": "string", "minLength": 1},
+            "assessment": {
+                "type": "string",
+                "enum": ["confirmed", "rejected", "reframed"],
+            },
+            "explanation": {"type": "string", "minLength": 1},
+        },
+        "required": ["finding", "assessment", "explanation"],
+    },
+}
+
+
+def _report_schema(title: str, properties: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "title": title,
+        "type": "object",
+        "additionalProperties": False,
+        "properties": properties,
+        "required": list(properties),
+    }
+
+
+REPORT_SCHEMAS: dict[str, dict[str, Any]] = {
+    "discover": _report_schema(
+        "PAF discovery report",
+        {key: value for key, value in _REPORT_BASE_PROPERTIES.items() if key != "changed"}
+        | {"source_dependencies": _SOURCE_DEPENDENCIES_PROPERTY},
+    ),
+    "formalize": _report_schema(
+        "PAF formalization report",
+        _REPORT_BASE_PROPERTIES | {"source_issues": _SOURCE_ISSUES_PROPERTY},
+    ),
+    "review": _report_schema(
+        "PAF statement review report",
+        _REPORT_BASE_PROPERTIES | {"source_issues": _SOURCE_ISSUES_PROPERTY},
+    ),
+    "proof_review": _report_schema(
+        "PAF failed-proof review report",
+        _REPORT_BASE_PROPERTIES
+        | {
+            "source_issues": _SOURCE_ISSUES_PROPERTY,
+            "finding_assessments": _FINDING_ASSESSMENTS_PROPERTY,
+        },
+    ),
+    "prove": _report_schema(
+        "PAF proof report",
+        _REPORT_BASE_PROPERTIES
+        | {
+            "source_issues": _SOURCE_ISSUES_PROPERTY,
+            "failed_attempts": _FAILED_ATTEMPTS_PROPERTY,
+            "upstream_requests": _UPSTREAM_REQUESTS_PROPERTY,
+        },
+    ),
+    "downstream_retry": _report_schema(
+        "PAF downstream proof retry report",
+        _REPORT_BASE_PROPERTIES
+        | {
+            "source_issues": _SOURCE_ISSUES_PROPERTY,
+            "failed_attempts": _FAILED_ATTEMPTS_PROPERTY,
+            "upstream_requests": _UPSTREAM_REQUESTS_PROPERTY,
+        },
+    ),
+    "upstream_repair": _report_schema(
+        "PAF upstream proof repair report",
+        _REPORT_BASE_PROPERTIES
+        | {
+            "source_issues": _SOURCE_ISSUES_PROPERTY,
+            "failed_attempts": _FAILED_ATTEMPTS_PROPERTY,
+            "upstream_answers": _UPSTREAM_ANSWERS_PROPERTY,
+        },
+    ),
 }
 
 LEAN_MCP_BASE_TOOLS = (
@@ -185,9 +252,101 @@ PROCESS_GROUP_GRACE_SECONDS = 1.0
 _PROMPT_RESOURCES = files("paf.prompts")
 COMMON_PROMPT_PATH = Path(str(_PROMPT_RESOURCES.joinpath("common.md")))
 PROOF_REVIEW_PROMPT_PATH = Path(str(_PROMPT_RESOURCES.joinpath("proof_review.md")))
-UPSTREAM_REPAIR_PROMPT_PATH = Path(str(_PROMPT_RESOURCES.joinpath("upstream_repair.md")))
 UPSTREAM_REPAIR_ROLE = "upstream_repair"
 DOWNSTREAM_RETRY_ROLE = "downstream_retry"
+
+
+def report_schema_key(stage: Stage, *, role: str = "", feedback: str = "") -> str:
+    if role == UPSTREAM_REPAIR_ROLE:
+        return UPSTREAM_REPAIR_ROLE
+    if role == DOWNSTREAM_RETRY_ROLE:
+        return DOWNSTREAM_RETRY_ROLE
+    if stage is Stage.REVIEW and feedback:
+        return "proof_review"
+    return stage.value
+
+
+def render_review_variant(template: str, *, upstream: bool) -> str:
+    if upstream:
+        values = {
+            "review_assignment": """This is the targeted upstream variant. A later proof asks this
+earlier chapter for one or more reusable results. Review those requests and their evidence together;
+do not audit the rest of the chapter or work on unrelated placeholders.""",
+            "review_goal_details": """For each request, decide whether the needed result already
+exists, belongs here as a new fully proved declaration, or depends on later material and should stay
+with the requesting chapter. Fully prove every declaration you add; this variant does not permit new
+placeholders.""",
+            "review_workflow_details": """Group requests that need the same result. If an existing
+declaration solves a request, record its exact fully qualified name and concrete usage. If a result
+is missing and naturally belongs here, add the smallest reusable version and prove it completely. If
+it depends on later-only data, explain why and give a viable downstream direction. Return one answer
+for every supplied request id.""",
+            "review_guardrails": """Do not change existing interfaces or the requesting chapter. Do
+not add `sorry`, `admit`, axioms, unused helpers, cosmetic aliases, or a theorem tailored merely to
+restate the later proof's final goal.""",
+            "review_definition_of_done": """Every request id has an evidence-backed answer, every
+new declaration is fully proved and clean, and no unrelated source was changed.""",
+            "review_output_format": """Return the structured report once, after tool use and edits
+have stopped. It must describe the stable files on disk, not planned work. Use only these fields:
+
+- `changed`: `true` exactly when an allowed edit remains.
+- `complete`: `true` only when the definition of done is met.
+- `summary`: when files changed, concise past-tense prose naming the added declarations and their
+  purpose, suitable for a commit body; otherwise, why no edit was needed.
+- `issues`: tooling, diagnostic, or out-of-scope blockers; otherwise an empty list.
+- `source_issues`: genuine defects in the informal textbook; otherwise an empty list. Each entry
+  must give `location`, an exact identifying `source_excerpt`, a mathematical `description`, and the
+  smallest `suggested_correction`.
+- `failed_attempts`: any new supporting declaration that could not be proved; otherwise an empty
+  list. Each entry must give its repository-relative `path`, fully qualified `declaration`, at least
+  two meaningfully different checked `attempts`, exact `remaining_goal`, and concrete `obstruction`.
+- `upstream_answers`: one answer for every supplied request id. Each entry gives `request_ids`, a
+  `disposition` of `added`, `existing`, or `downstream`, exact fully qualified `declarations`,
+  concrete `usage_guidance`, and a `rejection_reason`. For `downstream`, leave `declarations` empty
+  and explain why this earlier chapter is not the right owner. For the other dispositions, leave
+  `rejection_reason` empty.""",
+        }
+    else:
+        values = {
+            "review_assignment": """This is the full-chapter re-review variant.
+A proof attempt found evidence that one or more statements or supporting declarations may be wrong
+or hard to use.
+Review the complete assigned chapter, not only the declarations named in the evidence.""",
+            "review_goal_details": """This remains statement review, not proof work. Repair every
+genuine statement or interface problem in the assigned files, but preserve sound statements when
+only the proof strategy failed. Existing proof placeholders may remain, and new proposition proofs
+may use `by sorry` when proving them would distract from the review.""",
+            "review_workflow_details": """After resolving the supplied findings, continue through
+every declaration in the assigned chapter. Check source coverage, mathematical meaning, hypotheses,
+and a plausible proof route through earlier results. Account for every supplied finding as
+confirmed, rejected, or reframed.""",
+            "review_guardrails": """Do not restrict the review to the failed declarations. A
+no-change review needs no diagnostic calls because PAF's incoming build is authoritative.""",
+            "review_definition_of_done": """The complete assigned chapter has been re-reviewed,
+every supplied finding has been evaluated, all warranted in-scope repairs have been made, existing
+library and earlier-chapter APIs have been reused wherever possible, imports remain chronological,
+and edited files are clean except for permitted `sorry` warnings.""",
+            "review_output_format": """Return the structured report once, after tool use and edits
+have stopped. It must describe the stable files on disk, not planned work. Use only these fields:
+
+- `changed`: `true` exactly when an allowed edit remains.
+- `complete`: `true` only when the definition of done is met.
+- `summary`: when files changed, concise past-tense prose naming the main files or declarations and
+  the purpose of the edits, suitable for a commit body; otherwise, why no edit was needed.
+- `issues`: precise remaining statement, interface, diagnostic, tooling, or out-of-scope blockers;
+  otherwise an empty list.
+- `source_issues`: genuine defects in the informal textbook; otherwise an empty list. Each entry
+  must give `location`, an exact identifying `source_excerpt`, a mathematical `description`, and the
+  smallest `suggested_correction`.
+- `finding_assessments`: one entry for each supplied proof finding. Copy a concise identifying
+  `finding`, classify its `assessment` as `confirmed`, `rejected`, or `reframed`, and give the
+  evidence in `explanation`.""",
+        }
+    for key, value in values.items():
+        template = template.replace("{" + key + "}", value)
+    return template
+
+
 CAPACITY_RESUME_PROMPT = "Continue from the interrupted turn and complete the assigned task."
 UPSTREAM_SOURCE_BUNDLE_MAX_CHARS = 240_000
 LEAN_DECLARATION_RE = re.compile(
@@ -403,19 +562,20 @@ def _upstream_source_bundle(
     selected = tuple(requests)
     by_id = {chapter.id: chapter for chapter in chapters}
     parts = [
-        "# Targeted upstream repair evidence\n\n",
-        "This line-numbered snapshot supplies the request batch, relevant owner files, consumer "
-        "statements, and textbook excerpts. Read other files only for focused dependency lookup.\n",
-        "\n## Durable request batch\n",
+        "## Evidence supplied by PAF\n\n",
+        "The following line-numbered material contains the requests to answer, the relevant files "
+        "from this chapter, the later statements that need help, and the related book excerpts. "
+        "Read other files only when a focused search requires them.\n",
+        "\n### Requests to answer\n",
     ]
     for request in selected:
         request_id = str(request.get("id", "unknown"))
         parts.extend(
             [
                 f"\n### Request `{request_id}`\n\n",
-                f"- Consumer chapter: `{request.get('consumer_chapter_id', '')}`\n",
+                f"- Requesting chapter: `{request.get('consumer_chapter_id', '')}`\n",
                 f"- Blocked declaration: `{request.get('blocked_declaration', '')}`\n",
-                f"- Consumer path: `{request.get('consumer_path', '')}`\n",
+                f"- Requesting file: `{request.get('consumer_path', '')}`\n",
                 f"- Residual goal: `{request.get('residual_goal', '')}`\n",
                 f"- Requested result: {request.get('needed_result', '')}\n",
                 "- Attempted alternatives:\n",
@@ -426,25 +586,25 @@ def _upstream_source_bundle(
             parts.extend(f"  - {item}\n" for item in attempted if isinstance(item, str))
         previous = request.get("previous_attempts")
         if isinstance(previous, str) and previous.strip():
-            parts.extend(["- Previous proof-attempt ledger:\n\n", "```text\n", previous, "\n```\n"])
+            parts.extend(["- Earlier proof attempts:\n\n", "```text\n", previous, "\n```\n"])
 
-    # Keep the exact consumer declarations ahead of potentially large textbook and owner-source
+    # Keep the exact requesting declarations ahead of potentially large textbook and owner-source
     # excerpts so the bounded evidence packet cannot truncate the statements the repair must serve.
-    parts.append("\n## Relevant consumer declarations\n")
+    parts.append("\n### Relevant declarations from the requesting chapters\n")
     for request in selected:
         relative = str(request.get("consumer_path", ""))
         declaration = str(request.get("blocked_declaration", ""))
         excerpt = _declaration_excerpt(repo / relative, declaration)
         parts.append(f"\n### `{relative}` — `{declaration}`\n\n")
         if excerpt is None:
-            parts.append("[The named consumer declaration could not be extracted.]\n")
+            parts.append("[The named declaration from the requesting chapter was not found.]\n")
             continue
         start, lines = excerpt
         parts.append(_line_numbered(lines, start=start))
 
     excerpt_chapters = {owner.id}
     excerpt_chapters.update(str(request.get("consumer_chapter_id", "")) for request in selected)
-    parts.append("\n## Relevant textbook excerpts\n")
+    parts.append("\n### Relevant book excerpts\n")
     for chapter_id in sorted(excerpt_chapters):
         chapter = by_id.get(chapter_id)
         if chapter is None:
@@ -462,7 +622,7 @@ def _upstream_source_bundle(
             path for path in raw_paths if isinstance(path, str) and matcher.matches(path)
         )
     owner_paths = sorted(owner_path_set)
-    parts.append("\n## Requested upstream source paths\n")
+    parts.append("\n### Files in this earlier chapter\n")
     for relative in owner_paths:
         path = repo / relative
         parts.append(f"\n### `{relative}`\n\n")
@@ -476,7 +636,7 @@ def _upstream_source_bundle(
     bundle = "".join(parts)
     if len(bundle) <= maximum:
         return bundle
-    marker = f"\n[Upstream repair evidence truncated at {maximum:,} characters.]\n"
+    marker = f"\n[Earlier-chapter repair evidence truncated at {maximum:,} characters.]\n"
     if len(marker) >= maximum:
         return marker[:maximum]
     return bundle[: maximum - len(marker)] + marker
@@ -571,13 +731,8 @@ def _find_report(event: Any) -> dict[str, Any] | None:
         except json.JSONDecodeError:
             continue
         if isinstance(value, dict) and all(
-            key in value for key in ("changed", "complete", "summary", "issues")
+            key in value for key in ("complete", "summary", "issues")
         ):
-            value.setdefault("fixup_findings", [])
-            value.setdefault("source_dependencies", [])
-            value.setdefault("upstream_requests", [])
-            value.setdefault("upstream_answers", [])
-            value.setdefault("source_issues", [])
             return value
     return None
 
@@ -744,11 +899,17 @@ class CodexExecutor:
         self.config = config
         self.state = state
         self.resume_agents = resume_agents
-        self.schema_path = config.settings.state_dir / "agent-report.schema.json"
+        self.schema_paths = {
+            key: config.settings.state_dir / f"agent-report-{key}.schema.json"
+            for key in REPORT_SCHEMAS
+        }
 
     async def prepare(self) -> None:
-        self.schema_path.parent.mkdir(parents=True, exist_ok=True)
-        self.schema_path.write_text(json.dumps(REPORT_SCHEMA, indent=2), encoding="utf-8")
+        self.config.settings.state_dir.mkdir(parents=True, exist_ok=True)
+        legacy_path = self.config.settings.state_dir / "agent-report.schema.json"
+        legacy_path.unlink(missing_ok=True)
+        for key, schema in REPORT_SCHEMAS.items():
+            self.schema_paths[key].write_text(json.dumps(schema, indent=2), encoding="utf-8")
 
     def build_prompt(
         self,
@@ -760,147 +921,92 @@ class CodexExecutor:
         role: str = "",
         upstream_requests: Iterable[dict[str, Any]] = (),
     ) -> str:
-        if role == UPSTREAM_REPAIR_ROLE:
-            prompt_path = UPSTREAM_REPAIR_PROMPT_PATH
-        elif stage is Stage.REVIEW and feedback:
+        if role == UPSTREAM_REPAIR_ROLE or (stage is Stage.REVIEW and feedback):
             prompt_path = PROOF_REVIEW_PROMPT_PATH
         else:
             prompt_path = self.config.stages[stage].prompt
         template = prompt_path.read_text(encoding="utf-8")
+        if prompt_path == PROOF_REVIEW_PROMPT_PATH:
+            template = render_review_variant(template, upstream=role == UPSTREAM_REPAIR_ROLE)
         base = render_prompt(template, chapter)
-        common = render_prompt(COMMON_PROMPT_PATH.read_text(encoding="utf-8"), chapter)
-        scope = "\n".join(f"- `{item}`" for item in chapter.scope)
-        input_catalog = "\n".join(
-            f"- `{unit.id}` — {unit.title} ({unit.source.as_posix()}:{unit.source_span.start_line}-"
-            f"{unit.source_span.end_line})"
-            for unit in self.config.work_units
+        common = (
+            ""
+            if stage is Stage.DISCOVER
+            else render_prompt(COMMON_PROMPT_PATH.read_text(encoding="utf-8"), chapter)
         )
+        scope = "\n".join(f"- `{item}`" for item in chapter.scope)
+        input_catalog = ""
+        if stage is Stage.DISCOVER:
+            entries = "\n".join(
+                f"- `{unit.id}` — {unit.title} "
+                f"({unit.source.as_posix()}:{unit.source_span.start_line}-"
+                f"{unit.source_span.end_line})"
+                for unit in self.config.work_units
+            )
+            input_catalog = f"\n### Available chapters and ids\n\n{entries}\n"
         proof_retry_contract = ""
         if stage is Stage.PROVE and feedback and role != UPSTREAM_REPAIR_ROLE:
             proof_retry_contract = """
-This is a retry. The cumulative attempt ledger appended below is prior inventory, not a conclusion
-to echo. Do not merely repeat its full-file reads, clean diagnostics, searches, or prior proof
-experiments.
-Select one remaining placeholder and either refine a previous proof shape using specific new
-evidence or perform a materially different concrete experiment: search for another earlier theorem,
-unfold the local interface, prove a focused helper, construct the object directly, or change tactic
-structure. Persist through several checked approaches; a retry is not exhausted by one new failed
-tactic. Add and prove focused local or private helper lemmas when they unlock the result. Stop only
-after sustained concrete work exposes the same hard obstruction, or after a specific mathematical
-argument shows that the statement cannot follow from its assumptions. If the latter establishes
-that an earlier declaration or interface must change, return a minimal structured
-`upstream_requests` entry instead of another unchanged \"no pinned API\" report."""
+This is another attempt. The history appended below records earlier work; do not simply repeat or
+summarize it. Choose one remaining placeholder and use new evidence to improve a previous approach,
+or try a meaningfully different one: search for another earlier theorem, unfold a relevant
+definition, prove a focused helper, construct the object directly, or change the tactic structure.
+Try several checked approaches before concluding that the same obstruction remains. If a concrete
+mathematical argument shows that an earlier declaration must change, report the smallest required
+change through the proof report instead of repeating that no library result was found."""
         stage_contract = {
-            Stage.DISCOVER: """This is a read-only source discovery attempt. Inspect the assigned
-source chapter and identify its direct prerequisite input nodes. Do not edit any file and leave all
-non-discovery report ledgers empty.""",
-            Stage.FORMALIZE: """This attempt owns source-faithful formalization and elaboration.
-The chapter's discovered predecessors are already clean. Create or repair the complete assigned
-scope, use the attached Lean MCP to clear every diagnostic except declarations using `sorry`, and
-return only after the scope is ready for the coordinator's authoritative build. Unrelated
-dependency-ready formalizers may run concurrently.""",
-            Stage.REVIEW: """Audit and directly make every warranted in-scope statement or API
-change across the entire assigned chapter. When proof findings are attached, independently evaluate
-each one while still re-reviewing the complete scope. Preserve proof placeholders and do not spend
-time proving propositions.
-The coordinator has certified the incoming sources and dependencies clean except for permitted
-`sorry` warnings. The coordinator merges the scoped patch, then rebuilds it and returns
-compiler-only failures to formalization.""",
-            Stage.PROVE: """The project entered this attempt with a clean reviewed build. This is a
-proof-writing attempt, not an audit. Work directly on unresolved placeholders and do not diagnose
-untouched files merely to reconfirm the clean build. After the attempt, the coordinator builds the
-assigned chapter against its single writable cache."""
+            Stage.DISCOVER: """This is read-only source analysis. Identify the earlier chapters
+that this chapter directly needs. Do not edit any file.""",
+            Stage.FORMALIZE: """This attempt is responsible for accurately translating the chapter
+into Lean and leaving it free of diagnostics other than permitted `sorry` warnings. The earlier
+chapters it needs are already clean. Other independent chapters may be formalized at the same time.
+PAF will run the authoritative build after your work.""",
+            Stage.REVIEW: """Review the entire assigned chapter and make every warranted statement
+or interface change that belongs in its files. When proof findings are attached, evaluate them
+independently while still reviewing the complete chapter. Preserve proof placeholders and do not
+spend time proving propositions. PAF has already built the incoming files and will rebuild any
+changes.""",
+            Stage.PROVE: """The assigned chapter has passed review and builds cleanly. Work directly
+on unresolved proofs rather than auditing or rechecking untouched files. PAF will build the chapter
+after the attempt."""
             + proof_retry_contract,
         }[stage]
         if role == UPSTREAM_REPAIR_ROLE:
-            stage_contract = """This temporary agent owns one batched upstream-interface repair.
-Use the proof-capable Lean MCP, edit only the owner chapter, and fully prove every new declaration.
-The coordinator independently merges and builds the owner before releasing fresh consumer retries.
-Do not perform an ordinary owner-chapter placeholder pass."""
+            stage_contract = """This temporary attempt answers a group of requests for mathematical
+support from an earlier chapter. Use the attached Lean tools, edit only that earlier chapter, and
+fully prove every new declaration. PAF will merge and build the changes before retrying the later
+proofs. Do not work on unrelated placeholders."""
         validation_contract = {
-            Stage.DISCOVER: "The coordinator validates and persists the reported source tree.",
-            Stage.FORMALIZE: "The coordinator independently checks scoped hashes, placeholders, "
-            "diagnostics, and the dependency-ordered build after integration.",
-            Stage.REVIEW: "The coordinator independently checks scoped hashes, placeholders, and "
-            "the chapter build after integration.",
-            Stage.PROVE: "The coordinator independently checks scoped hashes, placeholders, "
+            Stage.DISCOVER: "PAF validates and saves the reported source dependencies.",
+            Stage.FORMALIZE: "PAF independently checks the allowed file changes, placeholders, "
+            "diagnostics, and the dependency-ordered build after applying the edits.",
+            Stage.REVIEW: "PAF independently checks the allowed file changes, placeholders, and "
+            "the chapter build after applying the edits.",
+            Stage.PROVE: "PAF independently checks the allowed file changes, placeholders, "
             "diagnostics, and the chapter build.",
         }[stage]
-        if role == UPSTREAM_REPAIR_ROLE:
-            upstream_contract = """For this repair batch, leave `upstream_requests` empty and
-return an `upstream_answers` entry covering every supplied request id. For `added` or `existing`,
-give exact fully qualified declaration names and concrete usage guidance. For `downstream`, leave
-declaration names empty and give both downstream guidance and the precise rejection reason. Do not
-omit or discard a request merely because no upstream edit was appropriate."""
-        elif stage is Stage.PROVE:
-            upstream_contract = """When sustained checked work shows that one blocked declaration
-needs a specific reusable result from an earlier chapter, record it in `upstream_requests`,
-including the exact declaration and consumer path, residual Lean goal, minimal needed result,
-proposed earlier owner chapter and paths, and at least two materially different attempted
-alternatives. Continue through independent declarations before finishing. Use `fixup_findings`, not
-`upstream_requests`,
-for an inaccurate consumer statement or another statement/API defect that requires editing existing
-interfaces. Leave `upstream_answers` empty; only targeted repair agents answer requests."""
-        else:
-            upstream_contract = """This agent does not create or answer proof-to-upstream handoffs.
-Leave both `upstream_requests` and `upstream_answers` empty."""
         contract = f"""
 
-## Runtime contract
+## PAF requirements
 
-### Scope and lifecycle
+### Files you may edit
 
-Your exclusive edit scope is:
+You may edit only these paths:
 {scope}
 
-This is a hard write boundary: edit only the paths listed above. You may read files elsewhere for
+This is a strict boundary. You may read files elsewhere for
 context, but do not create, modify, move, delete, format, or otherwise write any path outside this
 scope. In particular, do not edit `.paf`, `README.md`, repository-level documentation, prompts,
 scripts, orchestration code, configuration, or tests, even if changing them seems useful for this
-task. If a source repair requires an out-of-scope write, do not make that edit; report it in
-`fixup_findings` with its exact owner path. Report tooling or infrastructure problems that require
-no source edit in `issues`. Before every edit, verify that its target matches one of the listed
-scope paths. Any out-of-scope write causes the coordinator to reject the entire attempt.
+task. If a source repair requires an out-of-scope write, do not make that edit; explain the blocker
+and exact paths as directed by the stage prompt. Before every edit, verify that its target matches
+one of the listed scope paths. Any out-of-scope write causes PAF to reject the entire attempt.
 
 Do not commit and do not wait for another worker.
 Do not run `lake build`, `lake env lean`, raw `lean`, or another compiler command. Builds belong to
-the coordinator and use its single writable build cache. {stage_contract}
-
-### Final response
-
-Emit the required structured report exactly once, as the final response after tool use and edits
-have stopped. It must describe the stable on-disk state, never planned future work. Set `changed` to
-true exactly when you made a scoped filesystem edit that remains at the end, and set `complete` from
-the stage's definition of done. When `changed` is true, write a concise, self-contained `summary` in
-past tense that describes the actual scoped edits and their purpose, names the key files or
-declarations, and is suitable for use verbatim as a Git commit body. Keep progress, future work, and
-unresolved problems out of the summary and list them in `issues` instead. When `changed` is false,
-briefly explain why no edit was needed.
-
-For every unresolved actionable issue that requires another source edit, add one `fixup_findings`
-entry. Its
-`description` must state the complete minimal repair, and `owner_paths` must list the exact
-repository-relative Lean paths that need edits, including paths outside this attempt's scope. Use a
-prospective path when the repair requires creating a missing file. Split findings whose repairs have
-different owners. Leave `fixup_findings` empty exactly when no source edit is requested. The
-coordinator routes these entries to the chapters that own those paths.
-
-{upstream_contract}
-
-Set `source_dependencies` only during discovery. Use direct work-unit ids from the input catalog;
-do not include the assigned work unit itself, transitive prerequisites, target-code imports, or a
-dependency inferred solely from chapter numbering. Every other stage must return an empty list.
-
-### Input catalog
-
+PAF and use its single writable build cache. {stage_contract}
 {input_catalog}
-
-Record each genuine defect in the informal textbook in `source_issues`, with its precise heading or
-other location, an exact identifying excerpt, a mathematical explanation, and the smallest suggested
-replacement. Do not use this ledger for missing Lean APIs, proof failures, or tooling problems. A
-source issue is not a reason to stop: make the minimal principled accommodation permitted by this
-stage, clearly preserve or report the obstruction, and continue as far as possible through every
-unaffected part of the chapter. {validation_contract}
+{validation_contract}
 """
         if stage in (Stage.FORMALIZE, Stage.REVIEW, Stage.PROVE):
             capabilities = (
@@ -911,29 +1017,28 @@ unaffected part of the chapter. {validation_contract}
                 "lookup, code actions, completions, tactic trials, and local search"
             )
             mcp_workflow = {
-                Stage.FORMALIZE: """The MCP opens and synchronizes a destination file when any Lean
-tool uses it. Follow the formalization workflow above for diagnostic timing and scope.""",
-                Stage.REVIEW: """Any Lean tool opens and synchronizes its destination file. Follow
-the review workflow above for diagnostic timing and scope.""",
-                Stage.PROVE: """The MCP opens and synchronizes a destination file when any Lean tool
-uses it. Do not request diagnostics merely because you switched files. After editing, use goals and
-fresh diagnostics as needed to establish that the changed proof is clean.""",
+                Stage.FORMALIZE: """Using a Lean tool opens and synchronizes the file it targets.
+Follow the formalization workflow above for when and where to request diagnostics.""",
+                Stage.REVIEW: """Using a Lean tool opens and synchronizes the file it targets.
+Follow the review workflow above for when and where to request diagnostics.""",
+                Stage.PROVE: """Using a Lean tool opens and synchronizes the file it targets. Do not
+request diagnostics merely because you switched files. After editing, use goals and fresh
+diagnostics as needed to show that the changed proof is clean.""",
             }[stage]
             contract += f"""
 
-### Attached Lean MCP
+### Attached Lean tools (MCP)
 
-A private `paf_lean` MCP server is attached to this attempt. It points at the attempt's private
-Lean project. Use its {capabilities}. It intentionally does not expose `lean_build` or remote
-search. Paths passed to its tools are relative to the Lean project root: use `LastLib/...`, not
+A private `paf_lean` tool server is attached to this attempt through MCP. It works on this attempt's
+private Lean project. Use it for {capabilities}. It intentionally does not provide a build command
+or remote search. Tool paths are relative to the Lean project root: use `LastLib/...`, not
 `lean/LastLib/...`.
 {mcp_workflow}
-The MCP automatically reopens a document with one dependency-build pass only when Lean reports stale
-imports. Do not start another language server or work around stale imports with a compiler command.
-When checking more than one edited file, call `lean_prepare_dependencies` once with only the maximal
-affected dependents (the files in the changed closure that no other changed file imports). This
-warms their complete imported closure with coalesced dependency preparation. Then request the final
-whole-file diagnostics in import order; do not prepare every file separately.
+The tool server automatically prepares imported files when Lean reports that they are stale. Do not
+start another language server or work around stale imports with a compiler command. When checking
+more than one edited file, call `lean_prepare_dependencies` once with the edited files at the end of
+the dependency chain; the tool will prepare everything they import together. Then request final
+whole-file diagnostics from prerequisites to dependents. Do not prepare every file separately.
 """
         if feedback:
             feedback_heading = (
@@ -941,16 +1046,16 @@ whole-file diagnostics in import order; do not prepare every file separately.
                 if role == DOWNSTREAM_RETRY_ROLE
                 else {
                     Stage.DISCOVER: "Discovery feedback",
-                    Stage.FORMALIZE: "Coordinator diagnostics and routed findings",
+                    Stage.FORMALIZE: "PAF build diagnostics and reported findings",
                     Stage.REVIEW: "Failed proof findings to evaluate",
-                    Stage.PROVE: "Cumulative proof-attempt ledger",
+                    Stage.PROVE: "Earlier proof attempts",
                 }[stage]
             )
             contract += f"\n## {feedback_heading}\n\n```text\n{_bounded_feedback(feedback)}\n```\n"
-        prefix = ""
+        evidence = ""
         if role == UPSTREAM_REPAIR_ROLE:
             root = workspace_root or self.config.settings.repo
-            prefix = (
+            evidence = (
                 _upstream_source_bundle(
                     root,
                     chapter,
@@ -959,7 +1064,7 @@ whole-file diagnostics in import order; do not prepare every file separately.
                 ).rstrip()
                 + "\n\n"
             )
-        return f"{prefix}{base.rstrip()}\n\n{common.rstrip()}\n{contract}"
+        return f"{base.rstrip()}\n\n{evidence}{common.rstrip()}\n{contract}"
 
     def command(
         self,
@@ -968,6 +1073,7 @@ whole-file diagnostics in import order; do not prepare every file separately.
         *,
         chapter: WorkUnitLike | None = None,
         feedback: str = "",
+        role: str = "",
         resume_thread_id: str | None = None,
     ) -> list[str]:
         settings = self.config.settings
@@ -977,7 +1083,8 @@ whole-file diagnostics in import order; do not prepare every file separately.
             command.extend(["--json", "--color", "never", "--cd", str(root)])
         else:
             command.extend(["resume", "--json"])
-        command.extend(["--output-schema", str(self.schema_path)])
+        schema_key = report_schema_key(stage, role=role, feedback=feedback)
+        command.extend(["--output-schema", str(self.schema_paths[schema_key])])
         if root != settings.repo:
             command.append("--skip-git-repo-check")
         if settings.bypass_approvals_and_sandbox:
@@ -1015,7 +1122,13 @@ whole-file diagnostics in import order; do not prepare every file separately.
         workspace_root: Path | None = None,
     ) -> AgentResult:
         root = workspace_root or self.config.settings.repo
-        prompt = self.build_prompt(chapter, stage, feedback=feedback, workspace_root=root)
+        prompt = self.build_prompt(
+            chapter,
+            stage,
+            feedback=feedback,
+            workspace_root=root,
+            role=run.role,
+        )
         return await self._run_prompt(
             chapter,
             stage,
@@ -1269,6 +1382,7 @@ whole-file diagnostics in import order; do not prepare every file separately.
                         root,
                         chapter=chapter,
                         feedback=feedback,
+                        role=run.role,
                         resume_thread_id=thread_id,
                     )
                     input_text = CAPACITY_RESUME_PROMPT
@@ -1278,6 +1392,7 @@ whole-file diagnostics in import order; do not prepare every file separately.
                         root,
                         chapter=chapter,
                         feedback=feedback,
+                        role=run.role,
                     )
                     input_text = prompt
                 exit_code, timed_out, capacity_failure, fd_pressure = await invoke(

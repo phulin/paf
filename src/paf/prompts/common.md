@@ -1,30 +1,31 @@
-## Common Lean policy
+## Rules shared by all Lean stages
 
 The assigned filesystem is not a Git repository. Do not run `git` commands or rely on Git metadata.
 
-### Mathematical integrity
+### Preserve the mathematics
 
-Use canonical pinned Mathlib and established LastLib APIs before introducing new interfaces. Match
-the intended hypotheses, types, coercions, normalization conventions, and source order precisely.
-Never use `True`, vacuous implications, artificial contradictions, the desired conclusion as a
-hypothesis, axioms, unsafe declarations, `sorryAx`, or another kernel-checking loophole. A helper
-must express reusable mathematics, precede its users, and not conceal a circular proof.
-Do not add or invoke `aesop`; use explicit lemmas and focused ordinary tactics.
+Prefer established definitions and results from the project's Mathlib version and earlier project
+chapters. Match the book's hypotheses, types, coercions, normalization choices, and source order.
+Never make a theorem easier by replacing it with `True`, adding the desired conclusion as an
+assumption, creating an artificial contradiction, or using axioms, unsafe declarations, `sorryAx`, or
+another way around Lean's checker. A helper must state useful mathematics, appear before its users,
+and not hide a circular proof. Do not add or invoke `aesop`; use focused lemmas and ordinary tactics.
 
-### Imports
+### Keep imports focused and chronological
 
-Add as many focused Mathlib or stable LastLib imports as the work requires; they do not need to be
-minimized. Never add the exact umbrella imports `import Mathlib` or `import LastLib`. A production
-section must not import a book or chapter aggregator when a focused module provides the API, and it
-must not import another section merely to mirror prose order. Aggregators may import leaves; leaves
-must not import aggregators. Preserve chronological dependencies: a chapter may import only earlier
-chapters in the same book and chapters from earlier books, never a later chapter or later book. Put
-genuinely shared chapter prerequisites in `Dependencies.lean` or `Core.lean` when either exists, but
-only when they logically precede every section that imports them. Do not move a result arising later
-in the source into a shared prerequisite merely because several later declarations use it.
+Add the focused Mathlib or stable project imports the work needs. Do not use the umbrella imports
+`import Mathlib` or `import LastLib`. A section file must not import a whole book or chapter when a
+specific module provides what it needs. Top-level chapter files may import section files; section
+files must not import those top-level files.
 
-### Diagnostics and deliverables
+In particular, a chapter may import only earlier chapters in the same book or chapters from earlier
+books. Put a
+genuinely shared prerequisite in `Dependencies.lean` or `Core.lean` when one exists and the result
+logically belongs before every section that uses it. Do not move a later result earlier merely because
+several later declarations need it.
 
-Resolve diagnostics by fixing their cause. Do not hide a warning with `set_option`, disable a linter,
-or leave diagnostic-suppression tricks in the source. Remove exploratory commands and all scratch,
-backup, or log files before finishing. Preserve unrelated work.
+### Leave clean, intentional changes
+
+Fix the cause of diagnostics. Do not hide warnings with options, disable linters, or leave diagnostic-
+suppression tricks in the source. Remove exploratory commands and scratch, backup, or log files before
+finishing. Preserve unrelated work.

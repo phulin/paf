@@ -12,7 +12,7 @@ import paf.codex as codex_module
 from paf.activity import EVENT_TIMESTAMP_FIELD
 from paf.codex import (
     DOWNSTREAM_RETRY_ROLE,
-    REPORT_SCHEMA,
+    REPORT_SCHEMAS,
     UPSTREAM_REPAIR_ROLE,
     CodexExecutor,
     FatalCodexInvocationError,
@@ -40,20 +40,55 @@ from paf.state_db import read_full_snapshot
 from tests.support import write_project
 
 
-def test_report_schema_uses_structured_fixup_findings() -> None:
-    assert "needs_fixup" not in REPORT_SCHEMA["properties"]
-    assert "needs_fixup" not in REPORT_SCHEMA["required"]
-    assert "fixup_findings" in REPORT_SCHEMA["required"]
-    assert "summary" in REPORT_SCHEMA["required"]
-    assert REPORT_SCHEMA["properties"]["summary"]["minLength"] == 1
-    assert REPORT_SCHEMA["properties"]["summary"]["pattern"] == r"\S"
-    assert "commit body" in REPORT_SCHEMA["properties"]["summary"]["description"]
+def test_report_schemas_contain_only_fields_used_by_each_agent() -> None:
+    expected = {
+        "discover": {"complete", "summary", "issues", "source_dependencies"},
+        "formalize": {"changed", "complete", "summary", "issues", "source_issues"},
+        "review": {"changed", "complete", "summary", "issues", "source_issues"},
+        "proof_review": {
+            "changed",
+            "complete",
+            "summary",
+            "issues",
+            "source_issues",
+            "finding_assessments",
+        },
+        "prove": {
+            "changed",
+            "complete",
+            "summary",
+            "issues",
+            "source_issues",
+            "failed_attempts",
+            "upstream_requests",
+        },
+        "downstream_retry": {
+            "changed",
+            "complete",
+            "summary",
+            "issues",
+            "source_issues",
+            "failed_attempts",
+            "upstream_requests",
+        },
+        "upstream_repair": {
+            "changed",
+            "complete",
+            "summary",
+            "issues",
+            "source_issues",
+            "failed_attempts",
+            "upstream_answers",
+        },
+    }
+    assert set(REPORT_SCHEMAS) == set(expected)
+    for key, fields in expected.items():
+        assert set(REPORT_SCHEMAS[key]["properties"]) == fields
+        assert set(REPORT_SCHEMAS[key]["required"]) == fields
 
 
 def test_report_schema_records_complete_upstream_handoffs() -> None:
-    assert "upstream_requests" in REPORT_SCHEMA["required"]
-    assert "upstream_answers" in REPORT_SCHEMA["required"]
-    request = REPORT_SCHEMA["properties"]["upstream_requests"]["items"]
+    request = REPORT_SCHEMAS["prove"]["properties"]["upstream_requests"]["items"]
     assert set(request["required"]) == {
         "blocked_declaration",
         "consumer_path",
@@ -64,7 +99,7 @@ def test_report_schema_records_complete_upstream_handoffs() -> None:
         "attempted_alternatives",
     }
     assert request["properties"]["attempted_alternatives"]["minItems"] == 2
-    answer = REPORT_SCHEMA["properties"]["upstream_answers"]["items"]
+    answer = REPORT_SCHEMAS["upstream_repair"]["properties"]["upstream_answers"]["items"]
     assert answer["properties"]["disposition"]["enum"] == [
         "added",
         "existing",
@@ -80,7 +115,11 @@ def test_report_schema_avoids_unsupported_codex_keywords() -> None:
             return [item for child in value for item in mappings(child)]
         return []
 
-    assert all("uniqueItems" not in value for value in mappings(REPORT_SCHEMA))
+    assert all(
+        "uniqueItems" not in value
+        for schema in REPORT_SCHEMAS.values()
+        for value in mappings(schema)
+    )
 
 
 def test_extracts_api_equivalent_usage() -> None:
@@ -261,9 +300,7 @@ def test_executor_uses_machine_readable_codex_mode(tmp_path: Path) -> None:
         for index, item in enumerate(formalize_command[:-1])
         if item == "--config"
     }
-    assert "lean_diagnostic_messages" in formalize_overrides[
-        "mcp_servers.paf_lean.enabled_tools"
-    ]
+    assert "lean_diagnostic_messages" in formalize_overrides["mcp_servers.paf_lean.enabled_tools"]
     assert "lean_code_actions" in formalize_overrides["mcp_servers.paf_lean.enabled_tools"]
     assert "lean_file_outline" not in formalize_overrides["mcp_servers.paf_lean.enabled_tools"]
     assert "lean_multi_attempt" not in formalize_overrides["mcp_servers.paf_lean.enabled_tools"]
@@ -279,6 +316,31 @@ def test_executor_uses_machine_readable_codex_mode(tmp_path: Path) -> None:
     assert "--cd" not in resumed
     resumed_review = executor.command(Stage.REVIEW, isolated, resume_thread_id="review-thread")
     assert "--dangerously-bypass-approvals-and-sandbox" in resumed_review
+
+
+@pytest.mark.asyncio
+async def test_executor_selects_a_distinct_schema_for_each_agent(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    executor = CodexExecutor(config, StateStore(config))
+    await executor.prepare()
+
+    def schema_path(command: list[str]) -> Path:
+        return Path(command[command.index("--output-schema") + 1])
+
+    selected = {
+        "discover": schema_path(executor.command(Stage.DISCOVER)),
+        "formalize": schema_path(executor.command(Stage.FORMALIZE)),
+        "review": schema_path(executor.command(Stage.REVIEW)),
+        "proof_review": schema_path(executor.command(Stage.REVIEW, feedback="evidence")),
+        "prove": schema_path(executor.command(Stage.PROVE)),
+        "downstream_retry": schema_path(executor.command(Stage.PROVE, role=DOWNSTREAM_RETRY_ROLE)),
+        "upstream_repair": schema_path(executor.command(Stage.PROVE, role=UPSTREAM_REPAIR_ROLE)),
+    }
+
+    assert len(set(selected.values())) == len(selected)
+    for key, path in selected.items():
+        assert json.loads(path.read_text(encoding="utf-8")) == REPORT_SCHEMAS[key]
+    assert not (config.settings.state_dir / "agent-report.schema.json").exists()
 
 
 def test_lean_mcp_does_not_prewarm_files(tmp_path: Path) -> None:
@@ -313,51 +375,6 @@ def test_lean_mcp_does_not_prewarm_files(tmp_path: Path) -> None:
     }
     assert "mcp_servers.paf_lean.env.LEAN_MCP_PREWARM_FILES" not in overrides
     assert json.loads(overrides["mcp_servers.paf_lean.env.LEAN_MCP_SCRATCH_SLOTS"]) == "1"
-
-
-@pytest.mark.parametrize("stage", list(Stage))
-def test_every_agent_prompt_explains_that_git_is_unavailable(tmp_path: Path, stage: Stage) -> None:
-    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
-    executor = CodexExecutor(config, StateStore(config))
-
-    prompt = executor.build_prompt(config.chapters[0], stage)
-
-    assert "filesystem is not a Git repository" in prompt
-    assert "Do not run `git` commands" in prompt
-
-
-@pytest.mark.parametrize("stage", list(Stage))
-def test_every_agent_prompt_requests_a_commit_body_summary(tmp_path: Path, stage: Stage) -> None:
-    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
-    executor = CodexExecutor(config, StateStore(config))
-
-    prompt = " ".join(executor.build_prompt(config.chapters[0], stage).split())
-
-    assert "describes the actual scoped edits and their purpose" in prompt
-    assert "suitable for use verbatim as a Git commit body" in prompt
-
-
-@pytest.mark.parametrize("stage", list(Stage))
-def test_every_agent_prompt_preserves_chronological_imports(tmp_path: Path, stage: Stage) -> None:
-    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
-    executor = CodexExecutor(config, StateStore(config))
-
-    prompt = " ".join(executor.build_prompt(config.chapters[0], stage).split())
-
-    assert "a chapter may import only earlier chapters in the same book" in prompt
-    assert "never a later chapter or later book" in prompt
-
-
-@pytest.mark.parametrize("stage", list(Stage))
-def test_out_of_scope_source_repairs_use_fixup_findings(tmp_path: Path, stage: Stage) -> None:
-    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
-    executor = CodexExecutor(config, StateStore(config))
-
-    prompt = " ".join(executor.build_prompt(config.chapters[0], stage).split())
-
-    assert "If a source repair requires an out-of-scope write" in prompt
-    assert "report it in `fixup_findings` with its exact owner path" in prompt
-    assert "if a fix requires an out-of-scope write, report it in `issues`" not in prompt
 
 
 @pytest.mark.parametrize(
@@ -479,36 +496,7 @@ def test_review_command_enables_lean_mcp(tmp_path: Path) -> None:
     assert any("lean_diagnostic_messages" in item for item in command)
 
 
-def test_review_prompts_read_sources_dynamically(tmp_path: Path) -> None:
-    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
-    executor = CodexExecutor(config, StateStore(config))
-
-    review = executor.build_prompt(config.chapters[0], Stage.REVIEW)
-    proof_review = executor.build_prompt(
-        config.chapters[0], Stage.REVIEW, feedback="Check the reported obstruction."
-    )
-
-    for prompt in (review, proof_review):
-        assert not prompt.startswith("# Line-numbered review source set")
-
-    prompt_root = Path(__file__).parents[1] / "src" / "paf" / "prompts"
-    for name in ("review.md", "proof_review.md"):
-        template = (prompt_root / name).read_text(encoding="utf-8")
-        assert "dynamically from its numbered heading" in template
-        assert "do not read the complete informal book" in " ".join(template.lower().split())
-
-
-def test_fixup_prompt_requires_diagnostics_and_sorry(tmp_path: Path) -> None:
-    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
-    executor = CodexExecutor(config, StateStore(config))
-
-    prompt = executor.build_prompt(config.chapters[0], Stage.FORMALIZE)
-    assert "Attached Lean MCP" in prompt
-    assert "lean_prepare_dependencies" in prompt
-    assert "maximal affected dependents" in " ".join(prompt.split())
-
-
-def test_upstream_repair_prompt_contains_batched_evidence_and_answer_contract(
+def test_upstream_repair_bundle_contains_batched_evidence(
     tmp_path: Path,
 ) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
@@ -541,27 +529,13 @@ def test_upstream_repair_prompt_contains_batched_evidence_and_answer_contract(
         "attempted_alternatives": ["simp", "exact existingCandidate n"],
         "previous_attempts": "Proof attempt 1 failed at the exact residual goal.",
     }
-    executor = CodexExecutor(config, StateStore(config))
-
     bundle = _upstream_source_bundle(tmp_path, owner, (request,), config.chapters)
-    prompt = executor.build_prompt(
-        owner,
-        Stage.PROVE,
-        role=UPSTREAM_REPAIR_ROLE,
-        upstream_requests=(request,),
-        workspace_root=tmp_path,
-    )
-
     assert "request-one" in bundle
     assert "Owner theorem text." in bundle
     assert "Consumer theorem text." in bundle
     assert "existingBridge" in bundle
     assert "blockedTarget" in bundle
     assert "unrelated : True" not in bundle
-    assert "Targeted upstream interface repair" in prompt
-    assert "one `upstream_answers` entry for every request id" in prompt
-    assert "fully qualified declaration names" in prompt
-    assert "leave `upstream_requests` empty" in prompt
 
 
 def test_declaration_placeholder_check_is_targeted_to_the_named_declaration(
@@ -584,47 +558,6 @@ def test_declaration_placeholder_check_is_targeted_to_the_named_declaration(
     assert declaration_uses_placeholder_in_chapter(tmp_path, chapter, "Book.solved") is False
     assert declaration_uses_placeholder_in_chapter(tmp_path, chapter, "blocked") is True
     assert declaration_uses_placeholder_in_chapter(tmp_path, chapter, "missing") is None
-
-
-def test_downstream_retry_prompt_labels_the_persisted_handoff(tmp_path: Path) -> None:
-    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
-    prompt = CodexExecutor(config, StateStore(config)).build_prompt(
-        config.chapters[0],
-        Stage.PROVE,
-        role=DOWNSTREAM_RETRY_ROLE,
-        feedback="Request request-one was answered by `Book.bridge`.",
-    )
-
-    assert "Targeted downstream retry handoff" in prompt
-    assert "Request request-one was answered" in prompt
-
-
-def test_shipped_prompts_have_consistent_stage_contracts() -> None:
-    prompt_root = Path(__file__).parents[1] / "src" / "paf" / "prompts"
-    formalize = " ".join((prompt_root / "formalize.md").read_text().split())
-    discover = " ".join((prompt_root / "discover.md").read_text().split())
-    prove = " ".join((prompt_root / "prove.md").read_text().split())
-
-    assert "structured `source_issues` ledger" in formalize
-    assert "`SOURCE_ISSUE` comment" not in formalize
-    assert "clean diagnostic pass" in formalize
-    assert "mathematically natural local dependency guess" in formalize
-    assert "native `update_plan` tool" in formalize
-    assert "one item for every numbered source section" in formalize
-    assert "native plan is flat" in formalize
-    assert "named result in the active section item" in formalize
-
-    assert "whole-file diagnostics in dependency order" in formalize
-    assert "declaration-uses-`sorry` warning" in formalize
-    assert "source dependency tree" in discover
-    assert "Do not create or edit files" in discover
-
-    assert "`update_plan` tool" in prove
-    assert "one item for every file that contains work" in prove
-    assert "in that dependency order" in prove
-    assert "never check off files out of order" in prove
-    assert "Report issues with other chapters ONLY if you find a false statement" in prove
-    assert "A theorem that you wish existed is not a reportable issue" in prove
 
 
 def test_warning_filter_allows_only_declaration_uses_sorry() -> None:
@@ -832,7 +765,6 @@ print(json.dumps({{"type": "item.completed", "item": {{
     assert len(invocations) == 2
     assert invocations[1]["args"][:2] == ["exec", "resume"]
     assert "capacity-thread" in invocations[1]["args"]
-    assert "Continue from the interrupted turn" in invocations[1]["prompt"]
     log = (state.logs_dir / f"{run.id}.jsonl").read_text(encoding="utf-8")
     assert "remote compact task" in log
     assert "resumed successfully" in log
@@ -1212,7 +1144,6 @@ print(json.dumps({{"type": "item.completed", "item": {{
     invocation = json.loads(invocations_path.read_text(encoding="utf-8"))
     assert invocation["args"][:2] == ["exec", "resume"]
     assert "saved-session" in invocation["args"]
-    assert "Continue from the interrupted turn" in invocation["prompt"]
     assert result.succeeded
     assert result.thread_id == "saved-session"
 

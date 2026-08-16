@@ -220,7 +220,7 @@ uv run paf source-issues books/02-finite-extensions-of-local-fields.md
 uv run paf source-issues --config paf.toml --json
 ```
 
-Every agent report has a structured `source_issues` field. Genuine textbook defects are recorded
+Every Lean-writing agent report has a structured `source_issues` field. Genuine textbook defects are recorded
 with a precise location, exact identifying excerpt, mathematical explanation, and minimal suggested
 replacement. The coordinator enriches each sighting with book, chapter, stage, and run provenance,
 deduplicates repeated sightings, and persists the ledger at `.paf/.../source-issues.json` as well
@@ -371,13 +371,13 @@ After the daemon exits, `status`, `snapshot`, and `wait` fall back to the persis
   other than `declaration uses sorry`.
 - **Review** visits dependency-ready chapters against a clean source and `.olean` generation. Only
   the first review waits for source-tree dependency reviews; subsequent re-reviews do not. Agents
-  make warranted in-scope statement and API changes directly; unresolved findings retain exact edit
-  paths and are routed to their owners. The last clean coordinator build remains authoritative for
+  make warranted in-scope statement and API changes directly; exact out-of-scope blockers remain in
+  the report. The last clean coordinator build remains authoritative for
   files a reviewer does not edit. Reviewers request whole-file LSP diagnostics after the last relevant
   edit only for the edited files and their assigned transitive dependents, rechecking just the files
   invalidated by any subsequent repair. A changed chapter receives a prioritized coordinator build.
-  Failed builds and structured `fixup_findings` are fed to full-scope review agents for the owning
-  chapters; they return to review rather than formalization.
+  Failed builds and structured proof `failed_attempts` are fed to a full-scope re-review of the
+  affected chapter; they return to review rather than formalization.
   An initial review that edits source receives another full pass until one pass is clean, capped at
   five review/verification cycles. A review launched with specific persisted findings instead makes
   one repair pass and completes as soon as its coordinator rebuild is clean; it does not require a
@@ -385,11 +385,9 @@ After the daemon exits, `status`, `snapshot`, and `wait` fall back to the persis
   descendant reviews continue. A reported chapter-local failure is quarantined: unrelated review and
   proof branches keep running, while actual dependents are marked blocked. Unexpected coordinator
   exceptions still fail fast after draining live workers. There is no corpus-wide clean-build or
-  review gate in the pipeline. Successful completion leaves the review task `succeeded`. An explicit
-  statement/API repair request moves only its owning review back to `pending`; forced review moves all
-  selected reviews back. Already-running downstream agents finish against their pinned clean snapshot
-  instead of being cancelled. Once that downstream frontier is quiescent, the owning review resumes
-  and any edit triggers the fresh coordinator build. Downstream reviews and proofs remain green unless
+  review gate in the pipeline. Successful completion leaves the review task `succeeded`. Forced
+  review moves all selected reviews back. Already-running downstream agents finish against their
+  pinned clean snapshot instead of being cancelled. Downstream reviews and proofs remain green unless
   an actual source edit makes their coordinator build fail. Ordinary proof edits and restart
   reconciliation do not reopen review.
 - **Prove** sends one chapter to an agent and asks it to work directly on unresolved placeholders.
@@ -407,12 +405,12 @@ After the daemon exits, `status`, `snapshot`, and `wait` fall back to the persis
   records the blocked declaration and consumer path, exact residual goal, minimal result needed,
   proposed owner chapter and paths, and at least two materially different attempted alternatives.
   It keeps working on independent declarations. The coordinator persists the request before doing
-  anything else and batches all requested records by owner chapter. One temporary proof-capable owner
-  agent receives the complete batch, consumer declaration excerpts, residual goals, prior attempts,
-  upstream source paths, and relevant textbook excerpts. Owner and ordinary chapter agents share the
-  same per-chapter lock, while this auxiliary run leaves the owner's ordinary proof task and round
-  count untouched. A clean repair either adds and proves the interface, identifies an existing exact
-  declaration, or records why the bridge belongs downstream. Reported additions and in-corpus
+  anything else and batches all requested records by owner chapter. A targeted variant of the
+  failed-proof re-review receives the complete batch, consumer declaration excerpts, residual goals,
+  prior attempts, upstream source paths, and relevant textbook excerpts. Owner and ordinary chapter
+  agents share the same per-chapter lock, while this auxiliary run leaves the owner's ordinary proof
+  task and round count untouched. A clean repair either adds and proves the interface, identifies an
+  existing exact declaration, or records why the bridge belongs downstream. Reported additions and in-corpus
   declarations are checked against the integrated placeholder-free sources before their answers are
   accepted. The request remains `requested` while this agent runs and becomes `answered` only after
   that completed answer is durably stored.
@@ -424,13 +422,12 @@ After the daemon exits, `status`, `snapshot`, and `wait` fall back to the persis
   placeholder closes the request. A malformed request, failed owner repair, unusable answer, or failed
   targeted retry blocks the proof task and marks the request `escalated`; ordinary `unblock` explicitly
   authorizes another targeted attempt without erasing run history.
-- A proof agent may change proof bodies but not declaration interfaces. A genuine statement/API
-  problem is reported through a structured `fixup_findings` entry; despite the legacy field name,
-  the pipeline returns directly to editing review before proving resumes.
+- A proof agent may change proof bodies but not declaration interfaces. It reports each unresolved
+  proof through structured `failed_attempts`, including checked approaches and the exact remaining
+  goal; the pipeline sends that evidence to an independent editing re-review before proving resumes.
 
 The orchestrator independently hashes every configured chapter scope. Agent claims about changes do
-not control review convergence. Lean placeholder scanning ignores comments and strings. The strict
-agent report distinguishes ordinary proof errors from genuine statement repair requests.
+not control review convergence. Lean placeholder scanning ignores comments and strings.
 
 ## Multi-book scheduling
 

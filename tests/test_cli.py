@@ -48,7 +48,6 @@ def test_failure_summary_prints_task_build_and_blocker_details(tmp_path: Path) -
             report={
                 "summary": "Review found a remaining interface defect.",
                 "issues": ["The theorem needs a positivity hypothesis."],
-                "fixup_findings": [{"description": "Add the missing positivity hypothesis."}],
             },
             validation={
                 "succeeded": False,
@@ -59,7 +58,7 @@ def test_failure_summary_prints_task_build_and_blocker_details(tmp_path: Path) -
             chapter.id,
             Stage.REVIEW,
             TaskStatus.FAILED,
-            "review left fixup findings",
+            "review left unresolved issues",
         )
         await state.set_task(
             chapter.id,
@@ -115,7 +114,6 @@ def test_graph_failure_does_not_print_historical_agent_findings(tmp_path: Path) 
             report={
                 "summary": "Historical review summary.",
                 "issues": ["Historical review issue."],
-                "fixup_findings": [{"description": "Historical fixup instruction."}],
             },
         )
         state.fixup_graph = {"algorithm": "observed-lean-imports", "error": graph_error}
@@ -318,14 +316,29 @@ def test_agent_can_start_and_wait_for_detached_pipeline(
 import json
 import sys
 import time
+from pathlib import Path
 
 sys.stdin.read()
-time.sleep(0.15)
+time.sleep(0.01)
 print(json.dumps({"type": "thread.started", "thread_id": "managed-thread"}))
 print(json.dumps({"type": "turn.completed", "usage": {
     "input_tokens": 10, "cached_input_tokens": 5, "output_tokens": 2}}))
-report = {"changed": False, "complete": True,
-          "summary": "done", "issues": []}
+schema = next((arg for arg in sys.argv if "agent-report-" in arg), "")
+report = {"complete": True, "summary": "done", "issues": []}
+if "discover" in schema:
+    report["source_dependencies"] = []
+else:
+    report.update({"changed": False, "source_issues": []})
+if "formalize" in schema:
+    target = Path("lean/Book/Chapter01.lean")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("import Book.Chapter01.Section\\n")
+    section = Path("lean/Book/Chapter01/Section.lean")
+    section.parent.mkdir(parents=True, exist_ok=True)
+    section.write_text("def formalized := True\\n")
+    report["changed"] = True
+if "prove" in schema:
+    report.update({"failed_attempts": [], "upstream_requests": []})
 print(json.dumps({"type": "item.completed", "item": {
     "type": "agent_message", "text": json.dumps(report)}}))
 """,
