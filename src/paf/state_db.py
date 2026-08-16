@@ -559,7 +559,8 @@ class StateWriter:
             while True:
                 write, future = self._queue.get()
                 if write is None:
-                    future.set_result(None)
+                    if not future.cancelled():
+                        future.set_result(None)
                     return
                 writes = [write]
                 futures = [future]
