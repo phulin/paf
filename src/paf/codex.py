@@ -38,6 +38,11 @@ REPORT_SCHEMA: dict[str, Any] = {
             "description": "Self-contained, change-focused prose suitable for a commit body.",
         },
         "issues": {"type": "array", "items": {"type": "string"}},
+        "source_dependencies": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1},
+            "description": "Direct prerequisite work-unit ids found during source discovery.",
+        },
         "fixup_findings": {
             "type": "array",
             "items": {
@@ -143,6 +148,7 @@ REPORT_SCHEMA: dict[str, Any] = {
         "complete",
         "summary",
         "issues",
+        "source_dependencies",
         "fixup_findings",
         "upstream_requests",
         "upstream_answers",
@@ -167,7 +173,7 @@ LEAN_MCP_PROOF_TOOLS = (
     "lean_code_actions",
 )
 
-LEAN_MCP_FIXUP_TOOLS = (
+LEAN_MCP_FORMALIZE_TOOLS = (
     *LEAN_MCP_BASE_TOOLS,
     "lean_completions",
     "lean_code_actions",
@@ -568,6 +574,7 @@ def _find_report(event: Any) -> dict[str, Any] | None:
             key in value for key in ("changed", "complete", "summary", "issues")
         ):
             value.setdefault("fixup_findings", [])
+            value.setdefault("source_dependencies", [])
             value.setdefault("upstream_requests", [])
             value.setdefault("upstream_answers", [])
             value.setdefault("source_issues", [])
@@ -756,6 +763,11 @@ class CodexExecutor:
         base = render_prompt(template, chapter)
         common = render_prompt(COMMON_PROMPT_PATH.read_text(encoding="utf-8"), chapter)
         scope = "\n".join(f"- `{item}`" for item in chapter.scope)
+        input_catalog = "\n".join(
+            f"- `{unit.id}` — {unit.title} ({unit.source.as_posix()}:{unit.source_span.start_line}-"
+            f"{unit.source_span.end_line})"
+            for unit in self.config.work_units
+        )
         proof_retry_contract = ""
         if stage is Stage.PROVE and feedback and role != UPSTREAM_REPAIR_ROLE:
             proof_retry_contract = """
@@ -772,20 +784,21 @@ argument shows that the statement cannot follow from its assumptions. If the lat
 that an earlier declaration or interface must change, return a minimal structured
 `upstream_requests` entry instead of another unchanged \"no pinned API\" report."""
         stage_contract = {
-            Stage.FORMALIZE: """This is one optimistic drafting attempt. The coordinator merges
-accepted scoped changes without running Lean. Compiler failures are deferred to the global fixup
-loop.""",
-            Stage.FIXUP: """Use the attached Lean MCP and the coordinator diagnostics or review
-findings appended to this prompt. This attempt is dependency-ready and may run beside unrelated
-fixups. As soon as it finishes, the coordinator merges it, rescans observed imports, and rebuilds it
-when its refined predecessors are clean; unrelated agents continue running.""",
+            Stage.DISCOVER: """This is a read-only source discovery attempt. Inspect the assigned
+source chapter and identify its direct prerequisite input nodes. Do not edit any file and leave all
+non-discovery report ledgers empty.""",
+            Stage.FORMALIZE: """This attempt owns source-faithful formalization and elaboration.
+The chapter's discovered predecessors are already clean. Create or repair the complete assigned
+scope, use the attached Lean MCP to clear every diagnostic except declarations using `sorry`, and
+return only after the scope is ready for the coordinator's authoritative build. Unrelated
+dependency-ready formalizers may run concurrently.""",
             Stage.REVIEW: """Audit and directly make every warranted in-scope statement or API
 change across the entire assigned chapter. When proof findings are attached, independently evaluate
 each one while still re-reviewing the complete scope. Preserve proof placeholders and do not spend
 time proving propositions.
 The coordinator has certified the incoming sources and dependencies clean except for permitted
-`sorry` warnings. The coordinator merges the scoped patch, then rebuilds it and sends compiler-only
-failures through the dependency-ordered fixup scheduler.""",
+`sorry` warnings. The coordinator merges the scoped patch, then rebuilds it and returns
+compiler-only failures to formalization.""",
             Stage.PROVE: """The project entered this attempt with a clean reviewed build. This is a
 proof-writing attempt, not an audit. Work directly on unresolved placeholders and do not diagnose
 untouched files merely to reconfirm the clean build. After the attempt, the coordinator builds the
@@ -798,10 +811,9 @@ Use the proof-capable Lean MCP, edit only the owner chapter, and fully prove eve
 The coordinator independently merges and builds the owner before releasing fresh consumer retries.
 Do not perform an ordinary owner-chapter placeholder pass."""
         validation_contract = {
-            Stage.FORMALIZE: "The coordinator checks the scoped result but intentionally does not "
-            "compile this optimistic drafting stage.",
-            Stage.FIXUP: "The coordinator independently checks scoped hashes and placeholders, "
-            "then runs the authoritative dependency-ordered build after integration.",
+            Stage.DISCOVER: "The coordinator validates and persists the reported source tree.",
+            Stage.FORMALIZE: "The coordinator independently checks scoped hashes, placeholders, "
+            "diagnostics, and the dependency-ordered build after integration.",
             Stage.REVIEW: "The coordinator independently checks scoped hashes, placeholders, and "
             "the chapter build after integration.",
             Stage.PROVE: "The coordinator independently checks scoped hashes, placeholders, "
@@ -868,6 +880,14 @@ coordinator routes these entries to the chapters that own those paths.
 
 {upstream_contract}
 
+Set `source_dependencies` only during discovery. Use direct work-unit ids from the input catalog;
+do not include the assigned work unit itself, transitive prerequisites, target-code imports, or a
+dependency inferred solely from chapter numbering. Every other stage must return an empty list.
+
+### Input catalog
+
+{input_catalog}
+
 Record each genuine defect in the informal textbook in `source_issues`, with its precise heading or
 other location, an exact identifying excerpt, a mathematical explanation, and the smallest suggested
 replacement. Do not use this ledger for missing Lean APIs, proof failures, or tooling problems. A
@@ -875,17 +895,17 @@ source issue is not a reason to stop: make the minimal principled accommodation 
 stage, clearly preserve or report the obstruction, and continue as far as possible through every
 unaffected part of the chapter. {validation_contract}
 """
-        if stage in (Stage.FIXUP, Stage.REVIEW, Stage.PROVE):
+        if stage in (Stage.FORMALIZE, Stage.REVIEW, Stage.PROVE):
             capabilities = (
                 "dependency preparation, whole-file diagnostics, hover, declaration lookup, "
                 "local search, completions, and code actions"
-                if stage in (Stage.FIXUP, Stage.REVIEW)
+                if stage in (Stage.FORMALIZE, Stage.REVIEW)
                 else "dependency preparation, whole-file diagnostics, goals, hover, declaration "
                 "lookup, code actions, completions, tactic trials, and local search"
             )
             mcp_workflow = {
-                Stage.FIXUP: """The MCP opens and synchronizes a destination file when any Lean tool
-uses it. Follow the fixup workflow above for diagnostic timing and scope.""",
+                Stage.FORMALIZE: """The MCP opens and synchronizes a destination file when any Lean
+tool uses it. Follow the formalization workflow above for diagnostic timing and scope.""",
                 Stage.REVIEW: """Any Lean tool opens and synchronizes its destination file. Follow
 the review workflow above for diagnostic timing and scope.""",
                 Stage.PROVE: """The MCP opens and synchronizes a destination file when any Lean tool
@@ -913,8 +933,8 @@ whole-file diagnostics in import order; do not prepare every file separately.
                 "Targeted downstream retry handoff"
                 if role == DOWNSTREAM_RETRY_ROLE
                 else {
-                    Stage.FORMALIZE: "Coordinator feedback",
-                    Stage.FIXUP: "Coordinator diagnostics and routed findings",
+                    Stage.DISCOVER: "Discovery feedback",
+                    Stage.FORMALIZE: "Coordinator diagnostics and routed findings",
                     Stage.REVIEW: "Failed proof findings to evaluate",
                     Stage.PROVE: "Cumulative proof-attempt ledger",
                 }[stage]
@@ -965,7 +985,7 @@ whole-file diagnostics in import order; do not prepare every file separately.
             command.extend(["--model", settings.model])
         if settings.reasoning_effort:
             command.extend(["--config", f'model_reasoning_effort="{settings.reasoning_effort}"'])
-        if stage in (Stage.FIXUP, Stage.REVIEW, Stage.PROVE):
+        if stage in (Stage.FORMALIZE, Stage.REVIEW, Stage.PROVE):
             backend = self.config.backend or LeanBackend(
                 project=settings.lean_project,
                 mcp_tool_timeout_seconds=settings.lean_mcp_tool_timeout_seconds,

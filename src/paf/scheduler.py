@@ -27,7 +27,7 @@ from paf.coordination import CoordinatorBuildQueue, PriorityLimiter
 from paf.corpus import (
     WorkUnitImportGraph,
     build_corpus_schedule,
-    build_work_unit_import_graph,
+    build_source_dependency_graph,
     scheduling_snapshot,
 )
 from paf.diagnostics import unexpected_lean_warnings
@@ -123,19 +123,8 @@ class PendingBuildRequest:
     future: asyncio.Future[dict[str, ValidationResult]]
 
 
-@dataclass
-class RunningFixupAgent:
-    chapter: WorkUnitLike
-    run: RunRecord
-    workspace: Any
-    task: asyncio.Task[AgentResult]
-    dependency_source_digests: dict[str, str]
-    feedback: str
-    source_lock_held: bool = False
-
-
 @dataclass(frozen=True)
-class RunningFixupStage:
+class RunningFormalizeStage:
     task: asyncio.Task[bool]
     progress: asyncio.Event
     target_ids: frozenset[str]
@@ -357,7 +346,8 @@ class Orchestrator:
         # this lock is never held for an overlay agent's editing lifetime or
         # for a proof validation outside a coordinator build.
         self.source_lock = asyncio.Lock()
-        self._fixup_graph_lock = asyncio.Lock()
+        self._formalize_graph_lock = asyncio.Lock()
+        self._discovery_lock = asyncio.Lock()
         self._invalidated_reviews: set[str] = set()
         self._proof_rechecks: set[str] = set()
         self._review_invalidation_generations: dict[str, int] = {}
@@ -447,9 +437,65 @@ class Orchestrator:
         scaffold_directories(self.config, self.work_units)
 
     def _observed_work_unit_graph(self) -> WorkUnitImportGraph:
-        return build_work_unit_import_graph(self.config.settings.repo, self.work_units)
+        nodes = self.state.source_dependency_tree.get("nodes", {})
+        return build_source_dependency_graph(
+            self.work_units,
+            nodes if isinstance(nodes, dict) else {},
+        )
 
-    def _retain_fixup_clean(
+    def _source_input_digest(self, chapter: WorkUnitLike) -> str:
+        path = self.config.settings.repo / chapter.source
+        lines = path.read_text(encoding="utf-8").splitlines()
+        selected = "\n".join(
+            lines[chapter.source_span.start_line - 1 : chapter.source_span.end_line]
+        )
+        return hashlib.sha256(f"{chapter.id}\0{selected}".encode()).hexdigest()
+
+    def _discovery_is_current(self, chapter: WorkUnitLike) -> bool:
+        nodes = self.state.source_dependency_tree.get("nodes", {})
+        record = nodes.get(chapter.id, {}) if isinstance(nodes, dict) else {}
+        return (
+            self.state.task(chapter.id, Stage.DISCOVER).status == TaskStatus.SUCCEEDED
+            and isinstance(record, dict)
+            and record.get("source_digest") == self._source_input_digest(chapter)
+        )
+
+    async def _persist_source_dependencies(
+        self,
+        chapter: WorkUnitLike,
+        dependencies: Iterable[str],
+        report: dict[str, Any],
+    ) -> None:
+        async with self._discovery_lock:
+            previous = self.state.source_dependency_tree
+            raw_nodes = previous.get("nodes", {}) if isinstance(previous, dict) else {}
+            nodes = dict(raw_nodes) if isinstance(raw_nodes, dict) else {}
+            nodes[chapter.id] = {
+                "dependencies": sorted(set(dependencies)),
+                "source_digest": self._source_input_digest(chapter),
+                "summary": str(report.get("summary", "")),
+                "issues": list(report.get("issues", ())),
+            }
+            graph = build_source_dependency_graph(self.work_units, nodes)
+            previous_edges = previous.get("edges") if isinstance(previous, dict) else None
+            edges = [list(edge) for edge in graph.edges]
+            revision = int(previous.get("revision", 0)) if isinstance(previous, dict) else 0
+            if previous_edges != edges:
+                revision += 1
+            self.state.source_dependency_tree = {
+                "algorithm": "source-discovery",
+                "revision": revision,
+                "order": list(graph.order),
+                "edges": edges,
+                "dependencies": {
+                    chapter_id: sorted(required)
+                    for chapter_id, required in sorted(graph.dependencies.items())
+                },
+                "nodes": nodes,
+            }
+            await self.state.save()
+
+    def _retain_formalize_clean(
         self,
         graph: WorkUnitImportGraph,
         records: dict[str, Any],
@@ -526,10 +572,10 @@ class Orchestrator:
             if any(captured[chapter_id] != digest for chapter_id, digest in current.items()):
                 return False
 
-            persisted = self.state.fixup_graph.get("clean", {})
+            persisted = self.state.formalize_graph.get("clean", {})
             records = persisted if isinstance(persisted, dict) else {}
-            clean = self._retain_fixup_clean(graph, records)
-            build_generation = int(self.state.fixup_graph.get("build_generation", 0))
+            clean = self._retain_formalize_clean(graph, records)
+            build_generation = int(self.state.formalize_graph.get("build_generation", 0))
             for chapter_id in graph.order:
                 if chapter_id not in required:
                     continue
@@ -542,7 +588,7 @@ class Orchestrator:
                     "source_digest": source,
                     "build_generation": build_generation,
                 }
-            await self._save_fixup_graph(
+            await self._save_formalize_graph(
                 graph,
                 clean,
                 build_generation=build_generation,
@@ -558,7 +604,7 @@ class Orchestrator:
         return await self._publish_validated_builds({chapter.id: snapshot})
 
     @staticmethod
-    def _invalidate_fixup_descendants(
+    def _invalidate_formalize_descendants(
         graph: WorkUnitImportGraph,
         clean: dict[str, dict[str, Any]],
         chapter_ids: Iterable[str],
@@ -572,18 +618,21 @@ class Orchestrator:
         """Mark an edited source closure stale before any verification is queued."""
 
         graph = self._observed_work_unit_graph()
-        persisted = self.state.fixup_graph.get("clean", {})
-        clean = self._retain_fixup_clean(graph, persisted if isinstance(persisted, dict) else {})
-        invalidated = self._invalidate_fixup_descendants(graph, clean, chapter_ids)
-        await self._save_fixup_graph(
+        persisted = self.state.formalize_graph.get("clean", {})
+        clean = self._retain_formalize_clean(
+            graph,
+            persisted if isinstance(persisted, dict) else {},
+        )
+        invalidated = self._invalidate_formalize_descendants(graph, clean, chapter_ids)
+        await self._save_formalize_graph(
             graph,
             clean,
-            build_generation=int(self.state.fixup_graph.get("build_generation", 0)),
+            build_generation=int(self.state.formalize_graph.get("build_generation", 0)),
             invalidated=invalidated,
         )
         return invalidated
 
-    async def _save_fixup_graph(
+    async def _save_formalize_graph(
         self,
         graph: WorkUnitImportGraph,
         clean: dict[str, dict[str, Any]],
@@ -592,10 +641,10 @@ class Orchestrator:
         invalidated: Iterable[str] = (),
         validated: Iterable[str] = (),
     ) -> int:
-        async with self._fixup_graph_lock:
+        async with self._formalize_graph_lock:
             explicitly_invalidated = set(invalidated)
             explicitly_validated = set(validated)
-            previous = self.state.fixup_graph
+            previous = self.state.formalize_graph
             previous_edges = previous.get("edges") if isinstance(previous, dict) else None
             current = previous.get("clean", {}) if isinstance(previous, dict) else {}
             if isinstance(current, dict):
@@ -612,12 +661,12 @@ class Orchestrator:
                     # resurrecting records this caller explicitly invalidated.
                     if int(record.get("build_generation", 0)) >= local_generation:
                         clean[chapter_id] = dict(record)
-            retained = self._retain_fixup_clean(graph, clean)
+            retained = self._retain_formalize_clean(graph, clean)
             clean.clear()
             clean.update(retained)
             edges = [list(edge) for edge in graph.edges]
             revision = int(previous.get("revision", 0)) if isinstance(previous, dict) else 0
-            if previous.get("algorithm") != "observed-lean-imports" or previous_edges != edges:
+            if previous.get("algorithm") != "source-dependency-tree" or previous_edges != edges:
                 revision += 1
             build_generation = max(
                 build_generation,
@@ -626,7 +675,8 @@ class Orchestrator:
             dirty = set(previous.get("dirty", ())) if isinstance(previous, dict) else set()
             dirty.update(explicitly_invalidated)
             dirty.difference_update(explicitly_validated)
-            self.state.fixup_graph = graph.snapshot() | {
+            self.state.formalize_graph = graph.snapshot() | {
+                "algorithm": "source-dependency-tree",
                 "revision": revision,
                 "build_generation": build_generation,
                 "clean": clean,
@@ -642,8 +692,8 @@ class Orchestrator:
         """Whether the current chapter source belongs to a retained clean build."""
 
         graph = self._observed_work_unit_graph()
-        persisted = self.state.fixup_graph.get("clean", {})
-        clean = self._retain_fixup_clean(
+        persisted = self.state.formalize_graph.get("clean", {})
+        clean = self._retain_formalize_clean(
             graph,
             persisted if isinstance(persisted, dict) else {},
         )
@@ -683,7 +733,7 @@ class Orchestrator:
         if isolated.accepted and isolated.changed_paths and stage is not Stage.PROVE:
             try:
                 invalidated_builds = await self._invalidate_build_records((chapter.id,))
-                if stage in (Stage.FIXUP, Stage.REVIEW):
+                if stage in (Stage.FORMALIZE, Stage.REVIEW):
                     self._proof_rechecks.update(invalidated_builds)
             except BaseException as error:
                 detail = str(error) or type(error).__name__
@@ -707,7 +757,7 @@ class Orchestrator:
         await self.control.checkpoint()
         schedule = (
             self.statement_schedule
-            if stage in (Stage.FORMALIZE, Stage.FIXUP, Stage.REVIEW)
+            if stage in (Stage.FORMALIZE, Stage.FORMALIZE, Stage.REVIEW)
             else self.proof_schedule
         )
         chapter_lock = self._chapter_agent_locks[chapter.id]
@@ -798,7 +848,10 @@ class Orchestrator:
             if source_held:
                 self.source_lock.release()
                 source_held = False
-            if isolated.accepted and agent.changed and (stage is not Stage.PROVE or auxiliary):
+            if isolated.accepted and agent.changed and stage in (
+                Stage.FORMALIZE,
+                Stage.REVIEW,
+            ):
                 invalidated_builds = await self._invalidate_build_records((chapter.id,))
                 if stage is Stage.REVIEW or auxiliary:
                     self._proof_rechecks.update(invalidated_builds)
@@ -843,7 +896,7 @@ class Orchestrator:
                     validation = ValidationResult(
                         True,
                         0,
-                        "validation deferred to the coordinator fixup loop",
+                        "validation deferred to the coordinator formalize loop",
                     )
             else:
                 validation = ValidationResult(
@@ -924,48 +977,153 @@ class Orchestrator:
         assert run is not None
         return Attempt(agent=agent, validation=validation, run=run)
 
-    async def _formalize(self, chapter: WorkUnitLike, *, rerun: bool = False) -> FormalizeOutcome:
-        if self._already_done(chapter, Stage.FORMALIZE):
-            return FormalizeOutcome(True)
-        if not rerun and not self.force and self._scope_exists(chapter):
-            await self.state.set_task(
-                chapter.id,
-                Stage.FORMALIZE,
-                TaskStatus.SUCCEEDED,
-                "existing chapter files skipped",
-            )
+    async def _discover(self, chapter: WorkUnitLike, *, rerun: bool = False) -> FormalizeOutcome:
+        if not rerun and not self.force and self._discovery_is_current(chapter):
             return FormalizeOutcome(True)
         attempt = await self._attempt(
             chapter,
-            Stage.FORMALIZE,
-            queue_detail="single optimistic drafting pass",
+            Stage.DISCOVER,
+            queue_detail="reading source and discovering direct dependencies",
         )
         complete = bool(attempt.agent.report.get("complete"))
-        if attempt.agent.succeeded and attempt.validation.succeeded and complete:
+        raw_dependencies = attempt.agent.report.get("source_dependencies", ())
+        dependencies = (
+            tuple(dict.fromkeys(item for item in raw_dependencies if isinstance(item, str)))
+            if isinstance(raw_dependencies, list)
+            else ()
+        )
+        configured = tuple(chapter.depends_on)
+        dependencies = tuple(dict.fromkeys((*configured, *dependencies)))
+        known = {item.id for item in self.work_units}
+        invalid = set(dependencies).difference(known)
+        if chapter.id in dependencies:
+            invalid.add(chapter.id)
+        if attempt.agent.changed:
             await self.state.set_task(
                 chapter.id,
-                Stage.FORMALIZE,
-                TaskStatus.SUCCEEDED,
-                "optimistic chapter draft completed",
-            )
-            return FormalizeOutcome(True)
-        if attempt.agent.capacity_exhausted:
-            await self.state.set_task(
-                chapter.id,
-                Stage.FORMALIZE,
+                Stage.DISCOVER,
                 TaskStatus.FAILED,
-                "model capacity remained unavailable after the configured retries",
+                "discovery must be read-only",
             )
             return FormalizeOutcome(False)
+        if attempt.agent.succeeded and attempt.validation.succeeded and complete and not invalid:
+            try:
+                await self._persist_source_dependencies(chapter, dependencies, attempt.agent.report)
+            except ValueError as error:
+                await self.state.set_task(
+                    chapter.id,
+                    Stage.DISCOVER,
+                    TaskStatus.FAILED,
+                    str(error),
+                )
+                return FormalizeOutcome(False)
+            await self.state.set_task(
+                chapter.id,
+                Stage.DISCOVER,
+                TaskStatus.SUCCEEDED,
+                "source dependency tree persisted",
+            )
+            return FormalizeOutcome(True)
+        await self.state.set_task(
+            chapter.id,
+            Stage.DISCOVER,
+            TaskStatus.FAILED,
+            (
+                "discovery reported unknown dependency ids: " + ", ".join(sorted(invalid))
+                if invalid
+                else "source dependency discovery was incomplete"
+            ),
+        )
+        return FormalizeOutcome(False)
+
+    async def _formalize(self, chapter: WorkUnitLike, *, rerun: bool = False) -> FormalizeOutcome:
+        if self._already_done(chapter, Stage.FORMALIZE):
+            return FormalizeOutcome(True)
+        maximum = self.config.stages[Stage.FORMALIZE].max_rounds
+        feedback = ""
+        for iteration in range(1, maximum + 1):
+            if self._scope_exists(chapter):
+                snapshots: dict[str, ValidatedBuildSnapshot] = {}
+                validation = (
+                    await self._build_chapters(
+                        (chapter,),
+                        publish_if_clean=True,
+                        mode="source-tree-formalize",
+                        iteration=iteration,
+                        maximum_iterations=maximum,
+                        stage=Stage.FORMALIZE,
+                        priority=100.0,
+                        snapshots=snapshots,
+                    )
+                )[chapter.id]
+                if validation.succeeded and await self._publish_validated_build(
+                    chapter, snapshots[chapter.id]
+                ):
+                    await self.state.set_task(
+                        chapter.id,
+                        Stage.FORMALIZE,
+                        TaskStatus.SUCCEEDED,
+                        "clean diagnostics and coordinator build in source dependency order",
+                    )
+                    return FormalizeOutcome(True)
+                feedback = self._build_feedback({chapter.id: validation}).actionable.get(
+                    chapter.id, validation.output
+                )
+
+            attempt = await self._attempt(
+                chapter,
+                Stage.FORMALIZE,
+                feedback=feedback,
+                queue_detail=f"dependency-ready formalization pass {iteration}/{maximum}",
+            )
+            complete = bool(attempt.agent.report.get("complete"))
+            if attempt.agent.capacity_exhausted:
+                await self.state.set_task(
+                    chapter.id,
+                    Stage.FORMALIZE,
+                    TaskStatus.FAILED,
+                    "model capacity remained unavailable after the configured retries",
+                )
+                return FormalizeOutcome(False)
+            if not attempt.agent.succeeded or not attempt.validation.succeeded or not complete:
+                await self.state.set_task(
+                    chapter.id,
+                    Stage.FORMALIZE,
+                    TaskStatus.FAILED,
+                    "formalizer failed or reported incomplete coverage and diagnostics",
+                )
+                return FormalizeOutcome(False)
+
+        if self._scope_exists(chapter):
+            snapshots = {}
+            validation = (
+                await self._build_chapters(
+                    (chapter,),
+                    publish_if_clean=True,
+                    mode="source-tree-formalize-final",
+                    iteration=maximum,
+                    maximum_iterations=maximum,
+                    stage=Stage.FORMALIZE,
+                    priority=100.0,
+                    snapshots=snapshots,
+                )
+            )[chapter.id]
+            if validation.succeeded and await self._publish_validated_build(
+                chapter, snapshots[chapter.id]
+            ):
+                await self.state.set_task(
+                    chapter.id,
+                    Stage.FORMALIZE,
+                    TaskStatus.SUCCEEDED,
+                    "clean diagnostics and coordinator build in source dependency order",
+                )
+                return FormalizeOutcome(True)
+
         await self.state.set_task(
             chapter.id,
             Stage.FORMALIZE,
             TaskStatus.FAILED,
-            (
-                "formalizer reported an incomplete chapter draft"
-                if attempt.agent.succeeded and attempt.validation.succeeded
-                else "single drafting attempt failed"
-            ),
+            f"formalization did not reach clean diagnostics in {maximum} attempts",
         )
         return FormalizeOutcome(False)
 
@@ -1718,7 +1876,7 @@ class Orchestrator:
         mode: str = "targeted",
         iteration: int = 1,
         maximum_iterations: int = 1,
-        stage: Stage = Stage.FIXUP,
+        stage: Stage = Stage.FORMALIZE,
         priority: float = 100.0,
         preemptible: bool = False,
         snapshots: dict[str, ValidatedBuildSnapshot] | None = None,
@@ -1885,7 +2043,7 @@ class Orchestrator:
         mode: str = "targeted",
         iteration: int = 1,
         maximum_iterations: int = 1,
-        stage: Stage = Stage.FIXUP,
+        stage: Stage = Stage.FORMALIZE,
         priority: float = 100.0,
         preemptible: bool = False,
         snapshots: dict[str, ValidatedBuildSnapshot] | None = None,
@@ -2118,828 +2276,116 @@ class Orchestrator:
             deferred_owner_ids=deferred,
         )
 
-    async def _start_fixup_agent(
-        self,
-        chapter: WorkUnitLike,
-        feedback: str,
-        dependency_source_digests: dict[str, str],
-    ) -> RunningFixupAgent:
-        """Start an isolated fixup agent without waiting for or merging its result."""
+    async def _discover_all(self) -> bool:
+        """Discover every input independently and persist each result as it lands."""
 
-        maximum = self.config.stages[Stage.FIXUP].max_rounds
-        task = self.state.task(chapter.id, Stage.FIXUP)
-        await self.control.checkpoint()
-        try:
-            await self.state.set_task(
-                chapter.id,
-                Stage.FIXUP,
-                TaskStatus.PENDING,
-                f"queued for fixup run {task.rounds + 1} (repair-cycle cap {maximum})",
-                queued=True,
-            )
-            await self.agent_slots.acquire(self.statement_schedule.priority(chapter.document_id))
-        except BaseException:
-            if self.state.task(chapter.id, Stage.FIXUP).queued:
-                await self.state.set_task(
-                    chapter.id,
-                    Stage.FIXUP,
-                    TaskStatus.PENDING,
-                    "fixup start interrupted while queued",
-                )
-            raise
-        run = None
-        workspace = None
-        source_held = False
-        try:
-            run = await self.state.start_run(chapter.id, Stage.FIXUP)
-            if self.isolation.name == "shared":
-                await self.source_lock.acquire()
-                source_held = True
-                await self.git.ensure_clean(chapter)
-                workspace = await self.isolation.acquire(run.id)
-                snapshot = getattr(workspace, "snapshot", None)
-                if snapshot is not None:
-                    await snapshot(chapter)
-            else:
-                async with self.source_lock:
-                    await self.git.ensure_clean(chapter)
-                workspace = await self.isolation.acquire(run.id)
-
-            async def execute() -> AgentResult:
-                try:
-                    return await self.executor.run(
-                        chapter,
-                        Stage.FIXUP,
-                        run,
-                        feedback=feedback,
-                        workspace_root=workspace.root,
-                    )
-                finally:
-                    self.agent_slots.release()
-
-            return RunningFixupAgent(
-                chapter=chapter,
-                run=run,
-                workspace=workspace,
-                task=asyncio.create_task(execute()),
-                dependency_source_digests=dependency_source_digests,
-                feedback=feedback,
-                source_lock_held=source_held,
-            )
-        except BaseException as error:
-            self.agent_slots.release()
-            if self.state.task(chapter.id, Stage.FIXUP).queued:
-                await self.state.set_task(
-                    chapter.id,
-                    Stage.FIXUP,
-                    TaskStatus.PENDING,
-                    "fixup start interrupted while queued",
-                )
-            if workspace is not None:
-                await workspace.close()
-            if source_held:
-                self.source_lock.release()
-            if run is not None and run.status == TaskStatus.RUNNING:
-                detail = str(error) or type(error).__name__
-                await self.state.finish_run(
-                    run,
-                    status=TaskStatus.FAILED,
-                    isolation={
-                        "accepted": False,
-                        "error": f"orchestration failed before agent start: {detail}",
-                    },
-                )
-            raise
-
-    async def _integrate_fixup_agent(self, handle: RunningFixupAgent) -> Attempt | None:
-        """Merge one completed agent while no other source integration can interleave."""
-
-        workspace = handle.workspace
-        isolated: IsolationResult | None = None
-        try:
-            agent = await handle.task
-            if not handle.source_lock_held:
-                await self.source_lock.acquire()
-                handle.source_lock_held = True
-            isolated = await workspace.collect(handle.chapter, integration_lock=None)
-            isolated = await self._commit_agent_changes(
-                handle.chapter,
-                Stage.FIXUP,
-                agent,
-                isolated,
-            )
-            await workspace.close()
-            workspace = None
-            if handle.source_lock_held:
-                self.source_lock.release()
-                handle.source_lock_held = False
-            if isolated.accepted:
-                if agent.changed:
-                    invalidated_builds = await self._invalidate_build_records((handle.chapter.id,))
-                    self._proof_rechecks.update(invalidated_builds)
-                validation = ValidationResult(
-                    True,
-                    0,
-                    "validation deferred to the topological fixup scheduler",
-                )
-            else:
-                detail = isolated.error
-                if isolated.out_of_scope_paths:
-                    detail += ": " + ", ".join(isolated.out_of_scope_paths)
-                agent = replace(agent, succeeded=False, error=detail)
-                validation = ValidationResult(
-                    False,
-                    1,
-                    f"Isolation rejected the agent result: {detail}",
-                )
-                await self.state.update_run(handle.run, status=TaskStatus.FAILED)
-            await self.state.update_run(
-                handle.run,
-                isolation=isolated.as_dict(),
-                validation=validation.as_dict(),
-            )
-        except BaseException as error:
-            interrupted_isolation: dict[str, object] | None = None
-            if (
-                isinstance(error, asyncio.CancelledError)
-                and self.control.integrate_interrupted_workspaces
-                and workspace is not None
-            ):
-                interrupted_isolation = await self._integrate_interrupted_workspace(
-                    handle.chapter,
-                    Stage.FIXUP,
-                    workspace,
-                    source_lock_held=handle.source_lock_held,
-                    collected=isolated,
-                )
-            if workspace is not None:
-                await workspace.close()
-            if handle.source_lock_held:
-                self.source_lock.release()
-                handle.source_lock_held = False
-            if handle.run is not None:
-                detail = str(error) or type(error).__name__
-                failure_isolation = interrupted_isolation
-                if failure_isolation is None and isolated is not None:
-                    failure_isolation = isolated.as_dict()
-                    failure_isolation["error"] = (
-                        f"changes integrated but orchestration failed before completion: {detail}"
-                    )
-                await self.state.finish_run(
-                    handle.run,
-                    status=TaskStatus.FAILED,
-                    isolation=failure_isolation
-                    or {
-                        "accepted": False,
-                        "error": f"orchestration failed before integration: {detail}",
-                    },
-                )
-            raise
-
-        attempt = Attempt(agent=agent, validation=validation, run=handle.run)
-        if agent.succeeded and validation.succeeded:
-            await self.state.set_task(
-                handle.chapter.id,
-                Stage.FIXUP,
-                TaskStatus.PENDING,
-                "fixup complete; queued for coordinator verification",
-            )
-            return attempt
-        await self.state.set_task(
-            handle.chapter.id,
-            Stage.FIXUP,
-            TaskStatus.FAILED,
-            (
-                "capacity retries exhausted; fixup failed"
-                if agent.capacity_exhausted
-                else "fixup agent failed"
-            ),
+        results = await _gather_cancel_on_error(
+            self._discover(chapter) for chapter in self.work_units
         )
-        return None
+        return all(result.succeeded for result in results)
 
-    async def _fixup_to_clean(
+    async def _discover_and_formalize(
         self,
-        feedback: dict[str, str] | None = None,
         *,
-        target_ids: Iterable[str] | None = None,
         progress_event: asyncio.Event | None = None,
+        discover: bool = True,
     ) -> bool:
-        """Converge globally or until selected targets are clean in the observed DAG."""
+        """Pipeline discovery into dependency-ready formalization without a stage gate."""
 
-        incoming_feedback = dict(feedback or {})
-        pending_feedback: dict[str, str] = {}
         by_id = {chapter.id: chapter for chapter in self.work_units}
-        targeted = target_ids is not None
-        goals = set(target_ids or ())
-        unknown_goals = goals.difference(by_id)
-        if unknown_goals:
-            raise ValueError(f"unknown fixup targets: {', '.join(sorted(unknown_goals))}")
-        goals.difference_update(
-            chapter_id for chapter_id in goals if self.state.later_stage_started(chapter_id)
-        )
-        maximum = self.config.stages[Stage.FIXUP].max_rounds
-        attempts = {chapter_id: 0 for chapter_id in by_id}
-        running: dict[str, RunningFixupAgent] = {}
+        discovery_tasks: dict[str, asyncio.Task[FormalizeOutcome]] = {}
+        if discover:
+            for chapter in self.work_units:
+                if self.force or not self._discovery_is_current(chapter):
+                    discovery_tasks[chapter.id] = asyncio.create_task(
+                        self._discover(chapter, rerun=self.force)
+                    )
+        formalize_tasks: dict[str, asyncio.Task[FormalizeOutcome]] = {}
         failed: set[str] = set()
-        review_deferred: set[str] = set()
-        persisted_clean = self.state.fixup_graph.get("clean", {})
-        clean_records = persisted_clean if isinstance(persisted_clean, dict) else {}
-        clean: dict[str, dict[str, Any]] = {}
-        invalidated_clean: set[str] = set()
-        build_generation = int(self.state.fixup_graph.get("build_generation", 0))
 
-        async def merge_feedback(items: dict[str, str]) -> None:
-            review_feedback: dict[str, str] = {}
-            for chapter_id, diagnostic in items.items():
-                if chapter_id not in by_id:
-                    continue
-                if self.state.later_stage_started(chapter_id):
-                    review_feedback[chapter_id] = diagnostic
-                    goals.discard(chapter_id)
-                    pending_feedback.pop(chapter_id, None)
-                    continue
-                if targeted:
-                    goals.add(chapter_id)
-                existing = pending_feedback.get(chapter_id, "")
-                if diagnostic not in existing:
-                    pending_feedback[chapter_id] = (
-                        f"{existing}\n\n{diagnostic}" if existing else diagnostic
-                    )
-            if review_feedback:
-                feedback_fingerprint = hashlib.sha256(
-                    "\0".join(
-                        f"{chapter_id}\0{diagnostic}"
-                        for chapter_id, diagnostic in sorted(review_feedback.items())
-                    ).encode()
-                ).hexdigest()[:16]
-                await self._queue_review_feedback(
-                    review_feedback,
-                    origin=f"fixup-build:{feedback_fingerprint}",
-                )
-                invalidated_builds = await self._invalidate_build_records(review_feedback)
-                self._proof_rechecks.update(invalidated_builds)
-                review_deferred.update(review_feedback)
-                await self.state.set_tasks(
-                    review_feedback,
-                    Stage.FIXUP,
-                    TaskStatus.SUCCEEDED,
-                    "later build diagnostics routed to review",
-                )
-                if progress_event is not None:
-                    progress_event.set()
-
-        await merge_feedback(incoming_feedback)
-
-        async def publish_successful_builds(
-            results: dict[str, ValidationResult],
-            snapshots: dict[str, ValidatedBuildSnapshot],
-            *,
-            detail: str,
-        ) -> set[str]:
-            nonlocal build_generation, clean
-            successful = {
-                chapter_id: snapshots[chapter_id]
-                for chapter_id, result in results.items()
-                if result.succeeded and chapter_id in snapshots
-            }
-            if not successful or not await self._publish_validated_builds(successful):
-                return set()
-            persisted = self.state.fixup_graph.get("clean", {})
-            records = persisted if isinstance(persisted, dict) else {}
-            clean = self._retain_fixup_clean(self._observed_work_unit_graph(), records)
-            build_generation = int(self.state.fixup_graph.get("build_generation", 0))
-            published = set(successful).intersection(clean)
-            invalidated_clean.difference_update(published)
-            if published:
-                await self.state.set_tasks(
-                    published,
-                    Stage.FIXUP,
-                    TaskStatus.SUCCEEDED,
-                    detail,
-                )
-                if progress_event is not None:
-                    progress_event.set()
-            return published
-
-        async def fail_graph(error: ValueError) -> bool:
-            self.state.fixup_graph = {"algorithm": "observed-lean-imports", "error": str(error)}
-            async with self.state.batch():
-                await self.state.save()
-                await self.state.set_tasks(
-                    by_id,
-                    Stage.FIXUP,
-                    TaskStatus.FAILED,
-                    str(error),
-                )
-            return False
-
-        async def cancel_running() -> None:
-            handles = tuple(running.values())
-            running.clear()
-            for handle in handles:
-                handle.task.cancel()
-            await asyncio.gather(*(handle.task for handle in handles), return_exceptions=True)
-            for handle in handles:
-                interrupted_isolation: dict[str, object] | None = None
-                if self.control.integrate_interrupted_workspaces:
-                    interrupted_isolation = await self._integrate_interrupted_workspace(
-                        handle.chapter,
-                        Stage.FIXUP,
-                        handle.workspace,
-                        source_lock_held=handle.source_lock_held,
-                    )
-                if handle.run.status == TaskStatus.RUNNING:
-                    await self.state.finish_run(
-                        handle.run,
-                        status=TaskStatus.FAILED,
-                        isolation=interrupted_isolation
-                        or {
-                            "accepted": False,
-                            "error": "fixup agent cancelled by orchestrator",
-                        },
-                    )
-                elif interrupted_isolation is not None:
-                    await self.state.update_run(
-                        handle.run,
-                        isolation=interrupted_isolation,
-                    )
-                await self.state.set_task(
-                    handle.chapter.id,
-                    Stage.FIXUP,
-                    TaskStatus.PENDING,
-                    (
-                        "fixup agent interrupted; partial changes integrated; requeued"
-                        if interrupted_isolation is not None
-                        and interrupted_isolation.get("accepted")
-                        and interrupted_isolation.get("changed_paths")
-                        else "fixup agent interrupted; requeued"
-                    ),
-                )
-                await handle.workspace.close()
-                if handle.source_lock_held:
-                    self.source_lock.release()
-                    handle.source_lock_held = False
-
-        async def discard_stale(handle: RunningFixupAgent, changed: tuple[str, ...]) -> None:
-            detail = "dependency changed while fixup agent was running: " + ", ".join(changed)
-            await handle.workspace.close()
-            if handle.source_lock_held:
-                self.source_lock.release()
-                handle.source_lock_held = False
-            validation = ValidationResult(False, 1, detail)
-            await self.state.update_run(
-                handle.run,
-                isolation={"accepted": False, "error": detail},
-                validation=validation.as_dict(),
-            )
-            await self.state.set_task(
-                handle.chapter.id,
-                Stage.FIXUP,
-                TaskStatus.PENDING,
-                "stale dependency snapshot; fixup requeued",
-            )
-            await merge_feedback({handle.chapter.id: detail})
-
-        async def build_chapters(
-            chapter_ids: Iterable[str],
-            graph: WorkUnitImportGraph,
-            *,
-            mode: str = "topological",
-        ) -> bool:
-            nonlocal build_generation, clean
-            ids = tuple(chapter_ids)
-            if not ids:
-                return True
-            chapters = tuple(by_id[chapter_id] for chapter_id in ids)
-            snapshots: dict[str, ValidatedBuildSnapshot] = {}
-            results = await self._build_chapters(
-                chapters,
-                publish_if_clean=True,
-                mode=mode,
-                iteration=min(max(attempts[chapter_id] for chapter_id in ids) + 1, maximum),
-                maximum_iterations=maximum,
-                stage=Stage.FIXUP,
-                priority=100.0,
-                snapshots=snapshots,
-            )
-            published = await publish_successful_builds(
-                results,
-                snapshots,
-                detail="clean coordinator build against observed imports",
-            )
-            if published == set(ids):
-                return True
-
-            diagnostics = self._build_feedback(results).actionable
-            diagnostics.update(
-                {
-                    chapter_id: (
-                        "The source scope changed after its coordinator build; "
-                        "rebuild the fresh generation."
-                    )
-                    for chapter_id, result in results.items()
-                    if result.succeeded and chapter_id not in published
-                }
-            )
-            await merge_feedback(diagnostics)
-            invalidated_clean.update(
-                self._invalidate_fixup_descendants(
-                    graph,
-                    clean,
-                    diagnostics or ids,
-                )
-            )
-            await self._save_fixup_graph(
-                graph,
-                clean,
-                build_generation=build_generation,
-                invalidated=invalidated_clean,
-            )
-            return False
-
-        async def start_actionable_fixups(graph: WorkUnitImportGraph) -> None:
-            """Fill free agent slots from the dependency-ready feedback frontier."""
-
-            active = sum(not handle.task.done() for handle in running.values())
-            available = self.config.settings.max_agents - active
-            if self.isolation.name == "shared":
-                available = min(available, 1 - active)
-            actionable = [
-                chapter_id
-                for chapter_id in graph.order
-                if chapter_id in pending_feedback
-                and chapter_id not in running
-                and chapter_id not in failed
-                and graph.dependencies[chapter_id].issubset(clean)
-            ]
-            for chapter_id in actionable[: max(available, 0)]:
-                if self.state.later_stage_started(chapter_id):
-                    await merge_feedback({chapter_id: pending_feedback.pop(chapter_id)})
-                    continue
-                if attempts[chapter_id] >= maximum:
-                    await self.state.set_task(
-                        chapter_id,
-                        Stage.FIXUP,
-                        TaskStatus.FAILED,
-                        f"fixup did not converge in {maximum} attempts",
-                    )
-                    pending_feedback.pop(chapter_id, None)
-                    failed.add(chapter_id)
-                    invalidated_clean.update(
-                        self._invalidate_fixup_descendants(graph, clean, (chapter_id,))
-                    )
-                    continue
-                attempts[chapter_id] += 1
-                dependency_source_digests = {
-                    dependency: str(clean[dependency]["source_digest"])
-                    for dependency in graph.dependencies[chapter_id]
-                }
-                running[chapter_id] = await self._start_fixup_agent(
-                    by_id[chapter_id],
-                    pending_feedback.pop(chapter_id),
-                    dependency_source_digests,
-                )
-
-        try:
-            graph = self._observed_work_unit_graph()
-        except ValueError as error:
-            return await fail_graph(error)
-
-        clean = self._retain_fixup_clean(graph, clean_records)
-        invalidated_clean.update(self._invalidate_fixup_descendants(graph, clean, pending_feedback))
-        await self._save_fixup_graph(
-            graph,
-            clean,
-            build_generation=build_generation,
-            invalidated=invalidated_clean,
-        )
-        reusable = set(clean).intersection(goals if targeted else by_id)
-        if reusable:
-            await self.state.set_tasks(
-                reusable,
-                Stage.FIXUP,
-                TaskStatus.SUCCEEDED,
-                "clean initial build reused",
-            )
-            if progress_event is not None:
-                progress_event.set()
-
-        if targeted and goals.issubset(clean) and not pending_feedback:
-            return True
-
-        # Drafting deliberately skips Lean validation. Before spending an
-        # agent slot on any resulting fixup feedback, optimistically build the
-        # complete dirty selected closure in one Lake invocation. Lake owns the
-        # dependency ordering and parallelism within this initial frontier.
-        optimistic_ids = self._dependency_closure(graph, goals) if targeted else set(by_id)
-        optimistic_ids.difference_update(clean)
-        optimistic = tuple(
-            by_id[chapter_id] for chapter_id in graph.order if chapter_id in optimistic_ids
-        )
-        if optimistic:
-            snapshots: dict[str, ValidatedBuildSnapshot] = {}
-            results = await self._build_chapters(
-                optimistic,
-                publish_if_clean=True,
-                mode="optimistic",
-                iteration=1,
-                maximum_iterations=maximum,
-                snapshots=snapshots,
-            )
-            published = await publish_successful_builds(
-                results,
-                snapshots,
-                detail="clean optimistic coordinator build; no fixup agent needed",
-            )
-            if published != set(results):
-                diagnostics = self._build_feedback(results).actionable
-                diagnostics.update(
-                    {
-                        chapter_id: (
-                            "The source scope changed after the combined optimistic build; "
-                            "rebuild the fresh generation."
-                        )
-                        for chapter_id, result in results.items()
-                        if result.succeeded and chapter_id not in published
-                    }
-                )
-                await merge_feedback(diagnostics)
-                invalidated_clean.update(
-                    self._invalidate_fixup_descendants(graph, clean, diagnostics)
-                )
-                await self._save_fixup_graph(
-                    graph,
-                    clean,
-                    build_generation=build_generation,
-                    invalidated=invalidated_clean,
-                )
-            if self.isolation.name != "shared":
-                await start_actionable_fixups(graph)
-
-        # A successful target can certify imported predecessors too. Reconcile
-        # all records after the pass before deciding whether any feedback still
-        # warrants an agent.
-        graph = self._observed_work_unit_graph()
-        persisted = self.state.fixup_graph.get("clean", {})
-        clean = self._retain_fixup_clean(
-            graph,
-            persisted if isinstance(persisted, dict) else {},
-        )
-        optimistic_clean = optimistic_ids.intersection(clean)
-        for chapter_id in optimistic_clean:
-            pending_feedback.pop(chapter_id, None)
-        invalidated_clean.difference_update(optimistic_clean)
-        if optimistic_clean:
-            await self.state.set_tasks(
-                optimistic_clean,
-                Stage.FIXUP,
-                TaskStatus.SUCCEEDED,
-                "clean optimistic coordinator build; no fixup agent needed",
-            )
-            if progress_event is not None:
-                progress_event.set()
-        if not pending_feedback and (
-            (targeted and goals.issubset(clean)) or (not targeted and len(clean) == len(by_id))
-        ):
-            return True
+        async def cancel_all() -> None:
+            tasks = [*discovery_tasks.values(), *formalize_tasks.values()]
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
         try:
             while True:
-                await self.control.checkpoint()
-                try:
-                    rescanned = self._observed_work_unit_graph()
-                except ValueError as error:
-                    return await fail_graph(error)
-
-                graph_changed = rescanned.edges != graph.edges
-                graph = rescanned
-                clean = self._retain_fixup_clean(graph, clean)
-                await self._save_fixup_graph(
-                    graph,
-                    clean,
-                    build_generation=build_generation,
-                    invalidated=invalidated_clean,
-                )
-
-                if targeted and goals.issubset(clean) and not pending_feedback and not running:
-                    await self.state.set_tasks(
-                        goals,
-                        Stage.FIXUP,
-                        TaskStatus.SUCCEEDED,
-                        "clean initial build reused",
-                    )
-                    return True
-
-                completed = [
-                    chapter_id for chapter_id, handle in running.items() if handle.task.done()
-                ]
-                if completed:
-                    order = {chapter_id: index for index, chapter_id in enumerate(graph.order)}
-                    chapter_id = min(completed, key=lambda item: order.get(item, len(order)))
-                    handle = running.pop(chapter_id)
-                    try:
-                        await handle.task
-                    except BaseException as error:
-                        await handle.workspace.close()
-                        if handle.source_lock_held:
-                            self.source_lock.release()
-                            handle.source_lock_held = False
-                        if handle.run.status == TaskStatus.RUNNING:
-                            await self.state.finish_run(
-                                handle.run,
-                                status=TaskStatus.FAILED,
-                                isolation={
-                                    "accepted": False,
-                                    "error": (
-                                        str(error) or "fixup agent interrupted before integration"
-                                    ),
-                                },
-                            )
+                graph = self._observed_work_unit_graph()
+                succeeded = {
+                    chapter_id
+                    for chapter_id in by_id
+                    if self.state.task(chapter_id, Stage.FORMALIZE).status
+                    == TaskStatus.SUCCEEDED
+                }
+                for chapter_id in graph.order:
+                    if (
+                        chapter_id in succeeded
+                        or chapter_id in failed
+                        or chapter_id in formalize_tasks
+                    ):
+                        continue
+                    if self.state.task(chapter_id, Stage.DISCOVER).status != TaskStatus.SUCCEEDED:
+                        continue
+                    dependencies = graph.dependencies[chapter_id]
+                    if dependencies.issubset(succeeded):
+                        formalize_tasks[chapter_id] = asyncio.create_task(
+                            self._formalize(by_id[chapter_id])
+                        )
+                    elif dependencies & failed:
+                        failed.add(chapter_id)
                         await self.state.set_task(
                             chapter_id,
-                            Stage.FIXUP,
-                            (
-                                TaskStatus.PENDING
-                                if isinstance(error, asyncio.CancelledError)
-                                else TaskStatus.FAILED
-                            ),
-                            (
-                                "fixup agent interrupted; requeued"
-                                if isinstance(error, asyncio.CancelledError)
-                                else "fixup agent failed before integration"
-                            ),
+                            Stage.FORMALIZE,
+                            TaskStatus.BLOCKED,
+                            "blocked by a failed source dependency formalization",
                         )
-                        raise
-                    await self.state.set_task(
-                        chapter_id,
-                        Stage.FIXUP,
-                        TaskStatus.PENDING,
-                        "fixup agent complete; awaiting integration",
-                    )
-                    changed_dependencies = tuple(
-                        dependency
-                        for dependency, source_digest in handle.dependency_source_digests.items()
-                        if dependency not in clean
-                        or clean[dependency].get("source_digest") != source_digest
-                    )
-                    if changed_dependencies:
-                        await discard_stale(handle, changed_dependencies)
-                        continue
-                    attempt = await self._integrate_fixup_agent(handle)
-                    if progress_event is not None:
-                        progress_event.set()
-                    if attempt is None:
-                        if attempts[chapter_id] < maximum:
-                            await merge_feedback(
-                                {
-                                    chapter_id: (
-                                        "The previous fixup agent failed or exhausted its capacity "
-                                        "budget before producing an acceptable patch. Retry the "
-                                        "scoped repair from the coordinator diagnostics."
-                                    )
-                                }
-                            )
-                        else:
-                            failed.add(chapter_id)
-                            invalidated_clean.update(
-                                self._invalidate_fixup_descendants(graph, clean, (chapter_id,))
-                            )
-                        continue
-                    clean.pop(chapter_id, None)
-                    try:
-                        graph = self._observed_work_unit_graph()
-                    except ValueError as error:
-                        return await fail_graph(error)
-                    clean = self._retain_fixup_clean(graph, clean)
-                    continue
 
-                if (
-                    not targeted
-                    and len(clean) == len(by_id)
-                    and not pending_feedback
-                    and not running
-                ):
-                    ordered = tuple(by_id[chapter_id] for chapter_id in graph.order)
-                    snapshots: dict[str, ValidatedBuildSnapshot] = {}
-                    results = await self._build_chapters(
-                        ordered,
-                        publish_if_clean=True,
-                        mode="stable-topological",
-                        iteration=1,
-                        maximum_iterations=1,
-                        snapshots=snapshots,
-                    )
-                    verified = self._observed_work_unit_graph()
-                    clean = self._retain_fixup_clean(verified, clean)
-                    if (
-                        all(result.succeeded for result in results.values())
-                        and verified.edges == graph.edges
-                        and len(clean) == len(by_id)
-                        and await self._publish_validated_builds(snapshots)
-                    ):
-                        build_generation = int(self.state.fixup_graph.get("build_generation", 0))
-                        persisted = self.state.fixup_graph.get("clean", {})
-                        clean = self._retain_fixup_clean(
-                            verified,
-                            persisted if isinstance(persisted, dict) else {},
-                        )
-                        invalidated_clean.clear()
+                live = [*discovery_tasks.values(), *formalize_tasks.values()]
+                if not live:
+                    unresolved = set(by_id).difference(succeeded | failed)
+                    if unresolved:
+                        failed.update(unresolved)
                         await self.state.set_tasks(
-                            by_id,
-                            Stage.FIXUP,
-                            TaskStatus.SUCCEEDED,
-                            "stable clean build in observed import order",
+                            unresolved,
+                            Stage.FORMALIZE,
+                            TaskStatus.BLOCKED,
+                            "blocked by incomplete discovery or a source dependency cycle",
                         )
-                        return True
-                    graph = verified
-                    diagnostics = self._build_feedback(results).actionable
-                    await merge_feedback(diagnostics)
-                    invalidated_clean.update(
-                        self._invalidate_fixup_descendants(graph, clean, diagnostics)
-                    )
-                    if not diagnostics and not graph_changed:
-                        break
-                    continue
+                    break
 
-                await start_actionable_fixups(graph)
+                done, _ = await asyncio.wait(live, return_when=asyncio.FIRST_COMPLETED)
+                for chapter_id, task in tuple(discovery_tasks.items()):
+                    if task not in done:
+                        continue
+                    discovery_tasks.pop(chapter_id)
+                    if not task.result().succeeded:
+                        failed.add(chapter_id)
+                        await self.state.set_task(
+                            chapter_id,
+                            Stage.FORMALIZE,
+                            TaskStatus.BLOCKED,
+                            "blocked because source discovery failed",
+                        )
+                for chapter_id, task in tuple(formalize_tasks.items()):
+                    if task not in done:
+                        continue
+                    formalize_tasks.pop(chapter_id)
+                    if not task.result().succeeded:
+                        failed.add(chapter_id)
+                if progress_event is not None:
+                    progress_event.set()
+        except BaseException:
+            await cancel_all()
+            raise
 
-                if self.isolation.name == "shared" and running:
-                    await asyncio.wait(
-                        (handle.task for handle in running.values()),
-                        return_when=asyncio.FIRST_COMPLETED,
-                    )
-                    continue
-
-                needed = self._dependency_closure(graph, set(goals) | set(pending_feedback))
-                blocked_roots = set(pending_feedback) | set(running) | failed | review_deferred
-                unavailable = (
-                    self._successor_closure(graph, blocked_roots) if blocked_roots else set()
-                )
-                buildable = [
-                    chapter_id
-                    for chapter_id in graph.order
-                    if chapter_id not in clean
-                    and chapter_id not in unavailable
-                    and (not targeted or chapter_id in needed)
-                ]
-                if buildable:
-                    await build_chapters(buildable, graph)
-                    continue
-
-                if running:
-                    await asyncio.wait(
-                        (handle.task for handle in running.values()),
-                        return_when=asyncio.FIRST_COMPLETED,
-                    )
-                    continue
-                break
-        finally:
-            await cancel_running()
-
-        required = self._dependency_closure(graph, set(goals) if targeted else set(by_id))
-        unresolved = required.difference(clean)
-        blocked = unresolved.difference(failed)
-        if blocked:
-            waiting_for_review = bool(
-                self._successor_closure(graph, review_deferred).intersection(blocked)
-            )
-            await self.state.set_tasks(
-                blocked,
-                Stage.FIXUP,
-                TaskStatus.BLOCKED if failed or waiting_for_review else TaskStatus.FAILED,
-                (
-                    "blocked by a failed prerequisite fixup; unrelated branches completed"
-                    if failed
-                    else (
-                        "waiting for diagnostics routed to an existing review"
-                        if waiting_for_review
-                        else "observed-import fixup could not select dependency-ready work"
-                    )
-                ),
-            )
-        return False
+        return not failed and all(
+            self.state.task(chapter_id, Stage.FORMALIZE).status == TaskStatus.SUCCEEDED
+            for chapter_id in by_id
+        )
 
     async def _formalize_all(self) -> bool:
-        """Run every formalizer once and retain chapter-local failures."""
-
-        running = {
-            asyncio.create_task(self._formalize(chapter)): chapter for chapter in self.work_units
-        }
-        had_failure = False
-        try:
-            while running:
-                done, _ = await asyncio.wait(running, return_when=asyncio.FIRST_COMPLETED)
-                for task in done:
-                    running.pop(task)
-                    outcome = task.result()
-                    if not outcome.succeeded:
-                        had_failure = True
-        except BaseException:
-            for task in running:
-                task.cancel()
-            await asyncio.gather(*running, return_exceptions=True)
-            raise
-        return not had_failure
+        return await self._discover_and_formalize(discover=True)
 
     async def _review_once(
         self,
@@ -3064,7 +2510,7 @@ class Orchestrator:
         return targets
 
     async def _review_build(self, chapter: WorkUnitLike) -> dict[str, str]:
-        """Build review output once, returning diagnostics to review rather than fixup."""
+        """Build review output once, returning diagnostics to review rather than formalization."""
 
         snapshots: dict[str, ValidatedBuildSnapshot] = {}
         result = (
@@ -3159,9 +2605,9 @@ class Orchestrator:
                 )
             return True
 
-        persisted = self.state.fixup_graph.get("clean", {})
+        persisted = self.state.formalize_graph.get("clean", {})
         records = persisted if isinstance(persisted, dict) else {}
-        was_clean = chapter.id in self._retain_fixup_clean(graph, records)
+        was_clean = chapter.id in self._retain_formalize_clean(graph, records)
         if not was_clean and not rerun:
             build_feedback = await self._review_build(chapter)
             if build_feedback and not await route_feedback(
@@ -3259,9 +2705,9 @@ class Orchestrator:
         rerun: bool = False,
         prove: bool = False,
         quarantined: Iterable[str] = (),
-        fixup: RunningFixupStage | None = None,
+        formalize: RunningFormalizeStage | None = None,
     ) -> bool:
-        """Release dependency-ready reviews and proofs without a corpus-wide fixup gate."""
+        """Release each review and proof when its local dependency frontier is done."""
 
         await self._recover_proof_review_requests()
         by_id = {chapter.id: chapter for chapter in self.work_units}
@@ -3295,8 +2741,8 @@ class Orchestrator:
         rebuild_tasks: dict[str, asyncio.Task[bool]] = {}
         proof_tasks: dict[str, asyncio.Task[bool]] = {}
         failed_rebuilds: set[str] = set()
-        persisted_clean = self.state.fixup_graph.get("clean", {})
-        clean = self._retain_fixup_clean(
+        persisted_clean = self.state.formalize_graph.get("clean", {})
+        clean = self._retain_formalize_clean(
             initial_graph,
             persisted_clean if isinstance(persisted_clean, dict) else {},
         )
@@ -3311,14 +2757,10 @@ class Orchestrator:
             )
         }
         proof_reviews = {chapter_id: 0 for chapter_id in by_id}
-        fixup_failures_applied = False
+        formalize_failures_applied = False
 
-        def fixup_ready(chapter_id: str) -> bool:
-            return (
-                fixup is None
-                or chapter_id not in fixup.target_ids
-                or self.state.task(chapter_id, Stage.FIXUP).status == TaskStatus.SUCCEEDED
-            )
+        def formalize_ready(chapter_id: str) -> bool:
+            return self.state.task(chapter_id, Stage.FORMALIZE).status == TaskStatus.SUCCEEDED
 
         async with self.state.batch():
             if quarantined_ids:
@@ -3336,12 +2778,12 @@ class Orchestrator:
                 )
             for chapter_id in initial_graph.order:
                 if chapter_id not in reviewed:
-                    if not fixup_ready(chapter_id):
+                    if not formalize_ready(chapter_id):
                         await self.state.set_task(
                             chapter_id,
                             Stage.REVIEW,
                             TaskStatus.PENDING,
-                            "waiting for clean initial fixup",
+                            "waiting for clean formalization",
                         )
                     else:
                         required_reviews = self._dependency_closure(
@@ -3373,10 +2815,10 @@ class Orchestrator:
 
         try:
             while True:
-                if fixup is not None:
-                    # Clear before inspecting state so a subsequent fixup
+                if formalize is not None:
+                    # Clear before inspecting state so a subsequent formalize
                     # transition cannot be lost between the scan and wait.
-                    fixup.progress.clear()
+                    formalize.progress.clear()
                 try:
                     graph = self._observed_work_unit_graph()
                 except ValueError as error:
@@ -3388,48 +2830,53 @@ class Orchestrator:
                     )
                     return False
 
-                if fixup is not None and fixup.task.done() and not fixup_failures_applied:
+                if (
+                    formalize is not None
+                    and formalize.task.done()
+                    and not formalize_failures_applied
+                ):
                     # Propagate orchestration failures, then quarantine only
-                    # chapters whose own fixup did not succeed. Independent
+                    # chapters whose own formalization did not succeed. Independent
                     # clean branches remain eligible for review and proof.
-                    fixup.task.result()
-                    failed_fixups = {
+                    formalize.task.result()
+                    failed_formalizations = {
                         chapter_id
-                        for chapter_id in fixup.target_ids
-                        if self.state.task(chapter_id, Stage.FIXUP).status != TaskStatus.SUCCEEDED
+                        for chapter_id in formalize.target_ids
+                        if self.state.task(chapter_id, Stage.FORMALIZE).status
+                        != TaskStatus.SUCCEEDED
                     }
-                    if failed_fixups:
-                        reviewed.difference_update(failed_fixups)
-                        review_failures.update(failed_fixups)
+                    if failed_formalizations:
+                        reviewed.difference_update(failed_formalizations)
+                        review_failures.update(failed_formalizations)
                         cancelled_proofs = [
                             proof_tasks.pop(chapter_id)
-                            for chapter_id in failed_fixups
+                            for chapter_id in failed_formalizations
                             if chapter_id in proof_tasks
                         ]
                         for task in cancelled_proofs:
                             task.cancel()
                         await asyncio.gather(*cancelled_proofs, return_exceptions=True)
-                        for chapter_id in failed_fixups:
+                        for chapter_id in failed_formalizations:
                             proof_results.pop(chapter_id, None)
                         await self._invalidate_reviews(
-                            failed_fixups,
-                            detail="review blocked by failed initial fixup",
+                            failed_formalizations,
+                            detail="review blocked by failed formalization",
                         )
                         async with self.state.batch():
                             await self.state.set_tasks(
-                                failed_fixups,
+                                failed_formalizations,
                                 Stage.REVIEW,
                                 TaskStatus.FAILED,
-                                "initial fixup did not complete",
+                                "formalization did not complete",
                             )
                             if prove:
                                 await self.state.set_tasks(
-                                    failed_fixups,
+                                    failed_formalizations,
                                     Stage.PROVE,
                                     TaskStatus.BLOCKED,
-                                    "blocked because initial fixup did not complete",
+                                    "blocked because formalization did not complete",
                                 )
-                    fixup_failures_applied = True
+                    formalize_failures_applied = True
 
                 # Pull durable successes into readiness and remove reviews with
                 # direct findings. Source edits separately trigger build rechecks.
@@ -3438,7 +2885,7 @@ class Orchestrator:
                 new_rechecks = set(self._proof_rechecks)
                 self._proof_rechecks.clear()
                 failed_rebuilds.difference_update(new_rechecks)
-                dirty_value = self.state.fixup_graph.get("dirty", ())
+                dirty_value = self.state.formalize_graph.get("dirty", ())
                 dirty_builds = set(dirty_value) if isinstance(dirty_value, list) else set()
                 for chapter_id in dirty_builds:
                     proof_results.pop(chapter_id, None)
@@ -3481,7 +2928,10 @@ class Orchestrator:
 
                 for chapter_id in graph.order:
                     review_task = self.state.task(chapter_id, Stage.REVIEW)
-                    rereview = chapter_id in attempted or review_task.rounds > 0 or rerun
+                    # A forced pipeline run is not itself evidence that this node has
+                    # already been reviewed. Only actual prior/active review work may
+                    # bypass dependency-review ordering.
+                    rereview = chapter_id in attempted or review_task.rounds > 0
                     required_reviews = self._dependency_closure(graph, (chapter_id,)).difference(
                         {chapter_id}
                     )
@@ -3492,7 +2942,7 @@ class Orchestrator:
                         and chapter_id not in review_tasks
                         and chapter_id not in proof_tasks
                         and chapter_id not in rebuild_tasks
-                        and (rereview or fixup_ready(chapter_id))
+                        and (rereview or formalize_ready(chapter_id))
                         and (rereview or required_reviews.issubset(reviewed))
                     ):
                         dependencies = graph.dependencies[chapter_id]
@@ -3537,20 +2987,21 @@ class Orchestrator:
                         and chapter_id not in review_tasks
                         and chapter_id not in proof_tasks
                         and chapter_id not in rebuild_tasks
-                        and fixup_ready(chapter_id)
+                        and formalize_ready(chapter_id)
                     ):
                         rebuild_tasks[chapter_id] = asyncio.create_task(
                             self._rebuild_dirty_chapter(by_id[chapter_id])
                         )
 
                 if prove:
-                    for chapter_id in reviewed:
+                    for chapter_id in graph.order:
                         if (
-                            chapter_id not in proof_results
+                            chapter_id in reviewed
+                            and chapter_id not in proof_results
                             and chapter_id not in proof_tasks
                             and chapter_id not in review_tasks
                             and chapter_id not in rebuild_tasks
-                            and fixup_ready(chapter_id)
+                            and formalize_ready(chapter_id)
                         ):
                             proof_tasks[chapter_id] = asyncio.create_task(
                                 self._prove(by_id[chapter_id], defer_review=True)
@@ -3560,9 +3011,9 @@ class Orchestrator:
                 live_tasks.extend(rebuild_tasks.values())
                 live_tasks.extend(proof_tasks.values())
                 progress_waiter: asyncio.Task[bool] | None = None
-                if fixup is not None and not fixup.task.done():
-                    progress_waiter = asyncio.create_task(fixup.progress.wait())
-                    live_tasks.extend((fixup.task, progress_waiter))
+                if formalize is not None and not formalize.task.done():
+                    progress_waiter = asyncio.create_task(formalize.progress.wait())
+                    live_tasks.extend((formalize.task, progress_waiter))
                 if not live_tasks:
                     unresolved = set(by_id).difference(reviewed | review_failures | review_blocked)
                     if unresolved:
@@ -3731,8 +3182,8 @@ class Orchestrator:
         build_fresh = False
         if not self.force:
             graph = self._observed_work_unit_graph()
-            persisted = self.state.fixup_graph.get("clean", {})
-            clean = self._retain_fixup_clean(
+            persisted = self.state.formalize_graph.get("clean", {})
+            clean = self._retain_formalize_clean(
                 graph,
                 persisted if isinstance(persisted, dict) else {},
             )
@@ -4000,46 +3451,29 @@ class Orchestrator:
         return False
 
     async def run_stage(self, stage: Stage) -> bool:
-        if stage is Stage.FIXUP:
-            return await self._fixup_to_clean()
+        if stage is Stage.DISCOVER:
+            return await self._discover_all()
+        if stage is Stage.FORMALIZE:
+            return await self._discover_and_formalize(discover=True)
         if stage is Stage.REVIEW:
             return await self._review_until_clean()
-        if stage is Stage.FORMALIZE:
-            return await self._formalize_all()
-        return all(
-            await _gather_cancel_on_error(self._prove(chapter) for chapter in self.work_units)
-        )
+        return await self._review_tree(prove=True)
 
     async def run_pipeline(self) -> bool:
-        formalized = await self._formalize_all()
-        quarantined = (
-            set()
-            if formalized
-            else {
-                chapter.id
-                for chapter in self.work_units
-                if self.state.task(chapter.id, Stage.FORMALIZE).status != TaskStatus.SUCCEEDED
-            }
+        progress = asyncio.Event()
+        formalize_task = asyncio.create_task(
+            self._discover_and_formalize(progress_event=progress, discover=True)
         )
-        initial_targets = {
-            chapter.id
-            for chapter in self.work_units
-            if chapter.id not in quarantined and not self.state.later_stage_started(chapter.id)
-        }
-        fixed = await self._fixup_to_clean(target_ids=initial_targets) if initial_targets else True
-        failed_fixups = {
-            chapter_id
-            for chapter_id in initial_targets
-            if self.state.task(chapter_id, Stage.FIXUP).status != TaskStatus.SUCCEEDED
-        }
-        quarantined.update(failed_fixups)
-        if failed_fixups:
-            await self._invalidate_reviews(
-                failed_fixups,
-                detail="review blocked by failed initial fixup",
-            )
-        reviewed = await self._review_tree(
-            prove=True,
-            quarantined=quarantined,
+        handle = RunningFormalizeStage(
+            task=formalize_task,
+            progress=progress,
+            target_ids=frozenset(chapter.id for chapter in self.work_units),
         )
-        return formalized and fixed and reviewed
+        try:
+            reviewed = await self._review_tree(prove=True, formalize=handle)
+            formalized = formalize_task.result() if formalize_task.done() else await formalize_task
+            return formalized and reviewed
+        except BaseException:
+            formalize_task.cancel()
+            await asyncio.gather(formalize_task, return_exceptions=True)
+            raise

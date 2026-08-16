@@ -10,14 +10,13 @@ if TYPE_CHECKING:
 
 
 class Stage(StrEnum):
+    DISCOVER = "discover"
     FORMALIZE = "formalize"
-    FIXUP = "fixup"
     REVIEW = "review"
     PROVE = "prove"
-    REPAIR = "fixup"  # Backward-compatible source alias.
 
 
-STATEMENT_STAGES = (Stage.FORMALIZE, Stage.FIXUP, Stage.REVIEW)
+STATEMENT_STAGES = (Stage.DISCOVER, Stage.FORMALIZE, Stage.REVIEW)
 PROOF_STAGES = (Stage.PROVE,)
 
 

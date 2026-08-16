@@ -169,7 +169,7 @@ def parser() -> argparse.ArgumentParser:
     _add_run_options(stage)
 
     pipeline = commands.add_parser(
-        "pipeline", help="run scaffold/draft/fixup/review/prove to convergence"
+        "pipeline", help="run discover/formalize/review/prove to convergence"
     )
     _add_run_options(pipeline)
 
@@ -425,12 +425,10 @@ def print_plan(config: PipelineConfig, console: Console) -> None:
         )
     console.print(units)
     console.print(
-        "After drafting, every dependency-ready fixup runs concurrently from observed LastLib "
-        "imports. Each completed patch is merged and rebuilt as soon as its refined predecessors "
-        "are clean. Source digests skip unchanged rebuilds, while successful reviews survive "
-        "proof edits and restarts. Editing reviews follow the same dependency "
-        "order; each changed chapter is rebuilt/fixed before its proof is released, without a "
-        "corpus-wide build or review gate."
+        "Discovery reads every source input in parallel and persists its dependency tree. "
+        "Formalization starts when its own discovery and formalized dependencies are complete. "
+        "The first review follows that tree; later reviews and proofs are released from their "
+        "own prior-stage completion, without corpus-wide gates."
     )
 
 
@@ -501,7 +499,7 @@ def _print_failure_summary(
         ),
         key=lambda task: (task.book_id, task.chapter_number, task.stage),
     )
-    graph_error = state.fixup_graph.get("error")
+    graph_error = state.formalize_graph.get("error")
     graph_failure = graph_error if isinstance(graph_error, str) and graph_error else None
     graph_failed = [task for task in failed if task.detail == graph_failure]
     if graph_failed:

@@ -24,12 +24,12 @@ isolation = "shared"
 
 [stages.formalize]
 prompt = "prompts/formalize.md"
+[stages.discover]
+prompt = "prompts/discover.md"
 [stages.review]
 prompt = "prompts/review.md"
 [stages.prove]
 prompt = "prompts/prove.md"
-[stages.fixup]
-prompt = "prompts/fixup.md"
 
 [[books]]
 id = "book"

@@ -54,8 +54,8 @@ def _render(value: str, variables: dict[str, str]) -> str:
 
 
 STAGE_ROUNDS = {
-    Stage.FORMALIZE: 1,
-    Stage.FIXUP: 10,
+    Stage.DISCOVER: 1,
+    Stage.FORMALIZE: 10,
     Stage.REVIEW: 5,
     Stage.PROVE: 10,
 }
@@ -71,10 +71,19 @@ def standard_prompt_path(stage: Stage) -> Path:
 
 def _stage_configs(raw_stages: dict[str, Any], base: Path) -> dict[Stage, StageConfig]:
     stages: dict[Stage, StageConfig] = {}
+    legacy_workflow = "discover" not in raw_stages and any(
+        name in raw_stages for name in ("fixup", "repair")
+    )
     for stage in Stage:
-        raw = raw_stages.get(stage.value, {})
-        if stage is Stage.FIXUP and not raw:
-            raw = raw_stages.get("repair", {})
+        if legacy_workflow and stage is Stage.DISCOVER:
+            raw = raw_stages.get("formalize", {})
+        elif legacy_workflow and stage is Stage.FORMALIZE:
+            raw = raw_stages.get("fixup", raw_stages.get("repair", {}))
+        else:
+            raw = raw_stages.get(stage.value, {})
+        if stage is Stage.FORMALIZE and not raw:
+            # Accept the pre-discovery name while reading an older config.
+            raw = raw_stages.get("fixup", raw_stages.get("repair", {}))
         if not isinstance(raw, dict):
             raise ValueError(f"[stages.{stage.value}] must be a table")
         prompt_value = raw.get("prompt")

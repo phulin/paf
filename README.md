@@ -1,9 +1,9 @@
 # PAF
 
 `paf` orchestrates a large population of noninteractive Codex workers over an informal
-mathematics corpus and its Lean translation. It combines an optimistic parallel drafting pass with
-coordinator-driven build convergence, MCP-backed fixup, editing mathematical review, and
-LSP-backed proving.
+mathematics corpus and its Lean translation. It combines parallel source-dependency discovery,
+dependency-ready formalization with clean diagnostics, editing mathematical review, and LSP-backed
+proving.
 
 Install `ripgrep` and ensure its `rg` executable is on `PATH` before starting a large swarm. Agents
 use it for fast source and declaration searches. Worker-launching commands continue without it, but
@@ -12,18 +12,11 @@ fallback searches can be substantially slower.
 
 ```mermaid
 flowchart LR
-    S[Scaffold directories] --> F[Formalize once]
-    F -->|all drafts finished| I[Scan observed LastLib imports]
-    I --> C{Source and dependencies already built?}
-    C -->|no| O[Optimistic selected-scope build]
-    C -->|yes| G{Review already succeeded?}
-    O -->|failed diagnostics| B[Build dependency-ready chapter]
-    O -->|clean| G
-    B -->|initial build diagnostics| X[Fixup agents with MCP]
-    X -->|patch merged| I
-    B -->|clean| G
-    G -->|no| R[Editing review]
-    G -->|yes| P[Prove or revalidate proof]
+    S[Scaffold directories] --> D[Discover source tree per input]
+    D -->|own discovery + formalized dependencies| F[Formalize with MCP]
+    F -->|clean diagnostics and build| G{First review dependencies done?}
+    G --> R[Editing review]
+    R -->|successful own review| P[Prove or revalidate proof]
     R -->|changed, findings, or build failure| R
     R -->|succeeded| P
     P -->|statement/API problem; reopen affected reviews| R
@@ -39,34 +32,27 @@ flowchart LR
     P -->|no placeholders + Lean valid| D[Done]
 ```
 
-Scaffolding is deterministic and creates directories only. Formalization then runs once for every
-missing chapter scope without Lean or LSP validation, so chapters and books can draft concurrently
-despite provisional imports. After all drafts finish, the coordinator discovers chapter edges with
-regexes over the current `import LastLib...` lines and passes the complete dirty selected scope to
-one optimistic Lake invocation. Lake schedules those targets against the Lean import graph. A clean
-build records every selected source as fresh and skips fixup agents entirely. Otherwise the
-coordinator routes diagnostics to their owning chapters and fixes the dependency-ready owners with
-Lean MCP concurrently. As soon as an agent finishes, the coordinator merges it, rescans imports,
-and rebuilds it once its refined predecessors are clean. After a partially failing grouped build,
-the coordinator batches the remaining dependency-ready chapters into subsequent Lake invocations
-instead of verifying them one by one; unrelated agents keep running and a successful repair build
-immediately releases its review while fixup continues on other dependency-ready chapters. The final
-stable verification is likewise one grouped Lake invocation.
-All later coordinator checks use the same coalescer: fixup, review, proof refresh, and proof
+Scaffolding is deterministic and creates directories only. Discovery reads each input chapter in
+parallel, identifies its direct source prerequisites, and persists the resulting source dependency
+tree with source digests. A chapter can formalize as soon as its discovery is complete and its
+dependencies have formalized; it does not wait for unrelated discovery or formalization work.
+Formalization owns full source coverage, elaboration, MCP diagnostics, and coordinator build
+convergence. It permits only the exact declaration-uses-`sorry` warning.
+All later coordinator checks use the same coalescer: formalization, review, proof refresh, and proof
 certification requests that are pending together contribute targets to one Lake command, even
 across stages. The highest-priority request supplies the batch priority, and any non-preemptible
 request makes the shared command non-preemptible. If the command fails, diagnostics are routed to
 their owning chapters and affected import descendants while independent targets are retried as one
 smaller batch and retain their successful freshness records.
-A review starts once its own fixup is clean and all of its observed dependencies have been reviewed;
-there is no corpus-wide barrier between fixup and review. The coordinator remembers the source
+A first review starts once its own formalization is clean and all source-tree dependencies have been
+reviewed. A later targeted or forced re-review does not wait for dependency reviews. There is no
+corpus-wide barrier between formalization and review. The coordinator remembers the source
 digests of successful builds so it can avoid rebuilding unchanged chapters. Review has
 no separate green flag: a successful review task is the whole state. Restarts and ordinary proof-body edits leave it
 succeeded; explicit review findings, proof-requested statement/API repairs, and forced review reopen
 only the reviews that receive findings. Reviewers directly make scoped statement and API repairs.
 If a review edits source, transitive build freshness is invalidated and downstream proofs are
-kept green when a fresh coordinator build still succeeds. Fixup ends once the initial post-draft
-build has converged. Dependency-ready chapters receive prioritized, coalesced coordinator
+kept green when a fresh coordinator build still succeeds. Dependency-ready chapters receive prioritized, coalesced coordinator
 verification after changed reviews; failures and structured findings return to review with the
 diagnostics attached. After at most five
 such cycles—or immediately after a no-change review—the chapter is
@@ -77,7 +63,7 @@ Proof findings reopen review without invalidating build freshness; a subsequent 
 marks the affected import closure stale.
 Review agents read the assigned numbered textbook chapter and discover the assigned Lean files
 dynamically, then use targeted searches in earlier LastLib and pinned Mathlib sources as questions
-arise. They do not receive a prefabricated source packet. Fixup, review, and proof agents receive Lean MCP;
+arise. They do not receive a prefabricated source packet. Formalize, review, and proof agents receive Lean MCP;
 reviewers trust the last clean build for untouched files and request whole-file diagnostics
 only for files they edit and the assigned transitive dependents invalidated by those edits. A
 no-change review therefore needs no diagnostic calls.
@@ -188,7 +174,7 @@ Run an individual stage over the whole configured corpus or a selection:
 
 ```console
 uv run paf stage formalize books/02-finite-extensions-of-local-fields.md
-uv run paf stage fixup books/02-finite-extensions-of-local-fields.md
+uv run paf stage discover books/02-finite-extensions-of-local-fields.md
 uv run paf stage review --config paf.toml --book book02
 uv run paf stage prove --config paf.toml --book book02 --chapter 3
 ```
@@ -300,7 +286,7 @@ and batched tactic trials use one scratch worker per MCP server. Agents never in
 directly. After an agent exits, the coordinator terminates its MCP/LSP process group and merges
 accepted scoped changes into the main worktree under a short source-consistency barrier. It then
 enqueues one visible targeted `lake build +Module`; only Lake builds acquire the prioritized
-coordinator build queue. Review and fixup verification outrank proof certification, and an active
+coordinator build queue. Review and formalize verification outrank proof certification, and an active
 proof certification is cancelled and requeued when statement-critical build work arrives. Each
 coordinator build receives a private cache upper layer. A successful build atomically promotes that
 small delta and writes only those changed artifacts back to the main worktree's `.lake`; failed and
@@ -366,29 +352,22 @@ After the daemon exits, `status`, `snapshot`, and `wait` fall back to the persis
 ## Fixed-point semantics
 
 - **Scaffold** deterministically creates the configured chapter directories and no Lean files.
-- **Formalize** skips a materialized chapter scope or runs exactly one optimistic drafting agent.
-  Drafts are merged without agent-side Lean. A newly drafted scope is accepted only when the agent
-  reports that its full chapter coverage pass is complete. Each completed scope immediately becomes
-  eligible for targeted coordinator builds instead of waiting for the entire corpus to finish
-  drafting.
-- **Fixup** first optimistically builds the complete selected scope. A clean build publishes exact
-  build freshness and launches no fixup agents. Otherwise it groups build failures by chapter
-  ownership and appends them verbatim to parallel fixup prompts. Agents treat that feedback as
-  starting evidence, read only the implicated context,
-  and let fresh MCP diagnostics account for prerequisite repairs that made an old diagnostic stale.
-  A failure mentioning a scope whose formalizer is still active is deferred rather than assigned
-  prematurely. Completed scopes cycle through build and fixup during the initial post-draft pass; the
-  standalone fixup stage and the pipeline's initial fixup phase end with a stable full-corpus build.
-  Once review begins, this stage is never re-entered. Initial convergence repeats
-  up to `max_rounds`, allowing `declaration uses sorry` but rejecting other warnings.
-- **Review** visits dependency-ready chapters against a clean source and `.olean` generation. Agents
+- **Discover** reads every selected input independently, reports direct source prerequisites by
+  work-unit id, and persists the source dependency tree and input digests. Independent discoveries
+  run concurrently.
+- **Formalize** starts after its own discovery and the formalization of its direct dependencies.
+  It covers the complete source chapter, uses Lean MCP for elaboration and diagnostics, and cycles
+  through coordinator builds up to `max_rounds`. Completion requires a clean build with no warning
+  other than `declaration uses sorry`.
+- **Review** visits dependency-ready chapters against a clean source and `.olean` generation. Only
+  the first review waits for source-tree dependency reviews; subsequent re-reviews do not. Agents
   make warranted in-scope statement and API changes directly; unresolved findings retain exact edit
   paths and are routed to their owners. The last clean coordinator build remains authoritative for
   files a reviewer does not edit. Reviewers request whole-file LSP diagnostics after the last relevant
   edit only for the edited files and their assigned transitive dependents, rechecking just the files
   invalidated by any subsequent repair. A changed chapter receives a prioritized coordinator build.
   Failed builds and structured `fixup_findings` are fed to full-scope review agents for the owning
-  chapters; they never reopen fixup.
+  chapters; they return to review rather than formalization.
   An initial review that edits source receives another full pass until one pass is clean, capped at
   five review/verification cycles. A review launched with specific persisted findings instead makes
   one repair pass and completes as soon as its coordinator rebuild is clean; it does not require a
@@ -441,7 +420,7 @@ After the daemon exits, `status`, `snapshot`, and `wait` fall back to the persis
 
 The orchestrator independently hashes every configured chapter scope. Agent claims about changes do
 not control review convergence. Lean placeholder scanning ignores comments and strings. The strict
-agent report distinguishes ordinary proof errors from genuine statement fixup requests.
+agent report distinguishes ordinary proof errors from genuine statement repair requests.
 
 ## Multi-book scheduling
 
@@ -471,7 +450,7 @@ The dashboard shows:
 - the active coordinator build's mode, stage, iteration, target progress, current chapter, owner, and
   queued build count;
 - aggregate `pending`, `queued`, `running`, `succeeded`, `failed`, and `blocked` chapter counts for
-  formalize, fixup, review, and prove;
+  discover, formalize, review, and prove;
 - each chapter's status and attempt count in every stage, plus independent exact-build freshness;
 - per-chapter tokens for the current invocation;
 - statement/proof critical-path ranks and the current statement critical path;
@@ -549,7 +528,7 @@ request-state rewind is needed. Recovery also reconstructs both a handoff from a
 when the process stopped between those two durable writes and proof-requested statement repairs written
 by older orchestrators that invalidated review state before checkpointing the handoff. The chapter table
 displays exact-build
-freshness independently of whether a past fixup task succeeded. A coordinator-build record tracks the
+freshness independently of whether a past formalize task succeeded. A coordinator-build record tracks the
 single serialized Lake build, and the TUI also shows its owner and queued jobs. Running run records—not
 chapter-stage records—are the authoritative live-agent count.
 
@@ -641,7 +620,7 @@ Every stage automatically uses its packaged standard prompt and default retry bo
 may override either setting independently:
 
 ```toml
-[stages.fixup]
+[stages.formalize]
 max_rounds = 12
 
 [stages.review]

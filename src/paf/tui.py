@@ -1119,7 +1119,7 @@ class SwarmApp(App[bool]):
         proof_rank = self.orchestrator.proof_schedule.rank[chapter.document_id]
         critical = chapter.document_id in self.orchestrator.statement_schedule.critical_path
         book = f"★ {chapter.document_id}" if critical else chapter.document_id
-        clean = self.state.fixup_graph.get("clean", {})
+        clean = self.state.formalize_graph.get("clean", {})
         build_freshness = (
             "✓ fresh" if isinstance(clean, dict) and chapter.id in clean else "○ stale"
         )

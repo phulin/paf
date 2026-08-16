@@ -1,4 +1,4 @@
-export type Stage = "formalize" | "fixup" | "review" | "prove";
+export type Stage = "discover" | "formalize" | "review" | "prove";
 export type TaskStatus = "pending" | "running" | "succeeded" | "failed" | "blocked";
 
 export interface Task {

@@ -401,7 +401,7 @@ async def test_selected_chapter_opens_live_agent_detail(tmp_path: Path) -> None:
             status=TaskStatus.SUCCEEDED,
             usage=TokenUsage(input_tokens=1_000_000, output_tokens=100_000, measured=True),
         )
-        run = await state.start_run(config.chapters[0].id, Stage.FORMALIZE)
+        run = await state.start_run(config.chapters[0].id, Stage.DISCOVER)
         await state.update_run(
             run,
             usage=TokenUsage(
@@ -776,7 +776,7 @@ async def test_dashboard_separates_agents_queues_and_coordinator_builds(
         await state.start_run(config.chapters[0].id, Stage.FORMALIZE)
         await state.set_task(
             config.chapters[1].id,
-            Stage.FIXUP,
+            Stage.FORMALIZE,
             TaskStatus.PENDING,
             "waiting for a fresh build",
         )
@@ -788,7 +788,7 @@ async def test_dashboard_separates_agents_queues_and_coordinator_builds(
         )
         await state.start_coordinator_build(
             mode=build_mode,
-            stage=Stage.FIXUP,
+            stage=Stage.FORMALIZE,
             iteration=2,
             maximum_iterations=6,
             total=81,
@@ -826,8 +826,8 @@ async def test_dashboard_separates_agents_queues_and_coordinator_builds(
         assert "book/chapter-02" in status
         assert "Building dependency graph" in status
         assert "Compiling Book.Chapter02" in status
-        fixup = str(app.query_one("#stage-fixup", Static).content)
-        assert "agent 0 · running 0 · building 1" in fixup
+        formalize = str(app.query_one("#stage-formalize", Static).content)
+        assert "agent 1 · running 0 · building 1" in formalize
         review = str(app.query_one("#stage-review", Static).content)
         assert "agent 0 · running 1 · building 0" in review
         row = app._row_values(config.chapters[1])

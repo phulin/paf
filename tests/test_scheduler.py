@@ -88,7 +88,7 @@ async def test_coordinator_build_output_tracks_lake_progress(tmp_path: Path) -> 
     state = StateStore(config)
     await state.start_coordinator_build(
         mode="optimistic",
-        stage=Stage.FIXUP,
+        stage=Stage.FORMALIZE,
         iteration=1,
         maximum_iterations=10,
         total=2,
@@ -239,7 +239,7 @@ async def test_state_migrates_legacy_repair_tasks_to_fixup(tmp_path: Path) -> No
     reloaded = StateStore(config)
     await reloaded.load_or_create()
 
-    migrated = reloaded.task(chapter.id, Stage.FIXUP)
+    migrated = reloaded.task(chapter.id, Stage.FORMALIZE)
     assert migrated.stage == "fixup"
     assert migrated.runs[0].stage == "fixup"
     assert not reloaded.coordinator_build.active
@@ -279,20 +279,20 @@ async def test_review_progress_reconciles_pending_initial_fixup(tmp_path: Path) 
 
     await state.set_task(chapter.id, Stage.REVIEW, TaskStatus.RUNNING, "reviewing")
 
-    fixup = state.task(chapter.id, Stage.FIXUP)
+    fixup = state.task(chapter.id, Stage.FORMALIZE)
     assert fixup.status == TaskStatus.SUCCEEDED
     assert fixup.detail == "initial fixup completed before review"
 
     await state.set_task(
         chapter.id,
-        Stage.FIXUP,
+        Stage.FORMALIZE,
         TaskStatus.RUNNING,
         "late coordinator rebuild",
     )
     assert fixup.status == TaskStatus.SUCCEEDED
     assert fixup.detail == "initial fixup completed before review"
     with pytest.raises(RuntimeError, match="after review or proof has begun"):
-        await state.start_run(chapter.id, Stage.FIXUP)
+        await state.start_run(chapter.id, Stage.FORMALIZE)
 
     fixup.status = TaskStatus.RUNNING
     fixup.detail = "legacy coordinator build state"
@@ -301,7 +301,7 @@ async def test_review_progress_reconciles_pending_initial_fixup(tmp_path: Path) 
 
     recovered = StateStore(config)
     await recovered.load_or_create()
-    recovered_fixup = recovered.task(chapter.id, Stage.FIXUP)
+    recovered_fixup = recovered.task(chapter.id, Stage.FORMALIZE)
     assert recovered_fixup.status == TaskStatus.SUCCEEDED
     assert recovered_fixup.detail == "initial fixup completed before review"
     await recovered.close()
@@ -599,14 +599,14 @@ async def test_state_recovers_orphan_run_even_when_task_is_not_running(tmp_path:
     chapter = config.chapters[0]
     state = StateStore(config)
     await state.load_or_create()
-    run = await state.start_run(chapter.id, Stage.FIXUP)
-    await state.set_task(chapter.id, Stage.FIXUP, TaskStatus.SUCCEEDED, "newer work completed")
+    run = await state.start_run(chapter.id, Stage.FORMALIZE)
+    await state.set_task(chapter.id, Stage.FORMALIZE, TaskStatus.SUCCEEDED, "newer work completed")
     await state.close()
 
     recovered = StateStore(config)
     await recovered.load_or_create()
 
-    recovered_run = recovered.task(chapter.id, Stage.FIXUP).runs[-1]
+    recovered_run = recovered.task(chapter.id, Stage.FORMALIZE).runs[-1]
     assert recovered_run.id == run.id
     assert recovered_run.status == TaskStatus.FAILED
     assert recovered_run.finished_at is not None
@@ -880,7 +880,7 @@ async def test_fixup_repeats_coordinator_build_and_hands_back_diagnostics(
         feedback: str = "",
         workspace_root: Path | None = None,
     ) -> AgentResult:
-        assert stage is Stage.FIXUP
+        assert stage is Stage.FORMALIZE
         feedback_seen.append(feedback)
         return await original_run(
             chapter,
@@ -904,10 +904,10 @@ async def test_fixup_repeats_coordinator_build_and_hands_back_diagnostics(
     monkeypatch.setattr(orchestrator.executor, "run", tracked_run)
     monkeypatch.setattr(scheduler_module, "validate", tracked_validation)
 
-    assert await orchestrator.run_stage(Stage.FIXUP)
+    assert await orchestrator.run_stage(Stage.FORMALIZE)
     assert len(feedback_seen) == 1
     assert "Book/Chapter01/Section.lean:4:1: broken" in feedback_seen[0]
-    assert state.task(config.chapters[0].id, Stage.FIXUP).rounds == 1
+    assert state.task(config.chapters[0].id, Stage.FORMALIZE).rounds == 1
     await orchestrator.shutdown()
 
 
@@ -957,15 +957,15 @@ async def test_fixup_builds_in_observed_chapter_import_order(
 
     monkeypatch.setattr(scheduler_module, "validate", successful_validation)
 
-    assert await orchestrator.run_stage(Stage.FIXUP)
+    assert await orchestrator.run_stage(Stage.FORMALIZE)
     assert builds == [
         (
             second.id,
             "cd lean && lake build +Book.Chapter02 +Book.Chapter01",
         )
     ]
-    assert orchestrator.state.task(first.id, Stage.FIXUP).rounds == 0
-    assert orchestrator.state.task(second.id, Stage.FIXUP).rounds == 0
+    assert orchestrator.state.task(first.id, Stage.FORMALIZE).rounds == 0
+    assert orchestrator.state.task(second.id, Stage.FORMALIZE).rounds == 0
     assert state.fixup_graph["edges"] == [[second.id, first.id]]
     await orchestrator.shutdown()
 
@@ -1001,15 +1001,15 @@ async def test_targeted_fixup_does_not_build_cleanliness_descendants(
 
     assert await orchestrator._fixup_to_clean(target_ids={first.id})
     assert builds == [first.id]
-    await orchestrator.state.set_task(first.id, Stage.FIXUP, TaskStatus.PENDING, "stale label")
+    await orchestrator.state.set_task(first.id, Stage.FORMALIZE, TaskStatus.PENDING, "stale label")
     assert await orchestrator._fixup_to_clean(target_ids={first.id})
     assert builds == [first.id]
     clean = orchestrator.state.fixup_graph["clean"]
     assert first.id in clean
     assert second.id not in clean
-    assert orchestrator.state.task(first.id, Stage.FIXUP).status == TaskStatus.SUCCEEDED
-    assert orchestrator.state.task(first.id, Stage.FIXUP).detail == "clean initial build reused"
-    assert orchestrator.state.task(second.id, Stage.FIXUP).status == TaskStatus.PENDING
+    assert orchestrator.state.task(first.id, Stage.FORMALIZE).status == TaskStatus.SUCCEEDED
+    assert orchestrator.state.task(first.id, Stage.FORMALIZE).detail == "clean initial build reused"
+    assert orchestrator.state.task(second.id, Stage.FORMALIZE).status == TaskStatus.PENDING
     await orchestrator.shutdown()
 
 
@@ -1038,9 +1038,9 @@ async def test_optimistic_build_discards_stale_feedback_without_fixup_agent(
         {chapter.id: "stale diagnostic"}, target_ids={chapter.id}
     )
     assert builds == [chapter.id]
-    assert orchestrator.state.task(chapter.id, Stage.FIXUP).rounds == 0
+    assert orchestrator.state.task(chapter.id, Stage.FORMALIZE).rounds == 0
     assert (
-        orchestrator.state.task(chapter.id, Stage.FIXUP).detail
+        orchestrator.state.task(chapter.id, Stage.FORMALIZE).detail
         == "clean optimistic coordinator build; no fixup agent needed"
     )
     await orchestrator.shutdown()
@@ -1071,8 +1071,8 @@ async def test_optimistic_build_skips_chapters_with_reusable_clean_builds(
 
     assert await orchestrator._fixup_to_clean()
     assert builds == [second.id]
-    assert orchestrator.state.task(first.id, Stage.FIXUP).status == TaskStatus.SUCCEEDED
-    assert orchestrator.state.task(first.id, Stage.FIXUP).detail == "clean initial build reused"
+    assert orchestrator.state.task(first.id, Stage.FORMALIZE).status == TaskStatus.SUCCEEDED
+    assert orchestrator.state.task(first.id, Stage.FORMALIZE).detail == "clean initial build reused"
     await orchestrator.shutdown()
 
 
@@ -1106,7 +1106,7 @@ async def test_partial_optimistic_failure_batches_remaining_topological_builds(
 
     monkeypatch.setattr(scheduler_module, "validate", validation)
 
-    assert await orchestrator.run_stage(Stage.FIXUP)
+    assert await orchestrator.run_stage(Stage.FORMALIZE)
 
     def target(chapter: Chapter) -> str:
         return chapter.build_command.rpartition(" ")[2]
@@ -1117,9 +1117,9 @@ async def test_partial_optimistic_failure_batches_remaining_topological_builds(
         f"cd lean && lake build {target(first)}",
         f"cd lean && lake build {target(first)} {target(second)} {target(third)}",
     ]
-    assert orchestrator.state.task(first.id, Stage.FIXUP).rounds == 1
-    assert orchestrator.state.task(second.id, Stage.FIXUP).rounds == 0
-    assert orchestrator.state.task(third.id, Stage.FIXUP).rounds == 0
+    assert orchestrator.state.task(first.id, Stage.FORMALIZE).rounds == 1
+    assert orchestrator.state.task(second.id, Stage.FORMALIZE).rounds == 0
+    assert orchestrator.state.task(third.id, Stage.FORMALIZE).rounds == 0
     await orchestrator.shutdown()
 
 
@@ -1144,7 +1144,7 @@ async def test_post_review_fixup_request_is_migrated_back_to_review(tmp_path: Pa
     feedback, request_ids = orchestrator._proof_review_feedback(chapter.id)
     assert feedback == "missing scalar tower"
     assert request_ids == (request_id,)
-    assert recovered.task(chapter.id, Stage.FIXUP).status == TaskStatus.SUCCEEDED
+    assert recovered.task(chapter.id, Stage.FORMALIZE).status == TaskStatus.SUCCEEDED
     assert recovered.task(chapter.id, Stage.REVIEW).status == TaskStatus.PENDING
     await orchestrator.shutdown()
 
@@ -1185,12 +1185,12 @@ async def test_fixup_build_routes_reviewed_diagnostic_owner_back_to_review(
     monkeypatch.setattr(scheduler_module, "validate", validation)
 
     assert not await orchestrator._fixup_to_clean(target_ids={new.id})
-    assert orchestrator.state.task(reviewed.id, Stage.FIXUP).status == TaskStatus.SUCCEEDED
+    assert orchestrator.state.task(reviewed.id, Stage.FORMALIZE).status == TaskStatus.SUCCEEDED
     assert orchestrator.state.task(reviewed.id, Stage.REVIEW).status == TaskStatus.PENDING
-    assert orchestrator.state.task(reviewed.id, Stage.FIXUP).rounds == 0
-    assert orchestrator.state.task(new.id, Stage.FIXUP).status == TaskStatus.BLOCKED
+    assert orchestrator.state.task(reviewed.id, Stage.FORMALIZE).rounds == 0
+    assert orchestrator.state.task(new.id, Stage.FORMALIZE).status == TaskStatus.BLOCKED
     assert (
-        orchestrator.state.task(new.id, Stage.FIXUP).detail
+        orchestrator.state.task(new.id, Stage.FORMALIZE).detail
         == "waiting for diagnostics routed to an existing review"
     )
     queued_feedback = [
@@ -1481,7 +1481,7 @@ async def test_fixup_rescans_new_import_before_rebuilding_edited_chapter(
             workspace_root: Path | None = None,
         ) -> AgentResult:
             assert chapter.id == first.id
-            assert stage is Stage.FIXUP
+            assert stage is Stage.FORMALIZE
             assert workspace_root is not None
             assert "broken" in feedback
             events.append(f"agent:{chapter.id}")
@@ -1520,7 +1520,7 @@ async def test_fixup_rescans_new_import_before_rebuilding_edited_chapter(
 
     monkeypatch.setattr(scheduler_module, "validate", validation)
 
-    assert await orchestrator.run_stage(Stage.FIXUP)
+    assert await orchestrator.run_stage(Stage.FORMALIZE)
     assert events[:4] == [
         f"build:{first.id}",
         f"build:{second.id}",
@@ -1564,7 +1564,7 @@ async def test_fixup_runs_dependency_ready_agent_frontier_concurrently(
             workspace_root: Path | None = None,
         ) -> AgentResult:
             nonlocal active, maximum_active
-            assert stage is Stage.FIXUP
+            assert stage is Stage.FORMALIZE
             assert workspace_root is not None
             assert "broken" in feedback
             active += 1
@@ -1614,7 +1614,7 @@ async def test_fixup_runs_dependency_ready_agent_frontier_concurrently(
 
     monkeypatch.setattr(scheduler_module, "validate", validation)
 
-    assert await orchestrator.run_stage(Stage.FIXUP)
+    assert await orchestrator.run_stage(Stage.FORMALIZE)
     assert maximum_active == 2
     await orchestrator.shutdown()
 
@@ -1651,7 +1651,7 @@ async def test_fixup_does_not_launch_agent_before_observed_predecessor_is_clean(
             feedback: str = "",
             workspace_root: Path | None = None,
         ) -> AgentResult:
-            assert stage is Stage.FIXUP
+            assert stage is Stage.FORMALIZE
             assert workspace_root is not None
             assert "broken" in feedback
             agent_order.append(chapter.id)
@@ -1694,7 +1694,7 @@ async def test_fixup_does_not_launch_agent_before_observed_predecessor_is_clean(
 
     monkeypatch.setattr(scheduler_module, "validate", validation)
 
-    assert await orchestrator.run_stage(Stage.FIXUP)
+    assert await orchestrator.run_stage(Stage.FORMALIZE)
     assert agent_order == [first.id, second.id]
     await orchestrator.shutdown()
 
@@ -1744,7 +1744,7 @@ async def test_fixup_unlocks_descendant_before_slow_independent_agent_finishes(
             workspace_root: Path | None = None,
         ) -> AgentResult:
             nonlocal slow_finished
-            assert stage is Stage.FIXUP
+            assert stage is Stage.FORMALIZE
             assert workspace_root is not None
             assert "broken" in feedback
             if chapter.id == second.id:
@@ -1752,7 +1752,7 @@ async def test_fixup_unlocks_descendant_before_slow_independent_agent_finishes(
                 slow_finished = True
             elif chapter.id == third.id:
                 assert not slow_finished
-                assert state.task(first.id, Stage.FIXUP).status == TaskStatus.SUCCEEDED
+                assert state.task(first.id, Stage.FORMALIZE).status == TaskStatus.SUCCEEDED
                 descendant_started.set()
                 slow_release.set()
             fixed.add(chapter.id)
@@ -1794,7 +1794,7 @@ async def test_fixup_unlocks_descendant_before_slow_independent_agent_finishes(
 
     monkeypatch.setattr(scheduler_module, "validate", validation)
 
-    assert await orchestrator.run_stage(Stage.FIXUP)
+    assert await orchestrator.run_stage(Stage.FORMALIZE)
     assert descendant_started.is_set()
     assert slow_finished
     assert state.fixup_graph["edges"] == [[first.id, third.id]]
@@ -1827,7 +1827,7 @@ async def test_fixup_reuses_valid_persisted_build_records(
     first_state = StateStore(config)
     first = Orchestrator(config, first_state)
     await first.prepare()
-    assert await first.run_stage(Stage.FIXUP)
+    assert await first.run_stage(Stage.FORMALIZE)
     await first.shutdown()
     assert builds == [config.chapters[0].id]
 
@@ -1835,7 +1835,7 @@ async def test_fixup_reuses_valid_persisted_build_records(
     second_state = StateStore(config)
     second = Orchestrator(config, second_state)
     await second.prepare()
-    assert await second.run_stage(Stage.FIXUP)
+    assert await second.run_stage(Stage.FORMALIZE)
 
     assert builds == []
     await second.shutdown()
@@ -2077,7 +2077,7 @@ async def test_coordinator_build_does_not_count_as_an_agent(
     assert state.coordinator_build.error_count == 1
     assert state.agent_summary()["active"] == 0
     assert all(
-        state.task(chapter.id, Stage.FIXUP).status == TaskStatus.PENDING
+        state.task(chapter.id, Stage.FORMALIZE).status == TaskStatus.PENDING
         for chapter in config.chapters
     )
 
@@ -2093,7 +2093,7 @@ async def test_coordinator_build_does_not_count_as_an_agent(
     ]
     assert state.coordinator_build.error_count == 2
     assert all(
-        state.task(chapter.id, Stage.FIXUP).status == TaskStatus.PENDING
+        state.task(chapter.id, Stage.FORMALIZE).status == TaskStatus.PENDING
         for chapter in config.chapters
     )
     await orchestrator.shutdown()
@@ -2397,7 +2397,7 @@ async def test_incomplete_review_routes_follow_up_to_review(
     assert await orchestrator._review_until_clean()
     assert feedbacks == ["", "repair the remaining statement interface"]
     assert builds == 2
-    assert state.task(chapter.id, Stage.FIXUP).rounds == 0
+    assert state.task(chapter.id, Stage.FORMALIZE).rounds == 0
     await orchestrator.shutdown()
 
 
@@ -2471,7 +2471,8 @@ async def test_fixup_failure_does_not_cancel_independent_fixup(
     config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
     config = replace(
         config,
-        stages=config.stages | {Stage.FIXUP: replace(config.stages[Stage.FIXUP], max_rounds=1)},
+        stages=config.stages
+        | {Stage.FORMALIZE: replace(config.stages[Stage.FORMALIZE], max_rounds=1)},
     )
     first, second = config.chapters
     source_root = tmp_path / "lean" / "Book"
@@ -2522,8 +2523,8 @@ async def test_fixup_failure_does_not_cancel_independent_fixup(
         {first.id: "repair first", second.id: "repair second"},
         target_ids={first.id, second.id},
     )
-    assert state.task(first.id, Stage.FIXUP).status == TaskStatus.FAILED
-    assert state.task(second.id, Stage.FIXUP).status == TaskStatus.SUCCEEDED
+    assert state.task(first.id, Stage.FORMALIZE).status == TaskStatus.FAILED
+    assert state.task(second.id, Stage.FORMALIZE).status == TaskStatus.SUCCEEDED
     assert not orchestrator.executor.results
     await orchestrator.shutdown()
 
@@ -2632,7 +2633,7 @@ async def test_fixup_cancellation_releases_shared_source_lock(
 
     assert not orchestrator.source_lock.locked()
     assert orchestrator.agent_slots.available == orchestrator.agent_slots.capacity
-    fixup = orchestrator.state.task(chapter.id, Stage.FIXUP)
+    fixup = orchestrator.state.task(chapter.id, Stage.FORMALIZE)
     assert fixup.status == TaskStatus.PENDING
     assert fixup.detail == "fixup agent interrupted; requeued"
     assert fixup.runs[-1].status == TaskStatus.FAILED
@@ -2729,7 +2730,7 @@ async def test_requested_stop_integrates_partial_fixup_workspace(
     assert (config.settings.repo / relative).read_text(encoding="utf-8") == (
         "def partialFixup := 1\n"
     )
-    fixup = orchestrator.state.task(chapter.id, Stage.FIXUP)
+    fixup = orchestrator.state.task(chapter.id, Stage.FORMALIZE)
     assert fixup.status == TaskStatus.PENDING
     assert fixup.detail == "fixup agent interrupted; partial changes integrated; requeued"
     assert fixup.runs[-1].isolation is not None
@@ -2748,7 +2749,7 @@ async def test_capacity_failure_consumes_the_fixup_cap(
         settings=replace(config.settings, isolation="shared"),
         stages={
             **config.stages,
-            Stage.FIXUP: replace(config.stages[Stage.FIXUP], max_rounds=1),
+            Stage.FORMALIZE: replace(config.stages[Stage.FORMALIZE], max_rounds=1),
         },
     )
     chapter = config.chapters[0]
@@ -2811,7 +2812,7 @@ async def test_fatal_codex_invocation_aborts_fixup_without_retry(
         await orchestrator._fixup_to_clean({chapter.id: "repair"}, target_ids={chapter.id})
 
     assert len(feedbacks) == 1
-    assert orchestrator.state.task(chapter.id, Stage.FIXUP).rounds == 1
+    assert orchestrator.state.task(chapter.id, Stage.FORMALIZE).rounds == 1
     await orchestrator.shutdown()
 
 
@@ -2980,7 +2981,7 @@ async def test_pipeline_never_returns_reviewed_chapters_to_fixup(
         fixup_targets.update(target_ids or ())
         await orchestrator.state.set_task(
             new_chapter.id,
-            Stage.FIXUP,
+            Stage.FORMALIZE,
             TaskStatus.SUCCEEDED,
             "clean",
         )
@@ -2995,7 +2996,10 @@ async def test_pipeline_never_returns_reviewed_chapters_to_fixup(
 
     assert await orchestrator.run_pipeline()
     assert fixup_targets == {new_chapter.id}
-    assert orchestrator.state.task(reviewed_chapter.id, Stage.FIXUP).status == TaskStatus.SUCCEEDED
+    assert (
+        orchestrator.state.task(reviewed_chapter.id, Stage.FORMALIZE).status
+        == TaskStatus.SUCCEEDED
+    )
     await orchestrator.shutdown()
 
 
@@ -3029,9 +3033,9 @@ async def test_pipeline_reviews_clean_branch_after_other_fixup_finishes(
         nonlocal fixup_finished
         assert set(target_ids or ()) == {first.id, second.id}
         assert progress_event is None
-        await orchestrator.state.set_task(second.id, Stage.FIXUP, TaskStatus.SUCCEEDED, "clean")
+        await orchestrator.state.set_task(second.id, Stage.FORMALIZE, TaskStatus.SUCCEEDED, "clean")
         await orchestrator.state.set_task(
-            first.id, Stage.FIXUP, TaskStatus.FAILED, "did not converge"
+            first.id, Stage.FORMALIZE, TaskStatus.FAILED, "did not converge"
         )
         fixup_finished = True
         return False

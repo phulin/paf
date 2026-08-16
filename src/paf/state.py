@@ -270,7 +270,8 @@ class StateStore:
         self.tasks: dict[str, TaskRecord] = {}
         self.source_issues: dict[str, SourceIssueRecord] = {}
         self.scheduling: dict[str, Any] = {}
-        self.fixup_graph: dict[str, Any] = {}
+        self.source_dependency_tree: dict[str, Any] = {}
+        self.formalize_graph: dict[str, Any] = {}
         self.fixup_requests: dict[str, dict[str, Any]] = {}
         self.proof_review_requests: dict[str, dict[str, Any]] = {}
         self.upstream_requests: dict[str, dict[str, Any]] = {}
@@ -283,6 +284,16 @@ class StateStore:
     def key(chapter_id: str, stage: Stage) -> str:
         return f"{chapter_id}:{stage.value}"
 
+    @property
+    def fixup_graph(self) -> dict[str, Any]:
+        """Compatibility view of the pre-discovery build-freshness field."""
+
+        return self.formalize_graph
+
+    @fixup_graph.setter
+    def fixup_graph(self, value: dict[str, Any]) -> None:
+        self.formalize_graph = value
+
     async def load_or_create(self) -> None:
         self.logs_dir.mkdir(parents=True, exist_ok=True)
         await asyncio.to_thread(self._database.initialize)
@@ -292,8 +303,14 @@ class StateStore:
             self.updated_at = str(raw.get("updated_at", self.created_at))
             if not self.scheduling and isinstance(raw.get("scheduling"), dict):
                 self.scheduling = raw["scheduling"]
-            if not self.fixup_graph and isinstance(raw.get("fixup_graph"), dict):
-                self.fixup_graph = raw["fixup_graph"]
+            if not self.source_dependency_tree and isinstance(
+                raw.get("source_dependency_tree"), dict
+            ):
+                self.source_dependency_tree = raw["source_dependency_tree"]
+            if not self.formalize_graph and isinstance(raw.get("formalize_graph"), dict):
+                self.formalize_graph = raw["formalize_graph"]
+            if not self.formalize_graph and isinstance(raw.get("fixup_graph"), dict):
+                self.formalize_graph = raw["fixup_graph"]
             raw_fixup_requests = raw.get("fixup_requests")
             if isinstance(raw_fixup_requests, dict):
                 self.fixup_requests = {
@@ -334,14 +351,18 @@ class StateStore:
                     }
                 )
             persisted_tasks = raw.get("tasks", {})
+            legacy_workflow = isinstance(persisted_tasks, dict) and any(
+                isinstance(key, str) and key.endswith(":fixup") for key in persisted_tasks
+            )
             if isinstance(persisted_tasks, dict):
                 for key, value in persisted_tasks.items():
                     if not isinstance(key, str) or not isinstance(value, dict):
                         continue
-                    if key.endswith(":repair"):
-                        key = f"{key[: -len(':repair')]}:fixup"
-                        if key in persisted_tasks:
-                            continue
+                    if legacy_workflow and key.endswith(":formalize"):
+                        key = f"{key[: -len(':formalize')]}:discover"
+                    elif key.endswith(":repair") or key.endswith(":fixup"):
+                        suffix = ":repair" if key.endswith(":repair") else ":fixup"
+                        key = f"{key[: -len(suffix)]}:formalize"
                     task_value = {
                         name: item
                         for name, item in value.items()
@@ -351,8 +372,10 @@ class StateStore:
                     task_value.setdefault("book_id", value.get("document_id"))
                     task_value.setdefault("chapter_number", value.get("ordinal"))
                     task_value.setdefault("chapter_title", value.get("unit_title"))
-                    if task_value.get("stage") == "repair":
-                        task_value["stage"] = "fixup"
+                    if legacy_workflow and task_value.get("stage") == "formalize":
+                        task_value["stage"] = "discover"
+                    elif task_value.get("stage") in {"repair", "fixup"}:
+                        task_value["stage"] = "formalize"
                     legacy_review_green = value.get("review_green")
                     if task_value.get("stage") == Stage.REVIEW:
                         if legacy_review_green is True:
@@ -391,23 +414,25 @@ class StateStore:
                     task.source = chapter.source.as_posix()
                     task.source_start_line = chapter.source_span.start_line
                     task.source_end_line = chapter.source_span.end_line
-            fixup = self.task(chapter.id, Stage.FIXUP)
+            formalize = self.task(chapter.id, Stage.FORMALIZE)
             review = self.task(chapter.id, Stage.REVIEW)
             prove = self.task(chapter.id, Stage.PROVE)
-            if fixup.status != TaskStatus.SUCCEEDED and (
+            if formalize.status != TaskStatus.SUCCEEDED and (
                 review.rounds > 0
                 or prove.rounds > 0
                 or review.status in (TaskStatus.RUNNING, TaskStatus.SUCCEEDED)
                 or prove.status in (TaskStatus.RUNNING, TaskStatus.SUCCEEDED)
             ):
-                fixup.status = TaskStatus.SUCCEEDED
-                fixup.detail = "initial fixup completed before review"
-                fixup.updated_at = timestamp()
+                formalize.status = TaskStatus.SUCCEEDED
+                formalize.detail = "formalization completed before review"
+                formalize.updated_at = timestamp()
         for value in persisted_runs:
             if not isinstance(value, dict):
                 continue
-            if value.get("stage") == "repair":
-                value["stage"] = "fixup"
+            if legacy_workflow and value.get("stage") == "formalize":
+                value["stage"] = "discover"
+            elif value.get("stage") in {"repair", "fixup"}:
+                value["stage"] = "formalize"
             value.setdefault("chapter_id", value.get("work_unit_id"))
             if str(value.get("chapter_id", "")) not in configured:
                 continue
@@ -561,7 +586,7 @@ class StateStore:
         cost = self.total_cost()
         invocation_cost = self.invocation_cost()
         return {
-            "version": 13,
+            "version": 14,
             "history_database": DATABASE_NAME,
             "project_root": str(
                 self.config.project.root
@@ -578,7 +603,8 @@ class StateStore:
             "invocation_cost": invocation_cost.as_dict(),
             "agents": self.agent_summary(),
             "scheduling": self.scheduling,
-            "fixup_graph": self.fixup_graph,
+            "source_dependency_tree": self.source_dependency_tree,
+            "formalize_graph": self.formalize_graph,
             "fixup_requests": self.fixup_requests,
             "proof_review_requests": self.proof_review_requests,
             "upstream_requests": self.upstream_requests,
@@ -1049,7 +1075,7 @@ class StateStore:
             for chapter_id in migrated:
                 await self.set_task(
                     chapter_id,
-                    Stage.FIXUP,
+                    Stage.FORMALIZE,
                     TaskStatus.SUCCEEDED,
                     "initial fixup complete; later findings moved to review",
                 )
@@ -1340,22 +1366,22 @@ class StateStore:
     ) -> None:
         task = self.task(chapter_id, stage)
         if (
-            stage is Stage.FIXUP
+            stage is Stage.FORMALIZE
             and status != TaskStatus.SUCCEEDED
             and self.later_stage_started(chapter_id)
         ):
             status = TaskStatus.SUCCEEDED
-            detail = "initial fixup completed before review"
+            detail = "formalization completed before review"
         if stage in (Stage.REVIEW, Stage.PROVE) and status in (
             TaskStatus.RUNNING,
             TaskStatus.SUCCEEDED,
         ):
-            fixup = self.task(chapter_id, Stage.FIXUP)
-            if fixup.status != TaskStatus.SUCCEEDED:
-                fixup.status = TaskStatus.SUCCEEDED
-                fixup.queued = False
-                fixup.detail = "initial fixup completed before review"
-                fixup.updated_at = timestamp()
+            formalize = self.task(chapter_id, Stage.FORMALIZE)
+            if formalize.status != TaskStatus.SUCCEEDED:
+                formalize.status = TaskStatus.SUCCEEDED
+                formalize.queued = False
+                formalize.detail = "formalization completed before review"
+                formalize.updated_at = timestamp()
         task.status = status
         task.queued = queued and status == TaskStatus.PENDING
         if stage is Stage.PROVE:
@@ -1383,22 +1409,22 @@ class StateStore:
             task_status = status
             task_detail = detail
             if (
-                stage is Stage.FIXUP
+                stage is Stage.FORMALIZE
                 and status != TaskStatus.SUCCEEDED
                 and self.later_stage_started(chapter_id)
             ):
                 task_status = TaskStatus.SUCCEEDED
-                task_detail = "initial fixup completed before review"
+                task_detail = "formalization completed before review"
             if stage in (Stage.REVIEW, Stage.PROVE) and status in (
                 TaskStatus.RUNNING,
                 TaskStatus.SUCCEEDED,
             ):
-                fixup = self.task(chapter_id, Stage.FIXUP)
-                if fixup.status != TaskStatus.SUCCEEDED:
-                    fixup.status = TaskStatus.SUCCEEDED
-                    fixup.queued = False
-                    fixup.detail = "initial fixup completed before review"
-                    fixup.updated_at = updated_at
+                formalize = self.task(chapter_id, Stage.FORMALIZE)
+                if formalize.status != TaskStatus.SUCCEEDED:
+                    formalize.status = TaskStatus.SUCCEEDED
+                    formalize.queued = False
+                    formalize.detail = "formalization completed before review"
+                    formalize.updated_at = updated_at
             task.status = task_status
             task.queued = False
             if stage is Stage.PROVE and task_status != TaskStatus.SUCCEEDED:
@@ -1434,9 +1460,9 @@ class StateStore:
         return changed
 
     async def start_run(self, chapter_id: str, stage: Stage) -> RunRecord:
-        if stage is Stage.FIXUP and self.later_stage_started(chapter_id):
+        if stage is Stage.FORMALIZE and self.later_stage_started(chapter_id):
             raise RuntimeError(
-                f"cannot start fixup for {chapter_id} after review or proof has begun"
+                f"cannot start formalize for {chapter_id} after review or proof has begun"
             )
         task = self.task(chapter_id, stage)
         chapter = self.config.work_unit(chapter_id)

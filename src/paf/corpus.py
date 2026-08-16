@@ -152,6 +152,75 @@ def build_work_unit_import_graph(
     )
 
 
+def build_source_dependency_graph(
+    work_units: tuple[WorkUnitLike, ...],
+    discovered: dict[str, object],
+) -> WorkUnitImportGraph:
+    """Build the schedulable DAG persisted by source discovery.
+
+    Configured dependencies remain authoritative lower bounds. A discovery
+    record contributes direct work-unit ids through its ``dependencies`` list.
+    Records may be partial while discovery agents are still running; an absent
+    record contributes only configured dependencies.
+    """
+
+    by_id = {work_unit.id: work_unit for work_unit in work_units}
+    dependencies = {work_unit.id: set(work_unit.depends_on) for work_unit in work_units}
+    for work_unit_id, raw in discovered.items():
+        if work_unit_id not in dependencies or not isinstance(raw, dict):
+            continue
+        values = raw.get("dependencies", ())
+        if isinstance(values, list):
+            dependencies[work_unit_id].update(
+                value for value in values if isinstance(value, str) and value != work_unit_id
+            )
+
+    missing = {
+        dependency
+        for required in dependencies.values()
+        for dependency in required
+        if dependency not in by_id
+    }
+    if missing:
+        raise ValueError(f"source tree depends on unknown ids: {', '.join(sorted(missing))}")
+
+    successors = {work_unit.id: set() for work_unit in work_units}
+    for dependent, required in dependencies.items():
+        for prerequisite in required:
+            successors[prerequisite].add(dependent)
+
+    indegree = {work_unit_id: len(required) for work_unit_id, required in dependencies.items()}
+    ready = [work_unit_id for work_unit_id, degree in indegree.items() if degree == 0]
+    heapq.heapify(ready)
+    order: list[str] = []
+    while ready:
+        work_unit_id = heapq.heappop(ready)
+        order.append(work_unit_id)
+        for successor in sorted(successors[work_unit_id]):
+            indegree[successor] -= 1
+            if indegree[successor] == 0:
+                heapq.heappush(ready, successor)
+
+    if len(order) != len(by_id):
+        cycle = _chapter_cycle(dependencies)
+        detail = " -> ".join(cycle) if cycle else "unknown cycle"
+        raise ValueError(f"source dependency tree contains a cycle: {detail}")
+
+    edges = tuple(
+        sorted(
+            (prerequisite, dependent)
+            for dependent, required in dependencies.items()
+            for prerequisite in required
+        )
+    )
+    return WorkUnitImportGraph(
+        dependencies={key: frozenset(value) for key, value in dependencies.items()},
+        successors={key: frozenset(value) for key, value in successors.items()},
+        order=tuple(order),
+        edges=edges,
+    )
+
+
 # Compatibility names for callers that still construct ``Chapter`` adapters.
 ChapterImportGraph = WorkUnitImportGraph
 build_chapter_import_graph = build_work_unit_import_graph

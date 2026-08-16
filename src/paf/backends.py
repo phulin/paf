@@ -215,11 +215,13 @@ class LeanBackend:
         return os.pathsep.join(dict.fromkeys([*prefixes, *current]))
 
     def mcp_config(self, root: Path, stage: Stage) -> dict[str, Any]:
-        if not self.mcp_enabled or stage not in (Stage.FIXUP, Stage.REVIEW, Stage.PROVE):
+        if not self.mcp_enabled or stage not in (Stage.FORMALIZE, Stage.REVIEW, Stage.PROVE):
             return {}
         project = (root / self.project).resolve()
         tools = (
-            LEAN_MCP_FIXUP_TOOLS if stage in (Stage.FIXUP, Stage.REVIEW) else LEAN_MCP_PROOF_TOOLS
+            LEAN_MCP_FIXUP_TOOLS
+            if stage in (Stage.FORMALIZE, Stage.REVIEW)
+            else LEAN_MCP_PROOF_TOOLS
         )
         return {
             "mcp_servers.paf_lean.command": str(Path(sys.executable)),

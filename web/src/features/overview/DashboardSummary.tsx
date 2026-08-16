@@ -43,8 +43,8 @@ function StageCard({ stage, tasks }: { stage: Stage; tasks: Task[] }) {
   ).length;
   const percentage = tasks.length ? Math.round((100 * succeeded) / tasks.length) : 0;
   const stageColors: Record<Stage, string> = {
+    discover: "var(--violet)",
     formalize: "var(--cyan)",
-    fixup: "var(--violet)",
     review: "var(--amber)",
     prove: "var(--green)",
   };

@@ -11,7 +11,7 @@ from pathlib import Path
 
 PROMPTS = {
     "common.md",
-    "fixup.md",
+    "discover.md",
     "formalize.md",
     "proof_review.md",
     "prove.md",

@@ -55,7 +55,7 @@ def test_failure_summary_prints_task_build_and_blocker_details(tmp_path: Path) -
         )
         await state.start_coordinator_build(
             mode="targeted",
-            stage=Stage.FIXUP,
+            stage=Stage.FORMALIZE,
             iteration=1,
             maximum_iterations=1,
             total=1,
@@ -202,7 +202,8 @@ def test_plan_command(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> Non
 
     assert main(["plan", "--config", str(path)]) == 0
     output = capsys.readouterr().out
-    assert "fixup" in output
+    assert "discover" in output
+    assert "formalize" in output
     assert "Lean MCP: enabled" in output
 
 

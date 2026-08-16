@@ -255,19 +255,21 @@ def test_executor_uses_machine_readable_codex_mode(tmp_path: Path) -> None:
     assert "lean_file_outline" not in review_overrides["mcp_servers.paf_lean.enabled_tools"]
     assert "lean_multi_attempt" not in review_overrides["mcp_servers.paf_lean.enabled_tools"]
     assert "lean_build" not in review_overrides["mcp_servers.paf_lean.enabled_tools"]
-    fixup_command = executor.command(Stage.FIXUP, isolated)
-    fixup_overrides = {
-        fixup_command[index + 1].split("=", 1)[0]: fixup_command[index + 1].split("=", 1)[1]
-        for index, item in enumerate(fixup_command[:-1])
+    formalize_command = executor.command(Stage.FORMALIZE, isolated)
+    formalize_overrides = {
+        formalize_command[index + 1].split("=", 1)[0]: formalize_command[index + 1].split("=", 1)[1]
+        for index, item in enumerate(formalize_command[:-1])
         if item == "--config"
     }
-    assert "lean_diagnostic_messages" in fixup_overrides["mcp_servers.paf_lean.enabled_tools"]
-    assert "lean_code_actions" in fixup_overrides["mcp_servers.paf_lean.enabled_tools"]
-    assert "lean_file_outline" not in fixup_overrides["mcp_servers.paf_lean.enabled_tools"]
-    assert "lean_multi_attempt" not in fixup_overrides["mcp_servers.paf_lean.enabled_tools"]
-    assert "lean_goal" not in fixup_overrides["mcp_servers.paf_lean.enabled_tools"]
+    assert "lean_diagnostic_messages" in formalize_overrides[
+        "mcp_servers.paf_lean.enabled_tools"
+    ]
+    assert "lean_code_actions" in formalize_overrides["mcp_servers.paf_lean.enabled_tools"]
+    assert "lean_file_outline" not in formalize_overrides["mcp_servers.paf_lean.enabled_tools"]
+    assert "lean_multi_attempt" not in formalize_overrides["mcp_servers.paf_lean.enabled_tools"]
+    assert "lean_goal" not in formalize_overrides["mcp_servers.paf_lean.enabled_tools"]
 
-    assert not any("mcp_servers.paf_lean" in item for item in executor.command(Stage.FORMALIZE))
+    assert not any("mcp_servers.paf_lean" in item for item in executor.command(Stage.DISCOVER))
 
     resumed = executor.command(Stage.FORMALIZE, isolated, resume_thread_id="capacity-thread")
     assert resumed[:3] == ["codex", "exec", "resume"]
@@ -500,7 +502,7 @@ def test_fixup_prompt_requires_diagnostics_and_sorry(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
     executor = CodexExecutor(config, StateStore(config))
 
-    prompt = executor.build_prompt(config.chapters[0], Stage.FIXUP)
+    prompt = executor.build_prompt(config.chapters[0], Stage.FORMALIZE)
     assert "Attached Lean MCP" in prompt
     assert "lean_prepare_dependencies" in prompt
     assert "maximal affected dependents" in " ".join(prompt.split())
@@ -600,29 +602,22 @@ def test_downstream_retry_prompt_labels_the_persisted_handoff(tmp_path: Path) ->
 def test_shipped_prompts_have_consistent_stage_contracts() -> None:
     prompt_root = Path(__file__).parents[1] / "src" / "paf" / "prompts"
     formalize = " ".join((prompt_root / "formalize.md").read_text().split())
-    fixup = " ".join((prompt_root / "fixup.md").read_text().split())
+    discover = " ".join((prompt_root / "discover.md").read_text().split())
     prove = " ".join((prompt_root / "prove.md").read_text().split())
 
     assert "structured `source_issues` ledger" in formalize
     assert "`SOURCE_ISSUE` comment" not in formalize
-    assert "Set `complete` to `true` only when the full chapter coverage pass is finished" in (
-        formalize
-    )
+    assert "clean diagnostic pass" in formalize
     assert "mathematically natural local dependency guess" in formalize
     assert "native `update_plan` tool" in formalize
     assert "one item for every numbered source section" in formalize
     assert "native plan is flat" in formalize
     assert "named result in the active section item" in formalize
 
-    assert "authoritative starting evidence" in fixup
-    assert "Do not reread the complete chapter or assigned file set" in fixup
-    assert "coordinator feedback as the initial diagnostic pass" in fixup
-    assert "do not request diagnostics merely because you entered or switched files" in fixup
-    assert "request whole-file MCP diagnostics for that edited dependency closure" in fixup
-    assert "`SOURCE_ISSUE` comment" not in fixup
-    assert "`complete` means that every supplied finding" in fixup
-    assert "Never prove" in fixup
-    assert "`by sorry`" in fixup
+    assert "whole-file diagnostics in dependency order" in formalize
+    assert "declaration-uses-`sorry` warning" in formalize
+    assert "source dependency tree" in discover
+    assert "Do not create or edit files" in discover
 
     assert "`update_plan` tool" in prove
     assert "one item for every file that contains work" in prove

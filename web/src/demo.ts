@@ -12,7 +12,7 @@ const chapters = [
 
 const demoTasks: Record<string, Task> = {};
 chapters.forEach(([book, chapter, title], chapterIndex) => {
-  (["formalize", "fixup", "review", "prove"] as const).forEach((stage, stageIndex) => {
+  (["discover", "formalize", "review", "prove"] as const).forEach((stage, stageIndex) => {
     const statuses = ["succeeded", "succeeded", "running", "pending"] as const;
     const status =
       chapterIndex === 0

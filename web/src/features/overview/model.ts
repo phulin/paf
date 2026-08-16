@@ -1,6 +1,6 @@
 import type { AgentActivity, Stage, SwarmState, Task } from "../../types";
 
-export const STAGES: Stage[] = ["formalize", "fixup", "review", "prove"];
+export const STAGES: Stage[] = ["discover", "formalize", "review", "prove"];
 
 export interface ChapterRow {
   id: string;

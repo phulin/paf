@@ -570,7 +570,7 @@ async def test_cache_layers_compact_without_invalidating_pinned_agents(tmp_path:
 
 
 @pytest.mark.asyncio
-async def test_orchestrator_merges_then_fixup_builds_in_main_worktree(
+async def test_orchestrator_merges_then_formalize_builds_in_main_worktree(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config_path = write_project(tmp_path, chapters="chapters = [1]")
@@ -582,9 +582,11 @@ import pathlib
 import sys
 
 sys.stdin.read()
-target = pathlib.Path("lean/Book/Chapter01.lean")
+target = pathlib.Path("lean/Book/Chapter01/Section.lean")
 target.parent.mkdir(parents=True, exist_ok=True)
 target.write_text("theorem isolated : True := by trivial\\n", encoding="utf-8")
+aggregator = pathlib.Path("lean/Book/Chapter01.lean")
+aggregator.write_text("import Book.Chapter01.Section\\n", encoding="utf-8")
 artifact = pathlib.Path("lean/.lake/build/lib/lean/Book/Chapter01.olean")
 artifact.parent.mkdir(parents=True, exist_ok=True)
 artifact.write_bytes(b"compiled")
@@ -620,7 +622,10 @@ print(json.dumps({"type": "item.completed", "item": {
         assert workspace_root is not None
         assert (workspace_root / "lean" / "Book" / "Chapter01.lean").read_text(
             encoding="utf-8"
-        ) == "theorem isolated : True := by trivial\n"
+        ) == "import Book.Chapter01.Section\n"
+        assert (
+            workspace_root / "lean" / "Book" / "Chapter01" / "Section.lean"
+        ).read_text(encoding="utf-8") == "theorem isolated : True := by trivial\n"
         artifact = workspace_root / "lean" / ".lake" / "build" / "coordinator.marker"
         artifact.parent.mkdir(parents=True, exist_ok=True)
         artifact.write_bytes(b"built in main")
@@ -628,17 +633,20 @@ print(json.dumps({"type": "item.completed", "item": {
 
     monkeypatch.setattr(scheduler_module, "validate", coordinator_validation)
 
-    assert await orchestrator.run_stage(Stage.FORMALIZE)
-    assert (tmp_path / "lean" / "Book" / "Chapter01.lean").read_text(
+    assert (await orchestrator._formalize(config.chapters[0])).succeeded
+    assert (tmp_path / "lean" / "Book" / "Chapter01" / "Section.lean").read_text(
         encoding="utf-8"
     ) == "theorem isolated : True := by trivial\n"
     run = state.task(config.chapters[0].id, Stage.FORMALIZE).runs[0]
     assert run.isolation is not None
     assert run.isolation["accepted"] is True
     assert run.isolation["promoted_cache_paths"] == []
-    assert not (tmp_path / "lean" / ".lake" / "build" / "coordinator.marker").exists()
+    assert config.chapters[0].id in state.formalize_graph["clean"]
+    assert (
+        tmp_path / "lean" / ".lake" / "build" / "coordinator.marker"
+    ).read_bytes() == b"built in main"
 
-    assert await orchestrator.run_stage(Stage.FIXUP)
+    assert await orchestrator.run_stage(Stage.FORMALIZE)
     assert (tmp_path / "lean" / ".lake" / "build" / "coordinator.marker").read_bytes() == (
         b"built in main"
     )
