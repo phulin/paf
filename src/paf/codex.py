@@ -1195,7 +1195,7 @@ whole-file diagnostics from prerequisites to dependents. Do not prepare every fi
         root = workspace_root or self.config.settings.repo
         prompt_path = self.state.logs_dir / f"{run.id}.prompt.md"
         prompt_path.write_text(prompt, encoding="utf-8")
-        before = scope_digest(root, chapter)
+        before = await asyncio.to_thread(scope_digest, root, chapter)
         log_path = self.state.logs_dir / f"{run.id}.jsonl"
         usage = TokenUsage()
         report: dict[str, Any] = {}
@@ -1482,8 +1482,10 @@ whole-file diagnostics from prerequisites to dependents. Do not prepare every fi
             raise
         finally:
             await stop_usage_monitor()
-        changed = before != scope_digest(root, chapter)
-        placeholders = count_placeholders(root, chapter)
+        after, placeholders = await asyncio.to_thread(
+            lambda: (scope_digest(root, chapter), count_placeholders(root, chapter))
+        )
+        changed = before != after
         error = "agent timed out" if timed_out else ""
         if fd_pressure and exit_code != 0:
             error = (

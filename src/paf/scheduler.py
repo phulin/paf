@@ -509,28 +509,31 @@ class Orchestrator:
             }
             await self.state.save()
 
-    def _retain_formalize_clean(
+    async def _retain_formalize_clean(
         self,
         graph: WorkUnitImportGraph,
         records: dict[str, Any],
     ) -> dict[str, dict[str, Any]]:
         """Retain build records whose own source is unchanged."""
 
-        by_id = {chapter.id: chapter for chapter in self.work_units}
-        retained: dict[str, dict[str, Any]] = {}
-        for chapter_id in graph.order:
-            if not graph.dependencies[chapter_id].issubset(retained):
-                continue
-            record = records.get(chapter_id)
-            if not isinstance(record, dict):
-                continue
-            source = scope_digest(self.config.settings.repo, by_id[chapter_id])
-            if record.get("source_digest") == source:
-                retained[chapter_id] = {
-                    "source_digest": source,
-                    "build_generation": int(record.get("build_generation", 0)),
-                }
-        return retained
+        def retain() -> dict[str, dict[str, Any]]:
+            by_id = {chapter.id: chapter for chapter in self.work_units}
+            retained: dict[str, dict[str, Any]] = {}
+            for chapter_id in graph.order:
+                if not graph.dependencies[chapter_id].issubset(retained):
+                    continue
+                record = records.get(chapter_id)
+                if not isinstance(record, dict):
+                    continue
+                source = scope_digest(self.config.settings.repo, by_id[chapter_id])
+                if record.get("source_digest") == source:
+                    retained[chapter_id] = {
+                        "source_digest": source,
+                        "build_generation": int(record.get("build_generation", 0)),
+                    }
+            return retained
+
+        return await asyncio.to_thread(retain)
 
     @staticmethod
     def _dependency_closure(graph: WorkUnitImportGraph, chapter_ids: Iterable[str]) -> set[str]:
@@ -579,16 +582,18 @@ class Orchestrator:
                 return False
 
             by_id = {item.id: item for item in self.work_units}
-            current = {
-                chapter_id: scope_digest(self.config.settings.repo, by_id[chapter_id])
-                for chapter_id in required
-            }
+            current = await asyncio.to_thread(
+                lambda: {
+                    chapter_id: scope_digest(self.config.settings.repo, by_id[chapter_id])
+                    for chapter_id in required
+                }
+            )
             if any(captured[chapter_id] != digest for chapter_id, digest in current.items()):
                 return False
 
             persisted = self.state.formalize_graph.get("clean", {})
             records = persisted if isinstance(persisted, dict) else {}
-            clean = self._retain_formalize_clean(graph, records)
+            clean = await self._retain_formalize_clean(graph, records)
             build_generation = int(self.state.formalize_graph.get("build_generation", 0))
             for chapter_id in graph.order:
                 if chapter_id not in required:
@@ -633,7 +638,7 @@ class Orchestrator:
 
         graph = self._observed_work_unit_graph()
         persisted = self.state.formalize_graph.get("clean", {})
-        clean = self._retain_formalize_clean(
+        clean = await self._retain_formalize_clean(
             graph,
             persisted if isinstance(persisted, dict) else {},
         )
@@ -675,7 +680,7 @@ class Orchestrator:
                     # resurrecting records this caller explicitly invalidated.
                     if int(record.get("build_generation", 0)) >= local_generation:
                         clean[chapter_id] = dict(record)
-            retained = self._retain_formalize_clean(graph, clean)
+            retained = await self._retain_formalize_clean(graph, clean)
             clean.clear()
             clean.update(retained)
             edges = [list(edge) for edge in graph.edges]
@@ -699,15 +704,18 @@ class Orchestrator:
             await self.state.save()
             return revision
 
-    def _scope_exists(self, chapter: WorkUnitLike) -> bool:
-        return ScopeMatcher(chapter.scope).has_match_for_each_pattern(self.config.settings.repo)
+    async def _scope_exists(self, chapter: WorkUnitLike) -> bool:
+        return await asyncio.to_thread(
+            ScopeMatcher(chapter.scope).has_match_for_each_pattern,
+            self.config.settings.repo,
+        )
 
-    def _proof_build_is_fresh(self, chapter: WorkUnitLike) -> bool:
+    async def _proof_build_is_fresh(self, chapter: WorkUnitLike) -> bool:
         """Whether the current chapter source belongs to a retained clean build."""
 
         graph = self._observed_work_unit_graph()
         persisted = self.state.formalize_graph.get("clean", {})
-        clean = self._retain_formalize_clean(
+        clean = await self._retain_formalize_clean(
             graph,
             persisted if isinstance(persisted, dict) else {},
         )
@@ -913,7 +921,7 @@ class Orchestrator:
                             "Source scope changed after the coordinator build; retry required.",
                         )
                 elif stage is Stage.PROVE:
-                    build_fresh = self._proof_build_is_fresh(chapter)
+                    build_fresh = await self._proof_build_is_fresh(chapter)
                     validation = ValidationResult(
                         build_fresh,
                         0 if build_fresh else 1,
@@ -1077,7 +1085,7 @@ class Orchestrator:
         maximum = self.config.stages[Stage.FORMALIZE].max_rounds
         feedback = ""
         for iteration in range(1, maximum + 1):
-            if self._scope_exists(chapter):
+            if await self._scope_exists(chapter):
                 snapshots: dict[str, ValidatedBuildSnapshot] = {}
                 validation = (
                     await self._build_chapters(
@@ -1129,7 +1137,7 @@ class Orchestrator:
                 )
                 return FormalizeOutcome(False)
 
-        if self._scope_exists(chapter):
+        if await self._scope_exists(chapter):
             snapshots = {}
             validation = (
                 await self._build_chapters(
@@ -1480,7 +1488,7 @@ class Orchestrator:
             return
         requests = tuple(self.state.upstream_requests[request_id] for request_id in request_ids)
         try:
-            if not self._proof_build_is_fresh(owner):
+            if not await self._proof_build_is_fresh(owner):
                 refresh = await self._refresh_stale_proof_build(owner)
                 if not refresh.succeeded:
                     await escalate(
@@ -1523,17 +1531,23 @@ class Orchestrator:
                 error=answer_error,
             )
             owner_proof = self.state.task(owner.id, Stage.PROVE)
+            owner_placeholders = await asyncio.to_thread(
+                count_placeholders, self.config.settings.repo, owner
+            )
             if (
                 attempt.agent.changed
                 and owner_proof.status == TaskStatus.SUCCEEDED
-                and count_placeholders(self.config.settings.repo, owner) == 0
+                and owner_placeholders == 0
             ):
+                owner_digest = await asyncio.to_thread(
+                    scope_digest, self.config.settings.repo, owner
+                )
                 await self.state.set_task(
                     owner.id,
                     Stage.PROVE,
                     TaskStatus.SUCCEEDED,
                     "proved upstream interface repair validated",
-                    source_digest=scope_digest(self.config.settings.repo, owner),
+                    source_digest=owner_digest,
                 )
         except Exception as error:
             await escalate(f"targeted upstream repair orchestration failed: {error}")
@@ -2184,10 +2198,13 @@ class Orchestrator:
                 if clean and snapshots is not None:
                     graph = self._observed_work_unit_graph()
                     by_id = {item.id: item for item in self.work_units}
-                    captured = {
-                        chapter_id: scope_digest(self.config.settings.repo, by_id[chapter_id])
-                        for chapter_id in self._dependency_closure(graph, ids)
-                    }
+                    required_ids = self._dependency_closure(graph, ids)
+                    captured = await asyncio.to_thread(
+                        lambda: {
+                            chapter_id: scope_digest(self.config.settings.repo, by_id[chapter_id])
+                            for chapter_id in required_ids
+                        }
+                    )
                     for chapter in selected:
                         required = self._dependency_closure(graph, (chapter.id,))
                         snapshots[chapter.id] = ValidatedBuildSnapshot(
@@ -2618,7 +2635,7 @@ class Orchestrator:
 
         persisted = self.state.formalize_graph.get("clean", {})
         records = persisted if isinstance(persisted, dict) else {}
-        was_clean = chapter.id in self._retain_formalize_clean(graph, records)
+        was_clean = chapter.id in await self._retain_formalize_clean(graph, records)
         if not was_clean and not rerun:
             build_feedback = await self._review_build(chapter)
             if build_feedback and not await route_feedback(
@@ -2744,7 +2761,7 @@ class Orchestrator:
         proof_tasks: dict[str, asyncio.Task[bool]] = {}
         failed_rebuilds: set[str] = set()
         persisted_clean = self.state.formalize_graph.get("clean", {})
-        clean = self._retain_formalize_clean(
+        clean = await self._retain_formalize_clean(
             initial_graph,
             persisted_clean if isinstance(persisted_clean, dict) else {},
         )
@@ -3185,7 +3202,7 @@ class Orchestrator:
         if not self.force:
             graph = self._observed_work_unit_graph()
             persisted = self.state.formalize_graph.get("clean", {})
-            clean = self._retain_formalize_clean(
+            clean = await self._retain_formalize_clean(
                 graph,
                 persisted if isinstance(persisted, dict) else {},
             )
@@ -3203,7 +3220,9 @@ class Orchestrator:
                 return True
             files = scoped_files(self.config.settings.repo, chapter)
             if files:
-                placeholders = count_placeholders(self.config.settings.repo, chapter)
+                placeholders = await asyncio.to_thread(
+                    count_placeholders, self.config.settings.repo, chapter
+                )
                 build_fresh = isinstance(record, dict)
                 if not build_fresh:
                     revalidation = await self._refresh_stale_proof_build(chapter)
@@ -3234,12 +3253,15 @@ class Orchestrator:
                         chapter,
                         build_fresh=True,
                     )
+                    source_digest = await asyncio.to_thread(
+                        scope_digest, self.config.settings.repo, chapter
+                    )
                     await self.state.set_task(
                         chapter.id,
                         Stage.PROVE,
                         TaskStatus.SUCCEEDED,
                         "placeholder-free sources validated without an agent",
-                        source_digest=scope_digest(self.config.settings.repo, chapter),
+                        source_digest=source_digest,
                     )
                     return True
         proof_maximum = self.config.stages[Stage.PROVE].max_rounds
@@ -3376,12 +3398,15 @@ class Orchestrator:
                 and attempt.validation.succeeded
                 and attempt.agent.placeholders == 0
             ):
+                source_digest = await asyncio.to_thread(
+                    scope_digest, self.config.settings.repo, chapter
+                )
                 await self.state.set_task(
                     chapter.id,
                     Stage.PROVE,
                     TaskStatus.SUCCEEDED,
                     "no placeholders and chapter elaborates",
-                    source_digest=scope_digest(self.config.settings.repo, chapter),
+                    source_digest=source_digest,
                 )
                 return True
 
