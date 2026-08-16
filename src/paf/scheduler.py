@@ -123,6 +123,15 @@ class PendingBuildRequest:
 
 
 @dataclass(frozen=True)
+class PendingDiscovery:
+    chapter: WorkUnitLike
+    dependencies: tuple[str, ...]
+    summary: str
+    issues: tuple[Any, ...]
+    future: asyncio.Future[None]
+
+
+@dataclass(frozen=True)
 class RunningFormalizeStage:
     task: asyncio.Task[bool]
     progress: asyncio.Event
@@ -155,6 +164,8 @@ LAKE_CONTROL_PREFIXES = (
 )
 PROOF_FEEDBACK_MAX_CHARS = 24_000
 PROOF_FEEDBACK_ROUNDS = 3
+DISCOVERY_BATCH_SECONDS = 0.025
+DISCOVERY_BATCH_MAXIMUM = 256
 
 
 def _bounded_proof_feedback(blocks: Iterable[str]) -> str:
@@ -352,6 +363,8 @@ class Orchestrator:
         self.source_lock = asyncio.Lock()
         self._formalize_graph_lock = asyncio.Lock()
         self._discovery_lock = asyncio.Lock()
+        self._pending_discoveries: deque[PendingDiscovery] = deque()
+        self._discovery_batch_task: asyncio.Task[None] | None = None
         self._invalidated_reviews: set[str] = set()
         self._proof_rechecks: set[str] = set()
         self._review_invalidation_generations: dict[str, int] = {}
@@ -418,6 +431,14 @@ class Orchestrator:
 
     async def shutdown(self) -> None:
         try:
+            if self._discovery_batch_task is not None:
+                self._discovery_batch_task.cancel()
+                await asyncio.gather(self._discovery_batch_task, return_exceptions=True)
+                self._discovery_batch_task = None
+            for pending in self._pending_discoveries:
+                if not pending.future.done():
+                    pending.future.cancel()
+            self._pending_discoveries.clear()
             repairs = tuple(self._upstream_repair_tasks.values())
             for task in repairs:
                 task.cancel()
@@ -477,17 +498,98 @@ class Orchestrator:
         dependencies: Iterable[str],
         report: dict[str, Any],
     ) -> None:
+        """Queue one discovery result for a coalesced graph transaction."""
+
+        future: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        raw_issues = report.get("issues", ())
+        self._pending_discoveries.append(
+            PendingDiscovery(
+                chapter=chapter,
+                dependencies=tuple(sorted(set(dependencies))),
+                summary=str(report.get("summary", "")),
+                issues=tuple(raw_issues) if isinstance(raw_issues, list) else (),
+                future=future,
+            )
+        )
+        if self._discovery_batch_task is None or self._discovery_batch_task.done():
+            self._discovery_batch_task = asyncio.create_task(
+                self._drain_discovery_batches(), name="paf-discovery-persistence"
+            )
+        await future
+
+    async def _drain_discovery_batches(self) -> None:
+        try:
+            while self._pending_discoveries:
+                await asyncio.sleep(DISCOVERY_BATCH_SECONDS)
+                batch = tuple(
+                    self._pending_discoveries.popleft()
+                    for _ in range(min(len(self._pending_discoveries), DISCOVERY_BATCH_MAXIMUM))
+                )
+                try:
+                    await self._persist_discovery_batch(batch)
+                except asyncio.CancelledError:
+                    for pending in batch:
+                        if not pending.future.done():
+                            pending.future.cancel()
+                    raise
+                except BaseException as error:
+                    for pending in batch:
+                        if not pending.future.done():
+                            pending.future.set_exception(error)
+        finally:
+            self._discovery_batch_task = None
+
+    async def _persist_discovery_batch(self, batch: tuple[PendingDiscovery, ...]) -> None:
+        """Merge a completion burst and promote every valid task atomically."""
+
         async with self._discovery_lock:
             previous = self.state.source_dependency_tree
             raw_nodes = previous.get("nodes", {}) if isinstance(previous, dict) else {}
-            nodes = dict(raw_nodes) if isinstance(raw_nodes, dict) else {}
-            nodes[chapter.id] = {
-                "dependencies": sorted(set(dependencies)),
-                "source_digest": self._source_input_digest(chapter),
-                "summary": str(report.get("summary", "")),
-                "issues": list(report.get("issues", ())),
+            base_nodes: dict[str, object] = (
+                {
+                    str(chapter_id): dict(node)
+                    for chapter_id, node in raw_nodes.items()
+                    if isinstance(chapter_id, str) and isinstance(node, dict)
+                }
+                if isinstance(raw_nodes, dict)
+                else {}
+            )
+            digests = await asyncio.to_thread(
+                lambda: {
+                    pending.chapter.id: self._source_input_digest(pending.chapter)
+                    for pending in batch
+                }
+            )
+            updates: dict[str, object] = {
+                pending.chapter.id: {
+                    "dependencies": list(pending.dependencies),
+                    "source_digest": digests[pending.chapter.id],
+                    "summary": pending.summary,
+                    "issues": list(pending.issues),
+                }
+                for pending in batch
             }
-            graph = build_source_dependency_graph(self.work_units, nodes)
+            nodes: dict[str, object] = base_nodes | updates
+            valid = list(batch)
+            rejected: dict[str, ValueError] = {}
+            try:
+                graph = build_source_dependency_graph(self.work_units, nodes)
+            except ValueError:
+                # Cycles are exceptional. Identify only the offending results
+                # while preserving batching for the normal, valid path.
+                nodes = dict(base_nodes)
+                valid = []
+                graph = build_source_dependency_graph(self.work_units, nodes)
+                for pending in batch:
+                    trial = nodes | {pending.chapter.id: updates[pending.chapter.id]}
+                    try:
+                        candidate = build_source_dependency_graph(self.work_units, trial)
+                    except ValueError as error:
+                        rejected[pending.chapter.id] = error
+                        continue
+                    nodes = trial
+                    graph = candidate
+                    valid.append(pending)
             for chapter_id, node in nodes.items():
                 if chapter_id in graph.dependencies and isinstance(node, dict):
                     node["dependencies"] = sorted(graph.dependencies[chapter_id])
@@ -507,7 +609,21 @@ class Orchestrator:
                 },
                 "nodes": nodes,
             }
-            await self.state.save()
+            async with self.state.batch():
+                await self.state.save()
+                await self.state.set_tasks(
+                    (pending.chapter.id for pending in valid),
+                    Stage.DISCOVER,
+                    TaskStatus.SUCCEEDED,
+                    "source dependency tree persisted",
+                )
+            for pending in valid:
+                if not pending.future.done():
+                    pending.future.set_result(None)
+            for pending in batch:
+                error = rejected.get(pending.chapter.id)
+                if error is not None and not pending.future.done():
+                    pending.future.set_exception(error)
 
     async def _retain_formalize_clean(
         self,
@@ -1060,12 +1176,6 @@ class Orchestrator:
                     str(error),
                 )
                 return FormalizeOutcome(False)
-            await self.state.set_task(
-                chapter.id,
-                Stage.DISCOVER,
-                TaskStatus.SUCCEEDED,
-                "source dependency tree persisted",
-            )
             return FormalizeOutcome(True)
         await self.state.set_task(
             chapter.id,
@@ -2311,11 +2421,20 @@ class Orchestrator:
         )
 
     async def _discover_all(self) -> bool:
-        """Discover every input independently and persist each result as it lands."""
+        """Discover inputs with bounded scheduling and batched promotion."""
 
-        results = await _gather_cancel_on_error(
-            self._discover(chapter) for chapter in self.work_units
-        )
+        pending = deque(self.work_units)
+        results: list[FormalizeOutcome] = []
+        maximum = self.config.stages[Stage.DISCOVER].max_agents
+        assert maximum is not None
+
+        async def worker() -> None:
+            while pending:
+                chapter = pending.popleft()
+                results.append(await self._discover(chapter))
+
+        workers = tuple(worker() for _ in range(min(len(pending), maximum * 2)))
+        await _gather_cancel_on_error(workers)
         return all(result.succeeded for result in results)
 
     async def _discover_and_formalize(
@@ -2327,13 +2446,24 @@ class Orchestrator:
         """Pipeline discovery into dependency-ready formalization without a stage gate."""
 
         by_id = {chapter.id: chapter for chapter in self.work_units}
+        pending_discoveries: deque[WorkUnitLike] = deque()
         discovery_tasks: dict[str, asyncio.Task[FormalizeOutcome]] = {}
         if discover:
             for chapter in self.work_units:
                 if self.force or not self._discovery_is_current(chapter):
-                    discovery_tasks[chapter.id] = asyncio.create_task(
-                        self._discover(chapter, rerun=self.force)
-                    )
+                    pending_discoveries.append(chapter)
+        discovery_maximum = self.config.stages[Stage.DISCOVER].max_agents
+        assert discovery_maximum is not None
+        discovery_window = discovery_maximum * 2
+
+        def fill_discovery_window() -> None:
+            while pending_discoveries and len(discovery_tasks) < discovery_window:
+                chapter = pending_discoveries.popleft()
+                discovery_tasks[chapter.id] = asyncio.create_task(
+                    self._discover(chapter, rerun=self.force)
+                )
+
+        fill_discovery_window()
         formalize_tasks: dict[str, asyncio.Task[FormalizeOutcome]] = {}
         failed: set[str] = set()
 
@@ -2345,6 +2475,7 @@ class Orchestrator:
 
         try:
             while True:
+                fill_discovery_window()
                 graph = self._observed_work_unit_graph()
                 succeeded = {
                     chapter_id

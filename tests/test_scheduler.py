@@ -152,18 +152,16 @@ async def mark_discovered(
     """Persist a current source tree when a test starts at formalization."""
 
     dependencies = dependencies or {}
-    for chapter in orchestrator.work_units:
-        await orchestrator._persist_source_dependencies(
-            chapter,
-            tuple(dict.fromkeys((*chapter.depends_on, *dependencies.get(chapter.id, ())))),
-            {"summary": "test dependency tree", "issues": []},
+    await asyncio.gather(
+        *(
+            orchestrator._persist_source_dependencies(
+                chapter,
+                tuple(dict.fromkeys((*chapter.depends_on, *dependencies.get(chapter.id, ())))),
+                {"summary": "test dependency tree", "issues": []},
+            )
+            for chapter in orchestrator.work_units
         )
-        await orchestrator.state.set_task(
-            chapter.id,
-            Stage.DISCOVER,
-            TaskStatus.SUCCEEDED,
-            "source dependency tree persisted",
-        )
+    )
 
 
 async def mark_formalized(
@@ -200,6 +198,104 @@ async def mark_clean_formalization(
         "dirty": [],
     }
     await orchestrator.state.save()
+
+
+@pytest.mark.asyncio
+async def test_discovery_results_batch_graph_rebuild_and_task_promotion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = write_project(tmp_path, chapters="chapters = [1, 2, 3, 4, 5, 6]")
+    source = tmp_path / "books" / "book.md"
+    source.write_text(
+        source.read_text(encoding="utf-8")
+        + "\n".join(f"\n## {number}. Chapter {number}\n" for number in range(3, 7)),
+        encoding="utf-8",
+    )
+    config = load_config(config_path)
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await orchestrator.prepare()
+
+    graph_calls = 0
+    writes = 0
+    original_graph = scheduler_module.build_source_dependency_graph
+    original_write = state._database.write_delta
+
+    def build_graph(*args: Any, **kwargs: Any) -> Any:
+        nonlocal graph_calls
+        graph_calls += 1
+        return original_graph(*args, **kwargs)
+
+    def write_delta(write: Any, *, connection: Any = None) -> int:
+        nonlocal writes
+        writes += 1
+        return original_write(write, connection=connection)
+
+    monkeypatch.setattr(scheduler_module, "build_source_dependency_graph", build_graph)
+    monkeypatch.setattr(state._database, "write_delta", write_delta)
+
+    await asyncio.gather(
+        *(
+            orchestrator._persist_source_dependencies(
+                chapter,
+                (),
+                {"summary": f"discovered {chapter.id}", "issues": []},
+            )
+            for chapter in config.chapters
+        )
+    )
+
+    assert graph_calls == 1
+    assert writes == 1
+    assert set(state.source_dependency_tree["nodes"]) == {chapter.id for chapter in config.chapters}
+    assert all(
+        state.task(chapter.id, Stage.DISCOVER).status == TaskStatus.SUCCEEDED
+        for chapter in config.chapters
+    )
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_discovery_scheduler_bounds_created_coroutines(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = write_project(tmp_path, chapters="chapters = [1, 2, 3, 4, 5, 6]")
+    source = tmp_path / "books" / "book.md"
+    source.write_text(
+        source.read_text(encoding="utf-8")
+        + "\n".join(f"\n## {number}. Chapter {number}\n" for number in range(3, 7)),
+        encoding="utf-8",
+    )
+    config = load_config(config_path)
+    config = replace(
+        config,
+        stages={
+            **config.stages,
+            Stage.DISCOVER: replace(config.stages[Stage.DISCOVER], max_agents=1),
+        },
+    )
+    orchestrator = Orchestrator(config, StateStore(config))
+    release = asyncio.Event()
+    window_full = asyncio.Event()
+    started: list[str] = []
+
+    async def discover(chapter: Chapter, *, rerun: bool = False) -> FormalizeOutcome:
+        del rerun
+        started.append(chapter.id)
+        if len(started) == 2:
+            window_full.set()
+        await release.wait()
+        return FormalizeOutcome(True)
+
+    monkeypatch.setattr(orchestrator, "_discover", discover)
+    operation = asyncio.create_task(orchestrator._discover_all())
+    await asyncio.wait_for(window_full.wait(), timeout=1)
+    await asyncio.sleep(0)
+
+    assert len(started) == 2
+    release.set()
+    assert await operation
+    assert len(started) == 6
 
 
 @pytest.mark.asyncio
