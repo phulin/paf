@@ -472,6 +472,14 @@ impl DashboardModel {
         }
         targets
     }
+
+    pub fn is_building(&self, work_unit_id: &str, stage: &str) -> bool {
+        let build = &self.state.coordinator_build;
+        build.active
+            && build.completed < build.total
+            && build.stage == stage
+            && self.build_targets().contains(work_unit_id)
+    }
 }
 
 fn apply_optional<T>(target: &mut T, value: Option<T>) {
@@ -569,5 +577,22 @@ mod tests {
 
         assert_eq!(model.selected_activity().unwrap().current, "checking goals");
         assert_eq!(model.state.revision, 4);
+    }
+
+    #[test]
+    fn completed_coordinator_build_is_not_still_building_during_finalization() {
+        let mut model = DashboardModel::loading("test".into(), String::new());
+        model.state.coordinator_build = CoordinatorBuild {
+            active: true,
+            stage: "formalize".into(),
+            completed: 3,
+            total: 3,
+            target_work_unit_ids: vec!["book/chapter-01".into()],
+            ..CoordinatorBuild::default()
+        };
+
+        assert!(!model.is_building("book/chapter-01", "formalize"));
+        model.state.coordinator_build.completed = 2;
+        assert!(model.is_building("book/chapter-01", "formalize"));
     }
 }

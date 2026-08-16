@@ -158,8 +158,13 @@ fn summary(model: &DashboardModel) -> Paragraph<'static> {
         stage_agents
     };
     let build = if state.coordinator_build.active {
+        let phase = if state.coordinator_build.completed < state.coordinator_build.total {
+            "build"
+        } else {
+            "finalize"
+        };
         format!(
-            "{} build {}/{} · err {} · warn {}",
+            "{} {phase} {}/{} · err {} · warn {}",
             state.coordinator_build.mode,
             state.coordinator_build.completed,
             state.coordinator_build.total,
@@ -210,7 +215,6 @@ fn draw_stage_cards(frame: &mut Frame<'_>, model: &DashboardModel, area: Rect) {
         .direction(Direction::Horizontal)
         .constraints(STAGES.map(|_| Constraint::Ratio(1, 4)))
         .split(area);
-    let targets = model.build_targets();
     let mut statistics = [StageStatistics::default(); 4];
     for task in model.state.tasks.values() {
         let Some(index) = STAGES.iter().position(|stage| *stage == task.stage) else {
@@ -226,13 +230,12 @@ fn draw_stage_cards(frame: &mut Frame<'_>, model: &DashboardModel, area: Rect) {
             "pending" => current.pending += 1,
             _ => {}
         }
-        if task.phase == "postprocess" && !targets.contains(task.work_unit_id.as_str()) {
+        if task.phase == "postprocess"
+            && !model.is_building(task.work_unit_id.as_str(), task.stage.as_str())
+        {
             current.postprocess += 1;
         }
-        if model.state.coordinator_build.active
-            && model.state.coordinator_build.stage == task.stage
-            && targets.contains(task.work_unit_id.as_str())
-        {
+        if model.is_building(task.work_unit_id.as_str(), task.stage.as_str()) {
             current.building += 1;
         }
     }
@@ -290,7 +293,6 @@ fn draw_task_table(frame: &mut Frame<'_>, model: &DashboardModel, area: Rect) {
         .saturating_sub(viewport / 2)
         .min(rows.len().saturating_sub(viewport));
     let end = (start + viewport).min(rows.len());
-    let targets = model.build_targets();
     let critical: std::collections::HashSet<&str> = model
         .state
         .scheduling
@@ -333,14 +335,7 @@ fn draw_task_table(frame: &mut Frame<'_>, model: &DashboardModel, area: Rect) {
         for stage in STAGES {
             let value = row.tasks.get(stage).map_or_else(
                 || "· pending".into(),
-                |task| {
-                    task_mark(
-                        task,
-                        model.state.coordinator_build.active
-                            && model.state.coordinator_build.stage == stage
-                            && targets.contains(row.unit.id.as_str()),
-                    )
-                },
+                |task| task_mark(task, model.is_building(row.unit.id.as_str(), stage)),
             );
             cells.push(Cell::from(value));
         }
@@ -422,8 +417,13 @@ fn draw_status(frame: &mut Frame<'_>, model: &DashboardModel, area: Rect) {
         } else {
             build.completed as f64 / build.total as f64
         };
+        let phase = if build.completed < build.total {
+            "BUILD"
+        } else {
+            "FINALIZE"
+        };
         let label = format!(
-            "{} BUILD {}/{} · iter {}/{} · err {} · warn {}{}",
+            "{} {phase} {}/{} · iter {}/{} · err {} · warn {}{}",
             build.mode.to_uppercase(),
             build.completed,
             build.total,
@@ -679,8 +679,11 @@ fn current_activity(
     activity: Option<&Activity>,
 ) -> String {
     let build = &model.state.coordinator_build;
-    if build.active && model.build_targets().contains(row.unit.id.as_str()) {
+    if model.is_building(row.unit.id.as_str(), build.stage.as_str()) {
         return format!("{} coordinator build", build.mode);
+    }
+    if build.active && model.build_targets().contains(row.unit.id.as_str()) {
+        return format!("{} coordinator finalize", build.mode);
     }
     if let Some(activity) = activity {
         let idle = elapsed_seconds(&activity.updated_at);
@@ -887,6 +890,48 @@ mod tests {
         assert!(detail.contains("Agent detail"));
         assert!(detail.contains("[edit] success"));
         assert!(detail.contains("reload TUI"));
+    }
+
+    #[test]
+    fn completed_build_renders_as_finalizing_instead_of_building() {
+        let mut model = DashboardModel::loading("formalize stage".into(), String::new());
+        model.preparation = None;
+        model.state.coordinator_build = crate::model::CoordinatorBuild {
+            active: true,
+            mode: "targeted".into(),
+            stage: "formalize".into(),
+            completed: 3,
+            total: 3,
+            target_work_unit_ids: vec!["book/chapter-01".into()],
+            ..crate::model::CoordinatorBuild::default()
+        };
+        model.state.work_units.push(WorkUnit {
+            id: "book/chapter-01".into(),
+            document_id: "book".into(),
+            title: "Opening".into(),
+            ordinal: 1,
+            ..WorkUnit::default()
+        });
+        model.state.tasks.insert(
+            "book/chapter-01:formalize".into(),
+            Task {
+                work_unit_id: "book/chapter-01".into(),
+                stage: "formalize".into(),
+                status: "running".into(),
+                phase: "postprocess".into(),
+                ..Task::default()
+            },
+        );
+
+        let backend = TestBackend::new(180, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut model)).unwrap();
+        let rendered = terminal.backend().to_string();
+
+        assert!(rendered.contains("targeted finalize 3/3"));
+        assert!(rendered.contains("◇ postprocess"));
+        assert!(rendered.contains("targeted coordinator finalize"));
+        assert!(!rendered.contains("◆ building"));
     }
 
     #[test]
