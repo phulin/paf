@@ -7,6 +7,7 @@ import subprocess
 import sys
 import termios
 from pathlib import Path
+from typing import cast
 
 import paf.tui as tui_module
 from paf.config import load_config
@@ -90,6 +91,53 @@ def test_native_entry_point_forwards_connection_options(monkeypatch) -> None:  #
         == 0
     )
     assert received == [("/tmp/paf.sock", "review", "rg")]
+
+
+async def test_run_tui_waits_for_server_readiness_without_a_fixed_deadline(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:  # type: ignore[no-untyped-def]
+    launched: list[tuple[object, ...]] = []
+
+    class FakeServer:
+        def __init__(self, orchestrator: object, operation: object) -> None:
+            self.ready = asyncio.Event()
+            self.stopped = asyncio.Event()
+            # Deliberately never create this path: readiness is an in-process contract,
+            # not a racy filesystem observation.
+            self.socket_path = tmp_path / "control.sock"
+
+        async def run(self) -> bool:
+            for _ in range(201):
+                await asyncio.sleep(0)
+            self.ready.set()
+            await self.stopped.wait()
+            return True
+
+        def request_stop(self) -> None:
+            self.stopped.set()
+
+    class FakeProcess:
+        async def wait(self) -> int:
+            return 0
+
+    async def create_subprocess_exec(*args: object) -> FakeProcess:
+        launched.append(args)
+        return FakeProcess()
+
+    monkeypatch.setattr(tui_module, "ControlServer", FakeServer)
+    monkeypatch.setattr(tui_module.asyncio, "create_subprocess_exec", create_subprocess_exec)
+
+    async def operation() -> bool:
+        return True
+
+    assert await tui_module._run_tui(
+        cast(Orchestrator, object()),
+        operation,
+        label="readiness test",
+        startup_warning="",
+    )
+    assert launched
 
 
 async def test_dashboard_projection_includes_ordered_units_and_bounded_activity(

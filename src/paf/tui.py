@@ -59,16 +59,11 @@ async def _run_tui(
 ) -> bool:
     server = ControlServer(orchestrator, operation)
     server_task = asyncio.create_task(server.run())
+    ready_task = asyncio.create_task(server.ready.wait())
     try:
-        for _ in range(200):
-            if server.socket_path.exists():
-                break
-            if server_task.done():
-                return await server_task
-            await asyncio.sleep(0.01)
-        else:
-            server.request_stop()
-            raise RuntimeError("orchestrator dashboard socket did not become ready")
+        done, _ = await asyncio.wait({ready_task, server_task}, return_when=asyncio.FIRST_COMPLETED)
+        if server_task in done:
+            return await server_task
 
         process = await asyncio.create_subprocess_exec(
             sys.executable,
@@ -89,9 +84,11 @@ async def _run_tui(
             raise RuntimeError(f"native TUI exited unexpectedly with status {return_code}")
         return bool(result)
     finally:
+        if not ready_task.done():
+            ready_task.cancel()
         if not server_task.done():
             server.request_stop()
-        await asyncio.gather(server_task, return_exceptions=True)
+        await asyncio.gather(ready_task, server_task, return_exceptions=True)
 
 
 def run_tui(

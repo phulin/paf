@@ -86,6 +86,7 @@ class ControlServer:
         self.done = asyncio.Event()
         self.result: bool | None = None
         self._server: asyncio.Server | None = None
+        self.ready = asyncio.Event()
 
     async def run(self) -> bool:
         claimed_pid = False
@@ -98,6 +99,7 @@ class ControlServer:
             self.result_path.unlink(missing_ok=True)
             self._server = await asyncio.start_unix_server(self._handle, path=self.socket_path)
             self.socket_path.chmod(0o600)
+            self.ready.set()
             self.pipeline_task = asyncio.create_task(self.operation())
             loop = asyncio.get_running_loop()
             installed_signals: list[signal.Signals] = []
