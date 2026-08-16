@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import re
+import threading
 import time
 from collections import Counter
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from paf import json_codec as json
 
@@ -721,15 +724,39 @@ class ActivityStore:
         self.save(activity)
         return activity
 
-    def save(self, activity: AgentActivity) -> None:
+    async def start_async(self, run_id: str, chapter_id: str, stage: str) -> AgentActivity:
+        activity = AgentActivity(run_id=run_id, chapter_id=chapter_id, stage=stage)
+        self._cache[run_id] = activity
+        await self.save_async(activity)
+        return activity
+
+    def _persist(self, activity: AgentActivity) -> None:
         self.logs_dir.mkdir(parents=True, exist_ok=True)
         path = self.path(activity.run_id)
-        temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        temporary = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
         temporary.write_bytes(json.dumpb(activity.as_dict(), sort_keys=True))
         os.replace(temporary, path)
+
+    def save(self, activity: AgentActivity) -> None:
         self._cache[activity.run_id] = activity
+        self._persist(activity)
         self._last_saved[activity.run_id] = time.monotonic()
         self._notify_visible_change(activity)
+
+    async def save_async(self, activity: AgentActivity) -> None:
+        """Persist an activity without blocking the caller's asyncio loop."""
+
+        self._cache[activity.run_id] = activity
+        self._notify_visible_change(activity)
+        write = asyncio.create_task(asyncio.to_thread(self._persist, activity))
+        try:
+            await asyncio.shield(write)
+        except asyncio.CancelledError:
+            # A worker thread cannot be cancelled. Drain it before callers
+            # mutate this activity or start a newer write for the same run.
+            await write
+            raise
+        self._last_saved[activity.run_id] = time.monotonic()
 
     def save_throttled(self, activity: AgentActivity, *, interval: float = 1.0) -> None:
         """Persist a derived activity summary at most once per interval."""
@@ -739,6 +766,15 @@ class ActivityStore:
         last_saved = self._last_saved.get(activity.run_id, 0.0)
         if time.monotonic() - last_saved >= interval:
             self.save(activity)
+
+    async def save_throttled_async(self, activity: AgentActivity, *, interval: float = 1.0) -> None:
+        """Asynchronously persist a derived activity at most once per interval."""
+
+        self._cache[activity.run_id] = activity
+        self._notify_visible_change(activity)
+        last_saved = self._last_saved.get(activity.run_id, 0.0)
+        if time.monotonic() - last_saved >= interval:
+            await self.save_async(activity)
 
     def _notify_visible_change(self, activity: AgentActivity) -> None:
         visible = (

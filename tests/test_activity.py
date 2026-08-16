@@ -1,4 +1,5 @@
 import json
+import threading
 from pathlib import Path
 
 import pytest
@@ -36,6 +37,32 @@ def test_activity_store_throttles_reconstructible_sidecar_writes(
     persisted = ActivityStore(tmp_path / "logs").get("run")
     assert persisted is not None
     assert persisted.current == "updated in memory"
+
+
+@pytest.mark.asyncio
+async def test_async_activity_store_serializes_off_the_event_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    event_loop_thread = threading.get_ident()
+    serialization_threads: list[int] = []
+    original = activity_module.json.dumpb
+
+    def observed_dumpb(value: object, *, indent: bool = False, sort_keys: bool = False) -> bytes:
+        serialization_threads.append(threading.get_ident())
+        return original(value, indent=indent, sort_keys=sort_keys)
+
+    monkeypatch.setattr(activity_module.json, "dumpb", observed_dumpb)
+    store = ActivityStore(tmp_path / "logs")
+
+    activity = await store.start_async("run", "chapter", "formalize")
+    activity.current = "persisted asynchronously"
+    await store.save_async(activity)
+
+    assert serialization_threads
+    assert all(thread != event_loop_thread for thread in serialization_threads)
+    persisted = ActivityStore(store.logs_dir).get("run")
+    assert persisted is not None
+    assert persisted.current == "persisted asynchronously"
 
 
 def test_activity_replay_can_retain_a_full_timeline_without_replacing_cache(

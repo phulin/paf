@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from importlib.resources import files
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 
 from paf import json_codec as json
 from paf.activity import EVENT_TIMESTAMP_FIELD, activity_timestamp
@@ -829,6 +829,28 @@ def _complete_lines(pending: bytearray, chunk: bytes) -> tuple[bytes, ...]:
     return tuple(lines)
 
 
+def _record_jsonl_line(
+    log: BinaryIO,
+    line: bytes,
+    *,
+    terminated: bool,
+) -> tuple[Any, str | None]:
+    """Decode, timestamp, and record one event outside the asyncio loop."""
+
+    try:
+        event = json.loads(line)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        log.write(line + (b"\n" if terminated else b""))
+        return None, None
+    received_at = activity_timestamp()
+    if isinstance(event, dict):
+        event = {**event, EVENT_TIMESTAMP_FIELD: received_at}
+        log.write(json.dumpb(event) + b"\n")
+    else:
+        log.write(line + (b"\n" if terminated else b""))
+    return event, received_at
+
+
 def _codex_rollout(thread_id: str) -> Path | None:
     codex_home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
     sessions = codex_home / "sessions"
@@ -1217,7 +1239,9 @@ whole-file diagnostics from prerequisites to dependents. Do not prepare every fi
             await self.state.update_run(run, thread_id=thread_id)
         invocation_error = ""
         fatal_invocation_failure = False
-        activity = self.state.activities.start(run.id, chapter.id, run.role or stage.value)
+        activity = await self.state.activities.start_async(
+            run.id, chapter.id, run.role or stage.value
+        )
         usage_stop = asyncio.Event()
         usage_monitor: asyncio.Task[None] | None = None
         attempt_deadline = (
@@ -1278,19 +1302,25 @@ whole-file diagnostics from prerequisites to dependents. Do not prepare every fi
                     async def consume_line(line: bytes, *, terminated: bool = True) -> None:
                         nonlocal usage, report, thread_id, usage_monitor, capacity_failure
                         nonlocal invocation_error, fatal_invocation_failure
+                        recording = asyncio.create_task(
+                            asyncio.to_thread(
+                                _record_jsonl_line,
+                                log,
+                                line,
+                                terminated=terminated,
+                            )
+                        )
                         try:
-                            event = json.loads(line)
-                        except (json.JSONDecodeError, UnicodeDecodeError):
-                            log.write(line + (b"\n" if terminated else b""))
+                            event, received_at = await asyncio.shield(recording)
+                        except asyncio.CancelledError:
+                            # Do not close the log while its worker thread may
+                            # still be serializing or writing this record.
+                            await recording
+                            raise
+                        if received_at is None:
                             return
-                        received_at = activity_timestamp()
-                        if isinstance(event, dict):
-                            event = {**event, EVENT_TIMESTAMP_FIELD: received_at}
-                            log.write(json.dumpb(event) + b"\n")
-                        else:
-                            log.write(line + (b"\n" if terminated else b""))
                         activity.consume(event, workspace_root=root, at=received_at)
-                        self.state.activities.save_throttled(activity)
+                        await self.state.activities.save_throttled_async(activity)
                         capacity_failure = capacity_failure or _is_capacity_failure(event)
                         fatal_invocation_failure = (
                             fatal_invocation_failure or _is_fatal_invocation_failure(event)
@@ -1422,7 +1452,7 @@ whole-file diagnostics from prerequisites to dependents. Do not prepare every fi
                         activity.retry(
                             f"could not resume Codex session {thread_id}; starting a new agent"
                         )
-                        self.state.activities.save(activity)
+                        await self.state.activities.save_async(activity)
                         thread_id = None
                         report = {}
                         invocation_error = ""
@@ -1442,7 +1472,7 @@ whole-file diagnostics from prerequisites to dependents. Do not prepare every fi
                         f"{self.config.settings.codex_fd_recycle_attempts}: Codex reached "
                         f"{fd_pressure} open descriptors; resuming {thread_id}"
                     )
-                    self.state.activities.save(activity)
+                    await self.state.activities.save_async(activity)
                     continue
                 if capacity_failure:
                     if capacity_retries >= self.config.settings.capacity_resume_attempts:
@@ -1453,7 +1483,7 @@ whole-file diagnostics from prerequisites to dependents. Do not prepare every fi
                         f"capacity retry {capacity_retries}/"
                         f"{self.config.settings.capacity_resume_attempts}: resuming {thread_id}"
                     )
-                    self.state.activities.save(activity)
+                    await self.state.activities.save_async(activity)
                     delay = _capacity_resume_delay(
                         self.config.settings.capacity_resume_delay_seconds,
                         self.config.settings.capacity_resume_max_delay_seconds,
@@ -1472,7 +1502,7 @@ whole-file diagnostics from prerequisites to dependents. Do not prepare every fi
         except asyncio.CancelledError:
             await stop_usage_monitor()
             activity.finish("cancelled", "agent cancelled by orchestrator")
-            self.state.activities.save(activity)
+            await self.state.activities.save_async(activity)
             await self.state.finish_run(
                 run,
                 status=TaskStatus.INTERRUPTED,
@@ -1500,7 +1530,7 @@ whole-file diagnostics from prerequisites to dependents. Do not prepare every fi
             error = "Codex returned no structured final report"
         succeeded = exit_code == 0 and bool(report)
         activity.finish("succeeded" if succeeded else "failed", error)
-        self.state.activities.save(activity)
+        await self.state.activities.save_async(activity)
         await self.state.finish_run(
             run,
             status=TaskStatus.SUCCEEDED if succeeded else TaskStatus.FAILED,
