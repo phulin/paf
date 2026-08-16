@@ -312,7 +312,19 @@ def _config_from_args(args: argparse.Namespace) -> PipelineConfig:
             max_agents=max_agents or config.settings.max_agents,
             isolation=isolation or config.settings.isolation,
         )
-        config = replace(config, settings=settings)
+        stages = {
+            stage: replace(
+                stage_settings,
+                model=model if model is not None else stage_settings.model,
+                reasoning_effort=(
+                    reasoning_effort
+                    if reasoning_effort is not None
+                    else stage_settings.reasoning_effort
+                ),
+            )
+            for stage, stage_settings in config.stages.items()
+        }
+        config = replace(config, settings=settings, stages=stages)
     return config
 
 
@@ -391,11 +403,19 @@ def print_plan(config: PipelineConfig, console: Console) -> None:
     )
     stages = Table(title="Stages")
     stages.add_column("Stage")
+    stages.add_column("Model")
+    stages.add_column("Reasoning")
     stages.add_column("Prompt")
     stages.add_column("Max rounds", justify="right")
     for stage in Stage:
         settings = config.stages[stage]
-        stages.add_row(stage.value, str(settings.prompt), str(settings.max_rounds))
+        stages.add_row(
+            stage.value,
+            str(config.model_for(stage)),
+            str(config.reasoning_effort_for(stage)),
+            str(settings.prompt),
+            str(settings.max_rounds),
+        )
     console.print(stages)
     statement_schedule = build_corpus_schedule(
         config.documents, config.work_units, phase="statements"

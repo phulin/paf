@@ -26,6 +26,12 @@ def test_discovers_chapters_and_renders_paths(tmp_path: Path) -> None:
     assert config.stages[Stage.FORMALIZE].max_rounds == 10
     assert config.stages[Stage.FORMALIZE].max_rounds == 10
     assert config.stages[Stage.REVIEW].max_rounds == 5
+    assert config.stages[Stage.DISCOVER].model == "gpt-5.6-luna"
+    assert config.stages[Stage.DISCOVER].reasoning_effort == "medium"
+    assert config.stages[Stage.FORMALIZE].model is None
+    assert config.stages[Stage.FORMALIZE].reasoning_effort is None
+    assert config.model_for(Stage.FORMALIZE) == config.settings.model
+    assert config.reasoning_effort_for(Stage.FORMALIZE) == config.settings.reasoning_effort
     assert config.settings.state_dir == tmp_path / ".paf"
     assert config.settings.lean_project == Path("lean")
     assert config.settings.lean_mcp_tool_timeout_seconds == 300
@@ -179,6 +185,40 @@ def test_config_stage_prompts_are_optional(tmp_path: Path) -> None:
     config = load_config(path)
 
     assert config.stages[Stage.FORMALIZE].prompt.name == "formalize.md"
+
+
+def test_loads_stage_specific_model_and_reasoning_effort(tmp_path: Path) -> None:
+    path = write_project(tmp_path)
+    path.write_text(
+        path.read_text(encoding="utf-8").replace(
+            '[stages.review]\nprompt = "prompts/review.md"',
+            '[stages.review]\nprompt = "prompts/review.md"\n'
+            'model = "gpt-5.6-sol"\nreasoning_effort = "high"',
+        ),
+        encoding="utf-8",
+    )
+
+    config = load_config(path)
+
+    assert config.model_for(Stage.REVIEW) == "gpt-5.6-sol"
+    assert config.reasoning_effort_for(Stage.REVIEW) == "high"
+    assert config.model_for(Stage.PROVE) == config.settings.model
+    assert config.reasoning_effort_for(Stage.PROVE) == config.settings.reasoning_effort
+
+
+@pytest.mark.parametrize(("key", "value"), (("model", 7), ("reasoning_effort", True)))
+def test_rejects_non_string_stage_agent_settings(tmp_path: Path, key: str, value: object) -> None:
+    path = write_project(tmp_path)
+    path.write_text(
+        path.read_text(encoding="utf-8").replace(
+            '[stages.review]\nprompt = "prompts/review.md"',
+            f'[stages.review]\nprompt = "prompts/review.md"\n{key} = {str(value).lower()}',
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match=rf"stages\.review\.{key}"):
+        load_config(path)
 
 
 def test_legacy_repair_stage_config_maps_to_formalize(tmp_path: Path) -> None:

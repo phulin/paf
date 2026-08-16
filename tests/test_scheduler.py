@@ -814,6 +814,20 @@ async def test_concurrent_run_updates_coalesce_into_one_database_batch(
 
 
 @pytest.mark.asyncio
+async def test_run_records_use_the_stage_model(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    config = replace(config, settings=replace(config.settings, model="gpt-5.6-sol"))
+    state = StateStore(config)
+    await state.load_or_create()
+
+    discovery = await state.start_run(config.chapters[0].id, Stage.DISCOVER)
+    formalize = await state.start_run(config.chapters[0].id, Stage.FORMALIZE)
+
+    assert discovery.model == "gpt-5.6-luna"
+    assert formalize.model == "gpt-5.6-sol"
+
+
+@pytest.mark.asyncio
 async def test_recovering_interrupted_run_preserves_lazy_payload(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
     first = StateStore(config)

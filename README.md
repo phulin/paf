@@ -122,7 +122,7 @@ target, and durable run state only from the paths resolved by that project's `pa
 an external `state_dir`.
 
 Passing a `.md` as the first argument is shorthand for `pipeline <target>`. Zero-config runs default
-to `gpt-5.6-luna`, reasoning effort `max`, the packaged generic prompt library under
+to `gpt-5.6-luna`, reasoning effort `max` (with discovery using `gpt-5.6-luna` at `medium`), the packaged generic prompt library under
 `src/paf/prompts/`, automatic execution isolation, and a state directory at
 `.paf/<inferred-book-id>/`. Fixup, review, and proof attempts attach a private Lean LSP MCP server;
 drafting does not. Use
@@ -628,11 +628,18 @@ lean_project = "lean" # relative to swarm.repo; contains lakefile and lean-toolc
 lean_mcp_tool_timeout_seconds = 300
 ```
 
-Every stage automatically uses its packaged standard prompt and default retry bound. A stage table
-may override either setting independently:
+Every stage automatically uses its packaged standard prompt and default retry bound. It inherits
+the swarm model and reasoning effort unless the stage has an override; discovery defaults to
+`gpt-5.6-luna` at `medium`. A stage table may override any of these settings independently:
 
 ```toml
+[stages.discover]
+model = "gpt-5.6-luna"
+reasoning_effort = "medium"
+
 [stages.formalize]
+model = "gpt-5.6-sol"
+reasoning_effort = "high"
 max_rounds = 12
 
 [stages.review]

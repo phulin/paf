@@ -254,6 +254,8 @@ def test_executor_uses_machine_readable_codex_mode(tmp_path: Path) -> None:
     assert "--approve-for-me" not in command
     assert "--sandbox" not in command
     assert "--skip-git-repo-check" not in command
+    assert command[command.index("--model") + 1] == "gpt-5.6-luna"
+    assert 'model_reasoning_effort="max"' in command
     isolated = tmp_path / "isolated"
     isolated_command = executor.command(Stage.PROVE, isolated)
     assert "--skip-git-repo-check" in isolated_command
@@ -306,7 +308,10 @@ def test_executor_uses_machine_readable_codex_mode(tmp_path: Path) -> None:
     assert "lean_multi_attempt" not in formalize_overrides["mcp_servers.paf_lean.enabled_tools"]
     assert "lean_goal" not in formalize_overrides["mcp_servers.paf_lean.enabled_tools"]
 
-    assert not any("mcp_servers.paf_lean" in item for item in executor.command(Stage.DISCOVER))
+    discover_command = executor.command(Stage.DISCOVER)
+    assert not any("mcp_servers.paf_lean" in item for item in discover_command)
+    assert discover_command[discover_command.index("--model") + 1] == "gpt-5.6-luna"
+    assert 'model_reasoning_effort="medium"' in discover_command
 
     resumed = executor.command(Stage.FORMALIZE, isolated, resume_thread_id="capacity-thread")
     assert resumed[:3] == ["codex", "exec", "resume"]
@@ -316,6 +321,21 @@ def test_executor_uses_machine_readable_codex_mode(tmp_path: Path) -> None:
     assert "--cd" not in resumed
     resumed_review = executor.command(Stage.REVIEW, isolated, resume_thread_id="review-thread")
     assert "--dangerously-bypass-approvals-and-sandbox" in resumed_review
+
+
+def test_executor_uses_stage_specific_model_and_reasoning_effort(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    stages = dict(config.stages)
+    stages[Stage.REVIEW] = replace(
+        stages[Stage.REVIEW], model="gpt-5.6-sol", reasoning_effort="high"
+    )
+    config = replace(config, stages=stages)
+    executor = CodexExecutor(config, StateStore(config))
+
+    command = executor.command(Stage.REVIEW)
+
+    assert command[command.index("--model") + 1] == "gpt-5.6-sol"
+    assert 'model_reasoning_effort="high"' in command
 
 
 @pytest.mark.asyncio

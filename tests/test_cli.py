@@ -219,6 +219,31 @@ def test_plan_command(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> Non
     assert "Lean MCP: enabled" in output
 
 
+def test_cli_model_overrides_apply_to_every_stage(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    path = write_project(tmp_path)
+
+    assert (
+        main(
+            [
+                "plan",
+                "--config",
+                str(path),
+                "--model",
+                "gpt-5.6-sol",
+                "--reasoning-effort",
+                "low",
+            ]
+        )
+        == 0
+    )
+    output = capsys.readouterr().out
+    assert "gpt-5.6-sol" in output
+    assert "low" in output
+    assert "medium" not in output
+
+
 def test_scaffold_creates_only_chapter_directories(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

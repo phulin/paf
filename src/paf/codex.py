@@ -1096,10 +1096,12 @@ whole-file diagnostics from prerequisites to dependents. Do not prepare every fi
             command.append("--approve-for-me")
         else:
             command.extend(["--sandbox", settings.sandbox])
-        if settings.model:
-            command.extend(["--model", settings.model])
-        if settings.reasoning_effort:
-            command.extend(["--config", f'model_reasoning_effort="{settings.reasoning_effort}"'])
+        model = self.config.model_for(stage)
+        reasoning_effort = self.config.reasoning_effort_for(stage)
+        if model:
+            command.extend(["--model", model])
+        if reasoning_effort:
+            command.extend(["--config", f'model_reasoning_effort="{reasoning_effort}"'])
         if stage in (Stage.FORMALIZE, Stage.REVIEW, Stage.PROVE):
             backend = self.config.backend or LeanBackend(
                 project=settings.lean_project,

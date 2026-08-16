@@ -24,6 +24,8 @@ PROOF_STAGES = (Stage.PROVE,)
 class StageConfig:
     prompt: Path
     max_rounds: int
+    model: str | None = None
+    reasoning_effort: str | None = None
 
 
 @dataclass(frozen=True)
@@ -377,6 +379,16 @@ class PipelineConfig:
     canonical_documents: tuple[SourceDocument, ...] | None = None
     canonical_work_units: tuple[WorkUnit, ...] | None = None
     project: Project | None = None
+
+    def model_for(self, stage: Stage) -> str | None:
+        """Resolve a stage model override against the swarm-wide default."""
+
+        return self.stages[stage].model or self.settings.model
+
+    def reasoning_effort_for(self, stage: Stage) -> str | None:
+        """Resolve a stage reasoning override against the swarm-wide default."""
+
+        return self.stages[stage].reasoning_effort or self.settings.reasoning_effort
 
     @property
     def documents(self) -> tuple[SourceDocument, ...]:

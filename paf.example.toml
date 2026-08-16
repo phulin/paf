@@ -42,10 +42,12 @@ mcp_tool_timeout_seconds = 300
 # unit_module = "Formalization.Opening"
 # scope = ["lean/Formalization/Flat/Opening.lean"]
 
-[stages.formalize]
+[stages.discover]
+model = "gpt-5.6-luna"
+reasoning_effort = "medium"
 max_rounds = 1
 
-[stages.fixup]
+[stages.formalize]
 max_rounds = 12
 
 [stages.review]

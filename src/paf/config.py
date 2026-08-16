@@ -61,6 +61,14 @@ STAGE_ROUNDS = {
     Stage.PROVE: 10,
 }
 
+STAGE_MODELS = {
+    Stage.DISCOVER: "gpt-5.6-luna",
+}
+
+STAGE_REASONING_EFFORTS = {
+    Stage.DISCOVER: "medium",
+}
+
 
 def standard_prompt_path(stage: Stage) -> Path:
     resource = files("paf.prompts").joinpath(f"{stage.value}.md")
@@ -99,7 +107,18 @@ def _stage_configs(raw_stages: dict[str, Any], base: Path) -> dict[Stage, StageC
             raise ValueError(f"stages.{stage.value}.max_rounds must be positive")
         if not prompt.is_file():
             raise ValueError(f"prompt does not exist: {prompt}")
-        stages[stage] = StageConfig(prompt=prompt, max_rounds=max_rounds)
+        model_value = raw.get("model", STAGE_MODELS.get(stage))
+        if model_value is not None and not isinstance(model_value, str):
+            raise ValueError(f"stages.{stage.value}.model must be a string")
+        reasoning_value = raw.get("reasoning_effort", STAGE_REASONING_EFFORTS.get(stage))
+        if reasoning_value is not None and not isinstance(reasoning_value, str):
+            raise ValueError(f"stages.{stage.value}.reasoning_effort must be a string")
+        stages[stage] = StageConfig(
+            prompt=prompt,
+            max_rounds=max_rounds,
+            model=model_value,
+            reasoning_effort=reasoning_value,
+        )
     return stages
 
 
