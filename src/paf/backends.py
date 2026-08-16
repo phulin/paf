@@ -63,7 +63,9 @@ def _module_component(value: str) -> str:
 
 def target_variables(unit: WorkUnit) -> dict[str, str]:
     source_stem = unit.source.with_suffix("")
-    document_module = ".".join(_module_component(part) for part in source_stem.parts)
+    document_components = tuple(_module_component(part) for part in source_stem.parts)
+    document_module = ".".join(document_components)
+    document_module_path = "/".join(document_components)
     return {
         "work_unit_id": unit.id,
         "document_id": unit.document_id,
@@ -72,6 +74,7 @@ def target_variables(unit: WorkUnit) -> dict[str, str]:
         "document_path": unit.source.as_posix(),
         "document_stem": unit.source.stem,
         "document_module": document_module,
+        "document_module_path": document_module_path,
         "source": unit.source.as_posix(),
         "source_name": unit.source.name,
         "source_stem": unit.source.stem,
@@ -106,7 +109,7 @@ def render_target_template(template: str, variables: Mapping[str, str], *, name:
 class TargetTemplates:
     root: str = "lean/Formalization"
     module: str = "Formalization"
-    path: str = "{document_module}/Unit{unit_ordinal_padded}"
+    path: str = "{document_module_path}/Unit{unit_ordinal_padded}"
     unit_module: str = "{module}.{document_module}.Unit{unit_ordinal_padded}"
     build_command: str = "cd lean && lake build +{unit_module}"
     scope: tuple[str, ...] = (

@@ -76,6 +76,41 @@ def test_backend_templates_map_nested_mixed_sources_to_flat_targets(tmp_path: Pa
     assert tex.build_command == "true"
 
 
+def test_default_backend_uses_nested_paths_and_dotted_modules(tmp_path: Path) -> None:
+    (tmp_path / "books").mkdir()
+    (tmp_path / "books" / "crystalline.tex").write_text(
+        "\\section{Introduction}\nText.\n", encoding="utf-8"
+    )
+    config_path = tmp_path / "paf.toml"
+    config_path.write_text(
+        """
+[swarm]
+repo = "."
+isolation = "shared"
+
+[sources]
+roots = ["books"]
+
+[[sources.rules]]
+glob = "**/*.tex"
+unit = "section"
+
+[backend]
+kind = "lean"
+mcp_enabled = false
+""",
+        encoding="utf-8",
+    )
+
+    unit = load_config(config_path).work_unit("books/crystalline/unit-01")
+    assert unit.chapter_path == "Books/Crystalline/Unit01"
+    assert unit.chapter_module == "Formalization.Books.Crystalline.Unit01"
+    assert unit.scope == (
+        "lean/Formalization/Books/Crystalline/Unit01.lean",
+        "lean/Formalization/Books/Crystalline/Unit01/**/*.lean",
+    )
+
+
 def test_backend_bootstraps_mathlib_project_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
