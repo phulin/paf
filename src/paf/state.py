@@ -780,8 +780,9 @@ class StateStore:
         run: RunRecord | None = None,
         issues: bool = False,
         static: bool = False,
+        global_state: bool = True,
     ) -> None:
-        self._checkpoint_dirty = True
+        self._checkpoint_dirty = self._checkpoint_dirty or global_state
         changed_tasks = [*tasks]
         if task is not None:
             changed_tasks.append(task)
@@ -1880,7 +1881,10 @@ class StateStore:
             self._adjust_aggregate_caches(run, old_usage=old_usage, old_model=old_model)
         if "status" in changes:
             self._invalidate_status_summaries()
-        self._mark_dirty(run=run)
+        self._mark_dirty(
+            run=run,
+            global_state=bool({"usage", "model", "status"} & changes.keys()),
+        )
         if deferred:
             self._schedule_telemetry_flush()
         else:

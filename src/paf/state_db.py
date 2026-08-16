@@ -520,7 +520,7 @@ def _coalesce_writes(writes: list[DatabaseWrite]) -> DatabaseWrite:
 class StateWriter:
     """Single-connection delta writer with short micro-batching."""
 
-    def __init__(self, database: StateDatabase, *, batch_seconds: float = 0.02) -> None:
+    def __init__(self, database: StateDatabase, *, batch_seconds: float = 0.01) -> None:
         self.database = database
         self.batch_seconds = batch_seconds
         self._queue: queue.Queue[tuple[DatabaseWrite | None, Future[int | None]]] = queue.Queue()
@@ -784,7 +784,7 @@ class StateDatabase:
                 )
             }
             revision_row = connection.execute(
-                "SELECT revision FROM meta WHERE singleton=1"
+                "SELECT revision, updated_at FROM meta WHERE singleton=1"
             ).fetchone()
             task_metrics = connection.execute(
                 """
@@ -796,6 +796,11 @@ class StateDatabase:
             ).fetchone()
             document_count = int(connection.execute("SELECT count(*) FROM documents").fetchone()[0])
         return dict(value) | {
+            "updated_at": (
+                str(revision_row[1])
+                if revision_row is not None
+                else str(value.get("updated_at", ""))
+            ),
             "revision": int(revision_row[0]) if revision_row is not None else 0,
             "task_counts": counts,
             "projection_metrics": {
@@ -841,9 +846,11 @@ class StateDatabase:
             if isinstance(checkpoint, dict):
                 checkpoint = dict(checkpoint)
                 revision_row = connection.execute(
-                    "SELECT revision FROM meta WHERE singleton=1"
+                    "SELECT revision, updated_at FROM meta WHERE singleton=1"
                 ).fetchone()
                 checkpoint["revision"] = int(revision_row[0]) if revision_row is not None else 0
+                if revision_row is not None:
+                    checkpoint["updated_at"] = str(revision_row[1])
                 checkpoint["documents"] = [
                     json.loads(row[0])
                     for row in connection.execute(
