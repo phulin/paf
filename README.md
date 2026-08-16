@@ -506,10 +506,11 @@ estimate.
 
 Configured state defaults to `.paf/`; inferred single-target state uses `.paf/<book-id>/`, and
 inferred corpora use a deterministic `.paf/corpus-<id>/`. `state.sqlite3` is the canonical WAL
-database. Its compact checkpoint contains current task/build state, aggregate usage, and pointers to
-run history; immutable run payloads occupy independent rows and are loaded only for inspection or a
-full `snapshot` request. `state.json` remains a small atomic compatibility export of the checkpoint,
-not the historical database.
+database. Documents, work units, tasks, runs, globals, and issue/request records occupy normalized
+rows. Mutations enqueue immutable deltas to one background writer, which coalesces a short window and
+updates only changed rows. Immutable run payloads are loaded only for inspection or a full `snapshot`
+request. `state.json` is a compatibility export generated at startup migration, explicit snapshot,
+and clean shutdown; it is not rewritten during live state transitions.
 
 On the first load of a pre-SQLite state directory, the orchestrator imports every run and source
 issue in one transaction, verifies that the database is complete, retains the original snapshot as
@@ -524,8 +525,10 @@ copying command output into pipeline state; because they are reconstructible fro
 sidecar writes are rate-limited and a final summary is force-flushed. An attempt row is committed
 before its workspace is acquired or Codex is launched. Each run records its PID, Codex thread id,
 stage, round, timestamps, scoped-change result, placeholder count, final report, validation tail, and
-usage. Concurrent mutations coalesce into one SQLite transaction, coordinator transitions use
-explicit state batches, and JSON/database work runs off the TUI event loop. Task records persist one
+usage. Lifecycle transitions await a durability ticket; high-frequency usage is coalesced for 500 ms.
+Each transaction advances a bounded revision/change feed used by status and web readers. The TUI
+subscribes to the same in-process changes and recomputes only affected rows and aggregate cards;
+repository hashing, JSON export, and database work run off its event loop. Task records persist one
 status (`pending`, `running`, `succeeded`, `failed`, `blocked`, or `interrupted`) plus a short detail
 describing what
 a running or pending task is doing. A transient `queued` marker distinguishes runnable pending stages

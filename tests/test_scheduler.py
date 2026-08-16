@@ -786,6 +786,44 @@ async def test_hot_checkpoint_does_not_grow_with_run_payload_history(tmp_path: P
 
 
 @pytest.mark.asyncio
+async def test_live_mutations_do_not_rewrite_json_compatibility_exports(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    state = StateStore(config)
+    await state.load_or_create()
+    exported = state.path.read_bytes()
+
+    run = await state.start_run(config.chapters[0].id, Stage.FORMALIZE)
+
+    assert state.path.read_bytes() == exported
+    checkpoint = read_checkpoint(config.settings.state_dir)
+    assert checkpoint is not None
+    assert checkpoint["tasks"][f"{config.chapters[0].id}:formalize"]["run_count"] == 1
+
+    await state.export()
+    refreshed = json.loads(state.path.read_text(encoding="utf-8"))
+    assert refreshed["tasks"][f"{config.chapters[0].id}:formalize"]["run_count"] == 1
+    await state.close()
+
+
+@pytest.mark.asyncio
+async def test_deferred_telemetry_is_durable_after_coalescing_window(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    state = StateStore(config)
+    await state.load_or_create()
+    run = await state.start_run(config.chapters[0].id, Stage.FORMALIZE)
+
+    usage = TokenUsage(input_tokens=80, output_tokens=20, measured=True)
+    await state.update_run(run, usage=usage, deferred=True)
+    await asyncio.sleep(0.6)
+
+    persisted = state._database.run_payload(run.id)
+    assert persisted is not None
+    assert persisted["usage"]["input_tokens"] == 80
+    assert persisted["usage"]["output_tokens"] == 20
+    await state.close()
+
+
+@pytest.mark.asyncio
 async def test_concurrent_run_updates_coalesce_into_one_database_batch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
