@@ -13,7 +13,7 @@ from paf.config import load_config
 from paf.isolation import IsolationResult
 from paf.models import Stage
 from paf.scheduler import Orchestrator
-from paf.state import StateStore, TaskStatus, TokenUsage
+from paf.state import StateStore, TaskPhase, TaskStatus, TokenUsage
 from paf.tui import (
     ACTIVITY_KIND_ALIASES,
     ACTIVITY_KIND_DISPLAYS,
@@ -137,6 +137,18 @@ async def test_pending_prerequisite_work_is_visible_and_counted(tmp_path: Path) 
     assert stage_counts(state, Stage.PROVE)["pending"] == 0
     assert stage_counts(state, Stage.PROVE)["queued"] == 1
     assert state.hot_snapshot()["tasks"][f"{chapter.id}:prove"]["queued"] is True
+
+    await state.set_task(
+        chapter.id,
+        Stage.PROVE,
+        TaskStatus.RUNNING,
+        "postprocessing completed prove agent result",
+    )
+
+    assert task.phase == TaskPhase.POSTPROCESS
+    assert task_mark(task) == "◇ postprocess"
+    assert stage_counts(state, Stage.PROVE)["postprocess"] == 1
+    assert state.hot_snapshot()["tasks"][f"{chapter.id}:prove"]["phase"] == "postprocess"
 
 
 def test_formats_structured_agent_update_as_summary_and_issues() -> None:
@@ -818,6 +830,7 @@ async def test_dashboard_separates_agents_queues_and_coordinator_builds(
         assert "agent 0 · postprocess 1 · building 0" in review
         row = app._row_values(config.chapters[1])
         assert row[4] == "◆ building"
+        assert row[5] == "◇ postprocess"
         assert row[8] == f"{build_mode} coordinator build"
 
         finish_build.set()

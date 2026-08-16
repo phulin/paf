@@ -542,7 +542,9 @@ that are waiting for an agent slot, and both the TUI and web dashboard label the
 Successful discovery reports enter a short bounded batch: PAF merges the reports, rebuilds the source
 dependency graph once, and persists the graph plus all task promotions atomically. At most twice the
 configured discovery-agent pool is scheduled at once. Dashboards count live run records as working
-agents and label completed task-level work awaiting promotion as postprocessing.
+agents. Running tasks persist an explicit `agent` or `postprocess` phase, so the TUI and web dashboard
+show completed agent work awaiting integration, graph persistence, or coordinator verification as
+postprocessing.
 Statement repair requests are checkpointed before entering the
 in-memory batching queue and removed only after their dependency-aware review pass returns. Upstream
 proof requests instead remain in the checkpoint permanently and record only completed facts:

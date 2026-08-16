@@ -7,7 +7,7 @@ import {
   XCircle,
 } from "lucide-react";
 import { compactTaskDetail, timeAgo } from "../../lib/format";
-import type { AgentActivity, Task, TaskStatus } from "../../types";
+import type { AgentActivity, Task, TaskPhase, TaskStatus } from "../../types";
 
 function StatusIcon({ status }: { status?: TaskStatus }) {
   switch (status) {
@@ -31,18 +31,34 @@ export function StatusPill({
   rounds,
   building = false,
   queued = false,
+  phase = "idle",
 }: {
   status?: TaskStatus;
   rounds?: number;
   building?: boolean;
   queued?: boolean;
+  phase?: TaskPhase;
 }) {
-  const displayStatus = building ? "building" : queued ? "queued" : status;
+  const displayStatus = building
+    ? "building"
+    : queued
+      ? "queued"
+      : status === "running" && phase === "postprocess"
+        ? "postprocess"
+        : status;
   return (
     <span className={`status-pill status-${displayStatus}`}>
       <StatusIcon status={status} />
       <span>
-        {building ? "building" : queued ? "queued" : status === "succeeded" ? "done" : status}
+        {building
+          ? "building"
+          : queued
+            ? "queued"
+            : displayStatus === "postprocess"
+              ? "postprocess"
+              : status === "succeeded"
+                ? "done"
+                : status}
       </span>
       {Boolean(rounds) && <span className="round-count">×{rounds}</span>}
     </span>
@@ -50,6 +66,17 @@ export function StatusPill({
 }
 
 export function ActivityCell({ activity, task }: { activity?: AgentActivity; task?: Task }) {
+  if (task?.status === "running" && task.phase === "postprocess") {
+    return (
+      <div className="activity-cell active postprocess">
+        <span className="pulse-small" />
+        <div>
+          <strong>postprocessing agent result</strong>
+          <span>{timeAgo(task.updated_at)}</span>
+        </div>
+      </div>
+    );
+  }
   if (activity?.current) {
     return (
       <div className="activity-cell active">

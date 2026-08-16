@@ -1030,6 +1030,9 @@ p {
 .status-building {
   color: var(--cyan);
 }
+.status-postprocess {
+  color: var(--amber);
+}
 .status-failed {
   color: var(--red);
 }

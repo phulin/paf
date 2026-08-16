@@ -10,7 +10,7 @@ import paf.web as web_module
 from paf.cli import main
 from paf.config import load_config
 from paf.models import PipelineConfig, Stage
-from paf.state import StateStore
+from paf.state import StateStore, TaskPhase, TaskStatus
 from tests.support import write_project
 
 
@@ -152,6 +152,35 @@ def test_dashboard_changes_return_only_changed_rows_and_live_activity(
             params={"swarm": swarm_id, "after": delta["revision"] + 1, "view": "dashboard"},
         ).json()
         assert future["resync_required"] is True
+
+
+def test_dashboard_snapshot_exposes_postprocess_phase(tmp_path: Path, static_dir: Path) -> None:
+    config = _project(tmp_path)
+    state = StateStore(config)
+
+    async def populate() -> None:
+        await state.load_or_create()
+        chapter = config.chapters[0]
+        run = await state.start_run(chapter.id, Stage.DISCOVER)
+        await state.finish_run(run, status=TaskStatus.SUCCEEDED)
+        await state.set_task_phase(
+            chapter.id,
+            Stage.DISCOVER,
+            TaskPhase.POSTPROCESS,
+            "postprocessing completed discover agent result",
+        )
+        await state.close()
+
+    asyncio.run(populate())
+    with TestClient(web_module.create_app(config, static_dir=static_dir)) as client:
+        snapshot = client.get("/api/swarm").json()
+        task = snapshot["tasks"][f"{config.chapters[0].id}:discover"]
+
+        assert task["status"] == "running"
+        assert task["phase"] == "postprocess"
+        assert task["detail"] == "postprocessing completed discover agent result"
+        assert snapshot["agents"]["active"] == 0
+        assert snapshot["agents"]["postprocessing"] == 1
 
 
 def test_external_state_directory_is_the_only_state_root(tmp_path: Path, static_dir: Path) -> None:

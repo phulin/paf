@@ -21,6 +21,7 @@ from paf.scheduler import FormalizeOutcome, Orchestrator, ReviewOutcome
 from paf.state import (
     RunRecord,
     StateStore,
+    TaskPhase,
     TaskStatus,
     TokenUsage,
     UpstreamRequestStatus,
@@ -437,7 +438,7 @@ async def test_state_persists_fixup_graph(tmp_path: Path) -> None:
     await reloaded.load_or_create()
 
     assert reloaded.fixup_graph == state.fixup_graph
-    assert reloaded.snapshot()["version"] == 14
+    assert reloaded.snapshot()["version"] == 15
 
 
 @pytest.mark.asyncio
@@ -863,7 +864,7 @@ async def test_hot_checkpoint_does_not_grow_with_run_payload_history(tmp_path: P
     hot = read_checkpoint(config.settings.state_dir)
     assert hot is not None
     task = hot["tasks"][f"{config.chapters[0].id}:formalize"]
-    assert hot["version"] == 14
+    assert hot["version"] == 15
     assert "source_issues" not in hot
     assert "runs" not in task
     assert task["run_count"] == 25
@@ -1913,6 +1914,56 @@ async def test_agent_summary_separates_started_and_queued_runs(tmp_path: Path) -
     release_first.set()
     await asyncio.gather(first, second)
     assert state.agent_summary()["queued"] == 0
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_completed_agent_transitions_to_visible_postprocessing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await orchestrator.prepare()
+    entered_postprocess = asyncio.Event()
+    release_postprocess = asyncio.Event()
+    original_set_phase = state.set_task_phase
+
+    class ImmediateExecutor(CodexExecutor):
+        async def run(
+            self,
+            chapter: Chapter,
+            stage: Stage,
+            run: RunRecord,
+            *,
+            feedback: str = "",
+            workspace_root: Path | None = None,
+        ) -> AgentResult:
+            del chapter, stage, feedback, workspace_root
+            await state.finish_run(run, status=TaskStatus.SUCCEEDED)
+            return result(changed=False)
+
+    async def hold_postprocess(
+        chapter_id: str, stage: Stage, phase: TaskPhase, detail: str
+    ) -> None:
+        await original_set_phase(chapter_id, stage, phase, detail)
+        entered_postprocess.set()
+        await release_postprocess.wait()
+
+    orchestrator.executor = ImmediateExecutor(config, state)
+    monkeypatch.setattr(state, "set_task_phase", hold_postprocess)
+    attempt = asyncio.create_task(orchestrator._attempt(config.chapters[0], Stage.FORMALIZE))
+    await entered_postprocess.wait()
+
+    task = state.task(config.chapters[0].id, Stage.FORMALIZE)
+    assert task.status == TaskStatus.RUNNING
+    assert task.phase == TaskPhase.POSTPROCESS
+    assert task.detail == "postprocessing completed formalize agent result"
+    assert state.agent_summary()["active"] == 0
+    assert state.agent_summary()["postprocessing"] == 1
+
+    release_postprocess.set()
+    await attempt
     await orchestrator.shutdown()
 
 

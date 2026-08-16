@@ -36,6 +36,12 @@ class TaskStatus(StrEnum):
     INTERRUPTED = "interrupted"
 
 
+class TaskPhase(StrEnum):
+    IDLE = "idle"
+    AGENT = "agent"
+    POSTPROCESS = "postprocess"
+
+
 class UpstreamRequestStatus(StrEnum):
     """Completed durable facts for a missing interface in an earlier chapter."""
 
@@ -149,6 +155,7 @@ class TaskRecord:
     source_start_line: int = 1
     source_end_line: int = 1
     status: str = TaskStatus.PENDING
+    phase: str = TaskPhase.IDLE
     detail: str = ""
     # Transient scheduling state: the task is runnable and is waiting for an
     # agent-capacity slot. It remains pending until a run is actually started.
@@ -310,7 +317,7 @@ class StateStore:
         self._latest_runs_by_chapter: dict[str, RunRecord] = {}
         self._usage_cache: dict[tuple[bool, str | None], TokenUsage] = {}
         self._cost_cache: dict[tuple[bool, str | None], CostEstimate] = {}
-        self._indexed_task_states: dict[str, tuple[str, str, bool]] = {}
+        self._indexed_task_states: dict[str, tuple[str, str, bool, str]] = {}
         self._active_run_ids: set[str] = set()
         self._active_runs_by_chapter: dict[str, RunRecord] = {}
         self._stage_count_cache: dict[str, dict[str, int]] = {}
@@ -484,6 +491,7 @@ class StateStore:
                 or prove.status in (TaskStatus.RUNNING, TaskStatus.SUCCEEDED)
             ):
                 formalize.status = TaskStatus.SUCCEEDED
+                formalize.phase = TaskPhase.IDLE
                 formalize.detail = "formalization completed before review"
                 formalize.updated_at = timestamp()
         for value in persisted_runs:
@@ -527,8 +535,10 @@ class StateStore:
                     recovered_runs.append(run)
             if task.status == TaskStatus.RUNNING:
                 task.status = TaskStatus.INTERRUPTED
+                task.phase = TaskPhase.IDLE
                 task.detail = "agent interrupted with the orchestrator"
             if task.queued:
+                task.phase = TaskPhase.IDLE
                 task.queued = False
                 task.detail = "recovered after interrupted orchestrator"
         if self.coordinator_build.active:
@@ -624,6 +634,7 @@ class StateStore:
             "chapter_title": task.chapter_title,
             "stage": str(task.stage),
             "status": str(task.status),
+            "phase": str(task.phase),
             "detail": task.detail,
             "queued": task.queued,
             "source_digest": task.source_digest,
@@ -658,7 +669,7 @@ class StateStore:
         cost = self.total_cost()
         invocation_cost = self.invocation_cost()
         return {
-            "version": 14,
+            "version": 15,
             "history_database": DATABASE_NAME,
             "project_root": str(
                 self.config.project.root
@@ -1458,14 +1469,22 @@ class StateStore:
 
     def _rebuild_status_indexes(self) -> None:
         self._stage_count_cache = {
-            stage.value: {status.value: 0 for status in TaskStatus} | {"queued": 0}
+            stage.value: {status.value: 0 for status in TaskStatus}
+            | {"queued": 0, "postprocess": 0}
             for stage in Stage
         }
         self._indexed_task_states.clear()
         for key, task in self.tasks.items():
             bucket = "queued" if task.queued else str(task.status)
             self._stage_count_cache[task.stage][bucket] += 1
-            self._indexed_task_states[key] = (task.stage, str(task.status), task.queued)
+            if task.status == TaskStatus.RUNNING and task.phase == TaskPhase.POSTPROCESS:
+                self._stage_count_cache[task.stage]["postprocess"] += 1
+            self._indexed_task_states[key] = (
+                task.stage,
+                str(task.status),
+                task.queued,
+                str(task.phase),
+            )
         self._active_run_ids = {
             run.id for run in self._runs_by_id.values() if run.status == TaskStatus.RUNNING
         }
@@ -1480,18 +1499,24 @@ class StateStore:
             return
         key = self.key(task.chapter_id, Stage(task.stage))
         previous = self._indexed_task_states.get(key)
-        current = (task.stage, str(task.status), task.queued)
+        current = (task.stage, str(task.status), task.queued, str(task.phase))
         if previous == current:
             return
         if previous is not None:
-            old_stage, old_status, old_queued = previous
+            old_stage, old_status, old_queued, old_phase = previous
             old_bucket = "queued" if old_queued else old_status
             self._stage_count_cache[old_stage][old_bucket] -= 1
+            if old_status == TaskStatus.RUNNING and old_phase == TaskPhase.POSTPROCESS:
+                self._stage_count_cache[old_stage]["postprocess"] -= 1
         bucket = "queued" if task.queued else str(task.status)
         self._stage_count_cache[task.stage][bucket] += 1
+        if task.status == TaskStatus.RUNNING and task.phase == TaskPhase.POSTPROCESS:
+            self._stage_count_cache[task.stage]["postprocess"] += 1
         self._indexed_task_states[key] = current
 
     def agent_summary(self) -> dict[str, Any]:
+        if not self._stage_count_cache:
+            self._rebuild_status_indexes()
         by_stage = {stage.value: 0 for stage in Stage}
         by_role: dict[str, int] = {}
         for run_id in self._active_run_ids:
@@ -1511,6 +1536,12 @@ class StateStore:
                 "mutating": self.config.settings.max_agents,
             },
             "queued": sum(counts["queued"] for counts in self._stage_count_cache.values()),
+            "postprocessing": sum(
+                counts["postprocess"] for counts in self._stage_count_cache.values()
+            ),
+            "postprocessing_by_stage": {
+                stage.value: self._stage_count_cache[stage.value]["postprocess"] for stage in Stage
+            },
             "by_stage": by_stage,
             "by_role": by_role,
         }
@@ -1690,11 +1721,13 @@ class StateStore:
             formalize = self.task(chapter_id, Stage.FORMALIZE)
             if formalize.status != TaskStatus.SUCCEEDED:
                 formalize.status = TaskStatus.SUCCEEDED
+                formalize.phase = TaskPhase.IDLE
                 formalize.queued = False
                 formalize.detail = "formalization completed before review"
                 formalize.updated_at = timestamp()
                 changed_tasks.append(formalize)
         task.status = status
+        task.phase = TaskPhase.POSTPROCESS if status == TaskStatus.RUNNING else TaskPhase.IDLE
         task.queued = queued and status == TaskStatus.PENDING
         if stage is Stage.PROVE:
             task.source_digest = source_digest if status == TaskStatus.SUCCEEDED else None
@@ -1740,11 +1773,15 @@ class StateStore:
                 formalize = self.task(chapter_id, Stage.FORMALIZE)
                 if formalize.status != TaskStatus.SUCCEEDED:
                     formalize.status = TaskStatus.SUCCEEDED
+                    formalize.phase = TaskPhase.IDLE
                     formalize.queued = False
                     formalize.detail = "formalization completed before review"
                     formalize.updated_at = updated_at
                     changed_tasks.append(formalize)
             task.status = task_status
+            task.phase = (
+                TaskPhase.POSTPROCESS if task_status == TaskStatus.RUNNING else TaskPhase.IDLE
+            )
             task.queued = False
             if stage is Stage.PROVE and task_status != TaskStatus.SUCCEEDED:
                 task.source_digest = None
@@ -1757,6 +1794,24 @@ class StateStore:
             self._mark_dirty(tasks=changed_tasks)
             await self._persist()
 
+    async def set_task_phase(
+        self,
+        chapter_id: str,
+        stage: Stage,
+        phase: TaskPhase,
+        detail: str,
+    ) -> None:
+        """Update the live execution phase without changing task completion."""
+
+        task = self.task(chapter_id, stage)
+        if task.status != TaskStatus.RUNNING:
+            return
+        task.phase = phase
+        task.detail = detail
+        task.updated_at = timestamp()
+        self._mark_dirty(task=task)
+        await self._persist()
+
     async def unblock(self) -> list[str]:
         """Reset blocked tasks to pending without discarding attempt history."""
         changed: list[str] = []
@@ -1765,6 +1820,7 @@ class StateStore:
             if task.status != TaskStatus.BLOCKED:
                 continue
             task.status = TaskStatus.PENDING
+            task.phase = TaskPhase.IDLE
             task.queued = False
             if task.stage == Stage.PROVE:
                 task.source_digest = None
@@ -1787,6 +1843,7 @@ class StateStore:
             if task.status != TaskStatus.INTERRUPTED:
                 continue
             task.status = TaskStatus.PENDING
+            task.phase = TaskPhase.IDLE
             task.queued = False
             if task.stage == Stage.PROVE:
                 task.source_digest = None
@@ -1811,6 +1868,7 @@ class StateStore:
         task = self.task(chapter_id, stage)
         chapter = self.config.work_unit(chapter_id)
         task.status = TaskStatus.RUNNING
+        task.phase = TaskPhase.AGENT
         task.queued = False
         if stage is Stage.PROVE:
             task.source_digest = None
@@ -1925,6 +1983,7 @@ class StateStore:
         if status == TaskStatus.INTERRUPTED and not run.auxiliary:
             task = self.task(run.chapter_id, Stage(run.stage))
             task.status = TaskStatus.INTERRUPTED
+            task.phase = TaskPhase.IDLE
             task.queued = False
             if task.stage == Stage.PROVE:
                 task.source_digest = None

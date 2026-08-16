@@ -38,6 +38,7 @@ from paf.scope import ScopeMatcher
 from paf.state import (
     RunRecord,
     StateStore,
+    TaskPhase,
     TaskStatus,
     UpstreamRequestStatus,
 )
@@ -984,6 +985,13 @@ class Orchestrator:
             slot_held = False
             # Agent capacity covers live Codex processes, not integration or a
             # potentially preempted coordinator build queued after they exit.
+            if not auxiliary:
+                await self.state.set_task_phase(
+                    chapter.id,
+                    stage,
+                    TaskPhase.POSTPROCESS,
+                    f"postprocessing completed {stage.value} agent result",
+                )
             if live_discovery:
                 isolated = IsolationResult(accepted=True, generation=0)
             else:

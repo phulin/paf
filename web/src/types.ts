@@ -1,5 +1,6 @@
 export type Stage = "discover" | "formalize" | "review" | "prove";
 export type TaskStatus = "pending" | "running" | "succeeded" | "failed" | "blocked" | "interrupted";
+export type TaskPhase = "idle" | "agent" | "postprocess";
 
 export interface Task {
   work_unit_id: string;
@@ -14,7 +15,7 @@ export interface Task {
   stage: Stage;
   status: TaskStatus;
   queued?: boolean;
-  phase: string;
+  phase?: TaskPhase;
   detail: string;
   rounds: number;
   updated_at: string;
@@ -59,7 +60,9 @@ export interface SwarmState {
     active: number;
     maximum: number;
     queued: number;
+    postprocessing?: number;
     by_stage?: Partial<Record<Stage, number>>;
+    postprocessing_by_stage?: Partial<Record<Stage, number>>;
   };
   scheduling?: {
     statements?: { critical_path?: string[] };

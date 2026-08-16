@@ -32,7 +32,7 @@ from paf.activity import ActivityEntry, AgentActivity, reportable_error, systemi
 from paf.models import Stage, WorkUnitLike
 from paf.pricing import format_usd
 from paf.scheduler import Orchestrator
-from paf.state import RunRecord, StateStore, TaskRecord, TaskStatus, TokenUsage
+from paf.state import RunRecord, StateStore, TaskPhase, TaskRecord, TaskStatus, TokenUsage
 
 TUI_THEME = "ansi-dark"
 MAX_TIMELINE_EVENTS = 10_000
@@ -151,6 +151,8 @@ def task_mark(task: TaskRecord, *, building: bool = False) -> str:
         return "◆ building"
     if task.queued:
         return "· queued"
+    if task.status == TaskStatus.RUNNING and task.phase == TaskPhase.POSTPROCESS:
+        return "◇ postprocess"
     return STATUS_MARKS[TaskStatus(task.status)]
 
 
@@ -1087,7 +1089,12 @@ class SwarmApp(App[bool]):
                 {build.current_work_unit_id} if build.current_work_unit_id else set()
             )
             building = len(build_targets) if build.active and build.stage == stage.value else 0
-            postprocessing = max(0, counts["running"] - agents[stage.value] - building)
+            building_postprocess = sum(
+                self.state.task(chapter_id, stage).phase == TaskPhase.POSTPROCESS
+                for chapter_id in build_targets
+                if build.active and build.stage == stage.value
+            )
+            postprocessing = max(0, counts["postprocess"] - building_postprocess)
             self._update_static(
                 f"#stage-{stage.value}",
                 f"[b]{stage.value.title()} chapters[/b]\n"

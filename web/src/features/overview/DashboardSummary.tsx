@@ -86,7 +86,10 @@ export function DashboardSummary({
   const chaptersDone = rows.filter((row) => row.stages.prove?.status === "succeeded").length;
   const runningTasks = tasks.filter((task) => task.status === "running").length;
   const activeAgents = state.agents?.active ?? runningTasks;
-  const postprocessing = Math.max(0, runningTasks - activeAgents);
+  const phasedTasks = tasks.some((task) => task.phase !== undefined);
+  const postprocessing = phasedTasks
+    ? tasks.filter((task) => task.status === "running" && task.phase === "postprocess").length
+    : Math.max(0, runningTasks - activeAgents);
   const failed = tasks.filter(
     (task) =>
       task.status === "failed" || task.status === "blocked" || task.status === "interrupted",

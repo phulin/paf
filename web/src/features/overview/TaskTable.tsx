@@ -102,6 +102,7 @@ export function TaskTable({
                       status={row.stages[stage]?.status}
                       rounds={row.stages[stage]?.rounds}
                       queued={row.stages[stage]?.queued}
+                      phase={row.stages[stage]?.phase}
                       building={build.active && build.stage === stage && buildTargets.has(row.id)}
                     />
                   </td>
