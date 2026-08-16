@@ -44,21 +44,31 @@ def test_fuse_overlay_workspace_lives_in_swarm_state_directory(tmp_path: Path) -
 
 
 @pytest.mark.asyncio
-async def test_fuse_overlay_manifest_scans_do_not_block_event_loop(
+async def test_fuse_overlay_collect_uses_delta_and_does_not_block_event_loop(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     manager, chapter = fuse_manager(write_project(tmp_path, chapters="chapters = [1]"))
     await manager.prepare()
     workspace = await manager.acquire("responsive-collect")
     event_loop_thread = threading.get_ident()
-    manifest_threads: list[int] = []
+    scan_threads: list[int] = []
+    original_delta = isolation_module.overlay_delta_manifests
+    original_scope = isolation_module.scoped_manifest
 
-    def tracked_manifest(root: Path, *, excluded: tuple[str, ...]) -> dict[object, object]:
-        del root, excluded
-        manifest_threads.append(threading.get_ident())
-        return {}
+    def reject_full_manifest(*_args: object, **_kwargs: object) -> dict[object, object]:
+        raise AssertionError("collect must not scan the complete source tree")
 
-    monkeypatch.setattr(isolation_module, "tree_manifest", tracked_manifest)
+    def tracked_delta(*args: Any, **kwargs: Any) -> Any:
+        scan_threads.append(threading.get_ident())
+        return original_delta(*args, **kwargs)
+
+    def tracked_scope(*args: Any, **kwargs: Any) -> Any:
+        scan_threads.append(threading.get_ident())
+        return original_scope(*args, **kwargs)
+
+    monkeypatch.setattr(isolation_module, "tree_manifest", reject_full_manifest)
+    monkeypatch.setattr(isolation_module, "overlay_delta_manifests", tracked_delta)
+    monkeypatch.setattr(isolation_module, "scoped_manifest", tracked_scope)
     try:
         result = await workspace.collect(chapter)
     finally:
@@ -66,8 +76,8 @@ async def test_fuse_overlay_manifest_scans_do_not_block_event_loop(
         await manager.close()
 
     assert result.accepted
-    assert len(manifest_threads) == 2
-    assert all(thread != event_loop_thread for thread in manifest_threads)
+    assert len(scan_threads) == 2
+    assert all(thread != event_loop_thread for thread in scan_threads)
 
 
 @pytest.mark.asyncio
@@ -157,6 +167,46 @@ async def test_fuse_overlay_rejects_out_of_scope_changes(tmp_path: Path) -> None
     assert result.out_of_scope_paths == ("unexpected.txt",)
     assert not (tmp_path / "lean" / "Book" / "Chapter01.lean").exists()
     assert not (tmp_path / "unexpected.txt").exists()
+
+
+@pytest.mark.asyncio
+async def test_fuse_overlay_delta_reports_modified_created_and_deleted_paths(
+    tmp_path: Path,
+) -> None:
+    manager, chapter = fuse_manager(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter_root = tmp_path / "lean" / "Book" / "Chapter01"
+    modified = tmp_path / "lean" / "Book" / "Chapter01.lean"
+    deleted = chapter_root / "Deleted.lean"
+    modified.parent.mkdir(parents=True, exist_ok=True)
+    chapter_root.mkdir(parents=True, exist_ok=True)
+    modified.write_text("def original := 1\n", encoding="utf-8")
+    deleted.write_text("def obsolete := 1\n", encoding="utf-8")
+    await manager.prepare()
+    workspace = await manager.acquire("source-delta")
+    created = workspace.root / "lean" / "Book" / "Chapter01" / "Created.lean"
+    mounted_modified = workspace.root / modified.relative_to(tmp_path)
+    mounted_deleted = workspace.root / deleted.relative_to(tmp_path)
+    mounted_modified.write_text("def original := 2\n", encoding="utf-8")
+    created.write_text("def created := 1\n", encoding="utf-8")
+    mounted_deleted.unlink()
+    try:
+        result = await workspace.collect(chapter)
+    finally:
+        await workspace.close()
+        await manager.close()
+
+    assert result.accepted
+    assert result.changed_paths == tuple(
+        sorted(
+            path.relative_to(tmp_path).as_posix()
+            for path in (modified, deleted, tmp_path / created.relative_to(workspace.root))
+        )
+    )
+    assert modified.read_text(encoding="utf-8") == "def original := 2\n"
+    assert not deleted.exists()
+    assert (tmp_path / created.relative_to(workspace.root)).read_text(encoding="utf-8") == (
+        "def created := 1\n"
+    )
 
 
 @pytest.mark.asyncio

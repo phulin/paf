@@ -120,6 +120,102 @@ def tree_manifest(root: Path, *, excluded: tuple[str, ...]) -> dict[str, FileFin
     return result
 
 
+def _overlay_delta_paths(
+    upper: Path,
+    base: Path,
+    *,
+    excluded: tuple[str, ...],
+) -> set[str]:
+    """Return source paths represented by one overlay upper directory.
+
+    Walking the merged tree defeats the purpose of an overlay: on a large
+    corpus it re-hashes every source file for every completed agent.  The
+    upper directory is already the kernel-maintained change index.  Ordinary
+    entries name created or copied-up paths, while whiteouts name removals.
+    """
+
+    result: set[str] = set()
+
+    def add_base_tree(relative: str) -> None:
+        target = base / relative
+        if not target.is_dir():
+            result.add(relative)
+            return
+        for directory, names, filenames in os.walk(target, followlinks=False):
+            current = Path(directory)
+            parent = current.relative_to(base).as_posix()
+            parent = "" if parent == "." else parent
+            names[:] = [
+                name for name in names if not _excluded(f"{parent}/{name}".lstrip("/"), excluded)
+            ]
+            result.update(
+                f"{parent}/{name}".lstrip("/")
+                for name in filenames
+                if not _excluded(f"{parent}/{name}".lstrip("/"), excluded)
+            )
+
+    for directory, names, filenames in os.walk(upper, followlinks=False):
+        current = Path(directory)
+        parent = current.relative_to(upper).as_posix()
+        parent = "" if parent == "." else parent
+        names[:] = [
+            name for name in names if not _excluded(f"{parent}/{name}".lstrip("/"), excluded)
+        ]
+        for name in (*names, *filenames):
+            path = current / name
+            relative = f"{parent}/{name}".lstrip("/")
+            if _excluded(relative, excluded):
+                continue
+            try:
+                mode = path.lstat().st_mode
+            except FileNotFoundError:
+                continue
+            if stat.S_ISDIR(mode):
+                continue
+            if name in {".wh..opq", ".wh..wh..opq"}:
+                add_base_tree(parent)
+            elif name.startswith(".wh."):
+                add_base_tree(f"{parent}/{name.removeprefix('.wh.')}".lstrip("/"))
+            else:
+                result.add(relative)
+    return result
+
+
+def overlay_delta_manifests(
+    base: Path,
+    merged: Path,
+    upper: Path,
+    *,
+    excluded: tuple[str, ...],
+) -> tuple[dict[str, FileFingerprint], dict[str, FileFingerprint], tuple[str, ...]]:
+    """Fingerprint only paths named by an overlay delta."""
+
+    candidates = _overlay_delta_paths(upper, base, excluded=excluded)
+
+    def manifest(root: Path) -> dict[str, FileFingerprint]:
+        values: dict[str, FileFingerprint] = {}
+        for relative in candidates:
+            path = root / relative
+            try:
+                mode = path.lstat().st_mode
+            except FileNotFoundError:
+                continue
+            if not stat.S_ISDIR(mode):
+                values[relative] = _fingerprint(path)
+        return values
+
+    base_manifest = manifest(base)
+    merged_manifest = manifest(merged)
+    changed = tuple(
+        sorted(
+            relative
+            for relative in candidates
+            if base_manifest.get(relative) != merged_manifest.get(relative)
+        )
+    )
+    return base_manifest, merged_manifest, changed
+
+
 def scoped_manifest(root: Path, chapter: WorkUnitLike) -> dict[str, FileFingerprint]:
     """Fingerprint only a chapter's exclusive scope in the live worktree."""
 
@@ -221,15 +317,19 @@ class FuseWorkspace:
         *,
         integration_lock: asyncio.Lock | None = None,
     ) -> IsolationResult:
-        # Hashing walks the entire source tree. On a large corpus it can
-        # otherwise starve the TUI refresh timer just as the agent finishes.
-        base, merged = await asyncio.gather(
-            asyncio.to_thread(tree_manifest, self.base, excluded=self.manager.excluded),
-            asyncio.to_thread(tree_manifest, self.root, excluded=self.manager.excluded),
+        # The overlay upper is the exact candidate set. Only hash those paths
+        # plus this chapter's scope for stale-writer detection.
+        base_scope, delta = await asyncio.gather(
+            asyncio.to_thread(scoped_manifest, self.base, chapter),
+            asyncio.to_thread(
+                overlay_delta_manifests,
+                self.base,
+                self.root,
+                self.upper,
+                excluded=self.manager.excluded,
+            ),
         )
-        changed = tuple(
-            sorted(path for path in set(base) | set(merged) if base.get(path) != merged.get(path))
-        )
+        _, merged, changed = delta
         outside = tuple(path for path in changed if not _matches_scope(path, chapter))
         if outside:
             return IsolationResult(
@@ -244,7 +344,7 @@ class FuseWorkspace:
             chapter,
             generation=self.generation,
             cache_generation=self.cache_generation,
-            base_manifest=base,
+            base_manifest=base_scope,
             merged_manifest=merged,
             merged_root=self.root,
             changed=changed,
