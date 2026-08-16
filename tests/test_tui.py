@@ -80,9 +80,9 @@ def test_formats_measured_token_spend_without_double_counting_cache() -> None:
 def test_native_entry_point_forwards_connection_options(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     received: list[tuple[str, str, str]] = []
 
-    def native_run(socket_path: str, label: str, warning: str) -> bool:
+    def native_run(socket_path: str, label: str, warning: str) -> tui_module.TuiAction:
         received.append((socket_path, label, warning))
-        return True
+        return "success"
 
     monkeypatch.setattr(tui_module, "_native_run", native_run)
     assert (
@@ -92,6 +92,59 @@ def test_native_entry_point_forwards_connection_options(monkeypatch) -> None:  #
         == 0
     )
     assert received == [("/tmp/paf.sock", "review", "rg")]
+
+
+def test_reload_rebuilds_and_restarts_with_the_same_connection(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    rebuilt: list[bool] = []
+    restarted: list[tuple[str, str, str]] = []
+
+    class Restarted(Exception):
+        pass
+
+    def restart(socket_path: str, label: str, warning: str) -> None:
+        restarted.append((socket_path, label, warning))
+        raise Restarted
+
+    monkeypatch.setattr(tui_module, "_native_run", lambda *_: "reload")
+    monkeypatch.setattr(tui_module, "_rebuild_native_tui", lambda: rebuilt.append(True))
+    monkeypatch.setattr(tui_module, "_restart_native_tui", restart)
+
+    try:
+        tui_module.main(["--socket", "/tmp/live.sock", "--label", "review"])
+    except Restarted:
+        pass
+    else:
+        raise AssertionError("reload did not restart the TUI process")
+
+    assert rebuilt == [True]
+    assert restarted == [("/tmp/live.sock", "review", "")]
+
+
+def test_reload_builds_an_optimized_locked_native_extension(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:  # type: ignore[no-untyped-def]
+    calls: list[tuple[list[str], Path, bool]] = []
+
+    def which(command: str) -> str | None:
+        return f"/tools/{command}" if command in {"maturin", "uv"} else None
+
+    def run(command: list[str], *, cwd: Path, check: bool) -> None:
+        calls.append((command, cwd, check))
+
+    monkeypatch.setattr(tui_module, "_source_root", lambda: tmp_path)
+    monkeypatch.setattr(tui_module.shutil, "which", which)
+    monkeypatch.setattr(tui_module.subprocess, "run", run)
+
+    tui_module._rebuild_native_tui()
+
+    assert calls == [
+        (
+            ["/tools/maturin", "develop", "--release", "--locked", "--uv"],
+            tmp_path,
+            True,
+        )
+    ]
 
 
 async def test_run_tui_waits_for_server_readiness_without_a_fixed_deadline(

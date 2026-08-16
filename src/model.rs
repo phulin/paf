@@ -248,6 +248,7 @@ pub struct DashboardModel {
     pub startup_warning: String,
     pub stopping: bool,
     pub preparation: Option<Preparation>,
+    pub reload_requested: bool,
 }
 
 impl DashboardModel {
@@ -268,6 +269,7 @@ impl DashboardModel {
                 completed: 0,
                 total: 1,
             }),
+            reload_requested: false,
         }
     }
 

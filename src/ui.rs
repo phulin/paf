@@ -128,7 +128,7 @@ fn draw_dashboard(frame: &mut Frame<'_>, model: &DashboardModel) {
     draw_task_table(frame, model, layout[3]);
     draw_status(frame, model, layout[4]);
     frame.render_widget(
-        Paragraph::new("↑↓ select  Enter/i inspect  p pause/resume  q stop")
+        Paragraph::new("↑↓ select  Enter/i inspect  p pause/resume  r reload TUI  q stop")
             .style(Style::default().fg(MUTED))
             .alignment(Alignment::Center),
         layout[5],
@@ -553,7 +553,7 @@ fn draw_detail(frame: &mut Frame<'_>, model: &DashboardModel) {
     );
     draw_detail_content(frame, model, activity, layout[3]);
     frame.render_widget(
-        Paragraph::new("Tab/Shift-Tab switch  ↑↓ scroll  Esc/q back")
+        Paragraph::new("Tab/Shift-Tab switch  ↑↓ scroll  r reload TUI  Esc/q back")
             .style(Style::default().fg(MUTED))
             .alignment(Alignment::Center),
         layout[4],
@@ -858,12 +858,14 @@ mod tests {
         assert!(dashboard.contains("PAF · review stage"));
         assert!(dashboard.contains("editing theorem"));
         assert!(dashboard.contains("install rg"));
+        assert!(dashboard.contains("reload TUI"));
 
         model.detail = true;
         terminal.draw(|frame| draw(frame, &model)).unwrap();
         let detail = terminal.backend().to_string();
         assert!(detail.contains("Agent detail"));
         assert!(detail.contains("[edit] success"));
+        assert!(detail.contains("reload TUI"));
     }
 
     #[test]

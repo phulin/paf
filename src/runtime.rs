@@ -1,5 +1,6 @@
 use std::fmt;
 use std::io::{BufRead, BufReader, Write, stdout};
+use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::thread;
@@ -23,7 +24,14 @@ enum RuntimeEvent {
     Wire(Box<Result<WireEvent, String>>),
 }
 
+pub enum TuiExit {
+    Complete(bool),
+    Reload,
+}
+
 struct TerminalGuard;
+
+struct DashboardStreamGuard(UnixStream);
 
 const MOUSE_SCROLL_ROWS: isize = 3;
 
@@ -60,10 +68,21 @@ impl Drop for TerminalGuard {
     }
 }
 
-pub fn run(socket_path: &str, label: &str, startup_warning: &str) -> Result<bool> {
+impl Drop for DashboardStreamGuard {
+    fn drop(&mut self) {
+        let _ = self.0.shutdown(Shutdown::Both);
+    }
+}
+
+pub fn run(socket_path: &str, label: &str, startup_warning: &str) -> Result<TuiExit> {
     // Establish the push stream before taking over the terminal so startup errors remain plain
     // shell diagnostics.
     let stream = subscribe(socket_path)?;
+    let _stream_guard = DashboardStreamGuard(
+        stream
+            .try_clone()
+            .context("could not guard the dashboard stream")?,
+    );
     let (sender, receiver) = mpsc::channel();
     spawn_stream_reader(stream, sender.clone());
     spawn_terminal_reader(sender);
@@ -96,7 +115,7 @@ pub fn run(socket_path: &str, label: &str, startup_warning: &str) -> Result<bool
                 dirty = true;
                 if complete {
                     terminal.draw(|frame| ui::draw(frame, &model))?;
-                    return Ok(model.result.unwrap_or(false));
+                    return Ok(TuiExit::Complete(model.result.unwrap_or(false)));
                 }
             }
             Ok(RuntimeEvent::Wire(event)) => {
@@ -104,6 +123,9 @@ pub fn run(socket_path: &str, label: &str, startup_warning: &str) -> Result<bool
             }
             Ok(RuntimeEvent::Terminal(event)) => {
                 dirty = handle_terminal_event(event, &mut model, socket_path)?;
+                if model.reload_requested {
+                    return Ok(TuiExit::Reload);
+                }
             }
             Err(RecvTimeoutError::Timeout) => {
                 // This is a presentation clock for idle/elapsed labels, never a state poll.
@@ -186,6 +208,10 @@ fn handle_terminal_event(
         || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL));
     if model.preparation.is_some() && !stop_key {
         return Ok(false);
+    }
+    if key.code == KeyCode::Char('r') {
+        model.reload_requested = true;
+        return Ok(true);
     }
     if model.detail {
         return handle_detail_key(key, model);
@@ -356,6 +382,22 @@ mod tests {
         assert_eq!(model.scroll, 6);
         handle_terminal_event(wheel(MouseEventKind::ScrollDown), &mut model, "/unused").unwrap();
         assert_eq!(model.scroll, 9);
+    }
+
+    #[test]
+    fn reload_key_requests_a_fresh_tui_without_stopping() {
+        let mut model = DashboardModel::loading("test".into(), String::new());
+        model.preparation = None;
+        model.detail = true;
+        let changed = handle_terminal_event(
+            Event::Key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE)),
+            &mut model,
+            "/unused",
+        )
+        .unwrap();
+        assert!(changed);
+        assert!(model.reload_requested);
+        assert!(!model.stopping);
     }
 
     #[test]

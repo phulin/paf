@@ -3,9 +3,13 @@ from __future__ import annotations
 import argparse
 import asyncio
 import importlib
+import os
+import shutil
+import subprocess
 import sys
 from collections.abc import Callable, Coroutine, Sequence
-from typing import Any
+from pathlib import Path
+from typing import Any, Literal, NoReturn
 
 from paf.control import ControlServer
 from paf.display import (
@@ -31,14 +35,72 @@ __all__ = [
 ]
 
 
-def _native_run(socket_path: str, label: str, startup_warning: str) -> bool:
+TuiAction = Literal["success", "failure", "reload"]
+
+
+def _native_run(socket_path: str, label: str, startup_warning: str) -> TuiAction:
     try:
         _rust_tui = importlib.import_module("paf._rust_tui")
     except ImportError as error:
         raise RuntimeError(
             "the native PAF TUI is not installed; reinstall PAF from a wheel or with `uv sync`"
         ) from error
-    return bool(_rust_tui.run(socket_path, label, startup_warning))
+    result = _rust_tui.run(socket_path, label, startup_warning)
+    # Accept the pre-reload extension during editable source upgrades. Fresh wheels return the
+    # explicit action strings below.
+    if isinstance(result, bool):
+        return "success" if result else "failure"
+    if result not in ("success", "failure", "reload"):
+        raise RuntimeError(f"native PAF TUI returned an unknown action: {result!r}")
+    return result
+
+
+def _source_root() -> Path:
+    for parent in Path(__file__).resolve().parents:
+        if (parent / "Cargo.toml").is_file() and (parent / "pyproject.toml").is_file():
+            return parent
+    raise RuntimeError("TUI reload requires a PAF source checkout")
+
+
+def _rebuild_native_tui() -> None:
+    root = _source_root()
+    maturin = shutil.which("maturin")
+    uv = shutil.which("uv")
+    if maturin is not None:
+        command = [maturin]
+    elif uv is not None:
+        command = [uv, "tool", "run", "--from", "maturin>=1.11,<2.0", "maturin"]
+    else:
+        raise RuntimeError("TUI reload requires `maturin` or `uv` on PATH")
+    print("Rebuilding the native PAF TUI…", file=sys.stderr, flush=True)
+    options = ["develop", "--release", "--locked"]
+    if uv is not None:
+        options.append("--uv")
+    subprocess.run(
+        [*command, *options],
+        cwd=root,
+        check=True,
+    )
+
+
+def _restart_native_tui(
+    socket_path: str,
+    label: str,
+    startup_warning: str,
+) -> NoReturn:
+    arguments = [
+        sys.executable,
+        "-m",
+        "paf.tui",
+        "--socket",
+        socket_path,
+        "--label",
+        label,
+        "--startup-warning",
+        startup_warning,
+    ]
+    os.execv(sys.executable, arguments)
+    raise AssertionError("os.execv returned unexpectedly")
 
 
 def main(arguments: Sequence[str] | None = None) -> int:
@@ -47,7 +109,17 @@ def main(arguments: Sequence[str] | None = None) -> int:
     parser.add_argument("--label", default="managed pipeline")
     parser.add_argument("--startup-warning", default="")
     args = parser.parse_args(arguments)
-    return 0 if _native_run(args.socket, args.label, args.startup_warning) else 1
+    action = _native_run(args.socket, args.label, args.startup_warning)
+    if action == "reload":
+        warning = args.startup_warning
+        try:
+            _rebuild_native_tui()
+        except (OSError, RuntimeError, subprocess.CalledProcessError) as error:
+            detail = f"TUI reload failed: {error}"
+            print(detail, file=sys.stderr, flush=True)
+            warning = f"{warning}\n{detail}" if warning else detail
+        _restart_native_tui(args.socket, args.label, warning)
+    return 0 if action == "success" else 1
 
 
 async def _run_tui(
