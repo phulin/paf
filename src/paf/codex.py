@@ -986,11 +986,13 @@ proofs. Do not work on unrelated placeholders."""
             Stage.PROVE: "PAF independently checks the allowed file changes, placeholders, "
             "diagnostics, and the chapter build.",
         }[stage]
-        contract = f"""
+        file_contract = (
+            """### Files you may edit
 
-## PAF requirements
-
-### Files you may edit
+None. Discovery is strictly read-only: do not create, modify, move, delete, format, or otherwise
+write any file."""
+            if stage is Stage.DISCOVER
+            else f"""### Files you may edit
 
 You may edit only these paths:
 {scope}
@@ -1001,7 +1003,13 @@ scope. In particular, do not edit `.paf`, `README.md`, repository-level document
 scripts, orchestration code, configuration, or tests, even if changing them seems useful for this
 task. If a source repair requires an out-of-scope write, do not make that edit; explain the blocker
 and exact paths as directed by the stage prompt. Before every edit, verify that its target matches
-one of the listed scope paths. Any out-of-scope write causes PAF to reject the entire attempt.
+one of the listed scope paths. Any out-of-scope write causes PAF to reject the entire attempt."""
+        )
+        contract = f"""
+
+## PAF requirements
+
+{file_contract}
 
 Do not commit and do not wait for another worker.
 Do not run `lake build`, `lake env lean`, raw `lean`, or another compiler command. Builds belong to

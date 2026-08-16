@@ -312,6 +312,9 @@ def test_executor_uses_machine_readable_codex_mode(tmp_path: Path) -> None:
     assert not any("mcp_servers.paf_lean" in item for item in discover_command)
     assert discover_command[discover_command.index("--model") + 1] == "gpt-5.6-luna"
     assert 'model_reasoning_effort="medium"' in discover_command
+    discover_prompt = executor.build_prompt(config.chapters[0], Stage.DISCOVER)
+    assert "None. Discovery is strictly read-only" in discover_prompt
+    assert "You may edit only these paths" not in discover_prompt
 
     resumed = executor.command(Stage.FORMALIZE, isolated, resume_thread_id="capacity-thread")
     assert resumed[:3] == ["codex", "exec", "resume"]

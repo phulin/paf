@@ -793,6 +793,7 @@ class Orchestrator:
         workspace = None
         source_held = False
         isolated: IsolationResult | None = None
+        live_discovery = not auxiliary and stage is Stage.DISCOVER
         try:
             if auxiliary:
                 run = await self.state.start_auxiliary_run(
@@ -809,7 +810,9 @@ class Orchestrator:
                         role=role,
                         request_ids=list(selected_request_ids),
                     )
-            if self.isolation.name == "shared":
+            if live_discovery:
+                workspace_root = self.config.settings.repo
+            elif self.isolation.name == "shared":
                 await self.source_lock.acquire()
                 source_held = True
                 await self.git.ensure_clean(chapter)
@@ -817,16 +820,18 @@ class Orchestrator:
                 snapshot = getattr(workspace, "snapshot", None)
                 if snapshot is not None:
                     await snapshot(chapter)
+                workspace_root = workspace.root
             else:
                 async with self.source_lock:
                     await self.git.ensure_clean(chapter)
                 workspace = await self.isolation.acquire(run.id)
+                workspace_root = workspace.root
             if auxiliary:
                 agent = await self.executor.run_upstream_repair(
                     chapter,
                     run,
                     selected_upstream_requests,
-                    workspace_root=workspace.root,
+                    workspace_root=workspace_root,
                 )
             else:
                 agent = await self.executor.run(
@@ -834,22 +839,26 @@ class Orchestrator:
                     stage,
                     run,
                     feedback=feedback,
-                    workspace_root=workspace.root,
+                    workspace_root=workspace_root,
                 )
             self.agent_slots.release()
             slot_held = False
             # Agent capacity covers live Codex processes, not integration or a
             # potentially preempted coordinator build queued after they exit.
-            if not source_held:
-                await self.source_lock.acquire()
-                source_held = True
-            isolated = await workspace.collect(chapter, integration_lock=None)
-            isolated = await self._commit_agent_changes(chapter, stage, agent, isolated)
-            await workspace.close()
-            workspace = None
-            if source_held:
-                self.source_lock.release()
-                source_held = False
+            if live_discovery:
+                isolated = IsolationResult(accepted=True, generation=0)
+            else:
+                if not source_held:
+                    await self.source_lock.acquire()
+                    source_held = True
+                assert workspace is not None
+                isolated = await workspace.collect(chapter, integration_lock=None)
+                isolated = await self._commit_agent_changes(chapter, stage, agent, isolated)
+                await workspace.close()
+                workspace = None
+                if source_held:
+                    self.source_lock.release()
+                    source_held = False
             if (
                 isolated.accepted
                 and agent.changed

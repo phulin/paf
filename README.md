@@ -150,7 +150,9 @@ uncommitted files, preventing earlier work from being folded into the worker's c
 staged and unstaged files remain outside the commit.
 All swarm workers, including review workers, default to
 `--dangerously-bypass-approvals-and-sandbox`, giving them full host access for unattended
-formalization. The coordinator accepts review changes only inside the chapter's exclusive scope. To
+formalization. Discovery runs directly in the canonical repository without allocating an isolated
+workspace and its instructions prohibit edits. The coordinator accepts review changes only inside
+the chapter's exclusive scope. To
 opt into sandboxed workers, set `bypass_approvals_and_sandbox = false`; setting
 `approve_for_me = true` then uses Codex's workspace-write sandbox for every mutating stage. See
 OpenAI's official
@@ -362,9 +364,9 @@ After the daemon exits, `status`, `snapshot`, and `wait` fall back to the persis
 ## Fixed-point semantics
 
 - **Scaffold** deterministically creates the configured chapter directories and no Lean files.
-- **Discover** reads every selected input independently, reports direct source prerequisites by
-  work-unit id, and persists the source dependency tree and input digests. Independent discoveries
-  run concurrently.
+- **Discover** reads every selected input directly from the canonical repository, reports direct
+  source prerequisites by work-unit id, and persists the source dependency
+  tree and input digests. Independent discoveries run concurrently without allocating overlays.
 - **Formalize** starts after its own discovery and the formalization of its direct dependencies.
   It covers the complete source chapter, uses Lean MCP for elaboration and diagnostics, and cycles
   through coordinator builds up to `max_rounds`. Completion requires a clean build with no warning
@@ -551,9 +553,11 @@ before exiting. Shutdown waits briefly for the complete Codex process group and 
 surviving MCP/LSP descendants before unmounting; the next invocation also reclaims any mounts left
 by a hard-killed orchestrator.
 
-Agents never commit. With the default `auto` backend, supported Linux systems run each attempt in a
-private `fuse-overlayfs` view. Each view has two immutable lower generations: a source snapshot that
-excludes `.lake`, and an ordered manifest of read-only coordinator cache layers. The package cache
+Agents never commit. With the default `auto` backend, supported Linux systems run each mutating
+attempt in a private `fuse-overlayfs` view. Discovery is read-only and runs against the canonical
+repository without a private worktree. Each isolated view has two immutable lower generations: a
+source snapshot that excludes `.lake`, and an ordered manifest of read-only coordinator cache
+layers. The package cache
 is seeded once per invocation in a dependency layer keyed by `lean-toolchain` and
 `lake-manifest.json`; project artifacts begin in a separate layer. Only files changed by that
 attempt occupy its writable upper layer. Codex, its private LSP, and coordinator validation run in

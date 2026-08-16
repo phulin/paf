@@ -3506,3 +3506,56 @@ async def test_workspace_acquisition_failure_finishes_run(
     assert run.isolation is not None
     assert "workspace unavailable" in run.isolation["error"]
     await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_discovery_uses_live_repo_without_acquiring_workspace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await orchestrator.prepare()
+
+    async def fail_acquire(_run_id: str) -> object:
+        raise AssertionError("discovery must not acquire an isolated workspace")
+
+    async def discover(
+        chapter: Chapter,
+        stage: Stage,
+        run: RunRecord,
+        *,
+        feedback: str = "",
+        workspace_root: Path | None = None,
+    ) -> AgentResult:
+        del chapter, feedback
+        assert stage is Stage.DISCOVER
+        assert workspace_root == config.settings.repo
+        agent = result(changed=False, placeholders=0)
+        agent.report["source_dependencies"] = []
+        await state.finish_run(
+            run,
+            status=TaskStatus.SUCCEEDED,
+            exit_code=0,
+            changed=False,
+            report=agent.report,
+        )
+        return agent
+
+    monkeypatch.setattr(orchestrator.isolation, "acquire", fail_acquire)
+    monkeypatch.setattr(orchestrator.executor, "run", discover)
+
+    attempt = await orchestrator._attempt(config.chapters[0], Stage.DISCOVER)
+
+    assert attempt.validation.succeeded
+    assert attempt.run.isolation == {
+        "accepted": True,
+        "generation": 0,
+        "cache_generation": 0,
+        "changed_paths": [],
+        "promoted_cache_paths": [],
+        "out_of_scope_paths": [],
+        "error": "",
+        "commit": "",
+    }
+    await orchestrator.shutdown()
