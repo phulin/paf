@@ -1,5 +1,4 @@
 import asyncio
-import json
 import os
 import shutil
 import threading
@@ -18,6 +17,7 @@ from paf.isolation import FuseOverlayIsolation, fuse_overlay_available
 from paf.models import Chapter, Stage
 from paf.scheduler import Orchestrator
 from paf.state import StateStore
+from paf.state_db import read_checkpoint
 from tests.support import write_project
 
 pytestmark = pytest.mark.skipif(
@@ -650,7 +650,8 @@ print(json.dumps({"type": "item.completed", "item": {
     assert (tmp_path / "lean" / ".lake" / "build" / "coordinator.marker").read_bytes() == (
         b"built in main"
     )
-    assert json.loads((config.settings.state_dir / "state.json").read_text())["tasks"]
+    checkpoint = read_checkpoint(config.settings.state_dir)
+    assert checkpoint is not None and checkpoint["tasks"]
     await orchestrator.shutdown()
 
 

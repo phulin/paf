@@ -37,7 +37,13 @@ from paf.pricing import LEGACY_MODEL, CostEstimate, estimate_cost, format_usd
 from paf.project import Project, ProjectResolver
 from paf.scheduler import Orchestrator, scaffold_directories
 from paf.state import StateStore, TaskRecord, TaskStatus
-from paf.state_db import StateDatabase, read_checkpoint, read_full_snapshot, read_source_issues
+from paf.state_db import (
+    DATABASE_NAME,
+    StateDatabase,
+    read_checkpoint,
+    read_full_snapshot,
+    read_source_issues,
+)
 from paf.tui import activity_kind_badge, format_count, format_usage, run_tui
 
 RIPGREP_WARNING = (
@@ -240,6 +246,12 @@ def parser() -> argparse.ArgumentParser:
     ):
         command = agent_commands.add_parser(name, help=help_text)
         _add_source(command)
+        if name == "snapshot":
+            command.add_argument(
+                "--output",
+                type=Path,
+                help="explicitly export the complete snapshot to this JSON file",
+            )
     rpc = agent_commands.add_parser("rpc", help="read control commands as JSONL from stdin")
     _add_source(rpc)
     inspect = agent_commands.add_parser("inspect", help="show one agent's live activity")
@@ -674,12 +686,12 @@ def print_status(config: PipelineConfig, console: Console, *, raw_json: bool) ->
             if isinstance(task, dict) and task.get("status") in counts:
                 counts[str(task["status"])] += 1
     console.print("  ".join(f"{name}: {count}" for name, count in counts.items()))
-    console.print(f"State: {config.settings.state_dir / 'state.json'}")
+    console.print(f"State: {config.settings.state_dir / DATABASE_NAME}")
     return 0
 
 
 def print_source_issues(config: PipelineConfig, console: Console, *, raw_json: bool) -> int:
-    path = config.settings.state_dir / "source-issues.json"
+    path = config.settings.state_dir / DATABASE_NAME
     issues = read_source_issues(config.settings.state_dir)
     if issues is None:
         console.print(f"No source-issue ledger exists at {path}")
@@ -904,9 +916,6 @@ def _start_agent(args: argparse.Namespace, config: PipelineConfig) -> int:
 
 
 def _offline_snapshot(config: PipelineConfig) -> dict[str, object]:
-    database = StateDatabase(config.settings.state_dir)
-    if database.path.is_file():
-        database.export_snapshot()
     response = offline_status(config.settings.state_dir)
     value = read_full_snapshot(config.settings.state_dir)
     if value is not None:
@@ -1163,6 +1172,14 @@ def _agent_command(args: argparse.Namespace, config: PipelineConfig) -> int:
     if command == "inspect":
         return _inspect_agent(args, config)
     response = _control_response(command, config)
+    if command == "snapshot" and args.output is not None:
+        snapshot = response.get("snapshot")
+        if not isinstance(snapshot, dict):
+            raise ValueError(f"no swarm state exists at {config.settings.state_dir}")
+        output = StateDatabase(config.settings.state_dir).write_snapshot(
+            Path(args.output), snapshot
+        )
+        response["export_path"] = str(output)
     print(json.dumps(response, sort_keys=True))
     if command == "wait":
         if response.get("result") is None:

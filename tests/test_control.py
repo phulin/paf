@@ -49,6 +49,7 @@ async def test_control_server_accepts_bash_friendly_commands(tmp_path: Path) -> 
 
     status = await asyncio.to_thread(send_command, config.settings.state_dir, "status")
     assert status["status"] == "running"
+    assert Path(status["state_path"]) == state.database_path
     await state.set_task(
         config.chapters[0].id,
         Stage.REVIEW,
@@ -68,4 +69,6 @@ async def test_control_server_accepts_bash_friendly_commands(tmp_path: Path) -> 
     assert stopped["accepted"]
 
     assert not await server_task
-    assert offline_status(config.settings.state_dir)["status"] == "failed"
+    completed = offline_status(config.settings.state_dir)
+    assert completed["status"] == "failed"
+    assert Path(completed["state_path"]) == state.database_path

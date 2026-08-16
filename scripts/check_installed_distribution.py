@@ -227,7 +227,7 @@ def smoke_web(
             snapshot_status, _, snapshot_body = get(f"http://127.0.0.1:{port}/api/snapshots")
             snapshot = json.loads(snapshot_body)
             assert snapshot_status == 200 and snapshot["project_root"] == str(project.resolve())
-            assert Path(snapshot["source"]) == external_state / "state.json"
+            assert Path(snapshot["source"]) == external_state / "state.sqlite3"
             system_status, _, system_body = get(f"http://127.0.0.1:{port}/api/system")
             assert system_status == 200 and "memory_total_bytes" in json.loads(system_body)
             source_status, _, source_body = get(

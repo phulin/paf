@@ -411,6 +411,65 @@ def test_agent_rpc_reads_jsonl_from_stdin(
     assert response["scheduling"]["algorithm"] == "weighted-critical-path-list-scheduling"
 
 
+def test_agent_snapshot_writes_json_only_with_output(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config_path = write_project(tmp_path, chapters="chapters = [1]")
+    config = load_config(config_path)
+    state = StateStore(config)
+
+    async def populate() -> None:
+        await state.load_or_create()
+        run = await state.start_run(config.chapters[0].id, Stage.REVIEW)
+        await state.finish_run(run, status=TaskStatus.SUCCEEDED)
+        await state.close()
+
+    asyncio.run(populate())
+    legacy_path = config.settings.state_dir / "state.json"
+    assert not legacy_path.exists()
+
+    assert main(["agent", "snapshot", "--config", str(config_path)]) == 0
+    response = json.loads(capsys.readouterr().out)
+    assert response["snapshot"]["tasks"]["book/chapter-01:review"]["runs"]
+    assert not legacy_path.exists()
+
+    output = tmp_path / "export" / "snapshot.json"
+    assert (
+        main(
+            [
+                "agent",
+                "snapshot",
+                "--config",
+                str(config_path),
+                "--output",
+                str(output),
+            ]
+        )
+        == 0
+    )
+    response = json.loads(capsys.readouterr().out)
+    assert response["export_path"] == str(output.resolve())
+    exported = json.loads(output.read_text(encoding="utf-8"))
+    assert exported == response["snapshot"]
+    assert not legacy_path.exists()
+
+    assert (
+        main(
+            [
+                "agent",
+                "snapshot",
+                "--config",
+                str(config_path),
+                "--output",
+                str(state.database_path),
+            ]
+        )
+        == 2
+    )
+    assert "cannot overwrite the state database" in capsys.readouterr().err
+    assert read_full_snapshot(config.settings.state_dir) is not None
+
+
 def test_agent_unblock_updates_offline_state(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

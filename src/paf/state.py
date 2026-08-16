@@ -8,6 +8,7 @@ from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
+from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
@@ -284,8 +285,9 @@ class ChangeBus:
 class StateStore:
     def __init__(self, config: PipelineConfig) -> None:
         self.config = config
-        self.path = config.settings.state_dir / "state.json"
         self.database_path = config.settings.state_dir / DATABASE_NAME
+        self.path = self.database_path
+        self.legacy_path = config.settings.state_dir / "state.json"
         self.source_issues_path = config.settings.state_dir / "source-issues.json"
         self.logs_dir = config.settings.state_dir / "logs"
         self.change_bus = ChangeBus()
@@ -552,9 +554,6 @@ class StateStore:
         self._issues_dirty = True
         self._dirty_run_ids.update(run.id for run in recovered_runs)
         await self.flush()
-        # Refresh the legacy artifact once at startup. It is no longer part of
-        # the live write path and is refreshed again during clean shutdown.
-        await asyncio.to_thread(self._database.export_snapshot)
 
     def _new_task(self, chapter: WorkUnitLike, stage: Stage) -> TaskRecord:
         return TaskRecord(
@@ -743,7 +742,7 @@ class StateStore:
         }
 
     def snapshot(self) -> dict[str, Any]:
-        """Return a compatibility export, loading immutable run payloads on demand."""
+        """Return complete state, loading immutable run payloads on demand."""
 
         snapshot = self.hot_snapshot()
         payloads = self._database.run_payloads() if self.database_path.is_file() else {}
@@ -1363,13 +1362,15 @@ class StateStore:
             self._telemetry_flush_task = None
         await self.flush()
         await asyncio.wrap_future(self._writer.stop())
-        await asyncio.to_thread(self._database.export_snapshot)
 
-    async def export(self) -> None:
-        """Produce compatibility JSON artifacts from durable normalized state."""
+    async def export(self, output: Path) -> Path:
+        """Explicitly export the complete durable state as JSON."""
 
         await self.flush()
-        await asyncio.to_thread(self._database.export_snapshot)
+        exported = await asyncio.to_thread(self._database.export_snapshot, output)
+        if exported is None:
+            raise ValueError("no swarm state exists to export")
+        return exported
 
     @asynccontextmanager
     async def batch(self) -> AsyncIterator[None]:

@@ -225,8 +225,9 @@ uv run paf source-issues --config paf.toml --json
 Every Lean-writing agent report has a structured `source_issues` field. Genuine textbook defects are recorded
 with a precise location, exact identifying excerpt, mathematical explanation, and minimal suggested
 replacement. The coordinator enriches each sighting with book, chapter, stage, and run provenance,
-deduplicates repeated sightings, and persists the ledger at `.paf/.../source-issues.json` as well
-as in the state snapshot. Detection does not stop an agent: it must make the principled accommodation
+deduplicates repeated sightings, and persists the ledger in normalized SQLite state. An explicitly
+exported snapshot includes the same records. Detection does not stop an agent: it must make the
+principled accommodation
 allowed by its stage and continue through all unaffected work. The ledger is evidence for a later
 reviewed textbook patch; swarm workers do not rewrite the Markdown automatically.
 
@@ -328,6 +329,7 @@ uv run paf agent pause "$TARGET"
 uv run paf agent resume "$TARGET"
 uv run paf agent unblock "$TARGET"
 uv run paf agent snapshot "$TARGET"
+uv run paf agent snapshot "$TARGET" --output snapshot.json
 uv run paf agent inspect "$TARGET" --chapter 8
 uv run paf agent inspect "$TARGET" --chapter book02/chapter-08 --follow
 uv run paf agent wait "$TARGET"
@@ -338,6 +340,8 @@ auto-discovered dependency graph deterministically select a corpus-specific stat
 
 Every command prints one JSON object. `wait` blocks until completion and exits with the pipeline's
 success/failure code. `snapshot` includes the complete persisted task/run state; `status` is compact.
+`snapshot --output PATH` additionally writes that complete state to JSON atomically. No JSON file is
+written unless an output path is explicitly supplied.
 Use `agent stop` to cancel the scheduler and terminate active Codex/build subprocess groups.
 
 Pause is cooperative: already-running chapter attempts finish, while new agent/build attempts wait at
@@ -509,12 +513,12 @@ inferred corpora use a deterministic `.paf/corpus-<id>/`. `state.sqlite3` is the
 database. Documents, work units, tasks, runs, globals, and issue/request records occupy normalized
 rows. Mutations enqueue immutable deltas to one background writer, which coalesces a short window and
 updates only changed rows. Immutable run payloads are loaded only for inspection or a full `snapshot`
-request. `state.json` is a compatibility export generated at process startup, explicit snapshot,
-and clean shutdown; it is not rewritten during live state transitions.
+request. JSON is an explicit interchange/export format only: `paf agent snapshot --output PATH`
+writes a complete snapshot, while startup, live transitions, and clean shutdown touch only SQLite.
 
 On the first load of a pre-SQLite state directory, the orchestrator imports every run and source
-issue in one transaction, verifies that the database is complete, retains the original snapshot as
-`state.legacy-v6.json`, and only then replaces `state.json` with the compact checkpoint. Restarting an
+issue in one transaction, verifies that the database is complete, and retains a backup of the original
+snapshot as `state.legacy-v6.json`. It does not modify or delete the original `state.json`. Restarting an
 interrupted run updates its lightweight row summary without discarding its lazily stored report,
 validation, or isolation payload.
 

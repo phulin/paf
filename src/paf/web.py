@@ -19,7 +19,7 @@ from paf import json_codec as json
 from paf.config import resolve_config
 from paf.models import PipelineConfig
 from paf.project import Project, ProjectResolver
-from paf.state_db import StateDatabase, read_checkpoint, read_status_view
+from paf.state_db import DATABASE_NAME, StateDatabase, read_checkpoint, read_status_view
 
 _DECLARATION = re.compile(
     r"^\s*(?:(?:noncomputable|private|protected|unsafe|opaque)\s+)*"
@@ -120,7 +120,7 @@ def _state_candidates(state_root: Path, *, dashboard: bool = False) -> list[Stat
             if not resolved.is_relative_to(state_root):
                 continue
             state_path = resolved / "state.json"
-            database_path = resolved / "state.sqlite3"
+            database_path = resolved / DATABASE_NAME
             if not state_path.is_file() and not database_path.is_file():
                 continue
             state = read_checkpoint(resolved) if dashboard else read_status_view(resolved)
@@ -216,10 +216,12 @@ def _snapshot(candidate: StateCandidate, project_root: Path) -> dict[str, Any]:
         for run_id in recent
         if (activity := _activity(candidate, run_id)) is not None
     }
+    database_path = candidate.directory / DATABASE_NAME
+    source_path = database_path if database_path.is_file() else candidate.directory / "state.json"
     try:
-        source = (candidate.directory / "state.json").relative_to(project_root).as_posix()
+        source = source_path.relative_to(project_root).as_posix()
     except ValueError:
-        source = str(candidate.directory / "state.json")
+        source = str(source_path)
     return state | {"swarm_id": candidate.id, "source": source, "activities": activities}
 
 

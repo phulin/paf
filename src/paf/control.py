@@ -14,7 +14,7 @@ from paf import json_codec as json
 from paf.corpus import scheduling_summary
 from paf.scheduler import Orchestrator
 from paf.state import TaskStatus, timestamp
-from paf.state_db import read_status_view
+from paf.state_db import DATABASE_NAME, read_status_view
 
 PROTOCOL_VERSION = 2
 SOCKET_NAME = "control.sock"
@@ -196,7 +196,6 @@ class ControlServer:
                 await self.done.wait()
                 response = self._status()
             elif command == "snapshot":
-                await self.orchestrator.state.export()
                 response = self._status(full=True)
             elif command == "status":
                 response = self._status()
@@ -264,7 +263,7 @@ def offline_status(state_dir: Path) -> dict[str, Any]:
         value = json.loads(result_path.read_text(encoding="utf-8"))
         if isinstance(value, dict):
             return value
-    state_path = state_dir / "state.json"
+    state_path = state_dir / DATABASE_NAME
     snapshot = read_status_view(state_dir)
     if snapshot is not None:
         return {

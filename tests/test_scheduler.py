@@ -373,7 +373,6 @@ async def test_usage_and_cost_aggregates_cache_all_chapters_in_one_pass(tmp_path
 async def test_state_migrates_legacy_repair_tasks_to_formalize(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
     chapter = config.chapters[0]
-    state = StateStore(config)
     payload = {
         "version": 4,
         "created_at": "2026-01-01T00:00:00+00:00",
@@ -402,8 +401,9 @@ async def test_state_migrates_legacy_repair_tasks_to_formalize(tmp_path: Path) -
             }
         },
     }
-    state.path.parent.mkdir(parents=True)
-    state.path.write_text(json.dumps(payload), encoding="utf-8")
+    legacy_path = config.settings.state_dir / "state.json"
+    legacy_path.parent.mkdir(parents=True)
+    legacy_path.write_text(json.dumps(payload), encoding="utf-8")
 
     reloaded = StateStore(config)
     await reloaded.load_or_create()
@@ -414,8 +414,7 @@ async def test_state_migrates_legacy_repair_tasks_to_formalize(tmp_path: Path) -
     assert not reloaded.coordinator_build.active
     assert reloaded.database_path.is_file()
     assert (config.settings.state_dir / "state.legacy-v6.json").is_file()
-    hot = json.loads(reloaded.path.read_text(encoding="utf-8"))
-    assert "runs" not in hot["tasks"][f"{chapter.id}:formalize"]
+    assert json.loads(legacy_path.read_text(encoding="utf-8")) == payload
     assert reloaded.snapshot()["tasks"][f"{chapter.id}:formalize"]["runs"][0]["id"] == (
         "legacy-run"
     )
@@ -760,7 +759,8 @@ async def test_state_persists_successful_review_status(tmp_path: Path) -> None:
     await reloaded.load_or_create()
 
     assert reloaded.task(chapter.id, Stage.REVIEW).status == TaskStatus.SUCCEEDED
-    hot = json.loads(reloaded.path.read_text(encoding="utf-8"))
+    hot = read_checkpoint(config.settings.state_dir)
+    assert hot is not None
     assert "review_green" not in hot["tasks"][f"{chapter.id}:review"]
 
 
@@ -867,7 +867,7 @@ async def test_hot_checkpoint_does_not_grow_with_run_payload_history(tmp_path: P
     assert "source_issues" not in hot
     assert "runs" not in task
     assert task["run_count"] == 25
-    assert state.path.stat().st_size < 10_000
+    assert state.path == state.database_path
     with sqlite3.connect(state.database_path) as connection:
         assert connection.execute("SELECT count(*) FROM runs").fetchone()[0] == 25
 
@@ -882,23 +882,27 @@ async def test_hot_checkpoint_does_not_grow_with_run_payload_history(tmp_path: P
 
 
 @pytest.mark.asyncio
-async def test_live_mutations_do_not_rewrite_json_compatibility_exports(tmp_path: Path) -> None:
+async def test_json_snapshot_is_written_only_to_an_explicit_output(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
     state = StateStore(config)
     await state.load_or_create()
-    exported = state.path.read_bytes()
+    legacy_path = config.settings.state_dir / "state.json"
+    assert not legacy_path.exists()
 
     run = await state.start_run(config.chapters[0].id, Stage.FORMALIZE)
 
-    assert state.path.read_bytes() == exported
+    assert not legacy_path.exists()
     checkpoint = read_checkpoint(config.settings.state_dir)
     assert checkpoint is not None
     assert checkpoint["tasks"][f"{config.chapters[0].id}:formalize"]["run_count"] == 1
 
-    await state.export()
-    refreshed = json.loads(state.path.read_text(encoding="utf-8"))
-    assert refreshed["tasks"][f"{config.chapters[0].id}:formalize"]["run_count"] == 1
+    output = tmp_path / "exports" / "snapshot.json"
+    assert await state.export(output) == output.resolve()
+    exported = json.loads(output.read_text(encoding="utf-8"))
+    runs = exported["tasks"][f"{config.chapters[0].id}:formalize"]["runs"]
+    assert [value["id"] for value in runs] == [run.id]
     await state.close()
+    assert not legacy_path.exists()
 
 
 @pytest.mark.asyncio
@@ -1021,12 +1025,7 @@ async def test_state_accumulates_and_deduplicates_source_issue_ledger(tmp_path: 
     reloaded = StateStore(config)
     await reloaded.load_or_create()
     assert reloaded.source_issues[recorded.id].sightings == 2
-
-    reloaded.path.unlink()
-    reloaded.database_path.unlink()
-    ledger_only = StateStore(config)
-    await ledger_only.load_or_create()
-    assert ledger_only.source_issues[recorded.id].sightings == 2
+    assert not reloaded.source_issues_path.exists()
 
 
 def test_legacy_attempt_cost_is_always_luna(tmp_path: Path) -> None:

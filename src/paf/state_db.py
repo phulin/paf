@@ -584,9 +584,8 @@ class StateWriter:
                     for item in futures:
                         if not item.cancelled():
                             item.set_exception(error)
-                    if stopping is not None:
-                        if not stopping.cancelled():
-                            stopping.set_exception(error)
+                    if stopping is not None and not stopping.cancelled():
+                        stopping.set_exception(error)
                     if stopping is not None:
                         return
                     continue
@@ -955,15 +954,6 @@ class StateDatabase:
             )
             self._prune_changes(connection, revision)
 
-        self._write_export(self.state_dir / "state.json", checkpoint)
-        if issues is not None:
-            ledger = {
-                "version": 1,
-                "updated_at": checkpoint["updated_at"],
-                "issues": issues,
-            }
-            self._write_export(self.state_dir / "source-issues.json", ledger, indent=True)
-
     @staticmethod
     def _next_revision(connection: sqlite3.Connection, updated_at: str) -> int:
         row = connection.execute("SELECT revision FROM meta WHERE singleton=1").fetchone()
@@ -996,6 +986,22 @@ class StateDatabase:
         temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
         temporary.write_bytes(json.dumpb(value, indent=indent, sort_keys=indent))
         os.replace(temporary, path)
+
+    def write_snapshot(self, output: Path, snapshot: dict[str, Any]) -> Path:
+        """Atomically write an explicitly requested JSON snapshot."""
+
+        output = output.resolve()
+        database_path = self.path.resolve()
+        protected = {
+            database_path,
+            database_path.with_name(f"{database_path.name}-wal"),
+            database_path.with_name(f"{database_path.name}-shm"),
+        }
+        if output in protected:
+            raise ValueError(f"snapshot output cannot overwrite the state database: {output}")
+        output.parent.mkdir(parents=True, exist_ok=True)
+        self._write_export(output, snapshot)
+        return output
 
     def run_payload(self, run_id: str) -> dict[str, Any] | None:
         with _connect(self.path) as connection:
@@ -1044,41 +1050,13 @@ class StateDatabase:
         snapshot["source_issues"] = issues
         return snapshot
 
-    def export_snapshot(self) -> Path | None:
-        """Write legacy JSON artifacts from one explicit normalized read."""
+    def export_snapshot(self, output: Path) -> Path | None:
+        """Explicitly export one complete normalized snapshot as JSON."""
 
         snapshot = self.full_snapshot()
         if snapshot is None:
             return None
-        hot = dict(snapshot)
-        issues = hot.pop("source_issues", [])
-        raw_tasks = hot.get("tasks", {})
-        if isinstance(raw_tasks, dict):
-            hot["tasks"] = {
-                key: {name: value for name, value in task.items() if name != "runs"}
-                | {
-                    "run_count": len(task.get("runs", [])),
-                    "latest_run_id": (
-                        task["runs"][-1].get("id")
-                        if isinstance(task.get("runs"), list) and task["runs"]
-                        else None
-                    ),
-                }
-                for key, task in raw_tasks.items()
-                if isinstance(task, dict)
-            }
-        state_path = self.state_dir / "state.json"
-        self._write_export(state_path, hot)
-        self._write_export(
-            self.state_dir / "source-issues.json",
-            {
-                "version": 1,
-                "updated_at": hot.get("updated_at", ""),
-                "issues": issues,
-            },
-            indent=True,
-        )
-        return state_path
+        return self.write_snapshot(output, snapshot)
 
 
 def read_checkpoint(state_dir: Path) -> dict[str, Any] | None:
