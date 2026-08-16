@@ -249,6 +249,7 @@ LEAN_MCP_FORMALIZE_TOOLS = (
 USAGE_POLL_SECONDS = 1.0
 ROLLOUT_READ_BYTES = 1024 * 1024
 PROCESS_GROUP_GRACE_SECONDS = 1.0
+PROCESS_EXIT_POLL_SECONDS = 0.005
 _PROMPT_RESOURCES = files("paf.prompts")
 COMMON_PROMPT_PATH = Path(str(_PROMPT_RESOURCES.joinpath("common.md")))
 PROOF_REVIEW_PROMPT_PATH = Path(str(_PROMPT_RESOURCES.joinpath("proof_review.md")))
@@ -1572,7 +1573,7 @@ async def _wait_for_parent_exit(process: asyncio.subprocess.Process) -> int:
     """
 
     while process.returncode is None:
-        await asyncio.sleep(0.05)
+        await asyncio.sleep(PROCESS_EXIT_POLL_SECONDS)
     return process.returncode
 
 
@@ -1693,12 +1694,16 @@ async def _terminate(
         os.killpg(process_group, signal.SIGTERM)
     try:
         async with asyncio.timeout(10):
-            await process.wait()
+            # ``Process.wait()`` can wait for descendant-held stdout pipes even
+            # after the direct child has exited.  Observe the child watcher
+            # instead so detached MCP servers cannot consume the entire
+            # termination timeout.
+            await _wait_for_parent_exit(process)
     except TimeoutError:
         _signal_processes(process_tree.live_known(), signal.SIGKILL)
         with suppress(ProcessLookupError):
             os.killpg(process_group, signal.SIGKILL)
-        await process.wait()
+        await _wait_for_parent_exit(process)
 
     # Codex's code-mode host, MCP servers, and Lean watchdogs can each call
     # setsid(). Remember their identities before the parent exits so they can be

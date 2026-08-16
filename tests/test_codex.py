@@ -943,7 +943,10 @@ print(json.dumps({{"type": "item.completed", "item": {{
 
 
 @pytest.mark.asyncio
-async def test_fd_pressure_and_teardown_include_setsid_descendants(tmp_path: Path) -> None:
+async def test_fd_pressure_and_teardown_include_setsid_descendants(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(codex_module, "PROCESS_GROUP_GRACE_SECONDS", 0.02)
     child_pid_path = tmp_path / "setsid-child.pid"
     child = tmp_path / "descriptor-child"
     child.write_text(
@@ -1200,7 +1203,10 @@ print(json.dumps({{"type": "item.completed", "item": {{
 
 
 @pytest.mark.asyncio
-async def test_cancellation_kills_surviving_mcp_descendants(tmp_path: Path) -> None:
+async def test_cancellation_kills_surviving_mcp_descendants(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(codex_module, "PROCESS_GROUP_GRACE_SECONDS", 0.02)
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
     child_pid_path = tmp_path / "child.pid"
     child = tmp_path / "term-resistant-child"
