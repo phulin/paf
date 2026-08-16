@@ -12,6 +12,7 @@ from typing import Any, ClassVar
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal
+from textual.geometry import Size
 from textual.screen import Screen
 from textual.widgets import (
     DataTable,
@@ -39,6 +40,31 @@ MAX_TIMELINE_EVENTS = 10_000
 REFRESH_INTERVAL_SECONDS = 1.0
 SUCCESS_EXIT_DELAY_SECONDS = 1.0
 FAILURE_EXIT_DELAY_SECONDS = 2.0
+
+
+class FixedGridDataTable(DataTable[Any]):
+    """A fixed-size table that avoids measuring every cell as it is inserted.
+
+    Textual's DataTable measures new cell contents even when every column has an
+    explicit width.  That work is useful for auto-sized grids, but expensive for
+    the large, deliberately fixed dashboard below.  Retain the standard path if
+    another caller introduces an auto-sized column or row.
+    """
+
+    def _update_dimensions(self, new_rows: Iterable[Any]) -> None:
+        rows = tuple(new_rows)
+        if any(column.auto_width for column in self.columns.values()) or any(
+            self.rows[row_key].auto_height for row_key in rows if row_key in self.rows
+        ):
+            super()._update_dimensions(rows)
+            return
+
+        data_cells_width = sum(column.get_render_width(self) for column in self.columns.values())
+        header_height = self.header_height if self.show_header else 0
+        self.virtual_size = Size(
+            data_cells_width + self._row_label_column_width,
+            self._total_row_height + header_height,
+        )
 
 
 @dataclass(frozen=True)
@@ -859,20 +885,20 @@ class SwarmApp(App[bool]):
         with Horizontal(id="stages"):
             for stage in Stage:
                 yield Static(stage.value.title(), id=f"stage-{stage.value}", classes="stage-card")
-        yield DataTable(id="tasks", zebra_stripes=True, cursor_type="row")
+        yield FixedGridDataTable(id="tasks", zebra_stripes=True, cursor_type="row")
         yield Static(self._status_message, id="status")
         yield Footer()
 
     def on_mount(self) -> None:
         table: DataTable[Any] = self.query_one("#tasks", DataTable)
-        table.add_column("Book", key="book")
-        table.add_column("S/P rank", key="rank")
+        table.add_column("Book", key="book", width=28)
+        table.add_column("S/P rank", key="rank", width=10)
         table.add_column("Chapter", key="chapter", width=40)
         for stage in Stage:
-            table.add_column(stage.value.title(), key=stage.value)
-        table.add_column("Build", key="build")
-        table.add_column("Current agent activity", key="activity")
-        table.add_column("Tokens · API $", key="tokens")
+            table.add_column(stage.value.title(), key=stage.value, width=18)
+        table.add_column("Build", key="build", width=12)
+        table.add_column("Current agent activity", key="activity", width=52)
+        table.add_column("Tokens · API $", key="tokens", width=22)
         self.set_interval(REFRESH_INTERVAL_SECONDS, self._refresh_active_rows)
         self.run_worker(self.execute(), exclusive=True, group="pipeline")
 

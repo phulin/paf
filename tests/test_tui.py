@@ -19,6 +19,7 @@ from paf.tui import (
     ACTIVITY_KIND_DISPLAYS,
     TUI_THEME,
     AgentDetailScreen,
+    FixedGridDataTable,
     SwarmApp,
     activity_kind_badge,
     activity_kind_display,
@@ -218,6 +219,9 @@ async def test_dashboard_runs_an_operation_and_exits(tmp_path: Path) -> None:
         )
 
     assert app.result, repr(app.fatal_error)
+    assert isinstance(table, FixedGridDataTable)
+    assert all(not column.auto_width for column in table.columns.values())
+    assert all(row.height == 1 and not row.auto_height for row in table.rows.values())
     assert chapter_column.width == 40
     assert "API-equivalent cost" in str(usage)
     assert "lifetime tokens" in str(usage)
