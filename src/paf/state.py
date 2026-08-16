@@ -147,6 +147,9 @@ class TaskRecord:
     source_end_line: int = 1
     status: str = TaskStatus.PENDING
     detail: str = ""
+    # Transient scheduling state: the task is runnable and is waiting for an
+    # agent-capacity slot. It remains pending until a run is actually started.
+    queued: bool = False
     # Proof completion is tied to the exact validated chapter sources. This is
     # populated only on the prove task.
     source_digest: str | None = None
@@ -440,6 +443,9 @@ class StateStore:
             if task.status == TaskStatus.RUNNING:
                 task.status = TaskStatus.PENDING
                 task.detail = "recovered after interrupted orchestrator"
+            if task.queued:
+                task.queued = False
+                task.detail = "recovered after interrupted orchestrator"
         if self.coordinator_build.active:
             self.coordinator_build.active = False
             self.coordinator_build.current_chapter_id = ""
@@ -522,6 +528,7 @@ class StateStore:
             "stage": str(task.stage),
             "status": str(task.status),
             "detail": task.detail,
+            "queued": task.queued,
             "source_digest": task.source_digest,
             "rounds": task.rounds,
             "updated_at": task.updated_at,
@@ -1169,7 +1176,7 @@ class StateStore:
         self._agent_summary_cache = {
             "active": sum(by_stage.values()),
             "maximum": self.config.settings.max_agents,
-            "queued": 0,
+            "queued": sum(task.queued for task in self.tasks.values()),
             "by_stage": by_stage,
             "by_role": by_role,
         }
@@ -1178,11 +1185,11 @@ class StateStore:
     def stage_counts(self, stage: Stage) -> dict[str, int]:
         if stage.value in self._stage_count_cache:
             return self._stage_count_cache[stage.value]
-        statuses = {status.value: 0 for status in TaskStatus}
+        statuses = {status.value: 0 for status in TaskStatus} | {"queued": 0}
         for task in self.tasks.values():
             if task.stage != stage.value:
                 continue
-            statuses[str(task.status)] += 1
+            statuses["queued" if task.queued else str(task.status)] += 1
         self._stage_count_cache[stage.value] = statuses
         return statuses
 
@@ -1329,6 +1336,7 @@ class StateStore:
         detail: str,
         *,
         source_digest: str | None = None,
+        queued: bool = False,
     ) -> None:
         task = self.task(chapter_id, stage)
         if (
@@ -1345,9 +1353,11 @@ class StateStore:
             fixup = self.task(chapter_id, Stage.FIXUP)
             if fixup.status != TaskStatus.SUCCEEDED:
                 fixup.status = TaskStatus.SUCCEEDED
+                fixup.queued = False
                 fixup.detail = "initial fixup completed before review"
                 fixup.updated_at = timestamp()
         task.status = status
+        task.queued = queued and status == TaskStatus.PENDING
         if stage is Stage.PROVE:
             task.source_digest = source_digest if status == TaskStatus.SUCCEEDED else None
         task.detail = detail
@@ -1386,9 +1396,11 @@ class StateStore:
                 fixup = self.task(chapter_id, Stage.FIXUP)
                 if fixup.status != TaskStatus.SUCCEEDED:
                     fixup.status = TaskStatus.SUCCEEDED
+                    fixup.queued = False
                     fixup.detail = "initial fixup completed before review"
                     fixup.updated_at = updated_at
             task.status = task_status
+            task.queued = False
             if stage is Stage.PROVE and task_status != TaskStatus.SUCCEEDED:
                 task.source_digest = None
             task.detail = task_detail
@@ -1407,6 +1419,7 @@ class StateStore:
             if task.status != TaskStatus.BLOCKED:
                 continue
             task.status = TaskStatus.PENDING
+            task.queued = False
             if task.stage == Stage.PROVE:
                 task.source_digest = None
                 proof_chapters.add(task.chapter_id)
@@ -1428,6 +1441,7 @@ class StateStore:
         task = self.task(chapter_id, stage)
         chapter = self.config.work_unit(chapter_id)
         task.status = TaskStatus.RUNNING
+        task.queued = False
         if stage is Stage.PROVE:
             task.source_digest = None
         task.rounds += 1

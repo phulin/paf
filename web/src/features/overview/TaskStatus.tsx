@@ -21,16 +21,20 @@ export function StatusPill({
   status = "pending",
   rounds,
   building = false,
+  queued = false,
 }: {
   status?: TaskStatus;
   rounds?: number;
   building?: boolean;
+  queued?: boolean;
 }) {
-  const displayStatus = building ? "building" : status;
+  const displayStatus = building ? "building" : queued ? "queued" : status;
   return (
     <span className={`status-pill status-${displayStatus}`}>
       <StatusIcon status={status} />
-      <span>{building ? "building" : status === "succeeded" ? "done" : status}</span>
+      <span>
+        {building ? "building" : queued ? "queued" : status === "succeeded" ? "done" : status}
+      </span>
       {Boolean(rounds) && <span className="round-count">×{rounds}</span>}
     </span>
   );

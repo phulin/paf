@@ -100,6 +100,19 @@ async def test_pending_prerequisite_work_is_visible_and_counted(tmp_path: Path) 
     assert task_mark(task) == "· pending"
     assert stage_counts(state, Stage.PROVE)["pending"] == 1
 
+    await state.set_task(
+        chapter.id,
+        Stage.PROVE,
+        TaskStatus.PENDING,
+        "queued for prove agent",
+        queued=True,
+    )
+
+    assert task_mark(task) == "· queued"
+    assert stage_counts(state, Stage.PROVE)["pending"] == 0
+    assert stage_counts(state, Stage.PROVE)["queued"] == 1
+    assert state.hot_snapshot()["tasks"][f"{chapter.id}:prove"]["queued"] is True
+
 
 def test_formats_structured_agent_update_as_summary_and_issues() -> None:
     update = json.dumps(

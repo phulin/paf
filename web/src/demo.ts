@@ -22,6 +22,11 @@ chapters.forEach(([book, chapter, title], chapterIndex) => {
           : chapterIndex === 2 && stageIndex === 0
             ? "running"
             : "pending";
+    const queued =
+      status === "pending" &&
+      ((chapterIndex === 0 && stageIndex === 3) ||
+        (chapterIndex === 1 && stageIndex >= 2) ||
+        (chapterIndex === 2 && stageIndex === 1));
     demoTasks[`${book}/chapter-${String(chapter).padStart(2, "0")}:${stage}`] = {
       work_unit_id: `${book}/chapter-${String(chapter).padStart(2, "0")}`,
       document_id: book,
@@ -33,13 +38,16 @@ chapters.forEach(([book, chapter, title], chapterIndex) => {
       chapter_title: title,
       stage,
       status,
+      queued,
       phase: status === "running" ? "agent" : "idle",
       detail:
         status === "running"
           ? stage === "review"
             ? "checking declaration boundaries and imports"
             : "formalizing §6.3 prime and discriminant terms"
-          : "",
+          : queued
+            ? `queued for ${stage} agent`
+            : "",
       rounds: status === "succeeded" ? 1 : 0,
       updated_at: now,
       latest_run_id: status === "running" ? `demo-${chapterIndex}` : null,

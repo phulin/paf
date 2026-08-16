@@ -470,8 +470,8 @@ The dashboard shows:
 - the live-agent total against `max_agents`, broken down by stage;
 - the active coordinator build's mode, stage, iteration, target progress, current chapter, owner, and
   queued build count;
-- aggregate `pending`, `running`, `succeeded`, `failed`, and `blocked` chapter counts for formalize,
-  fixup, review, and prove;
+- aggregate `pending`, `queued`, `running`, `succeeded`, `failed`, and `blocked` chapter counts for
+  formalize, fixup, review, and prove;
 - each chapter's status and attempt count in every stage, plus independent exact-build freshness;
 - per-chapter tokens for the current invocation;
 - statement/proof critical-path ranks and the current statement critical path;
@@ -536,7 +536,9 @@ stage, round, timestamps, scoped-change result, placeholder count, final report,
 usage. Concurrent mutations coalesce into one SQLite transaction, coordinator transitions use
 explicit state batches, and JSON/database work runs off the TUI event loop. Task records persist one
 status (`pending`, `running`, `succeeded`, `failed`, or `blocked`) plus a short detail describing what
-a running or pending task is doing. Statement repair requests are checkpointed before entering the
+a running or pending task is doing. A transient `queued` marker distinguishes runnable pending stages
+that are waiting for an agent slot, and both the TUI and web dashboard label them accordingly.
+Statement repair requests are checkpointed before entering the
 in-memory batching queue and removed only after their dependency-aware review pass returns. Upstream
 proof requests instead remain in the checkpoint permanently and record only completed facts:
 `requested`, `answered`, `closed`, or `escalated`. Their owner-grouped requested batches are exported

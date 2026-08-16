@@ -2162,7 +2162,7 @@ async def test_validated_build_refuses_to_certify_a_newer_source_generation(
 
 
 @pytest.mark.asyncio
-async def test_agent_summary_counts_only_started_runs(tmp_path: Path) -> None:
+async def test_agent_summary_separates_started_and_queued_runs(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
     config = replace(config, settings=replace(config.settings, max_agents=1))
     state = StateStore(config)
@@ -2197,11 +2197,15 @@ async def test_agent_summary_counts_only_started_runs(tmp_path: Path) -> None:
 
     summary = state.agent_summary()
     assert summary["active"] == 1
-    assert summary["queued"] == 0
+    assert summary["queued"] == 1
     assert summary["by_stage"]["formalize"] == 1
+    queued_task = state.task(config.chapters[1].id, Stage.FORMALIZE)
+    assert queued_task.status == TaskStatus.PENDING
+    assert queued_task.queued is True
 
     release_first.set()
     await asyncio.gather(first, second)
+    assert state.agent_summary()["queued"] == 0
     await orchestrator.shutdown()
 
 

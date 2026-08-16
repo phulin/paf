@@ -13,6 +13,7 @@ export interface Task {
   chapter_title?: string;
   stage: Stage;
   status: TaskStatus;
+  queued?: boolean;
   phase: string;
   detail: string;
   rounds: number;

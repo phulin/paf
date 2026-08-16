@@ -704,13 +704,6 @@ class Orchestrator:
         auxiliary = role == UPSTREAM_REPAIR_ROLE
         selected_request_ids = tuple(dict.fromkeys(request_ids))
         selected_upstream_requests = tuple(upstream_requests)
-        if not auxiliary:
-            await self.state.set_task(
-                chapter.id,
-                stage,
-                TaskStatus.RUNNING,
-                queue_detail or f"queued for {stage.value} agent",
-            )
         await self.control.checkpoint()
         schedule = (
             self.statement_schedule
@@ -723,10 +716,26 @@ class Orchestrator:
         slot_held = False
         try:
             await self.control.checkpoint()
+            if not auxiliary:
+                await self.state.set_task(
+                    chapter.id,
+                    stage,
+                    TaskStatus.PENDING,
+                    queue_detail or f"queued for {stage.value} agent",
+                    queued=True,
+                )
             await self.agent_slots.acquire(schedule.priority(chapter.document_id))
             slot_held = True
         except BaseException:
             chapter_lock.release()
+            task = self.state.task(chapter.id, stage)
+            if not auxiliary and task.queued:
+                await self.state.set_task(
+                    chapter.id,
+                    stage,
+                    TaskStatus.PENDING,
+                    "agent start interrupted while queued",
+                )
             raise
         run = None
         workspace = None
@@ -904,6 +913,14 @@ class Orchestrator:
                 self.source_lock.release()
             if chapter_lock_held:
                 chapter_lock.release()
+            task = self.state.task(chapter.id, stage)
+            if not auxiliary and task.queued:
+                await self.state.set_task(
+                    chapter.id,
+                    stage,
+                    TaskStatus.PENDING,
+                    "agent start interrupted while queued",
+                )
         assert run is not None
         return Attempt(agent=agent, validation=validation, run=run)
 
@@ -2111,14 +2128,25 @@ class Orchestrator:
 
         maximum = self.config.stages[Stage.FIXUP].max_rounds
         task = self.state.task(chapter.id, Stage.FIXUP)
-        await self.state.set_task(
-            chapter.id,
-            Stage.FIXUP,
-            TaskStatus.PENDING,
-            f"queued for fixup run {task.rounds + 1} (repair-cycle cap {maximum})",
-        )
         await self.control.checkpoint()
-        await self.agent_slots.acquire(self.statement_schedule.priority(chapter.document_id))
+        try:
+            await self.state.set_task(
+                chapter.id,
+                Stage.FIXUP,
+                TaskStatus.PENDING,
+                f"queued for fixup run {task.rounds + 1} (repair-cycle cap {maximum})",
+                queued=True,
+            )
+            await self.agent_slots.acquire(self.statement_schedule.priority(chapter.document_id))
+        except BaseException:
+            if self.state.task(chapter.id, Stage.FIXUP).queued:
+                await self.state.set_task(
+                    chapter.id,
+                    Stage.FIXUP,
+                    TaskStatus.PENDING,
+                    "fixup start interrupted while queued",
+                )
+            raise
         run = None
         workspace = None
         source_held = False
@@ -2160,6 +2188,13 @@ class Orchestrator:
             )
         except BaseException as error:
             self.agent_slots.release()
+            if self.state.task(chapter.id, Stage.FIXUP).queued:
+                await self.state.set_task(
+                    chapter.id,
+                    Stage.FIXUP,
+                    TaskStatus.PENDING,
+                    "fixup start interrupted while queued",
+                )
             if workspace is not None:
                 await workspace.close()
             if source_held:

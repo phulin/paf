@@ -98,6 +98,7 @@ export function TaskTable({
                     <StatusPill
                       status={row.stages[stage]?.status}
                       rounds={row.stages[stage]?.rounds}
+                      queued={row.stages[stage]?.queued}
                       building={build.active && build.stage === stage && buildTargets.has(row.id)}
                     />
                   </td>

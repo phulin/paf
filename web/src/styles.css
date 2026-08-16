@@ -1023,6 +1023,10 @@ p {
 .status-running {
   color: var(--cyan);
 }
+.status-queued,
+.queued-text {
+  color: var(--violet);
+}
 .status-building {
   color: var(--cyan);
 }

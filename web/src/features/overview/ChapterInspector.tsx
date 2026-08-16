@@ -119,7 +119,7 @@ export function ChapterInspector({ row, close }: { row: ChapterRow; close: () =>
                           : "not started")}
                     </span>
                   </div>
-                  <StatusPill status={task?.status} rounds={task?.rounds} />
+                  <StatusPill status={task?.status} rounds={task?.rounds} queued={task?.queued} />
                 </div>
               );
             })}

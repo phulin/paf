@@ -37,6 +37,7 @@ function MetricCard({
 function StageCard({ stage, tasks }: { stage: Stage; tasks: Task[] }) {
   const succeeded = tasks.filter((task) => task.status === "succeeded").length;
   const running = tasks.filter((task) => task.status === "running").length;
+  const queued = tasks.filter((task) => task.queued).length;
   const failed = tasks.filter(
     (task) => task.status === "failed" || task.status === "blocked",
   ).length;
@@ -60,8 +61,11 @@ function StageCard({ stage, tasks }: { stage: Stage; tasks: Task[] }) {
       <div className="stage-counts">
         <span className="success-text">✓ {succeeded}</span>
         <span className="running-text">▶ {running}</span>
+        <span className="queued-text">· {queued}</span>
         <span className={failed ? "error-text" : "muted"}>! {failed}</span>
-        <span className="muted">· {Math.max(0, tasks.length - succeeded - running - failed)}</span>
+        <span className="muted">
+          · {Math.max(0, tasks.length - succeeded - running - queued - failed)}
+        </span>
       </div>
     </div>
   );

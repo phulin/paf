@@ -157,6 +157,8 @@ def running_agent_counts(state: StateStore) -> dict[str, int]:
 def task_mark(task: TaskRecord, *, building: bool = False) -> str:
     if building:
         return "◆ building"
+    if task.queued:
+        return "· queued"
     return STATUS_MARKS[TaskStatus(task.status)]
 
 
@@ -1031,7 +1033,8 @@ class SwarmApp(App[bool]):
                 f"agent {agents[stage.value]} · running {running} · "
                 f"building {building}\n"
                 f"✓ {counts['succeeded']}  "
-                f"✗ {counts['failed']}  · {counts['pending']}  ! {counts['blocked']}",
+                f"✗ {counts['failed']}  · {counts['pending']} pending  "
+                f"· {counts['queued']} queued  ! {counts['blocked']}",
             )
         table: DataTable[Any] = self.query_one("#tasks", DataTable)
         for chapter in self.work_units:
