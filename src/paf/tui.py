@@ -67,6 +67,44 @@ class FixedGridDataTable(DataTable[Any]):
             self._total_row_height + header_height,
         )
 
+    def update_cell(
+        self,
+        row_key: Any,
+        column_key: Any,
+        value: Any,
+        *,
+        update_width: bool = False,
+    ) -> None:
+        """Update one fixed-size cell without invalidating every visible cell."""
+
+        if update_width:
+            super().update_cell(row_key, column_key, value, update_width=True)
+            return
+
+        coordinate = self.get_cell_coordinate(row_key, column_key)
+        canonical_row_key, canonical_column_key = self.coordinate_to_cell_key(coordinate)
+        self._data[canonical_row_key][canonical_column_key] = value
+
+        # DataTable keys every rendering cache by one global update counter.
+        # Advancing it for a single value change discards formatting for the
+        # entire visible grid. The dashboard never changes cell dimensions, so
+        # evict only caches that can contain this row or cell instead.
+        for key in tuple(self._row_renderable_cache.keys()):
+            if key[1] == coordinate.row:
+                self._row_renderable_cache.discard(key)
+        for key in tuple(self._cell_render_cache.keys()):
+            if key[0] == canonical_row_key and key[1] == canonical_column_key:
+                self._cell_render_cache.discard(key)
+        for key in tuple(self._row_render_cache.keys()):
+            if key[0] == canonical_row_key:
+                self._row_render_cache.discard(key)
+        row_y = coordinate.row + (self.header_height if self.show_header else 0)
+        for key in tuple(self._line_cache.keys()):
+            if key[0] == row_y:
+                self._line_cache.discard(key)
+
+        self.refresh_coordinate(coordinate)
+
 
 @dataclass(frozen=True)
 class ActivityKindDisplay:

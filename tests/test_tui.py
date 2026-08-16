@@ -723,6 +723,37 @@ async def test_unchanged_dashboard_does_not_update_table_cells(
 
 
 @pytest.mark.asyncio
+async def test_fixed_dashboard_cell_update_retains_the_table_cache_generation(
+    tmp_path: Path,
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    orchestrator = Orchestrator(config, StateStore(config))
+    ready = asyncio.Event()
+    finish = asyncio.Event()
+
+    async def operation() -> bool:
+        ready.set()
+        await finish.wait()
+        return True
+
+    app = SwarmApp(orchestrator, operation, label="test")
+    async with app.run_test(size=(180, 40)) as pilot:
+        await ready.wait()
+        await pilot.pause()
+        table = app.query_one("#tasks", FixedGridDataTable)
+        generation = table._update_count
+        chapter_id = config.chapters[0].id
+
+        table.update_cell(chapter_id, "book", "updated-book")
+
+        assert table._update_count == generation
+        assert table.get_cell(chapter_id, "book") == "updated-book"
+        assert "updated-book" in table.render_line(table.header_height).text
+        finish.set()
+        await pilot.pause()
+
+
+@pytest.mark.asyncio
 async def test_dashboard_change_bus_updates_only_the_changed_row(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
