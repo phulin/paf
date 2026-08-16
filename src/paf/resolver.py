@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from fnmatch import fnmatchcase
@@ -94,7 +95,7 @@ class SourceResolver:
         exclude: Iterable[str] = (),
         rules: Iterable[Mapping[str, Any]] = (),
         dependencies: Mapping[str, Sequence[str]] | None = None,
-        manifest: Sequence[str] | str | Path | None = None,
+        manifest: Sequence[str] | str | Path | Mapping[str, Any] | None = None,
         ignore_defaults: bool = True,
         markdown_profile: str = "atx",
     ) -> None:
@@ -123,7 +124,28 @@ class SourceResolver:
                     "source dependencies must map document paths or ids to lists of documents"
                 )
             self.dependencies[key] = tuple(value)
-        self.manifest = manifest
+        self.manifest = dict(manifest) if isinstance(manifest, Mapping) else manifest
+        if isinstance(self.manifest, Mapping):
+            allowed = {"path", "pattern", "template", "allow_missing"}
+            unknown = set(self.manifest) - allowed
+            if unknown:
+                raise ValueError("unknown source manifest keys: " + ", ".join(sorted(unknown)))
+            for key in ("path", "pattern"):
+                if not isinstance(self.manifest.get(key), str) or not self.manifest[key]:
+                    raise ValueError(
+                        f"source manifest {key} is required and must be a non-empty string"
+                    )
+            template = self.manifest.get("template")
+            if template is not None and (not isinstance(template, str) or not template):
+                raise ValueError("source manifest template must be a non-empty string")
+            if "allow_missing" in self.manifest and not isinstance(
+                self.manifest["allow_missing"], bool
+            ):
+                raise ValueError("source manifest allow_missing must be a boolean")
+            try:
+                re.compile(str(self.manifest["pattern"]))
+            except re.error as error:
+                raise ValueError("source manifest pattern is not a valid regex") from error
         self.ignore_defaults = ignore_defaults
         self.markdown_profile = markdown_profile
         self._adapters: dict[Path, SourceAdapter] = {}
@@ -214,6 +236,29 @@ class SourceResolver:
     def _manifest_entries(self) -> tuple[str, ...]:
         if self.manifest is None:
             return ()
+        if isinstance(self.manifest, Mapping):
+            path = Path(str(self.manifest["path"]))
+            absolute = path if path.is_absolute() else self.root / path
+            try:
+                text = absolute.read_text(encoding="utf-8")
+            except OSError as error:
+                raise ValueError(f"cannot read source manifest: {absolute}") from error
+            pattern = re.compile(str(self.manifest["pattern"]))
+            template = str(self.manifest.get("template", "{path}"))
+            entries: list[str] = []
+            for match in pattern.finditer(text):
+                try:
+                    entry = template.format_map(match.groupdict())
+                except (KeyError, ValueError) as error:
+                    raise ValueError(
+                        "source manifest template references a missing regex group"
+                    ) from error
+                if not entry:
+                    raise ValueError("source manifest pattern produced an empty document path")
+                entries.append(entry)
+            if not entries:
+                raise ValueError(f"source manifest pattern matched no paths: {absolute}")
+            return tuple(entries)
         if isinstance(self.manifest, (str, Path)):
             path = Path(self.manifest)
             absolute = path if path.is_absolute() else self.root / path
@@ -253,10 +298,17 @@ class SourceResolver:
         for stem in ambiguous_stems:
             by_path.pop(stem, None)
         unknown = [entry for entry in entries if entry not in by_path]
-        if unknown:
+        allow_missing = isinstance(self.manifest, Mapping) and bool(
+            self.manifest.get("allow_missing", False)
+        )
+        if unknown and not allow_missing:
             raise ValueError(
                 "source manifest references undiscovered documents: " + ", ".join(unknown)
             )
+        if allow_missing:
+            entries = tuple(entry for entry in entries if entry in by_path)
+            if not entries:
+                raise ValueError("source manifest references no discovered documents")
         ordered = tuple(by_path[entry] for entry in entries)
         if len(set(ordered)) != len(ordered):
             raise ValueError("source manifest contains duplicate entries")

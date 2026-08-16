@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import re
 from collections import deque
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
@@ -106,17 +105,6 @@ STATUS_MARKS = {
     TaskStatus.BLOCKED: "! blocked",
     TaskStatus.INTERRUPTED: "Ⅱ interrupted",
 }
-
-BOOK_ID = re.compile(r"^book(?P<number>\d+)$", re.IGNORECASE)
-
-
-def chapter_display_sort_key(chapter: WorkUnitLike) -> tuple[tuple[int, int | str], int]:
-    """Sort canonical book ids numerically, then sort chapters numerically."""
-
-    match = BOOK_ID.fullmatch(chapter.document_id)
-    if match is None:
-        return (1, chapter.document_id.casefold()), chapter.ordinal
-    return (0, int(match.group("number"))), chapter.ordinal
 
 
 def format_count(value: int) -> str:
@@ -838,7 +826,15 @@ class SwarmApp(App[bool]):
         self._rows_added: set[str] = set()
         self._row_cache: dict[str, tuple[str, ...]] = {}
         self._static_cache: dict[str, str] = {}
-        self.work_units = tuple(sorted(orchestrator.work_units, key=chapter_display_sort_key))
+        document_order = {
+            document.id: index for index, document in enumerate(orchestrator.config.documents)
+        }
+        self.work_units = tuple(
+            sorted(
+                orchestrator.work_units,
+                key=lambda unit: (document_order[unit.document_id], unit.ordinal),
+            )
+        )
 
     @property
     def chapters(self) -> tuple[WorkUnitLike, ...]:

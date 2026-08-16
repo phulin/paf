@@ -697,6 +697,28 @@ The manifest may be a list as above or a path to a newline-delimited (or JSON-li
 Listed documents come first; discovered documents omitted from a partial manifest retain their
 stable repository-relative order afterward.
 
+When a project already records document order inside another source file, a manifest extraction
+table can derive paths without duplicating that order in PAF configuration. The regular expression
+is scanned in file order, and `template` formats its named capture groups into repository-relative
+document paths:
+
+```toml
+[sources]
+roots = ["books"]
+
+[sources.manifest]
+path = "table-of-contents.tex"
+pattern = '\\hyperref\[(?P<name>.+?)-section-phantom\]'
+template = "books/{name}.tex"
+allow_missing = true
+```
+
+By default, every extracted path must be among the discovered documents. Set `allow_missing` only
+when the ordering source intentionally mentions entries outside the selected roots (for example,
+an index). At least one extracted path must still resolve. Configured source order is also the
+display order and the deterministic tie-breaker when dependency-ready documents have equal
+critical-path priority.
+
 ## Development checks
 
 Run all required tooling through uv:

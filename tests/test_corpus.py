@@ -6,6 +6,7 @@ import pytest
 from paf.corpus import (
     build_chapter_import_graph,
     build_corpus_schedule,
+    build_source_dependency_graph,
     observed_imports,
 )
 from paf.models import BookConfig, Chapter
@@ -76,6 +77,15 @@ def test_bottom_level_ranks_prioritize_the_weighted_critical_path() -> None:
     )
 
 
+def test_equal_priority_documents_keep_source_order() -> None:
+    books = (book("z-last-lexically"), book("a-first-lexically"))
+
+    schedule = build_corpus_schedule(books, (), phase="statements")
+
+    assert schedule.order == ("z-last-lexically", "a-first-lexically")
+    assert schedule.critical_path == ("z-last-lexically",)
+
+
 def test_dependency_cycle_is_reported_with_its_path() -> None:
     books = (
         book("a", depends_on=("c",)),
@@ -142,6 +152,16 @@ def test_chapter_import_graph_reports_observed_cycle(tmp_path: Path) -> None:
         match=r"book/chapter-01 -> book/chapter-02 -> book/chapter-01",
     ):
         build_chapter_import_graph(tmp_path, chapters)
+
+
+def test_work_unit_graphs_keep_source_order_when_units_are_independent(tmp_path: Path) -> None:
+    chapters = tuple(chapter(number) for number in (2, 1))
+
+    observed = build_chapter_import_graph(tmp_path, chapters)
+    discovered = build_source_dependency_graph(chapters, {})
+
+    assert observed.order == ("book/chapter-02", "book/chapter-01")
+    assert discovered.order == observed.order
 
 
 @pytest.mark.asyncio

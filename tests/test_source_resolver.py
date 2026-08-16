@@ -96,6 +96,54 @@ def test_manifest_order_precedes_remaining_sorted_documents(tmp_path: Path) -> N
     assert [document.path.as_posix() for document in documents] == ["c.md", "a.md", "b.md"]
 
 
+def test_extracts_manifest_order_from_a_source_document(tmp_path: Path) -> None:
+    for name in ("introduction", "algebra", "appendix"):
+        _write(tmp_path / "books" / f"{name}.tex", f"\\section{{{name}}}\n")
+    _write(
+        tmp_path / "contents.tex",
+        """\\item \\hyperref[introduction-section-phantom]{Introduction}
+\\item \\hyperref[appendix-section-phantom]{Appendix}
+\\item \\hyperref[index-section-phantom]{Index}
+""",
+    )
+
+    documents = SourceResolver(
+        tmp_path,
+        manifest={
+            "path": "contents.tex",
+            "pattern": r"\\hyperref\[(?P<name>.+?)-section-phantom\]",
+            "template": "books/{name}.tex",
+            "allow_missing": True,
+        },
+    ).resolve("books")
+
+    assert [document.path.as_posix() for document in documents] == [
+        "books/introduction.tex",
+        "books/appendix.tex",
+        "books/algebra.tex",
+    ]
+
+
+def test_extracted_manifest_requires_matches_and_known_template_groups(tmp_path: Path) -> None:
+    _write(tmp_path / "books" / "one.tex", "\\section{One}\n")
+    _write(tmp_path / "contents.tex", "\\entry{one}\n")
+
+    with pytest.raises(ValueError, match="matched no paths"):
+        SourceResolver(
+            tmp_path,
+            manifest={"path": "contents.tex", "pattern": r"\\missing\{(?P<path>[^}]+)\}"},
+        ).resolve("books")
+    with pytest.raises(ValueError, match="missing regex group"):
+        SourceResolver(
+            tmp_path,
+            manifest={
+                "path": "contents.tex",
+                "pattern": r"\\entry\{(?P<name>[^}]+)\}",
+                "template": "books/{path}.tex",
+            },
+        ).resolve("books")
+
+
 @pytest.mark.parametrize(
     ("kwargs", "message"),
     [

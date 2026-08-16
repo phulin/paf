@@ -258,6 +258,37 @@ unit = "section"
     assert config.source_roots == (Path("notes"),)
 
 
+def test_loads_manifest_extracted_from_an_ordering_source(tmp_path: Path) -> None:
+    (tmp_path / ".git").mkdir()
+    (tmp_path / "books").mkdir()
+    (tmp_path / "books" / "a.tex").write_text("\\section{A}\n", encoding="utf-8")
+    (tmp_path / "books" / "b.tex").write_text("\\section{B}\n", encoding="utf-8")
+    (tmp_path / "contents.tex").write_text("\\book{b}\n\\book{a}\n", encoding="utf-8")
+    config_path = tmp_path / "paf.toml"
+    config_path.write_text(
+        r"""[swarm]
+repo = "."
+isolation = "shared"
+
+[sources]
+roots = ["books"]
+
+[sources.manifest]
+path = "contents.tex"
+pattern = '\\book\{(?P<name>[^}]+)\}'
+template = "books/{name}.tex"
+""",
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+
+    assert [document.path.as_posix() for document in config.documents] == [
+        "books/b.tex",
+        "books/a.tex",
+    ]
+
+
 def test_inferred_directory_recurses_over_mixed_formats_but_direct_markdown_stays_legacy(
     tmp_path: Path,
 ) -> None:

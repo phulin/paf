@@ -87,6 +87,7 @@ def build_work_unit_import_graph(
     """Build a deterministic work-unit DAG from currently observed imports."""
 
     by_id = {work_unit.id: work_unit for work_unit in work_units}
+    source_order = {work_unit.id: index for index, work_unit in enumerate(work_units)}
     dependencies = {work_unit.id: set(work_unit.depends_on) for work_unit in work_units}
     missing = {
         dependency
@@ -121,16 +122,20 @@ def build_work_unit_import_graph(
             successors[prerequisite].add(dependent)
 
     indegree = {chapter_id: len(required) for chapter_id, required in dependencies.items()}
-    ready = [chapter_id for chapter_id, degree in indegree.items() if degree == 0]
+    ready = [
+        (source_order[chapter_id], chapter_id)
+        for chapter_id, degree in indegree.items()
+        if degree == 0
+    ]
     heapq.heapify(ready)
     order: list[str] = []
     while ready:
-        chapter_id = heapq.heappop(ready)
+        _, chapter_id = heapq.heappop(ready)
         order.append(chapter_id)
-        for successor in sorted(successors[chapter_id]):
+        for successor in sorted(successors[chapter_id], key=source_order.__getitem__):
             indegree[successor] -= 1
             if indegree[successor] == 0:
-                heapq.heappush(ready, successor)
+                heapq.heappush(ready, (source_order[successor], successor))
 
     if len(order) != len(by_id):
         cycle = _chapter_cycle(dependencies)
@@ -165,6 +170,7 @@ def build_source_dependency_graph(
     """
 
     by_id = {work_unit.id: work_unit for work_unit in work_units}
+    source_order = {work_unit.id: index for index, work_unit in enumerate(work_units)}
     dependencies = {work_unit.id: set(work_unit.depends_on) for work_unit in work_units}
     for work_unit_id, raw in discovered.items():
         if work_unit_id not in dependencies or not isinstance(raw, dict):
@@ -190,16 +196,20 @@ def build_source_dependency_graph(
             successors[prerequisite].add(dependent)
 
     indegree = {work_unit_id: len(required) for work_unit_id, required in dependencies.items()}
-    ready = [work_unit_id for work_unit_id, degree in indegree.items() if degree == 0]
+    ready = [
+        (source_order[work_unit_id], work_unit_id)
+        for work_unit_id, degree in indegree.items()
+        if degree == 0
+    ]
     heapq.heapify(ready)
     order: list[str] = []
     while ready:
-        work_unit_id = heapq.heappop(ready)
+        _, work_unit_id = heapq.heappop(ready)
         order.append(work_unit_id)
-        for successor in sorted(successors[work_unit_id]):
+        for successor in sorted(successors[work_unit_id], key=source_order.__getitem__):
             indegree[successor] -= 1
             if indegree[successor] == 0:
-                heapq.heappush(ready, successor)
+                heapq.heappush(ready, (source_order[successor], successor))
 
     if len(order) != len(by_id):
         cycle = _chapter_cycle(dependencies)
@@ -315,6 +325,7 @@ def build_corpus_schedule(
         raise ValueError("pass selected_documents or legacy selected_books, not both")
     selected_ids = selected_documents if selected_documents is not None else selected_books
     by_id = {document.id: document for document in documents}
+    source_order = {document.id: index for index, document in enumerate(documents)}
     selected = set(by_id) if selected_ids is None else set(selected_ids)
     unknown = selected - set(by_id)
     if unknown:
@@ -327,16 +338,18 @@ def build_corpus_schedule(
             successors[dependency].add(book_id)
 
     indegree = {book_id: len(required) for book_id, required in dependencies.items()}
-    ready = [book_id for book_id, degree in indegree.items() if degree == 0]
+    ready = [
+        (source_order[book_id], book_id) for book_id, degree in indegree.items() if degree == 0
+    ]
     heapq.heapify(ready)
     topological: list[str] = []
     while ready:
-        book_id = heapq.heappop(ready)
+        _, book_id = heapq.heappop(ready)
         topological.append(book_id)
-        for successor in sorted(successors[book_id]):
+        for successor in sorted(successors[book_id], key=source_order.__getitem__):
             indegree[successor] -= 1
             if indegree[successor] == 0:
-                heapq.heappush(ready, successor)
+                heapq.heappush(ready, (source_order[successor], successor))
     if len(topological) != len(selected):
         cycle = _cycle_path(dependencies)
         detail = " -> ".join(cycle) if cycle else "unknown cycle"
@@ -364,27 +377,32 @@ def build_corpus_schedule(
     # whenever several dependency-ready books compete.
     indegree = {book_id: len(required) for book_id, required in dependencies.items()}
     priority_ready = [
-        (-rank[book_id], book_id) for book_id, degree in indegree.items() if degree == 0
+        (-rank[book_id], source_order[book_id], book_id)
+        for book_id, degree in indegree.items()
+        if degree == 0
     ]
     heapq.heapify(priority_ready)
     order: list[str] = []
     while priority_ready:
-        _, book_id = heapq.heappop(priority_ready)
+        _, _, book_id = heapq.heappop(priority_ready)
         order.append(book_id)
         for successor in successors[book_id]:
             indegree[successor] -= 1
             if indegree[successor] == 0:
-                heapq.heappush(priority_ready, (-rank[successor], successor))
+                heapq.heappush(
+                    priority_ready,
+                    (-rank[successor], source_order[successor], successor),
+                )
 
     roots = [book_id for book_id in selected if not dependencies[book_id]]
     critical: list[str] = []
     if roots:
-        current = max(roots, key=lambda item: (rank[item], item))
+        current = max(roots, key=lambda item: (rank[item], -source_order[item]))
         while True:
             critical.append(current)
             if not successors[current]:
                 break
-            current = max(successors[current], key=lambda item: (rank[item], item))
+            current = max(successors[current], key=lambda item: (rank[item], -source_order[item]))
 
     return CorpusSchedule(
         phase=phase,

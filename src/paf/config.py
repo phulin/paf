@@ -204,8 +204,11 @@ def _read_source_settings(
     if manifest is not None and not (
         isinstance(manifest, str)
         or (isinstance(manifest, list) and all(isinstance(item, str) and item for item in manifest))
+        or isinstance(manifest, dict)
     ):
-        raise ValueError("sources.manifest must be a path or a list of document paths")
+        raise ValueError(
+            "sources.manifest must be a path, a list of document paths, or an extraction table"
+        )
     if "ignore_defaults" in discovery and not isinstance(discovery["ignore_defaults"], bool):
         raise ValueError("sources.ignore_defaults must be a boolean")
     return defaults, tuple(rules), discovery
