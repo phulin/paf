@@ -7,3 +7,8 @@ repos:
         language: system
         types: [text]
         require_serial: true
+      - id: ty
+        name: ty check
+        entry: uv run ty check
+        language: system
+        pass_filenames: false
