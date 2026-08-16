@@ -406,8 +406,8 @@ async def test_unexpected_pipeline_cancellation_is_retained_as_fatal_error(tmp_p
         raise asyncio.CancelledError("worker infrastructure cancelled the pipeline")
 
     app = SwarmApp(orchestrator, operation, label="test")
-    async with app.run_test() as pilot:
-        await pilot.pause()
+    async with app.run_test():
+        await app.workers.wait_for_complete()
         assert isinstance(app.fatal_error, asyncio.CancelledError)
         assert "worker infrastructure" in str(app.fatal_error)
 
