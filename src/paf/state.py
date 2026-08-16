@@ -11,11 +11,12 @@ from enum import StrEnum
 from typing import Any
 from uuid import uuid4
 
+from paf import json_codec as json
 from paf.activity import ActivityStore, shorten_book_paths
 from paf.diagnostics import lean_diagnostic_counts
 from paf.models import PipelineConfig, Stage, WorkUnitLike
 from paf.pricing import LEGACY_MODEL, CostEstimate, estimate_cost
-from paf.state_db import DATABASE_NAME, StateDatabase
+from paf.state_db import DATABASE_NAME, DatabaseWrite, StateDatabase, StateWriter
 
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 LAKE_PROGRESS_RE = re.compile(r"\[(?P<completed>\d+)/(?P<total>\d+)\]\s+\S+\s+(?P<target>\S+)")
@@ -246,6 +247,40 @@ class SourceIssueRecord:
         return self.chapter_title
 
 
+@dataclass(frozen=True)
+class ChangeSet:
+    revision: int
+    work_units: frozenset[str] = frozenset()
+    runs: frozenset[str] = frozenset()
+    globals: frozenset[str] = frozenset()
+    stages: frozenset[str] = frozenset()
+    full_resync: bool = False
+
+
+class ChangeBus:
+    """Bounded in-process notifications for projection consumers."""
+
+    def __init__(self) -> None:
+        self._subscribers: set[asyncio.Queue[ChangeSet]] = set()
+
+    def subscribe(self, *, maximum: int = 256) -> asyncio.Queue[ChangeSet]:
+        queue: asyncio.Queue[ChangeSet] = asyncio.Queue(maxsize=maximum)
+        self._subscribers.add(queue)
+        return queue
+
+    def unsubscribe(self, queue: asyncio.Queue[ChangeSet]) -> None:
+        self._subscribers.discard(queue)
+
+    def publish(self, change: ChangeSet) -> None:
+        for queue in tuple(self._subscribers):
+            try:
+                queue.put_nowait(change)
+            except asyncio.QueueFull:
+                while not queue.empty():
+                    queue.get_nowait()
+                queue.put_nowait(ChangeSet(revision=change.revision, full_resync=True))
+
+
 class StateStore:
     def __init__(self, config: PipelineConfig) -> None:
         self.config = config
@@ -255,9 +290,14 @@ class StateStore:
         self.logs_dir = config.settings.state_dir / "logs"
         self.activities = ActivityStore(self.logs_dir)
         self._database = StateDatabase(config.settings.state_dir)
+        self._writer = StateWriter(self._database)
+        self.change_bus = ChangeBus()
+        self.revision = 0
         self._flush_lock = asyncio.Lock()
         self._batch_depth = 0
         self._checkpoint_dirty = False
+        self._static_dirty = False
+        self._dirty_task_keys: set[str] = set()
         self._issues_dirty = False
         self._dirty_run_ids: set[str] = set()
         self._prior_run_ids: set[str] = set()
@@ -298,6 +338,8 @@ class StateStore:
     async def load_or_create(self) -> None:
         self.logs_dir.mkdir(parents=True, exist_ok=True)
         await asyncio.to_thread(self._database.initialize)
+        self.revision = await asyncio.to_thread(self._database.revision)
+        self._writer.start()
         raw, persisted_runs, persisted_source_issues = await asyncio.to_thread(self._database.load)
         if raw is not None:
             self.created_at = str(raw.get("created_at", timestamp()))
@@ -480,9 +522,14 @@ class StateStore:
         self._invalidate_aggregates()
         self._invalidate_status_summaries()
         self._checkpoint_dirty = True
+        self._static_dirty = True
+        self._dirty_task_keys.update(self.tasks)
         self._issues_dirty = True
         self._dirty_run_ids.update(run.id for run in recovered_runs)
         await self.flush()
+        # Refresh the legacy artifact once at startup. It is no longer part of
+        # the live write path and is refreshed again during clean shutdown.
+        await asyncio.to_thread(self._database.export_snapshot)
 
     def _new_task(self, chapter: WorkUnitLike, stage: Stage) -> TaskRecord:
         return TaskRecord(
@@ -581,7 +628,7 @@ class StateStore:
             "current_work_unit_id": build.current_work_unit_id,
         }
 
-    def hot_snapshot(self) -> dict[str, Any]:
+    def _global_snapshot(self) -> dict[str, Any]:
         usage = self.total_usage()
         invocation_usage = self.invocation_usage()
         cost = self.total_cost()
@@ -612,30 +659,40 @@ class StateStore:
             "upstream_request_batches": self.upstream_request_batches(),
             "isolation": self.isolation,
             "coordinator_build": self._build_dict(self.coordinator_build),
-            "documents": [
-                {
-                    "id": document.id,
-                    "path": document.path.as_posix(),
-                    "format": document.format,
-                    "title": document.title,
-                    "depends_on": list(document.depends_on),
-                }
-                for document in self.config.documents
-            ],
-            "work_units": [
-                {
-                    "id": unit.id,
-                    "document_id": unit.document_id,
-                    "title": unit.title,
-                    "ordinal": unit.ordinal,
-                    "source": unit.source.as_posix(),
-                    "source_start_line": unit.source_span.start_line,
-                    "source_end_line": unit.source_span.end_line,
-                    "depends_on": list(unit.depends_on),
-                    "target_scope": list(unit.scope),
-                }
-                for unit in self.config.work_units
-            ],
+        }
+
+    def _document_dicts(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "id": document.id,
+                "path": document.path.as_posix(),
+                "format": document.format,
+                "title": document.title,
+                "depends_on": list(document.depends_on),
+            }
+            for document in self.config.documents
+        ]
+
+    def _work_unit_dicts(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "id": unit.id,
+                "document_id": unit.document_id,
+                "title": unit.title,
+                "ordinal": unit.ordinal,
+                "source": unit.source.as_posix(),
+                "source_start_line": unit.source_span.start_line,
+                "source_end_line": unit.source_span.end_line,
+                "depends_on": list(unit.depends_on),
+                "target_scope": list(unit.scope),
+            }
+            for unit in self.config.work_units
+        ]
+
+    def hot_snapshot(self) -> dict[str, Any]:
+        return self._global_snapshot() | {
+            "documents": [dict(value) for value in self._document_dicts()],
+            "work_units": [dict(value) for value in self._work_unit_dicts()],
             "tasks": {
                 key: self._task_dict(task)
                 | {
@@ -670,11 +727,32 @@ class StateStore:
         snapshot["tasks"] = tasks
         return snapshot
 
-    def _mark_dirty(self, *, run: RunRecord | None = None, issues: bool = False) -> None:
+    def _hot_task_dict(self, task: TaskRecord) -> dict[str, Any]:
+        return self._task_dict(task) | {
+            "run_count": len(task.runs),
+            "latest_run_id": task.runs[-1].id if task.runs else None,
+        }
+
+    def _mark_dirty(
+        self,
+        *,
+        task: TaskRecord | None = None,
+        tasks: Iterable[TaskRecord] = (),
+        run: RunRecord | None = None,
+        issues: bool = False,
+        static: bool = False,
+    ) -> None:
         self._checkpoint_dirty = True
+        changed_tasks = [*tasks]
+        if task is not None:
+            changed_tasks.append(task)
+        self._dirty_task_keys.update(
+            self.key(item.chapter_id, Stage(item.stage)) for item in changed_tasks
+        )
         if run is not None:
             self._dirty_run_ids.add(run.id)
         self._issues_dirty = self._issues_dirty or issues
+        self._static_dirty = self._static_dirty or static
 
     async def _persist(self) -> None:
         if self._batch_depth:
@@ -684,31 +762,111 @@ class StateStore:
 
     async def flush(self) -> None:
         async with self._flush_lock:
-            if not (self._checkpoint_dirty or self._dirty_run_ids or self._issues_dirty):
+            if not (
+                self._checkpoint_dirty
+                or self._dirty_task_keys
+                or self._dirty_run_ids
+                or self._issues_dirty
+                or self._static_dirty
+            ):
                 return
             if not self.database_path.is_file():
                 await asyncio.to_thread(self._database.initialize)
             self.updated_at = timestamp()
-            checkpoint = self.hot_snapshot()
+            globals_dirty = self._checkpoint_dirty
+            task_keys = self._dirty_task_keys
             dirty_runs = self._dirty_run_ids
             issues_dirty = self._issues_dirty
+            static_dirty = self._static_dirty
+            self._dirty_task_keys = set()
             self._dirty_run_ids = set()
             self._checkpoint_dirty = False
             self._issues_dirty = False
-            runs = [
-                (
+            self._static_dirty = False
+            task_payloads = {
+                key: json.dumpb(self._hot_task_dict(self.tasks[key]))
+                for key in sorted(task_keys)
+                if key in self.tasks
+            }
+            runs = {
+                run_id: (
                     self.key(run.chapter_id, Stage(run.stage)),
-                    self._run_dict(run, include_payload=run.id in self._payload_loaded_run_ids),
+                    json.dumpb(
+                        self._run_dict(run, include_payload=run.id in self._payload_loaded_run_ids)
+                    ),
                 )
                 for run_id in sorted(dirty_runs)
                 if (run := self._runs_by_id.get(run_id)) is not None
-            ]
+            }
             issues = (
-                [self._issue_dict(issue) for _, issue in sorted(self.source_issues.items())]
+                {
+                    issue.id: json.dumpb(self._issue_dict(issue))
+                    for _, issue in sorted(self.source_issues.items())
+                }
                 if issues_dirty
-                else None
+                else {}
             )
-            await asyncio.to_thread(self._database.write_batch, checkpoint, runs, issues)
+            documents = (
+                {
+                    value["id"]: (ordinal, json.dumpb(value))
+                    for ordinal, value in enumerate(self._document_dicts())
+                }
+                if static_dirty
+                else {}
+            )
+            work_units = (
+                {
+                    value["id"]: (
+                        str(value["document_id"]),
+                        int(value["ordinal"]),
+                        str(value["title"]),
+                        str(value["source"]),
+                        json.dumpb(value),
+                    )
+                    for value in self._work_unit_dicts()
+                }
+                if static_dirty
+                else {}
+            )
+            changed_work_units = {self.tasks[key].chapter_id for key in task_payloads} | {
+                run.chapter_id for run_id in runs if (run := self._runs_by_id.get(run_id))
+            }
+            changed_stages = {self.tasks[key].stage for key in task_payloads} | {
+                run.stage for run_id in runs if (run := self._runs_by_id.get(run_id))
+            }
+            changes = {
+                *(("task", key) for key in task_payloads),
+                *(("run", run_id) for run_id in runs),
+                *(("work_unit", unit_id) for unit_id in changed_work_units),
+            }
+            if globals_dirty:
+                changes.add(("global", "state"))
+            if issues_dirty:
+                changes.add(("source_issues", "*"))
+            write = DatabaseWrite(
+                updated_at=self.updated_at,
+                globals={"state": json.dumpb(self._global_snapshot())} if globals_dirty else {},
+                tasks=task_payloads,
+                runs=runs,
+                source_issues=issues,
+                replace_source_issues=issues_dirty,
+                documents=documents,
+                work_units=work_units,
+                changes=frozenset(changes),
+            )
+            revision = await asyncio.wrap_future(self._writer.submit(write))
+            assert revision is not None
+            self.revision = revision
+            self.change_bus.publish(
+                ChangeSet(
+                    revision=revision,
+                    work_units=frozenset(changed_work_units),
+                    runs=frozenset(runs),
+                    globals=frozenset({"state"} if globals_dirty else ()),
+                    stages=frozenset(changed_stages),
+                    full_resync=static_dirty,
+                )
+            )
 
     async def save(self) -> None:
         self._mark_dirty()
@@ -1137,6 +1295,8 @@ class StateStore:
 
     async def close(self) -> None:
         await self.flush()
+        await asyncio.wrap_future(self._writer.stop())
+        await asyncio.to_thread(self._database.export_snapshot)
 
     @asynccontextmanager
     async def batch(self) -> AsyncIterator[None]:
@@ -1384,6 +1544,7 @@ class StateStore:
         ):
             status = TaskStatus.SUCCEEDED
             detail = "formalization completed before review"
+        changed_tasks = [task]
         if stage in (Stage.REVIEW, Stage.PROVE) and status in (
             TaskStatus.RUNNING,
             TaskStatus.SUCCEEDED,
@@ -1394,6 +1555,7 @@ class StateStore:
                 formalize.queued = False
                 formalize.detail = "formalization completed before review"
                 formalize.updated_at = timestamp()
+                changed_tasks.append(formalize)
         task.status = status
         task.queued = queued and status == TaskStatus.PENDING
         if stage is Stage.PROVE:
@@ -1401,7 +1563,7 @@ class StateStore:
         task.detail = detail
         task.updated_at = timestamp()
         self._invalidate_status_summaries()
-        self._mark_dirty()
+        self._mark_dirty(tasks=changed_tasks)
         await self._persist()
 
     async def set_tasks(
@@ -1412,6 +1574,7 @@ class StateStore:
         detail: str,
     ) -> None:
         changed = False
+        changed_tasks: list[TaskRecord] = []
         updated_at = timestamp()
         for chapter_id in chapter_ids:
             key = self.key(chapter_id, stage)
@@ -1442,16 +1605,18 @@ class StateStore:
                     formalize.queued = False
                     formalize.detail = "formalization completed before review"
                     formalize.updated_at = updated_at
+                    changed_tasks.append(formalize)
             task.status = task_status
             task.queued = False
             if stage is Stage.PROVE and task_status != TaskStatus.SUCCEEDED:
                 task.source_digest = None
             task.detail = task_detail
             task.updated_at = updated_at
+            changed_tasks.append(task)
             changed = True
         if changed:
             self._invalidate_status_summaries()
-            self._mark_dirty()
+            self._mark_dirty(tasks=changed_tasks)
             await self._persist()
 
     async def unblock(self) -> list[str]:
@@ -1472,7 +1637,7 @@ class StateStore:
         await self.reopen_escalated_upstream_requests(proof_chapters)
         if changed:
             self._invalidate_status_summaries()
-            self._mark_dirty()
+            self._mark_dirty(tasks=(self.tasks[key] for key in changed))
             await self._persist()
         return changed
 
@@ -1496,7 +1661,7 @@ class StateStore:
             changed.append(key)
         if changed:
             self._invalidate_status_summaries()
-            self._mark_dirty()
+            self._mark_dirty(tasks=(self.tasks[key] for key in changed))
             await self._persist()
         return changed
 
@@ -1534,7 +1699,7 @@ class StateStore:
         self._payload_loaded_run_ids.add(run.id)
         self._invalidate_aggregates()
         self._invalidate_status_summaries()
-        self._mark_dirty(run=run)
+        self._mark_dirty(task=task, run=run)
         await self._persist()
         return run
 
@@ -1570,7 +1735,7 @@ class StateStore:
         self._payload_loaded_run_ids.add(run.id)
         self._invalidate_aggregates()
         self._invalidate_status_summaries()
-        self._mark_dirty(run=run)
+        self._mark_dirty(task=task, run=run)
         await self._persist()
         return run
 
@@ -1600,7 +1765,7 @@ class StateStore:
             run.report = report
         self._invalidate_aggregates()
         self._invalidate_status_summaries()
-        self._mark_dirty(run=run, issues=bool(issue_ids))
+        changed_task = None
         if status == TaskStatus.INTERRUPTED and not run.auxiliary:
             task = self.task(run.chapter_id, Stage(run.stage))
             task.status = TaskStatus.INTERRUPTED
@@ -1609,6 +1774,8 @@ class StateStore:
                 task.source_digest = None
             task.detail = "agent interrupted with the orchestrator"
             task.updated_at = timestamp()
+            changed_task = task
+        self._mark_dirty(task=changed_task, run=run, issues=bool(issue_ids))
         await self._persist()
 
     async def start_coordinator_build(

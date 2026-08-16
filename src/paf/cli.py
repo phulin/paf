@@ -37,7 +37,7 @@ from paf.pricing import LEGACY_MODEL, CostEstimate, estimate_cost, format_usd
 from paf.project import Project, ProjectResolver
 from paf.scheduler import Orchestrator, scaffold_directories
 from paf.state import StateStore, TaskRecord, TaskStatus
-from paf.state_db import read_checkpoint, read_full_snapshot
+from paf.state_db import read_checkpoint, read_full_snapshot, read_source_issues
 from paf.tui import activity_kind_badge, format_count, format_usage, run_tui
 
 RIPGREP_WARNING = (
@@ -680,12 +680,16 @@ def print_status(config: PipelineConfig, console: Console, *, raw_json: bool) ->
 
 def print_source_issues(config: PipelineConfig, console: Console, *, raw_json: bool) -> int:
     path = config.settings.state_dir / "source-issues.json"
-    if not path.is_file():
+    issues = read_source_issues(config.settings.state_dir)
+    if issues is None:
         console.print(f"No source-issue ledger exists at {path}")
         return 0
-    ledger = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(ledger, dict) or not isinstance(ledger.get("issues"), list):
-        raise ValueError(f"invalid source-issue ledger: {path}")
+    checkpoint = read_checkpoint(config.settings.state_dir) or {}
+    ledger = {
+        "version": 1,
+        "updated_at": checkpoint.get("updated_at", ""),
+        "issues": issues,
+    }
     if raw_json:
         console.print_json(json.dumps(ledger))
         return 0

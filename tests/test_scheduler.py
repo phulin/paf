@@ -25,6 +25,7 @@ from paf.state import (
     TokenUsage,
     UpstreamRequestStatus,
 )
+from paf.state_db import read_checkpoint
 from tests.support import write_project
 
 
@@ -763,7 +764,8 @@ async def test_hot_checkpoint_does_not_grow_with_run_payload_history(tmp_path: P
                 isolation={"accepted": True, "changed_paths": [f"file-{index}.lean"]},
             )
 
-    hot = json.loads(state.path.read_text(encoding="utf-8"))
+    hot = read_checkpoint(config.settings.state_dir)
+    assert hot is not None
     task = hot["tasks"][f"{config.chapters[0].id}:formalize"]
     assert hot["version"] == 14
     assert "source_issues" not in hot
@@ -794,18 +796,14 @@ async def test_concurrent_run_updates_coalesce_into_one_database_batch(
         runs = [await state.start_run(config.chapters[0].id, stage) for stage in Stage]
 
     calls = 0
-    original = state._database.write_batch
+    original = state._database.write_delta
 
-    def tracked(
-        checkpoint: dict[str, Any],
-        dirty_runs: list[tuple[str, dict[str, Any]]],
-        issues: list[dict[str, Any]] | None,
-    ) -> None:
+    def tracked(write: Any, *, connection: Any = None) -> int:
         nonlocal calls
         calls += 1
-        original(checkpoint, dirty_runs, issues)
+        return original(write, connection=connection)
 
-    monkeypatch.setattr(state._database, "write_batch", tracked)
+    monkeypatch.setattr(state._database, "write_delta", tracked)
     await asyncio.gather(
         *(state.update_run(run, pid=index) for index, run in enumerate(runs, start=1))
     )
@@ -882,10 +880,9 @@ async def test_state_accumulates_and_deduplicates_source_issue_ledger(tmp_path: 
     assert "source_issues" not in latest.report
     assert latest.report["source_issue_ids"] == [recorded.id]
 
-    ledger = json.loads(state.source_issues_path.read_text(encoding="utf-8"))
-    assert ledger["version"] == 1
-    assert ledger["issues"][0]["id"] == recorded.id
-    assert ledger["issues"][0]["suggested_correction"] == source_issue["suggested_correction"]
+    _, _, issues = state._database.load()
+    assert issues[0]["id"] == recorded.id
+    assert issues[0]["suggested_correction"] == source_issue["suggested_correction"]
 
     reloaded = StateStore(config)
     await reloaded.load_or_create()

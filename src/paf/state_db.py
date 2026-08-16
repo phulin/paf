@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import os
+import queue
 import shutil
 import sqlite3
+import threading
+import time
+from concurrent.futures import Future
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -471,6 +475,112 @@ class DatabaseWrite:
     changes: frozenset[tuple[str, str]] = frozenset()
 
 
+def _coalesce_writes(writes: list[DatabaseWrite]) -> DatabaseWrite:
+    globals_: dict[str, bytes] = {}
+    tasks: dict[str, bytes] = {}
+    runs: dict[str, tuple[str, bytes]] = {}
+    issues: dict[str, bytes] = {}
+    documents: dict[str, tuple[int, bytes]] = {}
+    work_units: dict[str, tuple[str, int, str, str, bytes]] = {}
+    changes: set[tuple[str, str]] = set()
+    replace_issues = False
+    for write in writes:
+        globals_.update(write.globals)
+        tasks.update(write.tasks)
+        runs.update(write.runs)
+        if write.replace_source_issues:
+            issues.clear()
+            replace_issues = True
+        issues.update(write.source_issues)
+        documents.update(write.documents)
+        work_units.update(write.work_units)
+        changes.update(write.changes)
+    return DatabaseWrite(
+        updated_at=writes[-1].updated_at,
+        globals=globals_,
+        tasks=tasks,
+        runs=runs,
+        source_issues=issues,
+        replace_source_issues=replace_issues,
+        documents=documents,
+        work_units=work_units,
+        changes=frozenset(changes),
+    )
+
+
+class StateWriter:
+    """Single-connection delta writer with short micro-batching."""
+
+    def __init__(self, database: StateDatabase, *, batch_seconds: float = 0.02) -> None:
+        self.database = database
+        self.batch_seconds = batch_seconds
+        self._queue: queue.Queue[tuple[DatabaseWrite | None, Future[int | None]]] = queue.Queue()
+        self._thread = threading.Thread(target=self._run, name="paf-state-writer", daemon=True)
+        self._started = False
+
+    def start(self) -> None:
+        if not self._started:
+            self._started = True
+            self._thread.start()
+
+    def submit(self, write: DatabaseWrite) -> Future[int | None]:
+        if not self._started:
+            self.start()
+        future: Future[int | None] = Future()
+        self._queue.put((write, future))
+        return future
+
+    def stop(self) -> Future[int | None]:
+        future: Future[int | None] = Future()
+        if not self._started:
+            future.set_result(None)
+            return future
+        self._queue.put((None, future))
+        return future
+
+    def _run(self) -> None:
+        connection = self.database.connect_writer()
+        try:
+            while True:
+                write, future = self._queue.get()
+                if write is None:
+                    future.set_result(None)
+                    return
+                writes = [write]
+                futures = [future]
+                deadline = time.monotonic() + self.batch_seconds
+                stopping: Future[int | None] | None = None
+                while (remaining := deadline - time.monotonic()) > 0:
+                    try:
+                        next_write, next_future = self._queue.get(timeout=remaining)
+                    except queue.Empty:
+                        break
+                    if next_write is None:
+                        stopping = next_future
+                        break
+                    writes.append(next_write)
+                    futures.append(next_future)
+                try:
+                    revision = self.database.write_delta(
+                        _coalesce_writes(writes), connection=connection
+                    )
+                except BaseException as error:
+                    for item in futures:
+                        item.set_exception(error)
+                    if stopping is not None:
+                        stopping.set_exception(error)
+                    if stopping is not None:
+                        return
+                    continue
+                for item in futures:
+                    item.set_result(revision)
+                if stopping is not None:
+                    stopping.set_result(None)
+                    return
+        finally:
+            connection.close()
+
+
 class StateDatabase:
     def __init__(self, state_dir: Path) -> None:
         self.state_dir = state_dir
@@ -850,6 +960,42 @@ class StateDatabase:
         snapshot["source_issues"] = issues
         return snapshot
 
+    def export_snapshot(self) -> Path | None:
+        """Write legacy JSON artifacts from one explicit normalized read."""
+
+        snapshot = self.full_snapshot()
+        if snapshot is None:
+            return None
+        hot = dict(snapshot)
+        issues = hot.pop("source_issues", [])
+        raw_tasks = hot.get("tasks", {})
+        if isinstance(raw_tasks, dict):
+            hot["tasks"] = {
+                key: {name: value for name, value in task.items() if name != "runs"}
+                | {
+                    "run_count": len(task.get("runs", [])),
+                    "latest_run_id": (
+                        task["runs"][-1].get("id")
+                        if isinstance(task.get("runs"), list) and task["runs"]
+                        else None
+                    ),
+                }
+                for key, task in raw_tasks.items()
+                if isinstance(task, dict)
+            }
+        state_path = self.state_dir / "state.json"
+        self._write_export(state_path, hot)
+        self._write_export(
+            self.state_dir / "source-issues.json",
+            {
+                "version": 1,
+                "updated_at": hot.get("updated_at", ""),
+                "issues": issues,
+            },
+            indent=True,
+        )
+        return state_path
+
 
 def read_checkpoint(state_dir: Path) -> dict[str, Any] | None:
     database = StateDatabase(state_dir)
@@ -870,3 +1016,17 @@ def read_full_snapshot(state_dir: Path) -> dict[str, Any] | None:
     if database.path.is_file():
         return database.full_snapshot()
     return read_checkpoint(state_dir)
+
+
+def read_source_issues(state_dir: Path) -> list[dict[str, Any]] | None:
+    database = StateDatabase(state_dir)
+    if database.path.is_file():
+        _, _, issues = database.load()
+        return issues
+    path = state_dir / "source-issues.json"
+    if not path.is_file():
+        return None
+    ledger = json.loads(path.read_bytes())
+    if not isinstance(ledger, dict) or not isinstance(ledger.get("issues"), list):
+        raise ValueError(f"invalid source-issue ledger: {path}")
+    return [value for value in ledger["issues"] if isinstance(value, dict)]
