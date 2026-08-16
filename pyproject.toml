@@ -18,6 +18,7 @@ paf = "paf.cli:main"
 [dependency-groups]
 dev = [
   "dprint-py>=0.55.2.0",
+  "httpx2>=2.9.0",
   "pre-commit>=4.0.0",
   "pytest>=8.4.0",
   "pytest-asyncio>=1.1.0",
