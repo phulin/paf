@@ -28,7 +28,7 @@ from textual.widgets import (
 from textual.worker import WorkerCancelled
 
 from paf import json_codec as json
-from paf.activity import AgentActivity, reportable_error, systemic_errors
+from paf.activity import ActivityEntry, AgentActivity, reportable_error, systemic_errors
 from paf.models import Stage, WorkUnitLike
 from paf.pricing import format_usd
 from paf.scheduler import Orchestrator
@@ -363,7 +363,8 @@ class AgentDetailScreen(Screen[None]):
         self._raw_offset = 0
         self._raw_pending = bytearray()
         self._raw_lines: deque[str] = deque(maxlen=30)
-        self._timeline_activities: dict[str, AgentActivity] = {}
+        self._rendered_plan: tuple[str, tuple[tuple[str, bool], ...]] | None = None
+        self._rendered_files: tuple[str, tuple[str, ...]] | None = None
         self._rendered_prompt: tuple[str, str, int | None, int | None] | None = None
 
     def compose(self) -> ComposeResult:
@@ -398,7 +399,7 @@ class AgentDetailScreen(Screen[None]):
                     id="agent-timeline",
                     wrap=True,
                     markup=False,
-                    max_lines=None,
+                    max_lines=MAX_TIMELINE_EVENTS,
                 )
             with TabPane("Prompt", id="prompt-pane"):
                 yield TextArea(
@@ -505,16 +506,8 @@ class AgentDetailScreen(Screen[None]):
         self._update_static("#agent-error", f"LATEST ERROR\n{error}" if error else "")
         path = Path(run.log_path) if run.log_path else self.state.logs_dir / f"{run.id}.jsonl"
         self._update_static("#agent-path", f"Raw JSONL: {path}")
-        timeline_activity = self._timeline_activity(run, activity, path)
         timeline_width = _log_render_width(self.query_one("#agent-timeline", RichLog))
-        rendered_activity = (
-            run.id,
-            timeline_activity.sequence if timeline_activity else None,
-            timeline_width,
-        )
-        if rendered_activity != self._rendered_activity:
-            self._render_activity(timeline_activity)
-            self._rendered_activity = rendered_activity
+        self._refresh_activity(run.id, activity, timeline_width)
         tabs = self.query_one("#agent-tabs", TabbedContent)
         if tabs.active == "prompt-pane":
             self._refresh_prompt(run)
@@ -544,64 +537,47 @@ class AgentDetailScreen(Screen[None]):
         prompt.scroll_home(animate=False, immediate=True)
         self._rendered_prompt = rendered
 
-    def _timeline_activity(
+    def _refresh_activity(
         self,
-        run: RunRecord,
-        compact: AgentActivity | None,
-        path: Path,
-    ) -> AgentActivity | None:
-        """Replay a run once, then extend that full timeline from its live sidecar."""
+        run_id: str,
+        activity: AgentActivity | None,
+        timeline_width: int,
+    ) -> None:
+        rendered = self._rendered_activity
+        sequence = activity.sequence if activity is not None else None
+        target = (run_id, sequence, timeline_width)
+        if target == rendered:
+            return
+        if rendered is not None and rendered[:2] == target[:2]:
+            # RichLog handles viewport changes; rebuilding thousands of already
+            # wrapped lines solely because a scrollbar changed the measured
+            # width is much more disruptive than retaining their old wrapping.
+            self._rendered_activity = target
+            return
 
-        timeline = self._timeline_activities.get(run.id)
-        if timeline is None:
-            replayed = self.state.activities.replay(
-                run.id,
-                run.chapter_id,
-                run.stage,
-                path,
-                workspace_root=self.state.config.settings.repo,
-                maximum_events=MAX_TIMELINE_EVENTS,
-                cache=False,
-            )
-            if replayed is None:
-                # A newly started run may not have created its JSONL yet. Do not
-                # cache the compact fallback, so a later refresh can replay it.
-                return compact
-            timeline = replayed
-            self._timeline_activities[run.id] = timeline
-
-        if compact is None or timeline is None or compact.sequence <= timeline.sequence:
-            return timeline
-
-        additions = [entry for entry in compact.recent if entry.sequence > timeline.sequence]
-        if not additions or additions[0].sequence != timeline.sequence + 1:
-            replayed = self.state.activities.replay(
-                run.id,
-                run.chapter_id,
-                run.stage,
-                path,
-                workspace_root=self.state.config.settings.repo,
-                maximum_events=MAX_TIMELINE_EVENTS,
-                cache=False,
-            )
-            if replayed is not None:
-                self._timeline_activities[run.id] = replayed
-                return replayed
-            return timeline
-
-        timeline.recent.extend(additions)
-        del timeline.recent[:-MAX_TIMELINE_EVENTS]
-        timeline.sequence = compact.sequence
-        timeline.updated_at = compact.updated_at
-        timeline.latest_summary = compact.latest_summary
-        timeline.latest_error = compact.latest_error
-        # Timeline entries do not retain enough detail to reconstruct these
-        # aggregate views. Keep them aligned with the live sidecar whenever we
-        # extend the cached replay, or the Plan and Files tabs remain stale
-        # until an eventual full replay.
-        timeline.todos = list(compact.todos)
-        timeline.files = list(compact.files)
-        return timeline
+        can_append = (
+            activity is not None
+            and rendered is not None
+            and rendered[0] == run_id
+            and rendered[1] is not None
+            and sequence is not None
+            and sequence > rendered[1]
+        )
+        if can_append:
+            assert activity is not None and rendered is not None and rendered[1] is not None
+            additions = [entry for entry in activity.recent if entry.sequence > rendered[1]]
+        else:
+            additions = []
+        if can_append and additions and additions[0].sequence == rendered[1] + 1:
+            assert activity is not None
+            self._append_activity(activity, additions, timeline_width)
+        else:
+            # The compact activity sidecar already retains a bounded recent
+            # window. Rebuilding from it avoids parsing an unbounded JSONL and
+            # is also the safe recovery path after missed events or a resize.
+            self._render_activity(activity)
+        self._render_activity_tabs(activity)
+        self._rendered_activity = target
 
     def _sync_run_tabs(self, runs: list[RunRecord]) -> None:
         tabs = self.query_one("#run-tabs", Tabs)
@@ -690,22 +666,31 @@ class AgentDetailScreen(Screen[None]):
         timeline.clear()
         timeline_width = _log_render_width(timeline)
         write_width = timeline_width if timeline.scrollable_size.width else None
-        marks = {"started": "▶", "completed": "✓", "failed": "✗", "updated": "•"}
         if activity and activity.recent and activity.recent[0].sequence > 1:
             omitted = activity.recent[0].sequence - 1
             timeline.write(
-                f"… {omitted:,} earlier timeline events omitted (extreme-length safeguard)",
+                f"… {omitted:,} earlier timeline events available in Raw events",
                 width=write_width,
             )
-        latest_message = (
-            max(
-                (entry.sequence for entry in activity.recent if entry.kind == "message"),
-                default=None,
-            )
-            if activity
-            else None
+        if activity is not None:
+            self._append_activity(activity, activity.recent, timeline_width)
+        else:
+            timeline.write("No activity events recorded for this step.", width=write_width)
+
+    def _append_activity(
+        self,
+        activity: AgentActivity,
+        entries: Iterable[ActivityEntry],
+        timeline_width: int,
+    ) -> None:
+        timeline = self.query_one("#agent-timeline", RichLog)
+        write_width = timeline_width if timeline.scrollable_size.width else None
+        marks = {"started": "▶", "completed": "✓", "failed": "✗", "updated": "•"}
+        latest_message = max(
+            (entry.sequence for entry in activity.recent if entry.kind == "message"),
+            default=None,
         )
-        for entry in activity.recent if activity else ():
+        for entry in entries:
             clock = entry.at[11:19] if len(entry.at) >= 19 else entry.at
             prefix = f"{clock} {marks.get(entry.status, '•')} "
             badge = activity_kind_badge(entry.kind)
@@ -736,23 +721,35 @@ class AgentDetailScreen(Screen[None]):
                     else:
                         line.append("\n" + "\n".join(f"    {part}" for part in detail.splitlines()))
             timeline.write(line, width=write_width)
-        if activity is None:
-            timeline.write("No activity events recorded for this step.", width=write_width)
 
+    def _render_activity_tabs(self, activity: AgentActivity | None) -> None:
+        run_id = activity.run_id if activity is not None else ""
+        plan_key = (
+            run_id,
+            tuple(
+                (str(item.get("text", "")), bool(item.get("completed"))) for item in activity.todos
+            )
+            if activity is not None
+            else (),
+        )
         plan = self.query_one("#agent-plan", RichLog)
-        plan.clear()
-        for item in activity.todos if activity else ():
-            mark = "✓" if item.get("completed") else "·"
-            plan.write(f"{mark} {item.get('text', '')}")
-        if activity is None or not activity.todos:
-            plan.write("No todo list emitted yet.")
+        if plan_key != self._rendered_plan:
+            plan.clear()
+            for text, completed in plan_key[1]:
+                plan.write(f"{'✓' if completed else '·'} {text}")
+            if not plan_key[1]:
+                plan.write("No todo list emitted yet.")
+            self._rendered_plan = plan_key
 
+        files_key = (run_id, tuple(activity.files) if activity is not None else ())
         files = self.query_one("#agent-files", RichLog)
-        files.clear()
-        for path in activity.files if activity else ():
-            files.write(path)
-        if activity is None or not activity.files:
-            files.write("No file-change event emitted yet.")
+        if files_key != self._rendered_files:
+            files.clear()
+            for path in files_key[1]:
+                files.write(path)
+            if not files_key[1]:
+                files.write("No file-change event emitted yet.")
+            self._rendered_files = files_key
 
 
 class SwarmApp(App[bool]):

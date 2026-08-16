@@ -575,7 +575,9 @@ async def test_agent_detail_can_switch_between_chapter_steps(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
-async def test_agent_detail_refreshes_plan_from_live_activity(tmp_path: Path) -> None:
+async def test_agent_detail_refreshes_plan_from_live_activity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
     state = StateStore(config)
     orchestrator = Orchestrator(config, state)
@@ -626,13 +628,28 @@ async def test_agent_detail_refreshes_plan_from_live_activity(tmp_path: Path) ->
         app.action_inspect_agent()
         await pilot.pause()
 
-        app.screen.query_one("#agent-tabs", TabbedContent).active = "plan-pane"
+        agent_tabs = app.screen.query_one("#agent-tabs", TabbedContent)
+        agent_tabs.active = "plan-pane"
         await pilot.pause()
         plan = app.screen.query_one("#agent-plan", RichLog)
         assert [line.text for line in plan.lines] == [
             "· Inspect the current behavior",
             "· Implement the fix",
         ]
+
+        agent_tabs.active = "timeline-pane"
+        cast(AgentDetailScreen, app.screen).refresh_agent()
+        await pilot.pause()
+        timeline = app.screen.query_one("#agent-timeline", RichLog)
+        original_clear = timeline.clear
+        timeline_clears = 0
+
+        def clear_timeline() -> None:
+            nonlocal timeline_clears
+            timeline_clears += 1
+            original_clear()
+
+        monkeypatch.setattr(timeline, "clear", clear_timeline)
 
         update_plan.set()
         await plan_updated.wait()
@@ -643,6 +660,8 @@ async def test_agent_detail_refreshes_plan_from_live_activity(tmp_path: Path) ->
             "✓ Inspect the current behavior",
             "· Implement the fix",
         ]
+        assert timeline_clears == 0
+        assert any("plan updated (1/2 complete)" in line.text for line in timeline.lines)
 
         await pilot.press("escape")
         finish.set()
