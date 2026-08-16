@@ -3,6 +3,7 @@ from __future__ import annotations
 import heapq
 import re
 from dataclasses import dataclass
+from itertools import pairwise
 from pathlib import Path
 from typing import Literal
 
@@ -163,7 +164,8 @@ def build_source_dependency_graph(
 ) -> WorkUnitImportGraph:
     """Build the schedulable DAG persisted by source discovery.
 
-    Configured dependencies remain authoritative lower bounds. A discovery
+    Configured dependencies remain authoritative lower bounds unless a
+    forward-pointing edge must be discarded to break a cycle. A discovery
     record contributes direct work-unit ids through its ``dependencies`` list.
     Records may be partial while discovery agents are still running; an absent
     record contributes only configured dependencies.
@@ -190,6 +192,20 @@ def build_source_dependency_graph(
     if missing:
         raise ValueError(f"source tree depends on unknown ids: {', '.join(sorted(missing))}")
 
+    # Discovery should only point to earlier source units. Be tolerant of stale
+    # or erroneous reports that form a cycle: every cycle has at least one edge
+    # pointing from a unit to a later unit, so dropping those edges restores a
+    # schedulable graph without failing an otherwise successful discovery.
+    while cycle := _chapter_cycle(dependencies):
+        removed = False
+        for dependent, prerequisite in pairwise(cycle):
+            if source_order[prerequisite] >= source_order[dependent]:
+                dependencies[dependent].remove(prerequisite)
+                removed = True
+        if not removed:  # Defensive guard; a cycle in a total order must have a forward edge.
+            detail = " -> ".join(cycle)
+            raise ValueError(f"source dependency tree contains a cycle: {detail}")
+
     successors = {work_unit.id: set() for work_unit in work_units}
     for dependent, required in dependencies.items():
         for prerequisite in required:
@@ -211,10 +227,7 @@ def build_source_dependency_graph(
             if indegree[successor] == 0:
                 heapq.heappush(ready, (source_order[successor], successor))
 
-    if len(order) != len(by_id):
-        cycle = _chapter_cycle(dependencies)
-        detail = " -> ".join(cycle) if cycle else "unknown cycle"
-        raise ValueError(f"source dependency tree contains a cycle: {detail}")
+    assert len(order) == len(by_id)
 
     edges = tuple(
         sorted(

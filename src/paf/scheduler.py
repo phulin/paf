@@ -482,6 +482,9 @@ class Orchestrator:
                 "issues": list(report.get("issues", ())),
             }
             graph = build_source_dependency_graph(self.work_units, nodes)
+            for chapter_id, node in nodes.items():
+                if chapter_id in graph.dependencies and isinstance(node, dict):
+                    node["dependencies"] = sorted(graph.dependencies[chapter_id])
             previous_edges = previous.get("edges") if isinstance(previous, dict) else None
             edges = [list(edge) for edge in graph.edges]
             revision = int(previous.get("revision", 0)) if isinstance(previous, dict) else 0

@@ -938,12 +938,18 @@ class CodexExecutor:
         scope = "\n".join(f"- `{item}`" for item in chapter.scope)
         input_catalog = ""
         if stage is Stage.DISCOVER:
+            previous_units: list[Any] = []
+            for unit in self.config.work_units:
+                if unit.id == chapter.id:
+                    break
+                previous_units.append(unit)
             entries = "\n".join(
                 f"- `{unit.id}` — {unit.title} "
                 f"({unit.source.as_posix()}:{unit.source_span.start_line}-"
                 f"{unit.source_span.end_line})"
-                for unit in self.config.work_units
+                for unit in previous_units
             )
+            entries = entries or "No earlier chapters are available."
             input_catalog = f"\n### Available chapters and ids\n\n{entries}\n"
         proof_retry_contract = ""
         if stage is Stage.PROVE and feedback and role != UPSTREAM_REPAIR_ROLE:

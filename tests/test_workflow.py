@@ -85,6 +85,26 @@ async def test_source_dependency_tree_survives_restart(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_source_dependency_cycle_drops_forward_edge_instead_of_failing(tmp_path) -> None:
+    config = load_config(write_project(tmp_path))
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await orchestrator.prepare()
+    first, second = config.work_units
+
+    await orchestrator._persist_source_dependencies(
+        first, (second.id,), {"summary": "incorrect forward edge", "issues": []}
+    )
+    await orchestrator._persist_source_dependencies(
+        second, (first.id,), {"summary": "valid earlier edge", "issues": []}
+    )
+
+    assert state.source_dependency_tree["edges"] == [[first.id, second.id]]
+    assert state.source_dependency_tree["nodes"][first.id]["dependencies"] == []
+    assert state.source_dependency_tree["nodes"][second.id]["dependencies"] == [first.id]
+
+
+@pytest.mark.asyncio
 async def test_rereview_does_not_wait_for_dependency_review(tmp_path, monkeypatch) -> None:
     config = load_config(write_project(tmp_path))
     state = StateStore(config)

@@ -326,6 +326,21 @@ def test_executor_uses_machine_readable_codex_mode(tmp_path: Path) -> None:
     assert "--dangerously-bypass-approvals-and-sandbox" in resumed_review
 
 
+def test_discovery_catalog_contains_only_previous_chapters(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path))
+    executor = CodexExecutor(config, StateStore(config))
+    first, second = config.work_units
+
+    first_prompt = executor.build_prompt(first, Stage.DISCOVER)
+    second_prompt = executor.build_prompt(second, Stage.DISCOVER)
+
+    assert "No earlier chapters are available." in first_prompt
+    assert f"`{first.id}`" not in first_prompt
+    assert f"`{second.id}`" not in first_prompt
+    assert f"`{first.id}`" in second_prompt
+    assert f"`{second.id}`" not in second_prompt
+
+
 def test_executor_uses_stage_specific_model_and_reasoning_effort(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
     stages = dict(config.stages)

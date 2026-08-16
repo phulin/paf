@@ -164,6 +164,26 @@ def test_work_unit_graphs_keep_source_order_when_units_are_independent(tmp_path:
     assert discovered.order == observed.order
 
 
+def test_source_dependency_graph_removes_forward_edges_from_cycles() -> None:
+    chapters = tuple(chapter(number) for number in (1, 2, 3))
+    first, second, third = chapters
+    graph = build_source_dependency_graph(
+        chapters,
+        {
+            first.id: {"dependencies": [third.id]},
+            second.id: {"dependencies": [first.id]},
+            third.id: {"dependencies": [second.id]},
+        },
+    )
+
+    assert graph.dependencies == {
+        first.id: frozenset(),
+        second.id: frozenset({first.id}),
+        third.id: frozenset({second.id}),
+    }
+    assert graph.order == (first.id, second.id, third.id)
+
+
 @pytest.mark.asyncio
 async def test_priority_limiter_grants_a_contended_slot_by_rank() -> None:
     limiter = PriorityLimiter(1)
