@@ -1,3 +1,4 @@
+use std::fmt;
 use std::io::{BufRead, BufReader, Write, stdout};
 use std::os::unix::net::UnixStream;
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
@@ -5,11 +6,11 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
-use crossterm::execute;
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
+use crossterm::{Command, execute};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use serde_json::{Value, json};
@@ -24,10 +25,38 @@ enum RuntimeEvent {
 
 struct TerminalGuard;
 
+const MOUSE_SCROLL_ROWS: isize = 3;
+
+/// Ask the terminal for button and wheel events using SGR coordinates.
+///
+/// Crossterm's general mouse-capture command also enables all-motion reporting, which sends a
+/// packet for every pointer movement. Normal tracking includes wheel events and avoids flooding
+/// slower SSH/tmux links with events this TUI does not use.
+struct EnableMouseWheelCapture;
+
+impl Command for EnableMouseWheelCapture {
+    fn write_ansi(&self, output: &mut impl fmt::Write) -> fmt::Result {
+        output.write_str("\x1b[?1000h\x1b[?1006h")
+    }
+}
+
+struct DisableMouseWheelCapture;
+
+impl Command for DisableMouseWheelCapture {
+    fn write_ansi(&self, output: &mut impl fmt::Write) -> fmt::Result {
+        output.write_str("\x1b[?1006l\x1b[?1000l")
+    }
+}
+
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(stdout(), LeaveAlternateScreen, crossterm::cursor::Show);
+        let _ = execute!(
+            stdout(),
+            DisableMouseWheelCapture,
+            LeaveAlternateScreen,
+            crossterm::cursor::Show
+        );
     }
 }
 
@@ -40,9 +69,14 @@ pub fn run(socket_path: &str, label: &str, startup_warning: &str) -> Result<bool
     spawn_terminal_reader(sender);
 
     enable_raw_mode().context("could not enable terminal raw mode")?;
-    execute!(stdout(), EnterAlternateScreen, crossterm::cursor::Hide)
-        .context("could not enter the alternate screen")?;
     let _guard = TerminalGuard;
+    execute!(
+        stdout(),
+        EnterAlternateScreen,
+        EnableMouseWheelCapture,
+        crossterm::cursor::Hide
+    )
+    .context("could not enter the alternate screen")?;
     let backend = CrosstermBackend::new(stdout());
     let mut terminal = Terminal::new(backend).context("could not initialize terminal")?;
 
@@ -139,8 +173,11 @@ fn handle_terminal_event(
     model: &mut DashboardModel,
     socket_path: &str,
 ) -> Result<bool> {
-    let Event::Key(key) = event else {
-        return Ok(matches!(event, Event::Resize(_, _)));
+    let key = match event {
+        Event::Key(key) => key,
+        Event::Mouse(mouse) => return Ok(handle_mouse_event(mouse, model)),
+        Event::Resize(_, _) => return Ok(true),
+        _ => return Ok(false),
     };
     if !key.is_press() {
         return Ok(false);
@@ -214,6 +251,23 @@ fn handle_terminal_event(
     }
 }
 
+fn handle_mouse_event(mouse: MouseEvent, model: &mut DashboardModel) -> bool {
+    if model.preparation.is_some() {
+        return false;
+    }
+    let delta = match mouse.kind {
+        MouseEventKind::ScrollUp => -MOUSE_SCROLL_ROWS,
+        MouseEventKind::ScrollDown => MOUSE_SCROLL_ROWS,
+        _ => return false,
+    };
+    if model.detail {
+        model.scroll = model.scroll.saturating_add_signed(delta as i16);
+    } else {
+        model.move_selection(delta);
+    }
+    true
+}
+
 fn handle_detail_key(key: KeyEvent, model: &mut DashboardModel) -> Result<bool> {
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') => {
@@ -245,6 +299,64 @@ fn send_control(socket_path: &str, command: &str) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{Task, WorkUnit};
+
+    #[test]
+    fn mouse_capture_uses_sgr_without_motion_tracking() {
+        let mut enabled = String::new();
+        EnableMouseWheelCapture.write_ansi(&mut enabled).unwrap();
+        assert!(enabled.contains("\x1b[?1000h"));
+        assert!(enabled.contains("\x1b[?1006h"));
+        assert!(!enabled.contains("?1002h"));
+        assert!(!enabled.contains("?1003h"));
+    }
+
+    #[test]
+    fn mouse_wheel_scrolls_dashboard_rows_and_detail_content() {
+        let mut model = DashboardModel::loading("test".into(), String::new());
+        model.preparation = None;
+        for ordinal in 0..8 {
+            let id = format!("book/chapter-{ordinal:02}");
+            model.state.work_units.push(WorkUnit {
+                id: id.clone(),
+                document_id: "book".into(),
+                title: format!("Chapter {ordinal}"),
+                ordinal,
+                ..WorkUnit::default()
+            });
+            model.state.tasks.insert(
+                format!("{id}:review"),
+                Task {
+                    work_unit_id: id,
+                    stage: "review".into(),
+                    ..Task::default()
+                },
+            );
+        }
+        let wheel = |kind| {
+            Event::Mouse(MouseEvent {
+                kind,
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+
+        assert!(
+            handle_terminal_event(wheel(MouseEventKind::ScrollDown), &mut model, "/unused")
+                .unwrap()
+        );
+        assert_eq!(model.selected, 3);
+        handle_terminal_event(wheel(MouseEventKind::ScrollUp), &mut model, "/unused").unwrap();
+        assert_eq!(model.selected, 0);
+
+        model.detail = true;
+        model.scroll = 9;
+        handle_terminal_event(wheel(MouseEventKind::ScrollUp), &mut model, "/unused").unwrap();
+        assert_eq!(model.scroll, 6);
+        handle_terminal_event(wheel(MouseEventKind::ScrollDown), &mut model, "/unused").unwrap();
+        assert_eq!(model.scroll, 9);
+    }
 
     #[test]
     fn detail_q_returns_to_dashboard_instead_of_stopping() {
