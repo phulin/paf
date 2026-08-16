@@ -184,7 +184,7 @@ def test_config_stage_prompts_are_optional(tmp_path: Path) -> None:
 def test_legacy_repair_stage_config_maps_to_formalize(tmp_path: Path) -> None:
     path = write_project(tmp_path)
     text = path.read_text(encoding="utf-8")
-    text = text.replace("[stages.discover]\nprompt = \"prompts/discover.md\"\n", "")
+    text = text.replace('[stages.discover]\nprompt = "prompts/discover.md"\n', "")
     text = text.replace("[stages.formalize]", "[stages.repair]")
     path.write_text(text, encoding="utf-8")
 

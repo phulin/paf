@@ -73,9 +73,7 @@ async def test_source_dependency_tree_survives_restart(tmp_path) -> None:
     await orchestrator.prepare()
     first, second = config.work_units
 
-    await orchestrator._persist_source_dependencies(
-        first, (), {"summary": "root", "issues": []}
-    )
+    await orchestrator._persist_source_dependencies(first, (), {"summary": "root", "issues": []})
     await orchestrator._persist_source_dependencies(
         second, (first.id,), {"summary": "dependent", "issues": []}
     )
@@ -93,15 +91,11 @@ async def test_rereview_does_not_wait_for_dependency_review(tmp_path, monkeypatc
     orchestrator = Orchestrator(config, state)
     await orchestrator.prepare()
     first, second = config.work_units
-    await orchestrator._persist_source_dependencies(
-        first, (), {"summary": "root", "issues": []}
-    )
+    await orchestrator._persist_source_dependencies(first, (), {"summary": "root", "issues": []})
     await orchestrator._persist_source_dependencies(
         second, (first.id,), {"summary": "dependent", "issues": []}
     )
-    await state.set_tasks(
-        (first.id, second.id), Stage.FORMALIZE, TaskStatus.SUCCEEDED, "clean"
-    )
+    await state.set_tasks((first.id, second.id), Stage.FORMALIZE, TaskStatus.SUCCEEDED, "clean")
     state.task(second.id, Stage.REVIEW).rounds = 1
     release_first = asyncio.Event()
     second_started = asyncio.Event()
@@ -129,15 +123,11 @@ async def test_first_review_waits_for_dependency_review(tmp_path, monkeypatch) -
     orchestrator = Orchestrator(config, state)
     await orchestrator.prepare()
     first, second = config.work_units
-    await orchestrator._persist_source_dependencies(
-        first, (), {"summary": "root", "issues": []}
-    )
+    await orchestrator._persist_source_dependencies(first, (), {"summary": "root", "issues": []})
     await orchestrator._persist_source_dependencies(
         second, (first.id,), {"summary": "dependent", "issues": []}
     )
-    await state.set_tasks(
-        (first.id, second.id), Stage.FORMALIZE, TaskStatus.SUCCEEDED, "clean"
-    )
+    await state.set_tasks((first.id, second.id), Stage.FORMALIZE, TaskStatus.SUCCEEDED, "clean")
     release_first = asyncio.Event()
     second_started = asyncio.Event()
 
@@ -168,15 +158,11 @@ async def test_proof_release_does_not_wait_for_dependency_proof(tmp_path, monkey
     orchestrator = Orchestrator(config, state)
     await orchestrator.prepare()
     first, second = config.work_units
-    await orchestrator._persist_source_dependencies(
-        first, (), {"summary": "root", "issues": []}
-    )
+    await orchestrator._persist_source_dependencies(first, (), {"summary": "root", "issues": []})
     await orchestrator._persist_source_dependencies(
         second, (first.id,), {"summary": "dependent", "issues": []}
     )
-    await state.set_tasks(
-        (first.id, second.id), Stage.FORMALIZE, TaskStatus.SUCCEEDED, "clean"
-    )
+    await state.set_tasks((first.id, second.id), Stage.FORMALIZE, TaskStatus.SUCCEEDED, "clean")
     await state.set_tasks((first.id, second.id), Stage.REVIEW, TaskStatus.SUCCEEDED, "reviewed")
     release_first = asyncio.Event()
     second_started = asyncio.Event()

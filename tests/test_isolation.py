@@ -623,9 +623,9 @@ print(json.dumps({"type": "item.completed", "item": {
         assert (workspace_root / "lean" / "Book" / "Chapter01.lean").read_text(
             encoding="utf-8"
         ) == "import Book.Chapter01.Section\n"
-        assert (
-            workspace_root / "lean" / "Book" / "Chapter01" / "Section.lean"
-        ).read_text(encoding="utf-8") == "theorem isolated : True := by trivial\n"
+        assert (workspace_root / "lean" / "Book" / "Chapter01" / "Section.lean").read_text(
+            encoding="utf-8"
+        ) == "theorem isolated : True := by trivial\n"
         artifact = workspace_root / "lean" / ".lake" / "build" / "coordinator.marker"
         artifact.parent.mkdir(parents=True, exist_ok=True)
         artifact.write_bytes(b"built in main")
