@@ -533,6 +533,10 @@ status (`pending`, `running`, `succeeded`, `failed`, `blocked`, or `interrupted`
 describing what
 a running or pending task is doing. A transient `queued` marker distinguishes runnable pending stages
 that are waiting for an agent slot, and both the TUI and web dashboard label them accordingly.
+Successful discovery reports enter a short bounded batch: PAF merges the reports, rebuilds the source
+dependency graph once, and persists the graph plus all task promotions atomically. At most twice the
+configured discovery-agent pool is scheduled at once. Dashboards count live run records as working
+agents and label completed task-level work awaiting promotion as postprocessing.
 Statement repair requests are checkpointed before entering the
 in-memory batching queue and removed only after their dependency-aware review pass returns. Upstream
 proof requests instead remain in the checkpoint permanently and record only completed facts:

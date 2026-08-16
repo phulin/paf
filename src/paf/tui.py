@@ -1081,11 +1081,11 @@ class SwarmApp(App[bool]):
                 {build.current_work_unit_id} if build.current_work_unit_id else set()
             )
             building = len(build_targets) if build.active and build.stage == stage.value else 0
-            running = max(0, counts["running"] - building)
+            postprocessing = max(0, counts["running"] - agents[stage.value] - building)
             self._update_static(
                 f"#stage-{stage.value}",
                 f"[b]{stage.value.title()} chapters[/b]\n"
-                f"agent {agents[stage.value]} · running {running} · "
+                f"agent {agents[stage.value]} · postprocess {postprocessing} · "
                 f"building {building}\n"
                 f"✓ {counts['succeeded']}  "
                 f"✗ {counts['failed']}  · {counts['pending']} pending  "

@@ -84,7 +84,9 @@ export function DashboardSummary({
   const tasks = Object.values(state.tasks ?? {});
   const successful = tasks.filter((task) => task.status === "succeeded").length;
   const chaptersDone = rows.filter((row) => row.stages.prove?.status === "succeeded").length;
-  const active = tasks.filter((task) => task.status === "running").length;
+  const runningTasks = tasks.filter((task) => task.status === "running").length;
+  const activeAgents = state.agents?.active ?? runningTasks;
+  const postprocessing = Math.max(0, runningTasks - activeAgents);
   const failed = tasks.filter(
     (task) =>
       task.status === "failed" || task.status === "blocked" || task.status === "interrupted",
@@ -97,12 +99,18 @@ export function DashboardSummary({
         <MetricCard
           icon={<Users size={19} />}
           label="Agents online"
-          value={`${state.agents?.active ?? active} / ${state.agents?.maximum ?? 0}`}
+          value={`${activeAgents} / ${state.agents?.maximum ?? 0}`}
           detail={
             <>
-              <span className="success-text">{active} working</span>
+              <span className="success-text">{activeAgents} working</span>
               <i />
               {state.agents?.queued ?? 0} queued
+              {postprocessing > 0 && (
+                <>
+                  <i />
+                  {postprocessing} postprocessing
+                </>
+              )}
             </>
           }
           accent="var(--cyan)"
