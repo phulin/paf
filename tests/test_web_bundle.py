@@ -13,14 +13,20 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def copy_bundle_fixture(tmp_path: Path) -> Path:
     shutil.copytree(ROOT / "web", tmp_path / "web", ignore=shutil.ignore_patterns("node_modules"))
-    shutil.copytree(ROOT / "src" / "paf" / "web_dist", tmp_path / "src" / "paf" / "web_dist")
+    output = tmp_path / "src" / "paf" / "web_dist"
+    assets = output / "assets"
+    assets.mkdir(parents=True)
+    (output / "index.html").write_text('<main id="root"></main>\n', encoding="utf-8")
+    (assets / "index-12345678.js").write_text("export {};\n", encoding="utf-8")
+    web_bundle.write_manifest(tmp_path)
     return tmp_path
 
 
-def test_committed_web_bundle_is_fresh_and_hashed() -> None:
-    web_bundle.check(ROOT)
+def test_generated_web_bundle_is_fresh_and_hashed(tmp_path: Path) -> None:
+    root = copy_bundle_fixture(tmp_path)
+    web_bundle.check(root)
     manifest = json.loads(
-        (ROOT / "src" / "paf" / "web_dist" / web_bundle.MANIFEST_NAME).read_text()
+        (root / "src" / "paf" / "web_dist" / web_bundle.MANIFEST_NAME).read_text()
     )
 
     assert "index.html" in manifest["files"]

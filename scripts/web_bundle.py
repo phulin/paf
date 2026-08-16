@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build or validate the committed PAF web bundle.
+"""Build or validate the locally generated PAF web bundle.
 
 The check deliberately uses content hashes, not mtimes. Git does not preserve
 mtimes, while a content manifest gives the same answer in every checkout and
@@ -33,7 +33,7 @@ WEB_CONFIG_FILES = (
 
 
 class BundleError(RuntimeError):
-    """A committed bundle is absent, corrupt, or stale."""
+    """A generated bundle is absent, corrupt, or stale."""
 
 
 def sha256(path: Path) -> str:
@@ -114,7 +114,7 @@ def load_manifest(root: Path) -> dict[str, Any]:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError as error:
-        raise BundleError(f"committed frontend manifest is missing: {path}") from error
+        raise BundleError(f"generated frontend manifest is missing: {path}") from error
     except json.JSONDecodeError as error:
         raise BundleError(f"invalid frontend manifest: {error}") from error
     if not isinstance(value, dict):
@@ -159,9 +159,9 @@ def check(root: Path) -> None:
     if problems:
         details = "\n".join(f"  - {problem}" for problem in problems)
         raise BundleError(
-            "committed frontend bundle is stale or corrupt:\n"
+            "generated frontend bundle is stale or corrupt:\n"
             f"{details}\n"
-            "Run `python scripts/web_bundle.py build` and commit src/paf/web_dist/."
+            "Run `python scripts/web_bundle.py build` to regenerate src/paf/web_dist/."
         )
 
 

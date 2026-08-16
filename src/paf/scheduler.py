@@ -294,6 +294,7 @@ class Orchestrator:
         work_units: Iterable[WorkUnitLike] | None = None,
         chapters: Iterable[WorkUnitLike] | None = None,
         force: bool = False,
+        resume_agents: bool = False,
         control: RunControl | None = None,
     ) -> None:
         self.config = config
@@ -303,8 +304,9 @@ class Orchestrator:
         selected_units = work_units if work_units is not None else chapters
         self.work_units = tuple(selected_units if selected_units is not None else config.work_units)
         self.force = force
+        self.resume_agents = resume_agents
         self.control = control or RunControl()
-        self.executor = CodexExecutor(config, state)
+        self.executor = CodexExecutor(config, state, resume_agents=resume_agents)
         self.isolation = create_isolation(config.settings)
         self.git = GitCommitter(config.settings.repo)
         self.state.isolation = {
@@ -366,6 +368,7 @@ class Orchestrator:
 
     async def prepare(self) -> None:
         await self.state.load_or_create()
+        await self.state.requeue_interrupted(resume_agents=self.resume_agents)
         self.scaffold()
         await self._recover_upstream_requests()
         migrated = await self.state.migrate_post_review_fixups()
@@ -949,7 +952,11 @@ class Orchestrator:
                     )
                 await self.state.finish_run(
                     run,
-                    status=TaskStatus.FAILED,
+                    status=(
+                        TaskStatus.INTERRUPTED
+                        if isinstance(error, asyncio.CancelledError)
+                        else TaskStatus.FAILED
+                    ),
                     isolation=failure_isolation
                     or {
                         "accepted": False,

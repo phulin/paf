@@ -30,8 +30,9 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build]
-# These non-Python resources are runtime inputs. Listing them as artifacts makes
-# their inclusion explicit even if a future build exclude becomes broader.
+# These non-Python resources are runtime inputs. The ignored frontend bundle is
+# generated before a release build; listing it as an artifact includes it in
+# wheels and source distributions without committing it to Git.
 artifacts = [
   "src/paf/prompts/*.md",
   "src/paf/web_dist/**",

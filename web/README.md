@@ -32,9 +32,10 @@ npm run preview
 
 `release:bundle` runs the production build into `src/paf/web_dist/`, records SHA-256 digests for
 all frontend sources, TypeScript/Vite configuration, npm metadata, and generated files, then checks
-the result. Commit that directory with any frontend change. `check:bundle` is a deterministic,
-Node-free freshness check suitable for CI. It fails when an input is added, removed, or changed, or
-when the committed bundle is missing, edited, or contains an unhashed asset.
+the result. That output directory is ignored and must not be committed. `check:bundle` is a
+deterministic, Node-free freshness check suitable after a local or CI build. It fails when an input
+is added, removed, or changed, or when the generated bundle is missing, edited, or contains an
+unhashed asset.
 
-Node and npm are contributor-only requirements. The Python wheel and sdist contain the already
-built UI and do not run npm during installation.
+Node and npm are contributor and release-build requirements. The Python wheel and sdist contain the
+already built UI and do not run npm during installation.

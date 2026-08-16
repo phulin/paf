@@ -101,6 +101,7 @@ STATUS_MARKS = {
     TaskStatus.SUCCEEDED: "✓ done",
     TaskStatus.FAILED: "✗ failed",
     TaskStatus.BLOCKED: "! blocked",
+    TaskStatus.INTERRUPTED: "Ⅱ interrupted",
 }
 
 BOOK_ID = re.compile(r"^book(?P<number>\d+)$", re.IGNORECASE)
@@ -202,6 +203,7 @@ def run_tab_label(run: RunRecord, step: int) -> str:
         TaskStatus.SUCCEEDED: "✓",
         TaskStatus.FAILED: "✗",
         TaskStatus.BLOCKED: "!",
+        TaskStatus.INTERRUPTED: "Ⅱ",
         TaskStatus.PENDING: "·",
     }
     mark = marks.get(TaskStatus(run.status), "·")
@@ -1034,7 +1036,8 @@ class SwarmApp(App[bool]):
                 f"building {building}\n"
                 f"✓ {counts['succeeded']}  "
                 f"✗ {counts['failed']}  · {counts['pending']} pending  "
-                f"· {counts['queued']} queued  ! {counts['blocked']}",
+                f"· {counts['queued']} queued  ! {counts['blocked']}  "
+                f"Ⅱ {counts['interrupted']}",
             )
         table: DataTable[Any] = self.query_one("#tasks", DataTable)
         for chapter in self.work_units:

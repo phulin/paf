@@ -734,9 +734,16 @@ async def _tail_rollout_usage(
 
 
 class CodexExecutor:
-    def __init__(self, config: PipelineConfig, state: StateStore) -> None:
+    def __init__(
+        self,
+        config: PipelineConfig,
+        state: StateStore,
+        *,
+        resume_agents: bool = False,
+    ) -> None:
         self.config = config
         self.state = state
+        self.resume_agents = resume_agents
         self.schema_path = config.settings.state_dir / "agent-report.schema.json"
 
     async def prepare(self) -> None:
@@ -1062,7 +1069,22 @@ whole-file diagnostics in import order; do not prepare every file separately.
         log_path = self.state.logs_dir / f"{run.id}.jsonl"
         usage = TokenUsage()
         report: dict[str, Any] = {}
-        thread_id: str | None = None
+        resumable_run = next(
+            (
+                prior
+                for prior in reversed(self.state.task(run.chapter_id, stage).runs)
+                if prior.id != run.id
+                and prior.status == TaskStatus.INTERRUPTED
+                and prior.thread_id
+                and (prior.role or prior.stage) == (run.role or run.stage)
+                and prior.request_ids == run.request_ids
+            ),
+            None,
+        )
+        thread_id = resumable_run.thread_id if self.resume_agents and resumable_run else None
+        interrupted_resume = thread_id is not None
+        if thread_id is not None:
+            await self.state.update_run(run, thread_id=thread_id)
         invocation_error = ""
         fatal_invocation_failure = False
         activity = self.state.activities.start(run.id, chapter.id, run.role or stage.value)
@@ -1229,6 +1251,7 @@ whole-file diagnostics in import order; do not prepare every file separately.
             return exit_code, timed_out, capacity_failure, fd_pressure
 
         resume_attempt = 0
+        invocation_count = 0
         capacity_retries = 0
         fd_recycles = 0
         capacity_failure = False
@@ -1239,7 +1262,7 @@ whole-file diagnostics in import order; do not prepare every file separately.
                     timed_out = True
                     exit_code = 124
                     break
-                if resume_attempt:
+                if interrupted_resume or resume_attempt:
                     assert thread_id is not None
                     command = self.command(
                         stage,
@@ -1258,8 +1281,23 @@ whole-file diagnostics in import order; do not prepare every file separately.
                     )
                     input_text = prompt
                 exit_code, timed_out, capacity_failure, fd_pressure = await invoke(
-                    command, input_text, append_log=bool(resume_attempt)
+                    command, input_text, append_log=bool(invocation_count)
                 )
+                invocation_count += 1
+                if interrupted_resume:
+                    interrupted_resume = False
+                    if exit_code != 0 and not timed_out:
+                        activity.retry(
+                            f"could not resume Codex session {thread_id}; starting a new agent"
+                        )
+                        self.state.activities.save(activity)
+                        thread_id = None
+                        report = {}
+                        invocation_error = ""
+                        fatal_invocation_failure = False
+                        capacity_failure = False
+                        await self.state.update_run(run, thread_id=None)
+                        continue
                 if exit_code == 0 or thread_id is None:
                     break
                 if fd_pressure:
@@ -1303,7 +1341,12 @@ whole-file diagnostics in import order; do not prepare every file separately.
             await stop_usage_monitor()
             activity.finish("cancelled", "agent cancelled by orchestrator")
             self.state.activities.save(activity)
-            await self.state.update_run(run, usage=usage)
+            await self.state.finish_run(
+                run,
+                status=TaskStatus.INTERRUPTED,
+                usage=usage,
+                thread_id=thread_id,
+            )
             raise
         finally:
             await stop_usage_monitor()

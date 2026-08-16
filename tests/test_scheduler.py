@@ -474,9 +474,9 @@ async def test_interrupted_runs_leave_requests_at_last_completed_fact(tmp_path: 
     assert recovered.upstream_requests[retry_id]["status"] == UpstreamRequestStatus.ANSWERED
     assert recovered.upstream_request_batches() == {owner.id: [repair_id]}
     assert recovered.task(owner.id, Stage.PROVE).runs[-1].id == repair_run.id
-    assert recovered.task(owner.id, Stage.PROVE).runs[-1].status == TaskStatus.FAILED
+    assert recovered.task(owner.id, Stage.PROVE).runs[-1].status == TaskStatus.INTERRUPTED
     assert recovered.task(consumer.id, Stage.PROVE).runs[-1].id == retry_run.id
-    assert recovered.task(consumer.id, Stage.PROVE).runs[-1].status == TaskStatus.FAILED
+    assert recovered.task(consumer.id, Stage.PROVE).runs[-1].status == TaskStatus.INTERRUPTED
     await recovered.close()
 
 
@@ -608,13 +608,13 @@ async def test_state_recovers_orphan_run_even_when_task_is_not_running(tmp_path:
 
     recovered_run = recovered.task(chapter.id, Stage.FORMALIZE).runs[-1]
     assert recovered_run.id == run.id
-    assert recovered_run.status == TaskStatus.FAILED
+    assert recovered_run.status == TaskStatus.INTERRUPTED
     assert recovered_run.finished_at is not None
     assert recovered.agent_summary()["active"] == 0
 
 
 @pytest.mark.asyncio
-async def test_interrupted_review_is_requeued(tmp_path: Path) -> None:
+async def test_interrupted_review_persists_until_startup_requeues_it(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
     chapter = config.chapters[0]
     state = StateStore(config)
@@ -626,8 +626,50 @@ async def test_interrupted_review_is_requeued(tmp_path: Path) -> None:
     await recovered.load_or_create()
     task = recovered.task(chapter.id, Stage.REVIEW)
 
+    assert task.status == TaskStatus.INTERRUPTED
+    assert task.detail == "agent interrupted with the orchestrator"
+
+    await recovered.set_task(
+        chapter.id,
+        Stage.REVIEW,
+        TaskStatus.BLOCKED,
+        "blocked by cancellation fallout",
+    )
+
+    assert task.status == TaskStatus.INTERRUPTED
+    assert task.detail == "agent interrupted with the orchestrator"
+
+    changed = await recovered.requeue_interrupted(resume_agents=True)
+
+    assert changed == [f"{chapter.id}:review"]
     assert task.status == TaskStatus.PENDING
-    assert task.detail == "recovered after interrupted orchestrator"
+    assert task.detail == "interrupted agent queued for session resume"
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_requeues_interrupted_tasks_for_fresh_retry_by_default(
+    tmp_path: Path,
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = config.chapters[0]
+    state = StateStore(config)
+    await state.load_or_create()
+    run = await state.start_run(chapter.id, Stage.REVIEW)
+    await state.finish_run(
+        run,
+        status=TaskStatus.INTERRUPTED,
+        thread_id="saved-but-not-requested",
+    )
+    await state.close()
+
+    orchestrator = Orchestrator(config, StateStore(config))
+    await orchestrator.prepare()
+
+    task = orchestrator.state.task(chapter.id, Stage.REVIEW)
+    assert task.status == TaskStatus.PENDING
+    assert task.detail == "interrupted agent queued for a fresh retry"
+    assert orchestrator.executor.resume_agents is False
+    await orchestrator.shutdown()
 
 
 @pytest.mark.asyncio
@@ -714,8 +756,8 @@ async def test_recovering_interrupted_run_preserves_lazy_payload(tmp_path: Path)
     recovered_task = recovered.task(config.chapters[0].id, Stage.REVIEW)
     recovered_run = recovered_task.runs[-1]
 
-    assert recovered_task.status == TaskStatus.PENDING
-    assert recovered_run.status == TaskStatus.FAILED
+    assert recovered_task.status == TaskStatus.INTERRUPTED
+    assert recovered_run.status == TaskStatus.INTERRUPTED
     assert recovered_run.report is None
     recovered.load_run_details(recovered_run)
     assert recovered_run.report == {"summary": "preserve me", "issues": []}
@@ -2634,9 +2676,9 @@ async def test_fixup_cancellation_releases_shared_source_lock(
     assert not orchestrator.source_lock.locked()
     assert orchestrator.agent_slots.available == orchestrator.agent_slots.capacity
     fixup = orchestrator.state.task(chapter.id, Stage.FORMALIZE)
-    assert fixup.status == TaskStatus.PENDING
-    assert fixup.detail == "fixup agent interrupted; requeued"
-    assert fixup.runs[-1].status == TaskStatus.FAILED
+    assert fixup.status == TaskStatus.INTERRUPTED
+    assert fixup.detail == "agent interrupted with the orchestrator"
+    assert fixup.runs[-1].status == TaskStatus.INTERRUPTED
     assert fixup.runs[-1].finished_at is not None
     assert orchestrator.state.agent_summary()["active"] == 0
     await orchestrator.shutdown()
@@ -2731,8 +2773,9 @@ async def test_requested_stop_integrates_partial_fixup_workspace(
         "def partialFixup := 1\n"
     )
     fixup = orchestrator.state.task(chapter.id, Stage.FORMALIZE)
-    assert fixup.status == TaskStatus.PENDING
-    assert fixup.detail == "fixup agent interrupted; partial changes integrated; requeued"
+    assert fixup.status == TaskStatus.INTERRUPTED
+    assert fixup.detail == "agent interrupted with the orchestrator"
+    assert fixup.runs[-1].status == TaskStatus.INTERRUPTED
     assert fixup.runs[-1].isolation is not None
     assert fixup.runs[-1].isolation["accepted"] is True
     assert fixup.runs[-1].isolation["interrupted"] is True

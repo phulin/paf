@@ -161,6 +161,11 @@ After the configured retries are exhausted, that stage fails instead of creating
 of fresh attempts. A failed chapter does not cancel unrelated formalizers; the pipeline finishes the
 remaining drafting work before reporting failure.
 
+Pass `--resume` to `pipeline`, `stage`, `corpus`, `agent start`, or `agent serve` to continue work
+interrupted by an earlier orchestrator shutdown in its saved Codex sessions. Every restart requeues
+interrupted tasks; without `--resume`, they start fresh agents. With `--resume`, the coordinator first
+tries each saved session id and transparently starts a fresh agent if Codex can no longer resume it.
+
 ## Commands
 
 Inspect discovery and configuration without launching agents:
@@ -190,7 +195,12 @@ Run the complete pipeline:
 ```console
 uv run paf pipeline books/02-finite-extensions-of-local-fields.md
 uv run paf corpus books/ --max-agents 24
+uv run paf corpus books/ --target lean/Stacks/
 ```
+
+For a zero-config corpus, `--target` selects the generated Lean namespace root. PAF locates the
+enclosing Lake project and derives the module prefix from the target path, so the last command
+above writes inferred book modules beneath `lean/Stacks/` with the `Stacks` namespace.
 
 The TUI is the default for stage and pipeline runs. Add `--no-tui` for CI, a process supervisor, or
 log-only operation. Add `--force` to rerun tasks already persisted as successful. Without `--force`,
@@ -230,7 +240,7 @@ agent/build diagnostics, blocked dependents, and persisted state path to standar
 ## Frontend release bundle
 
 Node is needed only by contributors rebuilding the React app. After changing `web/src`, frontend
-configuration, or npm package metadata, prepare and verify the committed package assets with:
+configuration, or npm package metadata, prepare and verify the package assets with:
 
 ```console
 cd web
@@ -240,10 +250,10 @@ cd ..
 python scripts/web_bundle.py check
 ```
 
-The release command writes content-hashed assets and a content manifest under
-`src/paf/web_dist/`. The check compares SHA-256 digests rather than filesystem mtimes, so it detects
-stale sources and edited build output consistently in fresh Git checkouts. To validate package
-contents during release preparation:
+The release command writes content-hashed assets and a content manifest under the ignored
+`src/paf/web_dist/` directory. Generated frontend files are not committed to Git. The check compares
+SHA-256 digests rather than filesystem mtimes, so it detects stale sources and edited build output.
+Build the bundle before creating a wheel or source distribution, then validate the package contents:
 
 ```console
 uv build
@@ -449,8 +459,8 @@ The dashboard shows:
 - the live-agent total against `max_agents`, broken down by stage;
 - the active coordinator build's mode, stage, iteration, target progress, current chapter, owner, and
   queued build count;
-- aggregate `pending`, `queued`, `running`, `succeeded`, `failed`, and `blocked` chapter counts for
-  discover, formalize, review, and prove;
+- aggregate `pending`, `queued`, `running`, `succeeded`, `failed`, `blocked`, and `interrupted`
+  chapter counts for discover, formalize, review, and prove;
 - each chapter's status and attempt count in every stage, plus independent exact-build freshness;
 - per-chapter tokens for the current invocation;
 - statement/proof critical-path ranks and the current statement critical path;
@@ -514,7 +524,8 @@ before its workspace is acquired or Codex is launched. Each run records its PID,
 stage, round, timestamps, scoped-change result, placeholder count, final report, validation tail, and
 usage. Concurrent mutations coalesce into one SQLite transaction, coordinator transitions use
 explicit state batches, and JSON/database work runs off the TUI event loop. Task records persist one
-status (`pending`, `running`, `succeeded`, `failed`, or `blocked`) plus a short detail describing what
+status (`pending`, `running`, `succeeded`, `failed`, `blocked`, or `interrupted`) plus a short detail
+describing what
 a running or pending task is doing. A transient `queued` marker distinguishes runnable pending stages
 that are waiting for an agent slot, and both the TUI and web dashboard label them accordingly.
 Statement repair requests are checkpointed before entering the
@@ -532,9 +543,13 @@ freshness independently of whether a past formalize task succeeded. A coordinato
 single serialized Lake build, and the TUI also shows its owner and queued jobs. Running run records—not
 chapter-stage records—are the authoritative live-agent count.
 
-Press `q` in the TUI or interrupt a headless run to terminate the active child process group. On the
-next invocation, interrupted `running` records become `pending` and can resume. Successful records
-remain skipped unless `--force` is given. The TUI drains its workers and unmounts their overlays
+Press `q` in the TUI or interrupt a headless run to terminate the active child process group. Active
+runs and their tasks become `interrupted`, never `failed` or dependency-propagated `blocked`, and
+retain the Codex session id observed before shutdown. The next invocation resets those tasks to
+`pending` and starts fresh agents by default. With `--resume`, it instead tries the saved sessions and
+falls back to fresh agents when a session is no longer available. Successful records remain skipped
+unless `--force` is given. The TUI drains its
+workers and unmounts their overlays
 before exiting. Shutdown waits briefly for the complete Codex process group and force-terminates
 surviving MCP/LSP descendants before unmounting; the next invocation also reclaims any mounts left
 by a hard-killed orchestrator.

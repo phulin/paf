@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import shlex
 import tomllib
 from dataclasses import replace
 from hashlib import sha256
@@ -10,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from paf.adapters import LatexAdapter, MarkdownAdapter, TextAdapter, format_for_path
-from paf.backends import LeanBackend, lean_backend_from_config
+from paf.backends import LeanBackend, TargetTemplates, lean_backend_from_config
 from paf.corpus import build_corpus_schedule
 from paf.models import (
     BookConfig,
@@ -782,10 +783,50 @@ def parse_book_dependencies(path: str | Path) -> dict[str, tuple[str, ...]]:
     return {key: tuple(sorted(value)) for key, value in dependencies.items()}
 
 
+def _inferred_target_backend(repo: Path, output_target: str | Path) -> tuple[LeanBackend, Path]:
+    target = Path(output_target).expanduser()
+    target = target.resolve() if target.is_absolute() else (Path.cwd() / target).resolve()
+    try:
+        target_root = target.relative_to(repo)
+    except ValueError as error:
+        raise ValueError("--target must be inside the inferred repository") from error
+    if target_root == Path("."):
+        raise ValueError("--target must name a directory inside the inferred repository")
+
+    project = None
+    for candidate in (target, *target.parents):
+        if not candidate.is_relative_to(repo):
+            break
+        if (candidate / "lakefile.toml").is_file() or (candidate / "lakefile.lean").is_file():
+            project = candidate
+            break
+        if candidate == repo:
+            break
+    if project is None:
+        project = repo / target_root.parts[0]
+
+    project_path = project.relative_to(repo)
+    namespace_path = target.relative_to(project)
+    namespace = ".".join(_pascal_case(part) for part in namespace_path.parts)
+    if not namespace:
+        namespace = _pascal_case(target.name)
+    project_command = shlex.quote(project_path.as_posix())
+    backend = LeanBackend(
+        project=project_path,
+        templates=TargetTemplates(
+            root=target_root.as_posix(),
+            module=namespace,
+            build_command=f"cd {project_command} && lake build +{{unit_module}}",
+        ),
+    )
+    return backend, target_root
+
+
 def infer_corpus(
     targets: tuple[str | Path, ...],
     *,
     dependency_file: str | Path | None = None,
+    output_target: str | Path | None = None,
     project: Project | None = None,
 ) -> PipelineConfig:
     project = project or ProjectResolver().resolve(targets=targets)
@@ -828,16 +869,35 @@ def infer_corpus(
         replace(book, depends_on=tuple(item for item in graph.get(book.id, ()) if item in selected))
         for book in books
     )
+    backend: LeanBackend
+    if output_target is None:
+        backend = LeanBackend()
+    else:
+        backend, target_root = _inferred_target_backend(repo, output_target)
+        module_root = backend.templates.module
+        project_command = shlex.quote(backend.project.as_posix())
+        books = tuple(
+            replace(
+                book,
+                lean_root=target_root / book.lean_root.name,
+                module=f"{module_root}.{book.lean_root.name}",
+                build_command=f"cd {project_command} && lake build +{{chapter_module}}",
+            )
+            for book in books
+        )
     chapters = tuple(chapter for book in books for chapter in _discover_chapters(repo, book))
     identity = "\n".join(
         sorted(source_path.relative_to(repo).as_posix() for source_path in source_paths)
     )
+    if output_target is not None:
+        identity += f"\ntarget={backend.templates.root}"
     corpus_id = sha256(identity.encode()).hexdigest()[:10]
     settings = SwarmSettings(
         repo=repo,
         state_dir=repo / ".paf" / f"corpus-{corpus_id}",
         model="gpt-5.6-luna",
         reasoning_effort="max",
+        lean_project=backend.project,
     )
     config = PipelineConfig(
         path=graph_path or repo,
@@ -847,8 +907,8 @@ def infer_corpus(
         chapters=chapters,
         source_roots=tuple(Path(target).resolve().relative_to(repo) for target in targets),
         source_include=DEFAULT_INCLUDES,
-        backend=LeanBackend(
-            project=settings.lean_project,
+        backend=replace(
+            backend,
             mcp_tool_timeout_seconds=settings.lean_mcp_tool_timeout_seconds,
         ),
         project=project.bind(

@@ -1,5 +1,11 @@
 export type Stage = "discover" | "formalize" | "review" | "prove";
-export type TaskStatus = "pending" | "running" | "succeeded" | "failed" | "blocked";
+export type TaskStatus =
+  | "pending"
+  | "running"
+  | "succeeded"
+  | "failed"
+  | "blocked"
+  | "interrupted";
 
 export interface Task {
   work_unit_id: string;

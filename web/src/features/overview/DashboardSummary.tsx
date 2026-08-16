@@ -39,7 +39,8 @@ function StageCard({ stage, tasks }: { stage: Stage; tasks: Task[] }) {
   const running = tasks.filter((task) => task.status === "running").length;
   const queued = tasks.filter((task) => task.queued).length;
   const failed = tasks.filter(
-    (task) => task.status === "failed" || task.status === "blocked",
+    (task) =>
+      task.status === "failed" || task.status === "blocked" || task.status === "interrupted",
   ).length;
   const percentage = tasks.length ? Math.round((100 * succeeded) / tasks.length) : 0;
   const stageColors: Record<Stage, string> = {
@@ -85,7 +86,8 @@ export function DashboardSummary({
   const chaptersDone = rows.filter((row) => row.stages.prove?.status === "succeeded").length;
   const active = tasks.filter((task) => task.status === "running").length;
   const failed = tasks.filter(
-    (task) => task.status === "failed" || task.status === "blocked",
+    (task) =>
+      task.status === "failed" || task.status === "blocked" || task.status === "interrupted",
   ).length;
   const completion = tasks.length ? Math.round((100 * successful) / tasks.length) : 0;
 

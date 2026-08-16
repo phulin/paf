@@ -31,6 +31,7 @@ class TaskStatus(StrEnum):
     SUCCEEDED = "succeeded"
     FAILED = "failed"
     BLOCKED = "blocked"
+    INTERRUPTED = "interrupted"
 
 
 class UpstreamRequestStatus(StrEnum):
@@ -462,12 +463,12 @@ class StateStore:
         for task in self.tasks.values():
             for run in task.runs:
                 if run.status == TaskStatus.RUNNING:
-                    run.status = TaskStatus.FAILED
+                    run.status = TaskStatus.INTERRUPTED
                     run.finished_at = timestamp()
                     recovered_runs.append(run)
             if task.status == TaskStatus.RUNNING:
-                task.status = TaskStatus.PENDING
-                task.detail = "recovered after interrupted orchestrator"
+                task.status = TaskStatus.INTERRUPTED
+                task.detail = "agent interrupted with the orchestrator"
             if task.queued:
                 task.queued = False
                 task.detail = "recovered after interrupted orchestrator"
@@ -1365,6 +1366,11 @@ class StateStore:
         queued: bool = False,
     ) -> None:
         task = self.task(chapter_id, stage)
+        if task.status == TaskStatus.INTERRUPTED and status not in (
+            TaskStatus.RUNNING,
+            TaskStatus.SUCCEEDED,
+        ):
+            return
         if (
             stage is Stage.FORMALIZE
             and status != TaskStatus.SUCCEEDED
@@ -1406,6 +1412,11 @@ class StateStore:
             if key not in self.tasks:
                 continue
             task = self.tasks[key]
+            if task.status == TaskStatus.INTERRUPTED and status not in (
+                TaskStatus.RUNNING,
+                TaskStatus.SUCCEEDED,
+            ):
+                continue
             task_status = status
             task_detail = detail
             if (
@@ -1453,6 +1464,30 @@ class StateStore:
             task.updated_at = timestamp()
             changed.append(key)
         await self.reopen_escalated_upstream_requests(proof_chapters)
+        if changed:
+            self._invalidate_status_summaries()
+            self._mark_dirty()
+            await self._persist()
+        return changed
+
+    async def requeue_interrupted(self, *, resume_agents: bool) -> list[str]:
+        """Requeue interrupted tasks while retaining their optional session history."""
+
+        changed: list[str] = []
+        for key, task in self.tasks.items():
+            if task.status != TaskStatus.INTERRUPTED:
+                continue
+            task.status = TaskStatus.PENDING
+            task.queued = False
+            if task.stage == Stage.PROVE:
+                task.source_digest = None
+            task.detail = (
+                "interrupted agent queued for session resume"
+                if resume_agents
+                else "interrupted agent queued for a fresh retry"
+            )
+            task.updated_at = timestamp()
+            changed.append(key)
         if changed:
             self._invalidate_status_summaries()
             self._mark_dirty()
@@ -1545,6 +1580,8 @@ class StateStore:
             await self._persist()
 
     async def finish_run(self, run: RunRecord, *, status: TaskStatus, **changes: Any) -> None:
+        if run.status == TaskStatus.INTERRUPTED and status != TaskStatus.SUCCEEDED:
+            status = TaskStatus.INTERRUPTED
         run.status = status
         run.finished_at = timestamp()
         for name, value in changes.items():
@@ -1558,6 +1595,14 @@ class StateStore:
         self._invalidate_aggregates()
         self._invalidate_status_summaries()
         self._mark_dirty(run=run, issues=bool(issue_ids))
+        if status == TaskStatus.INTERRUPTED and not run.auxiliary:
+            task = self.task(run.chapter_id, Stage(run.stage))
+            task.status = TaskStatus.INTERRUPTED
+            task.queued = False
+            if task.stage == Stage.PROVE:
+                task.source_digest = None
+            task.detail = "agent interrupted with the orchestrator"
+            task.updated_at = timestamp()
         await self._persist()
 
     async def start_coordinator_build(

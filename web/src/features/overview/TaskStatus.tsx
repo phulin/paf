@@ -1,4 +1,11 @@
-import { AlertTriangle, CheckCircle2, CircleDashed, Play, XCircle } from "lucide-react";
+import {
+  AlertTriangle,
+  CheckCircle2,
+  CircleDashed,
+  PauseCircle,
+  Play,
+  XCircle,
+} from "lucide-react";
 import { compactTaskDetail, timeAgo } from "../../lib/format";
 import type { AgentActivity, Task, TaskStatus } from "../../types";
 
@@ -12,6 +19,8 @@ function StatusIcon({ status }: { status?: TaskStatus }) {
       return <XCircle size={14} />;
     case "blocked":
       return <AlertTriangle size={14} />;
+    case "interrupted":
+      return <PauseCircle size={14} />;
     default:
       return <CircleDashed size={14} />;
   }

@@ -35,7 +35,7 @@ from paf.codex import (
 )
 from paf.config import load_config
 from paf.models import Stage
-from paf.state import StateStore, TokenUsage
+from paf.state import StateStore, TaskStatus, TokenUsage
 from paf.state_db import read_full_snapshot
 from tests.support import write_project
 
@@ -1160,11 +1160,112 @@ time.sleep(60)
     activity = state.activities.get(run.id)
     assert activity is not None
     assert activity.current == "agent cancelled"
+    assert run.status == TaskStatus.INTERRUPTED
+    assert run.thread_id == "visible-now"
+    assert state.task(run.chapter_id, Stage.REVIEW).status == TaskStatus.INTERRUPTED
     reloaded = read_full_snapshot(config.settings.state_dir)
     assert reloaded is not None
     persisted = reloaded["tasks"][f"{run.chapter_id}:review"]["runs"][-1]["usage"]
     assert persisted["input_tokens"] == 100
     assert persisted["output_tokens"] == 25
+
+
+@pytest.mark.asyncio
+async def test_executor_resumes_interrupted_session(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    invocations_path = tmp_path / "resume-invocations.jsonl"
+    fake_codex = tmp_path / "resume-codex"
+    fake_codex.write_text(
+        f"""#!/usr/bin/env python3
+import json
+import sys
+from pathlib import Path
+
+prompt = sys.stdin.read()
+with Path({str(invocations_path)!r}).open("a", encoding="utf-8") as handle:
+    handle.write(json.dumps({{"args": sys.argv[1:], "prompt": prompt}}) + "\\n")
+report = {{"changed": False, "complete": True,
+          "summary": "resumed interrupted work", "issues": []}}
+print(json.dumps({{"type": "thread.started", "thread_id": "saved-session"}}))
+print(json.dumps({{"type": "item.completed", "item": {{
+    "type": "agent_message", "text": json.dumps(report)}}}}))
+""",
+        encoding="utf-8",
+    )
+    fake_codex.chmod(0o755)
+    config = replace(config, settings=replace(config.settings, codex_bin=str(fake_codex)))
+    state = StateStore(config)
+    await state.load_or_create()
+    interrupted = await state.start_run(config.chapters[0].id, Stage.REVIEW)
+    await state.finish_run(
+        interrupted,
+        status=TaskStatus.INTERRUPTED,
+        thread_id="saved-session",
+    )
+    await state.requeue_interrupted(resume_agents=True)
+    run = await state.start_run(config.chapters[0].id, Stage.REVIEW)
+    executor = CodexExecutor(config, state, resume_agents=True)
+    await executor.prepare()
+
+    result = await executor.run(config.chapters[0], Stage.REVIEW, run)
+
+    invocation = json.loads(invocations_path.read_text(encoding="utf-8"))
+    assert invocation["args"][:2] == ["exec", "resume"]
+    assert "saved-session" in invocation["args"]
+    assert "Continue from the interrupted turn" in invocation["prompt"]
+    assert result.succeeded
+    assert result.thread_id == "saved-session"
+
+
+@pytest.mark.asyncio
+async def test_executor_starts_new_agent_when_session_cannot_resume(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    invocations_path = tmp_path / "fallback-invocations.jsonl"
+    fake_codex = tmp_path / "fallback-codex"
+    fake_codex.write_text(
+        f"""#!/usr/bin/env python3
+import json
+import sys
+from pathlib import Path
+
+prompt = sys.stdin.read()
+with Path({str(invocations_path)!r}).open("a", encoding="utf-8") as handle:
+    handle.write(json.dumps({{"args": sys.argv[1:], "prompt": prompt}}) + "\\n")
+if "resume" in sys.argv:
+    print(json.dumps({{"type": "error", "message": "session not found"}}))
+    raise SystemExit(1)
+report = {{"changed": False, "complete": True,
+          "summary": "started replacement agent", "issues": []}}
+print(json.dumps({{"type": "thread.started", "thread_id": "replacement-session"}}))
+print(json.dumps({{"type": "item.completed", "item": {{
+    "type": "agent_message", "text": json.dumps(report)}}}}))
+""",
+        encoding="utf-8",
+    )
+    fake_codex.chmod(0o755)
+    config = replace(config, settings=replace(config.settings, codex_bin=str(fake_codex)))
+    state = StateStore(config)
+    await state.load_or_create()
+    interrupted = await state.start_run(config.chapters[0].id, Stage.REVIEW)
+    await state.finish_run(
+        interrupted,
+        status=TaskStatus.INTERRUPTED,
+        thread_id="missing-session",
+    )
+    await state.requeue_interrupted(resume_agents=True)
+    run = await state.start_run(config.chapters[0].id, Stage.REVIEW)
+    executor = CodexExecutor(config, state, resume_agents=True)
+    await executor.prepare()
+
+    result = await executor.run(config.chapters[0], Stage.REVIEW, run)
+
+    invocations = [json.loads(line) for line in invocations_path.read_text().splitlines()]
+    assert len(invocations) == 2
+    assert invocations[0]["args"][:2] == ["exec", "resume"]
+    assert invocations[1]["args"][0] == "exec"
+    assert "resume" not in invocations[1]["args"]
+    assert result.succeeded
+    assert result.thread_id == "replacement-session"
 
 
 @pytest.mark.asyncio

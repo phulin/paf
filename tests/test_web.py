@@ -14,6 +14,16 @@ from paf.state import StateStore
 from tests.support import write_project
 
 
+@pytest.fixture
+def static_dir(tmp_path: Path) -> Path:
+    root = tmp_path / "web-static"
+    assets = root / "assets"
+    assets.mkdir(parents=True)
+    (root / "index.html").write_text('<main id="root"></main>\n', encoding="utf-8")
+    (assets / "index-12345678.js").write_text("export {};\n", encoding="utf-8")
+    return root
+
+
 def _project(tmp_path: Path, *, external_state: Path | None = None):
     config_path = write_project(tmp_path, chapters="chapters = [1]")
     if external_state is not None:
@@ -33,14 +43,13 @@ def _project(tmp_path: Path, *, external_state: Path | None = None):
     return config
 
 
-def test_app_serves_packaged_assets_and_spa_fallback(tmp_path: Path) -> None:
+def test_app_serves_packaged_assets_and_spa_fallback(tmp_path: Path, static_dir: Path) -> None:
     config = _project(tmp_path)
-    with TestClient(web_module.create_app(config)) as client:
+    with TestClient(web_module.create_app(config, static_dir=static_dir)) as client:
         index = client.get("/")
         fallback = client.get("/statements/result")
-        static_root = Path(str(web_module.resources.files("paf").joinpath("web_dist")))
         asset_name = next(
-            path.relative_to(static_root).as_posix() for path in static_root.rglob("*.js")
+            path.relative_to(static_dir).as_posix() for path in static_dir.rglob("*.js")
         )
         asset = client.get(f"/{asset_name}")
 
@@ -51,11 +60,11 @@ def test_app_serves_packaged_assets_and_spa_fallback(tmp_path: Path) -> None:
         assert client.get("/assets/missing-deadbeef.js").status_code == 404
 
 
-def test_state_list_snapshot_and_system_contracts(tmp_path: Path) -> None:
+def test_state_list_snapshot_and_system_contracts(tmp_path: Path, static_dir: Path) -> None:
     config = _project(tmp_path)
     asyncio.run(StateStore(config).load_or_create())
 
-    with TestClient(web_module.create_app(config)) as client:
+    with TestClient(web_module.create_app(config, static_dir=static_dir)) as client:
         listing = client.get("/api/swarms")
         alias = client.get("/api/runs")
         assert listing.status_code == alias.status_code == 200
@@ -76,7 +85,7 @@ def test_state_list_snapshot_and_system_contracts(tmp_path: Path) -> None:
         assert 0 <= system["memory_percent"] <= 100
 
 
-def test_external_state_directory_is_the_only_state_root(tmp_path: Path) -> None:
+def test_external_state_directory_is_the_only_state_root(tmp_path: Path, static_dir: Path) -> None:
     project = tmp_path / "project"
     project.mkdir()
     external = tmp_path / "state-elsewhere"
@@ -86,14 +95,16 @@ def test_external_state_directory_is_the_only_state_root(tmp_path: Path) -> None
     decoy.mkdir(parents=True)
     (decoy / "state.json").write_text('{"updated_at":"9999","tasks":{}}')
 
-    with TestClient(web_module.create_app(config)) as client:
+    with TestClient(web_module.create_app(config, static_dir=static_dir)) as client:
         summaries = client.get("/api/swarms").json()["swarms"]
         assert len(summaries) == 1
         assert summaries[0]["id"] == external.name
         assert client.get("/api/swarm").json()["project_root"] == str(project)
 
 
-def test_source_and_target_browsing_are_scoped_and_reject_escapes(tmp_path: Path) -> None:
+def test_source_and_target_browsing_are_scoped_and_reject_escapes(
+    tmp_path: Path, static_dir: Path
+) -> None:
     config = _project(tmp_path)
     secret = tmp_path / "secret.txt"
     secret.write_text("not configured source")
@@ -104,7 +115,7 @@ def test_source_and_target_browsing_are_scoped_and_reject_escapes(tmp_path: Path
     target_symlink = tmp_path / "lean" / "escape.txt"
     target_symlink.symlink_to(outside)
 
-    with TestClient(web_module.create_app(config)) as client:
+    with TestClient(web_module.create_app(config, static_dir=static_dir)) as client:
         root = client.get("/api/source")
         source = client.get("/api/source", params={"path": "books/book.md"})
         target = client.get(
@@ -131,9 +142,9 @@ def test_source_and_target_browsing_are_scoped_and_reject_escapes(tmp_path: Path
         assert client.get("/api/not-an-endpoint/extra").status_code == 404
 
 
-def test_declarations_preserve_frontend_filter_contract(tmp_path: Path) -> None:
+def test_declarations_preserve_frontend_filter_contract(tmp_path: Path, static_dir: Path) -> None:
     config = _project(tmp_path)
-    with TestClient(web_module.create_app(config)) as client:
+    with TestClient(web_module.create_app(config, static_dir=static_dir)) as client:
         response = client.get("/api/statements")
         assert response.status_code == 200
         payload = response.json()

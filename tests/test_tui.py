@@ -364,7 +364,8 @@ async def test_quit_integrates_partial_changes_from_active_isolated_agent(tmp_pa
     assert workspace.closed
     assert (config.settings.repo / relative).read_text(encoding="utf-8") == "def partial := 1\n"
     run = orchestrator.state.task(chapter.id, Stage.FORMALIZE).runs[-1]
-    assert run.status == TaskStatus.FAILED
+    assert run.status == TaskStatus.INTERRUPTED
+    assert orchestrator.state.task(chapter.id, Stage.FORMALIZE).status == TaskStatus.INTERRUPTED
     assert run.isolation is not None
     assert run.isolation["accepted"] is True
     assert run.isolation["interrupted"] is True

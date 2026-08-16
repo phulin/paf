@@ -120,6 +120,11 @@ def _add_run_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--force", action="store_true", help="rerun stages already marked successful"
     )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="resume interrupted Codex sessions, starting new agents when unavailable",
+    )
     parser.add_argument("--no-tui", action="store_true", help="run headlessly for automation")
 
 
@@ -190,10 +195,16 @@ def parser() -> argparse.ArgumentParser:
         "--dependencies",
         help="Mermaid book DAG; defaults to BOOK_DEPENDENCIES.md in the repository",
     )
+    corpus.add_argument(
+        "--target",
+        dest="output_target",
+        help="Lean output root for an inferred corpus (for example, lean/Stacks)",
+    )
     _add_overrides(corpus)
     corpus.add_argument("--book", action="append", default=[])
     corpus.add_argument("--chapter", action="append", default=[])
     corpus.add_argument("--force", action="store_true")
+    corpus.add_argument("--resume", action="store_true")
     corpus.add_argument("--no-tui", action="store_true")
 
     agent = commands.add_parser("agent", help="machine-friendly background pipeline control")
@@ -212,6 +223,7 @@ def parser() -> argparse.ArgumentParser:
             help="managed operation (default: pipeline)",
         )
         command.add_argument("--force", action="store_true")
+        command.add_argument("--resume", action="store_true")
     for name, help_text in (
         ("status", "return a compact JSON status"),
         ("snapshot", "return status plus the complete persisted state"),
@@ -250,6 +262,8 @@ def _config_from_args(args: argparse.Namespace) -> PipelineConfig:
         if args.config is not None:
             if args.targets:
                 raise ValueError("pass either --config or corpus targets, not both")
+            if args.output_target is not None:
+                raise ValueError("--target is only used with inferred corpus sources")
             config = resolve_config(
                 config=args.config,
                 target=None,
@@ -258,9 +272,14 @@ def _config_from_args(args: argparse.Namespace) -> PipelineConfig:
             )
         elif args.targets:
             config = infer_corpus(
-                tuple(args.targets), dependency_file=args.dependencies, project=project
+                tuple(args.targets),
+                dependency_file=args.dependencies,
+                output_target=args.output_target,
+                project=project,
             )
         else:
+            if args.output_target is not None:
+                raise ValueError("--target requires one or more corpus source paths")
             config = resolve_config(
                 config=None,
                 target=None,
@@ -512,6 +531,14 @@ def _print_failure_summary(
         ),
         key=lambda task: (task.book_id, task.chapter_number, task.stage),
     )
+    interrupted = sorted(
+        (
+            task
+            for task in state.tasks.values()
+            if selected(task) and task.status == TaskStatus.INTERRUPTED
+        ),
+        key=lambda task: (task.book_id, task.chapter_number, task.stage),
+    )
     console.print("\nFailure details", style="bold red")
     if graph_failure and graph_failed:
         console.print("- Coordinator [import graph]", style="bold red", markup=False)
@@ -531,7 +558,7 @@ def _print_failure_summary(
             for detail in _task_failure_details(state, task):
                 for line in detail.splitlines():
                     console.print(f"    {line}", markup=False)
-    elif not graph_failed:
+    elif not graph_failed and not interrupted:
         console.print("- No failed task detail was recorded.", markup=False)
 
     build = state.coordinator_build
@@ -547,6 +574,14 @@ def _print_failure_summary(
                 f"- {task.chapter_id} [{task.stage}]: {task.detail}",
                 markup=False,
             )
+    if interrupted:
+        console.print(f"Interrupted tasks ({len(interrupted)})", style="bold yellow")
+        for task in interrupted:
+            console.print(
+                f"- {task.chapter_id} [{task.stage}]: {task.detail}",
+                markup=False,
+            )
+        console.print("  Run again with --resume to continue saved Codex sessions.")
     console.print(f"State: {state.path}", markup=False)
 
 
@@ -656,7 +691,13 @@ def _run(args: argparse.Namespace, config: PipelineConfig, console: Console) -> 
         unit_selectors=args.chapter,
     )
     state = StateStore(config)
-    orchestrator = Orchestrator(config, state, work_units=chapters, force=args.force)
+    orchestrator = Orchestrator(
+        config,
+        state,
+        work_units=chapters,
+        force=args.force,
+        resume_agents=getattr(args, "resume", False),
+    )
     if args.command == "stage":
         stage = Stage(args.stage)
 
@@ -724,7 +765,13 @@ def _managed_operation(
 def _serve_agent(args: argparse.Namespace, config: PipelineConfig) -> int:
     chapters = select_work_units(config, document_ids=[], unit_selectors=[])
     state = StateStore(config)
-    orchestrator = Orchestrator(config, state, work_units=chapters, force=args.force)
+    orchestrator = Orchestrator(
+        config,
+        state,
+        work_units=chapters,
+        force=args.force,
+        resume_agents=getattr(args, "resume", False),
+    )
     operation = _managed_operation(orchestrator, args.stage)
     succeeded = asyncio.run(ControlServer(orchestrator, operation).run())
     return 0 if succeeded else 1
@@ -772,6 +819,8 @@ def _start_agent(args: argparse.Namespace, config: PipelineConfig) -> int:
     ]
     if args.force:
         command.append("--force")
+    if getattr(args, "resume", False):
+        command.append("--resume")
     log_path = state_dir / LOG_NAME
     log_handle = log_path.open("ab")
     try:

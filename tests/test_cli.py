@@ -17,6 +17,20 @@ from paf.state_db import read_full_snapshot
 from tests.support import write_project
 
 
+@pytest.mark.parametrize(
+    "arguments",
+    (
+        ["pipeline", "--resume"],
+        ["stage", "review", "--resume"],
+        ["corpus", "--resume"],
+        ["agent", "start", "--resume"],
+        ["agent", "serve", "--resume"],
+    ),
+)
+def test_worker_commands_accept_resume(arguments: list[str]) -> None:
+    assert cli_module.parser().parse_args(arguments).resume is True
+
+
 def test_failure_summary_prints_task_build_and_blocker_details(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
     state = StateStore(config)
@@ -506,3 +520,35 @@ def test_corpus_command_infers_a_directory_and_dependency_graph(
     config = captured["config"]
     assert isinstance(config, PipelineConfig)
     assert config.books[1].depends_on == ("book01",)
+
+
+def test_corpus_command_is_zero_config_with_an_explicit_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / ".git").mkdir()
+    books = tmp_path / "books"
+    books.mkdir()
+    (books / "01-foundation.md").write_text("# Foundation\n\n## 1. Start\n", encoding="utf-8")
+    lean = tmp_path / "lean"
+    lean.mkdir()
+    (lean / "lakefile.toml").write_text('name = "example"\n', encoding="utf-8")
+    captured: dict[str, object] = {}
+
+    def fake_run(_args: object, config: object, _console: object) -> int:
+        captured["config"] = config
+        return 0
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli_module, "_run", fake_run)
+
+    assert main(["corpus", "books/", "--target", "lean/Stacks/", "--no-tui"]) == 0
+    config = captured["config"]
+    assert isinstance(config, PipelineConfig)
+    assert config.settings.lean_project == Path("lean")
+    assert config.project is not None
+    assert config.project.target_dir == lean
+    unit = config.work_units[0]
+    assert unit.lean_root == Path("lean/Stacks/Book01Foundation")
+    assert unit.module == "Stacks.Book01Foundation"
+    assert unit.chapter_module == "Stacks.Book01Foundation.Chapter01"
+    assert unit.build_command == "cd lean && lake build +Stacks.Book01Foundation.Chapter01"
