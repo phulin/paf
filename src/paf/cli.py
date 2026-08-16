@@ -196,7 +196,10 @@ def parser() -> argparse.ArgumentParser:
     corpus.add_argument(
         "targets",
         nargs="*",
-        help=".md, .tex, and .txt files and/or recursively scanned directories",
+        help=(
+            ".md, .tex, and .txt files and/or recursively scanned directories; "
+            "used to discover paf.toml when present, inferred otherwise"
+        ),
     )
     corpus.add_argument(
         "--project",
@@ -286,6 +289,17 @@ def _config_from_args(args: argparse.Namespace) -> PipelineConfig:
                 config=args.config,
                 target=None,
                 dependency_file=args.dependencies,
+                project=project,
+            )
+        elif (
+            project.config_path is not None
+            and args.output_target is None
+            and args.dependencies is None
+        ):
+            config = resolve_config(
+                config=project.config_path,
+                target=None,
+                dependency_file=None,
                 project=project,
             )
         elif args.targets:

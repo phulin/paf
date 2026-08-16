@@ -630,6 +630,27 @@ def test_corpus_command_infers_a_directory_and_dependency_graph(
     assert config.books[1].depends_on == ("book01",)
 
 
+def test_corpus_command_uses_discovered_config_with_positional_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = write_project(tmp_path, chapters="chapters = [1]")
+    captured: dict[str, object] = {}
+
+    def fake_run(_args: object, config: object, _console: object) -> int:
+        captured["config"] = config
+        return 0
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli_module, "_run", fake_run)
+
+    assert main(["corpus", "books/", "--no-tui"]) == 0
+    config = captured["config"]
+    assert isinstance(config, PipelineConfig)
+    assert config.path == config_path
+    assert config.work_units[0].lean_root == Path("lean/Book")
+    assert config.work_units[0].module == "Book"
+
+
 def test_corpus_command_is_zero_config_with_an_explicit_target(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

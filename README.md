@@ -78,6 +78,11 @@ uv run paf plan books/
 uv run paf corpus books/
 ```
 
+When `corpus` discovers a `paf.toml` in the target directory or one of its ancestors, that
+configuration controls source discovery and target mapping. Without a discovered configuration,
+PAF infers the corpus from the positional files or directories. Pass `--target` to request an
+explicit zero-config output mapping.
+
 Dependency documents use Mermaid edges such as `B01 --> B02 --> B03`; chained edges are expanded.
 Pass `--dependencies path/to/graph.md` to select another graph. Dependencies whose books are outside
 the selected target set are treated as already satisfied.
