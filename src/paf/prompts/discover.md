@@ -24,6 +24,9 @@ A direct prerequisite is one this chapter actually uses, not merely one that an 
 uses. Do not include those indirect ancestors or incidental citations. Keep dependencies explicitly
 provided by the project even when the book leaves them implicit.
 
+Never create a dependency edge from this chapter to itself. The assigned chapter's own id must not
+appear in `source_dependencies`.
+
 Do not infer dependencies from chapter numbers or from Lean `import` lines. Do not create or edit
 files, run Lean, or attempt any formalization.
 
