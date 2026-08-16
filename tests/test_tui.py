@@ -226,7 +226,7 @@ def test_dashboard_inherits_terminal_theme(tmp_path: Path) -> None:
     assert TUI_THEME in app.available_themes
 
 
-def test_dashboard_keeps_configured_document_order_then_sorts_units(tmp_path: Path) -> None:
+def test_dashboard_sorts_documents_and_units_by_source_order(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
     template_book = config.books[0]
     template_chapters = config.chapters
@@ -234,8 +234,18 @@ def test_dashboard_keeps_configured_document_order_then_sorts_units(tmp_path: Pa
     book10 = replace(template_book, id="book10")
     chapters = (
         replace(template_chapters[0], book_id="book10"),
-        replace(template_chapters[1], book_id="book02", depends_on_books=("book10",)),
-        replace(template_chapters[0], book_id="book02", depends_on_books=("book10",)),
+        replace(
+            template_chapters[1],
+            book_id="book02",
+            depends_on_books=("book10",),
+            source_span=template_chapters[0].source_span,
+        ),
+        replace(
+            template_chapters[0],
+            book_id="book02",
+            depends_on_books=("book10",),
+            source_span=template_chapters[1].source_span,
+        ),
     )
     config = replace(config, books=(book10, book02), chapters=chapters)
     orchestrator = Orchestrator(config, StateStore(config))
@@ -248,9 +258,45 @@ def test_dashboard_keeps_configured_document_order_then_sorts_units(tmp_path: Pa
     assert orchestrator.statement_schedule.order == ("book10", "book02")
     assert [chapter.id for chapter in app.chapters] == [
         "book10/chapter-01",
-        "book02/chapter-01",
         "book02/chapter-02",
+        "book02/chapter-01",
     ]
+
+
+@pytest.mark.asyncio
+async def test_dashboard_partial_refresh_uses_source_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    ready = asyncio.Event()
+    finish = asyncio.Event()
+
+    async def operation() -> bool:
+        ready.set()
+        await finish.wait()
+        return True
+
+    app = SwarmApp(orchestrator, operation, label="test")
+    async with app.run_test() as pilot:
+        await ready.wait()
+        rendered: list[str] = []
+        original = app._row_values
+
+        def row_values(work_unit: Any) -> tuple[str, ...]:
+            rendered.append(work_unit.id)
+            return original(work_unit)
+
+        monkeypatch.setattr(app, "_row_values", row_values)
+        app.refresh_dashboard(
+            {config.chapters[1].id, config.chapters[0].id},
+            globals_changed=False,
+        )
+
+        assert rendered == [config.chapters[0].id, config.chapters[1].id]
+        finish.set()
+        await pilot.pause()
 
 
 @pytest.mark.asyncio

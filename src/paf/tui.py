@@ -835,7 +835,11 @@ class SwarmApp(App[bool]):
         self.work_units = tuple(
             sorted(
                 orchestrator.work_units,
-                key=lambda unit: (document_order[unit.document_id], unit.ordinal),
+                key=lambda unit: (
+                    document_order[unit.document_id],
+                    unit.source_span.start_line,
+                    unit.source_span.end_line,
+                ),
             )
         )
         self._work_units_by_id = {unit.id: unit for unit in self.work_units}
@@ -980,9 +984,7 @@ class SwarmApp(App[bool]):
             selected = self.work_units
         else:
             requested = {item if isinstance(item, str) else item.id for item in work_units}
-            selected = tuple(
-                self._work_units_by_id[item] for item in requested if item in self._work_units_by_id
-            )
+            selected = tuple(item for item in self.work_units if item.id in requested)
         self._refresh_rows(selected)
         if globals_changed:
             self._refresh_globals()

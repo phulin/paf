@@ -1,6 +1,7 @@
 import asyncio
 import json
 import shutil
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -11,7 +12,7 @@ from paf.config import infer_config, load_config
 from paf.models import PipelineConfig, Stage
 from paf.project import ProjectResolver
 from paf.state import StateStore
-from paf.state_db import read_full_snapshot
+from paf.state_db import read_checkpoint, read_full_snapshot
 from tests.support import write_project
 
 
@@ -152,6 +153,50 @@ def test_external_state_directory_and_project_metadata_are_durable(tmp_path: Pat
     run = snapshot["tasks"][f"{config.work_units[0].id}:formalize"]["runs"][0]
     assert run["id"] == run_id
     assert run["project_root"] == str(project)
+
+
+def test_normalized_checkpoint_keeps_source_order(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    template_book = config.books[0]
+    template_chapters = config.chapters
+    last_lexically = replace(template_book, id="z-first-in-source")
+    first_lexically = replace(template_book, id="a-second-in-source")
+    config = replace(
+        config,
+        books=(last_lexically, first_lexically),
+        chapters=(
+            replace(
+                template_chapters[1],
+                book_id=last_lexically.id,
+                source_span=template_chapters[0].source_span,
+            ),
+            replace(
+                template_chapters[0],
+                book_id=last_lexically.id,
+                source_span=template_chapters[1].source_span,
+            ),
+            replace(template_chapters[0], book_id=first_lexically.id),
+        ),
+    )
+    state = StateStore(config)
+
+    async def persist() -> None:
+        await state.load_or_create()
+        await state.close()
+
+    asyncio.run(persist())
+    checkpoint = read_checkpoint(config.settings.state_dir)
+
+    assert checkpoint is not None
+    assert [document["id"] for document in checkpoint["documents"]] == [
+        last_lexically.id,
+        first_lexically.id,
+    ]
+    assert [unit["id"] for unit in checkpoint["work_units"]] == [
+        f"{last_lexically.id}/chapter-02",
+        f"{last_lexically.id}/chapter-01",
+        f"{first_lexically.id}/chapter-01",
+    ]
 
 
 def test_project_local_state_rebinds_checkpoint_after_project_is_moved(tmp_path: Path) -> None:

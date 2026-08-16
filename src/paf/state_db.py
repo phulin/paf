@@ -860,7 +860,20 @@ class StateDatabase:
                 checkpoint["work_units"] = [
                     json.loads(row[0])
                     for row in connection.execute(
-                        "SELECT payload FROM work_units ORDER BY document_id, ordinal, id"
+                        """
+                        SELECT work_units.payload
+                        FROM work_units
+                        LEFT JOIN documents ON documents.id = work_units.document_id
+                        ORDER BY
+                            documents.ordinal,
+                            coalesce(
+                                cast(
+                                    json_extract(work_units.payload, '$.source_start_line') AS INT
+                                ),
+                                work_units.ordinal
+                            ),
+                            work_units.id
+                        """
                     )
                 ]
                 checkpoint["tasks"] = {
