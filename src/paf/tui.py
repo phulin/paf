@@ -37,6 +37,9 @@ from paf.state import RunRecord, StateStore, TaskRecord, TaskStatus, TokenUsage
 
 TUI_THEME = "ansi-dark"
 MAX_TIMELINE_EVENTS = 10_000
+REFRESH_INTERVAL_SECONDS = 1.0
+SUCCESS_EXIT_DELAY_SECONDS = 1.0
+FAILURE_EXIT_DELAY_SECONDS = 2.0
 
 
 @dataclass(frozen=True)
@@ -429,7 +432,7 @@ class AgentDetailScreen(Screen[None]):
     def on_mount(self) -> None:
         self.refresh_agent()
         self.call_after_refresh(self.refresh_agent)
-        self.set_interval(1.0, self.refresh_agent)
+        self.set_interval(REFRESH_INTERVAL_SECONDS, self.refresh_agent)
 
     def action_close(self) -> None:
         self.app.pop_screen()
@@ -866,7 +869,7 @@ class SwarmApp(App[bool]):
         table.add_column("Build", key="build")
         table.add_column("Current agent activity", key="activity")
         table.add_column("Tokens · API $", key="tokens")
-        self.set_interval(1.0, self.refresh_dashboard)
+        self.set_interval(REFRESH_INTERVAL_SECONDS, self.refresh_dashboard)
         self.run_worker(self.execute(), exclusive=True, group="pipeline")
 
     def action_inspect_agent(self) -> None:
@@ -922,14 +925,14 @@ class SwarmApp(App[bool]):
                 return
             self.fatal_error = error
             self._set_status(f"Fatal orchestrator error: {error}")
-            self.set_timer(2.0, lambda: self.exit(False))
+            self.set_timer(FAILURE_EXIT_DELAY_SECONDS, lambda: self.exit(False))
             return
         message = (
             "Pipeline completed successfully" if self.result else "Pipeline finished with failures"
         )
         self._set_status(message + " — returning to the shell")
         self.refresh_dashboard()
-        self.set_timer(1.0, lambda: self.exit(self.result))
+        self.set_timer(SUCCESS_EXIT_DELAY_SECONDS, lambda: self.exit(self.result))
 
     def refresh_dashboard(self) -> None:
         if not self.state.tasks:

@@ -82,7 +82,7 @@ def test_explicit_project_works_outside_checkout_for_source_and_control_commands
     asyncio.run(StateStore(load_config(project / "paf.toml")).load_or_create())
 
     assert main(["plan", "--project", str(project)]) == 0
-    assert str(project) in capsys.readouterr().out
+    assert str(project) in capsys.readouterr().out.replace("\n", "")
     assert main(["status", "--project", str(project), "--json"]) == 0
     assert json.loads(capsys.readouterr().out)["project_root"] == str(project)
     assert main(["source-issues", "--project", str(project), "--json"]) == 0

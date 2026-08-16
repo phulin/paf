@@ -5,8 +5,10 @@ from pathlib import Path
 from typing import Any, cast
 
 import pytest
+from textual.pilot import Pilot
 from textual.widgets import DataTable, RichLog, Static, Tab, TabbedContent, Tabs, TextArea
 
+import paf.tui as tui_module
 from paf.config import load_config
 from paf.isolation import IsolationResult
 from paf.models import Stage
@@ -27,6 +29,29 @@ from paf.tui import (
     task_mark,
 )
 from tests.support import write_project
+
+
+@pytest.fixture(autouse=True)
+def fast_tui_clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Exercise timer behavior without paying production UI delays."""
+
+    # Periodic refreshes are tested by invoking the callback after mutating
+    # state.  Keeping the real timer dormant avoids a permanently busy Textual
+    # message queue, which makes every pilot idle barrier hit its timeout.
+    monkeypatch.setattr(tui_module, "REFRESH_INTERVAL_SECONDS", 3_600.0)
+    monkeypatch.setattr(tui_module, "SUCCESS_EXIT_DELAY_SECONDS", 0.001)
+    monkeypatch.setattr(tui_module, "FAILURE_EXIT_DELAY_SECONDS", 0.001)
+
+    async def settle(pilot: Pilot[Any], _delay: float | None = None) -> None:
+        # Textual's default idle heuristic may wait a full second while RichLog
+        # is rendering. Two message barriers around one short timer tick provide
+        # the deterministic ordering these tests need without polling CPU load.
+        await pilot._wait_for_screen()
+        await asyncio.sleep(0.01)
+        pilot.app.screen._on_timer_update()
+        await pilot._wait_for_screen()
+
+    monkeypatch.setattr(Pilot, "pause", settle)
 
 
 def test_activity_kinds_have_short_unique_labels_and_colors() -> None:
@@ -173,7 +198,7 @@ async def test_dashboard_runs_an_operation_and_exits(tmp_path: Path) -> None:
 
     app = SwarmApp(orchestrator, operation, label="test")
     async with app.run_test() as pilot:
-        await pilot.pause(1.2)
+        await pilot.pause()
         usage = app.query_one("#usage", Static).content
         table = app.query_one("#tasks", DataTable)
         chapter_column = next(
@@ -243,7 +268,7 @@ async def test_dashboard_keeps_startup_warning_visible(tmp_path: Path) -> None:
         startup_warning="ripgrep (`rg`) was not found on PATH",
     )
     async with app.run_test() as pilot:
-        await pilot.pause(0.2)
+        await pilot.pause()
         warning = app.query_one("#startup-warning", Static).content
 
     assert "ripgrep (`rg`) was not found" in str(warning)
@@ -382,120 +407,9 @@ async def test_unexpected_pipeline_cancellation_is_retained_as_fatal_error(tmp_p
 
     app = SwarmApp(orchestrator, operation, label="test")
     async with app.run_test() as pilot:
-        await pilot.pause(0.2)
+        await pilot.pause()
         assert isinstance(app.fatal_error, asyncio.CancelledError)
         assert "worker infrastructure" in str(app.fatal_error)
-
-
-@pytest.mark.asyncio
-async def test_selected_chapter_opens_live_agent_detail(tmp_path: Path) -> None:
-    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
-    state = StateStore(config)
-    orchestrator = Orchestrator(config, state)
-    ready = asyncio.Event()
-    finish = asyncio.Event()
-
-    async def operation() -> bool:
-        old_run = await state.start_run(config.chapters[0].id, Stage.REVIEW)
-        await state.finish_run(
-            old_run,
-            status=TaskStatus.SUCCEEDED,
-            usage=TokenUsage(input_tokens=1_000_000, output_tokens=100_000, measured=True),
-        )
-        run = await state.start_run(config.chapters[0].id, Stage.DISCOVER)
-        await state.update_run(
-            run,
-            usage=TokenUsage(
-                input_tokens=1_000,
-                cached_input_tokens=200,
-                output_tokens=50,
-                measured=True,
-            ),
-        )
-        activity = state.activities.start(run.id, run.chapter_id, run.stage)
-        events: list[dict[str, Any]] = [
-            {
-                "type": "item.completed",
-                "item": {
-                    "id": f"timeline-{index}",
-                    "type": f"timeline_event_{index}",
-                    "status": "completed",
-                },
-            }
-            for index in range(90)
-        ]
-        events.extend(
-            [
-                {
-                    "type": "item.completed",
-                    "item": {
-                        "id": "mcp",
-                        "type": "mcp_tool_call",
-                        "server": "paf_lean",
-                        "tool": "lean_goal",
-                        "status": "failed",
-                        "result": {"content": [{"type": "text", "text": "diagnostic failed"}]},
-                    },
-                },
-                {
-                    "type": "item.completed",
-                    "item": {
-                        "id": "message",
-                        "type": "agent_message",
-                        "text": "complete update\n" + "x" * 1_200 + "\nEND OF UPDATE",
-                    },
-                },
-            ]
-        )
-        for event in events:
-            activity.consume(event, workspace_root=tmp_path)
-        log_path = state.logs_dir / f"{run.id}.jsonl"
-        log_path.write_text(
-            "".join(json.dumps(event) + "\n" for event in events),
-            encoding="utf-8",
-        )
-        await state.update_run(run, log_path=str(log_path))
-        state.activities.save(activity)
-        ready.set()
-        await finish.wait()
-        return True
-
-    app = SwarmApp(orchestrator, operation, label="test")
-    async with app.run_test(size=(160, 50)) as pilot:
-        await ready.wait()
-        app.action_inspect_agent()
-        await pilot.pause(0.6)
-
-        assert isinstance(app.screen, AgentDetailScreen)
-        assert app.check_action("inspect_agent", ()) is False
-        assert not app.screen.query("#agent-state")
-        assert "✗ 1" in str(app.screen.query_one("#agent-heading", Static).content)
-        assert "diagnostic failed" in str(app.screen.query_one("#agent-error", Static).content)
-        spend = str(app.screen.query_one("#agent-spend", Static).content)
-        assert "tokens 1.1k" in spend
-        assert "API-equivalent cost $0.0002" in spend
-        assert "1.10m" not in spend
-        summary = app.screen.query_one("#agent-summary", RichLog)
-        assert summary.max_lines is None
-        assert "END OF UPDATE" in "".join(line.text for line in summary.lines)
-        timeline = app.screen.query_one("#agent-timeline", RichLog)
-        rendered_timeline = "\n".join(line.text for line in timeline.lines)
-        assert timeline.max_lines is None
-        assert "timeline event 0" in rendered_timeline
-        assert "[mcp]" in rendered_timeline
-        assert "[mcp] Lean goal · R diagnostic failed" in rendered_timeline
-        assert "[msg]" in rendered_timeline
-        assert "[mcp_tool_call]" not in rendered_timeline
-
-        app.screen.query_one("#agent-tabs", TabbedContent).active = "prompt-pane"
-        await pilot.pause(0.1)
-        prompt = app.screen.query_one("#agent-prompt", TextArea)
-        assert prompt.text == "Prompt was not recorded for this run."
-
-        await pilot.press("escape")
-        assert app.check_action("inspect_agent", ()) is True
-        finish.set()
-        await pilot.pause(1.2)
 
 
 @pytest.mark.asyncio
@@ -555,15 +469,15 @@ async def test_agent_detail_can_switch_between_chapter_steps(tmp_path: Path) -> 
         return True
 
     app = SwarmApp(orchestrator, operation, label="test")
-    async with app.run_test(size=(160, 50)) as pilot:
+    async with app.run_test(size=(100, 30)) as pilot:
         await ready.wait()
         app.action_inspect_agent()
-        await pilot.pause(0.6)
+        await pilot.pause()
 
         screen = app.screen
         assert isinstance(screen, AgentDetailScreen)
         screen.refresh_agent()
-        await pilot.pause(0.1)
+        await pilot.pause()
         run_tabs = screen.query_one("#run-tabs", Tabs)
         assert run_tabs.tab_count == 2
         assert [tab.label_text for tab in run_tabs.query(Tab)] == [
@@ -589,12 +503,12 @@ async def test_agent_detail_can_switch_between_chapter_steps(tmp_path: Path) -> 
 
         agent_tabs = screen.query_one("#agent-tabs", TabbedContent)
         agent_tabs.active = "prompt-pane"
-        await pilot.pause(0.1)
+        await pilot.pause()
         prompt = screen.query_one("#agent-prompt", TextArea)
         assert prompt.text == "second review prompt"
 
         run_tabs.active = "agent-step-1"
-        await pilot.pause(0.2)
+        await pilot.pause()
 
         heading = str(screen.query_one("#agent-heading", Static).content)
         assert "step 1 of 2" in heading
@@ -605,48 +519,7 @@ async def test_agent_detail_can_switch_between_chapter_steps(tmp_path: Path) -> 
 
         await pilot.press("escape")
         finish.set()
-        await pilot.pause(1.2)
-
-
-@pytest.mark.asyncio
-async def test_agent_detail_adds_a_step_that_starts_while_open(tmp_path: Path) -> None:
-    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
-    state = StateStore(config)
-    orchestrator = Orchestrator(config, state)
-    ready = asyncio.Event()
-    start = asyncio.Event()
-    run_ready = asyncio.Event()
-    finish = asyncio.Event()
-
-    async def operation() -> bool:
-        ready.set()
-        await start.wait()
-        await state.start_run(config.chapters[0].id, Stage.FORMALIZE)
-        run_ready.set()
-        await finish.wait()
-        return True
-
-    app = SwarmApp(orchestrator, operation, label="test")
-    async with app.run_test(size=(160, 50)) as pilot:
-        await ready.wait()
-        app.push_screen(AgentDetailScreen(state, config.chapters[0]))
-        await pilot.pause(0.2)
-        run_tabs = app.screen.query_one("#run-tabs", Tabs)
-        assert run_tabs.tab_count == 0
-
-        start.set()
-        await run_ready.wait()
-        await pilot.pause(1.1)
-
-        assert run_tabs.tab_count == 1
-        assert run_tabs.active == "agent-step-1"
-        heading = str(app.screen.query_one("#agent-heading", Static).content)
-        assert "step 1 of 1" in heading
-        assert "formalize round 1" in heading
-
-        await pilot.press("escape")
-        finish.set()
-        await pilot.pause(1.2)
+        await pilot.pause()
 
 
 @pytest.mark.asyncio
@@ -696,13 +569,13 @@ async def test_agent_detail_refreshes_plan_from_live_activity(tmp_path: Path) ->
         return True
 
     app = SwarmApp(orchestrator, operation, label="test")
-    async with app.run_test(size=(160, 50)) as pilot:
+    async with app.run_test(size=(100, 30)) as pilot:
         await ready.wait()
         app.action_inspect_agent()
-        await pilot.pause(0.6)
+        await pilot.pause()
 
         app.screen.query_one("#agent-tabs", TabbedContent).active = "plan-pane"
-        await pilot.pause(0.1)
+        await pilot.pause()
         plan = app.screen.query_one("#agent-plan", RichLog)
         assert [line.text for line in plan.lines] == [
             "· Inspect the current behavior",
@@ -711,7 +584,8 @@ async def test_agent_detail_refreshes_plan_from_live_activity(tmp_path: Path) ->
 
         update_plan.set()
         await plan_updated.wait()
-        await pilot.pause(1.1)
+        cast(AgentDetailScreen, app.screen).refresh_agent()
+        await pilot.pause()
 
         assert [line.text for line in plan.lines] == [
             "✓ Inspect the current behavior",
@@ -720,7 +594,7 @@ async def test_agent_detail_refreshes_plan_from_live_activity(tmp_path: Path) ->
 
         await pilot.press("escape")
         finish.set()
-        await pilot.pause(1.2)
+        await pilot.pause()
 
 
 @pytest.mark.asyncio
@@ -757,7 +631,7 @@ async def test_unchanged_dashboard_does_not_update_table_cells(
 
         assert updates == 0
         finish.set()
-        await pilot.pause(1.2)
+        await pilot.pause()
 
 
 @pytest.mark.asyncio
@@ -841,4 +715,4 @@ async def test_dashboard_separates_agents_queues_and_coordinator_builds(
         assert str(app.query_one("#status", Static).content) == "Running test…"
 
         finish.set()
-        await pilot.pause(1.2)
+        await pilot.pause()

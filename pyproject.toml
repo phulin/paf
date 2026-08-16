@@ -21,6 +21,7 @@ dev = [
   "pre-commit>=4.0.0",
   "pytest>=8.4.0",
   "pytest-asyncio>=1.1.0",
+  "pytest-xdist>=3.8.0",
   "ruff>=0.12.0",
   "ty>=0.0.1a16",
 ]
@@ -49,7 +50,7 @@ include = [
 ]
 
 [tool.pytest.ini_options]
-addopts = "-q"
+addopts = "-q -n 4 --dist=worksteal"
 asyncio_mode = "auto"
 testpaths = ["tests"]
 
