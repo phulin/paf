@@ -19,7 +19,7 @@ from paf import json_codec as json
 from paf.config import resolve_config
 from paf.models import PipelineConfig
 from paf.project import Project, ProjectResolver
-from paf.state_db import read_full_snapshot
+from paf.state_db import StateDatabase, read_checkpoint, read_status_view
 
 _DECLARATION = re.compile(
     r"^\s*(?:(?:noncomputable|private|protected|unsafe|opaque)\s+)*"
@@ -104,7 +104,7 @@ def _relative(path: Path, root: Path) -> str:
     return path.relative_to(root).as_posix()
 
 
-def _state_candidates(state_root: Path) -> list[StateCandidate]:
+def _state_candidates(state_root: Path, *, dashboard: bool = False) -> list[StateCandidate]:
     state_root = state_root.resolve()
     directories = [state_root]
     try:
@@ -123,7 +123,7 @@ def _state_candidates(state_root: Path) -> list[StateCandidate]:
             database_path = resolved / "state.sqlite3"
             if not state_path.is_file() and not database_path.is_file():
                 continue
-            state = read_full_snapshot(resolved)
+            state = read_checkpoint(resolved) if dashboard else read_status_view(resolved)
             if not isinstance(state, dict):
                 continue
             modified = max(
@@ -147,6 +147,8 @@ def _summary(candidate: StateCandidate) -> dict[str, Any]:
     agents = agents if isinstance(agents, dict) else {}
     build = candidate.state.get("coordinator_build", {})
     build = build if isinstance(build, dict) else {}
+    metrics = candidate.state.get("projection_metrics", {})
+    metrics = metrics if isinstance(metrics, dict) else {}
 
     def number(value: object) -> int:
         if not isinstance(value, bool | int | float | str):
@@ -174,10 +176,16 @@ def _summary(candidate: StateCandidate) -> dict[str, Any]:
         "active_agents": active_agents,
         "maximum_agents": number(agents.get("maximum", 0)),
         "queued_agents": number(agents.get("queued", 0)),
-        "running_tasks": sum(task.get("status") == "running" for task in task_values),
-        "task_count": len(tasks),
-        "document_count": len(document_ids),
-        "book_count": len(book_ids),
+        "running_tasks": number(
+            metrics.get(
+                "running_tasks",
+                sum(task.get("status") == "running" for task in task_values),
+            )
+        ),
+        "task_count": number(metrics.get("task_count", len(tasks))),
+        "document_count": number(metrics.get("document_count", len(document_ids))),
+        "book_count": number(metrics.get("document_count", len(book_ids))),
+        "revision": number(candidate.state.get("revision", 0)),
     }
 
 
@@ -458,7 +466,7 @@ def create_app(
         )
 
     async def snapshot(request: Request) -> Response:
-        candidates = _state_candidates(state_root)
+        candidates = _state_candidates(state_root, dashboard=True)
         requested = request.query_params.get("swarm") or request.path_params.get("run_id")
         if requested:
             candidate = next((item for item in candidates if item.id == requested), None)
@@ -472,6 +480,27 @@ def create_app(
         return JSONResponse(
             _snapshot(candidate, project_root), headers={"Cache-Control": "no-store"}
         )
+
+    async def changes(request: Request) -> Response:
+        candidates = _state_candidates(state_root)
+        requested = request.query_params.get("swarm")
+        candidate = next((item for item in candidates if item.id == requested), None)
+        candidate = candidate or (candidates[0] if not requested and candidates else None)
+        if candidate is None:
+            return _json_error(
+                f"Unknown swarm: {requested}" if requested else "No PAF state found", 404
+            )
+        try:
+            after = int(request.query_params.get("after", "0"))
+        except ValueError:
+            return _json_error("after must be an integer revision", 400)
+        database = StateDatabase(candidate.directory)
+        if not database.path.is_file():
+            return JSONResponse(
+                {"revision": 0, "resync_required": True, "changes": []},
+                headers={"Cache-Control": "no-store"},
+            )
+        return JSONResponse(database.changes_since(after), headers={"Cache-Control": "no-store"})
 
     async def system(_request: Request) -> Response:
         used, total = _memory()
@@ -593,6 +622,7 @@ def create_app(
         Route("/api/swarms", list_runs),
         Route("/api/runs", list_runs),
         Route("/api/swarm", snapshot),
+        Route("/api/changes", changes),
         Route("/api/snapshots", snapshot),
         Route("/api/snapshots/{run_id:str}", snapshot),
         Route("/api/system", system),

@@ -14,7 +14,7 @@ from paf import json_codec as json
 from paf.corpus import scheduling_summary
 from paf.scheduler import Orchestrator
 from paf.state import TaskStatus, timestamp
-from paf.state_db import read_checkpoint
+from paf.state_db import read_status_view
 
 PROTOCOL_VERSION = 2
 SOCKET_NAME = "control.sock"
@@ -44,7 +44,7 @@ def state_summary(
     result: bool | None,
     full: bool = False,
 ) -> dict[str, Any]:
-    snapshot = orchestrator.state.snapshot()
+    snapshot = orchestrator.state.snapshot() if full else orchestrator.state.status_view()
     response: dict[str, Any] = {
         "protocol_version": PROTOCOL_VERSION,
         "status": daemon_status,
@@ -62,7 +62,7 @@ def state_summary(
         "scheduling": scheduling_summary(snapshot["scheduling"]),
         "agents": snapshot["agents"],
         "coordinator_build": snapshot["coordinator_build"],
-        "tasks": _task_counts(snapshot),
+        "tasks": (_task_counts(snapshot) if full else dict(snapshot.get("task_counts", {}))),
     }
     if full:
         response["snapshot"] = snapshot
@@ -264,7 +264,7 @@ def offline_status(state_dir: Path) -> dict[str, Any]:
         if isinstance(value, dict):
             return value
     state_path = state_dir / "state.json"
-    snapshot = read_checkpoint(state_dir)
+    snapshot = read_status_view(state_dir)
     if snapshot is not None:
         return {
             "protocol_version": PROTOCOL_VERSION,
@@ -280,7 +280,7 @@ def offline_status(state_dir: Path) -> dict[str, Any]:
             "scheduling": scheduling_summary(snapshot.get("scheduling", {})),
             "agents": snapshot.get("agents", {}),
             "coordinator_build": snapshot.get("coordinator_build", {}),
-            "tasks": _task_counts(snapshot),
+            "tasks": dict(snapshot.get("task_counts", {})),
         }
     return {
         "protocol_version": PROTOCOL_VERSION,

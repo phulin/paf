@@ -48,6 +48,7 @@ export interface CoordinatorBuild {
 
 export interface SwarmState {
   swarm_id?: string;
+  revision?: number;
   source: string;
   updated_at: string;
   usage: Usage;
@@ -71,6 +72,7 @@ export interface SwarmState {
 
 export interface SwarmSummary {
   id: string;
+  revision: number;
   active: boolean;
   updated_at: string;
   active_agents: number;

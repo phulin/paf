@@ -7,7 +7,7 @@ from collections import Counter
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from paf import json_codec as json
 
@@ -699,10 +699,18 @@ class AgentActivity:
 
 
 class ActivityStore:
-    def __init__(self, logs_dir: Path) -> None:
+    def __init__(
+        self,
+        logs_dir: Path,
+        *,
+        on_visible_change: Callable[[AgentActivity], None] | None = None,
+    ) -> None:
         self.logs_dir = logs_dir
         self._cache: dict[str, AgentActivity] = {}
         self._last_saved: dict[str, float] = {}
+        self._visible: dict[str, tuple[object, ...]] = {}
+        self._last_notification = 0.0
+        self.on_visible_change = on_visible_change
 
     def path(self, run_id: str) -> Path:
         return self.logs_dir / f"{run_id}.activity.json"
@@ -721,14 +729,33 @@ class ActivityStore:
         os.replace(temporary, path)
         self._cache[activity.run_id] = activity
         self._last_saved[activity.run_id] = time.monotonic()
+        self._notify_visible_change(activity)
 
     def save_throttled(self, activity: AgentActivity, *, interval: float = 1.0) -> None:
         """Persist a derived activity summary at most once per interval."""
 
         self._cache[activity.run_id] = activity
+        self._notify_visible_change(activity)
         last_saved = self._last_saved.get(activity.run_id, 0.0)
         if time.monotonic() - last_saved >= interval:
             self.save(activity)
+
+    def _notify_visible_change(self, activity: AgentActivity) -> None:
+        visible = (
+            activity.current,
+            activity.current_kind,
+            activity.latest_error,
+            activity.finished_at,
+            activity.todo_progress,
+        )
+        if self._visible.get(activity.run_id) == visible:
+            return
+        self._visible[activity.run_id] = visible
+        now = time.monotonic()
+        if self.on_visible_change is None or now - self._last_notification < 0.1:
+            return
+        self._last_notification = now
+        self.on_visible_change(activity)
 
     def get(self, run_id: str) -> AgentActivity | None:
         if run_id in self._cache:

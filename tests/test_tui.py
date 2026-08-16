@@ -47,7 +47,7 @@ def fast_tui_clock(monkeypatch: pytest.MonkeyPatch) -> None:
         # is rendering. Two message barriers around one short timer tick provide
         # the deterministic ordering these tests need without polling CPU load.
         await pilot._wait_for_screen()
-        await asyncio.sleep(0.01)
+        await asyncio.sleep(0.2)
         pilot.app.screen._on_timer_update()
         await pilot._wait_for_screen()
 
@@ -205,7 +205,7 @@ async def test_dashboard_runs_an_operation_and_exits(tmp_path: Path) -> None:
             column for column in table.columns.values() if column.label.plain == "Chapter"
         )
 
-    assert app.result
+    assert app.result, repr(app.fatal_error)
     assert chapter_column.width == 40
     assert "API-equivalent cost" in str(usage)
     assert "lifetime tokens" in str(usage)
@@ -630,6 +630,46 @@ async def test_unchanged_dashboard_does_not_update_table_cells(
         app.refresh_dashboard()
 
         assert updates == 0
+        finish.set()
+        await pilot.pause()
+
+
+@pytest.mark.asyncio
+async def test_dashboard_change_bus_updates_only_the_changed_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    ready = asyncio.Event()
+    finish = asyncio.Event()
+
+    async def operation() -> bool:
+        ready.set()
+        await finish.wait()
+        return True
+
+    app = SwarmApp(orchestrator, operation, label="test")
+    async with app.run_test() as pilot:
+        await ready.wait()
+        rendered: list[str] = []
+        original = app._row_values
+
+        def row_values(work_unit: Any) -> tuple[str, ...]:
+            rendered.append(work_unit.id)
+            return original(work_unit)
+
+        monkeypatch.setattr(app, "_row_values", row_values)
+        changed = config.chapters[1]
+        await state.set_task(
+            changed.id,
+            Stage.PROVE,
+            TaskStatus.PENDING,
+            "waiting for an upstream declaration",
+        )
+        await asyncio.sleep(0.1)
+
+        assert rendered == [changed.id]
         finish.set()
         await pilot.pause()
 

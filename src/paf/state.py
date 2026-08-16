@@ -288,10 +288,10 @@ class StateStore:
         self.database_path = config.settings.state_dir / DATABASE_NAME
         self.source_issues_path = config.settings.state_dir / "source-issues.json"
         self.logs_dir = config.settings.state_dir / "logs"
-        self.activities = ActivityStore(self.logs_dir)
+        self.change_bus = ChangeBus()
+        self.activities = ActivityStore(self.logs_dir, on_visible_change=self._activity_changed)
         self._database = StateDatabase(config.settings.state_dir)
         self._writer = StateWriter(self._database)
-        self.change_bus = ChangeBus()
         self.revision = 0
         self._flush_lock = asyncio.Lock()
         self._batch_depth = 0
@@ -306,7 +306,8 @@ class StateStore:
         self._chapter_runs: dict[str, list[RunRecord]] = {}
         self._usage_cache: dict[tuple[bool, str | None], TokenUsage] = {}
         self._cost_cache: dict[tuple[bool, str | None], CostEstimate] = {}
-        self._agent_summary_cache: dict[str, Any] | None = None
+        self._indexed_task_states: dict[str, tuple[str, str, bool]] = {}
+        self._active_run_ids: set[str] = set()
         self._stage_count_cache: dict[str, dict[str, int]] = {}
         self.tasks: dict[str, TaskRecord] = {}
         self.source_issues: dict[str, SourceIssueRecord] = {}
@@ -324,6 +325,16 @@ class StateStore:
     @staticmethod
     def key(chapter_id: str, stage: Stage) -> str:
         return f"{chapter_id}:{stage.value}"
+
+    def _activity_changed(self, activity: Any) -> None:
+        self.change_bus.publish(
+            ChangeSet(
+                revision=self.revision,
+                work_units=frozenset({str(activity.work_unit_id)}),
+                runs=frozenset({str(activity.run_id)}),
+                globals=frozenset({"activity"}),
+            )
+        )
 
     @property
     def fixup_graph(self) -> dict[str, Any]:
@@ -520,7 +531,7 @@ class StateStore:
             self.coordinator_build.updated_at = timestamp()
         self._normalize_upstream_request_state()
         self._invalidate_aggregates()
-        self._invalidate_status_summaries()
+        self._rebuild_status_indexes()
         self._checkpoint_dirty = True
         self._static_dirty = True
         self._dirty_task_keys.update(self.tasks)
@@ -703,6 +714,20 @@ class StateStore:
             },
         }
 
+    def status_view(self) -> dict[str, Any]:
+        """Return status fields and counters without materializing task rows."""
+
+        counts = {status.value: 0 for status in TaskStatus}
+        for stage in Stage:
+            stage_counts = self.stage_counts(stage)
+            for status in TaskStatus:
+                counts[status.value] += stage_counts[status.value]
+            counts[TaskStatus.PENDING] += stage_counts["queued"]
+        return self._global_snapshot() | {
+            "revision": self.revision,
+            "task_counts": counts,
+        }
+
     def snapshot(self) -> dict[str, Any]:
         """Return a compatibility export, loading immutable run payloads on demand."""
 
@@ -746,11 +771,17 @@ class StateStore:
         changed_tasks = [*tasks]
         if task is not None:
             changed_tasks.append(task)
+        for item in changed_tasks:
+            self._sync_task_index(item)
         self._dirty_task_keys.update(
             self.key(item.chapter_id, Stage(item.stage)) for item in changed_tasks
         )
         if run is not None:
             self._dirty_run_ids.add(run.id)
+            if run.status == TaskStatus.RUNNING:
+                self._active_run_ids.add(run.id)
+            else:
+                self._active_run_ids.discard(run.id)
         self._issues_dirty = self._issues_dirty or issues
         self._static_dirty = self._static_dirty or static
 
@@ -1346,45 +1377,66 @@ class StateStore:
         self._cost_cache.clear()
 
     def _invalidate_status_summaries(self) -> None:
-        self._agent_summary_cache = None
-        self._stage_count_cache.clear()
+        """Compatibility hook; indexes synchronize when dirty entities are marked."""
+
+    def _rebuild_status_indexes(self) -> None:
+        self._stage_count_cache = {
+            stage.value: {status.value: 0 for status in TaskStatus} | {"queued": 0}
+            for stage in Stage
+        }
+        self._indexed_task_states.clear()
+        for key, task in self.tasks.items():
+            bucket = "queued" if task.queued else str(task.status)
+            self._stage_count_cache[task.stage][bucket] += 1
+            self._indexed_task_states[key] = (task.stage, str(task.status), task.queued)
+        self._active_run_ids = {
+            run.id for run in self._runs_by_id.values() if run.status == TaskStatus.RUNNING
+        }
+
+    def _sync_task_index(self, task: TaskRecord) -> None:
+        if not self._stage_count_cache:
+            return
+        key = self.key(task.chapter_id, Stage(task.stage))
+        previous = self._indexed_task_states.get(key)
+        current = (task.stage, str(task.status), task.queued)
+        if previous == current:
+            return
+        if previous is not None:
+            old_stage, old_status, old_queued = previous
+            old_bucket = "queued" if old_queued else old_status
+            self._stage_count_cache[old_stage][old_bucket] -= 1
+        bucket = "queued" if task.queued else str(task.status)
+        self._stage_count_cache[task.stage][bucket] += 1
+        self._indexed_task_states[key] = current
 
     def agent_summary(self) -> dict[str, Any]:
-        if self._agent_summary_cache is not None:
-            return self._agent_summary_cache
         by_stage = {stage.value: 0 for stage in Stage}
         by_role: dict[str, int] = {}
-        for task in self.tasks.values():
-            for run in task.runs:
-                if run.status == TaskStatus.RUNNING and run.stage in by_stage:
-                    by_stage[run.stage] += 1
-                    role = run.role or run.stage
-                    by_role[role] = by_role.get(role, 0) + 1
+        for run_id in self._active_run_ids:
+            run = self._runs_by_id.get(run_id)
+            if run is None or run.stage not in by_stage:
+                continue
+            by_stage[run.stage] += 1
+            role = run.role or run.stage
+            by_role[role] = by_role.get(role, 0) + 1
         discovery_max_agents = self.config.stages[Stage.DISCOVER].max_agents
         assert discovery_max_agents is not None
-        self._agent_summary_cache = {
+        return {
             "active": sum(by_stage.values()),
             "maximum": discovery_max_agents + self.config.settings.max_agents,
             "maximum_by_pool": {
                 "discover": discovery_max_agents,
                 "mutating": self.config.settings.max_agents,
             },
-            "queued": sum(task.queued for task in self.tasks.values()),
+            "queued": sum(counts["queued"] for counts in self._stage_count_cache.values()),
             "by_stage": by_stage,
             "by_role": by_role,
         }
-        return self._agent_summary_cache
 
     def stage_counts(self, stage: Stage) -> dict[str, int]:
-        if stage.value in self._stage_count_cache:
-            return self._stage_count_cache[stage.value]
-        statuses = {status.value: 0 for status in TaskStatus} | {"queued": 0}
-        for task in self.tasks.values():
-            if task.stage != stage.value:
-                continue
-            statuses["queued" if task.queued else str(task.status)] += 1
-        self._stage_count_cache[stage.value] = statuses
-        return statuses
+        if not self._stage_count_cache:
+            self._rebuild_status_indexes()
+        return self._stage_count_cache[stage.value]
 
     def _record_source_issues(self, run: RunRecord) -> list[str]:
         report = run.report or {}

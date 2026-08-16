@@ -70,6 +70,7 @@ def test_state_list_snapshot_and_system_contracts(tmp_path: Path, static_dir: Pa
         assert listing.status_code == alias.status_code == 200
         summaries = listing.json()["swarms"]
         assert summaries and summaries[0]["task_count"] == 4
+        assert summaries[0]["revision"] > 0
         assert alias.json()["runs"] == summaries
 
         selected = client.get("/api/swarm", params={"swarm": summaries[0]["id"]})
@@ -77,6 +78,15 @@ def test_state_list_snapshot_and_system_contracts(tmp_path: Path, static_dir: Pa
         assert selected.status_code == by_path.status_code == 200
         assert selected.json()["swarm_id"] == summaries[0]["id"]
         assert selected.json()["project_root"] == str(tmp_path)
+        revision = selected.json()["revision"]
+        changes = client.get(
+            "/api/changes", params={"swarm": summaries[0]["id"], "after": revision}
+        ).json()
+        assert changes == {
+            "revision": revision,
+            "resync_required": False,
+            "changes": [],
+        }
         assert client.get("/api/swarm", params={"swarm": "unknown"}).status_code == 404
 
         system = client.get("/api/system").json()

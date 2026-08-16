@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -826,6 +826,9 @@ class SwarmApp(App[bool]):
         self._rows_added: set[str] = set()
         self._row_cache: dict[str, tuple[str, ...]] = {}
         self._static_cache: dict[str, str] = {}
+        self._active_work_units: set[str] = set()
+        self._active_activities: dict[str, AgentActivity] = {}
+        self._change_queue: asyncio.Queue[Any] | None = None
         document_order = {
             document.id: index for index, document in enumerate(orchestrator.config.documents)
         }
@@ -835,6 +838,7 @@ class SwarmApp(App[bool]):
                 key=lambda unit: (document_order[unit.document_id], unit.ordinal),
             )
         )
+        self._work_units_by_id = {unit.id: unit for unit in self.work_units}
 
     @property
     def chapters(self) -> tuple[WorkUnitLike, ...]:
@@ -865,7 +869,7 @@ class SwarmApp(App[bool]):
         table.add_column("Build", key="build")
         table.add_column("Current agent activity", key="activity")
         table.add_column("Tokens · API $", key="tokens")
-        self.set_interval(REFRESH_INTERVAL_SECONDS, self.refresh_dashboard)
+        self.set_interval(REFRESH_INTERVAL_SECONDS, self._refresh_active_rows)
         self.run_worker(self.execute(), exclusive=True, group="pipeline")
 
     def action_inspect_agent(self) -> None:
@@ -905,7 +909,9 @@ class SwarmApp(App[bool]):
         try:
             await self.orchestrator.prepare()
             self._set_status(f"Running {self.label}…", show_build_progress=True)
-            self.refresh_dashboard()
+            await self._bootstrap_dashboard()
+            self._change_queue = self.state.change_bus.subscribe()
+            self.run_worker(self._consume_changes(), exclusive=True, group="dashboard")
             self.result = await self.operation()
         except BaseException as caught:
             error = caught
@@ -927,12 +933,61 @@ class SwarmApp(App[bool]):
             "Pipeline completed successfully" if self.result else "Pipeline finished with failures"
         )
         self._set_status(message + " — returning to the shell")
-        self.refresh_dashboard()
+        self.refresh_dashboard((), globals_changed=True)
         self.set_timer(SUCCESS_EXIT_DELAY_SECONDS, lambda: self.exit(self.result))
 
-    def refresh_dashboard(self) -> None:
+    async def _bootstrap_dashboard(self, *, chunk_size: int = 200) -> None:
+        self.refresh_dashboard((), globals_changed=True)
+        for offset in range(0, len(self.work_units), chunk_size):
+            self.refresh_dashboard(
+                self.work_units[offset : offset + chunk_size], globals_changed=False
+            )
+            await asyncio.sleep(0)
+        self.refresh_dashboard((), globals_changed=True)
+
+    async def _consume_changes(self) -> None:
+        assert self._change_queue is not None
+        try:
+            while True:
+                change = await self._change_queue.get()
+                await asyncio.sleep(0.05)
+                work_unit_ids = set(change.work_units)
+                globals_changed = bool(change.globals)
+                full_resync = change.full_resync
+                while not self._change_queue.empty():
+                    item = self._change_queue.get_nowait()
+                    work_unit_ids.update(item.work_units)
+                    globals_changed = globals_changed or bool(item.globals)
+                    full_resync = full_resync or item.full_resync
+                selected = None if full_resync else work_unit_ids
+                self.refresh_dashboard(selected, globals_changed=globals_changed or full_resync)
+        finally:
+            self.state.change_bus.unsubscribe(self._change_queue)
+
+    def _refresh_active_rows(self) -> None:
+        if self._active_work_units:
+            self.refresh_dashboard(self._active_work_units, globals_changed=False)
+
+    def refresh_dashboard(
+        self,
+        work_units: Iterable[WorkUnitLike] | Iterable[str] | None = None,
+        *,
+        globals_changed: bool = True,
+    ) -> None:
         if not self.state.tasks:
             return
+        if work_units is None:
+            selected = self.work_units
+        else:
+            requested = {item if isinstance(item, str) else item.id for item in work_units}
+            selected = tuple(
+                self._work_units_by_id[item] for item in requested if item in self._work_units_by_id
+            )
+        self._refresh_rows(selected)
+        if globals_changed:
+            self._refresh_globals()
+
+    def _refresh_globals(self) -> None:
         usage = self.state.invocation_usage()
         lifetime_usage = self.state.total_usage()
         cost = self.state.invocation_cost()
@@ -1011,15 +1066,7 @@ class SwarmApp(App[bool]):
             f"Statement critical path: {critical}    isolation: {isolation}  "
             f"Lean MCP: on    Codex access: {codex_access}",
         )
-        activities: list[AgentActivity] = []
-        for chapter in self.work_units:
-            run = latest_run(self.state, chapter)
-            if (
-                run is not None
-                and run.status == TaskStatus.RUNNING
-                and (activity := self.state.activities.get(run.id)) is not None
-            ):
-                activities.append(activity)
+        activities = list(self._active_activities.values())
         systemic = [
             (count, message) for count, message in systemic_errors(activities) if count >= 2
         ]
@@ -1045,8 +1092,10 @@ class SwarmApp(App[bool]):
                 f"· {counts['queued']} queued  ! {counts['blocked']}  "
                 f"Ⅱ {counts['interrupted']}",
             )
+
+    def _refresh_rows(self, work_units: Iterable[WorkUnitLike]) -> None:
         table: DataTable[Any] = self.query_one("#tasks", DataTable)
-        for chapter in self.work_units:
+        for chapter in work_units:
             values = self._row_values(chapter)
             if chapter.id not in self._rows_added:
                 table.add_row(*values, key=chapter.id)
@@ -1071,6 +1120,17 @@ class SwarmApp(App[bool]):
                     if old_value != value:
                         table.update_cell(chapter.id, column, value)
                 self._row_cache[chapter.id] = values
+            active_run = self.state.active_run(chapter.id)
+            if active_run is None:
+                self._active_work_units.discard(chapter.id)
+                self._active_activities.pop(chapter.id, None)
+            else:
+                self._active_work_units.add(chapter.id)
+                activity = self.state.activities.get(active_run.id)
+                if activity is None:
+                    self._active_activities.pop(chapter.id, None)
+                else:
+                    self._active_activities[chapter.id] = activity
 
     def _update_static(self, selector: str, content: str) -> None:
         if self._static_cache.get(selector) == content:

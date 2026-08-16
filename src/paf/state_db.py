@@ -566,16 +566,20 @@ class StateWriter:
                     )
                 except BaseException as error:
                     for item in futures:
-                        item.set_exception(error)
+                        if not item.cancelled():
+                            item.set_exception(error)
                     if stopping is not None:
-                        stopping.set_exception(error)
+                        if not stopping.cancelled():
+                            stopping.set_exception(error)
                     if stopping is not None:
                         return
                     continue
                 for item in futures:
-                    item.set_result(revision)
+                    if not item.cancelled():
+                        item.set_result(revision)
                 if stopping is not None:
-                    stopping.set_result(None)
+                    if not stopping.cancelled():
+                        stopping.set_result(None)
                     return
         finally:
             connection.close()
@@ -734,6 +738,43 @@ class StateDatabase:
             row = connection.execute("SELECT revision FROM meta WHERE singleton=1").fetchone()
         return int(row[0]) if row is not None else 0
 
+    def status_view(self) -> dict[str, Any] | None:
+        with _connect(self.path) as connection:
+            row = connection.execute("SELECT payload FROM globals WHERE key='state'").fetchone()
+            if row is None:
+                return None
+            value = json.loads(row[0])
+            if not isinstance(value, dict):
+                raise ValueError(f"invalid global state in {self.path}")
+            counts = {
+                str(status): int(count)
+                for status, count in connection.execute(
+                    "SELECT status, count(*) FROM tasks GROUP BY status"
+                )
+            }
+            revision_row = connection.execute(
+                "SELECT revision FROM meta WHERE singleton=1"
+            ).fetchone()
+            task_metrics = connection.execute(
+                """
+                SELECT count(*),
+                    sum(CASE WHEN status='running' THEN 1 ELSE 0 END),
+                    count(DISTINCT work_unit_id)
+                FROM tasks
+                """
+            ).fetchone()
+            document_count = int(connection.execute("SELECT count(*) FROM documents").fetchone()[0])
+        return dict(value) | {
+            "revision": int(revision_row[0]) if revision_row is not None else 0,
+            "task_counts": counts,
+            "projection_metrics": {
+                "task_count": int(task_metrics[0] or 0),
+                "running_tasks": int(task_metrics[1] or 0),
+                "work_unit_count": int(task_metrics[2] or 0),
+                "document_count": document_count,
+            },
+        }
+
     def changes_since(self, revision: int) -> dict[str, Any]:
         with _connect(self.path) as connection:
             current_row = connection.execute(
@@ -768,6 +809,10 @@ class StateDatabase:
             checkpoint = json.loads(global_row[0]) if global_row is not None else None
             if isinstance(checkpoint, dict):
                 checkpoint = dict(checkpoint)
+                revision_row = connection.execute(
+                    "SELECT revision FROM meta WHERE singleton=1"
+                ).fetchone()
+                checkpoint["revision"] = int(revision_row[0]) if revision_row is not None else 0
                 checkpoint["documents"] = [
                     json.loads(row[0])
                     for row in connection.execute(
@@ -1009,6 +1054,23 @@ def read_checkpoint(state_dir: Path) -> dict[str, Any] | None:
     if not isinstance(value, dict):
         raise ValueError(f"invalid state file: {state_path}")
     return value
+
+
+def read_status_view(state_dir: Path) -> dict[str, Any] | None:
+    database = StateDatabase(state_dir)
+    if database.path.is_file():
+        return database.status_view()
+    checkpoint = read_checkpoint(state_dir)
+    if checkpoint is None:
+        return None
+    counts: dict[str, int] = {}
+    tasks = checkpoint.get("tasks", {})
+    if isinstance(tasks, dict):
+        for task in tasks.values():
+            if isinstance(task, dict):
+                status = str(task.get("status", "pending"))
+                counts[status] = counts.get(status, 0) + 1
+    return dict(checkpoint) | {"revision": 0, "task_counts": counts}
 
 
 def read_full_snapshot(state_dir: Path) -> dict[str, Any] | None:

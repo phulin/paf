@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { demoState } from "../demo";
 import { corpusFromUrl, setCorpusUrl } from "../lib/urlState";
 import type { SwarmState, SwarmSummary, SystemLoad } from "../types";
@@ -12,6 +12,7 @@ export function useSwarmState(live: boolean) {
   const [connected, setConnected] = useState(false);
   const [fetching, setFetching] = useState(true);
   const [systemLoad, setSystemLoad] = useState<SystemLoad | null>(null);
+  const loadedRevision = useRef<Record<string, number>>({});
 
   const refresh = useCallback(async () => {
     setFetching(true);
@@ -32,10 +33,15 @@ export function useSwarmState(live: boolean) {
         window.localStorage.setItem("paf.selectedSwarm", target);
         if (corpusFromUrl() !== target) setCorpusUrl(target, "replace");
       }
-      const params = target ? `?swarm=${encodeURIComponent(target)}` : "";
-      const response = await fetch(`/api/swarm${params}`, { cache: "no-store" });
-      if (!response.ok) throw new Error(`state endpoint returned ${response.status}`);
-      setState((await response.json()) as SwarmState);
+      const targetSummary = list.find((swarm) => swarm.id === target);
+      const revision = targetSummary?.revision ?? 0;
+      if (target && loadedRevision.current[target] !== revision) {
+        const params = `?swarm=${encodeURIComponent(target)}`;
+        const response = await fetch(`/api/swarm${params}`, { cache: "no-store" });
+        if (!response.ok) throw new Error(`state endpoint returned ${response.status}`);
+        setState((await response.json()) as SwarmState);
+        loadedRevision.current[target] = revision;
+      }
       setConnected(true);
     } catch {
       setConnected(false);
