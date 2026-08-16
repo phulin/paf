@@ -773,6 +773,14 @@ class StateStore:
             for run_id in recent_run_ids
             if (activity := self.activities.get(run_id)) is not None
         }
+        tasks_value = snapshot.get("tasks")
+        if isinstance(tasks_value, dict):
+            for task in tasks_value.values():
+                if not isinstance(task, dict):
+                    continue
+                work_unit_id = str(task.get("work_unit_id", ""))
+                task["work_unit_usage"] = self._usage_dict(self.invocation_usage(work_unit_id))
+                task["work_unit_cost"] = self.invocation_cost(work_unit_id).as_dict()
         return snapshot
 
     def dashboard_delta(self, change: ChangeSet) -> dict[str, Any]:
@@ -781,7 +789,16 @@ class StateStore:
         task_keys = sorted(
             key for key, task in self.tasks.items() if task.chapter_id in change.work_units
         )
-        tasks = {key: self._hot_task_dict(self.tasks[key]) for key in task_keys}
+        tasks = {
+            key: self._hot_task_dict(self.tasks[key])
+            | {
+                "work_unit_usage": self._usage_dict(
+                    self.invocation_usage(self.tasks[key].work_unit_id)
+                ),
+                "work_unit_cost": self.invocation_cost(self.tasks[key].work_unit_id).as_dict(),
+            }
+            for key in task_keys
+        }
         active_run_ids = sorted(self._active_run_ids)
         run_ids = set(change.runs) | set(active_run_ids)
         run_ids.update(

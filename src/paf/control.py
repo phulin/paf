@@ -124,7 +124,7 @@ class ControlServer:
         return bool(self.result)
 
     def request_stop(self) -> None:
-        self.orchestrator.control.stop()
+        self.orchestrator.control.stop(integrate_interrupted_workspaces=True)
         if self.pipeline_task is not None and not self.pipeline_task.done():
             self.pipeline_task.cancel()
 

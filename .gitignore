@@ -1,6 +1,8 @@
 /Mathlib/
 /.paf/
 /.venv/
+/target/
+*.so
 __pycache__/
 *.py[cod]
 .pytest_cache/

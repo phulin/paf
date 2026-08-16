@@ -7,13 +7,14 @@ requires-python = ">=3.12"
 dependencies = [
   "lean-lsp-mcp==0.29.0",
   "orjson>=3.11.0",
+  "rich>=14.0.0",
   "starlette>=0.47.0",
-  "textual>=6.0.0",
   "uvicorn>=0.35.0",
 ]
 
 [project.scripts]
 paf = "paf.cli:main"
+paf-tui = "paf.tui:main"
 
 [dependency-groups]
 dev = [
@@ -27,27 +28,15 @@ dev = [
 ]
 
 [build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+requires = ["maturin>=1.11,<2.0"]
+build-backend = "maturin"
 
-[tool.hatch.build]
-# These non-Python resources are runtime inputs. The ignored frontend bundle is
-# generated before a release build; listing it as an artifact includes it in
-# wheels and source distributions without committing it to Git.
-artifacts = [
-  "src/paf/prompts/*.md",
-  "src/paf/web_dist/**",
-]
-
-[tool.hatch.build.targets.wheel]
-packages = ["src/paf"]
-
-[tool.hatch.build.targets.sdist]
-include = [
-  "/README.md",
-  "/pyproject.toml",
-  "/src/paf",
-]
+[tool.maturin]
+python-source = "src"
+module-name = "paf._rust_tui"
+features = ["pyo3/extension-module"]
+include = ["src/paf/prompts/*.md", "src/paf/web_dist/**"]
+strip = true
 
 [tool.pytest.ini_options]
 addopts = "-q"

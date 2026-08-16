@@ -778,6 +778,7 @@ class ActivityStore:
 
     def _notify_visible_change(self, activity: AgentActivity) -> None:
         visible = (
+            activity.sequence,
             activity.current,
             activity.current_kind,
             activity.latest_error,

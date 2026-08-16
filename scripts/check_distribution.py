@@ -70,16 +70,29 @@ def check_archive(path: Path) -> list[str]:
         problems.append("missing web_dist/assets")
     if any("node_modules/" in name for name in names):
         problems.append("archive unexpectedly contains node_modules")
+    if path.suffix == ".whl" and not any(
+        name.startswith(suffix) and "_rust_tui" in name and name.endswith(".so") for name in names
+    ):
+        problems.append("missing native Rust TUI extension")
+    if path.name.endswith(".tar.gz"):
+        for relative in ("Cargo.toml", "Cargo.lock", "src/lib.rs", "src/runtime.rs", "src/ui.rs"):
+            if not any(name.endswith("/" + relative) for name in names):
+                problems.append(f"missing Rust source {relative}")
 
     try:
         if path.suffix == ".whl":
             entry_points = archive_bytes(path, ".dist-info/entry_points.txt").decode()
-            if "paf = paf.cli:main" not in entry_points:
+            compact_entry_points = entry_points.replace(" ", "")
+            if "paf=paf.cli:main" not in compact_entry_points:
                 problems.append("wheel console entry point is not paf = paf.cli:main")
+            if "paf-tui=paf.tui:main" not in compact_entry_points:
+                problems.append("wheel console entry point is not paf-tui = paf.tui:main")
         else:
             pyproject = archive_bytes(path, "/pyproject.toml").decode()
             if 'paf = "paf.cli:main"' not in pyproject:
                 problems.append("sdist console entry point is not paf = paf.cli:main")
+            if 'paf-tui = "paf.tui:main"' not in pyproject:
+                problems.append("sdist console entry point is not paf-tui = paf.tui:main")
     except (KeyError, UnicodeDecodeError, ValueError) as error:
         problems.append(f"cannot verify console entry point: {error}")
     return problems

@@ -204,9 +204,16 @@ For a zero-config corpus, `--target` selects the generated Lean namespace root. 
 enclosing Lake project and derives the module prefix from the target path, so the last command
 above writes inferred book modules beneath `lean/Stacks/` with the `Stacks` namespace.
 
-The TUI is the default for stage and pipeline runs. Add `--no-tui` for CI, a process supervisor, or
-log-only operation. Add `--force` to rerun tasks already persisted as successful. Without `--force`,
-successful stages are resumable and skipped.
+The native Rust TUI is the default for stage and pipeline runs. It runs as a separate process from
+the Python orchestrator and consumes the same bounded dashboard model as the web UI over a
+versioned Unix-socket protocol. The server sends one initial snapshot, then pushes coalesced task,
+agent-activity, and global-state deltas directly from the in-process change bus; the TUI does not
+poll SQLite or repeatedly request full snapshots. Press `Enter` or `i` to inspect the selected
+agent, `p` to pause or resume scheduling, and `q` to stop workers, integrate interrupted workspace
+changes, and return to the shell.
+
+Add `--no-tui` for CI, a process supervisor, or log-only operation. Add `--force` to rerun tasks
+already persisted as successful. Without `--force`, successful stages are resumable and skipped.
 
 Inspect durable status without starting or mutating a run:
 
@@ -243,7 +250,9 @@ agent/build diagnostics, blocked dependents, and persisted state path to standar
 
 ## Frontend release bundle
 
-Node is needed only by contributors rebuilding the React app. After changing `web/src`, frontend
+Rust is compiled into release wheels by Maturin. Contributors installing from a source checkout
+therefore need a Rust toolchain; users installing a wheel do not. Node is needed only by
+contributors rebuilding the React app. After changing `web/src`, frontend
 configuration, or npm package metadata, prepare and verify the package assets with:
 
 ```console

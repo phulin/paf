@@ -1,0 +1,35 @@
+[package]
+name = "paf-tui"
+version = "0.7.0"
+edition = "2024"
+include = [
+  "/Cargo.lock",
+  "/Cargo.toml",
+  "/README.md",
+  "/pyproject.toml",
+  "/src/*.rs",
+  "/src/paf/**/*.py",
+  "/src/paf/**/*.md",
+  "/src/paf/web_dist/**",
+]
+license = "MIT"
+rust-version = "1.88"
+description = "Native terminal dashboard for PAF"
+
+[lib]
+name = "_rust_tui"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+anyhow = "1.0.100"
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "serde"] }
+crossterm = "0.29.0"
+pyo3 = { version = "0.29.2", features = ["abi3-py312"] }
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm", "layout-cache"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.149"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+strip = true

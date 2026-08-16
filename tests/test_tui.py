@@ -1,59 +1,28 @@
 import asyncio
-import json
-from dataclasses import replace
+import fcntl
+import os
+import pty
+import struct
+import subprocess
+import sys
+import termios
 from pathlib import Path
-from typing import Any, cast
-
-import pytest
-from textual.pilot import Pilot
-from textual.widgets import DataTable, RichLog, Static, Tab, TabbedContent, Tabs, TextArea
 
 import paf.tui as tui_module
 from paf.config import load_config
-from paf.isolation import IsolationResult
-from paf.models import Stage
-from paf.scheduler import Orchestrator
-from paf.state import ChangeSet, StateStore, TaskPhase, TaskStatus, TokenUsage
-from paf.tui import (
+from paf.control import ControlServer, control_socket
+from paf.display import (
     ACTIVITY_KIND_ALIASES,
     ACTIVITY_KIND_DISPLAYS,
-    TUI_THEME,
-    AgentDetailScreen,
-    FixedGridDataTable,
-    SwarmApp,
     activity_kind_badge,
     activity_kind_display,
-    format_agent_update,
     format_count,
     format_usage,
-    stage_counts,
-    task_mark,
 )
+from paf.models import Stage
+from paf.scheduler import Orchestrator
+from paf.state import StateStore, TokenUsage
 from tests.support import write_project
-
-
-@pytest.fixture(autouse=True)
-def fast_tui_clock(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Exercise timer behavior without paying production UI delays."""
-
-    # Periodic refreshes are tested by invoking the callback after mutating
-    # state.  Keeping the real timer dormant avoids a permanently busy Textual
-    # message queue, which makes every pilot idle barrier hit its timeout.
-    monkeypatch.setattr(tui_module, "REFRESH_INTERVAL_SECONDS", 3_600.0)
-    monkeypatch.setattr(tui_module, "DASHBOARD_FRAME_INTERVAL_SECONDS", 0.01)
-    monkeypatch.setattr(tui_module, "SUCCESS_EXIT_DELAY_SECONDS", 0.001)
-    monkeypatch.setattr(tui_module, "FAILURE_EXIT_DELAY_SECONDS", 0.001)
-
-    async def settle(pilot: Pilot[Any], _delay: float | None = None) -> None:
-        # Textual's default idle heuristic may wait a full second while RichLog
-        # is rendering. Two message barriers around one short timer tick provide
-        # the deterministic ordering these tests need without polling CPU load.
-        await pilot._wait_for_screen()
-        await asyncio.sleep(0.2)
-        pilot.app.screen._on_timer_update()
-        await pilot._wait_for_screen()
-
-    monkeypatch.setattr(Pilot, "pause", settle)
 
 
 def test_activity_kinds_have_short_unique_labels_and_colors() -> None:
@@ -81,7 +50,6 @@ def test_activity_kinds_have_short_unique_labels_and_colors() -> None:
     )
     assert set(ACTIVITY_KIND_ALIASES.values()) <= set(ACTIVITY_KIND_DISPLAYS)
     assert activity_kind_display("compaction") == activity_kind_display("context_compaction")
-
     badge = activity_kind_badge("command_execution")
     assert badge.plain == "[bash]"
     assert "#2ac3de" in str(badge.style)
@@ -89,7 +57,6 @@ def test_activity_kinds_have_short_unique_labels_and_colors() -> None:
 
 def test_unknown_activity_kind_gets_a_bounded_neutral_badge() -> None:
     display = activity_kind_display("future_extremely_long_event_kind")
-
     assert display.label == "future-extr…"
     assert display.color == "#a9b1d6"
 
@@ -102,818 +69,110 @@ def test_formats_measured_token_spend_without_double_counting_cache() -> None:
         reasoning_output_tokens=20_000,
         measured=True,
     )
-
     rendered = format_usage(usage)
-
     assert "1.30m" in rendered
     assert "cached 1.00m" in rendered
     assert format_count(999) == "999"
 
 
-@pytest.mark.asyncio
-async def test_pending_prerequisite_work_is_visible_and_counted(tmp_path: Path) -> None:
-    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+def test_native_entry_point_forwards_connection_options(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    received: list[tuple[str, str, str]] = []
+
+    def native_run(socket_path: str, label: str, warning: str) -> bool:
+        received.append((socket_path, label, warning))
+        return True
+
+    monkeypatch.setattr(tui_module, "_native_run", native_run)
+    assert (
+        tui_module.main(
+            ["--socket", "/tmp/paf.sock", "--label", "review", "--startup-warning", "rg"]
+        )
+        == 0
+    )
+    assert received == [("/tmp/paf.sock", "review", "rg")]
+
+
+async def test_dashboard_projection_includes_ordered_units_and_bounded_activity(
+    tmp_path: Path,
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
     state = StateStore(config)
     await state.load_or_create()
     chapter = config.chapters[0]
-    await state.set_task(
-        chapter.id,
-        Stage.PROVE,
-        TaskStatus.PENDING,
-        "waiting for a durable green review",
-    )
+    run = await state.start_run(chapter.id, Stage.REVIEW)
+    activity = state.activities.start(run.id, chapter.id, Stage.REVIEW.value)
+    activity.current = "checking theorem signatures"
+    state.activities.save(activity)
 
-    task = state.task(chapter.id, Stage.PROVE)
-    assert task_mark(task) == "· pending"
-    assert stage_counts(state, Stage.PROVE)["pending"] == 1
+    snapshot = state.dashboard_snapshot()
 
-    await state.set_task(
-        chapter.id,
-        Stage.PROVE,
-        TaskStatus.PENDING,
-        "queued for prove agent",
-        queued=True,
-    )
-
-    assert task_mark(task) == "· queued"
-    assert stage_counts(state, Stage.PROVE)["pending"] == 0
-    assert stage_counts(state, Stage.PROVE)["queued"] == 1
-    assert state.hot_snapshot()["tasks"][f"{chapter.id}:prove"]["queued"] is True
-
-    await state.set_task(
-        chapter.id,
-        Stage.PROVE,
-        TaskStatus.RUNNING,
-        "postprocessing completed prove agent result",
-    )
-
-    assert task.phase == TaskPhase.POSTPROCESS
-    assert task_mark(task) == "◇ postprocess"
-    assert stage_counts(state, Stage.PROVE)["postprocess"] == 1
-    assert state.hot_snapshot()["tasks"][f"{chapter.id}:prove"]["phase"] == "postprocess"
-
-
-def test_formats_structured_agent_update_as_summary_and_issues() -> None:
-    update = json.dumps(
-        {
-            "changed": True,
-            "complete": False,
-            "summary": "Added the missing theorem.",
-            "issues": ["The downstream proof still needs repair.", "Confirm the new import."],
-        }
-    )
-
-    rendered = format_agent_update(update, heading="LATEST AGENT UPDATE", width=60)
-    lines = rendered.splitlines()
-
-    assert lines[0].startswith("LATEST AGENT UPDATE")
-    assert lines[0].endswith("CHANGED ✓")
-    assert len(lines[0]) == 60
-    assert lines[1:] == [
-        "Added the missing theorem.",
-        "ISSUES",
-        "  • The downstream proof still needs repair.",
-        "  • Confirm the new import.",
+    assert [unit["id"] for unit in snapshot["work_units"]] == [
+        chapter.id for chapter in config.chapters
     ]
+    assert snapshot["activities"][run.id]["current"] == "checking theorem signatures"
+    task = snapshot["tasks"][f"{chapter.id}:review"]
+    assert "work_unit_usage" in task
+    assert "work_unit_cost" in task
 
 
-def test_formats_unchanged_agent_update_with_an_empty_issue_list() -> None:
-    update = json.dumps({"changed": False, "summary": "No edit was needed.", "issues": []})
-
-    rendered = format_agent_update(update, heading="agent update", width=32, indent="    ")
-
-    assert rendered.splitlines() == [
-        "agent update           CHANGED ✗",
-        "    No edit was needed.",
-        "    ISSUES",
-        "      • None reported",
-    ]
-
-
-def test_keeps_changed_status_on_heading_line_at_narrow_width() -> None:
-    update = json.dumps({"changed": False, "summary": "No edit was needed.", "issues": []})
-
-    rendered = format_agent_update(update, heading="LATEST AGENT UPDATE", width=24)
-    lines = rendered.splitlines()
-
-    assert lines[0] == "LATEST AGENT … CHANGED ✗"
-    assert len(lines[0]) == 24
-    assert lines[1] == "No edit was needed."
-
-
-@pytest.mark.asyncio
-async def test_dashboard_runs_an_operation_and_exits(tmp_path: Path) -> None:
+async def test_native_tui_connects_renders_and_exits_with_pipeline(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
     state = StateStore(config)
     orchestrator = Orchestrator(config, state)
 
     async def operation() -> bool:
+        # Leave enough time for the native child to subscribe and render its first frame.
+        await asyncio.sleep(0.5)
         return True
 
-    app = SwarmApp(orchestrator, operation, label="test")
-    async with app.run_test() as pilot:
-        await pilot.pause()
-        usage = app.query_one("#usage", Static).content
-        table = app.query_one("#tasks", DataTable)
-        chapter_column = next(
-            column for column in table.columns.values() if column.label.plain == "Chapter"
+    server = ControlServer(orchestrator, operation)
+    server_task = asyncio.create_task(server.run())
+    for _ in range(100):
+        if control_socket(config.settings.state_dir).exists():
+            break
+        await asyncio.sleep(0.01)
+    else:
+        raise AssertionError("control socket was not created")
+
+    master, slave = pty.openpty()
+    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 180, 0, 0))
+    try:
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "paf.tui",
+                "--socket",
+                str(control_socket(config.settings.state_dir)),
+                "--label",
+                "native smoke test",
+            ],
+            stdin=slave,
+            stdout=slave,
+            stderr=slave,
+            close_fds=True,
         )
-
-    assert app.result, repr(app.fatal_error)
-    assert isinstance(table, FixedGridDataTable)
-    assert all(not column.auto_width for column in table.columns.values())
-    assert all(row.height == 1 and not row.auto_height for row in table.rows.values())
-    assert chapter_column.width == 40
-    assert "API-equivalent cost" in str(usage)
-    assert "lifetime tokens" in str(usage)
-    assert "Lean MCP: on" in str(usage)
-    assert "Codex access: full" in str(usage)
-
-
-def test_dashboard_inherits_terminal_theme(tmp_path: Path) -> None:
-    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
-    orchestrator = Orchestrator(config, StateStore(config))
-
-    async def operation() -> bool:
-        return True
-
-    app = SwarmApp(orchestrator, operation, label="test")
-
-    assert app.theme == TUI_THEME
-    assert TUI_THEME in app.available_themes
-
-
-def test_dashboard_sorts_documents_and_units_by_source_order(tmp_path: Path) -> None:
-    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
-    template_book = config.books[0]
-    template_chapters = config.chapters
-    book02 = replace(template_book, id="book02", depends_on=("book10",))
-    book10 = replace(template_book, id="book10")
-    chapters = (
-        replace(template_chapters[0], book_id="book10"),
-        replace(
-            template_chapters[1],
-            book_id="book02",
-            depends_on_books=("book10",),
-            source_span=template_chapters[0].source_span,
-        ),
-        replace(
-            template_chapters[0],
-            book_id="book02",
-            depends_on_books=("book10",),
-            source_span=template_chapters[1].source_span,
-        ),
-    )
-    config = replace(config, books=(book10, book02), chapters=chapters)
-    orchestrator = Orchestrator(config, StateStore(config))
-
-    async def operation() -> bool:
-        return True
-
-    app = SwarmApp(orchestrator, operation, label="test")
-
-    assert orchestrator.statement_schedule.order == ("book10", "book02")
-    assert [chapter.id for chapter in app.chapters] == [
-        "book10/chapter-01",
-        "book02/chapter-02",
-        "book02/chapter-01",
-    ]
-
-
-@pytest.mark.asyncio
-async def test_dashboard_partial_refresh_uses_source_order(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
-    state = StateStore(config)
-    orchestrator = Orchestrator(config, state)
-    ready = asyncio.Event()
-    finish = asyncio.Event()
-
-    async def operation() -> bool:
-        ready.set()
-        await finish.wait()
-        return True
-
-    app = SwarmApp(orchestrator, operation, label="test")
-    async with app.run_test() as pilot:
-        await ready.wait()
-        rendered: list[str] = []
-        original = app._row_values
-
-        def row_values(work_unit: Any) -> tuple[str, ...]:
-            rendered.append(work_unit.id)
-            return original(work_unit)
-
-        monkeypatch.setattr(app, "_row_values", row_values)
-
-        class NoFullScan(tuple[Any, ...]):
-            def __iter__(self):  # type: ignore[no-untyped-def]
-                raise AssertionError("partial refresh scanned every work unit")
-
-        app.work_units = cast(Any, NoFullScan(app.work_units))
-        app.refresh_dashboard(
-            {config.chapters[1].id, config.chapters[0].id},
-            globals_changed=False,
-        )
-
-        assert rendered == [config.chapters[0].id, config.chapters[1].id]
-        finish.set()
-        await pilot.pause()
-
-
-@pytest.mark.asyncio
-async def test_dashboard_keeps_startup_warning_visible(tmp_path: Path) -> None:
-    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
-    orchestrator = Orchestrator(config, StateStore(config))
-
-    async def operation() -> bool:
-        return True
-
-    app = SwarmApp(
-        orchestrator,
-        operation,
-        label="test",
-        startup_warning="ripgrep (`rg`) was not found on PATH",
-    )
-    async with app.run_test() as pilot:
-        await pilot.pause()
-        warning = app.query_one("#startup-warning", Static).content
-
-    assert "ripgrep (`rg`) was not found" in str(warning)
-
-
-@pytest.mark.asyncio
-async def test_quit_drains_pipeline_before_app_exit(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
-    orchestrator = Orchestrator(config, StateStore(config))
-    started = asyncio.Event()
-    operation_cleaned = asyncio.Event()
-    shutdown_finished = asyncio.Event()
-    original_shutdown = orchestrator.shutdown
-
-    async def operation() -> bool:
-        started.set()
-        try:
-            await asyncio.Future()
-        finally:
-            operation_cleaned.set()
-        return False
-
-    async def shutdown() -> None:
-        await original_shutdown()
-        shutdown_finished.set()
-
-    monkeypatch.setattr(orchestrator, "shutdown", shutdown)
-    app = SwarmApp(orchestrator, operation, label="test")
-    async with app.run_test() as pilot:
-        await started.wait()
-        assert str(app.query_one("#status", Static).content) == "Running test…"
-        await pilot.press("q")
-
-    assert operation_cleaned.is_set()
-    assert shutdown_finished.is_set()
-
-
-@pytest.mark.asyncio
-async def test_quit_integrates_partial_changes_from_active_isolated_agent(tmp_path: Path) -> None:
-    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
-    orchestrator = Orchestrator(config, StateStore(config))
-    chapter = config.chapters[0]
-    relative = Path("lean/Book/Chapter01.lean")
-    isolated_root = tmp_path / "isolated"
-    isolated_path = isolated_root / relative
-    isolated_path.parent.mkdir(parents=True)
-    started = asyncio.Event()
-
-    class EditingExecutor:
-        async def prepare(self) -> None:
-            return
-
-        async def run(self, *_args: object, workspace_root: Path, **_kwargs: object) -> None:
-            assert workspace_root == isolated_root
-            isolated_path.write_text("def partial := 1\n", encoding="utf-8")
-            started.set()
-            await asyncio.Future()
-
-    class Workspace:
-        root = isolated_root
-        closed = False
-        collected = False
-
-        async def collect(
-            self,
-            _chapter: object,
-            *,
-            integration_lock: asyncio.Lock | None = None,
-        ) -> IsolationResult:
-            self.collected = True
-            if integration_lock is not None:
-                await integration_lock.acquire()
+    finally:
+        os.close(slave)
+    output = b""
+    try:
+        return_code = await asyncio.to_thread(process.wait, 5)
+        os.set_blocking(master, False)
+        while True:
             try:
-                destination = config.settings.repo / relative
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                destination.write_text(isolated_path.read_text(encoding="utf-8"), encoding="utf-8")
-            finally:
-                if integration_lock is not None:
-                    integration_lock.release()
-            return IsolationResult(
-                accepted=True,
-                generation=0,
-                changed_paths=(relative.as_posix(),),
-            )
-
-        async def close(self) -> None:
-            self.closed = True
-
-    workspace = Workspace()
-
-    class Isolation:
-        name = "fuse-overlay"
-
-        async def prepare(self) -> None:
-            return
-
-        async def acquire(self, _run_id: str) -> Workspace:
-            return workspace
-
-        async def close(self) -> None:
-            assert workspace.closed
-
-    orchestrator.executor = cast(Any, EditingExecutor())
-    orchestrator.isolation = cast(Any, Isolation())
-
-    async def operation() -> bool:
-        await orchestrator._attempt(chapter, Stage.FORMALIZE)
-        return True
-
-    app = SwarmApp(orchestrator, operation, label="test")
-    async with app.run_test() as pilot:
-        await started.wait()
-        await pilot.press("q")
-
-    assert workspace.collected
-    assert workspace.closed
-    assert (config.settings.repo / relative).read_text(encoding="utf-8") == "def partial := 1\n"
-    run = orchestrator.state.task(chapter.id, Stage.FORMALIZE).runs[-1]
-    assert run.status == TaskStatus.INTERRUPTED
-    assert orchestrator.state.task(chapter.id, Stage.FORMALIZE).status == TaskStatus.INTERRUPTED
-    assert run.isolation is not None
-    assert run.isolation["accepted"] is True
-    assert run.isolation["interrupted"] is True
-    assert run.isolation["changed_paths"] == [relative.as_posix()]
-
-
-@pytest.mark.asyncio
-async def test_unexpected_pipeline_cancellation_is_retained_as_fatal_error(tmp_path: Path) -> None:
-    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
-    orchestrator = Orchestrator(config, StateStore(config))
-
-    async def operation() -> bool:
-        raise asyncio.CancelledError("worker infrastructure cancelled the pipeline")
-
-    app = SwarmApp(orchestrator, operation, label="test")
-    async with app.run_test():
-        await app.workers.wait_for_complete()
-        assert isinstance(app.fatal_error, asyncio.CancelledError)
-        assert "worker infrastructure" in str(app.fatal_error)
-
-
-@pytest.mark.asyncio
-async def test_agent_detail_can_switch_between_chapter_steps(tmp_path: Path) -> None:
-    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
-    state = StateStore(config)
-    orchestrator = Orchestrator(config, state)
-    ready = asyncio.Event()
-    finish = asyncio.Event()
-
-    async def record_update(run_id: str, text: str) -> None:
-        activity = state.activities.start(run_id, config.chapters[0].id, Stage.FORMALIZE.value)
-        activity.consume(
-            {
-                "type": "item.completed",
-                "item": {"id": "message", "type": "agent_message", "text": text},
-            },
-            workspace_root=tmp_path,
-        )
-        state.activities.save(activity)
-
-    async def operation() -> bool:
-        first = await state.start_run(config.chapters[0].id, Stage.FORMALIZE)
-        first_prompt = state.logs_dir / f"{first.id}.prompt.md"
-        first_prompt.write_text("first formalization prompt", encoding="utf-8")
-        await state.update_run(
-            first,
-            usage=TokenUsage(input_tokens=1_000, output_tokens=100, measured=True),
-        )
-        await record_update(first.id, "formalization update")
-        await state.finish_run(first, status=TaskStatus.SUCCEEDED)
-
-        second = await state.start_run(config.chapters[0].id, Stage.REVIEW)
-        second_prompt = state.logs_dir / f"{second.id}.prompt.md"
-        second_prompt.write_text("second review prompt", encoding="utf-8")
-        await state.update_run(
-            second,
-            usage=TokenUsage(input_tokens=2_000, output_tokens=200, measured=True),
-        )
-        await record_update(
-            second.id,
-            json.dumps(
-                {
-                    "changed": False,
-                    "complete": True,
-                    "summary": "review update",
-                    "issues": [
-                        "One issue for display.",
-                        "A second issue forces vertical scrolling.",
-                        "A third issue keeps the scrollbar visible.",
-                    ],
-                }
-            ),
-        )
-        ready.set()
-        await finish.wait()
-        return True
-
-    app = SwarmApp(orchestrator, operation, label="test")
-    async with app.run_test(size=(100, 30)) as pilot:
-        await ready.wait()
-        app.action_inspect_agent()
-        await pilot.pause()
-
-        screen = app.screen
-        assert isinstance(screen, AgentDetailScreen)
-        screen.refresh_agent()
-        await pilot.pause()
-        run_tabs = screen.query_one("#run-tabs", Tabs)
-        assert run_tabs.tab_count == 2
-        assert [tab.label_text for tab in run_tabs.query(Tab)] == [
-            "✓ Step 1 · Formalize round 1",
-            "▶ Step 2 · Review round 1",
-        ]
-        assert run_tabs.active == "agent-step-2"
-        assert "review round 1" in str(screen.query_one("#agent-heading", Static).content)
-        summary = screen.query_one("#agent-summary", RichLog)
-        rendered_summary = "\n".join(line.text for line in summary.lines)
-        assert "review update" in rendered_summary
-        assert "CHANGED ✗" in rendered_summary
-        assert "• One issue for display." in rendered_summary
-        assert '"changed"' not in rendered_summary
-        assert summary.show_vertical_scrollbar
-        assert summary.lines[0].text.endswith("CHANGED ✗")
-        assert summary.lines[0].cell_length == summary.scrollable_size.width
-        timeline = screen.query_one("#agent-timeline", RichLog)
-        rendered_timeline = "\n".join(line.text for line in timeline.lines)
-        assert "CHANGED ✗" in rendered_timeline
-        assert "• One issue for display." in rendered_timeline
-        assert '"changed"' not in rendered_timeline
-
-        agent_tabs = screen.query_one("#agent-tabs", TabbedContent)
-        agent_tabs.active = "prompt-pane"
-        await pilot.pause()
-        prompt = screen.query_one("#agent-prompt", TextArea)
-        assert prompt.text == "second review prompt"
-
-        run_tabs.active = "agent-step-1"
-        await pilot.pause()
-
-        heading = str(screen.query_one("#agent-heading", Static).content)
-        assert "step 1 of 2" in heading
-        assert "formalize round 1" in heading
-        assert "formalization update" in "".join(line.text for line in summary.lines)
-        assert "tokens 1.1k" in str(screen.query_one("#agent-spend", Static).content)
-        assert prompt.text == "first formalization prompt"
-
-        await pilot.press("escape")
-        finish.set()
-        await pilot.pause()
-
-
-@pytest.mark.asyncio
-async def test_agent_detail_refreshes_plan_from_live_activity(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
-    state = StateStore(config)
-    orchestrator = Orchestrator(config, state)
-    ready = asyncio.Event()
-    update_plan = asyncio.Event()
-    plan_updated = asyncio.Event()
-    finish = asyncio.Event()
-
-    initial_plan = [
-        {"text": "Inspect the current behavior", "completed": False},
-        {"text": "Implement the fix", "completed": False},
-    ]
-    revised_plan = [
-        {"text": "Inspect the current behavior", "completed": True},
-        {"text": "Implement the fix", "completed": False},
-    ]
-
-    def plan_event(items: list[dict[str, Any]]) -> dict[str, Any]:
-        return {
-            "type": "item.completed",
-            "item": {"id": "plan", "type": "todo_list", "items": items},
-        }
-
-    async def operation() -> bool:
-        run = await state.start_run(config.chapters[0].id, Stage.FORMALIZE)
-        activity = state.activities.start(run.id, run.chapter_id, run.stage)
-        initial_event = plan_event(initial_plan)
-        activity.consume(initial_event, workspace_root=tmp_path)
-        log_path = state.logs_dir / f"{run.id}.jsonl"
-        log_path.write_text(json.dumps(initial_event) + "\n", encoding="utf-8")
-        await state.update_run(run, log_path=str(log_path))
-        state.activities.save(activity)
-        ready.set()
-
-        await update_plan.wait()
-        revised_event = plan_event(revised_plan)
-        with log_path.open("a", encoding="utf-8") as log:
-            log.write(json.dumps(revised_event) + "\n")
-        activity.consume(revised_event, workspace_root=tmp_path)
-        state.activities.save(activity)
-        plan_updated.set()
-        await finish.wait()
-        return True
-
-    app = SwarmApp(orchestrator, operation, label="test")
-    async with app.run_test(size=(100, 30)) as pilot:
-        await ready.wait()
-        app.action_inspect_agent()
-        await pilot.pause()
-
-        agent_tabs = app.screen.query_one("#agent-tabs", TabbedContent)
-        agent_tabs.active = "plan-pane"
-        await pilot.pause()
-        plan = app.screen.query_one("#agent-plan", RichLog)
-        assert [line.text for line in plan.lines] == [
-            "· Inspect the current behavior",
-            "· Implement the fix",
-        ]
-
-        agent_tabs.active = "timeline-pane"
-        cast(AgentDetailScreen, app.screen).refresh_agent()
-        await pilot.pause()
-        timeline = app.screen.query_one("#agent-timeline", RichLog)
-        original_clear = timeline.clear
-        timeline_clears = 0
-
-        def clear_timeline() -> None:
-            nonlocal timeline_clears
-            timeline_clears += 1
-            original_clear()
-
-        monkeypatch.setattr(timeline, "clear", clear_timeline)
-
-        update_plan.set()
-        await plan_updated.wait()
-        cast(AgentDetailScreen, app.screen).refresh_agent()
-        await pilot.pause()
-
-        assert [line.text for line in plan.lines] == [
-            "✓ Inspect the current behavior",
-            "· Implement the fix",
-        ]
-        assert timeline_clears == 0
-        assert any("plan updated (1/2 complete)" in line.text for line in timeline.lines)
-
-        await pilot.press("escape")
-        finish.set()
-        await pilot.pause()
-
-
-@pytest.mark.asyncio
-async def test_unchanged_dashboard_does_not_update_table_cells(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
-    orchestrator = Orchestrator(config, StateStore(config))
-    ready = asyncio.Event()
-    finish = asyncio.Event()
-
-    async def operation() -> bool:
-        ready.set()
-        await finish.wait()
-        return True
-
-    app = SwarmApp(orchestrator, operation, label="test")
-    async with app.run_test() as pilot:
-        await ready.wait()
-        app.refresh_dashboard()
-        table = app.query_one("#tasks", DataTable)
-        original = table.update_cell
-        updates = 0
-
-        def update_cell(*args: Any, **kwargs: Any) -> None:
-            nonlocal updates
-            updates += 1
-            original(*args, **kwargs)
-
-        monkeypatch.setattr(table, "update_cell", update_cell)
-
-        app.refresh_dashboard()
-        app.refresh_dashboard()
-
-        assert updates == 0
-        finish.set()
-        await pilot.pause()
-
-
-@pytest.mark.asyncio
-async def test_fixed_dashboard_cell_update_retains_the_table_cache_generation(
-    tmp_path: Path,
-) -> None:
-    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
-    orchestrator = Orchestrator(config, StateStore(config))
-    ready = asyncio.Event()
-    finish = asyncio.Event()
-
-    async def operation() -> bool:
-        ready.set()
-        await finish.wait()
-        return True
-
-    app = SwarmApp(orchestrator, operation, label="test")
-    async with app.run_test(size=(180, 40)) as pilot:
-        await ready.wait()
-        await pilot.pause()
-        table = app.query_one("#tasks", FixedGridDataTable)
-        generation = table._update_count
-        chapter_id = config.chapters[0].id
-
-        table.update_cell(chapter_id, "book", "updated-book")
-
-        assert table._update_count == generation
-        assert table.get_cell(chapter_id, "book") == "updated-book"
-        assert "updated-book" in table.render_line(table.header_height).text
-        finish.set()
-        await pilot.pause()
-
-
-@pytest.mark.asyncio
-async def test_dashboard_change_bus_updates_only_the_changed_row(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
-    state = StateStore(config)
-    orchestrator = Orchestrator(config, state)
-    ready = asyncio.Event()
-    finish = asyncio.Event()
-
-    async def operation() -> bool:
-        ready.set()
-        await finish.wait()
-        return True
-
-    app = SwarmApp(orchestrator, operation, label="test")
-    async with app.run_test() as pilot:
-        await ready.wait()
-        rendered: list[str] = []
-        original = app._row_values
-
-        def row_values(work_unit: Any) -> tuple[str, ...]:
-            rendered.append(work_unit.id)
-            return original(work_unit)
-
-        monkeypatch.setattr(app, "_row_values", row_values)
-        changed = config.chapters[1]
-        await state.set_task(
-            changed.id,
-            Stage.PROVE,
-            TaskStatus.PENDING,
-            "waiting for an upstream declaration",
-        )
-        await asyncio.sleep(0.1)
-
-        assert rendered == [changed.id]
-        finish.set()
-        await pilot.pause()
-
-
-@pytest.mark.asyncio
-async def test_dashboard_coalesces_change_bursts_into_one_frame(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
-    state = StateStore(config)
-    orchestrator = Orchestrator(config, state)
-    ready = asyncio.Event()
-    finish = asyncio.Event()
-
-    async def operation() -> bool:
-        ready.set()
-        await finish.wait()
-        return True
-
-    app = SwarmApp(orchestrator, operation, label="test")
-    async with app.run_test() as pilot:
-        await ready.wait()
-        refreshes: list[tuple[set[str], bool]] = []
-        original = app.refresh_dashboard
-
-        def refresh_dashboard(work_units: Any = None, *, globals_changed: bool = True) -> None:
-            refreshes.append((set(work_units or ()), globals_changed))
-            original(work_units, globals_changed=globals_changed)
-
-        monkeypatch.setattr(app, "refresh_dashboard", refresh_dashboard)
-        for revision in range(20):
-            state.change_bus.publish(
-                ChangeSet(
-                    revision=revision,
-                    work_units=frozenset({config.chapters[revision % 2].id}),
-                    globals=frozenset({"activity"}),
-                )
-            )
-        await asyncio.sleep(0.05)
-
-        assert refreshes == [({chapter.id for chapter in config.chapters}, True)]
-        finish.set()
-        await pilot.pause()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("build_mode", ["streaming", "global"])
-async def test_dashboard_separates_agents_queues_and_coordinator_builds(
-    tmp_path: Path, build_mode: str
-) -> None:
-    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
-    state = StateStore(config)
-    orchestrator = Orchestrator(config, state)
-    ready = asyncio.Event()
-    finish_build = asyncio.Event()
-    build_finished = asyncio.Event()
-    finish = asyncio.Event()
-
-    async def operation() -> bool:
-        await state.start_run(config.chapters[0].id, Stage.FORMALIZE)
-        await state.set_task(
-            config.chapters[1].id,
-            Stage.FORMALIZE,
-            TaskStatus.PENDING,
-            "waiting for a fresh build",
-        )
-        await state.set_task(
-            config.chapters[1].id,
-            Stage.REVIEW,
-            TaskStatus.RUNNING,
-            "queued for review",
-        )
-        await state.start_coordinator_build(
-            mode=build_mode,
-            stage=Stage.FORMALIZE,
-            iteration=2,
-            maximum_iterations=6,
-            total=81,
-            target_chapter_ids=(config.chapters[1].id,),
-        )
-        await state.advance_coordinator_build(
-            chapter_id=config.chapters[1].id,
-            completed=20,
-        )
-        state.append_coordinator_build_output("Building dependency graph\n")
-        state.append_coordinator_build_output("Compiling Book.Chapter02\n")
-        state.append_coordinator_build_output("error: Book/Chapter02.lean:3:1: broken\n")
-        state.append_coordinator_build_output("warning: Book/Chapter02.lean:4:1: unused\n")
-        ready.set()
-        await finish_build.wait()
-        await state.finish_coordinator_build()
-        build_finished.set()
-        await finish.wait()
-        return True
-
-    app = SwarmApp(orchestrator, operation, label="test")
-    async with app.run_test(size=(180, 50)) as pilot:
-        await ready.wait()
-        app.refresh_dashboard()
-
-        usage = str(app.query_one("#usage", Static).content)
-        assert "Agents 1/44 · discovery 0/40 · mutating 1/4 · formalize 1 · queued 0" in usage
-        assert f"Coordinator {build_mode} build 20/81 · iter 2/6" in usage
-        assert "err 1 · warn 1" in usage
-        status = str(app.query_one("#status", Static).content)
-        build_label = "GLOBAL BUILD" if build_mode == "global" else "BUILD"
-        assert f"{build_label} [" in status
-        assert "20/81 (25%) · iter 2/6" in status
-        assert "err 1 · warn 1" in status
-        assert "book/chapter-02" in status
-        assert "Building dependency graph" in status
-        assert "Compiling Book.Chapter02" in status
-        formalize = str(app.query_one("#stage-formalize", Static).content)
-        assert "agent 1 · postprocess 0 · building 1" in formalize
-        review = str(app.query_one("#stage-review", Static).content)
-        assert "agent 0 · postprocess 1 · building 0" in review
-        row = app._row_values(config.chapters[1])
-        assert row[4] == "◆ building"
-        assert row[5] == "◇ postprocess"
-        assert row[8] == f"{build_mode} coordinator build"
-
-        finish_build.set()
-        await build_finished.wait()
-        app.refresh_dashboard()
-        assert str(app.query_one("#status", Static).content) == "Running test…"
-
-        finish.set()
-        await pilot.pause()
+                chunk = os.read(master, 65_536)
+            except BlockingIOError:
+                break
+            except OSError:
+                break
+            if not chunk:
+                break
+            output += chunk
+    finally:
+        os.close(master)
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+
+    assert return_code == 0, output.decode(errors="replace")
+    assert await server_task

@@ -33,6 +33,7 @@ from importlib.resources import files
 from pathlib import Path
 
 import paf
+from paf import _rust_tui
 from paf.codex import COMMON_PROMPT_PATH, PROOF_REVIEW_PROMPT_PATH
 from paf.config import load_config, standard_prompt_path
 from paf.models import Stage
@@ -43,7 +44,9 @@ package = files("paf")
 prompts = files("paf.prompts")
 web = package.joinpath("web_dist")
 origin = Path(paf.__file__).resolve()
+native_origin = Path(_rust_tui.__file__).resolve()
 assert origin.is_relative_to(environment.resolve()), origin
+assert native_origin.is_relative_to(environment.resolve()), native_origin
 assert not origin.is_relative_to(checkout.resolve()), origin
 for stage in Stage:
     expected = prompts.joinpath(f"{stage.value}.md")

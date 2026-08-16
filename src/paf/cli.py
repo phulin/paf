@@ -31,6 +31,7 @@ from paf.corpus import (
     scheduling_snapshot,
     scheduling_summary,
 )
+from paf.display import activity_kind_badge, format_count, format_usage
 from paf.isolation import fuse_overlay_available
 from paf.models import PipelineConfig, Stage, WorkUnitLike
 from paf.pricing import LEGACY_MODEL, CostEstimate, estimate_cost, format_usd
@@ -44,7 +45,7 @@ from paf.state_db import (
     read_full_snapshot,
     read_source_issues,
 )
-from paf.tui import activity_kind_badge, format_count, format_usage, run_tui
+from paf.tui import run_tui
 
 RIPGREP_WARNING = (
     "ripgrep (`rg`) was not found on PATH. Swarm agents rely on fast source search and may be "
