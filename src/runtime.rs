@@ -104,7 +104,7 @@ pub fn run(socket_path: &str, label: &str, startup_warning: &str) -> Result<TuiE
     loop {
         if dirty {
             terminal
-                .draw(|frame| ui::draw(frame, &model))
+                .draw(|frame| ui::draw(frame, &mut model))
                 .context("terminal draw failed")?;
         }
         match receiver.recv_timeout(Duration::from_secs(1)) {
@@ -114,7 +114,7 @@ pub fn run(socket_path: &str, label: &str, startup_warning: &str) -> Result<TuiE
                 model.apply(event)?;
                 dirty = true;
                 if complete {
-                    terminal.draw(|frame| ui::draw(frame, &model))?;
+                    terminal.draw(|frame| ui::draw(frame, &mut model))?;
                     return Ok(TuiExit::Complete(model.result.unwrap_or(false)));
                 }
             }
@@ -232,8 +232,7 @@ fn handle_terminal_event(
         }
         KeyCode::Char('i') | KeyCode::Enter => {
             if model.selected_row().is_some() {
-                model.detail = true;
-                model.scroll = 0;
+                model.enter_detail();
             }
             Ok(true)
         }
@@ -287,7 +286,7 @@ fn handle_mouse_event(mouse: MouseEvent, model: &mut DashboardModel) -> bool {
         _ => return false,
     };
     if model.detail {
-        model.scroll = model.scroll.saturating_add_signed(delta as i16);
+        model.scroll_detail(delta as i16);
     } else {
         model.move_selection(delta);
     }
@@ -297,16 +296,16 @@ fn handle_mouse_event(mouse: MouseEvent, model: &mut DashboardModel) -> bool {
 fn handle_detail_key(key: KeyEvent, model: &mut DashboardModel) -> Result<bool> {
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') => {
-            model.detail = false;
-            model.scroll = 0;
+            model.leave_detail();
         }
         KeyCode::Tab => model.cycle_tab(key.modifiers.contains(KeyModifiers::SHIFT)),
         KeyCode::BackTab => model.cycle_tab(true),
-        KeyCode::Up | KeyCode::Char('k') => model.scroll = model.scroll.saturating_sub(1),
-        KeyCode::Down | KeyCode::Char('j') => model.scroll = model.scroll.saturating_add(1),
-        KeyCode::PageUp => model.scroll = model.scroll.saturating_sub(10),
-        KeyCode::PageDown => model.scroll = model.scroll.saturating_add(10),
-        KeyCode::Home => model.scroll = 0,
+        KeyCode::Up | KeyCode::Char('k') => model.scroll_detail(-1),
+        KeyCode::Down | KeyCode::Char('j') => model.scroll_detail(1),
+        KeyCode::PageUp => model.scroll_detail(-10),
+        KeyCode::PageDown => model.scroll_detail(10),
+        KeyCode::Home => model.scroll_detail_home(),
+        KeyCode::End => model.scroll_detail_end(),
         _ => return Ok(false),
     }
     Ok(true)
@@ -377,11 +376,56 @@ mod tests {
         assert_eq!(model.selected, 0);
 
         model.detail = true;
+        model.detail_max_scroll = 20;
         model.scroll = 9;
+        model.detail_follow_tail = false;
         handle_terminal_event(wheel(MouseEventKind::ScrollUp), &mut model, "/unused").unwrap();
         assert_eq!(model.scroll, 6);
         handle_terminal_event(wheel(MouseEventKind::ScrollDown), &mut model, "/unused").unwrap();
         assert_eq!(model.scroll, 9);
+
+        model.scroll = model.detail_max_scroll;
+        handle_terminal_event(wheel(MouseEventKind::ScrollDown), &mut model, "/unused").unwrap();
+        assert_eq!(model.scroll, model.detail_max_scroll);
+        assert!(model.detail_follow_tail);
+    }
+
+    #[test]
+    fn detail_scrollback_pauses_and_resumes_tail_following() {
+        let mut model = DashboardModel::loading("test".into(), String::new());
+        model.enter_detail();
+
+        model.sync_detail_viewport(20);
+        assert_eq!(model.scroll, 20);
+        assert!(model.detail_follow_tail);
+
+        handle_detail_key(
+            KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
+            &mut model,
+        )
+        .unwrap();
+        assert_eq!(model.scroll, 10);
+        assert!(!model.detail_follow_tail);
+
+        model.sync_detail_viewport(25);
+        assert_eq!(model.scroll, 10, "new messages must not move scrollback");
+
+        handle_detail_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE), &mut model).unwrap();
+        assert_eq!(model.scroll, 25);
+        assert!(model.detail_follow_tail);
+
+        model.sync_detail_viewport(30);
+        assert_eq!(model.scroll, 30, "a pinned view follows new messages");
+
+        handle_detail_key(
+            KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
+            &mut model,
+        )
+        .unwrap();
+        assert_eq!(
+            model.scroll, 30,
+            "scrolling cannot expose space below the log"
+        );
     }
 
     #[test]

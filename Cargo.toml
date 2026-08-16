@@ -25,7 +25,7 @@ anyhow = "1.0.100"
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "serde"] }
 crossterm = "0.29.0"
 pyo3 = { version = "0.29.2", features = ["abi3-py312"] }
-ratatui = { version = "0.30.2", default-features = false, features = ["crossterm", "layout-cache"] }
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm", "layout-cache", "unstable-rendered-line-info"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.149"
 

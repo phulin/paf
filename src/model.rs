@@ -244,6 +244,8 @@ pub struct DashboardModel {
     pub detail: bool,
     pub detail_tab: DetailTab,
     pub scroll: u16,
+    pub detail_max_scroll: u16,
+    pub detail_follow_tail: bool,
     pub label: String,
     pub startup_warning: String,
     pub stopping: bool,
@@ -261,6 +263,8 @@ impl DashboardModel {
             detail: false,
             detail_tab: DetailTab::default(),
             scroll: 0,
+            detail_max_scroll: 0,
+            detail_follow_tail: true,
             label,
             startup_warning,
             stopping: false,
@@ -406,6 +410,53 @@ impl DashboardModel {
         };
         self.detail_tab = DetailTab::ALL[next];
         self.scroll = 0;
+        self.detail_max_scroll = 0;
+        self.detail_follow_tail = true;
+    }
+
+    pub fn enter_detail(&mut self) {
+        self.detail = true;
+        self.scroll = 0;
+        self.detail_max_scroll = 0;
+        self.detail_follow_tail = true;
+    }
+
+    pub fn leave_detail(&mut self) {
+        self.detail = false;
+        self.scroll = 0;
+        self.detail_max_scroll = 0;
+        self.detail_follow_tail = true;
+    }
+
+    pub fn sync_detail_viewport(&mut self, maximum: u16) {
+        self.detail_max_scroll = maximum;
+        if self.detail_follow_tail {
+            self.scroll = maximum;
+        } else {
+            self.scroll = self.scroll.min(maximum);
+        }
+    }
+
+    pub fn scroll_detail(&mut self, delta: i16) {
+        self.scroll = self
+            .scroll
+            .saturating_add_signed(delta)
+            .min(self.detail_max_scroll);
+        if self.scroll < self.detail_max_scroll {
+            self.detail_follow_tail = false;
+        } else if delta > 0 {
+            self.detail_follow_tail = true;
+        }
+    }
+
+    pub fn scroll_detail_home(&mut self) {
+        self.scroll = 0;
+        self.detail_follow_tail = self.detail_max_scroll == 0;
+    }
+
+    pub fn scroll_detail_end(&mut self) {
+        self.scroll = self.detail_max_scroll;
+        self.detail_follow_tail = true;
     }
 
     pub fn build_targets(&self) -> HashSet<&str> {

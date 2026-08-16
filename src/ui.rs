@@ -20,7 +20,7 @@ const PURPLE: Color = Color::Rgb(187, 154, 247);
 const MUTED: Color = Color::Rgb(169, 177, 214);
 const SURFACE: Color = Color::Rgb(36, 40, 59);
 
-pub fn draw(frame: &mut Frame<'_>, model: &DashboardModel) {
+pub fn draw(frame: &mut Frame<'_>, model: &mut DashboardModel) {
     if model.detail {
         draw_detail(frame, model);
     } else {
@@ -481,7 +481,7 @@ fn draw_status(frame: &mut Frame<'_>, model: &DashboardModel, area: Rect) {
     }
 }
 
-fn draw_detail(frame: &mut Frame<'_>, model: &DashboardModel) {
+fn draw_detail(frame: &mut Frame<'_>, model: &mut DashboardModel) {
     let Some(row) = model.selected_row() else {
         frame.render_widget(Paragraph::new("No work unit selected"), frame.area());
         return;
@@ -551,7 +551,8 @@ fn draw_detail(frame: &mut Frame<'_>, model: &DashboardModel) {
             .block(Block::default().borders(Borders::BOTTOM)),
         layout[2],
     );
-    draw_detail_content(frame, model, activity, layout[3]);
+    let text = detail_text(model.detail_tab, activity);
+    draw_detail_content(frame, model, text, layout[3]);
     frame.render_widget(
         Paragraph::new("Tab/Shift-Tab switch  ↑↓ scroll  r reload TUI  Esc/q back")
             .style(Style::default().fg(MUTED))
@@ -562,17 +563,39 @@ fn draw_detail(frame: &mut Frame<'_>, model: &DashboardModel) {
 
 fn draw_detail_content(
     frame: &mut Frame<'_>,
-    model: &DashboardModel,
-    activity: Option<&Activity>,
+    model: &mut DashboardModel,
+    text: Text<'static>,
     area: Rect,
 ) {
-    let text = match (model.detail_tab, activity) {
+    let block = Block::default().borders(Borders::ALL);
+    let inner = block.inner(area);
+    let paragraph = Paragraph::new(text).wrap(Wrap { trim: false });
+    let line_count = paragraph.line_count(inner.width);
+    let maximum = line_count
+        .saturating_sub(inner.height as usize)
+        .min(u16::MAX as usize) as u16;
+    model.sync_detail_viewport(maximum);
+    frame.render_widget(paragraph.scroll((model.scroll, 0)).block(block), area);
+    if maximum > 0 {
+        let mut scrollbar = ScrollbarState::new(line_count)
+            .position(model.scroll as usize)
+            .viewport_content_length(inner.height as usize);
+        frame.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight),
+            area,
+            &mut scrollbar,
+        );
+    }
+}
+
+fn detail_text(tab: DetailTab, activity: Option<&Activity>) -> Text<'static> {
+    match (tab, activity) {
         (_, None) => Text::from("No activity recorded for the latest run."),
         (DetailTab::Timeline, Some(activity)) => Text::from(
             activity
                 .recent
                 .iter()
-                .map(|entry| {
+                .flat_map(|entry| {
                     let clock = entry.at.get(11..19).unwrap_or(&entry.at);
                     let mark = match entry.status.as_str() {
                         "started" => "▶",
@@ -580,12 +603,7 @@ fn draw_detail_content(
                         "failed" => "✗",
                         _ => "•",
                     };
-                    let detail = if entry.detail.is_empty() {
-                        String::new()
-                    } else {
-                        format!("\n    {}", entry.detail.replace('\n', "\n    "))
-                    };
-                    Line::from(vec![
+                    let mut lines = vec![Line::from(vec![
                         Span::raw(format!("{clock} {mark} ")),
                         Span::styled(
                             format!("[{}]", activity_kind(&entry.kind)),
@@ -593,8 +611,15 @@ fn draw_detail_content(
                                 .fg(kind_color(&entry.kind))
                                 .add_modifier(Modifier::BOLD),
                         ),
-                        Span::raw(format!(" {}{detail}", entry.title)),
-                    ])
+                        Span::raw(format!(" {}", entry.title)),
+                    ])];
+                    lines.extend(
+                        entry
+                            .detail
+                            .lines()
+                            .map(|detail| Line::from(format!("    {detail}"))),
+                    );
+                    lines
                 })
                 .collect::<Vec<_>>(),
         ),
@@ -603,11 +628,21 @@ fn draw_detail_content(
                 "LATEST AGENT UPDATE",
                 Style::default().fg(CYAN).add_modifier(Modifier::BOLD),
             )];
-            lines.extend(activity.latest_summary.lines().map(Line::from));
+            lines.extend(
+                activity
+                    .latest_summary
+                    .lines()
+                    .map(|line| Line::from(line.to_owned())),
+            );
             if !activity.latest_error.is_empty() {
                 lines.push(Line::from(""));
                 lines.push(Line::styled("LATEST ERROR", Style::default().fg(RED)));
-                lines.extend(activity.latest_error.lines().map(Line::from));
+                lines.extend(
+                    activity
+                        .latest_error
+                        .lines()
+                        .map(|line| Line::from(line.to_owned())),
+                );
             }
             Text::from(lines)
         }
@@ -631,22 +666,6 @@ fn draw_detail_content(
                 .map(|path| Line::from(format!("• {path}")))
                 .collect::<Vec<_>>(),
         ),
-    };
-    let line_count = text.height();
-    frame.render_widget(
-        Paragraph::new(text)
-            .scroll((model.scroll, 0))
-            .wrap(Wrap { trim: false })
-            .block(Block::default().borders(Borders::ALL)),
-        area,
-    );
-    if line_count > area.height.saturating_sub(2) as usize {
-        let mut scrollbar = ScrollbarState::new(line_count).position(model.scroll as usize);
-        frame.render_stateful_widget(
-            Scrollbar::new(ScrollbarOrientation::VerticalRight),
-            area,
-            &mut scrollbar,
-        );
     }
 }
 
@@ -791,7 +810,9 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     use super::*;
-    use crate::model::{DashboardModel, PROTOCOL_VERSION, Preparation, Task, WireEvent, WorkUnit};
+    use crate::model::{
+        ActivityEntry, DashboardModel, PROTOCOL_VERSION, Preparation, Task, WireEvent, WorkUnit,
+    };
 
     #[test]
     fn renders_preparation_progress_as_a_modal() {
@@ -814,7 +835,7 @@ mod tests {
             .unwrap();
         let backend = TestBackend::new(100, 24);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| draw(frame, &model)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut model)).unwrap();
         let rendered = terminal.backend().to_string();
         assert!(rendered.contains("Preparing PAF"));
         assert!(rendered.contains("Preparing isolated workspaces and Lean caches"));
@@ -853,19 +874,108 @@ mod tests {
             .unwrap();
         let backend = TestBackend::new(180, 40);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| draw(frame, &model)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut model)).unwrap();
         let dashboard = terminal.backend().to_string();
         assert!(dashboard.contains("PAF · review stage"));
         assert!(dashboard.contains("editing theorem"));
         assert!(dashboard.contains("install rg"));
         assert!(dashboard.contains("reload TUI"));
 
-        model.detail = true;
-        terminal.draw(|frame| draw(frame, &model)).unwrap();
+        model.enter_detail();
+        terminal.draw(|frame| draw(frame, &mut model)).unwrap();
         let detail = terminal.backend().to_string();
         assert!(detail.contains("Agent detail"));
         assert!(detail.contains("[edit] success"));
         assert!(detail.contains("reload TUI"));
+    }
+
+    #[test]
+    fn agent_detail_enters_at_the_tail_and_uses_wrapped_viewport_bounds() {
+        let mut model = DashboardModel::loading("review stage".into(), String::new());
+        model.preparation = None;
+        model.state.work_units.push(WorkUnit {
+            id: "book/chapter-01".into(),
+            document_id: "book".into(),
+            title: "Opening".into(),
+            ordinal: 1,
+            ..WorkUnit::default()
+        });
+        model.state.tasks.insert(
+            "book/chapter-01:review".into(),
+            Task {
+                work_unit_id: "book/chapter-01".into(),
+                stage: "review".into(),
+                latest_run_id: Some("run-1".into()),
+                ..Task::default()
+            },
+        );
+        model.state.activities.insert(
+            "run-1".into(),
+            Activity {
+                run_id: "run-1".into(),
+                recent: (0..20)
+                    .map(|sequence| ActivityEntry {
+                        sequence,
+                        at: "2026-08-16T00:00:00+00:00".into(),
+                        kind: "message".into(),
+                        status: "completed".into(),
+                        title: format!("event-{sequence:02}"),
+                        detail: String::new(),
+                    })
+                    .collect(),
+                ..Activity::default()
+            },
+        );
+        model.enter_detail();
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| draw(frame, &mut model)).unwrap();
+
+        let rendered = terminal.backend().to_string();
+        assert!(model.detail_max_scroll > 0);
+        assert_eq!(model.scroll, model.detail_max_scroll);
+        assert!(rendered.contains("event-19"));
+        assert!(!rendered.contains("event-00"));
+
+        let previous_tail = model.scroll;
+        model
+            .state
+            .activities
+            .get_mut("run-1")
+            .unwrap()
+            .recent
+            .push(ActivityEntry {
+                sequence: 20,
+                at: "2026-08-16T00:00:01+00:00".into(),
+                kind: "message".into(),
+                status: "completed".into(),
+                title: "event-20".into(),
+                detail: String::new(),
+            });
+        terminal.draw(|frame| draw(frame, &mut model)).unwrap();
+        assert!(model.scroll > previous_tail);
+        assert!(terminal.backend().to_string().contains("event-20"));
+
+        model.scroll_detail(-3);
+        let scrollback = model.scroll;
+        model
+            .state
+            .activities
+            .get_mut("run-1")
+            .unwrap()
+            .recent
+            .push(ActivityEntry {
+                sequence: 21,
+                at: "2026-08-16T00:00:02+00:00".into(),
+                kind: "message".into(),
+                status: "completed".into(),
+                title: "event-21".into(),
+                detail: String::new(),
+            });
+        terminal.draw(|frame| draw(frame, &mut model)).unwrap();
+        assert_eq!(model.scroll, scrollback);
+        assert!(!model.detail_follow_tail);
     }
 
     #[test]
@@ -899,7 +1009,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
 
         let started = Instant::now();
-        terminal.draw(|frame| draw(frame, &model)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut model)).unwrap();
         let elapsed = started.elapsed();
 
         assert!(
