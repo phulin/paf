@@ -289,6 +289,12 @@ async def test_dashboard_partial_refresh_uses_source_order(
             return original(work_unit)
 
         monkeypatch.setattr(app, "_row_values", row_values)
+
+        class NoFullScan(tuple[Any, ...]):
+            def __iter__(self):  # type: ignore[no-untyped-def]
+                raise AssertionError("partial refresh scanned every work unit")
+
+        app.work_units = cast(Any, NoFullScan(app.work_units))
         app.refresh_dashboard(
             {config.chapters[1].id, config.chapters[0].id},
             globals_changed=False,

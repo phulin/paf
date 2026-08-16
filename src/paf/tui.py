@@ -843,6 +843,7 @@ class SwarmApp(App[bool]):
             )
         )
         self._work_units_by_id = {unit.id: unit for unit in self.work_units}
+        self._work_unit_order = {unit.id: index for index, unit in enumerate(self.work_units)}
 
     @property
     def chapters(self) -> tuple[WorkUnitLike, ...]:
@@ -984,7 +985,13 @@ class SwarmApp(App[bool]):
             selected = self.work_units
         else:
             requested = {item if isinstance(item, str) else item.id for item in work_units}
-            selected = tuple(item for item in self.work_units if item.id in requested)
+            selected = tuple(
+                self._work_units_by_id[item]
+                for item in sorted(
+                    requested.intersection(self._work_units_by_id),
+                    key=self._work_unit_order.__getitem__,
+                )
+            )
         self._refresh_rows(selected)
         if globals_changed:
             self._refresh_globals()
