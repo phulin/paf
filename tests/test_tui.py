@@ -13,7 +13,7 @@ from paf.config import load_config
 from paf.isolation import IsolationResult
 from paf.models import Stage
 from paf.scheduler import Orchestrator
-from paf.state import StateStore, TaskPhase, TaskStatus, TokenUsage
+from paf.state import ChangeSet, StateStore, TaskPhase, TaskStatus, TokenUsage
 from paf.tui import (
     ACTIVITY_KIND_ALIASES,
     ACTIVITY_KIND_DISPLAYS,
@@ -40,6 +40,7 @@ def fast_tui_clock(monkeypatch: pytest.MonkeyPatch) -> None:
     # state.  Keeping the real timer dormant avoids a permanently busy Textual
     # message queue, which makes every pilot idle barrier hit its timeout.
     monkeypatch.setattr(tui_module, "REFRESH_INTERVAL_SECONDS", 3_600.0)
+    monkeypatch.setattr(tui_module, "DASHBOARD_FRAME_INTERVAL_SECONDS", 0.01)
     monkeypatch.setattr(tui_module, "SUCCESS_EXIT_DELAY_SECONDS", 0.001)
     monkeypatch.setattr(tui_module, "FAILURE_EXIT_DELAY_SECONDS", 0.001)
 
@@ -757,6 +758,47 @@ async def test_dashboard_change_bus_updates_only_the_changed_row(
         await asyncio.sleep(0.1)
 
         assert rendered == [changed.id]
+        finish.set()
+        await pilot.pause()
+
+
+@pytest.mark.asyncio
+async def test_dashboard_coalesces_change_bursts_into_one_frame(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    ready = asyncio.Event()
+    finish = asyncio.Event()
+
+    async def operation() -> bool:
+        ready.set()
+        await finish.wait()
+        return True
+
+    app = SwarmApp(orchestrator, operation, label="test")
+    async with app.run_test() as pilot:
+        await ready.wait()
+        refreshes: list[tuple[set[str], bool]] = []
+        original = app.refresh_dashboard
+
+        def refresh_dashboard(work_units: Any = None, *, globals_changed: bool = True) -> None:
+            refreshes.append((set(work_units or ()), globals_changed))
+            original(work_units, globals_changed=globals_changed)
+
+        monkeypatch.setattr(app, "refresh_dashboard", refresh_dashboard)
+        for revision in range(20):
+            state.change_bus.publish(
+                ChangeSet(
+                    revision=revision,
+                    work_units=frozenset({config.chapters[revision % 2].id}),
+                    globals=frozenset({"activity"}),
+                )
+            )
+        await asyncio.sleep(0.05)
+
+        assert refreshes == [({chapter.id for chapter in config.chapters}, True)]
         finish.set()
         await pilot.pause()
 

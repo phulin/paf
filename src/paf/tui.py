@@ -38,6 +38,7 @@ from paf.state import RunRecord, StateStore, TaskPhase, TaskRecord, TaskStatus, 
 TUI_THEME = "ansi-dark"
 MAX_TIMELINE_EVENTS = 10_000
 REFRESH_INTERVAL_SECONDS = 1.0
+DASHBOARD_FRAME_INTERVAL_SECONDS = 0.2
 SUCCESS_EXIT_DELAY_SECONDS = 1.0
 FAILURE_EXIT_DELAY_SECONDS = 2.0
 
@@ -980,12 +981,18 @@ class SwarmApp(App[bool]):
         try:
             while True:
                 change = await self._change_queue.get()
-                await asyncio.sleep(0.05)
                 work_unit_ids = set(change.work_units)
                 globals_changed = bool(change.globals)
                 full_resync = change.full_resync
-                while not self._change_queue.empty():
-                    item = self._change_queue.get_nowait()
+                deadline = asyncio.get_running_loop().time() + DASHBOARD_FRAME_INTERVAL_SECONDS
+                while True:
+                    remaining = deadline - asyncio.get_running_loop().time()
+                    if remaining <= 0:
+                        break
+                    try:
+                        item = await asyncio.wait_for(self._change_queue.get(), remaining)
+                    except TimeoutError:
+                        break
                     work_unit_ids.update(item.work_units)
                     globals_changed = globals_changed or bool(item.globals)
                     full_resync = full_resync or item.full_resync
