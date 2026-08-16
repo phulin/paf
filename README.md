@@ -509,7 +509,7 @@ inferred corpora use a deterministic `.paf/corpus-<id>/`. `state.sqlite3` is the
 database. Documents, work units, tasks, runs, globals, and issue/request records occupy normalized
 rows. Mutations enqueue immutable deltas to one background writer, which coalesces a short window and
 updates only changed rows. Immutable run payloads are loaded only for inspection or a full `snapshot`
-request. `state.json` is a compatibility export generated at startup migration, explicit snapshot,
+request. `state.json` is a compatibility export generated at process startup, explicit snapshot,
 and clean shutdown; it is not rewritten during live state transitions.
 
 On the first load of a pre-SQLite state directory, the orchestrator imports every run and source
