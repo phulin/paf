@@ -233,8 +233,9 @@ reviewed textbook patch; swarm workers do not rewrite the Markdown automatically
 `--chapter N` selects that chapter number in every selected book. Use the full chapter id when a
 number would be ambiguous.
 
-CLI overrides such as `--model`, `--reasoning-effort`, and `--max-agents` work with both inferred and
-configured runs. `--isolation auto|fuse-overlay|shared` selects the execution backend.
+CLI overrides such as `--model`, `--reasoning-effort`, `--max-agents`, and
+`--discover-max-agents` work with both inferred and configured runs.
+`--isolation auto|fuse-overlay|shared` selects the execution backend.
 
 After a foreground TUI closes with a failed result, the CLI prints the failed task details, compact
 agent/build diagnostics, blocked dependents, and persisted state path to standard output.
@@ -311,7 +312,8 @@ An MCP/LSP process exists per active proof attempt, not per queued agent. Its im
 from a read-only snapshot of the coordinator cache taken when the attempt starts, while its document
 state remains private. No new attempt snapshot is created during a merge/build transaction, so it
 cannot pair newly merged sources with stale artifacts. Consequently `max_agents` also bounds the
-number of concurrent Lean language servers.
+number of concurrent Lean language servers. Discovery uses the separate
+`stages.discover.max_agents` pool and does not consume these mutating-agent slots.
 
 ## Agent-managed background mode
 
@@ -455,7 +457,8 @@ TUI, persisted snapshot, and agent-control JSON expose the priority order, ranks
 
 The dashboard shows:
 
-- the live-agent total against `max_agents`, broken down by stage;
+- the live-agent total against the combined discovery and mutating limits, broken down by stage and
+  concurrency pool;
 - the active coordinator build's mode, stage, iteration, target progress, current chapter, owner, and
   queued build count;
 - aggregate `pending`, `queued`, `running`, `succeeded`, `failed`, `blocked`, and `interrupted`
@@ -638,6 +641,7 @@ the swarm model and reasoning effort unless the stage has an override; discovery
 
 ```toml
 [stages.discover]
+max_agents = 40 # discovery-only pool; other stages share swarm.max_agents
 model = "gpt-5.6-luna"
 reasoning_effort = "medium"
 

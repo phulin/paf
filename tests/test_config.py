@@ -33,6 +33,7 @@ def test_discovers_chapters_and_renders_paths(tmp_path: Path) -> None:
     assert config.model_for(Stage.FORMALIZE) == config.settings.model
     assert config.reasoning_effort_for(Stage.FORMALIZE) == config.settings.reasoning_effort
     assert config.settings.state_dir == tmp_path / ".paf"
+    assert config.stages[Stage.DISCOVER].max_agents == 40
     assert config.settings.lean_project == Path("lean")
     assert config.settings.lean_mcp_tool_timeout_seconds == 300
     assert config.settings.capacity_resume_attempts == 10
@@ -42,6 +43,26 @@ def test_discovers_chapters_and_renders_paths(tmp_path: Path) -> None:
     assert config.settings.codex_fd_recycle_attempts == 20
     assert config.settings.sandbox == "danger-full-access"
     assert config.settings.cache_compaction_layers == 32
+
+
+def test_loads_and_validates_discovery_concurrency(tmp_path: Path) -> None:
+    path = write_project(tmp_path)
+    path.write_text(
+        path.read_text(encoding="utf-8").replace(
+            'prompt = "prompts/discover.md"',
+            'prompt = "prompts/discover.md"\nmax_agents = 12',
+        ),
+        encoding="utf-8",
+    )
+
+    assert load_config(path).stages[Stage.DISCOVER].max_agents == 12
+
+    path.write_text(
+        path.read_text(encoding="utf-8").replace("max_agents = 12", "max_agents = 0"),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match=r"stages\.discover\.max_agents"):
+        load_config(path)
 
 
 def test_selects_configured_chapters(tmp_path: Path) -> None:

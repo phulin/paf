@@ -1200,9 +1200,15 @@ class StateStore:
                     by_stage[run.stage] += 1
                     role = run.role or run.stage
                     by_role[role] = by_role.get(role, 0) + 1
+        discovery_max_agents = self.config.stages[Stage.DISCOVER].max_agents
+        assert discovery_max_agents is not None
         self._agent_summary_cache = {
             "active": sum(by_stage.values()),
-            "maximum": self.config.settings.max_agents,
+            "maximum": discovery_max_agents + self.config.settings.max_agents,
+            "maximum_by_pool": {
+                "discover": discovery_max_agents,
+                "mutating": self.config.settings.max_agents,
+            },
             "queued": sum(task.queued for task in self.tasks.values()),
             "by_stage": by_stage,
             "by_role": by_role,

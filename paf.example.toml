@@ -43,6 +43,7 @@ mcp_tool_timeout_seconds = 300
 # scope = ["lean/Formalization/Flat/Opening.lean"]
 
 [stages.discover]
+max_agents = 40
 model = "gpt-5.6-luna"
 reasoning_effort = "medium"
 max_rounds = 1

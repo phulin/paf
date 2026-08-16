@@ -99,6 +99,11 @@ def _add_overrides(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--reasoning-effort", help="override the configured reasoning effort")
     parser.add_argument("--max-agents", type=int, help="override the concurrency cap")
     parser.add_argument(
+        "--discover-max-agents",
+        type=int,
+        help="override the discovery-only concurrency cap",
+    )
+    parser.add_argument(
         "--isolation",
         choices=("auto", "fuse-overlay", "shared"),
         help="execution isolation backend",
@@ -296,13 +301,17 @@ def _config_from_args(args: argparse.Namespace) -> PipelineConfig:
     model = getattr(args, "model", None)
     reasoning_effort = getattr(args, "reasoning_effort", None)
     max_agents = getattr(args, "max_agents", None)
+    discover_max_agents = getattr(args, "discover_max_agents", None)
     isolation = getattr(args, "isolation", None)
     if max_agents is not None and max_agents < 1:
         raise ValueError("--max-agents must be positive")
+    if discover_max_agents is not None and discover_max_agents < 1:
+        raise ValueError("--discover-max-agents must be positive")
     if (
         model is not None
         or reasoning_effort is not None
         or max_agents is not None
+        or discover_max_agents is not None
         or isolation is not None
     ):
         settings = replace(
@@ -320,6 +329,11 @@ def _config_from_args(args: argparse.Namespace) -> PipelineConfig:
                     reasoning_effort
                     if reasoning_effort is not None
                     else stage_settings.reasoning_effort
+                ),
+                max_agents=(
+                    discover_max_agents
+                    if stage is Stage.DISCOVER and discover_max_agents is not None
+                    else stage_settings.max_agents
                 ),
             )
             for stage, stage_settings in config.stages.items()
@@ -376,8 +390,11 @@ def print_plan(config: PipelineConfig, console: Console) -> None:
     if isolation == "auto":
         isolation = "fuse-overlay" if fuse_overlay_available() else "shared"
     console.print(f"[bold]Repository:[/bold] {config.settings.repo}")
+    discovery_max_agents = config.stages[Stage.DISCOVER].max_agents
+    assert discovery_max_agents is not None
     console.print(
-        f"[bold]Concurrency:[/bold] {config.settings.max_agents} agents/builds  "
+        f"[bold]Concurrency:[/bold] {discovery_max_agents} discovery agents, "
+        f"{config.settings.max_agents} shared mutating agents  "
         f"[bold]State:[/bold] {config.settings.state_dir}"
     )
     console.print(
@@ -813,6 +830,8 @@ def _agent_source_args(args: argparse.Namespace) -> list[str]:
         values.extend(["--reasoning-effort", args.reasoning_effort])
     if args.max_agents is not None:
         values.extend(["--max-agents", str(args.max_agents)])
+    if args.discover_max_agents is not None:
+        values.extend(["--discover-max-agents", str(args.discover_max_agents)])
     if args.isolation is not None:
         values.extend(["--isolation", args.isolation])
     return values

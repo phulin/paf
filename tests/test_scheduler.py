@@ -1787,6 +1787,76 @@ async def test_agent_summary_separates_started_and_queued_runs(tmp_path: Path) -
 
 
 @pytest.mark.asyncio
+async def test_discovery_uses_a_separate_agent_pool(tmp_path: Path) -> None:
+    config_path = write_project(tmp_path, chapters="chapters = [1, 2, 3]")
+    source = tmp_path / "books" / "book.md"
+    source.write_text(
+        source.read_text(encoding="utf-8") + "\n## 3. Third chapter\n",
+        encoding="utf-8",
+    )
+    config = load_config(config_path)
+    config = replace(
+        config,
+        settings=replace(config.settings, max_agents=1),
+        stages={
+            **config.stages,
+            Stage.DISCOVER: replace(config.stages[Stage.DISCOVER], max_agents=1),
+        },
+    )
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await orchestrator.prepare()
+    discovery_started = asyncio.Event()
+    formalize_started = asyncio.Event()
+    release_discovery = asyncio.Event()
+    release_formalize = asyncio.Event()
+    starts: list[tuple[Stage, int]] = []
+
+    class GatedExecutor(CodexExecutor):
+        async def run(
+            self,
+            chapter: Chapter,
+            stage: Stage,
+            run: RunRecord,
+            *,
+            feedback: str = "",
+            workspace_root: Path | None = None,
+        ) -> AgentResult:
+            del feedback, workspace_root
+            starts.append((stage, chapter.number))
+            if stage is Stage.DISCOVER and chapter.number == 1:
+                discovery_started.set()
+                await release_discovery.wait()
+            elif stage is Stage.FORMALIZE:
+                formalize_started.set()
+                await release_formalize.wait()
+            agent = result(changed=False)
+            await state.finish_run(run, status=TaskStatus.SUCCEEDED)
+            return agent
+
+    orchestrator.executor = GatedExecutor(config, state)
+    first_discovery = asyncio.create_task(orchestrator._attempt(config.chapters[0], Stage.DISCOVER))
+    await discovery_started.wait()
+    second_discovery = asyncio.create_task(
+        orchestrator._attempt(config.chapters[1], Stage.DISCOVER)
+    )
+    formalize = asyncio.create_task(orchestrator._attempt(config.chapters[2], Stage.FORMALIZE))
+    await formalize_started.wait()
+    await asyncio.sleep(0)
+
+    assert (Stage.DISCOVER, 2) not in starts
+    summary = state.agent_summary()
+    assert summary["by_stage"]["discover"] == 1
+    assert summary["by_stage"]["formalize"] == 1
+    assert summary["maximum_by_pool"] == {"discover": 1, "mutating": 1}
+
+    release_formalize.set()
+    release_discovery.set()
+    await asyncio.gather(first_discovery, second_discovery, formalize)
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_changed_review_is_rebuilt_fixed_and_reviewed_again(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

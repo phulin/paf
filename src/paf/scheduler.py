@@ -338,6 +338,9 @@ class Orchestrator:
         )
         self.state.scheduling = self.scheduling_snapshot()
         self.agent_slots = PriorityLimiter(config.settings.max_agents)
+        discovery_max_agents = config.stages[Stage.DISCOVER].max_agents
+        assert discovery_max_agents is not None
+        self.discovery_slots = PriorityLimiter(discovery_max_agents)
         self.build_queue = CoordinatorBuildQueue()
         self._pending_build_requests: list[PendingBuildRequest] = []
         self._build_dispatch_task: asyncio.Task[None] | None = None
@@ -766,6 +769,9 @@ class Orchestrator:
         await chapter_lock.acquire()
         chapter_lock_held = True
         slot_held = False
+        slots = (
+            self.discovery_slots if stage is Stage.DISCOVER and not auxiliary else self.agent_slots
+        )
         try:
             await self.control.checkpoint()
             if not auxiliary:
@@ -776,7 +782,7 @@ class Orchestrator:
                     queue_detail or f"queued for {stage.value} agent",
                     queued=True,
                 )
-            await self.agent_slots.acquire(schedule.priority(chapter.document_id))
+            await slots.acquire(schedule.priority(chapter.document_id))
             slot_held = True
         except BaseException:
             chapter_lock.release()
@@ -841,7 +847,7 @@ class Orchestrator:
                     feedback=feedback,
                     workspace_root=workspace_root,
                 )
-            self.agent_slots.release()
+            slots.release()
             slot_held = False
             # Agent capacity covers live Codex processes, not integration or a
             # potentially preempted coordinator build queued after they exit.
@@ -979,7 +985,7 @@ class Orchestrator:
             raise
         finally:
             if slot_held:
-                self.agent_slots.release()
+                slots.release()
             if workspace is not None:
                 await workspace.close()
             if source_held:

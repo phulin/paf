@@ -69,6 +69,10 @@ STAGE_REASONING_EFFORTS = {
     Stage.DISCOVER: "medium",
 }
 
+STAGE_MAX_AGENTS = {
+    Stage.DISCOVER: 40,
+}
+
 
 def standard_prompt_path(stage: Stage) -> Path:
     resource = files("paf.prompts").joinpath(f"{stage.value}.md")
@@ -105,6 +109,12 @@ def _stage_configs(raw_stages: dict[str, Any], base: Path) -> dict[Stage, StageC
         max_rounds = int(raw.get("max_rounds", STAGE_ROUNDS[stage]))
         if max_rounds < 1:
             raise ValueError(f"stages.{stage.value}.max_rounds must be positive")
+        max_agents_value = raw.get("max_agents", STAGE_MAX_AGENTS.get(stage))
+        if max_agents_value is not None and stage is not Stage.DISCOVER:
+            raise ValueError("max_agents is only supported for stages.discover")
+        max_agents = int(max_agents_value) if max_agents_value is not None else None
+        if max_agents is not None and max_agents < 1:
+            raise ValueError(f"stages.{stage.value}.max_agents must be positive")
         if not prompt.is_file():
             raise ValueError(f"prompt does not exist: {prompt}")
         model_value = raw.get("model", STAGE_MODELS.get(stage))
@@ -116,6 +126,7 @@ def _stage_configs(raw_stages: dict[str, Any], base: Path) -> dict[Stage, StageC
         stages[stage] = StageConfig(
             prompt=prompt,
             max_rounds=max_rounds,
+            max_agents=max_agents,
             model=model_value,
             reasoning_effort=reasoning_value,
         )

@@ -24,6 +24,7 @@ PROOF_STAGES = (Stage.PROVE,)
 class StageConfig:
     prompt: Path
     max_rounds: int
+    max_agents: int | None = None
     model: str | None = None
     reasoning_effort: str | None = None
 

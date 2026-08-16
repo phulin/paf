@@ -216,7 +216,18 @@ def test_plan_command(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> Non
     output = capsys.readouterr().out
     assert "discover" in output
     assert "formalize" in output
+    assert "40 discovery agents, 4 shared mutating agents" in output
     assert "Lean MCP: enabled" in output
+
+
+def test_cli_overrides_discovery_concurrency(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    path = write_project(tmp_path)
+
+    assert main(["plan", "--config", str(path), "--discover-max-agents", "7"]) == 0
+
+    assert "7 discovery agents, 4 shared mutating agents" in capsys.readouterr().out
 
 
 def test_cli_model_overrides_apply_to_every_stage(

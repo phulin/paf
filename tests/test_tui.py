@@ -690,7 +690,7 @@ async def test_dashboard_separates_agents_queues_and_coordinator_builds(
         app.refresh_dashboard()
 
         usage = str(app.query_one("#usage", Static).content)
-        assert "Agents 1/4 · formalize 1 · queued 0" in usage
+        assert "Agents 1/44 · discovery 0/40 · mutating 1/4 · formalize 1 · queued 0" in usage
         assert f"Coordinator {build_mode} build 20/81 · iter 2/6" in usage
         assert "err 1 · warn 1" in usage
         status = str(app.query_one("#status", Static).content)

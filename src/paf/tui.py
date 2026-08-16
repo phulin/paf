@@ -940,7 +940,12 @@ class SwarmApp(App[bool]):
         agents = running_agent_counts(self.state)
         active_agents = sum(agents.values())
         queued_agents = int(self.state.agent_summary().get("queued", 0))
-        maximum = self.orchestrator.config.settings.max_agents
+        discovery_agents = agents[Stage.DISCOVER]
+        mutating_agents = active_agents - discovery_agents
+        discovery_maximum = self.orchestrator.config.stages[Stage.DISCOVER].max_agents
+        assert discovery_maximum is not None
+        mutating_maximum = self.orchestrator.config.settings.max_agents
+        maximum = discovery_maximum + mutating_maximum
         codex_access = (
             "full"
             if self.orchestrator.config.settings.bypass_approvals_and_sandbox
@@ -999,7 +1004,9 @@ class SwarmApp(App[bool]):
             f"API-equivalent cost: {format_usd(cost)}    "
             f"lifetime tokens: {format_count(lifetime_usage.total_tokens)}    "
             f"lifetime API-equivalent cost: {format_usd(lifetime_cost)}\n"
-            f"Agents {active_agents}/{maximum} · {agent_breakdown} · queued {queued_agents}    "
+            f"Agents {active_agents}/{maximum} · discovery {discovery_agents}/{discovery_maximum} "
+            f"· mutating {mutating_agents}/{mutating_maximum} · {agent_breakdown} "
+            f"· queued {queued_agents}    "
             f"{build_status}\n"
             f"Statement critical path: {critical}    isolation: {isolation}  "
             f"Lean MCP: on    Codex access: {codex_access}",
