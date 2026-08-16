@@ -4,7 +4,7 @@ import asyncio
 import hashlib
 import re
 from collections import deque
-from collections.abc import Coroutine, Iterable
+from collections.abc import Callable, Coroutine, Iterable
 from contextlib import suppress
 from dataclasses import dataclass, replace
 from typing import Any
@@ -42,7 +42,6 @@ from paf.state import (
     TaskStatus,
     UpstreamRequestStatus,
 )
-
 
 MAXIMUM_IN_FLIGHT_BUILD_BATCHES = 2
 
@@ -385,17 +384,32 @@ class Orchestrator:
     def scheduling_snapshot(self) -> dict[str, object]:
         return scheduling_snapshot(self.statement_schedule, self.proof_schedule)
 
-    async def prepare(self) -> None:
+    async def prepare(
+        self,
+        progress: Callable[[str, int, int], None] | None = None,
+    ) -> None:
+        total = 9
+
+        def report(phase: str, completed: int) -> None:
+            if progress is not None:
+                progress(phase, completed, total)
+
+        report("Preparing the Lean project", 0)
         if self.config.backend is not None:
             await asyncio.to_thread(
                 self.config.backend.prepare_project,
                 self.config.settings.repo,
                 timeout_seconds=self.config.settings.validation_timeout_seconds,
             )
+        report("Loading orchestration state", 1)
         await self.state.load_or_create()
+        report("Recovering interrupted work", 2)
         await self.state.requeue_interrupted(resume_agents=self.resume_agents)
+        report("Scaffolding work-unit directories", 3)
         self.scaffold()
+        report("Recovering upstream requests", 4)
         await self._recover_upstream_requests()
+        report("Migrating persisted workflow state", 5)
         migrated = await self.state.migrate_post_review_fixups()
         if migrated:
             # The normal review scheduler reports an invalid import graph.
@@ -404,9 +418,13 @@ class Orchestrator:
                     migrated,
                     detail="recovered post-review findings",
                 )
+        report("Preparing agent execution", 6)
         await self.executor.prepare()
+        report("Preparing isolated workspaces and Lean caches", 7)
         await self.isolation.prepare()
+        report("Checking the Git worktree", 8)
         await self.git.prepare()
+        report("Preparation complete", 9)
 
     async def _commit_agent_changes(
         self,

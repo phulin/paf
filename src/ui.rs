@@ -5,8 +5,8 @@ use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
-    Block, Borders, Cell, Gauge, Paragraph, Row, Scrollbar, ScrollbarOrientation, ScrollbarState,
-    Table, TableState, Tabs, Wrap,
+    Block, Borders, Cell, Clear, Gauge, Paragraph, Row, Scrollbar, ScrollbarOrientation,
+    ScrollbarState, Table, TableState, Tabs, Wrap,
 };
 
 use crate::model::{Activity, DashboardModel, DetailTab, RowModel, STAGES, Task, elapsed_seconds};
@@ -26,6 +26,74 @@ pub fn draw(frame: &mut Frame<'_>, model: &DashboardModel) {
     } else {
         draw_dashboard(frame, model);
     }
+    if model.preparation.is_some() {
+        draw_preparation_modal(frame, model);
+    }
+}
+
+fn draw_preparation_modal(frame: &mut Frame<'_>, model: &DashboardModel) {
+    let Some(preparation) = &model.preparation else {
+        return;
+    };
+    let area = centered(frame.area(), 74, 9);
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .title(" Preparing PAF ")
+        .title_alignment(Alignment::Center)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(CYAN))
+        .style(Style::default().bg(SURFACE));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Length(3),
+            Constraint::Min(1),
+        ])
+        .split(inner);
+    frame.render_widget(
+        Paragraph::new(preparation.phase.clone())
+            .style(Style::default().fg(MUTED).bg(SURFACE))
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: true }),
+        layout[0],
+    );
+    let ratio = if preparation.total == 0 {
+        0.0
+    } else {
+        preparation.completed as f64 / preparation.total as f64
+    };
+    frame.render_widget(
+        Gauge::default()
+            .block(Block::default().borders(Borders::ALL))
+            .gauge_style(Style::default().fg(BLUE).bg(SURFACE))
+            .ratio(ratio.clamp(0.0, 1.0))
+            .label(format!("{} / {}", preparation.completed, preparation.total)),
+        layout[1],
+    );
+    frame.render_widget(
+        Paragraph::new(if model.stopping {
+            "Stopping after preparation finishes…"
+        } else {
+            "q stops before workers are launched"
+        })
+        .style(Style::default().fg(MUTED).bg(SURFACE))
+        .alignment(Alignment::Center),
+        layout[2],
+    );
+}
+
+fn centered(area: Rect, preferred_width: u16, preferred_height: u16) -> Rect {
+    let width = preferred_width.min(area.width);
+    let height = preferred_height.min(area.height);
+    Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    )
 }
 
 fn draw_dashboard(frame: &mut Frame<'_>, model: &DashboardModel) {
@@ -723,14 +791,43 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     use super::*;
-    use crate::model::{DashboardModel, Task, WireEvent, WorkUnit};
+    use crate::model::{DashboardModel, PROTOCOL_VERSION, Preparation, Task, WireEvent, WorkUnit};
+
+    #[test]
+    fn renders_preparation_progress_as_a_modal() {
+        let mut model = DashboardModel::loading("review stage".into(), String::new());
+        model
+            .apply(WireEvent {
+                protocol_version: PROTOCOL_VERSION,
+                event: "preparation".into(),
+                status: "preparing".into(),
+                result: None,
+                snapshot: None,
+                delta: None,
+                preparation: Some(Preparation {
+                    phase: "Preparing isolated workspaces and Lean caches".into(),
+                    completed: 7,
+                    total: 9,
+                }),
+                message: String::new(),
+            })
+            .unwrap();
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &model)).unwrap();
+        let rendered = terminal.backend().to_string();
+        assert!(rendered.contains("Preparing PAF"));
+        assert!(rendered.contains("Preparing isolated workspaces and Lean caches"));
+        assert!(rendered.contains("7 / 9"));
+        assert!(rendered.contains("q stops before workers are launched"));
+    }
 
     #[test]
     fn renders_dashboard_and_agent_detail() {
         let mut model = DashboardModel::loading("review stage".into(), "install rg".into());
         model
             .apply(WireEvent {
-                protocol_version: 3,
+                protocol_version: PROTOCOL_VERSION,
                 event: "snapshot".into(),
                 status: "running".into(),
                 result: None,
@@ -750,6 +847,8 @@ mod tests {
                     }}
                 })),
                 delta: None,
+                preparation: None,
+                message: String::new(),
             })
             .unwrap();
         let backend = TestBackend::new(180, 40);

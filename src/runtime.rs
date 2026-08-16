@@ -145,6 +145,11 @@ fn handle_terminal_event(
     if !key.is_press() {
         return Ok(false);
     }
+    let stop_key = key.code == KeyCode::Char('q')
+        || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL));
+    if model.preparation.is_some() && !stop_key {
+        return Ok(false);
+    }
     if model.detail {
         return handle_detail_key(key, model);
     }

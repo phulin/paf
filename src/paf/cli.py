@@ -903,8 +903,10 @@ def _start_agent(args: argparse.Namespace, config: PipelineConfig) -> int:
             raise ValueError(f"managed pipeline exited during startup; inspect {log_path}")
         if control_socket(state_dir).exists():
             try:
-                response = send_command(state_dir, "status", timeout=0.5)
-                break
+                candidate = send_command(state_dir, "status", timeout=0.5)
+                if candidate.get("status") != "preparing":
+                    response = candidate
+                    break
             except OSError:
                 pass
         time.sleep(0.05)

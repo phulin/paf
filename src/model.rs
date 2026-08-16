@@ -6,6 +6,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 pub const STAGES: [&str; 4] = ["discover", "formalize", "review", "prove"];
+pub const PROTOCOL_VERSION: u64 = 4;
 
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default)]
@@ -171,6 +172,18 @@ pub struct WireEvent {
     pub snapshot: Option<Value>,
     #[serde(default)]
     pub delta: Option<DashboardDelta>,
+    #[serde(default)]
+    pub preparation: Option<Preparation>,
+    #[serde(default)]
+    pub message: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct Preparation {
+    pub phase: String,
+    pub completed: usize,
+    pub total: usize,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -234,6 +247,7 @@ pub struct DashboardModel {
     pub label: String,
     pub startup_warning: String,
     pub stopping: bool,
+    pub preparation: Option<Preparation>,
 }
 
 impl DashboardModel {
@@ -249,14 +263,20 @@ impl DashboardModel {
             label,
             startup_warning,
             stopping: false,
+            preparation: Some(Preparation {
+                phase: "Connecting to the orchestrator".into(),
+                completed: 0,
+                total: 1,
+            }),
         }
     }
 
     pub fn apply(&mut self, event: WireEvent) -> Result<()> {
-        if event.protocol_version != 3 {
+        if event.protocol_version != PROTOCOL_VERSION {
             bail!(
-                "unsupported dashboard protocol {}, expected 3",
-                event.protocol_version
+                "unsupported dashboard protocol {}, expected {}",
+                event.protocol_version,
+                PROTOCOL_VERSION
             );
         }
         if !event.status.is_empty() {
@@ -268,9 +288,18 @@ impl DashboardModel {
                     event.snapshot.context("snapshot event has no snapshot")?,
                 )
                 .context("invalid dashboard model")?;
+                self.preparation = None;
             }
             "delta" => self.apply_delta(event.delta.context("delta event has no delta")?)?,
+            "preparation" => {
+                self.preparation = Some(
+                    event
+                        .preparation
+                        .context("preparation event has no progress")?,
+                );
+            }
             "complete" => self.result = event.result,
+            "error" => bail!("{}", event.message),
             other => bail!("unknown dashboard event {other:?}"),
         }
         self.clamp_selection();
@@ -451,17 +480,19 @@ mod tests {
         let mut model = DashboardModel::loading("test".into(), String::new());
         model
             .apply(WireEvent {
-                protocol_version: 3,
+                protocol_version: PROTOCOL_VERSION,
                 event: "snapshot".into(),
                 status: "running".into(),
                 result: None,
                 snapshot: Some(snapshot()),
                 delta: None,
+                preparation: None,
+                message: String::new(),
             })
             .unwrap();
         model
             .apply(WireEvent {
-                protocol_version: 3,
+                protocol_version: PROTOCOL_VERSION,
                 event: "delta".into(),
                 status: "running".into(),
                 result: None,
@@ -478,6 +509,8 @@ mod tests {
                     )]),
                     ..DashboardDelta::default()
                 }),
+                preparation: None,
+                message: String::new(),
             })
             .unwrap();
 

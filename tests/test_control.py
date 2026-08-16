@@ -1,5 +1,6 @@
 import asyncio
 import json
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -55,6 +56,7 @@ async def test_control_server_accepts_bash_friendly_commands(tmp_path: Path) -> 
         await asyncio.sleep(0.01)
     else:
         pytest.fail("control socket was not created")
+    await server.prepared.wait()
 
     status = await asyncio.to_thread(send_command, config.settings.state_dir, "status")
     assert status["status"] == "running"
@@ -84,7 +86,94 @@ async def test_control_server_accepts_bash_friendly_commands(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
-async def test_dashboard_subscription_pushes_snapshot_and_live_deltas(tmp_path: Path) -> None:
+async def test_control_server_can_stop_during_preparation(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:  # type: ignore[no-untyped-def]
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    prepare = orchestrator.prepare
+    continue_preparation = asyncio.Event()
+    operation_started = False
+
+    async def delayed_prepare(
+        progress: Callable[[str, int, int], None] | None = None,
+    ) -> None:
+        await continue_preparation.wait()
+        await prepare(progress)
+
+    async def operation() -> bool:
+        nonlocal operation_started
+        operation_started = True
+        return True
+
+    monkeypatch.setattr(orchestrator, "prepare", delayed_prepare)
+    server = ControlServer(orchestrator, operation)
+    server_task = asyncio.create_task(server.run())
+    await server.ready.wait()
+
+    status = await asyncio.to_thread(send_command, config.settings.state_dir, "status")
+    assert status["status"] == "preparing"
+    stopped = await asyncio.to_thread(send_command, config.settings.state_dir, "stop")
+    assert stopped["accepted"] is True
+    assert stopped["status"] == "stopping"
+
+    continue_preparation.set()
+    assert not await server_task
+    assert not operation_started
+
+
+@pytest.mark.asyncio
+async def test_dashboard_subscription_pushes_preparation_errors(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:  # type: ignore[no-untyped-def]
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    fail_preparation = asyncio.Event()
+
+    async def prepare(
+        progress: Callable[[str, int, int], None] | None = None,
+    ) -> None:
+        if progress is not None:
+            progress("Checking the Lean project", 0, 9)
+        await fail_preparation.wait()
+        raise RuntimeError("Lean project preparation failed")
+
+    async def operation() -> bool:
+        raise AssertionError("operation must not start after a preparation failure")
+
+    monkeypatch.setattr(orchestrator, "prepare", prepare)
+    server = ControlServer(orchestrator, operation)
+    server_task = asyncio.create_task(server.run())
+    await server.ready.wait()
+    reader, writer = await asyncio.open_unix_connection(server.socket_path)
+    writer.write(b'{"command":"subscribe","view":"dashboard"}\n')
+    await writer.drain()
+
+    progress = await _read_stream_event(reader)
+    assert progress["event"] == "preparation"
+    fail_preparation.set()
+    failure = await _read_stream_event(reader)
+    assert failure == {
+        "protocol_version": 4,
+        "event": "error",
+        "status": "failed",
+        "message": "RuntimeError: Lean project preparation failed",
+    }
+    writer.close()
+    await writer.wait_closed()
+    with pytest.raises(RuntimeError, match="Lean project preparation failed"):
+        await server_task
+
+
+@pytest.mark.asyncio
+async def test_dashboard_subscription_pushes_preparation_snapshot_and_live_deltas(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:  # type: ignore[no-untyped-def]
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
     state = StateStore(config)
     control = RunControl()
@@ -95,23 +184,42 @@ async def test_dashboard_subscription_pushes_snapshot_and_live_deltas(tmp_path: 
         await finish.wait()
         return True
 
+    prepare = orchestrator.prepare
+    continue_preparation = asyncio.Event()
+
+    async def delayed_prepare(
+        progress: Callable[[str, int, int], None] | None = None,
+    ) -> None:
+        if progress is not None:
+            progress("Inspecting a large Lean project", 2, 9)
+        await continue_preparation.wait()
+        await prepare(progress)
+
+    monkeypatch.setattr(orchestrator, "prepare", delayed_prepare)
     server = ControlServer(orchestrator, operation)
     server_task = asyncio.create_task(server.run())
-    for _ in range(100):
-        if control_socket(config.settings.state_dir).exists():
-            break
-        await asyncio.sleep(0.01)
-    else:
-        pytest.fail("control socket was not created")
+    await server.ready.wait()
 
     reader, writer = await asyncio.open_unix_connection(control_socket(config.settings.state_dir))
     writer.write(b'{"command":"subscribe","view":"dashboard"}\n')
     await writer.drain()
 
     initial = await _read_stream_event(reader)
-    assert initial["protocol_version"] == 3
-    assert initial["event"] == "snapshot"
-    snapshot = initial["snapshot"]
+    assert initial["protocol_version"] == 4
+    assert initial["event"] == "preparation"
+    assert initial["status"] == "preparing"
+    assert initial["preparation"] == {
+        "phase": "Inspecting a large Lean project",
+        "completed": 2,
+        "total": 9,
+    }
+
+    continue_preparation.set()
+    event = await _read_stream_event(reader)
+    while event["event"] != "snapshot":
+        assert event["event"] == "preparation"
+        event = await _read_stream_event(reader)
+    snapshot = event["snapshot"]
     assert isinstance(snapshot, dict)
     assert snapshot["source"] == str(state.database_path)
     assert snapshot["tasks"]

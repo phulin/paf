@@ -16,7 +16,7 @@ from paf.scheduler import Orchestrator
 from paf.state import TaskStatus, timestamp
 from paf.state_db import DATABASE_NAME, read_status_view
 
-PROTOCOL_VERSION = 3
+PROTOCOL_VERSION = 4
 SOCKET_NAME = "control.sock"
 PID_NAME = "daemon.pid"
 RESULT_NAME = "daemon-result.json"
@@ -87,11 +87,21 @@ class ControlServer:
         self.result: bool | None = None
         self._server: asyncio.Server | None = None
         self.ready = asyncio.Event()
+        self.prepared = asyncio.Event()
+        self.dashboard_attached = asyncio.Event()
+        self._startup_done = asyncio.Event()
+        self._startup_error: BaseException | None = None
+        self._preparation = {
+            "phase": "Starting the orchestrator",
+            "completed": 0,
+            "total": 9,
+        }
+        self._preparation_subscribers: set[asyncio.Queue[dict[str, Any]]] = set()
 
     async def run(self) -> bool:
         claimed_pid = False
+        installed_signals: list[signal.Signals] = []
         try:
-            await self.orchestrator.prepare()
             self.state_dir.mkdir(parents=True, exist_ok=True)
             self._claim_pid()
             claimed_pid = True
@@ -100,31 +110,53 @@ class ControlServer:
             self._server = await asyncio.start_unix_server(self._handle, path=self.socket_path)
             self.socket_path.chmod(0o600)
             self.ready.set()
-            self.pipeline_task = asyncio.create_task(self.operation())
             loop = asyncio.get_running_loop()
-            installed_signals: list[signal.Signals] = []
             for item in (signal.SIGINT, signal.SIGTERM):
                 with suppress(NotImplementedError):
                     loop.add_signal_handler(item, self.request_stop)
                     installed_signals.append(item)
             try:
-                self.result = await self.pipeline_task
+                await self.orchestrator.prepare(self._publish_preparation)
+            except BaseException as error:
+                self._startup_error = error
+                self.done.set()
+                self._startup_done.set()
+                await asyncio.sleep(0.1)
+                raise
+            self.prepared.set()
+            self._startup_done.set()
+            try:
+                if self.orchestrator.control.stopping:
+                    self.result = False
+                else:
+                    self.pipeline_task = asyncio.create_task(self.operation())
+                    self.result = await self.pipeline_task
             except asyncio.CancelledError:
                 self.result = False
             finally:
                 self.done.set()
                 self._write_result()
                 await asyncio.sleep(0.1)
+            return bool(self.result)
+        finally:
+            self._startup_done.set()
+            if self._server is not None:
                 self._server.close()
                 await self._server.wait_closed()
-                for item in installed_signals:
-                    loop.remove_signal_handler(item)
-                self.socket_path.unlink(missing_ok=True)
-        finally:
+            loop = asyncio.get_running_loop()
+            for item in installed_signals:
+                loop.remove_signal_handler(item)
+            self.socket_path.unlink(missing_ok=True)
             await self.orchestrator.shutdown()
             if claimed_pid:
                 self.pid_path.unlink(missing_ok=True)
-        return bool(self.result)
+
+    def _publish_preparation(self, phase: str, completed: int, total: int) -> None:
+        self._preparation = {"phase": phase, "completed": completed, "total": total}
+        for queue in tuple(self._preparation_subscribers):
+            if queue.full():
+                queue.get_nowait()
+            queue.put_nowait(dict(self._preparation))
 
     def request_stop(self) -> None:
         self.orchestrator.control.stop(integrate_interrupted_workspaces=True)
@@ -222,12 +254,54 @@ class ControlServer:
         """Push one snapshot and subsequent dashboard deltas as newline-delimited JSON."""
 
         changes = self.orchestrator.state.change_bus.subscribe()
+        preparations: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=1)
+        self._preparation_subscribers.add(preparations)
+        self.dashboard_attached.set()
 
         async def send(event: dict[str, Any]) -> None:
             writer.write(json.dumpb({"protocol_version": PROTOCOL_VERSION} | event) + b"\n")
             await writer.drain()
 
         try:
+            if not self._startup_done.is_set():
+                await send(
+                    {
+                        "event": "preparation",
+                        "status": self._status_name(),
+                        "preparation": dict(self._preparation),
+                    }
+                )
+            while not self._startup_done.is_set():
+                update = asyncio.create_task(preparations.get())
+                finished = asyncio.create_task(self._startup_done.wait())
+                ready, pending = await asyncio.wait(
+                    {update, finished}, return_when=asyncio.FIRST_COMPLETED
+                )
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    await asyncio.gather(*pending, return_exceptions=True)
+                if update in ready:
+                    await send(
+                        {
+                            "event": "preparation",
+                            "status": self._status_name(),
+                            "preparation": update.result(),
+                        }
+                    )
+            if self._startup_error is not None:
+                await send(
+                    {
+                        "event": "error",
+                        "status": "failed",
+                        "message": (f"{type(self._startup_error).__name__}: {self._startup_error}"),
+                    }
+                )
+                return
+            # State loading may have published resync notifications before this client had a
+            # valid baseline. The snapshot below already contains all of them.
+            while not changes.empty():
+                changes.get_nowait()
             await send(
                 {
                     "event": "snapshot",
@@ -300,6 +374,7 @@ class ControlServer:
         except (BrokenPipeError, ConnectionError):
             pass
         finally:
+            self._preparation_subscribers.discard(preparations)
             self.orchestrator.state.change_bus.unsubscribe(changes)
             writer.close()
             with suppress(ConnectionError):
@@ -318,6 +393,8 @@ class ControlServer:
             return "completed" if self.result else "failed"
         if self.orchestrator.control.stopping:
             return "stopping"
+        if not self.prepared.is_set():
+            return "preparing"
         if self.orchestrator.control.paused:
             return "paused"
         return "running"

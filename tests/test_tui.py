@@ -6,6 +6,7 @@ import struct
 import subprocess
 import sys
 import termios
+from collections.abc import Callable
 from pathlib import Path
 from typing import cast
 
@@ -163,7 +164,10 @@ async def test_dashboard_projection_includes_ordered_units_and_bounded_activity(
     assert "work_unit_cost" in task
 
 
-async def test_native_tui_connects_renders_and_exits_with_pipeline(tmp_path: Path) -> None:
+async def test_native_tui_connects_renders_and_exits_with_pipeline(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:  # type: ignore[no-untyped-def]
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
     state = StateStore(config)
     orchestrator = Orchestrator(config, state)
@@ -173,14 +177,21 @@ async def test_native_tui_connects_renders_and_exits_with_pipeline(tmp_path: Pat
         await asyncio.sleep(0.5)
         return True
 
+    prepare = orchestrator.prepare
+    continue_preparation = asyncio.Event()
+
+    async def delayed_prepare(
+        progress: Callable[[str, int, int], None] | None = None,
+    ) -> None:
+        if progress is not None:
+            progress("Preparing isolated workspaces and Lean caches", 7, 9)
+        await continue_preparation.wait()
+        await prepare(progress)
+
+    monkeypatch.setattr(orchestrator, "prepare", delayed_prepare)
     server = ControlServer(orchestrator, operation)
     server_task = asyncio.create_task(server.run())
-    for _ in range(100):
-        if control_socket(config.settings.state_dir).exists():
-            break
-        await asyncio.sleep(0.01)
-    else:
-        raise AssertionError("control socket was not created")
+    await server.ready.wait()
 
     master, slave = pty.openpty()
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 180, 0, 0))
@@ -202,6 +213,9 @@ async def test_native_tui_connects_renders_and_exits_with_pipeline(tmp_path: Pat
         )
     finally:
         os.close(slave)
+    await asyncio.wait_for(server.dashboard_attached.wait(), timeout=2)
+    await asyncio.sleep(0.05)
+    continue_preparation.set()
     output = b""
     try:
         return_code = await asyncio.to_thread(process.wait, 5)
@@ -222,5 +236,8 @@ async def test_native_tui_connects_renders_and_exits_with_pipeline(tmp_path: Pat
             process.kill()
             process.wait()
 
-    assert return_code == 0, output.decode(errors="replace")
+    decoded = output.decode(errors="replace")
+    assert return_code == 0, decoded
+    assert "Preparing PAF" in decoded
+    assert "7 / 9" in decoded
     assert await server_task
