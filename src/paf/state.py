@@ -738,6 +738,90 @@ class StateStore:
             },
         }
 
+    def dashboard_snapshot(self, *, maximum_activities: int = 36) -> dict[str, Any]:
+        """Return the bounded, hot projection consumed by interactive dashboards.
+
+        This deliberately excludes immutable run payloads.  A dashboard needs current task
+        state and compact activity summaries, not every historical report and validation log.
+        Keeping this contract on the state boundary also lets native and web clients share the
+        same data model without depending on Python objects.
+        """
+
+        snapshot = self.hot_snapshot() | {
+            "revision": self.revision,
+            "source": str(self.database_path),
+        }
+        tasks = snapshot["tasks"]
+        recent_run_ids: list[str] = []
+        if isinstance(tasks, dict):
+            ordered = sorted(
+                (task for task in tasks.values() if isinstance(task, dict)),
+                key=lambda task: str(task.get("updated_at", "")),
+                reverse=True,
+            )
+            for task in ordered:
+                run_id = task.get("latest_run_id")
+                if isinstance(run_id, str) and run_id not in recent_run_ids:
+                    recent_run_ids.append(run_id)
+                if len(recent_run_ids) >= maximum_activities:
+                    break
+        for run_id in sorted(self._active_run_ids):
+            if run_id not in recent_run_ids:
+                recent_run_ids.append(run_id)
+        snapshot["activities"] = {
+            run_id: activity.as_dict()
+            for run_id in recent_run_ids
+            if (activity := self.activities.get(run_id)) is not None
+        }
+        return snapshot
+
+    def dashboard_delta(self, change: ChangeSet) -> dict[str, Any]:
+        """Project one in-process change notification into the dashboard wire model."""
+
+        task_keys = sorted(
+            key for key, task in self.tasks.items() if task.chapter_id in change.work_units
+        )
+        tasks = {key: self._hot_task_dict(self.tasks[key]) for key in task_keys}
+        active_run_ids = sorted(self._active_run_ids)
+        run_ids = set(change.runs) | set(active_run_ids)
+        run_ids.update(
+            run_id
+            for task in tasks.values()
+            if isinstance((run_id := task.get("latest_run_id")), str)
+        )
+        globals_changed = bool(change.globals.difference({"activity"}))
+        globals_ = self._global_snapshot() | {"revision": self.revision} if globals_changed else {}
+        activities = {
+            run_id: activity.as_dict()
+            for run_id in sorted(run_ids)
+            if (activity := self.activities.get(run_id)) is not None
+        }
+        changes = [
+            *(
+                {"revision": change.revision, "entity_type": "work_unit", "entity_id": unit_id}
+                for unit_id in sorted(change.work_units)
+            ),
+            *(
+                {"revision": change.revision, "entity_type": "run", "entity_id": run_id}
+                for run_id in sorted(change.runs)
+            ),
+            *(
+                {"revision": change.revision, "entity_type": "global", "entity_id": name}
+                for name in sorted(change.globals)
+            ),
+        ]
+        return {
+            "revision": self.revision,
+            "resync_required": change.full_resync,
+            "changes": changes,
+            "tasks": tasks,
+            "removed_task_ids": [],
+            "globals": globals_,
+            "run_ids": sorted(change.runs),
+            "active_run_ids": active_run_ids,
+            "activities": activities,
+        }
+
     def status_view(self) -> dict[str, Any]:
         """Return status fields and counters without materializing task rows."""
 

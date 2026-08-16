@@ -16,7 +16,7 @@ from paf.scheduler import Orchestrator
 from paf.state import TaskStatus, timestamp
 from paf.state_db import DATABASE_NAME, read_status_view
 
-PROTOCOL_VERSION = 2
+PROTOCOL_VERSION = 3
 SOCKET_NAME = "control.sock"
 PID_NAME = "daemon.pid"
 RESULT_NAME = "daemon-result.json"
@@ -177,6 +177,11 @@ class ControlServer:
             if not isinstance(request, dict) or not isinstance(request.get("command"), str):
                 raise ValueError("request must contain a string command")
             command = request["command"]
+            if command == "subscribe":
+                if request.get("view", "dashboard") != "dashboard":
+                    raise ValueError("only the dashboard subscription view is supported")
+                await self._subscribe_dashboard(writer)
+                return
             if command == "pause":
                 self.orchestrator.control.pause()
                 response = self._status()
@@ -210,21 +215,106 @@ class ControlServer:
         with suppress(ConnectionError):
             await writer.wait_closed()
 
+    async def _subscribe_dashboard(self, writer: asyncio.StreamWriter) -> None:
+        """Push one snapshot and subsequent dashboard deltas as newline-delimited JSON."""
+
+        changes = self.orchestrator.state.change_bus.subscribe()
+
+        async def send(event: dict[str, Any]) -> None:
+            writer.write(json.dumpb({"protocol_version": PROTOCOL_VERSION} | event) + b"\n")
+            await writer.drain()
+
+        try:
+            await send(
+                {
+                    "event": "snapshot",
+                    "status": self._status_name(),
+                    "snapshot": self.orchestrator.state.dashboard_snapshot(),
+                }
+            )
+            while not self.done.is_set():
+                next_change = asyncio.create_task(changes.get())
+                completed = asyncio.create_task(self.done.wait())
+                done, pending = await asyncio.wait(
+                    {next_change, completed}, return_when=asyncio.FIRST_COMPLETED
+                )
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    await asyncio.gather(*pending, return_exceptions=True)
+                if completed in done:
+                    break
+                change = next_change.result()
+                work_units = set(change.work_units)
+                runs = set(change.runs)
+                globals_ = set(change.globals)
+                stages = set(change.stages)
+                full_resync = change.full_resync
+                # One terminal frame does not benefit from rendering every mutation in a
+                # scheduler burst. Coalesce only already-queued changes; this adds no timer or
+                # polling latency to the first update.
+                while not changes.empty():
+                    item = changes.get_nowait()
+                    work_units.update(item.work_units)
+                    runs.update(item.runs)
+                    globals_.update(item.globals)
+                    stages.update(item.stages)
+                    full_resync = full_resync or item.full_resync
+                combined = type(change)(
+                    revision=self.orchestrator.state.revision,
+                    work_units=frozenset(work_units),
+                    runs=frozenset(runs),
+                    globals=frozenset(globals_),
+                    stages=frozenset(stages),
+                    full_resync=full_resync,
+                )
+                if full_resync:
+                    await send(
+                        {
+                            "event": "snapshot",
+                            "status": self._status_name(),
+                            "snapshot": self.orchestrator.state.dashboard_snapshot(),
+                        }
+                    )
+                else:
+                    await send(
+                        {
+                            "event": "delta",
+                            "status": self._status_name(),
+                            "delta": self.orchestrator.state.dashboard_delta(combined),
+                        }
+                    )
+            await send(
+                {
+                    "event": "complete",
+                    "status": self._status_name(),
+                    "result": self.result,
+                }
+            )
+        except (BrokenPipeError, ConnectionError):
+            pass
+        finally:
+            self.orchestrator.state.change_bus.unsubscribe(changes)
+            writer.close()
+            with suppress(ConnectionError):
+                await writer.wait_closed()
+
     def _status(self, *, full: bool = False) -> dict[str, Any]:
-        if self.done.is_set():
-            status = "completed" if self.result else "failed"
-        elif self.orchestrator.control.stopping:
-            status = "stopping"
-        elif self.orchestrator.control.paused:
-            status = "paused"
-        else:
-            status = "running"
         return state_summary(
             self.orchestrator,
-            daemon_status=status,
+            daemon_status=self._status_name(),
             result=self.result,
             full=full,
         )
+
+    def _status_name(self) -> str:
+        if self.done.is_set():
+            return "completed" if self.result else "failed"
+        if self.orchestrator.control.stopping:
+            return "stopping"
+        if self.orchestrator.control.paused:
+            return "paused"
+        return "running"
 
 
 def send_command(state_dir: Path, command: str, *, timeout: float | None = 10.0) -> dict[str, Any]:
