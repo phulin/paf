@@ -4,7 +4,7 @@ import asyncio
 import hashlib
 import re
 from collections.abc import AsyncIterator, Iterable
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -294,6 +294,7 @@ class StateStore:
         self._writer = StateWriter(self._database)
         self.revision = 0
         self._flush_lock = asyncio.Lock()
+        self._telemetry_flush_task: asyncio.Task[None] | None = None
         self._batch_depth = 0
         self._checkpoint_dirty = False
         self._static_dirty = False
@@ -304,10 +305,12 @@ class StateStore:
         self._runs_by_id: dict[str, RunRecord] = {}
         self._payload_loaded_run_ids: set[str] = set()
         self._chapter_runs: dict[str, list[RunRecord]] = {}
+        self._latest_runs_by_chapter: dict[str, RunRecord] = {}
         self._usage_cache: dict[tuple[bool, str | None], TokenUsage] = {}
         self._cost_cache: dict[tuple[bool, str | None], CostEstimate] = {}
         self._indexed_task_states: dict[str, tuple[str, str, bool]] = {}
         self._active_run_ids: set[str] = set()
+        self._active_runs_by_chapter: dict[str, RunRecord] = {}
         self._stage_count_cache: dict[str, dict[str, int]] = {}
         self.tasks: dict[str, TaskRecord] = {}
         self.source_issues: dict[str, SourceIssueRecord] = {}
@@ -321,6 +324,7 @@ class StateStore:
         self.coordinator_build = CoordinatorBuildRecord()
         self.created_at = timestamp()
         self.updated_at = self.created_at
+        self._config_fingerprint = ""
 
     @staticmethod
     def key(chapter_id: str, stage: Stage) -> str:
@@ -533,7 +537,17 @@ class StateStore:
         self._invalidate_aggregates()
         self._rebuild_status_indexes()
         self._checkpoint_dirty = True
-        self._static_dirty = True
+        self._config_fingerprint = hashlib.sha256(
+            json.dumpb(
+                {
+                    "documents": self._document_dicts(),
+                    "work_units": self._work_unit_dicts(),
+                },
+                sort_keys=True,
+            )
+        ).hexdigest()
+        persisted_fingerprint = await asyncio.to_thread(self._database.config_fingerprint)
+        self._static_dirty = persisted_fingerprint != self._config_fingerprint
         self._dirty_task_keys.update(self.tasks)
         self._issues_dirty = True
         self._dirty_run_ids.update(run.id for run in recovered_runs)
@@ -780,8 +794,22 @@ class StateStore:
             self._dirty_run_ids.add(run.id)
             if run.status == TaskStatus.RUNNING:
                 self._active_run_ids.add(run.id)
+                self._active_runs_by_chapter[run.chapter_id] = run
             else:
                 self._active_run_ids.discard(run.id)
+                if self._active_runs_by_chapter.get(run.chapter_id) is run:
+                    replacement = next(
+                        (
+                            self._runs_by_id[item]
+                            for item in self._active_run_ids
+                            if self._runs_by_id[item].chapter_id == run.chapter_id
+                        ),
+                        None,
+                    )
+                    if replacement is None:
+                        self._active_runs_by_chapter.pop(run.chapter_id, None)
+                    else:
+                        self._active_runs_by_chapter[run.chapter_id] = replacement
         self._issues_dirty = self._issues_dirty or issues
         self._static_dirty = self._static_dirty or static
 
@@ -883,6 +911,8 @@ class StateStore:
                 replace_source_issues=issues_dirty,
                 documents=documents,
                 work_units=work_units,
+                config_fingerprint=self._config_fingerprint if static_dirty else None,
+                replace_static=static_dirty,
                 changes=frozenset(changes),
             )
             revision = await asyncio.wrap_future(self._writer.submit(write))
@@ -1325,8 +1355,19 @@ class StateStore:
             await self._persist()
 
     async def close(self) -> None:
+        if self._telemetry_flush_task is not None:
+            self._telemetry_flush_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._telemetry_flush_task
+            self._telemetry_flush_task = None
         await self.flush()
         await asyncio.wrap_future(self._writer.stop())
+        await asyncio.to_thread(self._database.export_snapshot)
+
+    async def export(self) -> None:
+        """Produce compatibility JSON artifacts from durable normalized state."""
+
+        await self.flush()
         await asyncio.to_thread(self._database.export_snapshot)
 
     @asynccontextmanager
@@ -1342,26 +1383,18 @@ class StateStore:
     def _index_run(self, run: RunRecord) -> None:
         self._runs_by_id[run.id] = run
         self._chapter_runs.setdefault(run.chapter_id, []).append(run)
+        latest = self._latest_runs_by_chapter.get(run.chapter_id)
+        if latest is None or (run.started_at, run.id) >= (latest.started_at, latest.id):
+            self._latest_runs_by_chapter[run.chapter_id] = run
 
     def chapter_runs(self, chapter_id: str) -> tuple[RunRecord, ...]:
         return tuple(self._chapter_runs.get(chapter_id, ()))
 
     def latest_run(self, chapter_id: str) -> RunRecord | None:
-        runs = self._chapter_runs.get(chapter_id, ())
-        if not runs:
-            return None
-        running = [run for run in runs if run.status == TaskStatus.RUNNING]
-        return max(running or runs, key=lambda run: (run.started_at, run.id))
+        return self.active_run(chapter_id) or self._latest_runs_by_chapter.get(chapter_id)
 
     def active_run(self, chapter_id: str) -> RunRecord | None:
-        return next(
-            (
-                run
-                for run in self._chapter_runs.get(chapter_id, ())
-                if run.status == TaskStatus.RUNNING
-            ),
-            None,
-        )
+        return self._active_runs_by_chapter.get(chapter_id)
 
     def load_run_details(self, run: RunRecord) -> RunRecord:
         value = self._database.run_payload(run.id)
@@ -1375,6 +1408,46 @@ class StateStore:
     def _invalidate_aggregates(self) -> None:
         self._usage_cache.clear()
         self._cost_cache.clear()
+
+    def _adjust_aggregate_caches(
+        self,
+        run: RunRecord,
+        *,
+        old_usage: TokenUsage,
+        old_model: str | None,
+    ) -> None:
+        if self._usage_cache:
+            delta = TokenUsage(
+                input_tokens=run.usage.input_tokens - old_usage.input_tokens,
+                cached_input_tokens=(run.usage.cached_input_tokens - old_usage.cached_input_tokens),
+                output_tokens=run.usage.output_tokens - old_usage.output_tokens,
+                reasoning_output_tokens=(
+                    run.usage.reasoning_output_tokens - old_usage.reasoning_output_tokens
+                ),
+                measured=run.usage.measured or old_usage.measured,
+            )
+            for invocation_only in (False, True):
+                if invocation_only and run.id in self._prior_run_ids:
+                    continue
+                for key in ((invocation_only, None), (invocation_only, run.chapter_id)):
+                    if key in self._usage_cache:
+                        self._usage_cache[key] = self._usage_cache[key] + delta
+        if self._cost_cache:
+            old_cost = self._run_cost(old_usage, old_model)
+            new_cost = self.run_cost(run)
+            delta_cost = CostEstimate(
+                estimated_usd=new_cost.estimated_usd - old_cost.estimated_usd,
+                priced_tokens=new_cost.priced_tokens - old_cost.priced_tokens,
+                unpriced_tokens=new_cost.unpriced_tokens - old_cost.unpriced_tokens,
+                inferred_runs=new_cost.inferred_runs - old_cost.inferred_runs,
+                unknown_models=new_cost.unknown_models,
+            )
+            for invocation_only in (False, True):
+                if invocation_only and run.id in self._prior_run_ids:
+                    continue
+                for key in ((invocation_only, None), (invocation_only, run.chapter_id)):
+                    if key in self._cost_cache:
+                        self._cost_cache[key] = self._cost_cache[key] + delta_cost
 
     def _invalidate_status_summaries(self) -> None:
         """Compatibility hook; indexes synchronize when dirty entities are marked."""
@@ -1391,6 +1464,11 @@ class StateStore:
             self._indexed_task_states[key] = (task.stage, str(task.status), task.queued)
         self._active_run_ids = {
             run.id for run in self._runs_by_id.values() if run.status == TaskStatus.RUNNING
+        }
+        self._active_runs_by_chapter = {
+            run.chapter_id: run
+            for run in self._runs_by_id.values()
+            if run.status == TaskStatus.RUNNING
         }
 
     def _sync_task_index(self, task: TaskRecord) -> None:
@@ -1544,15 +1622,19 @@ class StateStore:
         return self._cost_cache.get(key, CostEstimate())
 
     def run_cost(self, run: RunRecord) -> CostEstimate:
-        if not run.usage.measured:
+        return self._run_cost(run.usage, run.model)
+
+    @staticmethod
+    def _run_cost(usage: TokenUsage, model: str | None) -> CostEstimate:
+        if not usage.measured:
             return CostEstimate()
-        model = run.model or LEGACY_MODEL
+        selected_model = model or LEGACY_MODEL
         return estimate_cost(
-            model=model,
-            input_tokens=run.usage.input_tokens,
-            cached_input_tokens=run.usage.cached_input_tokens,
-            output_tokens=run.usage.output_tokens,
-            inferred=run.model is None,
+            model=selected_model,
+            input_tokens=usage.input_tokens,
+            cached_input_tokens=usage.cached_input_tokens,
+            output_tokens=usage.output_tokens,
+            inferred=model is None,
         )
 
     def total_cost(self) -> CostEstimate:
@@ -1749,7 +1831,6 @@ class StateStore:
         task.runs.append(run)
         self._index_run(run)
         self._payload_loaded_run_ids.add(run.id)
-        self._invalidate_aggregates()
         self._invalidate_status_summaries()
         self._mark_dirty(task=task, run=run)
         await self._persist()
@@ -1785,22 +1866,38 @@ class StateStore:
         task.runs.append(run)
         self._index_run(run)
         self._payload_loaded_run_ids.add(run.id)
-        self._invalidate_aggregates()
         self._invalidate_status_summaries()
         self._mark_dirty(task=task, run=run)
         await self._persist()
         return run
 
     async def update_run(self, run: RunRecord, *, deferred: bool = False, **changes: Any) -> None:
+        old_usage = run.usage
+        old_model = run.model
         for name, value in changes.items():
             setattr(run, name, value)
         if "usage" in changes or "model" in changes:
-            self._invalidate_aggregates()
+            self._adjust_aggregate_caches(run, old_usage=old_usage, old_model=old_model)
         if "status" in changes:
             self._invalidate_status_summaries()
         self._mark_dirty(run=run)
-        if not deferred:
+        if deferred:
+            self._schedule_telemetry_flush()
+        else:
             await self._persist()
+
+    def _schedule_telemetry_flush(self) -> None:
+        if self._telemetry_flush_task is not None and not self._telemetry_flush_task.done():
+            return
+
+        async def persist_later() -> None:
+            try:
+                await asyncio.sleep(0.5)
+                await self.flush()
+            finally:
+                self._telemetry_flush_task = None
+
+        self._telemetry_flush_task = asyncio.create_task(persist_later())
 
     async def finish_run(self, run: RunRecord, *, status: TaskStatus, **changes: Any) -> None:
         if run.status == TaskStatus.INTERRUPTED and status != TaskStatus.SUCCEEDED:

@@ -472,6 +472,8 @@ class DatabaseWrite:
     replace_source_issues: bool = False
     documents: dict[str, tuple[int, bytes]] = field(default_factory=dict)
     work_units: dict[str, tuple[str, int, str, str, bytes]] = field(default_factory=dict)
+    config_fingerprint: str | None = None
+    replace_static: bool = False
     changes: frozenset[tuple[str, str]] = frozenset()
 
 
@@ -484,6 +486,8 @@ def _coalesce_writes(writes: list[DatabaseWrite]) -> DatabaseWrite:
     work_units: dict[str, tuple[str, int, str, str, bytes]] = {}
     changes: set[tuple[str, str]] = set()
     replace_issues = False
+    replace_static = False
+    config_fingerprint: str | None = None
     for write in writes:
         globals_.update(write.globals)
         tasks.update(write.tasks)
@@ -494,6 +498,9 @@ def _coalesce_writes(writes: list[DatabaseWrite]) -> DatabaseWrite:
         issues.update(write.source_issues)
         documents.update(write.documents)
         work_units.update(write.work_units)
+        if write.config_fingerprint is not None:
+            config_fingerprint = write.config_fingerprint
+        replace_static = replace_static or write.replace_static
         changes.update(write.changes)
     return DatabaseWrite(
         updated_at=writes[-1].updated_at,
@@ -504,6 +511,8 @@ def _coalesce_writes(writes: list[DatabaseWrite]) -> DatabaseWrite:
         replace_source_issues=replace_issues,
         documents=documents,
         work_units=work_units,
+        config_fingerprint=config_fingerprint,
+        replace_static=replace_static,
         changes=frozenset(changes),
     )
 
@@ -517,6 +526,7 @@ class StateWriter:
         self._queue: queue.Queue[tuple[DatabaseWrite | None, Future[int | None]]] = queue.Queue()
         self._thread = threading.Thread(target=self._run, name="paf-state-writer", daemon=True)
         self._started = False
+        self._stop_future: Future[int | None] | None = None
 
     def start(self) -> None:
         if not self._started:
@@ -524,6 +534,8 @@ class StateWriter:
             self._thread.start()
 
     def submit(self, write: DatabaseWrite) -> Future[int | None]:
+        if self._stop_future is not None:
+            raise RuntimeError("state writer is closed")
         if not self._started:
             self.start()
         future: Future[int | None] = Future()
@@ -531,7 +543,10 @@ class StateWriter:
         return future
 
     def stop(self) -> Future[int | None]:
+        if self._stop_future is not None:
+            return self._stop_future
         future: Future[int | None] = Future()
+        self._stop_future = future
         if not self._started:
             future.set_result(None)
             return future
@@ -606,6 +621,15 @@ class StateDatabase:
         try:
             with connection:
                 revision = self._next_revision(connection, write.updated_at)
+                if write.config_fingerprint is not None:
+                    connection.execute(
+                        "UPDATE meta SET config_fingerprint=? WHERE singleton=1",
+                        (write.config_fingerprint,),
+                    )
+                if write.replace_static:
+                    connection.execute("DELETE FROM documents")
+                    connection.execute("DELETE FROM work_units")
+                    connection.execute("DELETE FROM tasks")
                 for key, payload in write.globals.items():
                     connection.execute(
                         """
@@ -737,6 +761,13 @@ class StateDatabase:
         with _connect(self.path) as connection:
             row = connection.execute("SELECT revision FROM meta WHERE singleton=1").fetchone()
         return int(row[0]) if row is not None else 0
+
+    def config_fingerprint(self) -> str:
+        with _connect(self.path) as connection:
+            row = connection.execute(
+                "SELECT config_fingerprint FROM meta WHERE singleton=1"
+            ).fetchone()
+        return str(row[0]) if row is not None else ""
 
     def status_view(self) -> dict[str, Any] | None:
         with _connect(self.path) as connection:

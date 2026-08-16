@@ -196,6 +196,7 @@ class ControlServer:
                 await self.done.wait()
                 response = self._status()
             elif command == "snapshot":
+                await self.orchestrator.state.export()
                 response = self._status(full=True)
             elif command == "status":
                 response = self._status()

@@ -37,7 +37,7 @@ from paf.pricing import LEGACY_MODEL, CostEstimate, estimate_cost, format_usd
 from paf.project import Project, ProjectResolver
 from paf.scheduler import Orchestrator, scaffold_directories
 from paf.state import StateStore, TaskRecord, TaskStatus
-from paf.state_db import read_checkpoint, read_full_snapshot, read_source_issues
+from paf.state_db import StateDatabase, read_checkpoint, read_full_snapshot, read_source_issues
 from paf.tui import activity_kind_badge, format_count, format_usage, run_tui
 
 RIPGREP_WARNING = (
@@ -904,6 +904,9 @@ def _start_agent(args: argparse.Namespace, config: PipelineConfig) -> int:
 
 
 def _offline_snapshot(config: PipelineConfig) -> dict[str, object]:
+    database = StateDatabase(config.settings.state_dir)
+    if database.path.is_file():
+        database.export_snapshot()
     response = offline_status(config.settings.state_dir)
     value = read_full_snapshot(config.settings.state_dir)
     if value is not None:
