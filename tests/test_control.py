@@ -37,7 +37,9 @@ async def test_run_control_pauses_and_stops_checkpoints() -> None:
 
 
 @pytest.mark.asyncio
-async def test_control_server_accepts_bash_friendly_commands(tmp_path: Path) -> None:
+async def test_control_server_accepts_bash_friendly_commands(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
     state = StateStore(config)
     control = RunControl()
@@ -76,6 +78,37 @@ async def test_control_server_accepts_bash_friendly_commands(tmp_path: Path) -> 
     assert paused["status"] == "paused"
     resumed = await asyncio.to_thread(send_command, config.settings.state_dir, "resume")
     assert resumed["status"] == "running"
+    await state.set_task(
+        config.chapters[0].id,
+        Stage.REVIEW,
+        TaskStatus.FAILED,
+        "review failed",
+    )
+    retried_failed = await asyncio.to_thread(send_command, config.settings.state_dir, "retry")
+    assert retried_failed["retried"] == 1
+    assert retried_failed["retried_tasks"] == ["book/chapter-01:review"]
+    assert state.task(config.chapters[0].id, Stage.REVIEW).status == TaskStatus.PENDING
+    retried_targets: list[tuple[str, Stage]] = []
+
+    def retry_live_agent(chapter: str) -> dict[str, object]:
+        retried_targets.append((chapter, Stage.REVIEW))
+        return {
+            "accepted": True,
+            "chapter_id": "book/chapter-01",
+            "stage": "review",
+            "interrupted_run_id": "live-run",
+        }
+
+    monkeypatch.setattr(orchestrator, "retry_live_agent", retry_live_agent)
+    retried = await asyncio.to_thread(
+        send_command,
+        config.settings.state_dir,
+        "retry",
+        parameters={"chapter": "book/chapter-01"},
+    )
+    assert retried["accepted"] is True
+    assert retried["interrupted_run_id"] == "live-run"
+    assert retried_targets == [("book/chapter-01", Stage.REVIEW)]
     stopped = await asyncio.to_thread(send_command, config.settings.state_dir, "stop")
     assert stopped["accepted"]
 

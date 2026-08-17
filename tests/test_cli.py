@@ -411,6 +411,45 @@ def test_agent_rpc_reads_jsonl_from_stdin(
     assert response["scheduling"]["algorithm"] == "weighted-critical-path-list-scheduling"
 
 
+def test_agent_retry_sends_targeted_chapter_and_stage(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = write_project(tmp_path, chapters="chapters = [1]")
+    captured: dict[str, object] = {}
+
+    def control_response(
+        command: str,
+        _config: PipelineConfig,
+        *,
+        parameters: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        captured.update(command=command, parameters=parameters)
+        return {"accepted": True}
+
+    monkeypatch.setattr(cli_module, "_control_response", control_response)
+
+    assert (
+        main(
+            [
+                "agent",
+                "retry",
+                "--config",
+                str(config_path),
+                "--chapter",
+                "book/chapter-01",
+            ]
+        )
+        == 0
+    )
+    assert json.loads(capsys.readouterr().out) == {"accepted": True}
+    assert captured == {
+        "command": "retry",
+        "parameters": {"chapter": "book/chapter-01"},
+    }
+
+
 def test_agent_snapshot_writes_json_only_with_output(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -507,6 +546,43 @@ def test_agent_unblock_updates_offline_state(
     assert len(task["runs"]) == 1
     assert snapshot["scheduling"] == {"algorithm": "saved-schedule"}
     assert snapshot["isolation"] == {"backend": "saved-isolation"}
+
+
+def test_agent_retry_without_chapter_requeues_failed_but_not_blocked_tasks(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config_path = write_project(tmp_path, chapters="chapters = [1]")
+    config = load_config(config_path)
+    state = StateStore(config)
+
+    async def populate() -> None:
+        await state.load_or_create()
+        await state.set_task(
+            config.chapters[0].id,
+            Stage.REVIEW,
+            TaskStatus.FAILED,
+            "review failed",
+        )
+        await state.set_task(
+            config.chapters[0].id,
+            Stage.PROVE,
+            TaskStatus.BLOCKED,
+            "proof blocked",
+        )
+        await state.close()
+
+    asyncio.run(populate())
+
+    assert main(["agent", "retry", "--config", str(config_path)]) == 0
+    response = json.loads(capsys.readouterr().out)
+    assert response["retried"] == 1
+    assert response["retried_tasks"] == ["book/chapter-01:review"]
+
+    snapshot = read_full_snapshot(config.settings.state_dir)
+    assert snapshot is not None
+    assert snapshot["tasks"]["book/chapter-01:review"]["status"] == "pending"
+    assert snapshot["tasks"]["book/chapter-01:review"]["detail"] == "manually retried"
+    assert snapshot["tasks"]["book/chapter-01:prove"]["status"] == "blocked"
 
 
 def test_agent_inspect_reports_compact_live_activity(

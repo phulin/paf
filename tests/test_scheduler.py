@@ -2787,6 +2787,61 @@ async def test_proof_releases_agent_slot_before_coordinator_build(
     await orchestrator.shutdown()
 
 
+@pytest.mark.asyncio
+async def test_targeted_live_retry_resumes_only_selected_agent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = config.chapters[0]
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await orchestrator.prepare()
+    executor = FakeExecutor(state, [result(changed=False)])
+    started = asyncio.Event()
+
+    async def blocked_run(
+        _chapter: Chapter,
+        _stage: Stage,
+        run: RunRecord,
+        **_kwargs: Any,
+    ) -> AgentResult:
+        await state.update_run(run, thread_id="live-session")
+        started.set()
+        try:
+            await asyncio.Future()
+            raise AssertionError("blocked agent unexpectedly continued without cancellation")
+        except asyncio.CancelledError:
+            await state.finish_run(
+                run,
+                status=TaskStatus.INTERRUPTED,
+                thread_id="live-session",
+            )
+            raise
+
+    monkeypatch.setattr(executor, "run", blocked_run)
+    orchestrator.executor = executor
+    attempt_task = asyncio.create_task(orchestrator._attempt(chapter, Stage.REVIEW))
+    await started.wait()
+    first_run = state.task(chapter.id, Stage.REVIEW).runs[-1]
+
+    response = orchestrator.retry_live_agent("1")
+    attempt = await attempt_task
+
+    assert response == {
+        "accepted": True,
+        "chapter_id": chapter.id,
+        "stage": "review",
+        "interrupted_run_id": first_run.id,
+    }
+    assert first_run.status == TaskStatus.INTERRUPTED
+    assert attempt.run.id != first_run.id
+    assert attempt.run.resumed_from_run_id == first_run.id
+    assert executor.resume_thread_ids == ["live-session"]
+    assert "operator requested a targeted retry" in executor.resume_prompts[0]
+    assert not orchestrator._live_agent_tasks
+    await orchestrator.shutdown()
+
+
 def test_proof_feedback_is_bounded_and_retains_latest_diagnostics() -> None:
     feedback = scheduler_module._bounded_proof_feedback(("old" * 20_000, "latest diagnostic"))
 

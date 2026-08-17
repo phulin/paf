@@ -62,6 +62,10 @@ Continue the same review assignment in the current files. Re-read the assignment
 done and structured-output instructions, finish any incomplete review work, and return exactly one
 complete structured report. Account for every supplied finding id when the assignment includes
 proof findings."""
+LIVE_AGENT_RETRY_PROMPT = """An operator requested a targeted retry of this live agent. Continue
+the same assignment from the current files and conversation. Re-read the assignment instructions,
+correct the issue that prevented the prior turn from completing, and return the required structured
+report only after the work is stable."""
 
 
 class ShepherdPlanError(ValueError):
@@ -402,6 +406,10 @@ class Orchestrator:
         self._shepherd_sweeps_started = 0
         self._repair_progress_generation = 0
         self._repair_slots = asyncio.Semaphore(config.shepherd.max_agents)
+        self._live_agent_tasks: dict[
+            tuple[str, Stage], tuple[RunRecord, asyncio.Task[AgentResult]]
+        ] = {}
+        self._live_agent_retry_requests: set[str] = set()
 
     @property
     def chapters(self) -> tuple[WorkUnitLike, ...]:
@@ -527,6 +535,41 @@ class Orchestrator:
         """Create configured chapter directories without creating Lean files."""
 
         scaffold_directories(self.config, self.work_units)
+
+    def retry_live_agent(self, chapter_selector: str) -> dict[str, object]:
+        """Interrupt and continue the single agent currently executing for one chapter."""
+
+        matches = [unit for unit in self.work_units if unit.id == chapter_selector]
+        if not matches and chapter_selector.isdigit():
+            matches = [unit for unit in self.work_units if unit.ordinal == int(chapter_selector)]
+        if not matches:
+            raise ValueError(f"work-unit selector matched nothing: {chapter_selector}")
+        if len(matches) > 1:
+            raise ValueError(
+                f"work-unit selector {chapter_selector!r} is ambiguous; pass a complete id"
+            )
+        chapter_id = matches[0].id
+        live = [
+            (stage, active)
+            for (active_chapter_id, stage), active in self._live_agent_tasks.items()
+            if active_chapter_id == chapter_id and not active[1].done()
+        ]
+        if not live:
+            raise ValueError(f"no live agent for {chapter_id}")
+        if len(live) > 1:
+            raise ValueError(f"multiple live agents unexpectedly found for {chapter_id}")
+        stage, active = live[0]
+        run, task = active
+        if run.id in self._live_agent_retry_requests:
+            raise ValueError(f"retry already requested for live run {run.id}")
+        self._live_agent_retry_requests.add(run.id)
+        task.cancel()
+        return {
+            "accepted": True,
+            "chapter_id": chapter_id,
+            "stage": stage.value,
+            "interrupted_run_id": run.id,
+        }
 
     def _observed_work_unit_graph(self) -> WorkUnitImportGraph:
         nodes = self.state.source_dependency_tree.get("nodes", {})
@@ -1004,9 +1047,10 @@ class Orchestrator:
         source_held = False
         isolated: IsolationResult | None = None
         live_discovery = not auxiliary and stage is Stage.DISCOVER
-        try:
+
+        async def start_agent_run() -> RunRecord:
             if auxiliary:
-                run = await self.state.start_auxiliary_run(
+                started = await self.state.start_auxiliary_run(
                     chapter.id,
                     stage,
                     role=role,
@@ -1016,7 +1060,7 @@ class Orchestrator:
                     ),
                 )
             else:
-                run = await self.state.start_run(chapter.id, stage)
+                started = await self.state.start_run(chapter.id, stage)
                 run_updates: dict[str, Any] = {
                     "prompt_kind": report_schema_key(stage, role=role, feedback=feedback),
                 }
@@ -1024,7 +1068,11 @@ class Orchestrator:
                     run_updates["role"] = role
                 if selected_request_ids:
                     run_updates["request_ids"] = list(selected_request_ids)
-                await self.state.update_run(run, **run_updates)
+                await self.state.update_run(started, **run_updates)
+            return started
+
+        try:
+            run = await start_agent_run()
             if live_discovery:
                 workspace_root = self.config.settings.repo
             elif self.isolation.name == "shared":
@@ -1041,16 +1089,9 @@ class Orchestrator:
                     await self.git.ensure_clean(chapter)
                 workspace = await self.isolation.acquire(run.id)
                 workspace_root = workspace.root
-            if upstream_repair:
-                agent = await self.executor.run_upstream_repair(
-                    chapter,
-                    run,
-                    selected_upstream_requests,
-                    workspace_root=workspace_root,
-                )
-            else:
+            while True:
                 if resume_thread_id is not None:
-                    agent = await self.executor.resume(
+                    operation = self.executor.resume(
                         chapter,
                         stage,
                         run,
@@ -1060,14 +1101,54 @@ class Orchestrator:
                         feedback=feedback,
                         workspace_root=workspace_root,
                     )
+                elif upstream_repair:
+                    operation = self.executor.run_upstream_repair(
+                        chapter,
+                        run,
+                        selected_upstream_requests,
+                        workspace_root=workspace_root,
+                    )
                 else:
-                    agent = await self.executor.run(
+                    operation = self.executor.run(
                         chapter,
                         stage,
                         run,
                         feedback=feedback,
                         workspace_root=workspace_root,
                     )
+                agent_task = asyncio.create_task(operation)
+                active_run = run
+                live_key = (chapter.id, stage)
+                self._live_agent_tasks[live_key] = (active_run, agent_task)
+                try:
+                    agent = await agent_task
+                except asyncio.CancelledError:
+                    current = asyncio.current_task()
+                    targeted_retry = active_run.id in self._live_agent_retry_requests
+                    if (
+                        not targeted_retry
+                        or self.control.stopping
+                        or (current is not None and current.cancelling())
+                    ):
+                        self._live_agent_retry_requests.discard(active_run.id)
+                        raise
+                    self._live_agent_retry_requests.discard(active_run.id)
+                    previous_run = active_run
+                    if previous_run.status == TaskStatus.RUNNING:
+                        await self.state.finish_run(
+                            previous_run,
+                            status=TaskStatus.INTERRUPTED,
+                            thread_id=previous_run.thread_id,
+                        )
+                    run = await start_agent_run()
+                    resume_thread_id = previous_run.thread_id
+                    resume_run_id = previous_run.id
+                    resume_prompt = LIVE_AGENT_RETRY_PROMPT
+                    continue
+                finally:
+                    if self._live_agent_tasks.get(live_key) == (active_run, agent_task):
+                        self._live_agent_tasks.pop(live_key, None)
+                break
             slots.release()
             slot_held = False
             # Agent capacity covers live Codex processes, not integration or a

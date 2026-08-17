@@ -342,6 +342,8 @@ uv run paf agent start "$TARGET"
 uv run paf agent status "$TARGET"
 uv run paf agent pause "$TARGET"
 uv run paf agent resume "$TARGET"
+uv run paf agent retry "$TARGET" --chapter book02/chapter-08
+uv run paf agent retry "$TARGET"
 uv run paf agent unblock "$TARGET"
 uv run paf agent snapshot "$TARGET"
 uv run paf agent snapshot "$TARGET" --output snapshot.json
@@ -361,6 +363,11 @@ Use `agent stop` to cancel the scheduler and terminate active Codex/build subpro
 
 Pause is cooperative: already-running chapter attempts finish, while new agent/build attempts wait at
 a checkpoint. This preserves coherent edits and build results. Resume releases all queued work.
+`retry --chapter ID` interrupts only that chapter's live agent and immediately continues its
+assignment, resuming the same Codex session when a thread id is available. Other agents and the
+scheduler keep running. Without `--chapter`, `retry` resets every `failed` task to `pending` while
+retaining run history. This is distinct from `unblock`, which resets `blocked` tasks and reopens any
+escalated upstream handoffs.
 `unblock` resets every persisted `blocked` task to `pending` without deleting its run history. It can
 be issued against either a live daemon or offline state; pending tasks are eligible the next time the
 corresponding stage is scheduled. For a manually escalated upstream proof request, it also reopens
@@ -374,8 +381,8 @@ printf '%s\n' '{"command":"status"}' '{"command":"snapshot"}' \
   | uv run paf agent rpc "$TARGET"
 ```
 
-Accepted RPC commands are `status`, `snapshot`, `pause`, `resume`, `unblock`, `stop`, `wait`, and
-`inspect`.
+Accepted RPC commands are `status`, `snapshot`, `pause`, `resume`, `retry`, `unblock`, `stop`, `wait`,
+and `inspect`. A retry request may include `chapter`; omitting it retries every failed task.
 Inspection requests may include `chapter` or `run`, for example
 `{"command":"inspect","chapter":"book02/chapter-08"}`. The daemon
 stores its socket, PID, JSON result, and combined stdout/stderr log under the inferred state directory.
@@ -404,7 +411,9 @@ After the daemon exits, `status`, `snapshot`, and `wait` fall back to the persis
   An initial review that edits source receives another full pass until one pass is clean, capped at
   five review/verification cycles. A review launched with specific persisted findings instead makes
   one repair pass and completes as soon as its coordinator rebuild is clean; it does not require a
-  redundant no-change confirmation pass. Once a chapter is clean, its proof agent may start while
+  redundant no-change confirmation pass. Incomplete reports, malformed structured output, and
+  missing finding assessments resume the same review session with an instruction reminder; each
+  continuation consumes the same five-cycle budget. Once a chapter is clean, its proof agent may start while
   descendant reviews continue. A reported chapter-local failure is quarantined: unrelated review and
   proof branches keep running, while actual dependents are marked blocked. Unexpected coordinator
   exceptions still fail fast after draining live workers. There is no corpus-wide clean-build or
@@ -427,6 +436,8 @@ After the daemon exits, `status`, `snapshot`, and `wait` fall back to the persis
 - If sustained checked proof work exposes a genuinely missing earlier interface, the proof agent
   records the blocked declaration and consumer path, exact residual goal, minimal result needed,
   proposed owner chapter and paths, and at least two materially different attempted alternatives.
+  When all exact owner paths resolve to one selected work unit, that path-derived owner is
+  authoritative even if the agent supplied a noncanonical owner label.
   It keeps working on independent declarations. The coordinator persists the request before doing
   anything else and batches all requested records by owner chapter. A targeted variant of the
   failed-proof re-review receives the complete batch, consumer declaration excerpts, residual goals,

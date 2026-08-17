@@ -2144,6 +2144,27 @@ class StateStore:
             await self._persist()
         return changed
 
+    async def retry_failed(self) -> list[str]:
+        """Reset every failed task to pending without discarding attempt history."""
+
+        changed: list[str] = []
+        for key, task in self.tasks.items():
+            if task.status != TaskStatus.FAILED:
+                continue
+            task.status = TaskStatus.PENDING
+            task.phase = TaskPhase.IDLE
+            task.queued = False
+            if task.stage == Stage.PROVE:
+                task.source_digest = None
+            task.detail = "manually retried"
+            task.updated_at = timestamp()
+            changed.append(key)
+        if changed:
+            self._invalidate_status_summaries()
+            self._mark_dirty(tasks=(self.tasks[key] for key in changed))
+            await self._persist()
+        return changed
+
     async def requeue_interrupted(self, *, resume_agents: bool) -> list[str]:
         """Requeue interrupted tasks while retaining their optional session history."""
 

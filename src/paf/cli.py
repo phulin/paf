@@ -256,6 +256,17 @@ def parser() -> argparse.ArgumentParser:
                 type=Path,
                 help="explicitly export the complete snapshot to this JSON file",
             )
+    retry = agent_commands.add_parser(
+        "retry", help="retry one live chapter agent or reset all failed tasks"
+    )
+    _add_source(retry)
+    retry.add_argument(
+        "--chapter",
+        help=(
+            "chapter id or unambiguous number for one live agent; "
+            "without it, reset every failed task"
+        ),
+    )
     rpc = agent_commands.add_parser("rpc", help="read control commands as JSONL from stdin")
     _add_source(rpc)
     inspect = agent_commands.add_parser("inspect", help="show one agent's live activity")
@@ -1103,10 +1114,20 @@ def _inspect_agent(args: argparse.Namespace, config: PipelineConfig) -> int:
         time.sleep(args.interval)
 
 
-def _control_response(command: str, config: PipelineConfig) -> dict[str, object]:
+def _control_response(
+    command: str,
+    config: PipelineConfig,
+    *,
+    parameters: dict[str, object] | None = None,
+) -> dict[str, object]:
     timeout = None if command == "wait" else 10.0
     try:
-        response = send_command(config.settings.state_dir, command, timeout=timeout)
+        response = send_command(
+            config.settings.state_dir,
+            command,
+            timeout=timeout,
+            parameters=parameters,
+        )
     except OSError:
         if command == "snapshot":
             response = _offline_snapshot(config)
@@ -1133,12 +1154,37 @@ def _control_response(command: str, config: PipelineConfig) -> dict[str, object]
                     "updated_at": state.updated_at,
                     "tasks": counts,
                 }
+        elif command == "retry" and not parameters:
+            if read_checkpoint(config.settings.state_dir) is None:
+                response = offline_status(config.settings.state_dir) | {
+                    "retried": 0,
+                    "retried_tasks": [],
+                }
+            else:
+                state = StateStore(config)
+
+                async def retry_failed() -> list[str]:
+                    await state.load_or_create()
+                    return await state.retry_failed()
+
+                tasks = asyncio.run(retry_failed())
+                counts = {status.value: 0 for status in TaskStatus}
+                for task in state.tasks.values():
+                    counts[str(task.status)] += 1
+                response = offline_status(config.settings.state_dir) | {
+                    "retried": len(tasks),
+                    "retried_tasks": tasks,
+                    "updated_at": state.updated_at,
+                    "tasks": counts,
+                }
         elif command in {"status", "wait"}:
             response = offline_status(config.settings.state_dir)
         else:
             raise ValueError(
                 f"no managed pipeline is running at {config.settings.state_dir}"
             ) from None
+    if isinstance(response.get("error"), str):
+        raise ValueError(str(response["error"]))
     if not response.get("scheduling"):
         statements = build_corpus_schedule(config.documents, config.work_units, phase="statements")
         proofs = build_corpus_schedule(config.documents, config.work_units, phase="proofs")
@@ -1153,6 +1199,7 @@ def _agent_rpc(config: PipelineConfig) -> int:
         "snapshot",
         "pause",
         "resume",
+        "retry",
         "unblock",
         "stop",
         "wait",
@@ -1173,7 +1220,10 @@ def _agent_rpc(config: PipelineConfig) -> int:
                     run_id=str(request["run"]) if request.get("run") is not None else None,
                 )
             else:
-                response = _control_response(str(request["command"]), config)
+                parameters = None
+                if request["command"] == "retry" and "chapter" in request:
+                    parameters = {"chapter": request["chapter"]}
+                response = _control_response(str(request["command"]), config, parameters=parameters)
         except (json.JSONDecodeError, ValueError) as error:
             response = {"error": str(error)}
             failed = True
@@ -1191,7 +1241,10 @@ def _agent_command(args: argparse.Namespace, config: PipelineConfig) -> int:
         return _agent_rpc(config)
     if command == "inspect":
         return _inspect_agent(args, config)
-    response = _control_response(command, config)
+    parameters = (
+        {"chapter": args.chapter} if command == "retry" and args.chapter is not None else None
+    )
+    response = _control_response(command, config, parameters=parameters)
     if command == "snapshot" and args.output is not None:
         snapshot = response.get("snapshot")
         if not isinstance(snapshot, dict):

@@ -229,6 +229,19 @@ class ControlServer:
                     "unblocked": len(tasks),
                     "unblocked_tasks": tasks,
                 }
+            elif command == "retry":
+                chapter = request.get("chapter")
+                if chapter is None:
+                    tasks = await self.orchestrator.state.retry_failed()
+                    response = self._status() | {
+                        "retried": len(tasks),
+                        "retried_tasks": tasks,
+                    }
+                elif isinstance(chapter, str) and chapter:
+                    retried = self.orchestrator.retry_live_agent(chapter)
+                    response = self._status() | retried
+                else:
+                    raise ValueError("retry chapter must be a non-empty string")
             elif command == "stop":
                 self.request_stop()
                 response = self._status() | {"accepted": True}
@@ -400,12 +413,21 @@ class ControlServer:
         return "running"
 
 
-def send_command(state_dir: Path, command: str, *, timeout: float | None = 10.0) -> dict[str, Any]:
+def send_command(
+    state_dir: Path,
+    command: str,
+    *,
+    timeout: float | None = 10.0,
+    parameters: dict[str, object] | None = None,
+) -> dict[str, Any]:
     path = control_socket(state_dir)
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
         client.settimeout(timeout)
         client.connect(str(path))
-        client.sendall(json.dumpb({"command": command}) + b"\n")
+        request: dict[str, object] = {"command": command}
+        if parameters is not None:
+            request.update(parameters)
+        client.sendall(json.dumpb(request) + b"\n")
         chunks = bytearray()
         while not chunks.endswith(b"\n"):
             block = client.recv(65536)
