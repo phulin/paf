@@ -13,6 +13,8 @@ from mcp.server.fastmcp import Context
 from mcp.server.fastmcp.server import Settings as FastMCPSettings
 from mcp.types import ToolAnnotations
 
+from paf.diagnostics import LEAN_WARNING_RE, lean_diagnostic_counts
+
 # pydantic-settings 2.15 detects the forward reference to FastMCP in the MCP
 # SDK's generic settings model.  Rebuild it after its module has finished
 # defining FastMCP, but before lean-lsp-mcp constructs its server at import time.
@@ -129,6 +131,13 @@ def _dependency_preparation_errors(document: Any, path: str) -> list[dict[str, A
         message = str(diagnostic.get("message", ""))
         if not (is_build_stderr(message) or _STALE_IMPORT_TEXT in message):
             continue
+        if is_build_stderr(message):
+            error_count, warning_count = lean_diagnostic_counts(message)
+            if not error_count and not warning_count and LEAN_WARNING_RE.search(message):
+                # Lake writes permitted ``sorry`` warnings to stderr.  The Lean
+                # server wraps that output as a build diagnostic even though the
+                # dependency artifact is usable.
+                continue
         errors.append(
             {
                 "file_path": path,

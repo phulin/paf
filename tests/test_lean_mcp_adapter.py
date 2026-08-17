@@ -333,6 +333,42 @@ async def test_explicit_prepare_threads_raw_missing_artifact_error(tmp_path: Pat
 
 
 @pytest.mark.asyncio
+async def test_explicit_prepare_allows_dependency_sorry_warnings(tmp_path: Path) -> None:
+    write(tmp_path, "A.lean", "import B\n")
+    client = FakeClient(tmp_path)
+    build_output = "lake setup-file A.lean failed\nwarning: B.lean:2:8: declaration uses 'sorry'"
+
+    async def barrier(_client: Any, path: str, timeout: float | None) -> None:
+        client.events.append(("barrier", path, timeout))
+        client._docs[path].diagnostics = [{"message": build_output}]
+
+    _, errors = await _force_prepare_dependencies(client, "A.lean", original_barrier=barrier)
+
+    assert errors == []
+
+
+@pytest.mark.asyncio
+async def test_explicit_prepare_rejects_non_sorry_dependency_warnings(tmp_path: Path) -> None:
+    write(tmp_path, "A.lean", "import B\n")
+    client = FakeClient(tmp_path)
+    build_output = "lake setup-file A.lean failed\nwarning: B.lean:2:8: unused variable `value`"
+
+    async def barrier(_client: Any, path: str, timeout: float | None) -> None:
+        client.events.append(("barrier", path, timeout))
+        client._docs[path].diagnostics = [{"message": build_output}]
+
+    _, errors = await _force_prepare_dependencies(client, "A.lean", original_barrier=barrier)
+
+    assert errors == [
+        {
+            "file_path": "A.lean",
+            "message": build_output,
+            "failed_dependencies": ["B.lean"],
+        }
+    ]
+
+
+@pytest.mark.asyncio
 async def test_prepare_tool_threads_structured_errors(monkeypatch: pytest.MonkeyPatch) -> None:
     client = object()
     ctx: Any = SimpleNamespace(
