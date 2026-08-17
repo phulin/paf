@@ -148,9 +148,9 @@ pub fn run(
                 bail!(event.expect_err("guarded as failed wire event"))
             }
             Ok(RuntimeEvent::Terminal(event)) => {
-                let previous_run = model.selected_run_id().map(str::to_owned);
+                let previous_run = model.trace_run_id().map(str::to_owned);
                 dirty = handle_terminal_event(event, &mut model, socket_path)?;
-                let selected_run = model.selected_run_id().map(str::to_owned);
+                let selected_run = model.trace_run_id().map(str::to_owned);
                 if selected_run != previous_run && selected_run.is_some() {
                     request_timeline_if_needed(&mut model, socket_path, sender.clone());
                 }
@@ -176,7 +176,7 @@ pub fn run(
             }
             Err(RecvTimeoutError::Timeout) => {
                 // This is a presentation clock for idle/elapsed labels, never a state poll.
-                dirty = model.detail || model.state.agents.active > 0;
+                dirty = model.detail || model.shepherd_detail || model.state.agents.active > 0;
             }
             Err(RecvTimeoutError::Disconnected) => {
                 bail!("dashboard event sources disconnected unexpectedly")
@@ -283,6 +283,9 @@ fn handle_terminal_event(
         }
         return Ok(dirty);
     }
+    if model.shepherd_detail {
+        return handle_shepherd_key(key, model, socket_path);
+    }
     match key.code {
         KeyCode::Char('q') | KeyCode::Char('c')
             if key.code == KeyCode::Char('q') || key.modifiers.contains(KeyModifiers::CONTROL) =>
@@ -302,6 +305,10 @@ fn handle_terminal_event(
                 model.enter_detail();
                 load_chapter_runs(model, socket_path, None)?;
             }
+            Ok(true)
+        }
+        KeyCode::Char('s') => {
+            model.enter_shepherd_detail();
             Ok(true)
         }
         KeyCode::Up | KeyCode::Char('k') => {
@@ -374,7 +381,7 @@ fn request_timeline_if_needed(
     socket_path: &str,
     sender: Sender<RuntimeEvent>,
 ) {
-    let Some(run_id) = model.selected_run_id().map(str::to_owned) else {
+    let Some(run_id) = model.trace_run_id().map(str::to_owned) else {
         return;
     };
     if !model.begin_timeline_load(&run_id) {
@@ -415,12 +422,50 @@ fn handle_mouse_event(mouse: MouseEvent, model: &mut DashboardModel) -> bool {
         MouseEventKind::ScrollDown => MOUSE_SCROLL_ROWS,
         _ => return false,
     };
-    if model.detail {
+    if model.detail || model.shepherd_detail {
         model.scroll_detail(delta as i16);
     } else {
         model.move_selection(delta);
     }
     true
+}
+
+fn handle_shepherd_key(
+    key: KeyEvent,
+    model: &mut DashboardModel,
+    socket_path: &str,
+) -> Result<bool> {
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('s') => {
+            model.leave_shepherd_detail();
+        }
+        KeyCode::Up | KeyCode::Char('k') => model.move_shepherd_selection(-1),
+        KeyCode::Down | KeyCode::Char('j') => model.move_shepherd_selection(1),
+        KeyCode::PageUp => model.move_shepherd_selection(-10),
+        KeyCode::PageDown => model.move_shepherd_selection(10),
+        KeyCode::Home => model.move_shepherd_selection(-(model.shepherd_selected as isize)),
+        KeyCode::End => model.move_shepherd_selection(isize::MAX),
+        KeyCode::Enter | KeyCode::Char('i') => {
+            let Some(agent) = model.selected_shepherd_agent().cloned() else {
+                return Ok(false);
+            };
+            if agent.run_id.is_empty() || agent.work_unit_id.is_empty() {
+                return Ok(false);
+            }
+            let Some(selected) = model
+                .rows()
+                .iter()
+                .position(|row| row.unit.id == agent.work_unit_id)
+            else {
+                return Ok(false);
+            };
+            model.selected = selected;
+            model.enter_detail();
+            load_chapter_runs(model, socket_path, Some(&agent.run_id))?;
+        }
+        _ => return Ok(false),
+    }
+    Ok(true)
 }
 
 fn handle_detail_key(key: KeyEvent, model: &mut DashboardModel) -> Result<bool> {
@@ -589,6 +634,20 @@ mod tests {
             model.scroll, 30,
             "scrolling cannot expose space below the log"
         );
+    }
+
+    #[test]
+    fn shepherd_key_opens_and_closes_the_trace_view() {
+        let mut model = DashboardModel::loading("test".into(), String::new());
+        model.preparation = None;
+        let shepherd_key = Event::Key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+
+        assert!(handle_terminal_event(shepherd_key.clone(), &mut model, "/unused").unwrap());
+        assert!(model.shepherd_detail);
+        assert!(!model.detail);
+        assert!(handle_terminal_event(shepherd_key, &mut model, "/unused").unwrap());
+        assert!(!model.shepherd_detail);
+        assert!(!model.stopping);
     }
 
     #[test]

@@ -27,6 +27,8 @@ const SURFACE: Color = Color::Rgb(36, 40, 59);
 pub fn draw(frame: &mut Frame<'_>, model: &mut DashboardModel) {
     if model.detail {
         draw_detail(frame, model);
+    } else if model.shepherd_detail {
+        draw_shepherd_detail(frame, model);
     } else {
         draw_dashboard(frame, model);
     }
@@ -133,11 +135,116 @@ fn draw_dashboard(frame: &mut Frame<'_>, model: &DashboardModel) {
     draw_status(frame, model, layout[4]);
     frame.render_widget(
         Paragraph::new(
-            "↑↓ select  Enter/i inspect  p pause/resume  r reload TUI  d detach  q stop",
+            "↑↓ select  Enter/i inspect  s shepherd  p pause/resume  r reload TUI  d detach  q stop",
         )
         .style(Style::default().fg(MUTED))
         .alignment(Alignment::Center),
         layout[5],
+    );
+}
+
+fn draw_shepherd_detail(frame: &mut Frame<'_>, model: &mut DashboardModel) {
+    let shepherd = &model.state.shepherd;
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(4),
+            Constraint::Length((shepherd.agents.len().clamp(1, 8) + 3) as u16),
+            Constraint::Min(6),
+            Constraint::Length(1),
+        ])
+        .split(frame.area());
+    let summary = if shepherd.last_error.is_empty() {
+        shepherd.last_summary.as_str()
+    } else {
+        shepherd.last_error.as_str()
+    };
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::styled(
+                format!("Shepherd · {}", shepherd.status),
+                Style::default().fg(YELLOW).add_modifier(Modifier::BOLD),
+            ),
+            Line::from(format!(
+                "failures {} · repairs {}/{} · succeeded {} · failed {}    {}",
+                shepherd.pending_failures,
+                shepherd.running_units,
+                shepherd.planned_units,
+                shepherd.succeeded_units,
+                shepherd.failed_units,
+                summary,
+            )),
+        ])
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Shepherd trace "),
+        ),
+        layout[0],
+    );
+
+    let rows = if shepherd.agents.is_empty() {
+        vec![Row::new(["—", "No Shepherd sweep has run yet", "", ""])]
+    } else {
+        shepherd
+            .agents
+            .iter()
+            .map(|agent| {
+                Row::new([
+                    if agent.role == "shepherd" {
+                        "planner"
+                    } else {
+                        "worker"
+                    },
+                    agent.label.as_str(),
+                    agent.status.as_str(),
+                    if agent.run_id.is_empty() {
+                        "not started"
+                    } else {
+                        agent.run_id.as_str()
+                    },
+                ])
+            })
+            .collect()
+    };
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(9),
+            Constraint::Min(24),
+            Constraint::Length(13),
+            Constraint::Length(14),
+        ],
+    )
+    .header(
+        Row::new(["Role", "Agent / objective", "Status", "Run"])
+            .style(Style::default().fg(CYAN).add_modifier(Modifier::BOLD)),
+    )
+    .row_highlight_style(Style::default().bg(SURFACE).add_modifier(Modifier::BOLD))
+    .highlight_symbol("▸ ")
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Relevant agents "),
+    );
+    let mut table_state = TableState::default()
+        .with_selected((!shepherd.agents.is_empty()).then_some(model.shepherd_selected));
+    frame.render_stateful_widget(table, layout[1], &mut table_state);
+
+    let text = detail_text(
+        DetailTab::Timeline,
+        model.selected_shepherd_activity(),
+        None,
+        None,
+    );
+    draw_detail_content(frame, model, text, layout[2]);
+    frame.render_widget(
+        Paragraph::new(
+            "↑↓ select agent  Enter open full agent view  s/Esc/q back  r reload TUI  d detach",
+        )
+        .style(Style::default().fg(MUTED))
+        .alignment(Alignment::Center),
+        layout[3],
     );
 }
 
@@ -552,7 +659,13 @@ fn draw_detail(frame: &mut Frame<'_>, model: &mut DashboardModel) {
         let labels = model
             .detail_runs
             .iter()
-            .map(|run| format!("{} round {}", title(&run.stage), run.round))
+            .map(|run| match run.role.as_str() {
+                "shepherd" => "Shepherd planner".into(),
+                "repair_worker" => {
+                    format!("Repair {} round {}", title(&run.stage), run.round)
+                }
+                _ => format!("{} round {}", title(&run.stage), run.round),
+            })
             .collect::<Vec<_>>();
         visible_run_tabs(&labels, model.selected_run, layout[1].width as usize)
     };
@@ -622,9 +735,11 @@ fn draw_detail(frame: &mut Frame<'_>, model: &mut DashboardModel) {
         draw_detail_content(frame, model, text, layout[4]);
     }
     frame.render_widget(
-        Paragraph::new("←→ runs  Tab/Shift-Tab views  ↑↓ scroll  r reload  d detach  Esc/q back")
-            .style(Style::default().fg(MUTED))
-            .alignment(Alignment::Center),
+        Paragraph::new(
+            "←→ runs  Tab/Shift-Tab views  ↑↓ scroll  r reload TUI  d detach  Esc/q back",
+        )
+        .style(Style::default().fg(MUTED))
+        .alignment(Alignment::Center),
         layout[5],
     );
 }
@@ -1214,6 +1329,74 @@ mod tests {
         assert!(detail.contains("Agent detail"));
         assert!(detail.contains("[edit] success"));
         assert!(detail.contains("reload TUI"));
+    }
+
+    #[test]
+    fn renders_shepherd_trace_and_relevant_agent_navigation() {
+        let mut model = DashboardModel::loading("pipeline".into(), String::new());
+        model
+            .apply(WireEvent {
+                protocol_version: PROTOCOL_VERSION,
+                event: "snapshot".into(),
+                status: "running".into(),
+                result: None,
+                snapshot: Some(serde_json::json!({
+                    "shepherd": {
+                        "enabled": true,
+                        "status": "repairing",
+                        "pending_failures": 2,
+                        "planned_units": 1,
+                        "running_units": 1,
+                        "last_summary": "repair the shared blocker",
+                        "agents": [{
+                            "run_id": "plan-run",
+                            "role": "shepherd",
+                            "work_unit_id": "book/chapter-01",
+                            "stage": "discover",
+                            "status": "running",
+                            "label": "Shepherd planner",
+                            "objective": "rank repair candidates"
+                        }, {
+                            "run_id": "worker-run",
+                            "role": "repair_worker",
+                            "work_unit_id": "book/chapter-01",
+                            "stage": "review",
+                            "status": "running",
+                            "label": "Repair review",
+                            "repair_work_unit_id": "repair-1",
+                            "objective": "repair the failed declaration"
+                        }]
+                    },
+                    "activities": {
+                        "plan-run": {
+                            "run_id": "plan-run",
+                            "current": "ranking repair candidates",
+                            "recent": [{
+                                "sequence": 1,
+                                "at": "2026-08-16T00:00:00+00:00",
+                                "kind": "reasoning",
+                                "status": "started",
+                                "title": "Inspect failures"
+                            }]
+                        }
+                    }
+                })),
+                delta: None,
+                preparation: None,
+                message: String::new(),
+            })
+            .unwrap();
+        model.enter_shepherd_detail();
+
+        let backend = TestBackend::new(140, 32);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut model)).unwrap();
+        let rendered = terminal.backend().to_string();
+        assert!(rendered.contains("Shepherd trace"));
+        assert!(rendered.contains("Shepherd planner"));
+        assert!(rendered.contains("Repair review"));
+        assert!(rendered.contains("Inspect failures"));
+        assert!(rendered.contains("Enter open full agent view"));
     }
 
     #[test]

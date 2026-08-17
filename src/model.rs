@@ -74,6 +74,20 @@ pub struct Shepherd {
     pub running_units: usize,
     pub succeeded_units: usize,
     pub failed_units: usize,
+    pub agents: Vec<ShepherdAgent>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct ShepherdAgent {
+    pub run_id: String,
+    pub role: String,
+    pub work_unit_id: String,
+    pub stage: String,
+    pub status: String,
+    pub label: String,
+    pub repair_work_unit_id: String,
+    pub objective: String,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -140,6 +154,7 @@ pub struct Activity {
 pub struct HistoricalRun {
     pub id: String,
     pub stage: String,
+    pub role: String,
     pub round: usize,
     pub status: String,
     pub started_at: String,
@@ -326,6 +341,8 @@ pub struct DashboardModel {
     pub result: Option<bool>,
     pub selected: usize,
     pub detail: bool,
+    pub shepherd_detail: bool,
+    pub shepherd_selected: usize,
     pub detail_tab: DetailTab,
     pub scroll: u16,
     pub detail_max_scroll: u16,
@@ -364,6 +381,8 @@ impl DashboardModel {
             result: None,
             selected: 0,
             detail: false,
+            shepherd_detail: false,
+            shepherd_selected: 0,
             detail_tab: detail_tab.map(DetailTab::from_name).unwrap_or_default(),
             scroll: 0,
             detail_max_scroll: 0,
@@ -555,6 +574,7 @@ impl DashboardModel {
 
     pub fn enter_detail(&mut self) {
         self.detail = true;
+        self.shepherd_detail = false;
         self.detail_runs.clear();
         self.selected_run = 0;
         self.scroll = 0;
@@ -570,6 +590,62 @@ impl DashboardModel {
         self.scroll = 0;
         self.detail_max_scroll = 0;
         self.detail_follow_tail = true;
+    }
+
+    pub fn enter_shepherd_detail(&mut self) {
+        self.shepherd_detail = true;
+        self.detail = false;
+        self.shepherd_selected = self
+            .state
+            .shepherd
+            .agents
+            .iter()
+            .position(|agent| !agent.run_id.is_empty() && agent.status == "running")
+            .unwrap_or(0);
+        self.scroll = 0;
+        self.detail_max_scroll = 0;
+        self.detail_follow_tail = true;
+    }
+
+    pub fn leave_shepherd_detail(&mut self) {
+        self.shepherd_detail = false;
+        self.scroll = 0;
+        self.detail_max_scroll = 0;
+        self.detail_follow_tail = true;
+    }
+
+    pub fn selected_shepherd_agent(&self) -> Option<&ShepherdAgent> {
+        self.state.shepherd.agents.get(self.shepherd_selected)
+    }
+
+    pub fn selected_shepherd_activity(&self) -> Option<&Activity> {
+        let run_id = &self.selected_shepherd_agent()?.run_id;
+        self.state.activities.get(run_id)
+    }
+
+    pub fn move_shepherd_selection(&mut self, delta: isize) {
+        let length = self.state.shepherd.agents.len();
+        if length == 0 {
+            self.shepherd_selected = 0;
+            return;
+        }
+        self.shepherd_selected = self
+            .shepherd_selected
+            .saturating_add_signed(delta)
+            .min(length - 1);
+        self.scroll = 0;
+        self.detail_max_scroll = 0;
+        self.detail_follow_tail = true;
+    }
+
+    pub fn trace_run_id(&self) -> Option<&str> {
+        if self.shepherd_detail {
+            self.selected_shepherd_agent()
+                .map(|agent| agent.run_id.as_str())
+                .filter(|run_id| !run_id.is_empty())
+        } else {
+            self.selected_run_id()
+        }
     }
 
     pub fn selected_run_id(&self) -> Option<&str> {
