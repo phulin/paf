@@ -2414,6 +2414,56 @@ class Orchestrator:
             self._diagnostic_owner_cache[diagnostic] = owners
         return owners
 
+    def _partition_successful_build_diagnostics(
+        self,
+        result: ValidationResult,
+        target_ids: Iterable[str],
+        graph: WorkUnitImportGraph,
+    ) -> dict[str, ValidationResult]:
+        """Apply warning policy per target after one successful Lake process.
+
+        Lake may compile every requested target and exit successfully while
+        PAF rejects a warning from just one source file.  The combined process
+        result must not make unrelated targets fail validation.
+        """
+
+        ids = tuple(target_ids)
+        if result.succeeded or not result.compiler_succeeded:
+            return {target_id: result for target_id in ids}
+        diagnostics = _lean_diagnostics(result.output)
+        owned = tuple(
+            (diagnostic, set(self._diagnostic_owner_ids(diagnostic))) for diagnostic in diagnostics
+        )
+        # An unlocated warning cannot safely be assigned within this batch.
+        # Leave it shared so the batch dispatcher retries smaller groups.
+        if not diagnostics or any(not owners for _, owners in owned):
+            return {target_id: result for target_id in ids}
+
+        partitioned: dict[str, ValidationResult] = {}
+        for target_id in ids:
+            closure = self._dependency_closure(graph, (target_id,))
+            relevant = [diagnostic for diagnostic, owners in owned if closure & owners]
+            if relevant:
+                output = "\n\n".join(diagnostic.text for diagnostic in relevant)
+                output += (
+                    f"\n\nCoordinator rejected {len(relevant)} non-sorry Lean warning(s) "
+                    f"relevant to {target_id}."
+                )
+                partitioned[target_id] = ValidationResult(
+                    False,
+                    1,
+                    output[-20_000:],
+                    process_exit_code=0,
+                )
+            else:
+                partitioned[target_id] = ValidationResult(
+                    True,
+                    0,
+                    "Lake build succeeded; diagnostics belonged to other batch targets.",
+                    process_exit_code=0,
+                )
+        return partitioned
+
     async def _build_chapters(
         self,
         chapters: Iterable[WorkUnitLike],
@@ -2484,6 +2534,7 @@ class Orchestrator:
 
         requested_ids = {chapter.id for request in requests for chapter in request.chapters}
         remaining = set(requested_ids)
+        isolate = set[str]()
         results_by_id: dict[str, ValidationResult] = {}
         snapshots_by_id: dict[str, ValidatedBuildSnapshot] = {}
 
@@ -2529,10 +2580,13 @@ class Orchestrator:
                             selected_by_id.setdefault(chapter.id, chapter)
                 candidates = tuple(selected_by_id.values())
                 first_prefix = candidates[0].build_command.strip().rpartition(" ")[0]
-                selected = tuple(
+                compatible = tuple(
                     chapter
                     for chapter in candidates
                     if chapter.build_command.strip().rpartition(" ")[0] == first_prefix
+                )
+                selected = (
+                    compatible[:1] if any(item.id in isolate for item in compatible) else compatible
                 )
                 active_ids = {chapter.id for chapter in selected}
                 attempt_requests = tuple(
@@ -2560,26 +2614,46 @@ class Orchestrator:
                     preemptible=all(request.preemptible for request in attempt_requests),
                     snapshots=attempt_snapshots if capture_snapshots else None,
                 )
-                if all(result.succeeded for result in attempt_results.values()):
-                    results_by_id.update(attempt_results)
-                    snapshots_by_id.update(attempt_snapshots)
-                    remaining.difference_update(active_ids)
+                succeeded_ids = {
+                    chapter_id for chapter_id, result in attempt_results.items() if result.succeeded
+                }
+                if succeeded_ids:
+                    results_by_id.update(
+                        (chapter_id, attempt_results[chapter_id]) for chapter_id in succeeded_ids
+                    )
+                    snapshots_by_id.update(
+                        (chapter_id, attempt_snapshots[chapter_id])
+                        for chapter_id in succeeded_ids
+                        if chapter_id in attempt_snapshots
+                    )
+                    remaining.difference_update(succeeded_ids)
                     finish_ready_requests()
+                failed_ids = active_ids.difference(succeeded_ids)
+                if not failed_ids:
                     continue
 
-                owners = set((await self._build_feedback_async(attempt_results)).actionable)
+                failed_results = {
+                    chapter_id: attempt_results[chapter_id] for chapter_id in failed_ids
+                }
+                owners = set((await self._build_feedback_async(failed_results)).actionable)
                 graph = self._observed_work_unit_graph()
                 affected = {
                     chapter_id
-                    for chapter_id in active_ids
+                    for chapter_id in failed_ids
                     if self._dependency_closure(graph, (chapter_id,)) & owners
                 }
                 if not affected:
-                    affected = active_ids
+                    if len(failed_ids) > 1:
+                        # No diagnostic could be attributed. Retry each target
+                        # independently instead of failing the complete batch.
+                        isolate.update(failed_ids)
+                        continue
+                    affected = failed_ids
                 results_by_id.update(
                     (chapter_id, attempt_results[chapter_id]) for chapter_id in affected
                 )
                 remaining.difference_update(affected)
+                isolate.difference_update(affected)
                 finish_ready_requests()
         except BaseException as error:
             for request in requests:
@@ -2726,17 +2800,23 @@ class Orchestrator:
                     preemption.cancel()
                     await asyncio.gather(preemption, return_exceptions=True)
                     result = validation.result()
-                    results.update((chapter_id, result) for chapter_id in result_ids)
+                    results.update(
+                        self._partition_successful_build_diagnostics(
+                            result,
+                            result_ids,
+                            build_graph,
+                        )
+                    )
                     await self.state.advance_coordinator_build(
                         work_unit_id=chapter.id,
                         completed=self.state.coordinator_build.total,
                     )
-                clean = (
+                artifacts_built = (
                     not preempted
                     and bool(results)
-                    and all(result.succeeded for result in results.values())
+                    and all(result.compiler_succeeded for result in results.values())
                 )
-                if clean:
+                if artifacts_built:
                     if not source_held:
                         await self.source_lock.acquire()
                         source_held = True
@@ -2759,7 +2839,7 @@ class Orchestrator:
                             "retry required.",
                         )
                         results = {chapter_id: stale for chapter_id in results}
-                        clean = False
+                        artifacts_built = False
                     elif snapshots is not None:
                         for chapter in selected:
                             required = self._dependency_closure(build_graph, (chapter.id,))
@@ -2771,8 +2851,8 @@ class Orchestrator:
                                 },
                             )
                 await build_workspace.finish(
-                    succeeded=clean,
-                    publish=publish_if_clean and clean,
+                    succeeded=artifacts_built,
+                    publish=publish_if_clean and artifacts_built,
                 )
                 build_workspace = None
             finally:

@@ -478,6 +478,15 @@ class ValidationResult:
     exit_code: int
     output: str
     timed_out: bool = False
+    # ``exit_code`` includes PAF's warning policy.  Keep the subprocess exit
+    # status separately so a successful Lake batch with one rejected warning
+    # can still publish its artifacts and certify unrelated targets.
+    process_exit_code: int | None = None
+
+    @property
+    def compiler_succeeded(self) -> bool:
+        code = self.exit_code if self.process_exit_code is None else self.process_exit_code
+        return code == 0 and not self.timed_out
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -485,6 +494,7 @@ class ValidationResult:
             "exit_code": self.exit_code,
             "output": self.output,
             "timed_out": self.timed_out,
+            "process_exit_code": self.process_exit_code,
         }
 
 
@@ -1810,7 +1820,7 @@ async def validate(
                 if on_output is not None:
                     on_output(line.decode(errors="replace"))
             await process.wait()
-        exit_code = process.returncode or 0
+        process_exit_code = process.returncode or 0
         timed_out = False
     except TimeoutError:
         await _terminate(process)
@@ -1818,7 +1828,7 @@ async def validate(
         output_parts.append(timeout_message)
         if on_output is not None:
             on_output(timeout_message.decode())
-        exit_code = 124
+        process_exit_code = 124
         timed_out = True
     except asyncio.CancelledError:
         await _terminate(process)
@@ -1826,6 +1836,7 @@ async def validate(
     output_bytes = b"".join(output_parts)
     complete_output = output_bytes.decode(errors="replace")
     warnings = unexpected_lean_warnings(complete_output)
+    exit_code = process_exit_code
     output = complete_output[-20000:]
     if warnings:
         warning_summary = "\n".join(warnings[-50:])
@@ -1835,7 +1846,13 @@ async def validate(
         )[-20000:]
         if exit_code == 0:
             exit_code = 1
-    return ValidationResult(exit_code == 0 and not warnings, exit_code, output, timed_out)
+    return ValidationResult(
+        exit_code == 0 and not warnings,
+        exit_code,
+        output,
+        timed_out,
+        process_exit_code,
+    )
 
 
 async def _wait_for_parent_exit(process: asyncio.subprocess.Process) -> int:

@@ -1955,6 +1955,46 @@ async def test_pending_review_and_proof_builds_share_a_cross_stage_command(
     await orchestrator.shutdown()
 
 
+@pytest.mark.asyncio
+async def test_successful_batch_warning_fails_only_its_owned_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    first, second = config.chapters
+    orchestrator = Orchestrator(config, StateStore(config))
+    await orchestrator.prepare()
+    commands: list[str] = []
+
+    async def validation(
+        _config: object,
+        chapter: Chapter,
+        **_kwargs: object,
+    ) -> ValidationResult:
+        commands.append(chapter.build_command)
+        return ValidationResult(
+            False,
+            1,
+            "warning: Book/Chapter02/Section.lean:10:2: unused variable `h`\n\n"
+            "Coordinator rejected 1 non-sorry Lean warning(s):\n"
+            "warning: Book/Chapter02/Section.lean:10:2: unused variable `h`",
+            process_exit_code=0,
+        )
+
+    monkeypatch.setattr(scheduler_module, "validate", validation)
+
+    first_result, second_result = await asyncio.gather(
+        orchestrator._build_chapters((first,), publish_if_clean=True),
+        orchestrator._build_chapters((second,), publish_if_clean=True),
+    )
+
+    assert len(commands) == 1
+    assert first_result[first.id].succeeded
+    assert not second_result[second.id].succeeded
+    assert "Chapter02" not in first_result[first.id].output
+    assert second_result[second.id].output.count("unused variable `h`") == 1
+    await orchestrator.shutdown()
+
+
 def test_build_feedback_routes_only_source_located_non_sorry_diagnostics(
     tmp_path: Path,
 ) -> None:
