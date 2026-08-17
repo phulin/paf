@@ -1127,22 +1127,47 @@ async def test_formalize_retries_after_diagnostics_and_builds_cleanly(
 
 
 @pytest.mark.asyncio
-async def test_formalize_rejects_an_incomplete_draft(tmp_path: Path) -> None:
+async def test_formalize_retries_an_incomplete_draft(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
     chapter = config.chapters[0]
     state = StateStore(config)
     orchestrator = Orchestrator(config, state)
     await orchestrator.prepare()
     await mark_discovered(orchestrator)
-    orchestrator.executor = FakeExecutor(
+    executor = FakeExecutor(
         state,
-        [result(changed=True, complete=False, issues=["coverage audit unfinished"])],
+        [
+            result(changed=True, complete=False, issues=["coverage audit unfinished"]),
+            result(changed=True),
+        ],
     )
+    orchestrator.executor = executor
+    scope_checks = iter((False, False, True))
 
-    assert not await orchestrator.run_stage(Stage.FORMALIZE)
+    async def scope_exists(_chapter: Chapter) -> bool:
+        return next(scope_checks)
+
+    async def clean_build(
+        *_args: object, snapshots: dict[str, object], **_kwargs: object
+    ) -> dict[str, ValidationResult]:
+        snapshots[chapter.id] = object()
+        return {chapter.id: ValidationResult(True, 0, "ok")}
+
+    async def publish(_chapter: Chapter, _snapshot: object) -> bool:
+        return True
+
+    monkeypatch.setattr(orchestrator, "_scope_exists", scope_exists)
+    monkeypatch.setattr(orchestrator, "_build_chapters", clean_build)
+    monkeypatch.setattr(orchestrator, "_publish_validated_build", publish)
+
+    assert await orchestrator.run_stage(Stage.FORMALIZE)
     task = state.task(chapter.id, Stage.FORMALIZE)
-    assert task.status == TaskStatus.FAILED
-    assert task.detail == "formalizer failed or reported incomplete coverage and diagnostics"
+    assert task.status == TaskStatus.SUCCEEDED
+    assert task.rounds == 2
+    assert len(executor.feedbacks) == 2
+    assert "coverage audit unfinished" in executor.feedbacks[1]
     await orchestrator.shutdown()
 
 

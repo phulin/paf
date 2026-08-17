@@ -1267,14 +1267,17 @@ class Orchestrator:
                     "model capacity remained unavailable after the configured retries",
                 )
                 return FormalizeOutcome(False)
-            if not attempt.agent.succeeded or not attempt.validation.succeeded or not complete:
+            if not attempt.agent.succeeded or not attempt.validation.succeeded:
                 await self.state.set_task(
                     chapter.id,
                     Stage.FORMALIZE,
                     TaskStatus.FAILED,
-                    "formalizer failed or reported incomplete coverage and diagnostics",
+                    "formalizer or formalization validation failed",
                 )
                 return FormalizeOutcome(False)
+            if not complete:
+                feedback = attempt.feedback()
+                continue
 
         if await self._scope_exists(chapter):
             snapshots = {}
