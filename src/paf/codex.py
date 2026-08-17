@@ -161,6 +161,59 @@ _FINDING_ASSESSMENTS_PROPERTY: dict[str, Any] = {
     },
 }
 
+_SHEPHERD_DISPOSITIONS_PROPERTY: dict[str, Any] = {
+    "type": "array",
+    "items": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "case_id": {"type": "string", "minLength": 1},
+            "disposition": {
+                "type": "string",
+                "enum": ["repair", "defer", "ignore"],
+            },
+            "reason": {"type": "string", "minLength": 1},
+        },
+        "required": ["case_id", "disposition", "reason"],
+    },
+}
+
+_SHEPHERD_WORK_UNITS_PROPERTY: dict[str, Any] = {
+    "type": "array",
+    "items": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "key": {"type": "string", "minLength": 1, "pattern": "^[a-zA-Z0-9_-]+$"},
+            "case_ids": {
+                "type": "array",
+                "items": {"type": "string", "minLength": 1},
+                "minItems": 1,
+            },
+            "owner_chapter_id": {"type": "string", "minLength": 1},
+            "target_stage": {
+                "type": "string",
+                "enum": [stage.value for stage in Stage],
+            },
+            "objective": {"type": "string", "minLength": 1},
+            "depends_on": {
+                "type": "array",
+                "items": {"type": "string", "minLength": 1},
+            },
+            "effort": {"type": "string", "enum": ["small", "medium", "large"]},
+        },
+        "required": [
+            "key",
+            "case_ids",
+            "owner_chapter_id",
+            "target_stage",
+            "objective",
+            "depends_on",
+            "effort",
+        ],
+    },
+}
+
 
 def _report_schema(title: str, properties: dict[str, Any]) -> dict[str, Any]:
     return {
@@ -174,6 +227,16 @@ def _report_schema(title: str, properties: dict[str, Any]) -> dict[str, Any]:
 
 
 REPORT_SCHEMAS: dict[str, dict[str, Any]] = {
+    "shepherd": _report_schema(
+        "PAF Shepherd repair plan",
+        {
+            "complete": _REPORT_BASE_PROPERTIES["complete"],
+            "summary": _REPORT_BASE_PROPERTIES["summary"],
+            "issues": _REPORT_BASE_PROPERTIES["issues"],
+            "dispositions": _SHEPHERD_DISPOSITIONS_PROPERTY,
+            "work_units": _SHEPHERD_WORK_UNITS_PROPERTY,
+        },
+    ),
     "discover": _report_schema(
         "PAF discovery report",
         {key: value for key, value in _REPORT_BASE_PROPERTIES.items() if key != "changed"}
@@ -254,11 +317,16 @@ PROCESS_EXIT_POLL_SECONDS = 0.005
 _PROMPT_RESOURCES = files("paf.prompts")
 COMMON_PROMPT_PATH = Path(str(_PROMPT_RESOURCES.joinpath("common.md")))
 PROOF_REVIEW_PROMPT_PATH = Path(str(_PROMPT_RESOURCES.joinpath("proof_review.md")))
+SHEPHERD_PROMPT_PATH = Path(str(_PROMPT_RESOURCES.joinpath("shepherd.md")))
 UPSTREAM_REPAIR_ROLE = "upstream_repair"
 DOWNSTREAM_RETRY_ROLE = "downstream_retry"
+SHEPHERD_ROLE = "shepherd"
+REPAIR_WORKER_ROLE = "repair_worker"
 
 
 def report_schema_key(stage: Stage, *, role: str = "", feedback: str = "") -> str:
+    if role == SHEPHERD_ROLE:
+        return SHEPHERD_ROLE
     if role == UPSTREAM_REPAIR_ROLE:
         return UPSTREAM_REPAIR_ROLE
     if role == DOWNSTREAM_RETRY_ROLE:
@@ -1023,7 +1091,12 @@ after the attempt."""
             stage_contract = """This temporary attempt answers a group of requests for mathematical
 support from an earlier chapter. Use the attached Lean tools, edit only that earlier chapter, and
 fully prove every new declaration. PAF will merge and build the changes before retrying the later
-proofs. Do not work on unrelated placeholders."""
+            proofs. Do not work on unrelated placeholders."""
+        elif role == REPAIR_WORKER_ROLE:
+            stage_contract = f"""This is a bounded Shepherd repair work unit targeting the existing
+{stage.value} stage. Diagnose and fix the concrete blocker in the attached repair dossier. Keep the
+change as small as possible, do not broaden into unrelated cleanup, and satisfy the ordinary
+{stage.value} stage contract. PAF will independently validate and integrate the result."""
         validation_contract = {
             Stage.DISCOVER: "PAF validates and saves the reported source dependencies.",
             Stage.FORMALIZE: "PAF independently checks the allowed file changes, placeholders, "
@@ -1100,6 +1173,8 @@ whole-file diagnostics from prerequisites to dependents. Do not prepare every fi
             feedback_heading = (
                 "Targeted downstream retry handoff"
                 if role == DOWNSTREAM_RETRY_ROLE
+                else "Shepherd repair dossier"
+                if role == REPAIR_WORKER_ROLE
                 else {
                     Stage.DISCOVER: "Discovery feedback",
                     Stage.FORMALIZE: "PAF build diagnostics and reported findings",
@@ -1122,6 +1197,24 @@ whole-file diagnostics from prerequisites to dependents. Do not prepare every fi
             )
         return f"{base.rstrip()}\n\n{evidence}{common.rstrip()}\n{contract}"
 
+    def build_shepherd_prompt(
+        self,
+        failures: Iterable[dict[str, Any]],
+        *,
+        scheduling: dict[str, Any],
+    ) -> str:
+        template = SHEPHERD_PROMPT_PATH.read_text(encoding="utf-8")
+        dossier = {
+            "failures": list(failures),
+            "scheduling": scheduling,
+            "limits": {
+                "maximum_work_units": self.config.shepherd.maximum_work_units_per_sweep,
+                "allowed_chapter_ids": [unit.id for unit in self.config.work_units],
+                "allowed_stages": [stage.value for stage in Stage],
+            },
+        }
+        return f"{template.rstrip()}\n\n## Failure dossier\n\n```json\n{json.dumps(dossier, indent=2)}\n```\n"
+
     def command(
         self,
         stage: Stage,
@@ -1143,7 +1236,11 @@ whole-file diagnostics from prerequisites to dependents. Do not prepare every fi
         command.extend(["--output-schema", str(self.schema_paths[schema_key])])
         if root != settings.repo:
             command.append("--skip-git-repo-check")
-        if settings.bypass_approvals_and_sandbox:
+        if role == SHEPHERD_ROLE and resume_thread_id is None:
+            command.extend(["--sandbox", "read-only"])
+        elif role == SHEPHERD_ROLE:
+            command.extend(["--config", 'sandbox_mode="read-only"'])
+        elif settings.bypass_approvals_and_sandbox:
             command.append("--dangerously-bypass-approvals-and-sandbox")
         elif settings.approve_for_me and resume_thread_id is None:
             # Current Codex versions make --approve-for-me mutually exclusive
@@ -1155,8 +1252,15 @@ whole-file diagnostics from prerequisites to dependents. Do not prepare every fi
             # `codex exec resume` does not accept the top-level `--sandbox`
             # option, but it does accept the equivalent config override.
             command.extend(["--config", f'sandbox_mode="{settings.sandbox}"'])
-        model = self.config.model_for(stage)
-        reasoning_effort = self.config.reasoning_effort_for(stage)
+        if role == SHEPHERD_ROLE:
+            model = self.config.shepherd.model
+            reasoning_effort = self.config.shepherd.reasoning_effort
+        elif role == REPAIR_WORKER_ROLE:
+            model = self.config.shepherd.worker_model
+            reasoning_effort = self.config.shepherd.worker_reasoning_effort
+        else:
+            model = self.config.model_for(stage)
+            reasoning_effort = self.config.reasoning_effort_for(stage)
         if model:
             command.extend(["--model", model])
         if reasoning_effort:
@@ -1225,6 +1329,25 @@ whole-file diagnostics from prerequisites to dependents. Do not prepare every fi
             run,
             prompt=prompt,
             workspace_root=root,
+        )
+
+    async def run_shepherd(
+        self,
+        anchor: WorkUnitLike,
+        run: RunRecord,
+        failures: Iterable[dict[str, Any]],
+        *,
+        scheduling: dict[str, Any],
+    ) -> AgentResult:
+        """Ask the strong, read-only Shepherd model for a bounded repair DAG."""
+
+        prompt = self.build_shepherd_prompt(failures, scheduling=scheduling)
+        return await self._run_prompt(
+            anchor,
+            Stage.DISCOVER,
+            run,
+            prompt=prompt,
+            workspace_root=self.config.settings.repo,
         )
 
     async def _run_prompt(

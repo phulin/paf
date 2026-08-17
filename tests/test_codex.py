@@ -12,7 +12,9 @@ import paf.codex as codex_module
 from paf.activity import EVENT_TIMESTAMP_FIELD
 from paf.codex import (
     DOWNSTREAM_RETRY_ROLE,
+    REPAIR_WORKER_ROLE,
     REPORT_SCHEMAS,
+    SHEPHERD_ROLE,
     UPSTREAM_REPAIR_ROLE,
     CodexExecutor,
     FatalCodexInvocationError,
@@ -42,6 +44,7 @@ from tests.support import write_project
 
 def test_report_schemas_contain_only_fields_used_by_each_agent() -> None:
     expected = {
+        "shepherd": {"complete", "summary", "issues", "dispositions", "work_units"},
         "discover": {"complete", "summary", "issues", "source_dependencies"},
         "formalize": {"changed", "complete", "summary", "issues", "source_issues"},
         "review": {"changed", "complete", "summary", "issues", "source_issues"},
@@ -356,6 +359,29 @@ def test_executor_uses_stage_specific_model_and_reasoning_effort(tmp_path: Path)
     assert 'model_reasoning_effort="high"' in command
 
 
+def test_shepherd_is_strong_read_only_and_repair_workers_use_luna_max(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    executor = CodexExecutor(config, StateStore(config))
+
+    shepherd = executor.command(Stage.DISCOVER, role=SHEPHERD_ROLE)
+    repair = executor.command(Stage.REVIEW, role=REPAIR_WORKER_ROLE, feedback="repair case")
+
+    assert "--dangerously-bypass-approvals-and-sandbox" not in shepherd
+    assert shepherd[shepherd.index("--sandbox") + 1] == "read-only"
+    assert shepherd[shepherd.index("--model") + 1] == "gpt-5.6-sol"
+    assert 'model_reasoning_effort="xhigh"' in shepherd
+    assert repair[repair.index("--model") + 1] == "gpt-5.6-luna"
+    assert 'model_reasoning_effort="max"' in repair
+    prompt = executor.build_prompt(
+        config.work_units[0],
+        Stage.REVIEW,
+        role=REPAIR_WORKER_ROLE,
+        feedback="fix declaration X from diagnostic Y",
+    )
+    assert "bounded Shepherd repair work unit" in prompt
+    assert "Shepherd repair dossier" in prompt
+
+
 @pytest.mark.asyncio
 async def test_executor_selects_a_distinct_schema_for_each_agent(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
@@ -373,6 +399,7 @@ async def test_executor_selects_a_distinct_schema_for_each_agent(tmp_path: Path)
         "prove": schema_path(executor.command(Stage.PROVE)),
         "downstream_retry": schema_path(executor.command(Stage.PROVE, role=DOWNSTREAM_RETRY_ROLE)),
         "upstream_repair": schema_path(executor.command(Stage.PROVE, role=UPSTREAM_REPAIR_ROLE)),
+        "shepherd": schema_path(executor.command(Stage.DISCOVER, role=SHEPHERD_ROLE)),
     }
 
     assert len(set(selected.values())) == len(selected)
