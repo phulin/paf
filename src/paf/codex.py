@@ -1130,8 +1130,12 @@ whole-file diagnostics from prerequisites to dependents. Do not prepare every fi
             # Current Codex versions make --approve-for-me mutually exclusive
             # with --sandbox; approve-for-me itself selects workspace-write.
             command.append("--approve-for-me")
-        else:
+        elif resume_thread_id is None:
             command.extend(["--sandbox", settings.sandbox])
+        else:
+            # `codex exec resume` does not accept the top-level `--sandbox`
+            # option, but it does accept the equivalent config override.
+            command.extend(["--config", f'sandbox_mode="{settings.sandbox}"'])
         model = self.config.model_for(stage)
         reasoning_effort = self.config.reasoning_effort_for(stage)
         if model:

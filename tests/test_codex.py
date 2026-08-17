@@ -524,6 +524,13 @@ def test_review_uses_write_sandbox_when_full_access_is_disabled(tmp_path: Path) 
     assert command[command.index("--sandbox") + 1] == "workspace-write"
     assert "--dangerously-bypass-approvals-and-sandbox" not in command
 
+    resumed = CodexExecutor(config, StateStore(config)).command(
+        Stage.REVIEW, resume_thread_id="review-thread"
+    )
+    assert resumed[:3] == ["codex", "exec", "resume"]
+    assert "--sandbox" not in resumed
+    assert 'sandbox_mode="workspace-write"' in resumed
+
 
 def test_review_command_enables_lean_mcp(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
