@@ -1,11 +1,11 @@
-from pathlib import Path
 from dataclasses import replace
+from pathlib import Path
 from typing import Any, cast
 
 import pytest
 
+from paf.codex import REPAIR_WORKER_ROLE, SHEPHERD_ROLE, AgentResult, CodexExecutor
 from paf.config import load_config
-from paf.codex import REPAIR_WORKER_ROLE, AgentResult, CodexExecutor
 from paf.models import Stage
 from paf.scheduler import Orchestrator, ShepherdPlanError
 from paf.state import (
@@ -70,6 +70,76 @@ async def test_repair_work_unit_overlays_existing_stage_and_persists(tmp_path: P
     assert recovered.repair_work_units[unit.id].status == RepairWorkUnitStatus.SUCCEEDED
     assert recovered.hot_snapshot()["shepherd"]["last_summary"] == "one repair"
     await recovered.close()
+
+
+@pytest.mark.asyncio
+async def test_dashboard_exposes_live_shepherd_and_repair_worker_runs(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = config.work_units[0]
+    state = StateStore(config)
+    await state.load_or_create()
+    await state.set_task(chapter.id, Stage.REVIEW, TaskStatus.FAILED, "review build failed")
+    task_key = state.key(chapter.id, Stage.REVIEW)
+    sweep = await state.start_repair_sweep(trigger="test", task_keys=[task_key])
+    planner = await state.start_auxiliary_run(
+        chapter.id,
+        Stage.DISCOVER,
+        role=SHEPHERD_ROLE,
+        request_ids=sweep.case_ids,
+    )
+    state.shepherd.current_run_id = planner.id
+    planner_activity = state.activities.start(planner.id, chapter.id, SHEPHERD_ROLE)
+    planner_activity.current = "ranking repair candidates"
+    state.activities.save(planner_activity)
+    case = state.repair_cases[sweep.case_ids[0]]
+    unit = RepairWorkUnitRecord(
+        id="repair-live",
+        sweep_id=sweep.id,
+        case_ids=[case.id],
+        task_keys=[task_key],
+        owner_chapter_id=chapter.id,
+        target_stage=Stage.REVIEW,
+        objective="repair the review blocker",
+    )
+    await state.install_repair_plan(sweep.id, [unit], summary="one repair", run_id=planner.id)
+    await state.start_repair_work_unit(unit.id)
+    worker = await state.start_auxiliary_run(
+        chapter.id,
+        Stage.REVIEW,
+        role=REPAIR_WORKER_ROLE,
+        request_ids=[unit.id, case.id],
+    )
+    await state.link_repair_work_unit_run(unit.id, worker.id)
+    worker_activity = state.activities.start(worker.id, chapter.id, REPAIR_WORKER_ROLE)
+    worker_activity.current = "editing the failed declaration"
+    state.activities.save(worker_activity)
+
+    snapshot = state.dashboard_snapshot()
+    assert snapshot["shepherd"]["agents"] == [
+        {
+            "run_id": planner.id,
+            "role": SHEPHERD_ROLE,
+            "work_unit_id": chapter.id,
+            "stage": Stage.DISCOVER,
+            "status": TaskStatus.RUNNING,
+            "label": "Shepherd planner",
+            "repair_work_unit_id": "",
+            "objective": "one repair",
+        },
+        {
+            "run_id": worker.id,
+            "role": REPAIR_WORKER_ROLE,
+            "work_unit_id": chapter.id,
+            "stage": Stage.REVIEW,
+            "status": RepairWorkUnitStatus.RUNNING,
+            "label": "Repair review",
+            "repair_work_unit_id": unit.id,
+            "objective": unit.objective,
+        },
+    ]
+    assert snapshot["activities"][planner.id]["current"] == "ranking repair candidates"
+    assert snapshot["activities"][worker.id]["current"] == "editing the failed declaration"
+    await state.close()
 
 
 @pytest.mark.asyncio

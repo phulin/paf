@@ -68,6 +68,18 @@ export interface Shepherd {
   running_units: number;
   succeeded_units: number;
   failed_units: number;
+  agents?: ShepherdAgent[];
+}
+
+export interface ShepherdAgent {
+  run_id: string;
+  role: "shepherd" | "repair_worker" | string;
+  work_unit_id: string;
+  stage: Stage | string;
+  status: string;
+  label: string;
+  repair_work_unit_id: string;
+  objective: string;
 }
 
 export interface SwarmState {

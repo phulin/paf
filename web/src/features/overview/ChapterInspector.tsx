@@ -7,7 +7,7 @@ import { STAGES, type ChapterRow } from "./model";
 import { StatusPill } from "./TaskStatus";
 import { EventKind, eventTime } from "./Timeline";
 
-function AgentTimelinePane({ activity }: { activity?: AgentActivity }) {
+export function AgentTimelinePane({ activity }: { activity?: AgentActivity }) {
   const events = [...(activity?.recent ?? [])].sort((left, right) =>
     left.at.localeCompare(right.at),
   );
@@ -84,8 +84,17 @@ function AgentTimelinePane({ activity }: { activity?: AgentActivity }) {
   );
 }
 
-export function ChapterInspector({ row, close }: { row: ChapterRow; close: () => void }) {
-  const activity = row.activity;
+export function ChapterInspector({
+  row,
+  close,
+  activity = row.activity,
+  runLabel,
+}: {
+  row: ChapterRow;
+  close: () => void;
+  activity?: AgentActivity;
+  runLabel?: string;
+}) {
   return (
     <div
       className="drawer-backdrop"
@@ -96,7 +105,7 @@ export function ChapterInspector({ row, close }: { row: ChapterRow; close: () =>
           <div className="drawer-header">
             <div>
               <span className="eyebrow">
-                {row.book} / chapter {String(row.number).padStart(2, "0")}
+                {runLabel ?? `${row.book} / chapter ${String(row.number).padStart(2, "0")}`}
               </span>
               <h2>{row.title}</h2>
             </div>

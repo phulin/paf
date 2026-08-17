@@ -891,7 +891,8 @@ class StateStore:
             "coordinator_build": self._build_dict(self.coordinator_build),
             "shepherd": {
                 name: getattr(self.shepherd, name) for name in ShepherdRecord.__dataclass_fields__
-            },
+            }
+            | {"agents": self._shepherd_agent_views()},
             "repair_cases": {
                 key: {name: getattr(value, name) for name in RepairCaseRecord.__dataclass_fields__}
                 for key, value in sorted(self.repair_cases.items())
@@ -907,6 +908,51 @@ class StateStore:
                 for key, value in sorted(self.repair_work_units.items())
             },
         }
+
+    def _shepherd_agent_views(self) -> list[dict[str, Any]]:
+        """Return the planner and repair workers belonging to the current or latest sweep."""
+
+        sweep = self.repair_sweeps.get(self.shepherd.current_sweep_id)
+        if sweep is None and self.repair_sweeps:
+            sweep = max(self.repair_sweeps.values(), key=lambda item: (item.started_at, item.id))
+        if sweep is None:
+            return []
+
+        agents: list[dict[str, Any]] = []
+        planner_run_id = sweep.run_id or (
+            self.shepherd.current_run_id if self.shepherd.current_sweep_id == sweep.id else ""
+        )
+        if planner_run_id:
+            run = self._runs_by_id.get(planner_run_id)
+            agents.append(
+                {
+                    "run_id": planner_run_id,
+                    "role": "shepherd",
+                    "work_unit_id": run.chapter_id if run is not None else "",
+                    "stage": run.stage if run is not None else "discover",
+                    "status": run.status if run is not None else sweep.status,
+                    "label": "Shepherd planner",
+                    "repair_work_unit_id": "",
+                    "objective": sweep.summary,
+                }
+            )
+        for unit_id in sweep.work_unit_ids:
+            unit = self.repair_work_units.get(unit_id)
+            if unit is None:
+                continue
+            agents.append(
+                {
+                    "run_id": unit.run_id,
+                    "role": "repair_worker",
+                    "work_unit_id": unit.owner_chapter_id,
+                    "stage": unit.target_stage,
+                    "status": unit.status,
+                    "label": f"Repair {unit.target_stage}",
+                    "repair_work_unit_id": unit.id,
+                    "objective": unit.objective,
+                }
+            )
+        return agents
 
     def _document_dicts(self) -> list[dict[str, Any]]:
         return [
@@ -980,6 +1026,12 @@ class StateStore:
         for run_id in sorted(self._active_run_ids):
             if run_id not in recent_run_ids:
                 recent_run_ids.append(run_id)
+        shepherd_snapshot = snapshot.get("shepherd")
+        if isinstance(shepherd_snapshot, dict):
+            for agent in shepherd_snapshot.get("agents", []):
+                run_id = agent.get("run_id") if isinstance(agent, dict) else None
+                if isinstance(run_id, str) and run_id and run_id not in recent_run_ids:
+                    recent_run_ids.append(run_id)
         snapshot["activities"] = {
             run_id: activity.as_dict()
             for run_id in recent_run_ids
@@ -1020,6 +1072,15 @@ class StateStore:
         )
         globals_changed = bool(change.globals.difference({"activity"}))
         globals_ = self._global_snapshot() | {"revision": self.revision} if globals_changed else {}
+        shepherd = globals_.get("shepherd", {})
+        if isinstance(shepherd, dict):
+            run_ids.update(
+                run_id
+                for agent in shepherd.get("agents", [])
+                if isinstance(agent, dict)
+                and isinstance((run_id := agent.get("run_id")), str)
+                and run_id
+            )
         activities = {
             run_id: activity.as_dict()
             for run_id in sorted(run_ids)
@@ -1735,6 +1796,7 @@ class StateStore:
                 {
                     "id": run.id,
                     "stage": run.stage,
+                    "role": run.role,
                     "round": run.round,
                     "status": run.status,
                     "started_at": run.started_at,
@@ -2525,6 +2587,14 @@ class StateStore:
             case.updated_at = timestamp()
         self.shepherd.running_units += 1
         self._mark_dirty(tasks=changed_tasks)
+        await self._persist()
+
+    async def link_repair_work_unit_run(self, unit_id: str, run_id: str) -> None:
+        """Expose a repair worker's agent run as soon as the run starts."""
+
+        unit = self.repair_work_units[unit_id]
+        unit.run_id = run_id
+        self._mark_dirty()
         await self._persist()
 
     async def finish_repair_work_unit(

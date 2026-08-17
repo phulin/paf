@@ -214,9 +214,11 @@ the Python orchestrator and consumes the same bounded dashboard model as the web
 versioned Unix-socket protocol. The server sends one initial snapshot, then pushes coalesced task,
 agent-activity, and global-state deltas directly from the in-process change bus; the TUI does not
 poll SQLite or repeatedly request full snapshots. Press `Enter` or `i` to inspect the selected
-agent, `p` to pause or resume scheduling, and `q` to stop workers, integrate interrupted workspace
-changes, and return to the shell. Press `d` to detach the TUI while leaving a managed orchestrator
-running.
+agent, `s` to open the Shepherd trace and jump directly to its planner or repair workers, `p` to
+pause or resume scheduling, and `q` to stop workers, integrate interrupted workspace changes, and
+return to the shell. Press `d` to detach the TUI while leaving a managed orchestrator running. The
+web dashboard exposes the same trace and agent links through its Shepherd metric card (or the `s`
+shortcut).
 
 Add `--no-tui` for CI, a process supervisor, or log-only operation. Add `--force` to rerun tasks
 already persisted as successful. Without `--force`, successful stages are resumable and skipped.

@@ -1093,6 +1093,8 @@ class Orchestrator:
 
         try:
             run = await start_agent_run()
+            if role == REPAIR_WORKER_ROLE and selected_request_ids:
+                await self.state.link_repair_work_unit_run(selected_request_ids[0], run.id)
             if live_discovery:
                 workspace_root = self.config.settings.repo
             elif self.isolation.name == "shared":

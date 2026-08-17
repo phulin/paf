@@ -97,6 +97,35 @@ def test_state_list_snapshot_and_system_contracts(tmp_path: Path, static_dir: Pa
         assert 0 <= system["memory_percent"] <= 100
 
 
+def test_snapshot_keeps_shepherd_agent_activity_without_a_latest_task(tmp_path: Path) -> None:
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    (logs / "planner-run.activity.json").write_text(
+        '{"run_id":"planner-run","current":"planning repairs"}', encoding="utf-8"
+    )
+    candidate = web_module.StateCandidate(
+        id="swarm",
+        directory=tmp_path,
+        modified=0,
+        state={
+            "tasks": {},
+            "shepherd": {
+                "agents": [
+                    {
+                        "run_id": "planner-run",
+                        "role": "shepherd",
+                        "work_unit_id": "book/chapter-01",
+                    }
+                ]
+            },
+        },
+    )
+
+    snapshot = web_module._snapshot(candidate, tmp_path)
+
+    assert snapshot["activities"]["planner-run"]["current"] == "planning repairs"
+
+
 def test_dashboard_changes_return_only_changed_rows_and_live_activity(
     tmp_path: Path, static_dir: Path
 ) -> None:

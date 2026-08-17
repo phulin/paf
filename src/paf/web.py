@@ -211,6 +211,12 @@ def _snapshot(candidate: StateCandidate, project_root: Path) -> dict[str, Any]:
                 recent.append(run_id)
             if len(recent) >= 36:
                 break
+    shepherd = state.get("shepherd", {})
+    if isinstance(shepherd, dict):
+        for agent in shepherd.get("agents", []):
+            run_id = agent.get("run_id") if isinstance(agent, dict) else None
+            if isinstance(run_id, str) and run_id and run_id not in recent:
+                recent.append(run_id)
     activities = {
         run_id: activity
         for run_id in recent
@@ -516,6 +522,16 @@ def create_app(
                     for task in tasks.values()
                     if isinstance(task, dict)
                     and isinstance((run_id := task.get("latest_run_id")), str)
+                )
+            globals_ = result.get("globals", {})
+            shepherd = globals_.get("shepherd", {}) if isinstance(globals_, dict) else {}
+            if isinstance(shepherd, dict):
+                run_ids.update(
+                    run_id
+                    for agent in shepherd.get("agents", [])
+                    if isinstance(agent, dict)
+                    and isinstance((run_id := agent.get("run_id")), str)
+                    and run_id
                 )
             result["activities"] = {
                 run_id: activity

@@ -11,17 +11,21 @@ function MetricCard({
   value,
   detail,
   accent,
+  onClick,
 }: {
   icon: ReactNode;
   label: string;
   value: string;
   detail: ReactNode;
   accent?: string;
+  onClick?: () => void;
 }) {
+  const Component = onClick ? "button" : "div";
   return (
-    <div
-      className="metric-card"
+    <Component
+      className={`metric-card${onClick ? " metric-card-action" : ""}`}
       style={{ "--accent": accent ?? "var(--cyan)" } as React.CSSProperties}
+      onClick={onClick}
     >
       <div className="metric-icon">{icon}</div>
       <div className="metric-body">
@@ -30,7 +34,7 @@ function MetricCard({
         <div className="metric-detail">{detail}</div>
       </div>
       <span className="corner-mark" />
-    </div>
+    </Component>
   );
 }
 
@@ -76,10 +80,12 @@ export function DashboardSummary({
   state,
   rows,
   connected,
+  openShepherd,
 }: {
   state: SwarmState;
   rows: ChapterRow[];
   connected: boolean;
+  openShepherd: () => void;
 }) {
   const tasks = Object.values(state.tasks ?? {});
   const successful = tasks.filter((task) => task.status === "succeeded").length;
@@ -159,6 +165,7 @@ export function DashboardSummary({
             </>
           }
           accent={shepherd?.status === "error" ? "var(--red)" : "var(--amber)"}
+          onClick={openShepherd}
         />
       </div>
       <section className="pipeline-strip">
