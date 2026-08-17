@@ -1,4 +1,4 @@
-import { AlertTriangle, CheckCircle2, Users, Zap } from "lucide-react";
+import { CheckCircle2, ShieldCheck, Users, Zap } from "lucide-react";
 import type { ReactNode } from "react";
 import { ProgressBar } from "../../components/Controls";
 import { formatNumber } from "../../lib/format";
@@ -95,6 +95,7 @@ export function DashboardSummary({
       task.status === "failed" || task.status === "blocked" || task.status === "interrupted",
   ).length;
   const completion = tasks.length ? Math.round((100 * successful) / tasks.length) : 0;
+  const shepherd = state.shepherd;
 
   return (
     <>
@@ -146,17 +147,18 @@ export function DashboardSummary({
           accent="var(--violet)"
         />
         <MetricCard
-          icon={<AlertTriangle size={19} />}
-          label="Attention"
-          value={String(failed)}
+          icon={<ShieldCheck size={19} />}
+          label="Shepherd"
+          value={shepherd?.enabled ? shepherd.status : "off"}
           detail={
             <>
-              <span>{failed ? "tasks need review" : "no systemic errors"}</span>
+              <span>{shepherd?.pending_failures ?? failed} failures</span>
               <i />
-              {connected ? "live" : "demo"}
+              {shepherd?.running_units ?? 0} repairing
+              {!connected && " · demo"}
             </>
           }
-          accent={failed ? "var(--red)" : "var(--amber)"}
+          accent={shepherd?.status === "error" ? "var(--red)" : "var(--amber)"}
         />
       </div>
       <section className="pipeline-strip">

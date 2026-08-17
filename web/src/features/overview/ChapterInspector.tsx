@@ -124,6 +124,7 @@ export function ChapterInspector({ row, close }: { row: ChapterRow; close: () =>
                     rounds={task?.rounds}
                     queued={task?.queued}
                     phase={task?.phase}
+                    repairing={task?.repairing}
                   />
                 </div>
               );

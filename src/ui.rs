@@ -204,8 +204,20 @@ fn summary(model: &DashboardModel) -> Paragraph<'static> {
             )),
         ]),
         Line::from(format!(
-            "Agents {}/{} · {} · queued {}    {}",
-            state.agents.active, state.agents.maximum, agent_detail, state.agents.queued, build
+            "Agents {}/{} · {} · queued {}    {}    Shepherd {} · failures {} · repair {}/{}",
+            state.agents.active,
+            state.agents.maximum,
+            agent_detail,
+            state.agents.queued,
+            build,
+            if state.shepherd.enabled {
+                state.shepherd.status.as_str()
+            } else {
+                "off"
+            },
+            state.shepherd.pending_failures,
+            state.shepherd.running_units,
+            state.shepherd.planned_units,
         )),
         Line::from(format!(
             "revision {} · isolation {} · Lean MCP on · stream {}",
@@ -240,6 +252,9 @@ fn draw_stage_cards(frame: &mut Frame<'_>, model: &DashboardModel, area: Rect) {
         {
             current.postprocess += 1;
         }
+        if task.repairing {
+            current.repairing += 1;
+        }
         if model.is_building(task.work_unit_id.as_str(), task.stage.as_str()) {
             current.building += 1;
         }
@@ -255,8 +270,8 @@ fn draw_stage_cards(frame: &mut Frame<'_>, model: &DashboardModel, area: Rect) {
             .unwrap_or_default();
         let content = vec![
             Line::from(format!(
-                "agent {agents} · post {} · build {}",
-                statistics.postprocess, statistics.building
+                "agent {agents} · repair {} · post {} · build {}",
+                statistics.repairing, statistics.postprocess, statistics.building
             )),
             Line::from(vec![
                 Span::styled(
@@ -408,6 +423,7 @@ struct StageStatistics {
     interrupted: usize,
     postprocess: usize,
     building: usize,
+    repairing: usize,
 }
 
 fn draw_status(frame: &mut Frame<'_>, model: &DashboardModel, area: Rect) {
@@ -529,7 +545,10 @@ fn draw_detail(frame: &mut Frame<'_>, model: &mut DashboardModel) {
         layout[0],
     );
     let pending_reason = model.pending_reason(&row);
-    let has_running_task = row.tasks.values().any(|task| task.status == "running");
+    let has_running_task = row
+        .tasks
+        .values()
+        .any(|task| task.status == "running" || task.repairing);
     let metrics = activity.filter(|_| has_running_task).map_or_else(
         || {
             pending_reason
@@ -708,7 +727,10 @@ fn current_activity(
     if build.active && model.build_targets().contains(row.unit.id.as_str()) {
         return format!("{} coordinator finalize", build.mode);
     }
-    let has_running_task = row.tasks.values().any(|task| task.status == "running");
+    let has_running_task = row
+        .tasks
+        .values()
+        .any(|task| task.status == "running" || task.repairing);
     if let Some(activity) = activity.filter(|_| has_running_task) {
         let idle = elapsed_seconds(&activity.updated_at);
         return if idle >= 60 {
@@ -749,7 +771,9 @@ fn row_spend(row: &RowModel<'_>) -> String {
 }
 
 fn task_mark(task: &Task, building: bool) -> String {
-    let mark = if building {
+    let mark = if task.repairing {
+        "↻ repairing"
+    } else if building {
         "◆ building"
     } else if task.queued {
         "· queued"
@@ -1037,6 +1061,19 @@ mod tests {
         assert!(rendered.contains("◇ postprocess"));
         assert!(rendered.contains("targeted coordinator finalize"));
         assert!(!rendered.contains("◆ building"));
+    }
+
+    #[test]
+    fn repairing_overlay_wins_over_failed_task_and_build_state() {
+        let task = Task {
+            status: "failed".into(),
+            repairing: true,
+            rounds: 2,
+            ..Task::default()
+        };
+
+        assert_eq!(task_mark(&task, false), "↻ repairing (2)");
+        assert_eq!(task_mark(&task, true), "↻ repairing (2)");
     }
 
     #[test]

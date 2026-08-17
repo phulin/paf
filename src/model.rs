@@ -55,6 +55,29 @@ pub struct CoordinatorBuild {
 
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default)]
+pub struct Shepherd {
+    pub enabled: bool,
+    pub status: String,
+    pub model: String,
+    pub worker_model: String,
+    pub interval_seconds: f64,
+    pub failure_threshold: usize,
+    pub current_sweep_id: String,
+    pub current_run_id: String,
+    pub last_started_at: Option<String>,
+    pub last_finished_at: Option<String>,
+    pub next_run_at: Option<String>,
+    pub last_summary: String,
+    pub last_error: String,
+    pub pending_failures: usize,
+    pub planned_units: usize,
+    pub running_units: usize,
+    pub succeeded_units: usize,
+    pub failed_units: usize,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
 pub struct Task {
     pub work_unit_id: String,
     pub document_id: String,
@@ -65,6 +88,8 @@ pub struct Task {
     pub phase: String,
     pub detail: String,
     pub queued: bool,
+    pub repairing: bool,
+    pub repair_work_unit_id: String,
     pub rounds: usize,
     pub updated_at: String,
     pub latest_run_id: Option<String>,
@@ -158,6 +183,7 @@ pub struct SwarmState {
     pub cost: Cost,
     pub agents: Agents,
     pub coordinator_build: CoordinatorBuild,
+    pub shepherd: Shepherd,
     pub scheduling: Scheduling,
     pub source_dependency_tree: SourceDependencyTree,
     pub isolation: Isolation,
@@ -215,6 +241,7 @@ pub struct GlobalDelta {
     pub cost: Option<Cost>,
     pub agents: Option<Agents>,
     pub coordinator_build: Option<CoordinatorBuild>,
+    pub shepherd: Option<Shepherd>,
     pub scheduling: Option<Scheduling>,
     pub source_dependency_tree: Option<SourceDependencyTree>,
     pub isolation: Option<Isolation>,
@@ -394,6 +421,7 @@ impl DashboardModel {
             &mut self.state.coordinator_build,
             delta.globals.coordinator_build,
         );
+        apply_optional(&mut self.state.shepherd, delta.globals.shepherd);
         apply_optional(&mut self.state.scheduling, delta.globals.scheduling);
         apply_optional(
             &mut self.state.source_dependency_tree,

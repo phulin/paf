@@ -4,6 +4,7 @@ import {
   CircleDashed,
   PauseCircle,
   Play,
+  RotateCw,
   XCircle,
 } from "lucide-react";
 import { compactTaskDetail, timeAgo } from "../../lib/format";
@@ -30,35 +31,41 @@ export function StatusPill({
   status = "pending",
   rounds,
   building = false,
+  repairing = false,
   queued = false,
   phase = "idle",
 }: {
   status?: TaskStatus;
   rounds?: number;
   building?: boolean;
+  repairing?: boolean;
   queued?: boolean;
   phase?: TaskPhase;
 }) {
-  const displayStatus = building
-    ? "building"
-    : queued
-      ? "queued"
-      : status === "running" && phase === "postprocess"
-        ? "postprocess"
-        : status;
+  const displayStatus = repairing
+    ? "repairing"
+    : building
+      ? "building"
+      : queued
+        ? "queued"
+        : status === "running" && phase === "postprocess"
+          ? "postprocess"
+          : status;
   return (
     <span className={`status-pill status-${displayStatus}`}>
-      <StatusIcon status={status} />
+      {repairing ? <RotateCw size={13} /> : <StatusIcon status={status} />}
       <span>
-        {building
-          ? "building"
-          : queued
-            ? "queued"
-            : displayStatus === "postprocess"
-              ? "postprocess"
-              : status === "succeeded"
-                ? "done"
-                : status}
+        {repairing
+          ? "repairing"
+          : building
+            ? "building"
+            : queued
+              ? "queued"
+              : displayStatus === "postprocess"
+                ? "postprocess"
+                : status === "succeeded"
+                  ? "done"
+                  : status}
       </span>
       {Boolean(rounds) && <span className="round-count">×{rounds}</span>}
     </span>
@@ -66,6 +73,17 @@ export function StatusPill({
 }
 
 export function ActivityCell({ activity, task }: { activity?: AgentActivity; task?: Task }) {
+  if (task?.repairing && !activity?.current) {
+    return (
+      <div className="activity-cell active">
+        <span className="pulse-small" />
+        <div>
+          <strong>Shepherd repair in progress</strong>
+          <span>{task.repair_work_unit_id || timeAgo(task.updated_at)}</span>
+        </div>
+      </div>
+    );
+  }
   if (task?.status === "running" && task.phase === "postprocess") {
     return (
       <div className="activity-cell active postprocess">

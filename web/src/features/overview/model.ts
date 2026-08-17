@@ -34,7 +34,9 @@ export function chapterRows(state: SwarmState): ChapterRow[] {
         Boolean(candidate?.latest_run_id && state.activities?.[candidate.latest_run_id]),
       )
       .sort((left, right) => {
-        const running = Number(right.status === "running") - Number(left.status === "running");
+        const running =
+          Number(right.status === "running" || right.repairing) -
+          Number(left.status === "running" || left.repairing);
         if (running) return running;
         const leftUpdated = state.activities?.[left.latest_run_id]?.updated_at ?? left.updated_at;
         const rightUpdated =

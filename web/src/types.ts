@@ -15,6 +15,8 @@ export interface Task {
   stage: Stage;
   status: TaskStatus;
   queued?: boolean;
+  repairing?: boolean;
+  repair_work_unit_id?: string;
   phase?: TaskPhase;
   detail: string;
   rounds: number;
@@ -47,6 +49,27 @@ export interface CoordinatorBuild {
   output_tail: string[];
 }
 
+export interface Shepherd {
+  enabled: boolean;
+  status: "idle" | "planning" | "repairing" | "error" | string;
+  model: string;
+  worker_model: string;
+  interval_seconds: number;
+  failure_threshold: number;
+  current_sweep_id: string;
+  current_run_id: string;
+  last_started_at?: string | null;
+  last_finished_at?: string | null;
+  next_run_at?: string | null;
+  last_summary: string;
+  last_error: string;
+  pending_failures: number;
+  planned_units: number;
+  running_units: number;
+  succeeded_units: number;
+  failed_units: number;
+}
+
 export interface SwarmState {
   swarm_id?: string;
   revision?: number;
@@ -69,6 +92,7 @@ export interface SwarmState {
   };
   isolation?: { backend?: string };
   coordinator_build: CoordinatorBuild;
+  shepherd?: Shepherd;
   tasks: Record<string, Task>;
   activities?: Record<string, AgentActivity>;
 }

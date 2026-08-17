@@ -1023,6 +1023,10 @@ p {
 .status-running {
   color: var(--cyan);
 }
+.status-repairing {
+  color: var(--amber);
+  background: color-mix(in srgb, var(--amber) 12%, transparent);
+}
 .status-queued,
 .queued-text {
   color: var(--violet);

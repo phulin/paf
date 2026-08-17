@@ -36,7 +36,8 @@ export function TaskTable({
         (task) =>
           task?.status === "failed" || task?.status === "blocked" || task?.status === "interrupted",
       );
-    if (filter === "active") return tasks.some((task) => task?.status !== "succeeded");
+    if (filter === "active")
+      return tasks.some((task) => task?.repairing || task?.status !== "succeeded");
     return true;
   });
 
@@ -103,6 +104,7 @@ export function TaskTable({
                       rounds={row.stages[stage]?.rounds}
                       queued={row.stages[stage]?.queued}
                       phase={row.stages[stage]?.phase}
+                      repairing={row.stages[stage]?.repairing}
                       building={build.active && build.stage === stage && buildTargets.has(row.id)}
                     />
                   </td>
