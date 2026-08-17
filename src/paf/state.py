@@ -2394,7 +2394,7 @@ class StateStore:
         self.shepherd.running_units = max(0, self.shepherd.running_units - 1)
         if status == RepairWorkUnitStatus.SUCCEEDED:
             self.shepherd.succeeded_units += 1
-        else:
+        elif status in {RepairWorkUnitStatus.FAILED, RepairWorkUnitStatus.INTERRUPTED}:
             self.shepherd.failed_units += 1
         self._mark_dirty(tasks=changed_tasks)
         await self._persist()

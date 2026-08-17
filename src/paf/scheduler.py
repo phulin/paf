@@ -7,11 +7,15 @@ from collections import deque
 from collections.abc import Callable, Coroutine, Iterable
 from contextlib import suppress
 from dataclasses import dataclass, replace
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import uuid4
 
+from paf import json_codec as json
 from paf.codex import (
     DOWNSTREAM_RETRY_ROLE,
+    REPAIR_WORKER_ROLE,
+    SHEPHERD_ROLE,
     UPSTREAM_REPAIR_ROLE,
     AgentResult,
     CodexExecutor,
@@ -37,6 +41,10 @@ from paf.isolation import IsolationResult, create_isolation
 from paf.models import PipelineConfig, Stage, WorkUnit, WorkUnitLike
 from paf.scope import ScopeMatcher
 from paf.state import (
+    RepairCaseRecord,
+    RepairCaseStatus,
+    RepairWorkUnitRecord,
+    RepairWorkUnitStatus,
     RunRecord,
     StateStore,
     TaskPhase,
@@ -45,6 +53,11 @@ from paf.state import (
 )
 
 MAXIMUM_IN_FLIGHT_BUILD_BATCHES = 2
+REPAIR_EFFORT = {"small": 1.0, "medium": 3.0, "large": 8.0}
+
+
+class ShepherdPlanError(ValueError):
+    """The Shepherd returned a plan that cannot safely enter the scheduler."""
 
 
 async def _gather_cancel_on_error[T](
@@ -375,6 +388,11 @@ class Orchestrator:
         self._review_generation_lock = asyncio.Lock()
         self._chapter_agent_locks = {chapter.id: asyncio.Lock() for chapter in self.work_units}
         self._upstream_repair_tasks: dict[str, asyncio.Task[None]] = {}
+        self._shepherd_task: asyncio.Task[None] | None = None
+        self._shepherd_lock = asyncio.Lock()
+        self._shepherd_sweeps_started = 0
+        self._repair_progress_generation = 0
+        self._repair_slots = asyncio.Semaphore(config.shepherd.max_agents)
 
     @property
     def chapters(self) -> tuple[WorkUnitLike, ...]:
@@ -425,6 +443,8 @@ class Orchestrator:
         await self.isolation.prepare()
         report("Checking the Git worktree", 8)
         await self.git.prepare()
+        if self.config.shepherd.enabled:
+            self._shepherd_task = asyncio.create_task(self._shepherd_loop(), name="paf-shepherd")
         report("Preparation complete", 9)
 
     async def _commit_agent_changes(
@@ -454,6 +474,10 @@ class Orchestrator:
 
     async def shutdown(self) -> None:
         try:
+            if self._shepherd_task is not None:
+                self._shepherd_task.cancel()
+                await asyncio.gather(self._shepherd_task, return_exceptions=True)
+                self._shepherd_task = None
             if self._discovery_batch_task is not None:
                 self._discovery_batch_task.cancel()
                 await asyncio.gather(self._discovery_batch_task, return_exceptions=True)
@@ -911,14 +935,16 @@ class Orchestrator:
         role: str = "",
         request_ids: Iterable[str] = (),
         upstream_requests: Iterable[dict[str, Any]] = (),
+        priority_override: float | None = None,
     ) -> Attempt:
-        auxiliary = role == UPSTREAM_REPAIR_ROLE
+        auxiliary = role in {UPSTREAM_REPAIR_ROLE, REPAIR_WORKER_ROLE}
+        upstream_repair = role == UPSTREAM_REPAIR_ROLE
         selected_request_ids = tuple(dict.fromkeys(request_ids))
         selected_upstream_requests = tuple(upstream_requests)
         await self.control.checkpoint()
         schedule = (
             self.statement_schedule
-            if stage in (Stage.FORMALIZE, Stage.FORMALIZE, Stage.REVIEW)
+            if stage in (Stage.DISCOVER, Stage.FORMALIZE, Stage.REVIEW)
             else self.proof_schedule
         )
         chapter_lock = self._chapter_agent_locks[chapter.id]
@@ -938,7 +964,11 @@ class Orchestrator:
                     queue_detail or f"queued for {stage.value} agent",
                     queued=True,
                 )
-            await slots.acquire(schedule.priority(chapter.document_id))
+            await slots.acquire(
+                priority_override
+                if priority_override is not None
+                else schedule.priority(chapter.document_id)
+            )
             slot_held = True
         except BaseException:
             chapter_lock.release()
@@ -963,6 +993,9 @@ class Orchestrator:
                     stage,
                     role=role,
                     request_ids=selected_request_ids,
+                    model=(
+                        self.config.shepherd.worker_model if role == REPAIR_WORKER_ROLE else None
+                    ),
                 )
             else:
                 run = await self.state.start_run(chapter.id, stage)
@@ -990,7 +1023,7 @@ class Orchestrator:
                     await self.git.ensure_clean(chapter)
                 workspace = await self.isolation.acquire(run.id)
                 workspace_root = workspace.root
-            if auxiliary:
+            if upstream_repair:
                 agent = await self.executor.run_upstream_repair(
                     chapter,
                     run,
@@ -1051,11 +1084,19 @@ class Orchestrator:
                             publish_if_clean=True,
                             mode=(
                                 "upstream-repair-certification"
-                                if auxiliary
+                                if upstream_repair
+                                else "shepherd-repair-certification"
+                                if role == REPAIR_WORKER_ROLE
                                 else "proof-certification"
                             ),
                             stage=Stage.PROVE,
-                            priority=250.0 if auxiliary else 0.0,
+                            priority=(
+                                priority_override
+                                if priority_override is not None
+                                else 250.0
+                                if auxiliary
+                                else 0.0
+                            ),
                             preemptible=not auxiliary,
                             snapshots=snapshots,
                         )
@@ -3773,7 +3814,494 @@ class Orchestrator:
         )
         return False
 
-    async def run_stage(self, stage: Stage) -> bool:
+    def _repair_cases(self, *, periodic: bool) -> list[RepairCaseRecord]:
+        selected = {chapter.id for chapter in self.work_units}
+        cases: list[RepairCaseRecord] = []
+        for task_key, task in self.state.repairable_tasks():
+            if task.chapter_id not in selected:
+                continue
+            case = self.state.ensure_repair_case(task_key)
+            if case.status == RepairCaseStatus.OPEN or (
+                periodic and case.status == RepairCaseStatus.EXHAUSTED
+            ):
+                cases.append(case)
+        return cases
+
+    def _repair_failure_evidence(self, case: RepairCaseRecord) -> dict[str, Any]:
+        task = self.state.tasks[case.task_key]
+        run = task.runs[-1] if task.runs else None
+        report: dict[str, Any] = {}
+        validation: dict[str, Any] = {}
+        if run is not None and isinstance(run.report, dict):
+            for key in (
+                "summary",
+                "issues",
+                "failed_attempts",
+                "upstream_requests",
+                "finding_assessments",
+            ):
+                if key in run.report:
+                    report[key] = run.report[key]
+        if run is not None and isinstance(run.validation, dict):
+            validation = dict(run.validation)
+            output = validation.get("output")
+            if isinstance(output, str) and len(output) > 12_000:
+                validation["output"] = output[-12_000:]
+        return {
+            "case_id": case.id,
+            "task_key": case.task_key,
+            "work_unit_id": case.chapter_id,
+            "stage": case.stage,
+            "status": str(task.status),
+            "detail": task.detail,
+            "updated_at": task.updated_at,
+            "latest_run": (
+                {
+                    "id": run.id,
+                    "role": run.role,
+                    "model": run.model,
+                    "exit_code": run.exit_code,
+                    "changed": run.changed,
+                    "placeholders": run.placeholders,
+                    "report": report,
+                    "validation": validation,
+                }
+                if run is not None
+                else None
+            ),
+        }
+
+    def _validate_shepherd_plan(
+        self,
+        sweep_id: str,
+        cases: Iterable[RepairCaseRecord],
+        report: dict[str, Any],
+    ) -> list[RepairWorkUnitRecord]:
+        selected_cases = {case.id: case for case in cases}
+        raw_dispositions = report.get("dispositions")
+        raw_units = report.get("work_units")
+        if not report.get("complete"):
+            raise ShepherdPlanError("Shepherd did not complete the repair plan")
+        if not isinstance(raw_dispositions, list) or not isinstance(raw_units, list):
+            raise ShepherdPlanError("Shepherd plan is missing dispositions or work units")
+        if len(raw_units) > self.config.shepherd.maximum_work_units_per_sweep:
+            raise ShepherdPlanError("Shepherd plan exceeds the configured work-unit limit")
+
+        dispositions: dict[str, str] = {}
+        for value in raw_dispositions:
+            if not isinstance(value, dict):
+                raise ShepherdPlanError("Shepherd disposition must be an object")
+            case_id = value.get("case_id")
+            disposition = value.get("disposition")
+            if not isinstance(case_id, str) or case_id not in selected_cases:
+                raise ShepherdPlanError(f"Shepherd disposition has unknown case id: {case_id}")
+            if case_id in dispositions:
+                raise ShepherdPlanError(f"Shepherd disposition repeats case id: {case_id}")
+            if disposition not in {"repair", "defer", "ignore"}:
+                raise ShepherdPlanError(f"Shepherd disposition is invalid for case {case_id}")
+            dispositions[case_id] = disposition
+        if set(dispositions) != set(selected_cases):
+            missing = sorted(set(selected_cases).difference(dispositions))
+            raise ShepherdPlanError("Shepherd omitted case dispositions: " + ", ".join(missing))
+
+        selected_chapters = {chapter.id: chapter for chapter in self.work_units}
+        by_key: dict[str, dict[str, Any]] = {}
+        covered_cases: set[str] = set()
+        for value in raw_units:
+            if not isinstance(value, dict):
+                raise ShepherdPlanError("Shepherd work unit must be an object")
+            key = value.get("key")
+            if not isinstance(key, str) or not key:
+                raise ShepherdPlanError("Shepherd work unit has no local key")
+            if key in by_key:
+                raise ShepherdPlanError(f"Shepherd work-unit key is repeated: {key}")
+            case_ids = value.get("case_ids")
+            if not isinstance(case_ids, list) or not case_ids:
+                raise ShepherdPlanError(f"Shepherd work unit {key} has no cases")
+            if any(case_id not in selected_cases for case_id in case_ids):
+                raise ShepherdPlanError(f"Shepherd work unit {key} references an unknown case")
+            if any(dispositions[case_id] != "repair" for case_id in case_ids):
+                raise ShepherdPlanError(f"Shepherd work unit {key} references a deferred case")
+            owner = value.get("owner_chapter_id")
+            if not isinstance(owner, str) or owner not in selected_chapters:
+                raise ShepherdPlanError(f"Shepherd work unit {key} has an unknown owner")
+            try:
+                Stage(str(value.get("target_stage")))
+            except ValueError as error:
+                raise ShepherdPlanError(
+                    f"Shepherd work unit {key} has an invalid target stage"
+                ) from error
+            effort = value.get("effort")
+            if effort not in REPAIR_EFFORT:
+                raise ShepherdPlanError(f"Shepherd work unit {key} has invalid effort")
+            objective = value.get("objective")
+            if not isinstance(objective, str) or not objective.strip():
+                raise ShepherdPlanError(f"Shepherd work unit {key} has no objective")
+            dependencies = value.get("depends_on")
+            if not isinstance(dependencies, list) or not all(
+                isinstance(item, str) for item in dependencies
+            ):
+                raise ShepherdPlanError(f"Shepherd work unit {key} has invalid dependencies")
+            by_key[key] = value
+            covered_cases.update(case_ids)
+
+        required_cases = {
+            case_id for case_id, disposition in dispositions.items() if disposition == "repair"
+        }
+        if covered_cases != required_cases:
+            missing = sorted(required_cases.difference(covered_cases))
+            extra = sorted(covered_cases.difference(required_cases))
+            raise ShepherdPlanError(
+                "Shepherd work-unit coverage does not match repair dispositions"
+                + (f"; missing: {', '.join(missing)}" if missing else "")
+                + (f"; extra: {', '.join(extra)}" if extra else "")
+            )
+        for key, value in by_key.items():
+            dependencies = list(dict.fromkeys(value["depends_on"]))
+            if key in dependencies or any(item not in by_key for item in dependencies):
+                raise ShepherdPlanError(f"Shepherd work unit {key} has an invalid dependency")
+            value["depends_on"] = dependencies
+
+        successors: dict[str, list[str]] = {key: [] for key in by_key}
+        for key, value in by_key.items():
+            for dependency in value["depends_on"]:
+                successors[dependency].append(key)
+        visiting: set[str] = set()
+        dynamic_ranks: dict[str, float] = {}
+
+        def dynamic_rank(key: str) -> float:
+            if key in dynamic_ranks:
+                return dynamic_ranks[key]
+            if key in visiting:
+                raise ShepherdPlanError("Shepherd work-unit dependencies contain a cycle")
+            visiting.add(key)
+            successor_rank = max(
+                (dynamic_rank(successor) for successor in successors[key]), default=0.0
+            )
+            visiting.remove(key)
+            rank = REPAIR_EFFORT[str(by_key[key]["effort"])] + successor_rank
+            dynamic_ranks[key] = rank
+            return rank
+
+        for key in by_key:
+            dynamic_rank(key)
+
+        id_by_key = {key: f"{sweep_id}-{key}" for key in by_key}
+        units: list[RepairWorkUnitRecord] = []
+        for key, value in by_key.items():
+            owner = selected_chapters[str(value["owner_chapter_id"])]
+            stage = Stage(str(value["target_stage"]))
+            schedule = self.statement_schedule if stage is not Stage.PROVE else self.proof_schedule
+            units.append(
+                RepairWorkUnitRecord(
+                    id=id_by_key[key],
+                    sweep_id=sweep_id,
+                    case_ids=list(dict.fromkeys(value["case_ids"])),
+                    task_keys=[self.state.key(owner.id, stage)],
+                    owner_chapter_id=owner.id,
+                    target_stage=stage.value,
+                    objective=str(value["objective"]),
+                    depends_on=[id_by_key[item] for item in value["depends_on"]],
+                    effort=str(value["effort"]),
+                    priority=schedule.priority(owner.document_id) + dynamic_ranks[key],
+                )
+            )
+        return units
+
+    async def _run_repair_work_unit(self, unit: RepairWorkUnitRecord) -> bool:
+        active_cases = [
+            self.state.repair_cases[case_id]
+            for case_id in unit.case_ids
+            if self.state.tasks[self.state.repair_cases[case_id].task_key].status
+            in {TaskStatus.FAILED, TaskStatus.BLOCKED}
+        ]
+        if not active_cases:
+            await self.state.finish_repair_work_unit(
+                unit.id,
+                status=RepairWorkUnitStatus.SUPERSEDED,
+                detail="all covered failures were resolved before this repair ran",
+            )
+            return False
+        async with self._repair_slots:
+            await self.state.start_repair_work_unit(unit.id)
+            chapter = self.config.work_unit(unit.owner_chapter_id)
+            stage = Stage(unit.target_stage)
+            before_placeholders = (
+                await asyncio.to_thread(count_placeholders, self.config.settings.repo, chapter)
+                if stage is Stage.PROVE
+                else None
+            )
+            dossier = {
+                "repair_work_unit_id": unit.id,
+                "objective": unit.objective,
+                "target_stage": unit.target_stage,
+                "effort": unit.effort,
+                "covered_failures": [self._repair_failure_evidence(case) for case in active_cases],
+            }
+            try:
+                attempt = await self._attempt(
+                    chapter,
+                    stage,
+                    feedback=json.dumps(dossier, indent=2),
+                    queue_detail=f"Shepherd repair {unit.id}",
+                    role=REPAIR_WORKER_ROLE,
+                    request_ids=[unit.id, *(case.id for case in active_cases)],
+                    priority_override=unit.priority,
+                )
+                complete = bool(attempt.agent.report.get("complete"))
+                validation = attempt.validation
+                if stage in {Stage.FORMALIZE, Stage.REVIEW} and attempt.agent.succeeded:
+                    snapshots: dict[str, ValidatedBuildSnapshot] = {}
+                    validation = (
+                        await self._build_chapters(
+                            (chapter,),
+                            publish_if_clean=True,
+                            mode=f"shepherd-{stage.value}-repair",
+                            stage=stage,
+                            priority=unit.priority,
+                            preemptible=False,
+                            snapshots=snapshots,
+                        )
+                    )[chapter.id]
+                    if validation.succeeded and not await self._publish_validated_build(
+                        chapter, snapshots[chapter.id]
+                    ):
+                        validation = ValidationResult(
+                            False,
+                            1,
+                            "Source scope changed after the Shepherd repair build.",
+                        )
+                    await self.state.update_run(
+                        attempt.run,
+                        validation=validation.as_dict(),
+                    )
+                accepted = attempt.agent.succeeded and validation.succeeded and complete
+                if stage is Stage.DISCOVER:
+                    raw_dependencies = attempt.agent.report.get("source_dependencies")
+                    dependencies = (
+                        tuple(item for item in raw_dependencies if isinstance(item, str))
+                        if isinstance(raw_dependencies, list)
+                        else ()
+                    )
+                    known = {chapter.id for chapter in self.work_units}
+                    accepted = (
+                        accepted
+                        and not attempt.agent.changed
+                        and isinstance(raw_dependencies, list)
+                        and len(dependencies) == len(raw_dependencies)
+                        and all(item in known for item in dependencies)
+                        and chapter.id not in dependencies
+                    )
+                    if accepted:
+                        await self._persist_source_dependencies(
+                            chapter,
+                            dependencies,
+                            attempt.agent.report,
+                        )
+                elif stage is Stage.PROVE and before_placeholders is not None:
+                    accepted = accepted and (
+                        attempt.agent.placeholders == 0
+                        or attempt.agent.placeholders < before_placeholders
+                    )
+                if not accepted:
+                    detail = attempt.feedback()
+                    await self.state.finish_repair_work_unit(
+                        unit.id,
+                        status=RepairWorkUnitStatus.FAILED,
+                        detail=detail,
+                        run_id=attempt.run.id,
+                    )
+                    return False
+                async with self.state.batch():
+                    for case in active_cases:
+                        task = self.state.tasks[case.task_key]
+                        if task.status in {TaskStatus.FAILED, TaskStatus.BLOCKED}:
+                            await self.state.set_task(
+                                task.chapter_id,
+                                Stage(task.stage),
+                                TaskStatus.PENDING,
+                                f"Shepherd repair {unit.id} accepted; stage retry required",
+                            )
+                    await self.state.finish_repair_work_unit(
+                        unit.id,
+                        status=RepairWorkUnitStatus.SUCCEEDED,
+                        detail="repair integrated and validated",
+                        run_id=attempt.run.id,
+                    )
+                self._repair_progress_generation += 1
+                return True
+            except asyncio.CancelledError:
+                await self.state.finish_repair_work_unit(
+                    unit.id,
+                    status=RepairWorkUnitStatus.INTERRUPTED,
+                    detail="repair interrupted with the orchestrator",
+                )
+                raise
+            except BaseException as error:
+                await self.state.finish_repair_work_unit(
+                    unit.id,
+                    status=RepairWorkUnitStatus.FAILED,
+                    detail=str(error) or type(error).__name__,
+                )
+                return False
+
+    async def _execute_repair_plan(self, units: Iterable[RepairWorkUnitRecord]) -> bool:
+        pending = {unit.id: unit for unit in units}
+        progressed = False
+        while pending:
+            terminal_failures = {
+                unit_id
+                for unit_id, unit in self.state.repair_work_units.items()
+                if unit.status
+                in {
+                    RepairWorkUnitStatus.FAILED,
+                    RepairWorkUnitStatus.INTERRUPTED,
+                    RepairWorkUnitStatus.SUPERSEDED,
+                }
+            }
+            blocked = [
+                unit
+                for unit in pending.values()
+                if set(unit.depends_on).intersection(terminal_failures)
+            ]
+            for unit in blocked:
+                await self.state.finish_repair_work_unit(
+                    unit.id,
+                    status=RepairWorkUnitStatus.SUPERSEDED,
+                    detail="repair dependency did not succeed",
+                )
+                pending.pop(unit.id)
+            succeeded = {
+                unit_id
+                for unit_id, unit in self.state.repair_work_units.items()
+                if unit.status == RepairWorkUnitStatus.SUCCEEDED
+            }
+            ready = [unit for unit in pending.values() if set(unit.depends_on).issubset(succeeded)]
+            if not ready:
+                if pending:
+                    raise RuntimeError("validated Shepherd repair DAG made no progress")
+                break
+            results = await _gather_cancel_on_error(
+                self._run_repair_work_unit(unit) for unit in ready
+            )
+            progressed = progressed or any(results)
+            for unit in ready:
+                pending.pop(unit.id)
+        return progressed
+
+    async def _run_shepherd_sweep(
+        self,
+        *,
+        trigger: str,
+        cases: Iterable[RepairCaseRecord],
+    ) -> bool:
+        selected_cases = list(cases)[: self.config.shepherd.maximum_failures_per_sweep]
+        if not selected_cases:
+            return False
+        async with self._shepherd_lock:
+            if self._shepherd_sweeps_started >= self.config.shepherd.maximum_sweeps_per_invocation:
+                return False
+            self._shepherd_sweeps_started += 1
+            sweep = await self.state.start_repair_sweep(
+                trigger=trigger,
+                task_keys=[case.task_key for case in selected_cases],
+            )
+            anchor = self.config.work_unit(selected_cases[0].chapter_id)
+            run: RunRecord | None = None
+            planning_slot = False
+            try:
+                await self.agent_slots.acquire(1_000_000.0)
+                planning_slot = True
+                run = await self.state.start_auxiliary_run(
+                    anchor.id,
+                    Stage.DISCOVER,
+                    role=SHEPHERD_ROLE,
+                    request_ids=[case.id for case in selected_cases],
+                    model=self.config.shepherd.model,
+                )
+                self.state.shepherd.current_run_id = run.id
+                await self.state.save()
+                result = await self.executor.run_shepherd(
+                    anchor,
+                    run,
+                    (self._repair_failure_evidence(case) for case in selected_cases),
+                    scheduling=self.state.scheduling,
+                )
+                self.agent_slots.release()
+                planning_slot = False
+                if not result.succeeded:
+                    raise ShepherdPlanError(result.error or "Shepherd planning agent failed")
+                units = self._validate_shepherd_plan(sweep.id, selected_cases, result.report)
+                await self.state.install_repair_plan(
+                    sweep.id,
+                    units,
+                    summary=str(result.report.get("summary", "")),
+                    run_id=run.id,
+                )
+                progressed = await self._execute_repair_plan(units)
+                await self.state.finish_repair_sweep(sweep.id)
+                return progressed
+            except asyncio.CancelledError:
+                await self.state.finish_repair_sweep(
+                    sweep.id, error="Shepherd sweep interrupted with the orchestrator"
+                )
+                raise
+            except BaseException as error:
+                await self.state.finish_repair_sweep(
+                    sweep.id,
+                    error=str(error) or type(error).__name__,
+                )
+                return False
+            finally:
+                if planning_slot:
+                    self.agent_slots.release()
+
+    async def _trigger_threshold_shepherd(self) -> bool:
+        if not self.config.shepherd.enabled:
+            return False
+        cases = self._repair_cases(periodic=False)
+        if len(cases) < self.config.shepherd.failure_threshold:
+            return False
+        return await self._run_shepherd_sweep(trigger="failure-threshold", cases=cases)
+
+    async def _shepherd_loop(self) -> None:
+        changes = self.state.change_bus.subscribe()
+        interval = self.config.shepherd.interval_seconds
+        due = datetime.now(UTC) + timedelta(seconds=interval)
+        self.state.shepherd.next_run_at = due.isoformat()
+        await self.state.save()
+        try:
+            while (
+                self._shepherd_sweeps_started < self.config.shepherd.maximum_sweeps_per_invocation
+            ):
+                remaining = max(0.0, (due - datetime.now(UTC)).total_seconds())
+                timed_out = False
+                try:
+                    await asyncio.wait_for(changes.get(), timeout=remaining)
+                except TimeoutError:
+                    timed_out = True
+                cases = self._repair_cases(periodic=timed_out)
+                pending = len(self.state.repairable_tasks())
+                if self.state.shepherd.pending_failures != pending:
+                    self.state.shepherd.pending_failures = pending
+                    await self.state.save()
+                if not timed_out and len(cases) >= self.config.shepherd.failure_threshold:
+                    await self._run_shepherd_sweep(trigger="failure-threshold", cases=cases)
+                elif timed_out:
+                    if cases:
+                        await self._run_shepherd_sweep(trigger="interval", cases=cases)
+                    due = datetime.now(UTC) + timedelta(seconds=interval)
+                    self.state.shepherd.next_run_at = due.isoformat()
+                    await self.state.save()
+        finally:
+            self.state.change_bus.unsubscribe(changes)
+
+    async def _drain_active_shepherd(self) -> None:
+        if self._shepherd_lock.locked():
+            async with self._shepherd_lock:
+                pass
+
+    async def _run_stage_once(self, stage: Stage) -> bool:
         if stage is Stage.DISCOVER:
             return await self._discover_all()
         if stage is Stage.FORMALIZE:
@@ -3782,7 +4310,16 @@ class Orchestrator:
             return await self._review_until_clean()
         return await self._review_tree(prove=True)
 
-    async def run_pipeline(self) -> bool:
+    async def run_stage(self, stage: Stage) -> bool:
+        generation = self._repair_progress_generation
+        result = await self._run_stage_once(stage)
+        await self._trigger_threshold_shepherd()
+        await self._drain_active_shepherd()
+        if self._repair_progress_generation != generation:
+            result = await self._run_stage_once(stage)
+        return result
+
+    async def _run_pipeline_once(self) -> bool:
         progress = asyncio.Event()
         formalize_task = asyncio.create_task(
             self._discover_and_formalize(progress_event=progress, discover=True)
@@ -3800,3 +4337,12 @@ class Orchestrator:
             formalize_task.cancel()
             await asyncio.gather(formalize_task, return_exceptions=True)
             raise
+
+    async def run_pipeline(self) -> bool:
+        generation = self._repair_progress_generation
+        result = await self._run_pipeline_once()
+        await self._trigger_threshold_shepherd()
+        await self._drain_active_shepherd()
+        if self._repair_progress_generation != generation:
+            result = await self._run_pipeline_once()
+        return result

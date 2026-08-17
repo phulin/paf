@@ -442,7 +442,7 @@ async def test_state_persists_fixup_graph(tmp_path: Path) -> None:
     await reloaded.load_or_create()
 
     assert reloaded.fixup_graph == state.fixup_graph
-    assert reloaded.snapshot()["version"] == 15
+    assert reloaded.snapshot()["version"] == 16
 
 
 @pytest.mark.asyncio
@@ -984,7 +984,7 @@ async def test_hot_checkpoint_does_not_grow_with_run_payload_history(tmp_path: P
     hot = read_checkpoint(config.settings.state_dir)
     assert hot is not None
     task = hot["tasks"][f"{config.chapters[0].id}:formalize"]
-    assert hot["version"] == 15
+    assert hot["version"] == 16
     assert "source_issues" not in hot
     assert "runs" not in task
     assert task["run_count"] == 25
