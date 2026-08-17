@@ -36,7 +36,7 @@ class SwarmSettings:
     max_agents: int = 16
     codex_bin: str = "codex"
     model: str | None = "gpt-5.6-luna"
-    reasoning_effort: str | None = "max"
+    reasoning_effort: str | None = "xhigh"
     sandbox: str = "danger-full-access"
     approve_for_me: bool = False
     bypass_approvals_and_sandbox: bool = True
@@ -66,7 +66,7 @@ class ShepherdSettings:
     model: str = "gpt-5.6-sol"
     reasoning_effort: str = "medium"
     worker_model: str = "gpt-5.6-luna"
-    worker_reasoning_effort: str = "max"
+    worker_reasoning_effort: str = "xhigh"
     interval_seconds: float = 1200.0
     failure_threshold: int = 10
     maximum_failures_per_sweep: int = 50

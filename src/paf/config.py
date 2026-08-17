@@ -57,9 +57,9 @@ def _render(value: str, variables: dict[str, str]) -> str:
 
 STAGE_ROUNDS = {
     Stage.DISCOVER: 1,
-    Stage.FORMALIZE: 10,
-    Stage.REVIEW: 5,
-    Stage.PROVE: 10,
+    Stage.FORMALIZE: 3,
+    Stage.REVIEW: 3,
+    Stage.PROVE: 3,
 }
 
 STAGE_MODELS = {
@@ -67,7 +67,7 @@ STAGE_MODELS = {
 }
 
 STAGE_REASONING_EFFORTS = {
-    Stage.DISCOVER: "medium",
+    Stage.DISCOVER: "xhigh",
 }
 
 STAGE_MAX_AGENTS = {
@@ -482,7 +482,7 @@ def load_config(path: str | Path, *, project: Project | None = None) -> Pipeline
         max_agents=int(swarm.get("max_agents", 16)),
         codex_bin=str(swarm.get("codex_bin", "codex")),
         model=str(swarm.get("model", "gpt-5.6-luna")),
-        reasoning_effort=str(swarm.get("reasoning_effort", "max")),
+        reasoning_effort=str(swarm.get("reasoning_effort", "xhigh")),
         sandbox=str(swarm.get("sandbox", "danger-full-access")),
         approve_for_me=bool(swarm.get("approve_for_me", False)),
         bypass_approvals_and_sandbox=bool(swarm.get("bypass_approvals_and_sandbox", True)),
@@ -530,7 +530,7 @@ def load_config(path: str | Path, *, project: Project | None = None) -> Pipeline
         model=str(raw_shepherd.get("model", "gpt-5.6-sol")),
         reasoning_effort=str(raw_shepherd.get("reasoning_effort", "medium")),
         worker_model=str(raw_shepherd.get("worker_model", "gpt-5.6-luna")),
-        worker_reasoning_effort=str(raw_shepherd.get("worker_reasoning_effort", "max")),
+        worker_reasoning_effort=str(raw_shepherd.get("worker_reasoning_effort", "xhigh")),
         interval_seconds=float(raw_shepherd.get("interval_seconds", 1200)),
         failure_threshold=int(raw_shepherd.get("failure_threshold", 10)),
         maximum_failures_per_sweep=int(raw_shepherd.get("maximum_failures_per_sweep", 50)),
@@ -781,7 +781,7 @@ def infer_config(target: str | Path, *, project: Project | None = None) -> Pipel
         repo=repo,
         state_dir=repo / ".paf" / book.id,
         model="gpt-5.6-luna",
-        reasoning_effort="max",
+        reasoning_effort="xhigh",
     )
     chapters = tuple(_discover_chapters(repo, book))
     return PipelineConfig(
@@ -957,7 +957,7 @@ def infer_corpus(
         repo=repo,
         state_dir=repo / ".paf" / f"corpus-{corpus_id}",
         model="gpt-5.6-luna",
-        reasoning_effort="max",
+        reasoning_effort="xhigh",
         lean_project=backend.project,
     )
     config = PipelineConfig(

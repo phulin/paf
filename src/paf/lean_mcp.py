@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import re
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -12,6 +13,7 @@ from leanclient.aio import AsyncLeanLSPClient, LeanClientError
 from mcp.server.fastmcp import Context
 from mcp.server.fastmcp.server import Settings as FastMCPSettings
 from mcp.types import ToolAnnotations
+from pydantic import BaseModel
 
 from paf.diagnostics import LEAN_WARNING_RE, lean_diagnostic_counts
 
@@ -22,6 +24,7 @@ FastMCPSettings.model_rebuild()
 
 from lean_lsp_mcp import main as upstream_main  # noqa: E402
 from lean_lsp_mcp import server  # noqa: E402
+from lean_lsp_mcp.models import DiagnosticMessage  # noqa: E402
 from lean_lsp_mcp.utils import (  # noqa: E402
     extract_failed_dependency_paths,
     is_build_stderr,
@@ -34,6 +37,7 @@ Notification = Callable[[AsyncLeanLSPClient, str, dict[str, Any]], None]
 _ORIGINAL_RELOAD = AsyncLeanLSPClient.reload_from_disk
 _ORIGINAL_BARRIER = AsyncLeanLSPClient.barrier
 _ORIGINAL_NOTIFICATION = AsyncLeanLSPClient._on_notification
+_ORIGINAL_PROCESS_DIAGNOSTICS = server._process_diagnostics
 
 _DEPENDENCY_LOCKS: WeakKeyDictionary[Any, asyncio.Lock] = WeakKeyDictionary()
 _DOCUMENT_LOCKS: WeakKeyDictionary[Any, dict[str, asyncio.Lock]] = WeakKeyDictionary()
@@ -50,6 +54,112 @@ _STALE_IMPORT_TEXT = "Imports are out of date"
 _OBJECT_FILE_TEXT = "object file"
 _OLEAN_TEXT = ".olean"
 _RECOVERABLE_OBJECT_FILE_FAILURES = ("does not exist", "is out of date")
+_TOOL_OUTPUT_MAX_CHARS = 12 * 1024
+_BOUNDED_TOOL_NAMES: set[str] = set()
+
+
+def compact_target_diagnostics(
+    diagnostics: list[dict[str, Any]],
+    build_success: bool,
+    severity: str | None = None,
+    timed_out: bool = False,
+    partial: bool = False,
+    processing_lines: list[list[int]] | None = None,
+) -> Any:
+    """Return target errors plus a count, suppressing warning bodies and large payloads."""
+
+    warning_count = sum(
+        1
+        for diagnostic in diagnostics
+        if isinstance(diagnostic, dict) and diagnostic.get("severity", 1) == 2
+    )
+    errors: list[dict[str, Any]] = []
+    remaining = _TOOL_OUTPUT_MAX_CHARS
+    for diagnostic in diagnostics:
+        if not isinstance(diagnostic, dict):
+            continue
+        # Keep dependency build stderr long enough for the upstream parser to
+        # extract failed paths. It omits that imported-file blob from `items`.
+        message = str(diagnostic.get("message", ""))
+        is_dependency_build = is_build_stderr(message)
+        if diagnostic.get("severity", 1) != 1 and not is_dependency_build:
+            continue
+        compact = dict(diagnostic)
+        if not is_dependency_build and len(message) > remaining:
+            compact["message"] = message[: max(0, remaining)] + "… [truncated]"
+        remaining -= min(len(message), max(0, remaining))
+        errors.append(compact)
+        if remaining <= 0:
+            break
+    result = _ORIGINAL_PROCESS_DIAGNOSTICS(
+        errors,
+        build_success,
+        severity="error",
+        timed_out=timed_out,
+        partial=partial,
+        processing_lines=processing_lines,
+    )
+    result.items.append(
+        DiagnosticMessage(
+            severity="info",
+            message=f"{warning_count} target-file warning(s) suppressed",
+            line=1,
+            column=1,
+        )
+    )
+    return result
+
+
+def _bounded_tool_value(value: Any, remaining: list[int]) -> Any:
+    """Copy a structured MCP result while enforcing one shared string budget."""
+
+    if isinstance(value, str):
+        if len(value) <= remaining[0]:
+            remaining[0] -= len(value)
+            return value
+        kept = max(0, remaining[0] - 16)
+        remaining[0] = 0
+        return value[:kept] + "… [truncated]"
+    if isinstance(value, BaseModel):
+        updates = {
+            name: _bounded_tool_value(item, remaining) for name, item in value.__dict__.items()
+        }
+        return value.model_copy(update=updates)
+    if isinstance(value, dict):
+        result: dict[Any, Any] = {}
+        for key, item in value.items():
+            if remaining[0] <= 0:
+                break
+            result[key] = _bounded_tool_value(item, remaining)
+        return result
+    if isinstance(value, (list, tuple)):
+        items = []
+        for item in value:
+            if remaining[0] <= 0:
+                break
+            items.append(_bounded_tool_value(item, remaining))
+        return type(value)(items)
+    return value
+
+
+def install_tool_output_bounds() -> None:
+    """Bound every tool exposed to proof agents before FastMCP serializes it."""
+
+    def wrap(original: Any) -> Any:
+        async def bounded(*args: Any, **kwargs: Any) -> Any:
+            result = original(*args, **kwargs)
+            if inspect.isawaitable(result):
+                result = await result
+            return _bounded_tool_value(result, [_TOOL_OUTPUT_MAX_CHARS])
+
+        return bounded
+
+    for name, tool in server.mcp._tool_manager._tools.items():
+        original = tool.fn
+        if name in _BOUNDED_TOOL_NAMES:
+            continue
+        tool.fn = wrap(original)
+        _BOUNDED_TOOL_NAMES.add(name)
 
 
 def _client_lock(client: Any) -> asyncio.Lock:
@@ -411,6 +521,9 @@ def install_dependency_reopens() -> None:
     client_type._on_notification = record_stale_dependency
     client_type.reload_from_disk = reload_with_dependencies_when_stale
     client_type.barrier = barrier_with_dependency_refresh
+    server_any: Any = server
+    server_any._process_diagnostics = compact_target_diagnostics
+    install_tool_output_bounds()
 
 
 def main() -> int:

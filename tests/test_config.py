@@ -23,11 +23,11 @@ def test_discovers_chapters_and_renders_paths(tmp_path: Path) -> None:
     assert first.chapter_module == "Book.Chapter01"
     assert first.scope == ("lean/Book/Chapter01.lean", "lean/Book/Chapter01/**/*.lean")
     assert config.stages[Stage.DISCOVER].max_rounds == 1
-    assert config.stages[Stage.FORMALIZE].max_rounds == 10
-    assert config.stages[Stage.FORMALIZE].max_rounds == 10
-    assert config.stages[Stage.REVIEW].max_rounds == 5
+    assert config.stages[Stage.FORMALIZE].max_rounds == 3
+    assert config.stages[Stage.FORMALIZE].max_rounds == 3
+    assert config.stages[Stage.REVIEW].max_rounds == 3
     assert config.stages[Stage.DISCOVER].model == "gpt-5.6-luna"
-    assert config.stages[Stage.DISCOVER].reasoning_effort == "medium"
+    assert config.stages[Stage.DISCOVER].reasoning_effort == "xhigh"
     assert config.stages[Stage.FORMALIZE].model is None
     assert config.stages[Stage.FORMALIZE].reasoning_effort is None
     assert config.model_for(Stage.FORMALIZE) == config.settings.model
@@ -47,7 +47,7 @@ def test_discovers_chapters_and_renders_paths(tmp_path: Path) -> None:
     assert config.shepherd.enabled is True
     assert config.shepherd.reasoning_effort == "medium"
     assert config.shepherd.worker_model == "gpt-5.6-luna"
-    assert config.shepherd.worker_reasoning_effort == "max"
+    assert config.shepherd.worker_reasoning_effort == "xhigh"
 
 
 def test_loads_and_validates_discovery_concurrency(tmp_path: Path) -> None:
@@ -245,7 +245,7 @@ def test_infers_zero_config_project_from_markdown(tmp_path: Path) -> None:
 
     assert config.settings.repo == tmp_path
     assert config.settings.model == "gpt-5.6-luna"
-    assert config.settings.reasoning_effort == "max"
+    assert config.settings.reasoning_effort == "xhigh"
     assert config.settings.bypass_approvals_and_sandbox
     assert config.settings.isolation == "auto"
     assert config.shepherd.enabled is True

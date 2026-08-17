@@ -33,7 +33,9 @@ bodies, add focused imports, and add fully proved helper lemmas when they are ge
    directly, or change the tactic structure. One guessed name or failed tactic is not enough reason to
    stop.
 7. If repeated concrete attempts expose the same obstruction, preserve every clean proof and useful
-   helper, record the exact remaining goal and attempts, and continue with independent placeholders.
+   helper, record only new evidence, and continue with independent placeholders. When the handoff
+   names a durable blocker ID and its path, declaration, residual goal, and obstruction are unchanged,
+   put that ID in `blocker_refs` instead of repeating the failed attempt.
 8. Complete each file before moving to the next. After all files have been visited, check every edited
    file and the assigned files that depend on it. Remove or revert any speculative edit that does not
    pass diagnostics; every retained proof and helper must be accepted by Lean.
@@ -84,10 +86,15 @@ files on disk, not planned work. Use only these fields:
   give `location`, an exact identifying `source_excerpt`, a mathematical `description`, and the
   smallest `suggested_correction`. Do not use this field for an ordinary failed proof or missing Lean
   interface.
-- `failed_attempts`: every unresolved assigned proof; otherwise an empty list. Each entry must give
+- `failed_attempts`: only new or materially changed unresolved proofs; otherwise an empty list. Each
+  entry must give
   its repository-relative `path`, fully qualified `declaration`, at least two meaningfully different
-  checked `attempts`, exact `remaining_goal`, and concrete `obstruction`. State suspected statement or
-  interface problems as evidence, not conclusions; PAF sends these entries to an independent review.
+  checked `attempts`, exact `remaining_goal`, concrete `obstruction`, and a `disposition`: `retry`,
+  `missing_upstream`, `statement_review`, `interface_review`, or `genuine_blocker`. Use either review
+  disposition only with concrete mathematical evidence; PAF waits for a repeated fingerprint before
+  escalating it.
+- `blocker_refs`: durable blocker IDs from the handoff that are unchanged in this attempt; otherwise
+  an empty list. Never copy their full evidence into the report again.
 - `upstream_requests`: only missing reusable results that belong in an earlier chapter; otherwise an
   empty list. Each entry must give `blocked_declaration`, `consumer_path`, `residual_goal`, the smallest
   `needed_result`, `owner_chapter_id`, exact `owner_paths`, and at least two

@@ -374,7 +374,7 @@ if "formalize" in schema:
     section.write_text("def formalized := True\\n")
     report["changed"] = True
 if "prove" in schema:
-    report.update({"failed_attempts": [], "upstream_requests": []})
+    report.update({"failed_attempts": [], "blocker_refs": [], "upstream_requests": []})
 print(json.dumps({"type": "item.completed", "item": {
     "type": "agent_message", "text": json.dumps(report)}}))
 """,
@@ -393,8 +393,10 @@ print(json.dumps({"type": "item.completed", "item": {
     assert main(["agent", "wait", "--config", str(config_path)]) == 0
     finished = json.loads(capsys.readouterr().out)
     assert finished["status"] == "completed"
-    assert finished["usage"]["total_tokens"] == 36
-    assert finished["cost"]["estimated_usd"] == pytest.approx(0.0000105)
+    # The fake backend reuses one thread and repeats its cumulative counter in
+    # each stage; only the first 12 tokens are billable.
+    assert finished["usage"]["total_tokens"] == 12
+    assert finished["cost"]["estimated_usd"] == pytest.approx(0.0000035)
 
 
 def test_agent_rpc_reads_jsonl_from_stdin(

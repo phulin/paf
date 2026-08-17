@@ -4,7 +4,7 @@ state_dir = ".paf"
 max_agents = 24
 codex_bin = "codex"
 model = "gpt-5.6-luna"
-reasoning_effort = "max"
+reasoning_effort = "xhigh"
 sandbox = "danger-full-access"
 approve_for_me = false
 bypass_approvals_and_sandbox = true
@@ -25,7 +25,7 @@ enabled = true
 model = "gpt-5.6-sol"
 reasoning_effort = "medium"
 worker_model = "gpt-5.6-luna"
-worker_reasoning_effort = "max"
+worker_reasoning_effort = "xhigh"
 interval_seconds = 1200
 failure_threshold = 10
 maximum_failures_per_sweep = 50
@@ -62,17 +62,17 @@ mcp_tool_timeout_seconds = 300
 [stages.discover]
 max_agents = 40
 model = "gpt-5.6-luna"
-reasoning_effort = "medium"
+reasoning_effort = "xhigh"
 max_rounds = 1
 
 [stages.formalize]
-max_rounds = 12
+max_rounds = 3
 
 [stages.review]
-max_rounds = 5
+max_rounds = 3
 
 [stages.prove]
-max_rounds = 12
+max_rounds = 3
 
 # Adapter defaults apply to every configured source. Ordered path rules can
 # override the format or splitting mode for a mixed corpus.

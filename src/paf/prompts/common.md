@@ -29,3 +29,14 @@ several later declarations need it.
 Fix the cause of diagnostics. Do not hide warnings with options, disable linters, or leave diagnostic-
 suppression tricks in the source. Remove exploratory commands and scratch, backup, or log files before
 finishing. Preserve unrelated work.
+
+### Keep searches and tool output bounded
+
+Never search, list, read, or recurse into `.paf/logs`, `.paf/isolation`, or any isolation/worktree
+tree. Those directories contain duplicated agent transcripts and source snapshots, not mathematical
+evidence. Scope repository searches to the assigned files, earlier source modules, and Mathlib.
+
+Keep shell and tool responses below roughly 12 KiB: use narrow paths and patterns, limit matches,
+and request small source windows. If a command could emit more, add an explicit output bound or split
+it into targeted queries. Lean diagnostics report target-file errors and a warning count; do not ask
+for imported-file warning dumps.

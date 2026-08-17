@@ -68,6 +68,14 @@ class UpstreamRequestStatus(StrEnum):
     ESCALATED = "escalated"
 
 
+class ProofBlockerStatus(StrEnum):
+    OPEN = "open"
+    UPSTREAM_REQUESTED = "upstream_requested"
+    REVIEW_REQUESTED = "review_requested"
+    BLOCKED = "blocked"
+    RESOLVED = "resolved"
+
+
 @dataclass
 class TokenUsage:
     input_tokens: int = 0
@@ -88,6 +96,20 @@ class TokenUsage:
             output_tokens=self.output_tokens + other.output_tokens,
             reasoning_output_tokens=self.reasoning_output_tokens + other.reasoning_output_tokens,
             measured=self.measured or other.measured,
+        )
+
+    def delta_from(self, previous: TokenUsage) -> TokenUsage:
+        """Return a non-negative delta between cumulative usage counters."""
+
+        return TokenUsage(
+            input_tokens=max(0, self.input_tokens - previous.input_tokens),
+            cached_input_tokens=max(0, self.cached_input_tokens - previous.cached_input_tokens),
+            output_tokens=max(0, self.output_tokens - previous.output_tokens),
+            reasoning_output_tokens=max(
+                0,
+                self.reasoning_output_tokens - previous.reasoning_output_tokens,
+            ),
+            measured=self.measured or previous.measured,
         )
 
     @classmethod
@@ -149,6 +171,7 @@ class RunRecord:
     validation: dict[str, Any] | None = None
     isolation: dict[str, Any] | None = None
     usage: TokenUsage = field(default_factory=TokenUsage)
+    cumulative_usage: TokenUsage | None = None
     log_path: str | None = None
     role: str = ""
     auxiliary: bool = False
@@ -426,6 +449,8 @@ class StateStore:
         self.fixup_requests: dict[str, dict[str, Any]] = {}
         self.proof_review_requests: dict[str, dict[str, Any]] = {}
         self.upstream_requests: dict[str, dict[str, Any]] = {}
+        self.proof_blockers: dict[str, dict[str, Any]] = {}
+        self.thread_cumulative_usage: dict[str, TokenUsage] = {}
         self.isolation: dict[str, Any] = {}
         self.coordinator_build = CoordinatorBuildRecord()
         shepherd = config.shepherd
@@ -506,6 +531,20 @@ class StateStore:
                     request_id: dict(value)
                     for request_id, value in raw_upstream_requests.items()
                     if isinstance(request_id, str) and isinstance(value, dict)
+                }
+            raw_proof_blockers = raw.get("proof_blockers")
+            if isinstance(raw_proof_blockers, dict):
+                self.proof_blockers = {
+                    blocker_id: dict(value)
+                    for blocker_id, value in raw_proof_blockers.items()
+                    if isinstance(blocker_id, str) and isinstance(value, dict)
+                }
+            raw_thread_usage = raw.get("thread_cumulative_usage")
+            if isinstance(raw_thread_usage, dict):
+                self.thread_cumulative_usage = {
+                    thread_id: TokenUsage(**value)
+                    for thread_id, value in raw_thread_usage.items()
+                    if isinstance(thread_id, str) and isinstance(value, dict)
                 }
             if not self.isolation and isinstance(raw.get("isolation"), dict):
                 self.isolation = raw["isolation"]
@@ -683,13 +722,21 @@ class StateStore:
                 continue
             usage_value = value.get("usage")
             usage = TokenUsage(**usage_value) if isinstance(usage_value, dict) else TokenUsage()
+            cumulative_value = value.get("cumulative_usage")
+            cumulative_usage = (
+                TokenUsage(**cumulative_value) if isinstance(cumulative_value, dict) else None
+            )
             fields = {
                 name: item
                 for name, item in value.items()
                 if name in RunRecord.__dataclass_fields__
-                and name not in {"usage", "report", "validation", "isolation"}
+                and name not in {"usage", "cumulative_usage", "report", "validation", "isolation"}
             }
-            run = RunRecord(**fields, usage=usage)
+            run = RunRecord(
+                **fields,
+                usage=usage,
+                cumulative_usage=cumulative_usage,
+            )
             chapter = self.config.work_unit(run.chapter_id)
             if not run.source:
                 run.source = chapter.source.as_posix()
@@ -702,6 +749,7 @@ class StateStore:
             task.runs.sort(key=lambda run: (run.started_at, run.id))
         for runs in self._chapter_runs.values():
             runs.sort(key=lambda run: (run.started_at, run.id))
+        migrated_usage_runs = self._normalize_cumulative_thread_usage()
         self._prior_run_ids = set(self._runs_by_id)
         recovered_runs: list[RunRecord] = []
         for task in self.tasks.values():
@@ -752,8 +800,33 @@ class StateStore:
         self._static_dirty = persisted_fingerprint != self._config_fingerprint
         self._dirty_task_keys.update(self.tasks)
         self._issues_dirty = True
-        self._dirty_run_ids.update(run.id for run in recovered_runs)
+        self._dirty_run_ids.update(run.id for run in (*recovered_runs, *migrated_usage_runs))
         await self.flush()
+
+    def _normalize_cumulative_thread_usage(self) -> list[RunRecord]:
+        """Migrate legacy per-run cumulative counters to thread-local deltas once."""
+
+        previous: dict[str, TokenUsage] = {}
+        migrated: list[RunRecord] = []
+        ordered = sorted(self._runs_by_id.values(), key=lambda run: (run.started_at, run.id))
+        for run in ordered:
+            if not run.thread_id:
+                continue
+            if run.cumulative_usage is None:
+                cumulative = run.usage
+                run.cumulative_usage = cumulative
+                run.usage = cumulative.delta_from(previous.get(run.thread_id, TokenUsage()))
+                migrated.append(run)
+            else:
+                cumulative = run.cumulative_usage
+            prior = previous.get(run.thread_id)
+            if prior is None or cumulative.total_tokens >= prior.total_tokens:
+                previous[run.thread_id] = cumulative
+        for thread_id, usage in previous.items():
+            persisted = self.thread_cumulative_usage.get(thread_id)
+            if persisted is None or usage.total_tokens >= persisted.total_tokens:
+                self.thread_cumulative_usage[thread_id] = usage
+        return migrated
 
     def _new_task(self, chapter: WorkUnitLike, stage: Stage) -> TaskRecord:
         return TaskRecord(
@@ -796,6 +869,9 @@ class StateStore:
             "changed": run.changed,
             "placeholders": run.placeholders,
             "usage": self._usage_dict(run.usage),
+            "cumulative_usage": (
+                self._usage_dict(run.cumulative_usage) if run.cumulative_usage is not None else None
+            ),
             "log_path": run.log_path,
             "role": run.role,
             "auxiliary": run.auxiliary,
@@ -864,7 +940,7 @@ class StateStore:
         cost = self.total_cost()
         invocation_cost = self.invocation_cost()
         return {
-            "version": 16,
+            "version": 17,
             "history_database": DATABASE_NAME,
             "project_root": str(
                 self.config.project.root
@@ -886,6 +962,11 @@ class StateStore:
             "fixup_requests": self.fixup_requests,
             "proof_review_requests": self.proof_review_requests,
             "upstream_requests": self.upstream_requests,
+            "proof_blockers": self.proof_blockers,
+            "thread_cumulative_usage": {
+                thread_id: self._usage_dict(usage)
+                for thread_id, usage in sorted(self.thread_cumulative_usage.items())
+            },
             "upstream_request_batches": self.upstream_request_batches(),
             "isolation": self.isolation,
             "coordinator_build": self._build_dict(self.coordinator_build),
@@ -1374,6 +1455,142 @@ class StateStore:
             if isinstance(owner, str) and owner:
                 batches.setdefault(owner, []).append(request_id)
         return batches
+
+    @staticmethod
+    def _proof_blocker_fingerprint(attempt: dict[str, Any]) -> str:
+        """Fingerprint the stable obstruction, excluding verbose checked attempts."""
+
+        fields = (
+            str(attempt.get("path", "")).strip(),
+            str(attempt.get("declaration", "")).strip(),
+            str(attempt.get("remaining_goal", "")).strip(),
+            str(attempt.get("obstruction", "")).strip(),
+        )
+        return hashlib.sha256("\0".join(fields).encode()).hexdigest()[:20]
+
+    def proof_blockers_for_consumer(
+        self,
+        chapter_id: str,
+        *,
+        active_only: bool = True,
+    ) -> tuple[dict[str, Any], ...]:
+        return tuple(
+            blocker
+            for _, blocker in sorted(self.proof_blockers.items())
+            if blocker.get("consumer_chapter_id") == chapter_id
+            and (not active_only or blocker.get("status") == ProofBlockerStatus.OPEN.value)
+        )
+
+    async def record_proof_blockers(
+        self,
+        chapter_id: str,
+        *,
+        origin_run_id: str,
+        failed_attempts: Iterable[dict[str, Any]],
+        unchanged_ids: Iterable[str] = (),
+        upstream_candidates: Iterable[dict[str, Any]] = (),
+    ) -> tuple[dict[str, Any], ...]:
+        """Merge proof-failure deltas into a restart-safe declaration ledger."""
+
+        changed: dict[str, dict[str, Any]] = {}
+        by_fingerprint = {
+            str(value.get("fingerprint", "")): value
+            for value in self.proof_blockers.values()
+            if value.get("consumer_chapter_id") == chapter_id
+        }
+        candidates = tuple(value for value in upstream_candidates if isinstance(value, dict))
+        for raw in failed_attempts:
+            if not isinstance(raw, dict):
+                continue
+            fingerprint = self._proof_blocker_fingerprint(raw)
+            blocker: dict[str, Any] | None = by_fingerprint.get(fingerprint)
+            if blocker is None:
+                prior_numbers = (int(key[1:]) for key in self.proof_blockers if key[1:].isdigit())
+                blocker_id = f"B{1 + max(prior_numbers, default=0)}"
+                now = timestamp()
+                blocker = {
+                    "id": blocker_id,
+                    "fingerprint": fingerprint,
+                    "consumer_chapter_id": chapter_id,
+                    "path": str(raw.get("path", "")).strip(),
+                    "declaration": str(raw.get("declaration", "")).strip(),
+                    "remaining_goal": str(raw.get("remaining_goal", "")).strip(),
+                    "obstruction": str(raw.get("obstruction", "")).strip(),
+                    "disposition": str(raw.get("disposition", "retry")).strip(),
+                    "attempts": [],
+                    "origin_run_ids": [],
+                    "sightings": 0,
+                    "status": ProofBlockerStatus.OPEN.value,
+                    "created_at": now,
+                    "updated_at": now,
+                }
+                self.proof_blockers[blocker_id] = blocker
+                by_fingerprint[fingerprint] = blocker
+            attempts = blocker.setdefault("attempts", [])
+            raw_attempts = raw.get("attempts")
+            if isinstance(attempts, list) and isinstance(raw_attempts, list):
+                for attempt in raw_attempts:
+                    text = str(attempt).strip()
+                    if text and text not in attempts:
+                        attempts.append(text)
+            origins = blocker.setdefault("origin_run_ids", [])
+            if isinstance(origins, list) and origin_run_id not in origins:
+                origins.append(origin_run_id)
+                sightings = blocker.get("sightings", 0)
+                blocker["sightings"] = (sightings if isinstance(sightings, int) else 0) + 1
+            disposition = str(raw.get("disposition", "")).strip()
+            if disposition:
+                blocker["disposition"] = disposition
+            for candidate in candidates:
+                if (
+                    str(candidate.get("blocked_declaration", "")).strip()
+                    == blocker.get("declaration")
+                    and str(candidate.get("consumer_path", "")).strip() == blocker.get("path")
+                    and str(candidate.get("residual_goal", "")).strip()
+                    == blocker.get("remaining_goal")
+                ):
+                    blocker["upstream_candidate"] = dict(candidate)
+                    blocker["disposition"] = "missing_upstream"
+                    break
+            blocker["updated_at"] = timestamp()
+            changed[str(blocker["id"])] = blocker
+
+        for blocker_id in dict.fromkeys(unchanged_ids):
+            blocker = self.proof_blockers.get(str(blocker_id))
+            if not isinstance(blocker, dict) or blocker.get("consumer_chapter_id") != chapter_id:
+                continue
+            origins = blocker.setdefault("origin_run_ids", [])
+            if isinstance(origins, list) and origin_run_id not in origins:
+                origins.append(origin_run_id)
+                sightings = blocker.get("sightings", 0)
+                blocker["sightings"] = (sightings if isinstance(sightings, int) else 0) + 1
+            blocker["updated_at"] = timestamp()
+            changed[str(blocker["id"])] = blocker
+        if changed:
+            self._mark_dirty()
+            await self._persist()
+        return tuple(changed.values())
+
+    async def set_proof_blocker_status(
+        self,
+        blocker_ids: Iterable[str],
+        status: ProofBlockerStatus,
+        *,
+        request_id: str = "",
+    ) -> None:
+        changed = False
+        for blocker_id in blocker_ids:
+            blocker = self.proof_blockers.get(blocker_id)
+            if not isinstance(blocker, dict):
+                continue
+            blocker["status"] = status.value
+            blocker["updated_at"] = timestamp()
+            if request_id:
+                blocker["request_id"] = request_id
+            changed = True
+        if changed:
+            self._mark_dirty()
+            await self._persist()
 
     def upstream_requests_for_consumer(
         self,
@@ -2666,6 +2883,25 @@ class StateStore:
             run=run,
             global_state=bool({"usage", "model", "status"} & changes.keys()),
         )
+        if deferred:
+            self._schedule_telemetry_flush()
+        else:
+            await self._persist()
+
+    async def record_thread_cumulative_usage(
+        self,
+        thread_id: str,
+        usage: TokenUsage,
+        *,
+        deferred: bool = True,
+    ) -> None:
+        """Persist the latest monotone cumulative counter emitted by one Codex thread."""
+
+        previous = self.thread_cumulative_usage.get(thread_id)
+        if previous is not None and usage.total_tokens < previous.total_tokens:
+            return
+        self.thread_cumulative_usage[thread_id] = usage
+        self._mark_dirty(global_state=True)
         if deferred:
             self._schedule_telemetry_flush()
         else:

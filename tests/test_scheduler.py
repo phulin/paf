@@ -381,6 +381,73 @@ async def test_invocation_usage_excludes_persisted_attempts(tmp_path: Path) -> N
 
 
 @pytest.mark.asyncio
+async def test_reload_migrates_cumulative_thread_usage_to_per_run_deltas(
+    tmp_path: Path,
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    state = StateStore(config)
+    await state.load_or_create()
+    first = await state.start_run(config.chapters[0].id, Stage.FORMALIZE)
+    await state.finish_run(
+        first,
+        status=TaskStatus.SUCCEEDED,
+        thread_id="shared-thread",
+        usage=TokenUsage(input_tokens=100, output_tokens=20, measured=True),
+    )
+    second = await state.start_run(config.chapters[0].id, Stage.REVIEW)
+    await state.finish_run(
+        second,
+        status=TaskStatus.SUCCEEDED,
+        thread_id="shared-thread",
+        usage=TokenUsage(input_tokens=150, output_tokens=30, measured=True),
+    )
+    await state.close()
+
+    reloaded = StateStore(config)
+    await reloaded.load_or_create()
+    runs = (
+        reloaded.task(config.chapters[0].id, Stage.FORMALIZE).runs
+        + reloaded.task(config.chapters[0].id, Stage.REVIEW).runs
+    )
+
+    assert [run.usage.total_tokens for run in runs] == [120, 60]
+    assert [run.cumulative_usage.total_tokens for run in runs if run.cumulative_usage] == [
+        120,
+        180,
+    ]
+    assert reloaded.total_usage().total_tokens == 180
+    assert reloaded.thread_cumulative_usage["shared-thread"].total_tokens == 180
+    await reloaded.close()
+
+
+@pytest.mark.asyncio
+async def test_proof_blockers_merge_delta_reports_and_persist_ids(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    state = StateStore(config)
+    await state.load_or_create()
+    chapter_id = config.chapters[0].id
+    attempt = failed_attempt("no reusable bridge is available") | {"disposition": "genuine_blocker"}
+
+    first = await state.record_proof_blockers(
+        chapter_id,
+        origin_run_id="run-1",
+        failed_attempts=[attempt],
+    )
+    second = await state.record_proof_blockers(
+        chapter_id,
+        origin_run_id="run-2",
+        failed_attempts=[],
+        unchanged_ids=[first[0]["id"]],
+    )
+
+    assert first[0]["id"].startswith("B")
+    assert second[0]["id"] == first[0]["id"]
+    assert second[0]["sightings"] == 2
+    assert len(second[0]["attempts"]) == 2
+    await state.close()
+
+
+@pytest.mark.asyncio
 async def test_usage_and_cost_aggregates_cache_all_chapters_in_one_pass(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
     state = StateStore(config)
@@ -482,7 +549,7 @@ async def test_state_persists_fixup_graph(tmp_path: Path) -> None:
     await reloaded.load_or_create()
 
     assert reloaded.fixup_graph == state.fixup_graph
-    assert reloaded.snapshot()["version"] == 16
+    assert reloaded.snapshot()["version"] == 17
 
 
 @pytest.mark.asyncio
@@ -672,7 +739,7 @@ async def test_malformed_review_report_resumes_same_session(tmp_path: Path) -> N
 
 
 @pytest.mark.asyncio
-async def test_incomplete_review_report_retries_only_to_five_round_cap(tmp_path: Path) -> None:
+async def test_incomplete_review_report_respects_three_round_cap(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
     chapter = config.chapters[0]
     state = StateStore(config)
@@ -685,10 +752,10 @@ async def test_incomplete_review_report_retries_only_to_five_round_cap(tmp_path:
 
     assert not await orchestrator._review_chapter_to_clean(chapter, {chapter.id: 0})
     review = state.task(chapter.id, Stage.REVIEW)
-    assert review.rounds == 5
+    assert review.rounds == 3
     assert review.status == TaskStatus.FAILED
-    assert "retry cap reached after 5 cycles" in review.detail
-    assert executor.resume_thread_ids == [None, *("review-session" for _ in range(4))]
+    assert "retry cap reached after 3 cycles" in review.detail
+    assert executor.resume_thread_ids == [None, "review-session", "review-session"]
     await orchestrator.shutdown()
 
 
@@ -1186,7 +1253,7 @@ async def test_hot_checkpoint_does_not_grow_with_run_payload_history(tmp_path: P
     hot = read_checkpoint(config.settings.state_dir)
     assert hot is not None
     task = hot["tasks"][f"{config.chapters[0].id}:formalize"]
-    assert hot["version"] == 16
+    assert hot["version"] == 17
     assert "source_issues" not in hot
     assert "runs" not in task
     assert task["run_count"] == 25
@@ -1644,7 +1711,7 @@ async def test_post_review_fixup_request_is_migrated_back_to_review(tmp_path: Pa
 
 
 @pytest.mark.asyncio
-async def test_unqueued_proof_finding_is_recovered_as_durable_review(
+async def test_single_unqueued_proof_finding_is_recovered_as_open_blocker(
     tmp_path: Path,
 ) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
@@ -1666,10 +1733,14 @@ async def test_unqueued_proof_finding_is_recovered_as_durable_review(
     await orchestrator._recover_proof_review_requests()
 
     feedback, request_ids = orchestrator._proof_review_feedback(chapter.id)
-    assert "missing scalar tower" in feedback
-    assert len(request_ids) == 1
+    assert feedback == ""
+    assert request_ids == ()
     assert recovered.fixup_requests == {}
-    assert len(recovered.proof_review_requests) == 1
+    assert recovered.proof_review_requests == {}
+    blockers = recovered.proof_blockers_for_consumer(chapter.id)
+    assert len(blockers) == 1
+    assert "missing scalar tower" in blockers[0]["obstruction"]
+    assert blockers[0]["sightings"] == 1
     assert recovered.task(chapter.id, Stage.REVIEW).status == TaskStatus.PENDING
     await orchestrator.shutdown()
 
@@ -2807,7 +2878,7 @@ async def test_dirty_proof_scope_defers_only_that_chapter(
 
 
 @pytest.mark.asyncio
-async def test_review_is_capped_at_five_edit_rebuild_cycles(
+async def test_review_is_capped_at_three_edit_rebuild_cycles(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
@@ -2835,8 +2906,8 @@ async def test_review_is_capped_at_five_edit_rebuild_cycles(
     monkeypatch.setattr(orchestrator, "_review_build", review_build)
 
     assert await orchestrator._review_until_clean()
-    assert reviews == 5
-    assert rebuilds == 6
+    assert reviews == 3
+    assert rebuilds == 4
     await orchestrator.shutdown()
 
 
@@ -3150,10 +3221,15 @@ async def test_standalone_failed_proof_attempt_queues_durable_review(
         [
             result(
                 changed=False,
-                failed_attempts=[failed_attempt("the statement needs another hypothesis")],
-            )
+                failed_attempts=[
+                    failed_attempt("the statement needs another hypothesis")
+                    | {"disposition": "statement_review"}
+                ],
+            ),
+            result(changed=False, failed_attempts=[]),
         ],
     )
+    orchestrator.executor.results[1].report["blocker_refs"] = ["B1"]
 
     assert not await orchestrator._prove(chapter)
     review = orchestrator.state.task(chapter.id, Stage.REVIEW)
@@ -4235,7 +4311,7 @@ async def test_prove_counts_edits_without_fewer_placeholders_as_no_progress(
 
 
 @pytest.mark.asyncio
-async def test_prove_retries_receive_a_cumulative_attempt_ledger(
+async def test_prove_retries_receive_only_latest_attempt_delta(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
@@ -4263,12 +4339,10 @@ async def test_prove_retries_receive_a_cumulative_attempt_ledger(
     assert feedbacks[0] == ""
     assert "Proof attempt 1:" in feedbacks[1]
     assert "tried route one" in feedbacks[1]
-    assert "Proof attempt 1:" in feedbacks[2]
+    assert "Proof attempt 1:" not in feedbacks[2]
     assert "Proof attempt 2:" in feedbacks[2]
-    assert "tried route one" in feedbacks[2]
+    assert "tried route one" not in feedbacks[2]
     assert "tried route two" in feedbacks[2]
-    assert "Proof attempt 3:" in feedbacks[3]
-    assert "tried route three" in feedbacks[3]
     await orchestrator.shutdown()
 
 

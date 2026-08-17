@@ -10,12 +10,43 @@ import pytest
 from leanclient.aio import LeanClientError
 
 from paf.lean_mcp import (
+    _bounded_tool_value,
     _force_prepare_dependencies,
     barrier_with_dependency_refresh,
+    compact_target_diagnostics,
     prepare_dependencies,
     record_stale_dependency,
     reload_with_dependencies_when_stale,
 )
+
+
+def test_compact_diagnostics_returns_errors_and_warning_count() -> None:
+    diagnostics = [
+        {
+            "severity": 1,
+            "message": "unknown identifier",
+            "range": {"start": {"line": 4, "character": 2}, "end": {}},
+        },
+        {
+            "severity": 2,
+            "message": "declaration uses sorry",
+            "range": {"start": {"line": 8, "character": 0}, "end": {}},
+        },
+    ]
+
+    result = compact_target_diagnostics(diagnostics, build_success=False)
+
+    assert [(item.severity, item.message) for item in result.items] == [
+        ("error", "unknown identifier"),
+        ("info", "1 target-file warning(s) suppressed"),
+    ]
+
+
+def test_bounded_tool_value_caps_nested_text() -> None:
+    result = _bounded_tool_value({"content": "x" * 20_000}, [12 * 1024])
+
+    assert len(result["content"]) <= 12 * 1024
+    assert result["content"].endswith("… [truncated]")
 
 
 @dataclass

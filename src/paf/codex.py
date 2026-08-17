@@ -72,9 +72,32 @@ _FAILED_ATTEMPTS_PROPERTY: dict[str, Any] = {
             },
             "remaining_goal": {"type": "string", "minLength": 1},
             "obstruction": {"type": "string", "minLength": 1},
+            "disposition": {
+                "type": "string",
+                "enum": [
+                    "retry",
+                    "missing_upstream",
+                    "statement_review",
+                    "interface_review",
+                    "genuine_blocker",
+                ],
+            },
         },
-        "required": ["path", "declaration", "attempts", "remaining_goal", "obstruction"],
+        "required": [
+            "path",
+            "declaration",
+            "attempts",
+            "remaining_goal",
+            "obstruction",
+            "disposition",
+        ],
     },
+}
+
+_BLOCKER_REFS_PROPERTY: dict[str, Any] = {
+    "type": "array",
+    "items": {"type": "string", "pattern": "^B[0-9]+$"},
+    "description": "Durable blocker IDs whose fingerprint and evidence are unchanged.",
 }
 
 _UPSTREAM_REQUESTS_PROPERTY: dict[str, Any] = {
@@ -264,6 +287,7 @@ REPORT_SCHEMAS: dict[str, dict[str, Any]] = {
         | {
             "source_issues": _SOURCE_ISSUES_PROPERTY,
             "failed_attempts": _FAILED_ATTEMPTS_PROPERTY,
+            "blocker_refs": _BLOCKER_REFS_PROPERTY,
             "upstream_requests": _UPSTREAM_REQUESTS_PROPERTY,
         },
     ),
@@ -273,6 +297,7 @@ REPORT_SCHEMAS: dict[str, dict[str, Any]] = {
         | {
             "source_issues": _SOURCE_ISSUES_PROPERTY,
             "failed_attempts": _FAILED_ATTEMPTS_PROPERTY,
+            "blocker_refs": _BLOCKER_REFS_PROPERTY,
             "upstream_requests": _UPSTREAM_REQUESTS_PROPERTY,
         },
     ),
@@ -1133,7 +1158,9 @@ one of the listed scope paths. Any out-of-scope write causes PAF to reject the e
 
 Do not commit and do not wait for another worker.
 Do not run `lake build`, `lake env lean`, raw `lean`, or another compiler command. Builds belong to
-PAF and use its single writable build cache. {stage_contract}
+PAF and use its single writable build cache. Never search or read `.paf/logs`, `.paf/isolation`, or
+isolation/worktree trees. Bound each command's output to roughly 12 KiB with narrow paths, match
+limits, or small source windows. {stage_contract}
 {input_catalog}
 {validation_contract}
 """
@@ -1213,7 +1240,8 @@ whole-file diagnostics from prerequisites to dependents. Do not prepare every fi
                 "allowed_stages": [stage.value for stage in Stage],
             },
         }
-        return f"{template.rstrip()}\n\n## Failure dossier\n\n```json\n{json.dumps(dossier, indent=2)}\n```\n"
+        payload = json.dumps(dossier, indent=2)
+        return f"{template.rstrip()}\n\n## Failure dossier\n\n```json\n{payload}\n```\n"
 
     def command(
         self,
@@ -1403,6 +1431,8 @@ whole-file diagnostics from prerequisites to dependents. Do not prepare every fi
         before = await asyncio.to_thread(scope_digest, root, chapter)
         log_path = self.state.logs_dir / f"{run.id}.jsonl"
         usage = TokenUsage()
+        cumulative_usage = TokenUsage()
+        usage_baseline: TokenUsage | None = None
         report: dict[str, Any] = {}
         resumable_run = self._resumable_run(run, stage)
         thread_id = resume_thread_id
@@ -1429,13 +1459,25 @@ whole-file diagnostics from prerequisites to dependents. Do not prepare every fi
         )
 
         async def update_usage(found: TokenUsage) -> None:
-            nonlocal usage
-            if found.total_tokens < usage.total_tokens:
+            nonlocal usage, cumulative_usage, usage_baseline
+            if found.total_tokens < cumulative_usage.total_tokens:
                 return
-            usage = found
+            cumulative_usage = found
+            if thread_id is not None:
+                if usage_baseline is None:
+                    usage_baseline = self.state.thread_cumulative_usage.get(thread_id, TokenUsage())
+                usage = found.delta_from(usage_baseline)
+                await self.state.record_thread_cumulative_usage(thread_id, found, deferred=True)
+            else:
+                usage = found
             # Live UI reads the in-memory record. Let another state transition or
             # the final run flush batch these high-frequency rollout updates.
-            await self.state.update_run(run, usage=usage, deferred=True)
+            await self.state.update_run(
+                run,
+                usage=usage,
+                cumulative_usage=found,
+                deferred=True,
+            )
 
         async def stop_usage_monitor() -> None:
             usage_stop.set()
@@ -1445,7 +1487,7 @@ whole-file diagnostics from prerequisites to dependents. Do not prepare every fi
         async def invoke(
             command: list[str], input_text: str, *, append_log: bool
         ) -> tuple[int, bool, bool, int]:
-            nonlocal usage, report, thread_id, usage_monitor
+            nonlocal usage, report, thread_id, usage_monitor, usage_baseline
             nonlocal invocation_error, fatal_invocation_failure
             process = await asyncio.create_subprocess_exec(
                 *command,
@@ -1481,6 +1523,7 @@ whole-file diagnostics from prerequisites to dependents. Do not prepare every fi
 
                     async def consume_line(line: bytes, *, terminated: bool = True) -> None:
                         nonlocal usage, report, thread_id, usage_monitor, capacity_failure
+                        nonlocal usage_baseline
                         nonlocal invocation_error, fatal_invocation_failure
                         recording = asyncio.create_task(
                             asyncio.to_thread(
@@ -1509,6 +1552,9 @@ whole-file diagnostics from prerequisites to dependents. Do not prepare every fi
                             invocation_error = found_error
                         if found := _find_thread_id(event):
                             thread_id = found
+                            usage_baseline = self.state.thread_cumulative_usage.get(
+                                found, TokenUsage()
+                            )
                             await self.state.update_run(run, thread_id=found)
                             if usage_monitor is None:
                                 usage_monitor = asyncio.create_task(

@@ -42,6 +42,7 @@ from paf.isolation import IsolationResult, create_isolation
 from paf.models import PipelineConfig, Stage, WorkUnit, WorkUnitLike
 from paf.scope import ScopeMatcher
 from paf.state import (
+    ProofBlockerStatus,
     RepairCaseRecord,
     RepairCaseStatus,
     RepairWorkUnitRecord,
@@ -193,7 +194,7 @@ LAKE_CONTROL_PREFIXES = (
     "Some required targets logged failures:",
     "Coordinator rejected ",
 )
-PROOF_FEEDBACK_MAX_CHARS = 24_000
+PROOF_FEEDBACK_MAX_CHARS = 12_000
 PROOF_FEEDBACK_ROUNDS = 3
 DISCOVERY_BATCH_SECONDS = 0.025
 DISCOVERY_BATCH_MAXIMUM = 256
@@ -1378,7 +1379,7 @@ class Orchestrator:
                 await self.state.set_task(
                     chapter.id,
                     Stage.DISCOVER,
-                    TaskStatus.FAILED,
+                    TaskStatus.BLOCKED,
                     str(error),
                 )
                 return FormalizeOutcome(False)
@@ -2031,6 +2032,95 @@ class Orchestrator:
             )
         return "\n\n".join(blocks)
 
+    def _durable_blocker_feedback(self, chapter_id: str) -> str:
+        """Render compact blocker identities, not their accumulated attempt transcripts."""
+
+        blocks = []
+        for blocker in self.state.proof_blockers_for_consumer(chapter_id):
+            blocks.append(
+                f"{blocker['id']} — `{blocker.get('declaration', '')}` in "
+                f"`{blocker.get('path', '')}` (seen {blocker.get('sightings', 1)} time(s))\n"
+                f"Residual goal: {str(blocker.get('remaining_goal', ''))[:2000]}\n"
+                f"Obstruction: {str(blocker.get('obstruction', ''))[:1200]}"
+            )
+        if not blocks:
+            return ""
+        return _bounded_proof_feedback(
+            (
+                "Durable blocker ledger. Do not repeat its evidence. Put unchanged IDs in "
+                "`blocker_refs`; use `failed_attempts` only for new or materially changed "
+                "blockers:\n\n" + "\n\n".join(blocks),
+            )
+        )
+
+    async def _record_proof_blocker_deltas(
+        self,
+        chapter: WorkUnitLike,
+        run: RunRecord,
+        report: dict[str, Any],
+    ) -> tuple[dict[str, Any], ...]:
+        attempts = report.get("failed_attempts")
+        refs = report.get("blocker_refs")
+        upstream = report.get("upstream_requests")
+        return await self.state.record_proof_blockers(
+            chapter.id,
+            origin_run_id=run.id,
+            failed_attempts=(attempts if isinstance(attempts, list) else ()),
+            unchanged_ids=(refs if isinstance(refs, list) else ()),
+            upstream_candidates=(upstream if isinstance(upstream, list) else ()),
+        )
+
+    async def _resolve_satisfied_proof_blockers(self, chapter: WorkUnitLike) -> None:
+        resolved = []
+        for blocker in self.state.proof_blockers_for_consumer(chapter.id, active_only=False):
+            if (
+                declaration_uses_placeholder(
+                    self.config.settings.repo,
+                    str(blocker.get("path", "")),
+                    str(blocker.get("declaration", "")),
+                )
+                is False
+            ):
+                resolved.append(str(blocker["id"]))
+        await self.state.set_proof_blocker_status(resolved, ProofBlockerStatus.RESOLVED)
+
+    @staticmethod
+    def _blocker_needs_review(blocker: dict[str, Any]) -> bool:
+        disposition = str(blocker.get("disposition", ""))
+        if disposition in {"statement_review", "interface_review"}:
+            return True
+        evidence = (
+            str(blocker.get("obstruction", "")) + " " + str(blocker.get("remaining_goal", ""))
+        ).lower()
+        return any(
+            marker in evidence
+            for marker in (
+                "statement is false",
+                "missing hypothesis",
+                "missing assumption",
+                "statement/interface",
+                "interface mismatch",
+            )
+        )
+
+    @staticmethod
+    def _blocker_report(blocker: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "failed_attempts": [
+                {
+                    "path": blocker.get("path", ""),
+                    "declaration": blocker.get("declaration", ""),
+                    "attempts": list(blocker.get("attempts", ()))
+                    or [
+                        "Durable proof attempts are recorded in the blocker ledger.",
+                        "The residual obstruction was unchanged on a later proof cycle.",
+                    ],
+                    "remaining_goal": blocker.get("remaining_goal", ""),
+                    "obstruction": blocker.get("obstruction", ""),
+                }
+            ]
+        }
+
     def _proof_review_feedback(
         self,
         chapter_id: str,
@@ -2218,35 +2308,40 @@ class Orchestrator:
                 persisted_origins.add(run.id)
 
     async def _recover_proof_review_requests(self) -> None:
-        """Recover the proof-to-review handoff if a process died between its durable steps."""
+        """Recover durable blockers and only escalate repeated review evidence."""
 
         persisted_origins = {
-            value.get("origin_run_id")
-            for value in self.state.proof_review_requests.values()
+            origin
+            for value in self.state.proof_blockers.values()
             if isinstance(value, dict)
+            for origin in value.get("origin_run_ids", ())
+            if isinstance(origin, str)
         }
         for chapter in self.work_units:
-            proof_runs = [
-                run for run in self.state.task(chapter.id, Stage.PROVE).runs if not run.auxiliary
-            ]
-            if not proof_runs:
-                continue
-            run = proof_runs[-1]
-            self.state.load_run_details(run)
-            report = run.report if isinstance(run.report, dict) else {}
-            if not report.get("failed_attempts") or run.id in persisted_origins:
-                continue
-            review_runs = self.state.task(chapter.id, Stage.REVIEW).runs
-            reviewed_after = any(
-                review_run.status == TaskStatus.SUCCEEDED
-                and review_run.finished_at is not None
-                and review_run.finished_at >= (run.finished_at or run.started_at)
-                for review_run in review_runs
-            )
-            if reviewed_after:
-                continue
-            await self._queue_proof_review(chapter, report, origin_run_id=run.id)
-            persisted_origins.add(run.id)
+            for run in self.state.task(chapter.id, Stage.PROVE).runs:
+                if run.auxiliary or run.id in persisted_origins:
+                    continue
+                self.state.load_run_details(run)
+                report = run.report if isinstance(run.report, dict) else {}
+                if not report.get("failed_attempts") and not report.get("blocker_refs"):
+                    continue
+                blockers = await self._record_proof_blocker_deltas(chapter, run, report)
+                for blocker in blockers:
+                    if (
+                        int(blocker.get("sightings", 0)) >= 2
+                        and blocker.get("status") == ProofBlockerStatus.OPEN.value
+                        and self._blocker_needs_review(blocker)
+                    ):
+                        await self._queue_proof_review(
+                            chapter,
+                            self._blocker_report(blocker),
+                            origin_run_id=run.id,
+                        )
+                        await self.state.set_proof_blocker_status(
+                            (str(blocker["id"]),),
+                            ProofBlockerStatus.REVIEW_REQUESTED,
+                        )
+                persisted_origins.add(run.id)
 
         by_id = {chapter.id: chapter for chapter in self.work_units}
         pending_owners = {
@@ -3386,7 +3481,7 @@ class Orchestrator:
                 await self.state.set_tasks(
                     quarantined_ids,
                     Stage.PROVE,
-                    TaskStatus.BLOCKED,
+                    TaskStatus.FAILED,
                     "formalization failed; quarantined from proof",
                 )
             for chapter_id in initial_graph.order:
@@ -3859,10 +3954,26 @@ class Orchestrator:
                     )
                     return True
         proof_maximum = self.config.stages[Stage.PROVE].max_rounds
+        pending_review = any(
+            isinstance(value, dict)
+            and isinstance(value.get("feedback"), dict)
+            and chapter.id in value["feedback"]
+            for value in self.state.proof_review_requests.values()
+        )
+        if not pending_review:
+            reviewed_blockers = (
+                str(blocker["id"])
+                for blocker in self.state.proof_blockers_for_consumer(chapter.id, active_only=False)
+                if blocker.get("status") == ProofBlockerStatus.REVIEW_REQUESTED.value
+            )
+            await self.state.set_proof_blocker_status(reviewed_blockers, ProofBlockerStatus.OPEN)
         feedback = initial_feedback
         feedback_ledger: deque[str] = deque(maxlen=PROOF_FEEDBACK_ROUNDS)
         if initial_feedback:
             feedback_ledger.append(initial_feedback)
+        if durable_feedback := self._durable_blocker_feedback(chapter.id):
+            feedback_ledger.append(durable_feedback)
+            feedback = _bounded_proof_feedback(feedback_ledger)
         stalled_rounds = 0
         previous_placeholders: int | None = None
         proof_round = 0
@@ -4001,6 +4112,7 @@ class Orchestrator:
                 and attempt.validation.succeeded
                 and attempt.agent.placeholders == 0
             ):
+                await self._resolve_satisfied_proof_blockers(chapter)
                 source_digest = await asyncio.to_thread(
                     scope_digest, self.config.settings.repo, chapter
                 )
@@ -4013,27 +4125,82 @@ class Orchestrator:
                 )
                 return True
 
+            feedback_ledger.clear()
             feedback_ledger.append(f"Proof attempt {proof_round}:\n{attempt.feedback()}")
-            feedback = _bounded_proof_feedback(feedback_ledger)
-            upstream_request_ids = await self._record_upstream_requests(
-                chapter,
-                attempt.run,
-                attempt.agent.report,
-                previous_attempts=feedback,
+            blockers = await self._record_proof_blocker_deltas(
+                chapter, attempt.run, attempt.agent.report
             )
-            if bool(attempt.agent.report.get("failed_attempts")):
+            if durable_feedback := self._durable_blocker_feedback(chapter.id):
+                feedback_ledger.append(durable_feedback)
+            feedback = _bounded_proof_feedback(feedback_ledger)
+            raw_upstream = attempt.agent.report.get("upstream_requests")
+            reported_upstream = (
+                tuple(item for item in raw_upstream if isinstance(item, dict))
+                if isinstance(raw_upstream, list)
+                else ()
+            )
+            attached_upstream = tuple(
+                blocker.get("upstream_candidate")
+                for blocker in blockers
+                if isinstance(blocker.get("upstream_candidate"), dict)
+            )
+            unmatched_upstream = tuple(
+                item for item in reported_upstream if item not in attached_upstream
+            )
+            upstream_request_ids = (
+                await self._record_upstream_requests(
+                    chapter,
+                    attempt.run,
+                    {"upstream_requests": list(unmatched_upstream)},
+                    previous_attempts=feedback,
+                )
+                if unmatched_upstream
+                else ()
+            )
+            review_queued = False
+            terminal_blockers: list[str] = []
+            for blocker in blockers:
+                if int(blocker.get("sightings", 0)) < 2:
+                    continue
+                blocker_id = str(blocker.get("id", ""))
+                candidate = blocker.get("upstream_candidate")
+                if isinstance(candidate, dict):
+                    ids = await self._record_upstream_requests(
+                        chapter,
+                        attempt.run,
+                        {"upstream_requests": [candidate]},
+                        previous_attempts=feedback,
+                    )
+                    upstream_request_ids += ids
+                    await self.state.set_proof_blocker_status(
+                        (blocker_id,),
+                        ProofBlockerStatus.UPSTREAM_REQUESTED,
+                        request_id=ids[0] if ids else "",
+                    )
+                elif self._blocker_needs_review(blocker):
+                    report = self._blocker_report(blocker)
+                    await self._queue_proof_review(
+                        chapter,
+                        report,
+                        origin_run_id=attempt.run.id,
+                    )
+                    await self.state.set_proof_blocker_status(
+                        (blocker_id,), ProofBlockerStatus.REVIEW_REQUESTED
+                    )
+                    review_queued = True
+                else:
+                    await self.state.set_proof_blocker_status(
+                        (blocker_id,), ProofBlockerStatus.BLOCKED
+                    )
+                    terminal_blockers.append(blocker_id)
+            upstream_request_ids = tuple(dict.fromkeys(upstream_request_ids))
+            if review_queued:
                 await self.state.set_task(
                     chapter.id,
                     Stage.PROVE,
                     TaskStatus.PENDING,
-                    "proof left checked failures; waiting for independent review",
+                    "unchanged statement/interface blocker queued for focused review",
                 )
-                if not defer_review:
-                    await self._queue_proof_review(
-                        chapter,
-                        attempt.agent.report,
-                        origin_run_id=attempt.run.id,
-                    )
                 return False
             if upstream_request_ids:
                 answered_ids = await self._ensure_upstream_answers(upstream_request_ids)
@@ -4057,6 +4224,14 @@ class Orchestrator:
                     feedback,
                 )
                 continue
+            if terminal_blockers and not self.state.proof_blockers_for_consumer(chapter.id):
+                await self.state.set_task(
+                    chapter.id,
+                    Stage.PROVE,
+                    TaskStatus.BLOCKED,
+                    "unchanged proof blocker(s): " + ", ".join(terminal_blockers),
+                )
+                return False
             placeholders = attempt.agent.placeholders
             if previous_placeholders is not None and placeholders >= previous_placeholders:
                 stalled_rounds += 1
@@ -4075,8 +4250,14 @@ class Orchestrator:
         await self.state.set_task(
             chapter.id,
             Stage.PROVE,
-            TaskStatus.FAILED,
-            f"proof pass did not converge in {proof_maximum} rounds",
+            TaskStatus.BLOCKED
+            if any(
+                blocker.get("status")
+                in {ProofBlockerStatus.OPEN.value, ProofBlockerStatus.BLOCKED.value}
+                for blocker in self.state.proof_blockers_for_consumer(chapter.id, active_only=False)
+            )
+            else TaskStatus.FAILED,
+            f"proof pass did not converge in {proof_maximum} rounds; durable blockers retained",
         )
         return False
 

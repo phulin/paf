@@ -63,6 +63,7 @@ def test_report_schemas_contain_only_fields_used_by_each_agent() -> None:
             "issues",
             "source_issues",
             "failed_attempts",
+            "blocker_refs",
             "upstream_requests",
         },
         "downstream_retry": {
@@ -72,6 +73,7 @@ def test_report_schemas_contain_only_fields_used_by_each_agent() -> None:
             "issues",
             "source_issues",
             "failed_attempts",
+            "blocker_refs",
             "upstream_requests",
         },
         "upstream_repair": {
@@ -258,7 +260,7 @@ def test_executor_uses_machine_readable_codex_mode(tmp_path: Path) -> None:
     assert "--sandbox" not in command
     assert "--skip-git-repo-check" not in command
     assert command[command.index("--model") + 1] == "gpt-5.6-luna"
-    assert 'model_reasoning_effort="max"' in command
+    assert 'model_reasoning_effort="xhigh"' in command
     isolated = tmp_path / "isolated"
     isolated_command = executor.command(Stage.PROVE, isolated)
     assert "--skip-git-repo-check" in isolated_command
@@ -314,7 +316,7 @@ def test_executor_uses_machine_readable_codex_mode(tmp_path: Path) -> None:
     discover_command = executor.command(Stage.DISCOVER)
     assert not any("mcp_servers.paf_lean" in item for item in discover_command)
     assert discover_command[discover_command.index("--model") + 1] == "gpt-5.6-luna"
-    assert 'model_reasoning_effort="medium"' in discover_command
+    assert 'model_reasoning_effort="xhigh"' in discover_command
     discover_prompt = executor.build_prompt(config.chapters[0], Stage.DISCOVER)
     assert "None. Discovery is strictly read-only" in discover_prompt
     assert "You may edit only these paths" not in discover_prompt
@@ -371,7 +373,7 @@ def test_shepherd_is_strong_read_only_and_repair_workers_use_luna_max(tmp_path: 
     assert shepherd[shepherd.index("--model") + 1] == "gpt-5.6-sol"
     assert 'model_reasoning_effort="medium"' in shepherd
     assert repair[repair.index("--model") + 1] == "gpt-5.6-luna"
-    assert 'model_reasoning_effort="max"' in repair
+    assert 'model_reasoning_effort="xhigh"' in repair
     prompt = executor.build_prompt(
         config.work_units[0],
         Stage.REVIEW,
