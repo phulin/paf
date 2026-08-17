@@ -20,8 +20,10 @@ FastMCPSettings.model_rebuild()
 
 from lean_lsp_mcp import main as upstream_main  # noqa: E402
 from lean_lsp_mcp import server  # noqa: E402
-from lean_lsp_mcp.client_utils import open_synced  # noqa: E402
-from lean_lsp_mcp.utils import is_build_stderr  # noqa: E402
+from lean_lsp_mcp.utils import (  # noqa: E402
+    extract_failed_dependency_paths,
+    is_build_stderr,
+)
 
 Reload = Callable[[AsyncLeanLSPClient, str, bool], Awaitable[Any]]
 Barrier = Callable[[AsyncLeanLSPClient, str, float | None], Awaitable[None]]
@@ -115,6 +117,34 @@ def _require_fresh_dependencies(document: Any, path: str) -> Any:
     if _needs_dependency_refresh(document):
         raise LeanClientError(f"Lean could not prepare a usable dependency snapshot for {path}.")
     return document
+
+
+def _dependency_preparation_errors(document: Any, path: str) -> list[dict[str, Any]]:
+    """Return dependency failures without hiding Lake's original diagnostics."""
+
+    errors: list[dict[str, Any]] = []
+    for diagnostic in document.diagnostics:
+        if not isinstance(diagnostic, dict):
+            continue
+        message = str(diagnostic.get("message", ""))
+        if not (is_build_stderr(message) or _STALE_IMPORT_TEXT in message):
+            continue
+        errors.append(
+            {
+                "file_path": path,
+                "message": message,
+                "failed_dependencies": extract_failed_dependency_paths(message),
+            }
+        )
+    if document.stale_imports and not errors:
+        errors.append(
+            {
+                "file_path": path,
+                "message": f"Lean reported stale dependencies for {path}.",
+                "failed_dependencies": [],
+            }
+        )
+    return errors
 
 
 def _preserve_document_identity(client: Any, path: str, previous: Any, current: Any) -> Any:
@@ -244,6 +274,27 @@ async def _refresh_dependencies(
         return _require_fresh_dependencies(document, path)
 
 
+async def _force_prepare_dependencies(
+    client: Any,
+    path: str,
+    *,
+    timeout: float | None = None,
+    original_barrier: Barrier = _ORIGINAL_BARRIER,
+) -> tuple[Any, list[dict[str, Any]]]:
+    """Perform one real dependency build, bypassing automatic-refresh deduplication."""
+
+    async with _document_lock(client, path), _client_lock(client):
+        document = await _open_and_finish_dependency_setup(
+            client,
+            path,
+            "once",
+            timeout,
+            original_barrier=original_barrier,
+        )
+        _BUILD_GENERATIONS[client] = _build_generation(client) + 1
+    return document, _dependency_preparation_errors(document, path)
+
+
 async def reload_with_dependencies_when_stale(
     self: Any,
     path: str,
@@ -310,23 +361,40 @@ reload_with_dependencies_on_switch = reload_with_dependencies_when_stale
         openWorldHint=False,
     ),
 )
-async def prepare_dependencies(ctx: Context, file_paths: list[str]) -> dict[str, list[str]]:
-    """Warm maximal affected files and build their stale imported closure once."""
+async def prepare_dependencies(ctx: Context, file_paths: list[str]) -> dict[str, Any]:
+    """Build maximal affected files' imported closures once and report failures."""
 
-    prepared: list[str] = []
-    stale: list[str] = []
+    attempted: list[str] = []
+    ready: list[str] = []
+    failed: list[str] = []
+    errors: list[dict[str, Any]] = []
     for file_path in dict.fromkeys(file_paths):
         rel_path = await server.setup_client_for_file(ctx, file_path)
         if not rel_path:
             server._raise_invalid_path(file_path)
         client: AsyncLeanLSPClient = ctx.request_context.lifespan_context.client
-        await open_synced(ctx, rel_path)
-        await client.barrier(rel_path)
-        prepared.append(rel_path)
-        document = client._docs.get(rel_path)
-        if document is not None and _needs_dependency_refresh(document):
-            stale.append(rel_path)
-    return {"prepared": prepared, "stale": stale}
+        attempted.append(rel_path)
+        try:
+            _, preparation_errors = await _force_prepare_dependencies(client, rel_path)
+        except LeanClientError as exc:
+            preparation_errors = [
+                {
+                    "file_path": rel_path,
+                    "message": str(exc),
+                    "failed_dependencies": [],
+                }
+            ]
+        if preparation_errors:
+            failed.append(rel_path)
+            errors.extend(preparation_errors)
+        else:
+            ready.append(rel_path)
+    return {
+        "attempted": attempted,
+        "ready": ready,
+        "failed": failed,
+        "errors": errors,
+    }
 
 
 def install_dependency_reopens() -> None:

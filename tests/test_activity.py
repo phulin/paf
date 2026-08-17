@@ -474,8 +474,19 @@ def test_summarizes_each_enabled_lean_mcp_query(
     [
         (
             "lean_prepare_dependencies",
-            {"prepared": ["A.lean", "B.lean"], "stale": ["B.lean"]},
-            "R 2 prepared · 1 stale",
+            {
+                "attempted": ["A.lean", "B.lean"],
+                "ready": ["A.lean"],
+                "failed": ["B.lean"],
+                "errors": [
+                    {
+                        "file_path": "B.lean",
+                        "message": "lake setup-file B.lean failed",
+                        "failed_dependencies": ["C.lean"],
+                    }
+                ],
+            },
+            "R 2 attempted · 1 ready · 1 failed",
         ),
         (
             "lean_diagnostic_messages",

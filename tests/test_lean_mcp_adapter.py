@@ -3,13 +3,16 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 from leanclient.aio import LeanClientError
 
 from paf.lean_mcp import (
+    _force_prepare_dependencies,
     barrier_with_dependency_refresh,
+    prepare_dependencies,
     record_stale_dependency,
     reload_with_dependencies_when_stale,
 )
@@ -270,6 +273,104 @@ async def test_new_dependency_build_failure_notification_allows_retry(tmp_path: 
         ("open", "A.lean", False, "once"),
         ("open", "A.lean", False, "once"),
     ]
+
+
+@pytest.mark.asyncio
+async def test_explicit_prepare_retries_after_failed_dependency_source_is_fixed(
+    tmp_path: Path,
+) -> None:
+    write(tmp_path, "A.lean", "import B\n")
+    write(tmp_path, "B.lean", "def b : Nat := broken\n")
+    client = FakeClient(tmp_path)
+    build_failure = "lake setup-file A.lean failed\nerror: B.lean:1:15: unknown identifier 'broken'"
+
+    async def barrier(_client: Any, path: str, timeout: float | None) -> None:
+        client.events.append(("barrier", path, timeout))
+        if "broken" in (tmp_path / "B.lean").read_text(encoding="utf-8"):
+            client._docs[path].diagnostics = [{"message": build_failure}]
+        else:
+            client._docs[path].diagnostics = []
+
+    _, first_errors = await _force_prepare_dependencies(client, "A.lean", original_barrier=barrier)
+    write(tmp_path, "B.lean", "def b : Nat := 0\n")
+    _, second_errors = await _force_prepare_dependencies(client, "A.lean", original_barrier=barrier)
+
+    assert first_errors == [
+        {
+            "file_path": "A.lean",
+            "message": build_failure,
+            "failed_dependencies": ["B.lean"],
+        }
+    ]
+    assert second_errors == []
+    assert [event for event in client.events if event[0] == "open"] == [
+        ("open", "A.lean", False, "once"),
+        ("open", "A.lean", False, "once"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_explicit_prepare_threads_raw_missing_artifact_error(tmp_path: Path) -> None:
+    write(tmp_path, "A.lean", "import B\n")
+    client = FakeClient(tmp_path)
+    build_failure = (
+        "lake setup-file A.lean failed\nerror: B.lean:1:0: object file 'B.olean' does not exist"
+    )
+
+    async def barrier(_client: Any, path: str, timeout: float | None) -> None:
+        client.events.append(("barrier", path, timeout))
+        client._docs[path].diagnostics = [{"message": build_failure}]
+
+    _, errors = await _force_prepare_dependencies(client, "A.lean", original_barrier=barrier)
+
+    assert errors == [
+        {
+            "file_path": "A.lean",
+            "message": build_failure,
+            "failed_dependencies": ["B.lean"],
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_prepare_tool_threads_structured_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = object()
+    ctx: Any = SimpleNamespace(
+        request_context=SimpleNamespace(lifespan_context=SimpleNamespace(client=client))
+    )
+    build_failure = "lake setup-file B.lean failed\nerror: C.lean:2:3: unknown identifier 'c'"
+
+    async def setup_client_for_file(_ctx: Any, path: str) -> str:
+        return path
+
+    async def force_prepare(_client: Any, path: str) -> tuple[None, list[dict[str, Any]]]:
+        if path == "A.lean":
+            return None, []
+        return None, [
+            {
+                "file_path": path,
+                "message": build_failure,
+                "failed_dependencies": ["C.lean"],
+            }
+        ]
+
+    monkeypatch.setattr("paf.lean_mcp.server.setup_client_for_file", setup_client_for_file)
+    monkeypatch.setattr("paf.lean_mcp._force_prepare_dependencies", force_prepare)
+
+    result = await prepare_dependencies(ctx, ["A.lean", "B.lean", "B.lean"])
+
+    assert result == {
+        "attempted": ["A.lean", "B.lean"],
+        "ready": ["A.lean"],
+        "failed": ["B.lean"],
+        "errors": [
+            {
+                "file_path": "B.lean",
+                "message": build_failure,
+                "failed_dependencies": ["C.lean"],
+            }
+        ],
+    }
 
 
 @pytest.mark.asyncio

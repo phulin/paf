@@ -356,9 +356,13 @@ def _lean_mcp_result(item: dict[str, Any]) -> str:
     elif "error" in value:
         summary = f"error: {_mcp_text(value['error'])}"
     elif tool == "lean_prepare_dependencies":
-        prepared = value.get("prepared")
-        stale = value.get("stale")
-        summary = f"{len(prepared or [])} prepared · {len(stale or [])} stale"
+        attempted = value.get("attempted")
+        ready = value.get("ready")
+        failed = value.get("failed")
+        summary = (
+            f"{len(attempted or [])} attempted · {len(ready or [])} ready · "
+            f"{len(failed or [])} failed"
+        )
     elif tool == "lean_diagnostic_messages":
         summary = _diagnostics_result(value)
     elif tool == "lean_hover_info":
