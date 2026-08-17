@@ -54,6 +54,14 @@ from paf.state import (
 
 MAXIMUM_IN_FLIGHT_BUILD_BATCHES = 2
 REPAIR_EFFORT = {"small": 1.0, "medium": 3.0, "large": 8.0}
+REVIEW_REPORT_RETRY_PROMPT = """Your previous review turn did not satisfy the report contract:
+
+{error}
+
+Continue the same review assignment in the current files. Re-read the assignment's definition of
+done and structured-output instructions, finish any incomplete review work, and return exactly one
+complete structured report. Account for every supplied finding id when the assignment includes
+proof findings."""
 
 
 class ShepherdPlanError(ValueError):
@@ -111,6 +119,7 @@ class ReviewOutcome:
     changed: bool
     complete: bool = True
     run_id: str = ""
+    report_error: str = ""
 
 
 @dataclass(frozen=True)
@@ -940,6 +949,9 @@ class Orchestrator:
         request_ids: Iterable[str] = (),
         upstream_requests: Iterable[dict[str, Any]] = (),
         priority_override: float | None = None,
+        resume_thread_id: str | None = None,
+        resume_run_id: str = "",
+        resume_prompt: str = "",
     ) -> Attempt:
         auxiliary = role in {UPSTREAM_REPAIR_ROLE, REPAIR_WORKER_ROLE}
         upstream_repair = role == UPSTREAM_REPAIR_ROLE
@@ -1037,13 +1049,25 @@ class Orchestrator:
                     workspace_root=workspace_root,
                 )
             else:
-                agent = await self.executor.run(
-                    chapter,
-                    stage,
-                    run,
-                    feedback=feedback,
-                    workspace_root=workspace_root,
-                )
+                if resume_thread_id is not None:
+                    agent = await self.executor.resume(
+                        chapter,
+                        stage,
+                        run,
+                        thread_id=resume_thread_id,
+                        previous_run_id=resume_run_id,
+                        reminder=resume_prompt,
+                        feedback=feedback,
+                        workspace_root=workspace_root,
+                    )
+                else:
+                    agent = await self.executor.run(
+                        chapter,
+                        stage,
+                        run,
+                        feedback=feedback,
+                        workspace_root=workspace_root,
+                    )
             slots.release()
             slot_held = False
             # Agent capacity covers live Codex processes, not integration or a
@@ -1402,7 +1426,7 @@ class Orchestrator:
         consumer: WorkUnitLike,
         raw: Any,
     ) -> tuple[dict[str, Any], str, str]:
-        """Resolve one proposed owner and retain a reason for every rejected handoff."""
+        """Resolve one owner from exact paths and retain why an unsafe handoff was rejected."""
 
         if not isinstance(raw, dict):
             return {}, "", "proof agent returned a non-object upstream request"
@@ -1461,23 +1485,21 @@ class Orchestrator:
                 ("upstream owner paths must resolve to exactly one selected chapter"),
             )
         owner_id = next(iter(path_owners))
-        if proposed_owner != owner_id:
-            return (
-                request,
-                owner_id,
-                (f"proposed owner {proposed_owner!r} disagrees with path owner {owner_id!r}"),
-            )
         by_id = {chapter.id: chapter for chapter in self.work_units}
         owner = by_id.get(owner_id)
         if owner is None:
-            return request, owner_id, "proposed owner chapter is outside this swarm selection"
+            return request, owner_id, "path-derived owner chapter is outside this swarm selection"
         if not self._is_earlier_work_unit(owner, consumer):
             return (
                 request,
                 owner_id,
-                (f"proposed owner {owner_id} is not chronologically earlier than {consumer.id}"),
+                (
+                    f"path-derived owner {owner_id} is not chronologically earlier than "
+                    f"{consumer.id}"
+                ),
             )
         request.update({name: str(request[name]).strip() for name in required_strings})
+        request["owner_chapter_id"] = owner_id
         request["owner_paths"] = sorted(dict.fromkeys(str(path).strip() for path in owner_paths))
         request["attempted_alternatives"] = [str(item).strip() for item in valid_alternatives]
         return request, owner_id, ""
@@ -2745,6 +2767,9 @@ class Orchestrator:
         rerun: bool = False,
         feedback: str = "",
         request_ids: Iterable[str] = (),
+        resume_thread_id: str | None = None,
+        resume_run_id: str = "",
+        resume_prompt: str = "",
     ) -> ReviewOutcome:
         if not rerun and self._already_done(chapter, Stage.REVIEW):
             return ReviewOutcome(True, False, complete=True)
@@ -2758,6 +2783,9 @@ class Orchestrator:
                 if feedback
                 else "source-faithful editing review"
             ),
+            resume_thread_id=resume_thread_id,
+            resume_run_id=resume_run_id,
+            resume_prompt=resume_prompt,
         )
         if attempt.agent.capacity_exhausted:
             await self.state.set_task(
@@ -2772,6 +2800,9 @@ class Orchestrator:
                 complete=False,
                 run_id=attempt.run.id,
             )
+        report_error = ""
+        if not attempt.agent.report and not attempt.agent.capacity_exhausted:
+            report_error = attempt.agent.error or "review returned no structured final report"
         succeeded = attempt.agent.succeeded and attempt.validation.succeeded
         complete = bool(attempt.agent.report.get("complete"))
         if succeeded and complete:
@@ -2786,6 +2817,33 @@ class Orchestrator:
                 True,
                 attempt.agent.changed,
                 complete=True,
+                run_id=attempt.run.id,
+            )
+        if report_error:
+            await self.state.set_task(
+                chapter.id,
+                Stage.REVIEW,
+                TaskStatus.RUNNING,
+                "invalid review report; session retry queued",
+            )
+            return ReviewOutcome(
+                False,
+                attempt.agent.changed,
+                complete=False,
+                run_id=attempt.run.id,
+                report_error=report_error,
+            )
+        if succeeded:
+            await self.state.set_task(
+                chapter.id,
+                Stage.REVIEW,
+                TaskStatus.RUNNING,
+                "incomplete review report; session retry queued",
+            )
+            return ReviewOutcome(
+                True,
+                attempt.agent.changed,
+                complete=False,
                 run_id=attempt.run.id,
             )
         await self.state.set_task(
@@ -2965,22 +3023,76 @@ class Orchestrator:
                 return False
 
         maximum = min(self.config.stages[Stage.REVIEW].max_rounds, 5)
+        resume_thread_id: str | None = None
+        resume_run_id = ""
+        resume_prompt = ""
+
+        async def queue_report_retry(outcome: ReviewOutcome, error: str) -> bool:
+            nonlocal resume_thread_id, resume_run_id, resume_prompt
+            if rounds_used[chapter.id] >= maximum:
+                await self.state.set_task(
+                    chapter.id,
+                    Stage.REVIEW,
+                    TaskStatus.FAILED,
+                    f"{error}; review report retry cap reached after {maximum} cycles",
+                )
+                return False
+            run = next(
+                (
+                    item
+                    for item in self.state.task(chapter.id, Stage.REVIEW).runs
+                    if item.id == outcome.run_id
+                ),
+                None,
+            )
+            if run is not None and run.thread_id:
+                resume_thread_id = run.thread_id
+                resume_run_id = run.id
+                resume_prompt = REVIEW_REPORT_RETRY_PROMPT.format(error=error)
+            await self.state.set_task(
+                chapter.id,
+                Stage.REVIEW,
+                TaskStatus.RUNNING,
+                (
+                    "resuming review session after invalid report "
+                    if resume_thread_id is not None
+                    else "retrying review after invalid report "
+                )
+                + f"({rounds_used[chapter.id]}/{maximum})",
+            )
+            return True
+
         while rounds_used[chapter.id] < maximum:
             rounds_used[chapter.id] += 1
             review_rerun = rerun or rounds_used[chapter.id] > 1
             finding_guided = bool(review_feedback)
-            outcome = (
-                await self._review_once(
-                    chapter,
-                    rerun=review_rerun,
-                    feedback=review_feedback,
-                    request_ids=request_ids,
+            attempt_feedback = review_feedback
+            review_options: dict[str, Any] = {"rerun": review_rerun}
+            if review_feedback:
+                review_options.update(feedback=review_feedback, request_ids=request_ids)
+            if resume_thread_id is not None:
+                review_options.update(
+                    resume_thread_id=resume_thread_id,
+                    resume_run_id=resume_run_id,
+                    resume_prompt=resume_prompt,
                 )
-                if review_feedback
-                else await self._review_once(chapter, rerun=review_rerun)
-            )
+            outcome = await self._review_once(chapter, **review_options)
+            resume_thread_id = None
+            resume_run_id = ""
+            resume_prompt = ""
             review_feedback = ""
             if not outcome.succeeded:
+                if outcome.report_error:
+                    review_feedback = attempt_feedback
+                    if outcome.changed:
+                        malformed_build_feedback = await self._review_build(chapter)
+                        if malformed_build_feedback and not await route_feedback(
+                            malformed_build_feedback,
+                            origin=f"review-build:{outcome.run_id or uuid4().hex[:12]}",
+                        ):
+                            return False
+                    if await queue_report_retry(outcome, outcome.report_error):
+                        continue
                 return False
             expected_finding_ids = self._expected_proof_finding_ids(chapter.id, request_ids)
             if assessment_error := self._proof_review_assessment_error(
@@ -2988,12 +3100,9 @@ class Orchestrator:
                 outcome.run_id,
                 expected_finding_ids,
             ):
-                await self.state.set_task(
-                    chapter.id,
-                    Stage.REVIEW,
-                    TaskStatus.FAILED,
-                    assessment_error,
-                )
+                review_feedback = attempt_feedback
+                if await queue_report_retry(outcome, assessment_error):
+                    continue
                 return False
             build_feedback: dict[str, str] = {}
             if outcome.changed:
@@ -3014,23 +3123,12 @@ class Orchestrator:
                     return False
                 continue
             if not outcome.complete:
-                if not outcome.changed and not build_feedback:
-                    await self.state.set_task(
-                        chapter.id,
-                        Stage.REVIEW,
-                        TaskStatus.FAILED,
-                        "review was incomplete and supplied no actionable follow-up",
-                    )
-                    return False
-                if rounds_used[chapter.id] >= maximum:
-                    await self.state.set_task(
-                        chapter.id,
-                        Stage.REVIEW,
-                        TaskStatus.FAILED,
-                        f"review remained incomplete after {maximum} cycles",
-                    )
-                    return False
-                continue
+                review_feedback = attempt_feedback
+                if await queue_report_retry(
+                    outcome, "review report marked the assignment incomplete"
+                ):
+                    continue
+                return False
             if finding_guided:
                 return await self._complete_review(
                     chapter,

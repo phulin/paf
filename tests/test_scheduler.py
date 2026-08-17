@@ -36,6 +36,8 @@ class FakeExecutor(CodexExecutor):
         self.state = state
         self.results = results
         self.feedbacks: list[str] = []
+        self.resume_thread_ids: list[str | None] = []
+        self.resume_prompts: list[str] = []
 
     async def run(
         self,
@@ -48,6 +50,8 @@ class FakeExecutor(CodexExecutor):
     ) -> AgentResult:
         del chapter, stage, workspace_root
         self.feedbacks.append(feedback)
+        self.resume_thread_ids.append(None)
+        self.resume_prompts.append("")
         result = self.results.pop(0)
         await self.state.finish_run(
             run,
@@ -57,6 +61,41 @@ class FakeExecutor(CodexExecutor):
             placeholders=result.placeholders,
             report=result.report,
             usage=result.usage,
+            thread_id=result.thread_id,
+        )
+        return result
+
+    async def resume(
+        self,
+        chapter: Chapter,
+        stage: Stage,
+        run: RunRecord,
+        *,
+        thread_id: str,
+        previous_run_id: str,
+        reminder: str,
+        feedback: str = "",
+        workspace_root: Path | None = None,
+    ) -> AgentResult:
+        del chapter, stage, workspace_root
+        self.feedbacks.append(feedback)
+        self.resume_thread_ids.append(thread_id)
+        self.resume_prompts.append(reminder)
+        result = self.results.pop(0)
+        await self.state.update_run(
+            run,
+            thread_id=thread_id,
+            resumed_from_run_id=previous_run_id,
+        )
+        await self.state.finish_run(
+            run,
+            status=TaskStatus.SUCCEEDED,
+            exit_code=0,
+            changed=result.changed,
+            placeholders=result.placeholders,
+            report=result.report,
+            usage=result.usage,
+            thread_id=result.thread_id or thread_id,
         )
         return result
 
@@ -538,7 +577,7 @@ def test_proof_review_feedback_tags_each_finding_with_a_stable_id(tmp_path: Path
 
 
 @pytest.mark.asyncio
-async def test_proof_review_does_not_acknowledge_missing_finding_assessments(
+async def test_proof_review_retries_missing_finding_assessments_in_same_session(
     tmp_path: Path,
 ) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
@@ -556,10 +595,27 @@ async def test_proof_review_does_not_acknowledge_missing_finding_assessments(
         origin_run_id="proof-run",
     )
     feedback, request_ids = orchestrator._proof_review_feedback(chapter.id)
-    orchestrator.executor = FakeExecutor(
+    executor = FakeExecutor(
         state,
-        [result(changed=False, finding_assessments=[])],
+        [
+            replace(
+                result(changed=False, finding_assessments=[]),
+                thread_id="review-session",
+            ),
+            result(
+                changed=False,
+                finding_assessments=[
+                    {
+                        "finding_id": f"{request_id}:1",
+                        "finding": "Book.target",
+                        "assessment": "rejected",
+                        "explanation": "The statement is sound.",
+                    }
+                ],
+            ),
+        ],
     )
+    orchestrator.executor = executor
 
     succeeded = await orchestrator._review_chapter_to_clean(
         chapter,
@@ -569,13 +625,69 @@ async def test_proof_review_does_not_acknowledge_missing_finding_assessments(
         proof_request_ids=request_ids,
     )
 
-    assert not succeeded
-    assert request_id in state.proof_review_requests
+    assert succeeded
+    assert request_id not in state.proof_review_requests
     review = state.task(chapter.id, Stage.REVIEW)
+    assert review.status == TaskStatus.SUCCEEDED
+    assert review.rounds == 2
+    assert executor.resume_thread_ids == [None, "review-session"]
+    assert f"missing: {request_id}:1" in executor.resume_prompts[-1]
+    assert all(run.request_ids == [request_id] for run in review.runs)
+    assert all(run.prompt_kind == "proof_review" for run in review.runs)
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_malformed_review_report_resumes_same_session(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = config.chapters[0]
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await orchestrator.prepare()
+    await mark_formalized(orchestrator)
+    executor = FakeExecutor(
+        state,
+        [
+            AgentResult(
+                succeeded=False,
+                exit_code=0,
+                changed=False,
+                placeholders=0,
+                usage=TokenUsage(),
+                report={},
+                thread_id="malformed-session",
+                error="Codex returned no structured final report",
+            ),
+            result(changed=False),
+        ],
+    )
+    orchestrator.executor = executor
+
+    assert await orchestrator._review_chapter_to_clean(chapter, {chapter.id: 0})
+    assert state.task(chapter.id, Stage.REVIEW).rounds == 2
+    assert executor.resume_thread_ids == [None, "malformed-session"]
+    assert "structured final report" in executor.resume_prompts[-1]
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_incomplete_review_report_retries_only_to_five_round_cap(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = config.chapters[0]
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await orchestrator.prepare()
+    await mark_formalized(orchestrator)
+    incomplete = replace(result(changed=False, complete=False), thread_id="review-session")
+    executor = FakeExecutor(state, [incomplete] * 5)
+    orchestrator.executor = executor
+
+    assert not await orchestrator._review_chapter_to_clean(chapter, {chapter.id: 0})
+    review = state.task(chapter.id, Stage.REVIEW)
+    assert review.rounds == 5
     assert review.status == TaskStatus.FAILED
-    assert f"missing: {request_id}:1" in review.detail
-    assert review.runs[-1].request_ids == [request_id]
-    assert review.runs[-1].prompt_kind == "proof_review"
+    assert "retry cap reached after 5 cycles" in review.detail
+    assert executor.resume_thread_ids == [None, *("review-session" for _ in range(4))]
     await orchestrator.shutdown()
 
 
@@ -698,6 +810,29 @@ async def test_upstream_requests_persist_answers_and_batch_by_owner(tmp_path: Pa
     assert reloaded.upstream_requests[request_id]["status"] == UpstreamRequestStatus.ANSWERED
     assert reloaded.upstream_requests[request_id]["answer"] == persisted["answer"]
     await reloaded.close()
+
+
+def test_upstream_request_uses_unique_path_owner_over_agent_label(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    owner, consumer = config.chapters
+    orchestrator = Orchestrator(config, StateStore(config))
+
+    request, owner_id, error = orchestrator._normalize_upstream_request(
+        consumer,
+        {
+            "blocked_declaration": "consumerTarget",
+            "consumer_path": "lean/Book/Chapter02.lean",
+            "residual_goal": "⊢ Result x",
+            "needed_result": "A transport lemma from Input x to Result x",
+            "owner_chapter_id": "chapter 1",
+            "owner_paths": ["lean/Book/Chapter01.lean"],
+            "attempted_alternatives": ["simp [Result]", "exact existingCandidate x"],
+        },
+    )
+
+    assert error == ""
+    assert owner_id == owner.id
+    assert request["owner_chapter_id"] == owner.id
 
 
 @pytest.mark.asyncio

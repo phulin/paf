@@ -1304,6 +1304,40 @@ whole-file diagnostics from prerequisites to dependents. Do not prepare every fi
             workspace_root=root,
         )
 
+    async def resume(
+        self,
+        chapter: Any,
+        stage: Stage,
+        run: RunRecord,
+        *,
+        thread_id: str,
+        previous_run_id: str,
+        reminder: str,
+        feedback: str = "",
+        workspace_root: Path | None = None,
+    ) -> AgentResult:
+        """Continue an explicitly selected Codex session with a focused reminder."""
+
+        root = workspace_root or self.config.settings.repo
+        prompt = self.build_prompt(
+            chapter,
+            stage,
+            feedback=feedback,
+            workspace_root=root,
+            role=run.role,
+        )
+        return await self._run_prompt(
+            chapter,
+            stage,
+            run,
+            prompt=prompt,
+            feedback=feedback,
+            workspace_root=root,
+            resume_thread_id=thread_id,
+            resume_run_id=previous_run_id,
+            resume_prompt=reminder,
+        )
+
     async def run_upstream_repair(
         self,
         chapter: WorkUnitLike,
@@ -1359,6 +1393,9 @@ whole-file diagnostics from prerequisites to dependents. Do not prepare every fi
         prompt: str,
         feedback: str = "",
         workspace_root: Path | None = None,
+        resume_thread_id: str | None = None,
+        resume_run_id: str = "",
+        resume_prompt: str = CAPACITY_RESUME_PROMPT,
     ) -> AgentResult:
         root = workspace_root or self.config.settings.repo
         prompt_path = self.state.logs_dir / f"{run.id}.prompt.md"
@@ -1368,14 +1405,17 @@ whole-file diagnostics from prerequisites to dependents. Do not prepare every fi
         usage = TokenUsage()
         report: dict[str, Any] = {}
         resumable_run = self._resumable_run(run, stage)
-        thread_id = resumable_run.thread_id if self.resume_agents and resumable_run else None
+        thread_id = resume_thread_id
+        if thread_id is None and self.resume_agents and resumable_run:
+            thread_id = resumable_run.thread_id
         interrupted_resume = thread_id is not None
         if thread_id is not None:
-            assert resumable_run is not None
             await self.state.update_run(
                 run,
                 thread_id=thread_id,
-                resumed_from_run_id=resumable_run.id,
+                resumed_from_run_id=(
+                    resume_run_id or (resumable_run.id if resumable_run is not None else "")
+                ),
             )
         invocation_error = ""
         fatal_invocation_failure = False
@@ -1572,7 +1612,7 @@ whole-file diagnostics from prerequisites to dependents. Do not prepare every fi
                         role=run.role,
                         resume_thread_id=thread_id,
                     )
-                    input_text = CAPACITY_RESUME_PROMPT
+                    input_text = resume_prompt if invocation_count == 0 else CAPACITY_RESUME_PROMPT
                 else:
                     command = self.command(
                         stage,
