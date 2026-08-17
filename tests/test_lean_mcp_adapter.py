@@ -129,6 +129,65 @@ async def test_stale_diagnostic_rebuilds_and_retries_once(tmp_path: Path) -> Non
 
 
 @pytest.mark.asyncio
+async def test_missing_dependency_build_stderr_rebuilds_and_retries_once(
+    tmp_path: Path,
+) -> None:
+    write(tmp_path, "A.lean", "import B\n")
+    client = FakeClient(tmp_path)
+    document = await client.open("A.lean", wait=False, dependency_build_mode="never")
+    document.diagnostics = [
+        {
+            "message": (
+                "lake setup-file A.lean failed\n"
+                "error: B.lean:1:0: object file 'B.olean' does not exist"
+            )
+        }
+    ]
+    client.events.clear()
+
+    async def barrier(_client: Any, path: str, timeout: float | None) -> None:
+        client.events.append(("barrier", path, timeout))
+        if client.open_modes[path] == "once":
+            client._docs[path].diagnostics = []
+
+    await barrier_with_dependency_refresh(client, "A.lean", original=barrier)
+
+    assert client.events == [
+        ("barrier", "A.lean", None),
+        ("close", "A.lean"),
+        ("open", "A.lean", False, "once"),
+        ("barrier", "A.lean", None),
+    ]
+    assert client._docs["A.lean"] is document
+    assert document.diagnostics == []
+
+
+@pytest.mark.asyncio
+async def test_non_artifact_dependency_build_failure_does_not_trigger_build(
+    tmp_path: Path,
+) -> None:
+    write(tmp_path, "A.lean", "import B\n")
+    client = FakeClient(tmp_path)
+    document = await client.open("A.lean", wait=False, dependency_build_mode="never")
+    document.diagnostics = [
+        {
+            "message": (
+                "lake setup-file A.lean failed\n"
+                "error: B.lean:3:7: type mismatch in dependency source"
+            )
+        }
+    ]
+    client.events.clear()
+
+    async def barrier(_client: Any, path: str, timeout: float | None) -> None:
+        client.events.append(("barrier", path, timeout))
+
+    await barrier_with_dependency_refresh(client, "A.lean", original=barrier)
+
+    assert client.events == [("barrier", "A.lean", None)]
+
+
+@pytest.mark.asyncio
 async def test_failed_stale_recovery_is_hidden_and_not_repeated_without_new_state(
     tmp_path: Path,
 ) -> None:
@@ -167,6 +226,46 @@ async def test_failed_stale_recovery_is_hidden_and_not_repeated_without_new_stat
     )
     with pytest.raises(LeanClientError, match="usable dependency snapshot"):
         await barrier_with_dependency_refresh(client, "A.lean", original=barrier)
+    assert [event for event in client.events if event[0] == "open"] == [
+        ("open", "A.lean", False, "once"),
+        ("open", "A.lean", False, "once"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_new_dependency_build_failure_notification_allows_retry(tmp_path: Path) -> None:
+    write(tmp_path, "A.lean", "import B\n")
+    client = FakeClient(tmp_path)
+    document = await client.open("A.lean", wait=False, dependency_build_mode="never")
+    build_failure = {
+        "message": (
+            "lake setup-file A.lean failed\nerror: B.lean:1:0: object file 'B.olean' does not exist"
+        )
+    }
+    document.diagnostics = [build_failure]
+    client.events.clear()
+
+    async def barrier(_client: Any, path: str, timeout: float | None) -> None:
+        client.events.append(("barrier", path, timeout))
+        client._docs[path].diagnostics = [build_failure]
+
+    with pytest.raises(LeanClientError, match="usable dependency snapshot"):
+        await barrier_with_dependency_refresh(client, "A.lean", original=barrier)
+    with pytest.raises(LeanClientError, match="usable dependency snapshot"):
+        await barrier_with_dependency_refresh(client, "A.lean", original=barrier)
+
+    def publish(_client: Any, _method: str, params: dict[str, Any]) -> None:
+        client._docs["A.lean"].diagnostics = params["diagnostics"]
+
+    record_stale_dependency(
+        client,
+        "textDocument/publishDiagnostics",
+        {"uri": client._docs["A.lean"].uri, "diagnostics": [build_failure]},
+        original=publish,
+    )
+    with pytest.raises(LeanClientError, match="usable dependency snapshot"):
+        await barrier_with_dependency_refresh(client, "A.lean", original=barrier)
+
     assert [event for event in client.events if event[0] == "open"] == [
         ("open", "A.lean", False, "once"),
         ("open", "A.lean", False, "once"),

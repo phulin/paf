@@ -21,6 +21,7 @@ FastMCPSettings.model_rebuild()
 from lean_lsp_mcp import main as upstream_main  # noqa: E402
 from lean_lsp_mcp import server  # noqa: E402
 from lean_lsp_mcp.client_utils import open_synced  # noqa: E402
+from lean_lsp_mcp.utils import is_build_stderr  # noqa: E402
 
 Reload = Callable[[AsyncLeanLSPClient, str, bool], Awaitable[Any]]
 Barrier = Callable[[AsyncLeanLSPClient, str, float | None], Awaitable[None]]
@@ -33,7 +34,7 @@ _ORIGINAL_NOTIFICATION = AsyncLeanLSPClient._on_notification
 _DEPENDENCY_LOCKS: WeakKeyDictionary[Any, asyncio.Lock] = WeakKeyDictionary()
 _DOCUMENT_LOCKS: WeakKeyDictionary[Any, dict[str, asyncio.Lock]] = WeakKeyDictionary()
 _BUILD_GENERATIONS: WeakKeyDictionary[Any, int] = WeakKeyDictionary()
-_STALE_EPOCHS: WeakKeyDictionary[Any, dict[str, int]] = WeakKeyDictionary()
+_DEPENDENCY_EPOCHS: WeakKeyDictionary[Any, dict[str, int]] = WeakKeyDictionary()
 _REFRESH_ATTEMPTS: WeakKeyDictionary[Any, dict[str, tuple[str, int, int]]] = WeakKeyDictionary()
 
 _IMPORT_RE = re.compile(
@@ -42,6 +43,9 @@ _IMPORT_RE = re.compile(
     re.MULTILINE,
 )
 _STALE_IMPORT_TEXT = "Imports are out of date"
+_OBJECT_FILE_TEXT = "object file"
+_OLEAN_TEXT = ".olean"
+_RECOVERABLE_OBJECT_FILE_FAILURES = ("does not exist", "is out of date")
 
 
 def _client_lock(client: Any) -> asyncio.Lock:
@@ -65,8 +69,8 @@ def _build_generation(client: Any) -> int:
     return _BUILD_GENERATIONS.get(client, 0)
 
 
-def _stale_epoch(client: Any, path: str) -> int:
-    return _STALE_EPOCHS.get(client, {}).get(path, 0)
+def _dependency_epoch(client: Any, path: str) -> int:
+    return _DEPENDENCY_EPOCHS.get(client, {}).get(path, 0)
 
 
 def _source_digest(text: str) -> str:
@@ -81,16 +85,30 @@ def _imports(text: str) -> tuple[str, ...]:
     return tuple(imports)
 
 
-def _has_stale_diagnostic(document: Any) -> bool:
+def _is_recoverable_dependency_build_failure(message: str) -> bool:
+    return (
+        is_build_stderr(message)
+        and _OBJECT_FILE_TEXT in message
+        and _OLEAN_TEXT in message
+        and any(reason in message for reason in _RECOVERABLE_OBJECT_FILE_FAILURES)
+    )
+
+
+def _diagnostics_need_dependency_refresh(diagnostics: Any) -> bool:
     return any(
-        _STALE_IMPORT_TEXT in str(diagnostic.get("message", ""))
-        for diagnostic in document.diagnostics
+        _STALE_IMPORT_TEXT in (message := str(diagnostic.get("message", "")))
+        or _is_recoverable_dependency_build_failure(message)
+        for diagnostic in diagnostics
         if isinstance(diagnostic, dict)
     )
 
 
+def _has_dependency_refresh_diagnostic(document: Any) -> bool:
+    return _diagnostics_need_dependency_refresh(document.diagnostics)
+
+
 def _needs_dependency_refresh(document: Any) -> bool:
-    return bool(document.stale_imports or _has_stale_diagnostic(document))
+    return bool(document.stale_imports or _has_dependency_refresh_diagnostic(document))
 
 
 def _require_fresh_dependencies(document: Any, path: str) -> Any:
@@ -125,7 +143,7 @@ def record_stale_dependency(
     *,
     original: Notification = _ORIGINAL_NOTIFICATION,
 ) -> None:
-    """Retain a generation for each newly published stale-import condition."""
+    """Retain a generation for each newly published dependency-refresh condition."""
 
     uri = None
     if "uri" in params:
@@ -136,14 +154,13 @@ def record_stale_dependency(
     original(self, method, params)
     if document is None:
         return
-    stale_was_published = method == "textDocument/publishDiagnostics" and any(
-        _STALE_IMPORT_TEXT in str(diagnostic.get("message", ""))
-        for diagnostic in params.get("diagnostics", [])
-        if isinstance(diagnostic, dict)
+    refresh_was_published = (
+        method == "textDocument/publishDiagnostics"
+        and _diagnostics_need_dependency_refresh(params.get("diagnostics", []))
     )
-    if method != "$/lean/staleDependency" and not stale_was_published:
+    if method != "$/lean/staleDependency" and not refresh_was_published:
         return
-    epochs = _STALE_EPOCHS.setdefault(self, {})
+    epochs = _DEPENDENCY_EPOCHS.setdefault(self, {})
     epochs[document.path] = epochs.get(document.path, 0) + 1
 
 
@@ -189,7 +206,7 @@ async def _refresh_dependencies(
             return document
 
         generation = _build_generation(self)
-        epoch = _stale_epoch(self, path)
+        epoch = _dependency_epoch(self, path)
         attempt_key = (_source_digest(disk), epoch, generation)
         attempts = _REFRESH_ATTEMPTS.setdefault(self, {})
         if not header_changed and attempts.get(path) == attempt_key:
@@ -219,7 +236,11 @@ async def _refresh_dependencies(
         if mode == "once":
             generation += 1
             _BUILD_GENERATIONS[self] = generation
-        attempts[path] = (_source_digest(document.text), _stale_epoch(self, path), generation)
+        attempts[path] = (
+            _source_digest(document.text),
+            _dependency_epoch(self, path),
+            generation,
+        )
         return _require_fresh_dependencies(document, path)
 
 
@@ -231,7 +252,7 @@ async def reload_with_dependencies_when_stale(
     original: Reload = _ORIGINAL_RELOAD,
     original_barrier: Barrier = _ORIGINAL_BARRIER,
 ) -> Any:
-    """Sync cheaply, rebuilding only for stale imports or an import-header edit."""
+    """Sync cheaply, rebuilding only for recoverable imports or an import-header edit."""
 
     document = self._docs.get(path)
     if document is None:
@@ -259,7 +280,7 @@ async def barrier_with_dependency_refresh(
     *,
     original: Barrier = _ORIGINAL_BARRIER,
 ) -> None:
-    """Wait for fresh results, then repair and retry stale imports once."""
+    """Wait for fresh results, then repair and retry recoverable import failures once."""
 
     async with _document_lock(self, path):
         observed_generation = _build_generation(self)
