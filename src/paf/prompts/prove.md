@@ -48,6 +48,11 @@ Do not add a helper merely because it would be convenient. First search Mathlib 
 and reuse an existing result whenever it provides the required mathematics. Do not add placeholders,
 axioms, unsafe declarations, or unused scaffolding.
 
+Do not increase Lean's maximum heartbeat limit or disable heartbeat limits to make a proof pass. If
+a proof exceeds the current limit, find a less computationally intensive strategy: break the argument
+into focused lemmas, reuse stronger existing results, reduce unnecessary unfolding or search, or
+restructure the proof so Lean can check each step efficiently.
+
 Report a problem with a statement only when you have concrete mathematical evidence that it is false,
 does not match the book, or cannot follow from its assumptions. A failed search, unknown theorem name,
 tactic failure, coercion error, timeout, or unfinished proof is not enough evidence.
