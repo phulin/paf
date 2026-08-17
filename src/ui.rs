@@ -595,7 +595,10 @@ fn draw_detail_content(
     model.sync_detail_viewport(maximum);
     frame.render_widget(paragraph.scroll((model.scroll, 0)).block(block), area);
     if maximum > 0 {
-        let mut scrollbar = ScrollbarState::new(line_count)
+        // Ratatui models `content_length` as the number of valid scrollbar
+        // positions once an explicit viewport length is supplied. The paragraph's
+        // valid offsets are 0..=maximum, not 0..line_count.
+        let mut scrollbar = ScrollbarState::new(maximum as usize + 1)
             .position(model.scroll as usize)
             .viewport_content_length(inner.height as usize);
         frame.render_stateful_widget(
@@ -1121,6 +1124,28 @@ mod tests {
         terminal.draw(|frame| draw(frame, &mut model)).unwrap();
         assert_eq!(model.scroll, scrollback);
         assert!(!model.detail_follow_tail);
+    }
+
+    #[test]
+    fn agent_detail_scrollbar_reaches_the_bottom_at_the_tail() {
+        let mut model = DashboardModel::loading("scrollbar test".into(), String::new());
+        model.enter_detail();
+        let text = Text::from(
+            (0..40)
+                .map(|line| Line::from(format!("event-{line:02}")))
+                .collect::<Vec<_>>(),
+        );
+        let backend = TestBackend::new(20, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|frame| draw_detail_content(frame, &mut model, text.clone(), frame.area()))
+            .unwrap();
+
+        assert_eq!(model.scroll, model.detail_max_scroll);
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(19, 8)].symbol(), "█");
+        assert_eq!(buffer[(19, 9)].symbol(), "▼");
     }
 
     #[test]
