@@ -366,8 +366,10 @@ a checkpoint. This preserves coherent edits and build results. Resume releases a
 `retry --chapter ID` interrupts only that chapter's live agent and immediately continues its
 assignment, resuming the same Codex session when a thread id is available. Other agents and the
 scheduler keep running. Without `--chapter`, `retry` resets every `failed` task to `pending` while
-retaining run history. This is distinct from `unblock`, which resets `blocked` tasks and reopens any
-escalated upstream handoffs.
+retaining run history. When a retried stage succeeds, tasks blocked by that failure are automatically
+returned to `pending` as their prerequisites recover; unrelated blocks remain intact. This is
+distinct from `unblock`, which resets all `blocked` tasks and reopens any escalated upstream
+handoffs.
 `unblock` resets every persisted `blocked` task to `pending` without deleting its run history. It can
 be issued against either a live daemon or offline state; pending tasks are eligible the next time the
 corresponding stage is scheduled. For a manually escalated upstream proof request, it also reopens

@@ -183,6 +183,9 @@ class TaskRecord:
     # underlying task remains failed/blocked until the repair is validated.
     repairing: bool = False
     repair_work_unit_id: str = ""
+    # Set by explicit failed-task retry and propagated through tasks released from its fallout.
+    # A later success uses this marker to reopen only causally blocked work.
+    recovering_failure: bool = False
     # Proof completion is tied to the exact validated chapter sources. This is
     # populated only on the prove task.
     source_digest: str | None = None
@@ -828,6 +831,7 @@ class StateStore:
             "queued": task.queued,
             "repairing": task.repairing,
             "repair_work_unit_id": task.repair_work_unit_id,
+            "recovering_failure": task.recovering_failure,
             "source_digest": task.source_digest,
             "rounds": task.rounds,
             "updated_at": task.updated_at,
@@ -2035,6 +2039,7 @@ class StateStore:
                 formalize.detail = "formalization completed before review"
                 formalize.updated_at = timestamp()
                 changed_tasks.append(formalize)
+        recovered = task.recovering_failure and status == TaskStatus.SUCCEEDED
         task.status = status
         task.phase = TaskPhase.POSTPROCESS if status == TaskStatus.RUNNING else TaskPhase.IDLE
         task.queued = queued and status == TaskStatus.PENDING
@@ -2042,6 +2047,10 @@ class StateStore:
             task.source_digest = source_digest if status == TaskStatus.SUCCEEDED else None
         task.detail = detail
         task.updated_at = timestamp()
+        if status in {TaskStatus.SUCCEEDED, TaskStatus.FAILED, TaskStatus.BLOCKED}:
+            task.recovering_failure = False
+        if recovered:
+            changed_tasks.extend(self._release_failure_blocked_tasks())
         self._invalidate_status_summaries()
         self._mark_dirty(tasks=changed_tasks)
         await self._persist()
@@ -2055,6 +2064,7 @@ class StateStore:
     ) -> None:
         changed = False
         changed_tasks: list[TaskRecord] = []
+        recovered = False
         updated_at = timestamp()
         for chapter_id in chapter_ids:
             key = self.key(chapter_id, stage)
@@ -2087,6 +2097,9 @@ class StateStore:
                     formalize.detail = "formalization completed before review"
                     formalize.updated_at = updated_at
                     changed_tasks.append(formalize)
+            recovered = recovered or (
+                task.recovering_failure and task_status == TaskStatus.SUCCEEDED
+            )
             task.status = task_status
             task.phase = (
                 TaskPhase.POSTPROCESS if task_status == TaskStatus.RUNNING else TaskPhase.IDLE
@@ -2096,8 +2109,12 @@ class StateStore:
                 task.source_digest = None
             task.detail = task_detail
             task.updated_at = updated_at
+            if task_status in {TaskStatus.SUCCEEDED, TaskStatus.FAILED, TaskStatus.BLOCKED}:
+                task.recovering_failure = False
             changed_tasks.append(task)
             changed = True
+        if recovered:
+            changed_tasks.extend(self._release_failure_blocked_tasks())
         if changed:
             self._invalidate_status_summaries()
             self._mark_dirty(tasks=changed_tasks)
@@ -2157,6 +2174,7 @@ class StateStore:
             if task.stage == Stage.PROVE:
                 task.source_digest = None
             task.detail = "manually retried"
+            task.recovering_failure = True
             task.updated_at = timestamp()
             changed.append(key)
         if changed:
@@ -2164,6 +2182,67 @@ class StateStore:
             self._mark_dirty(tasks=(self.tasks[key] for key in changed))
             await self._persist()
         return changed
+
+    def _source_dependencies(self, chapter_id: str) -> set[str]:
+        dependencies = self.source_dependency_tree.get("dependencies", {})
+        raw = dependencies.get(chapter_id, ()) if isinstance(dependencies, dict) else ()
+        if isinstance(raw, list):
+            return {item for item in raw if isinstance(item, str)}
+        nodes = self.source_dependency_tree.get("nodes", {})
+        node = nodes.get(chapter_id, {}) if isinstance(nodes, dict) else {}
+        raw = node.get("dependencies", ()) if isinstance(node, dict) else ()
+        return {item for item in raw if isinstance(item, str)} if isinstance(raw, list) else set()
+
+    def _release_failure_blocked_tasks(self) -> list[TaskRecord]:
+        """Release blocked tasks whose failed prerequisites have now recovered."""
+
+        released: list[TaskRecord] = []
+        for task in self.tasks.values():
+            if task.status != TaskStatus.BLOCKED:
+                continue
+            stage = Stage(task.stage)
+            dependencies = self._source_dependencies(task.chapter_id)
+            ready = False
+            if stage is Stage.FORMALIZE and task.detail in {
+                "blocked by a failed source dependency formalization",
+                "blocked by incomplete discovery or a source dependency cycle",
+                "blocked because source discovery failed",
+            }:
+                ready = self.task(task.chapter_id, Stage.DISCOVER).status == TaskStatus.SUCCEEDED
+                ready = ready and all(
+                    self.task(chapter_id, Stage.FORMALIZE).status == TaskStatus.SUCCEEDED
+                    for chapter_id in dependencies
+                )
+            elif stage is Stage.REVIEW and task.detail == (
+                "blocked by a failed prerequisite review; unrelated branches completed"
+            ):
+                ready = self.task(task.chapter_id, Stage.FORMALIZE).status == TaskStatus.SUCCEEDED
+                ready = ready and all(
+                    self.task(chapter_id, Stage.REVIEW).status == TaskStatus.SUCCEEDED
+                    for chapter_id in dependencies
+                )
+            elif stage is Stage.PROVE and task.detail in {
+                "formalization failed; quarantined from proof",
+                "blocked because formalization did not complete",
+            }:
+                ready = self.task(task.chapter_id, Stage.FORMALIZE).status == TaskStatus.SUCCEEDED
+            elif (
+                stage is Stage.PROVE
+                and task.detail == "blocked because statement review did not complete"
+            ):
+                ready = self.task(task.chapter_id, Stage.REVIEW).status == TaskStatus.SUCCEEDED
+            if not ready:
+                continue
+            task.status = TaskStatus.PENDING
+            task.phase = TaskPhase.IDLE
+            task.queued = False
+            if stage is Stage.PROVE:
+                task.source_digest = None
+            task.detail = "automatically unblocked after failed prerequisite recovered"
+            task.recovering_failure = True
+            task.updated_at = timestamp()
+            released.append(task)
+        return released
 
     async def requeue_interrupted(self, *, resume_agents: bool) -> list[str]:
         """Requeue interrupted tasks while retaining their optional session history."""

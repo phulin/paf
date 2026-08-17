@@ -1074,6 +1074,72 @@ async def test_interrupted_review_persists_until_startup_requeues_it(tmp_path: P
 
 
 @pytest.mark.asyncio
+async def test_successful_failure_retry_releases_only_its_blocked_dependents(
+    tmp_path: Path,
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    first, second = config.chapters
+    state = StateStore(config)
+    await state.load_or_create()
+    state.source_dependency_tree = {
+        "dependencies": {first.id: [], second.id: [first.id]},
+        "nodes": {},
+    }
+    await state.set_tasks(
+        (first.id, second.id),
+        Stage.FORMALIZE,
+        TaskStatus.SUCCEEDED,
+        "formalized",
+    )
+    await state.set_task(first.id, Stage.REVIEW, TaskStatus.FAILED, "review failed")
+    await state.set_task(
+        second.id,
+        Stage.REVIEW,
+        TaskStatus.BLOCKED,
+        "blocked by a failed prerequisite review; unrelated branches completed",
+    )
+    await state.set_task(
+        second.id,
+        Stage.PROVE,
+        TaskStatus.BLOCKED,
+        "blocked because statement review did not complete",
+    )
+    await state.set_task(
+        first.id,
+        Stage.PROVE,
+        TaskStatus.BLOCKED,
+        "upstream request requires manual escalation: request-one",
+    )
+
+    assert await state.retry_failed() == [f"{first.id}:review"]
+    await state.close()
+
+    recovered = StateStore(config)
+    await recovered.load_or_create()
+    first_review = recovered.task(first.id, Stage.REVIEW)
+    assert first_review.recovering_failure
+
+    await recovered.set_task(first.id, Stage.REVIEW, TaskStatus.RUNNING, "retrying")
+    await recovered.set_task(first.id, Stage.REVIEW, TaskStatus.SUCCEEDED, "review recovered")
+
+    second_review = recovered.task(second.id, Stage.REVIEW)
+    assert second_review.status == TaskStatus.PENDING
+    assert second_review.recovering_failure
+    assert recovered.task(second.id, Stage.PROVE).status == TaskStatus.BLOCKED
+    assert recovered.task(first.id, Stage.PROVE).status == TaskStatus.BLOCKED
+
+    await recovered.set_task(second.id, Stage.REVIEW, TaskStatus.RUNNING, "reviewing")
+    await recovered.set_task(second.id, Stage.REVIEW, TaskStatus.SUCCEEDED, "reviewed")
+
+    second_proof = recovered.task(second.id, Stage.PROVE)
+    assert second_proof.status == TaskStatus.PENDING
+    assert second_proof.recovering_failure
+    assert "automatically unblocked" in second_proof.detail
+    assert recovered.task(first.id, Stage.PROVE).status == TaskStatus.BLOCKED
+    await recovered.close()
+
+
+@pytest.mark.asyncio
 async def test_orchestrator_requeues_interrupted_tasks_for_fresh_retry_by_default(
     tmp_path: Path,
 ) -> None:
