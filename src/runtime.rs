@@ -26,6 +26,7 @@ enum RuntimeEvent {
 
 pub enum TuiExit {
     Complete(bool),
+    Detach,
     Reload(Option<AgentView>),
 }
 
@@ -139,6 +140,9 @@ pub fn run(
             }
             Ok(RuntimeEvent::Terminal(event)) => {
                 dirty = handle_terminal_event(event, &mut model, socket_path)?;
+                if model.detach_requested {
+                    return Ok(TuiExit::Detach);
+                }
                 if model.reload_requested {
                     let agent_view = model.detail.then(|| {
                         model.selected_row().map(|row| AgentView {
@@ -228,6 +232,10 @@ fn handle_terminal_event(
     }
     let stop_key = key.code == KeyCode::Char('q')
         || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL));
+    if key.code == KeyCode::Char('d') {
+        model.detach_requested = true;
+        return Ok(true);
+    }
     if model.preparation.is_some() && !stop_key {
         return Ok(false);
     }
@@ -464,6 +472,23 @@ mod tests {
         assert!(changed);
         assert!(model.reload_requested);
         assert!(!model.stopping);
+    }
+
+    #[test]
+    fn detach_key_exits_from_any_view_without_stopping() {
+        for detail in [false, true] {
+            let mut model = DashboardModel::loading("test".into(), String::new());
+            model.detail = detail;
+            let changed = handle_terminal_event(
+                Event::Key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE)),
+                &mut model,
+                "/unused",
+            )
+            .unwrap();
+            assert!(changed);
+            assert!(model.detach_requested);
+            assert!(!model.stopping);
+        }
     }
 
     #[test]

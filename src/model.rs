@@ -277,6 +277,7 @@ pub struct DashboardModel {
     pub stopping: bool,
     pub preparation: Option<Preparation>,
     pub reload_requested: bool,
+    pub detach_requested: bool,
     restore_agent_view: Option<String>,
 }
 
@@ -311,6 +312,7 @@ impl DashboardModel {
                 total: 1,
             }),
             reload_requested: false,
+            detach_requested: false,
             restore_agent_view: agent_view,
         }
     }

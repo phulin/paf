@@ -80,7 +80,7 @@ fn draw_preparation_modal(frame: &mut Frame<'_>, model: &DashboardModel) {
         Paragraph::new(if model.stopping {
             "Stopping after preparation finishes…"
         } else {
-            "q stops before workers are launched"
+            "d detaches  q stops before workers are launched"
         })
         .style(Style::default().fg(MUTED).bg(SURFACE))
         .alignment(Alignment::Center),
@@ -131,9 +131,11 @@ fn draw_dashboard(frame: &mut Frame<'_>, model: &DashboardModel) {
     draw_task_table(frame, model, layout[3]);
     draw_status(frame, model, layout[4]);
     frame.render_widget(
-        Paragraph::new("↑↓ select  Enter/i inspect  p pause/resume  r reload TUI  q stop")
-            .style(Style::default().fg(MUTED))
-            .alignment(Alignment::Center),
+        Paragraph::new(
+            "↑↓ select  Enter/i inspect  p pause/resume  r reload TUI  d detach  q stop",
+        )
+        .style(Style::default().fg(MUTED))
+        .alignment(Alignment::Center),
         layout[5],
     );
 }
@@ -572,7 +574,7 @@ fn draw_detail(frame: &mut Frame<'_>, model: &mut DashboardModel) {
     let text = detail_text(model.detail_tab, activity);
     draw_detail_content(frame, model, text, layout[3]);
     frame.render_widget(
-        Paragraph::new("Tab/Shift-Tab switch  ↑↓ scroll  r reload TUI  Esc/q back")
+        Paragraph::new("Tab/Shift-Tab switch  ↑↓ scroll  r reload TUI  d detach  Esc/q back")
             .style(Style::default().fg(MUTED))
             .alignment(Alignment::Center),
         layout[4],
@@ -876,7 +878,7 @@ mod tests {
         assert!(rendered.contains("Preparing PAF"));
         assert!(rendered.contains("Preparing isolated workspaces and Lean caches"));
         assert!(rendered.contains("7 / 9"));
-        assert!(rendered.contains("q stops before workers are launched"));
+        assert!(rendered.contains("d detaches  q stops before workers are launched"));
     }
 
     #[test]

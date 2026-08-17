@@ -37,7 +37,7 @@ __all__ = [
 ]
 
 
-TuiAction = Literal["success", "failure", "reload"]
+TuiAction = Literal["success", "failure", "detach", "reload"]
 
 
 @dataclass(frozen=True)
@@ -74,7 +74,7 @@ def _native_run(
     # explicit action strings below.
     if isinstance(result, bool):
         return TuiOutcome("success" if result else "failure")
-    if result in ("success", "failure", "reload"):
+    if result in ("success", "failure", "detach", "reload"):
         return TuiOutcome(result)
     try:
         payload = json.loads(result)
@@ -175,7 +175,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
             outcome.agent_view,
             outcome.detail_tab,
         )
-    return 0 if outcome.action == "success" else 1
+    return 0 if outcome.action in ("success", "detach") else 1
 
 
 async def _run_tui(

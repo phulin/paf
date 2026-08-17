@@ -215,7 +215,8 @@ versioned Unix-socket protocol. The server sends one initial snapshot, then push
 agent-activity, and global-state deltas directly from the in-process change bus; the TUI does not
 poll SQLite or repeatedly request full snapshots. Press `Enter` or `i` to inspect the selected
 agent, `p` to pause or resume scheduling, and `q` to stop workers, integrate interrupted workspace
-changes, and return to the shell.
+changes, and return to the shell. Press `d` to detach the TUI while leaving a managed orchestrator
+running.
 
 Add `--no-tui` for CI, a process supervisor, or log-only operation. Add `--force` to rerun tasks
 already persisted as successful. Without `--force`, successful stages are resumable and skipped.
@@ -497,7 +498,8 @@ spend. Bare process statuses such as `exit 2` are retained in the event timeline
 to latest or systemic errors. The detail pane reports tokens and API-equivalent cost for that exact
 agent attempt, and the overview-only Inspect action is hidden there. Press Escape or `q` to return
 to the swarm overview. Repeated equivalent failures across agents produce a deduplicated systemic
-alert in the overview instead of requiring inspection of every chapter.
+alert in the overview instead of requiring inspection of every chapter. Press `d` from either view
+to detach without sending a stop request to the orchestrator.
 
 Codex JSONL, state, activity, and control messages are decoded with `orjson`. Live JSONL is still
 framed incrementally rather than loaded as a whole file. Dashboard cells and static cards are updated

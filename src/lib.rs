@@ -30,6 +30,7 @@ fn run(
     .map(|result| match result {
         runtime::TuiExit::Complete(true) => "success".into(),
         runtime::TuiExit::Complete(false) => "failure".into(),
+        runtime::TuiExit::Detach => "detach".into(),
         runtime::TuiExit::Reload(agent_view) => serde_json::json!({
             "action": "reload",
             "agent_view": agent_view.as_ref().map(|view| &view.work_unit_id),

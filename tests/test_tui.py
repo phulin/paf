@@ -130,6 +130,17 @@ def test_native_restart_receives_the_agent_view_to_restore(monkeypatch) -> None:
     assert native.calls == [("/tmp/live.sock", "review", "", "book/chapter-01", "summary")]
 
 
+def test_native_detach_returns_success_without_reloading(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    native = FakeRustTui("detach")
+    monkeypatch.setattr(tui_module.importlib, "import_module", lambda _: native)
+
+    outcome = tui_module._native_run("/tmp/live.sock", "review", "", None, None)
+
+    assert outcome == tui_module.TuiOutcome("detach")
+    monkeypatch.setattr(tui_module, "_native_run", lambda *_: outcome)
+    assert tui_module.main(["--socket", "/tmp/live.sock", "--label", "review"]) == 0
+
+
 def test_reload_rebuilds_and_restarts_with_the_same_agent_view(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     rebuilt: list[bool] = []
     restarted: list[tuple[str, str, str, str | None, str | None]] = []
