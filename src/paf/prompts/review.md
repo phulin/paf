@@ -21,9 +21,10 @@ use `sorry`. If you make changes, leave the changed files equally clean for PAF'
    constructors, elimination rules, equivalences, coercions, instances, lemmas, and existing uses.
    Prefer the established API over a new local version.
 3. Use `update_plan` to make one checklist item for every numbered source section, in source order,
-   followed by a chapter-wide coverage/import check and a final diagnostic check. Keep exactly one
+   followed by a chapter-wide coverage/import check and a final diagnostic check. If you are assigned
+   only one section, break the section into a checklist of its logical subcomponents. Keep exactly one
    item in progress.
-4. For each source section, name the definitions, precise assertions, examples, hypotheses, warnings,
+4. For each checklist item, name the definitions, precise assertions, examples, hypotheses, warnings,
    and proof-support results it requires. Compare them with the Lean declarations one by one.
 5. Check mathematical meaning as well as surface similarity: quantifiers, implication direction,
    hypotheses, domains and codomains, coercions, indexing, normalization, strength, and dependency
@@ -37,7 +38,7 @@ use `sorry`. If you make changes, leave the changed files equally clean for PAF'
    `issues`.
 8. Use the attached Lean tools as needed while investigating. After the final edit, check the edited
    files and every assigned file that depends on them, from prerequisites to dependents. Fix every
-   diagnostic except the exact warning that a declaration uses `sorry`.
+   warning and error except the exact warning that a declaration uses `sorry`.
 9. Return a concise report of what you checked, what you changed, and any precise work that remains.
 
 ## Guardrails
