@@ -545,18 +545,19 @@ fn draw_detail(frame: &mut Frame<'_>, model: &mut DashboardModel) {
         ),
         layout[0],
     );
-    let run_titles = if model.detail_runs.is_empty() {
-        vec![Line::from("No runs")]
+    let (run_titles, selected_run) = if model.detail_runs.is_empty() {
+        (vec![Line::from("No runs")], 0)
     } else {
-        model
+        let labels = model
             .detail_runs
             .iter()
-            .map(|run| Line::from(format!("{} round {}", title(&run.stage), run.round)))
-            .collect()
+            .map(|run| format!("{} round {}", title(&run.stage), run.round))
+            .collect::<Vec<_>>();
+        visible_run_tabs(&labels, model.selected_run, layout[1].width as usize)
     };
     frame.render_widget(
         Tabs::new(run_titles)
-            .select(model.selected_run)
+            .select(selected_run)
             .highlight_style(Style::default().fg(YELLOW).add_modifier(Modifier::BOLD))
             .divider(" │ ")
             .block(Block::default().borders(Borders::BOTTOM).title(" Runs ")),
@@ -621,6 +622,79 @@ fn draw_detail(frame: &mut Frame<'_>, model: &mut DashboardModel) {
             .alignment(Alignment::Center),
         layout[5],
     );
+}
+
+fn visible_run_tabs(
+    labels: &[String],
+    selected: usize,
+    available_width: usize,
+) -> (Vec<Line<'static>>, usize) {
+    const DIVIDER_WIDTH: usize = 3;
+    const TAB_PADDING_WIDTH: usize = 2;
+
+    if labels.is_empty() {
+        return (Vec::new(), 0);
+    }
+    let selected = selected.min(labels.len() - 1);
+    let width = |start: usize, end: usize| {
+        let left_hidden = usize::from(start > 0);
+        let right_hidden = usize::from(end < labels.len());
+        let count = end - start + left_hidden + right_hidden;
+        labels[start..end]
+            .iter()
+            .map(|label| label.chars().count())
+            .sum::<usize>()
+            + left_hidden
+            + right_hidden
+            + TAB_PADDING_WIDTH * count
+            + DIVIDER_WIDTH * count.saturating_sub(1)
+    };
+
+    let mut start = selected;
+    let mut end = selected + 1;
+    loop {
+        let mut changed = false;
+        if start > 0 && width(start - 1, end) <= available_width {
+            start -= 1;
+            changed = true;
+        }
+        if end < labels.len() && width(start, end + 1) <= available_width {
+            end += 1;
+            changed = true;
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    let mut left_hidden = start > 0;
+    let mut right_hidden = end < labels.len();
+    let rendered_width = |show_left: bool, show_right: bool| {
+        let count = end - start + usize::from(show_left) + usize::from(show_right);
+        labels[start..end]
+            .iter()
+            .map(|label| label.chars().count())
+            .sum::<usize>()
+            + usize::from(show_left)
+            + usize::from(show_right)
+            + TAB_PADDING_WIDTH * count
+            + DIVIDER_WIDTH * count.saturating_sub(1)
+    };
+    if rendered_width(left_hidden, right_hidden) > available_width {
+        left_hidden = false;
+    }
+    if rendered_width(left_hidden, right_hidden) > available_width {
+        right_hidden = false;
+    }
+    let mut titles = Vec::with_capacity(end - start + 2);
+    if left_hidden {
+        titles.push(Line::from("‹"));
+    }
+    titles.extend(labels[start..end].iter().cloned().map(Line::from));
+    if right_hidden {
+        titles.push(Line::from("›"));
+    }
+    (titles, selected - start + usize::from(left_hidden))
 }
 
 fn draw_detail_content(
@@ -925,6 +999,50 @@ mod tests {
     use crate::model::{
         ActivityEntry, DashboardModel, PROTOCOL_VERSION, Preparation, Task, WireEvent, WorkUnit,
     };
+
+    fn plain_tabs(lines: &[Line<'_>]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn run_tabs_scroll_to_keep_the_selection_visible() {
+        let labels = (1..=10)
+            .map(|round| format!("Formalize round {round}"))
+            .collect::<Vec<_>>();
+
+        let (first, first_selected) = visible_run_tabs(&labels, 0, 48);
+        assert_eq!(
+            plain_tabs(&first),
+            ["Formalize round 1", "Formalize round 2", "›"]
+        );
+        assert_eq!(first_selected, 0);
+
+        let (middle, middle_selected) = visible_run_tabs(&labels, 7, 60);
+        assert_eq!(
+            plain_tabs(&middle),
+            ["‹", "Formalize round 7", "Formalize round 8", "›"]
+        );
+        assert_eq!(plain_tabs(&middle)[middle_selected], "Formalize round 8");
+
+        let (last, last_selected) = visible_run_tabs(&labels, 9, 48);
+        assert_eq!(
+            plain_tabs(&last),
+            ["‹", "Formalize round 9", "Formalize round 10"]
+        );
+        assert_eq!(plain_tabs(&last)[last_selected], "Formalize round 10");
+
+        let (narrow, narrow_selected) = visible_run_tabs(&labels, 7, 20);
+        assert_eq!(plain_tabs(&narrow), ["Formalize round 8"]);
+        assert_eq!(narrow_selected, 0);
+    }
 
     #[test]
     fn renders_preparation_progress_as_a_modal() {
