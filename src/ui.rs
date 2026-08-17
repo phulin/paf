@@ -9,7 +9,10 @@ use ratatui::widgets::{
     ScrollbarState, Table, TableState, Tabs, Wrap,
 };
 
-use crate::model::{Activity, DashboardModel, DetailTab, RowModel, STAGES, Task, elapsed_seconds};
+use crate::model::{
+    Activity, DashboardModel, DetailTab, RowModel, STAGES, Task, compact_task_detail,
+    elapsed_seconds,
+};
 
 const BLUE: Color = Color::Rgb(122, 162, 247);
 const CYAN: Color = Color::Rgb(125, 207, 255);
@@ -459,12 +462,17 @@ fn draw_status(frame: &mut Frame<'_>, model: &DashboardModel, area: Rect) {
             chunks[1],
         );
     } else {
+        let pending_reason = model
+            .selected_row()
+            .and_then(|row| model.pending_reason(&row));
         let message = if model.stopping {
             "Stopping workers and integrating workspace changes…".to_owned()
         } else if model.result == Some(true) {
             "Pipeline completed successfully".to_owned()
         } else if model.result == Some(false) {
             "Pipeline finished with failures".to_owned()
+        } else if let Some(reason) = &pending_reason {
+            format!("Pending · {reason}")
         } else {
             format!("{} · {}", title(&model.daemon_status), model.label)
         };
@@ -473,6 +481,8 @@ fn draw_status(frame: &mut Frame<'_>, model: &DashboardModel, area: Rect) {
                 .block(Block::default().borders(Borders::TOP))
                 .style(Style::default().fg(if model.result == Some(false) {
                     RED
+                } else if !model.stopping && model.result.is_none() && pending_reason.is_some() {
+                    YELLOW
                 } else {
                     GREEN
                 })),
@@ -516,8 +526,16 @@ fn draw_detail(frame: &mut Frame<'_>, model: &mut DashboardModel) {
         ),
         layout[0],
     );
-    let metrics = activity.map_or_else(
-        || "Awaiting compact agent activity".into(),
+    let pending_reason = model.pending_reason(&row);
+    let has_running_task = row.tasks.values().any(|task| task.status == "running");
+    let metrics = activity.filter(|_| has_running_task).map_or_else(
+        || {
+            pending_reason
+                .as_ref()
+                .map_or_else(|| "Awaiting compact agent activity".into(), |reason| {
+                    format!("CURRENT\n{reason}")
+                })
+        },
         |activity| {
             format!(
                 "CURRENT\n{}\n\nWORK\n{} shell · {} MCP · {} edits · {} failures · plan {}/{} · last event {} ago",
@@ -685,6 +703,18 @@ fn current_activity(
     if build.active && model.build_targets().contains(row.unit.id.as_str()) {
         return format!("{} coordinator finalize", build.mode);
     }
+    let has_running_task = row.tasks.values().any(|task| task.status == "running");
+    if let Some(activity) = activity.filter(|_| has_running_task) {
+        let idle = elapsed_seconds(&activity.updated_at);
+        return if idle >= 60 {
+            format!("{} · idle {}m", activity.current, idle / 60)
+        } else {
+            activity.current.clone()
+        };
+    }
+    if let Some(reason) = model.pending_reason(row) {
+        return reason;
+    }
     if let Some(activity) = activity {
         let idle = elapsed_seconds(&activity.updated_at);
         return if idle >= 60 {
@@ -695,7 +725,7 @@ fn current_activity(
     }
     latest_task(&row.tasks)
         .filter(|task| !task.detail.is_empty())
-        .map(|task| task.detail.clone())
+        .map(|task| compact_task_detail(&task.detail))
         .unwrap_or_else(|| "—".into())
 }
 
@@ -890,6 +920,76 @@ mod tests {
         assert!(detail.contains("Agent detail"));
         assert!(detail.contains("[edit] success"));
         assert!(detail.contains("reload TUI"));
+    }
+
+    #[test]
+    fn renders_live_pending_dependencies_instead_of_stale_activity() {
+        let mut model = DashboardModel::loading("review stage".into(), String::new());
+        model.preparation = None;
+        for (id, document_id, ordinal) in [
+            ("introductions/unit-05", "introductions", 5),
+            ("cohomology/unit-07", "cohomology", 7),
+            ("results/unit-02", "results", 2),
+        ] {
+            model.state.work_units.push(WorkUnit {
+                id: id.into(),
+                document_id: document_id.into(),
+                title: id.into(),
+                ordinal,
+                ..WorkUnit::default()
+            });
+        }
+        model.state.source_dependency_tree.dependencies.insert(
+            "results/unit-02".into(),
+            vec!["cohomology/unit-07".into(), "introductions/unit-05".into()],
+        );
+        for id in ["introductions/unit-05", "cohomology/unit-07"] {
+            model.state.tasks.insert(
+                format!("{id}:review"),
+                Task {
+                    work_unit_id: id.into(),
+                    stage: "review".into(),
+                    status: "pending".into(),
+                    ..Task::default()
+                },
+            );
+        }
+        for (stage, status) in [
+            ("discover", "succeeded"),
+            ("formalize", "succeeded"),
+            ("review", "pending"),
+        ] {
+            model.state.tasks.insert(
+                format!("results/unit-02:{stage}"),
+                Task {
+                    work_unit_id: "results/unit-02".into(),
+                    stage: stage.into(),
+                    status: status.into(),
+                    latest_run_id: (stage == "formalize").then(|| "old-run".into()),
+                    ..Task::default()
+                },
+            );
+        }
+        model.state.activities.insert(
+            "old-run".into(),
+            Activity {
+                current: "finished an earlier stage".into(),
+                ..Activity::default()
+            },
+        );
+        model.selected = 2;
+
+        let row = model.selected_row().unwrap();
+        assert_eq!(
+            current_activity(&model, &row, model.selected_activity()),
+            "waiting: introductions.5, cohomology.7"
+        );
+
+        let backend = TestBackend::new(220, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut model)).unwrap();
+        let rendered = terminal.backend().to_string();
+        assert!(rendered.contains("waiting: introductions.5, cohomology.7"));
     }
 
     #[test]

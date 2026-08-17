@@ -135,6 +135,12 @@ pub struct Scheduling {
 
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default)]
+pub struct SourceDependencyTree {
+    pub dependencies: HashMap<String, Vec<String>>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
 pub struct Isolation {
     pub backend: String,
     pub codex_access: String,
@@ -153,6 +159,7 @@ pub struct SwarmState {
     pub agents: Agents,
     pub coordinator_build: CoordinatorBuild,
     pub scheduling: Scheduling,
+    pub source_dependency_tree: SourceDependencyTree,
     pub isolation: Isolation,
     pub work_units: Vec<WorkUnit>,
     pub tasks: HashMap<String, Task>,
@@ -209,6 +216,7 @@ pub struct GlobalDelta {
     pub agents: Option<Agents>,
     pub coordinator_build: Option<CoordinatorBuild>,
     pub scheduling: Option<Scheduling>,
+    pub source_dependency_tree: Option<SourceDependencyTree>,
     pub isolation: Option<Isolation>,
     pub formalize_graph: Option<Value>,
 }
@@ -340,6 +348,10 @@ impl DashboardModel {
             delta.globals.coordinator_build,
         );
         apply_optional(&mut self.state.scheduling, delta.globals.scheduling);
+        apply_optional(
+            &mut self.state.source_dependency_tree,
+            delta.globals.source_dependency_tree,
+        );
         apply_optional(&mut self.state.isolation, delta.globals.isolation);
         apply_optional(
             &mut self.state.formalize_graph,
@@ -480,6 +492,97 @@ impl DashboardModel {
             && build.stage == stage
             && self.build_targets().contains(work_unit_id)
     }
+
+    /// Explain the first pending stage that is actually able to make progress.
+    ///
+    /// Dependency state is derived from the pushed snapshot instead of being persisted as
+    /// presentation text. That keeps this reason current as prerequisites complete without
+    /// generating extra state revisions solely for the dashboard.
+    pub fn pending_reason(&self, row: &RowModel<'_>) -> Option<String> {
+        for (stage, own_prerequisite) in [("formalize", "discover"), ("review", "formalize")] {
+            let Some(task) = row.tasks.get(stage) else {
+                continue;
+            };
+            if task.status != "pending" || task.queued {
+                continue;
+            }
+            if row
+                .tasks
+                .get(own_prerequisite)
+                .is_none_or(|prerequisite| prerequisite.status != "succeeded")
+            {
+                continue;
+            }
+            let Some(dependencies) = self
+                .state
+                .source_dependency_tree
+                .dependencies
+                .get(&row.unit.id)
+            else {
+                continue;
+            };
+            let mut waiting = dependencies
+                .iter()
+                .filter(|dependency| {
+                    self.state
+                        .tasks
+                        .get(&format!("{dependency}:{stage}"))
+                        .is_none_or(|required| required.status != "succeeded")
+                })
+                .collect::<Vec<_>>();
+            waiting.sort_by_key(|dependency| {
+                self.state
+                    .work_units
+                    .iter()
+                    .position(|unit| unit.id == dependency.as_str())
+                    .unwrap_or(usize::MAX)
+            });
+            if !waiting.is_empty() {
+                return Some(format!(
+                    "waiting: {}",
+                    waiting
+                        .into_iter()
+                        .map(|dependency| self.work_unit_label(dependency))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+            return Some("waiting: scheduler".into());
+        }
+
+        let pending = STAGES
+            .iter()
+            .filter_map(|stage| row.tasks.get(stage))
+            .find(|task| task.status == "pending" && (task.queued || !task.detail.is_empty()))?;
+        if pending.queued && pending.detail.is_empty() {
+            Some("waiting: agent capacity".into())
+        } else {
+            Some(compact_task_detail(&pending.detail))
+        }
+    }
+
+    fn work_unit_label(&self, work_unit_id: &str) -> String {
+        self.state
+            .work_units
+            .iter()
+            .find(|unit| unit.id == work_unit_id)
+            .map_or_else(
+                || work_unit_id.to_owned(),
+                |unit| format!("{}.{}", unit.document_id, unit.ordinal),
+            )
+    }
+}
+
+pub fn compact_task_detail(detail: &str) -> String {
+    const LEGACY_PREFIX: &str = "waiting for prerequisite reviews:";
+    if detail
+        .get(..LEGACY_PREFIX.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(LEGACY_PREFIX))
+    {
+        format!("waiting:{}", &detail[LEGACY_PREFIX.len()..])
+    } else {
+        detail.to_owned()
+    }
 }
 
 fn apply_optional<T>(target: &mut T, value: Option<T>) {
@@ -594,5 +697,80 @@ mod tests {
         assert!(!model.is_building("book/chapter-01", "formalize"));
         model.state.coordinator_build.completed = 2;
         assert!(model.is_building("book/chapter-01", "formalize"));
+    }
+
+    #[test]
+    fn pending_reason_tracks_pushed_prerequisite_status_in_source_order() {
+        let mut model = DashboardModel::loading("test".into(), String::new());
+        for (id, document_id, ordinal) in [
+            ("introductions/unit-05", "introductions", 5),
+            ("cohomology/unit-07", "cohomology", 7),
+            ("results/unit-02", "results", 2),
+        ] {
+            model.state.work_units.push(WorkUnit {
+                id: id.into(),
+                document_id: document_id.into(),
+                ordinal,
+                ..WorkUnit::default()
+            });
+        }
+        model.state.source_dependency_tree.dependencies.insert(
+            "results/unit-02".into(),
+            vec!["cohomology/unit-07".into(), "introductions/unit-05".into()],
+        );
+        for id in ["introductions/unit-05", "cohomology/unit-07"] {
+            model.state.tasks.insert(
+                format!("{id}:review"),
+                Task {
+                    work_unit_id: id.into(),
+                    stage: "review".into(),
+                    status: "pending".into(),
+                    ..Task::default()
+                },
+            );
+        }
+        for (stage, status) in [
+            ("discover", "succeeded"),
+            ("formalize", "succeeded"),
+            ("review", "pending"),
+        ] {
+            model.state.tasks.insert(
+                format!("results/unit-02:{stage}"),
+                Task {
+                    work_unit_id: "results/unit-02".into(),
+                    stage: stage.into(),
+                    status: status.into(),
+                    detail: "waiting: stale prerequisite".into(),
+                    ..Task::default()
+                },
+            );
+        }
+
+        assert_eq!(
+            model.pending_reason(&model.rows()[2]),
+            Some("waiting: introductions.5, cohomology.7".into())
+        );
+
+        model
+            .state
+            .tasks
+            .get_mut("introductions/unit-05:review")
+            .unwrap()
+            .status = "succeeded".into();
+        assert_eq!(
+            model.pending_reason(&model.rows()[2]),
+            Some("waiting: cohomology.7".into())
+        );
+
+        model
+            .state
+            .tasks
+            .get_mut("cohomology/unit-07:review")
+            .unwrap()
+            .status = "succeeded".into();
+        assert_eq!(
+            model.pending_reason(&model.rows()[2]),
+            Some("waiting: scheduler".into())
+        );
     }
 }
