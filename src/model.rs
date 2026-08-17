@@ -119,6 +119,7 @@ pub struct Todo {
 #[serde(default)]
 pub struct Activity {
     pub run_id: String,
+    pub sequence: u64,
     pub updated_at: String,
     pub current: String,
     pub commands: usize,
@@ -332,6 +333,9 @@ pub struct DashboardModel {
     pub detail_runs: Vec<HistoricalRun>,
     pub selected_run: usize,
     pub run_prompts: HashMap<String, String>,
+    pub full_timeline_runs: HashSet<String>,
+    pub loading_timeline_runs: HashSet<String>,
+    pub timeline_errors: HashMap<String, String>,
     pub label: String,
     pub startup_warning: String,
     pub stopping: bool,
@@ -366,6 +370,9 @@ impl DashboardModel {
             detail_runs: Vec::new(),
             selected_run: 0,
             run_prompts: HashMap::new(),
+            full_timeline_runs: HashSet::new(),
+            loading_timeline_runs: HashSet::new(),
+            timeline_errors: HashMap::new(),
             label,
             startup_warning,
             stopping: false,
@@ -439,7 +446,9 @@ impl DashboardModel {
         for task_id in delta.removed_task_ids {
             self.state.tasks.remove(&task_id);
         }
-        self.state.activities.extend(delta.activities);
+        for (run_id, activity) in delta.activities {
+            self.merge_activity(run_id, activity);
+        }
         apply_optional(&mut self.state.updated_at, delta.globals.updated_at);
         apply_optional(&mut self.state.source, delta.globals.source);
         apply_optional(
@@ -495,10 +504,10 @@ impl DashboardModel {
     }
 
     pub fn selected_activity(&self) -> Option<&Activity> {
-        if self.detail {
-            if let Some(run) = self.detail_runs.get(self.selected_run) {
-                return self.state.activities.get(&run.id);
-            }
+        if self.detail
+            && let Some(run) = self.detail_runs.get(self.selected_run)
+        {
+            return self.state.activities.get(&run.id);
         }
         let row = self.selected_row()?;
         row.tasks
@@ -572,6 +581,54 @@ impl DashboardModel {
             .and_then(|run_id| self.run_prompts.get(run_id).map(String::as_str))
     }
 
+    pub fn selected_timeline_status(&self) -> Option<&str> {
+        let run_id = self.selected_run_id()?;
+        if let Some(error) = self.timeline_errors.get(run_id) {
+            Some(error)
+        } else if self.loading_timeline_runs.contains(run_id) {
+            Some("Loading earlier transcript events…")
+        } else {
+            None
+        }
+    }
+
+    pub fn begin_timeline_load(&mut self, run_id: &str) -> bool {
+        if self.full_timeline_runs.contains(run_id) || self.loading_timeline_runs.contains(run_id) {
+            return false;
+        }
+        self.timeline_errors.remove(run_id);
+        self.loading_timeline_runs.insert(run_id.to_owned());
+        true
+    }
+
+    pub fn apply_full_timeline(&mut self, run_id: String, activity: Activity) {
+        self.loading_timeline_runs.remove(&run_id);
+        self.timeline_errors.remove(&run_id);
+        self.full_timeline_runs.insert(run_id.clone());
+        self.merge_activity(run_id, activity);
+    }
+
+    pub fn fail_timeline_load(&mut self, run_id: String, error: String) {
+        self.loading_timeline_runs.remove(&run_id);
+        self.timeline_errors.insert(run_id, error);
+    }
+
+    fn merge_activity(&mut self, run_id: String, mut incoming: Activity) {
+        if self.full_timeline_runs.contains(&run_id)
+            && let Some(existing) = self.state.activities.get(&run_id)
+        {
+            let mut recent = incoming.recent;
+            recent.extend(existing.recent.iter().cloned());
+            recent.sort_by_key(|entry| entry.sequence);
+            recent.dedup_by_key(|entry| entry.sequence);
+            if existing.sequence > incoming.sequence {
+                incoming = existing.clone();
+            }
+            incoming.recent = recent;
+        }
+        self.state.activities.insert(run_id, incoming);
+    }
+
     pub fn apply_chapter_runs(&mut self, details: ChapterRuns) {
         let selected = details
             .selected_run_id
@@ -579,9 +636,7 @@ impl DashboardModel {
             .and_then(|id| details.runs.iter().position(|run| run.id == id))
             .unwrap_or_else(|| details.runs.len().saturating_sub(1));
         if let Some(activity) = details.activity {
-            self.state
-                .activities
-                .insert(activity.run_id.clone(), activity);
+            self.merge_activity(activity.run_id.clone(), activity);
         }
         self.detail_runs = details.runs;
         self.selected_run = selected;
@@ -924,6 +979,51 @@ mod tests {
             .run_prompts
             .insert("review-2".into(), "Review carefully.".into());
         assert_eq!(model.selected_prompt(), Some("Review carefully."));
+    }
+
+    #[test]
+    fn full_timeline_is_merged_with_new_live_events() {
+        let mut model = DashboardModel::loading("test".into(), String::new());
+        model.state.activities.insert(
+            "run".into(),
+            Activity {
+                run_id: "run".into(),
+                sequence: 3,
+                recent: vec![ActivityEntry {
+                    sequence: 3,
+                    title: "recent".into(),
+                    ..ActivityEntry::default()
+                }],
+                ..Activity::default()
+            },
+        );
+        assert!(model.begin_timeline_load("run"));
+        model.apply_full_timeline(
+            "run".into(),
+            Activity {
+                run_id: "run".into(),
+                sequence: 2,
+                recent: (1..=2)
+                    .map(|sequence| ActivityEntry {
+                        sequence,
+                        title: format!("event {sequence}"),
+                        ..ActivityEntry::default()
+                    })
+                    .collect(),
+                ..Activity::default()
+            },
+        );
+
+        assert_eq!(
+            model.state.activities["run"]
+                .recent
+                .iter()
+                .map(|entry| entry.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert!(model.full_timeline_runs.contains("run"));
+        assert!(!model.loading_timeline_runs.contains("run"));
     }
 
     #[test]

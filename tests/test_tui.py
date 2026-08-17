@@ -1,5 +1,6 @@
 import asyncio
 import fcntl
+import json
 import os
 import pty
 import struct
@@ -301,6 +302,30 @@ async def test_chapter_run_projection_lists_history_and_selected_recent_activity
     prompt_path.write_text("Formalize this chapter.", encoding="utf-8")
     assert state.dashboard_run_prompt(formalize.id) == "Formalize this chapter."
     assert state.dashboard_run_prompt("missing-run") is None
+
+    transcript_path = state.logs_dir / f"{formalize.id}.jsonl"
+    transcript_path.write_text(
+        "".join(
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "id": f"event-{index}",
+                        "type": "reasoning",
+                        "status": "completed",
+                    },
+                }
+            )
+            + "\n"
+            for index in range(150)
+        ),
+        encoding="utf-8",
+    )
+    formalize.log_path = str(transcript_path)
+    formalize.project_root = str(tmp_path)
+    full_timeline = state.dashboard_run_timeline(formalize.id)
+    assert full_timeline is not None
+    assert len(full_timeline["recent"]) == 150
 
 
 async def test_native_tui_connects_renders_and_exits_with_pipeline(

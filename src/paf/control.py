@@ -206,6 +206,7 @@ class ControlServer:
         self.result_path.write_bytes(json.dumpb(payload, indent=True, sort_keys=True))
 
     async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        command = ""
         try:
             line = await reader.readline()
             request = json.loads(line)
@@ -273,13 +274,32 @@ class ControlServer:
                 if prompt is None:
                     raise ValueError(f"unknown run: {run_id}")
                 response = {"protocol_version": PROTOCOL_VERSION, "prompt": prompt}
+            elif command == "run_timeline":
+                run_id = request.get("run_id")
+                if not isinstance(run_id, str) or not run_id:
+                    raise ValueError("run_timeline run_id must be a non-empty string")
+                activity = await asyncio.to_thread(
+                    self.orchestrator.state.dashboard_run_timeline, run_id
+                )
+                if activity is None:
+                    raise ValueError(f"timeline unavailable for run: {run_id}")
+                response = {
+                    "protocol_version": PROTOCOL_VERSION,
+                    "run_id": run_id,
+                    "activity": activity,
+                }
             elif command == "status":
                 response = self._status()
             else:
                 raise ValueError(f"unknown command: {command}")
         except (json.JSONDecodeError, ValueError) as error:
             response = {"protocol_version": PROTOCOL_VERSION, "error": str(error)}
-        writer.write(json.dumpb(response, sort_keys=True) + b"\n")
+        serialized = (
+            await asyncio.to_thread(json.dumpb, response, sort_keys=True)
+            if command == "run_timeline"
+            else json.dumpb(response, sort_keys=True)
+        )
+        writer.write(serialized + b"\n")
         with suppress(ConnectionError):
             await writer.drain()
         writer.close()

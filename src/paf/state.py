@@ -1757,6 +1757,26 @@ class StateStore:
         except FileNotFoundError:
             return ""
 
+    def dashboard_run_timeline(self, run_id: str) -> dict[str, Any] | None:
+        """Replay one complete transcript without replacing the bounded hot cache."""
+
+        run = self._runs_by_id.get(run_id)
+        if run is None:
+            return None
+        if not run.log_path:
+            activity = self.activities.get(run_id)
+            return activity.as_dict() if activity is not None else None
+        activity = self.activities.replay(
+            run.id,
+            run.chapter_id,
+            run.role or run.stage,
+            Path(run.log_path),
+            workspace_root=Path(run.project_root or self.config.settings.repo),
+            maximum_events=None,
+            cache=False,
+        )
+        return activity.as_dict() if activity is not None else None
+
     def latest_run(self, chapter_id: str) -> RunRecord | None:
         return self.active_run(chapter_id) or self._latest_runs_by_chapter.get(chapter_id)
 

@@ -608,7 +608,12 @@ fn draw_detail(frame: &mut Frame<'_>, model: &mut DashboardModel) {
             .block(Block::default().borders(Borders::BOTTOM)),
         layout[3],
     );
-    let text = detail_text(model.detail_tab, activity, model.selected_prompt());
+    let text = detail_text(
+        model.detail_tab,
+        activity,
+        model.selected_prompt(),
+        model.selected_timeline_status(),
+    );
     draw_detail_content(frame, model, text, layout[4]);
     frame.render_widget(
         Paragraph::new("←→ runs  Tab/Shift-Tab views  ↑↓ scroll  r reload  d detach  Esc/q back")
@@ -648,7 +653,12 @@ fn draw_detail_content(
     }
 }
 
-fn detail_text(tab: DetailTab, activity: Option<&Activity>, prompt: Option<&str>) -> Text<'static> {
+fn detail_text(
+    tab: DetailTab,
+    activity: Option<&Activity>,
+    prompt: Option<&str>,
+    timeline_status: Option<&str>,
+) -> Text<'static> {
     if tab == DetailTab::Prompt {
         return Text::from(match prompt {
             Some("") => "No prompt was recorded for this run.".to_owned(),
@@ -657,39 +667,53 @@ fn detail_text(tab: DetailTab, activity: Option<&Activity>, prompt: Option<&str>
         });
     }
     match (tab, activity) {
+        (DetailTab::Timeline, None) if timeline_status.is_some() => {
+            Text::from(timeline_status.unwrap_or_default().to_owned())
+        }
         (_, None) => Text::from("No activity recorded for the latest run."),
-        (DetailTab::Timeline, Some(activity)) => Text::from(
-            activity
-                .recent
-                .iter()
-                .flat_map(|entry| {
-                    let clock = entry.at.get(11..19).unwrap_or(&entry.at);
-                    let mark = match entry.status.as_str() {
-                        "started" => "▶",
-                        "completed" => "✓",
-                        "failed" => "✗",
-                        _ => "•",
-                    };
-                    let mut lines = vec![Line::from(vec![
-                        Span::raw(format!("{clock} {mark} ")),
-                        Span::styled(
-                            format!("[{}]", activity_kind(&entry.kind)),
-                            Style::default()
-                                .fg(kind_color(&entry.kind))
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                        Span::raw(format!(" {}", entry.title)),
-                    ])];
-                    lines.extend(
-                        entry
-                            .detail
-                            .lines()
-                            .map(|detail| Line::from(format!("    {detail}"))),
-                    );
-                    lines
+        (DetailTab::Timeline, Some(activity)) => {
+            let mut lines = timeline_status
+                .map(|status| {
+                    vec![
+                        Line::styled(status.to_owned(), Style::default().fg(MUTED)),
+                        Line::from(""),
+                    ]
                 })
-                .collect::<Vec<_>>(),
-        ),
+                .unwrap_or_default();
+            lines.extend(
+                activity
+                    .recent
+                    .iter()
+                    .flat_map(|entry| {
+                        let clock = entry.at.get(11..19).unwrap_or(&entry.at);
+                        let mark = match entry.status.as_str() {
+                            "started" => "▶",
+                            "completed" => "✓",
+                            "failed" => "✗",
+                            _ => "•",
+                        };
+                        let mut lines = vec![Line::from(vec![
+                            Span::raw(format!("{clock} {mark} ")),
+                            Span::styled(
+                                format!("[{}]", activity_kind(&entry.kind)),
+                                Style::default()
+                                    .fg(kind_color(&entry.kind))
+                                    .add_modifier(Modifier::BOLD),
+                            ),
+                            Span::raw(format!(" {}", entry.title)),
+                        ])];
+                        lines.extend(
+                            entry
+                                .detail
+                                .lines()
+                                .map(|detail| Line::from(format!("    {detail}"))),
+                        );
+                        lines
+                    })
+                    .collect::<Vec<_>>(),
+            );
+            Text::from(lines)
+        }
         (DetailTab::Summary, Some(activity)) => {
             let mut lines = vec![Line::styled(
                 "LATEST AGENT UPDATE",

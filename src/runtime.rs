@@ -22,6 +22,10 @@ use crate::ui;
 enum RuntimeEvent {
     Terminal(Event),
     Wire(Box<Result<WireEvent, String>>),
+    Timeline {
+        run_id: String,
+        result: Box<Result<crate::model::Activity, String>>,
+    },
 }
 
 pub enum TuiExit {
@@ -97,7 +101,7 @@ pub fn run(
     );
     let (sender, receiver) = mpsc::channel();
     spawn_stream_reader(stream, sender.clone());
-    spawn_terminal_reader(sender);
+    spawn_terminal_reader(sender.clone());
 
     enable_raw_mode().context("could not enable terminal raw mode")?;
     let _guard = TerminalGuard;
@@ -132,6 +136,7 @@ pub fn run(
                 if model.detail && model.detail_runs.is_empty() {
                     load_chapter_runs(&mut model, socket_path, None)?;
                     load_prompt_if_needed(&mut model, socket_path)?;
+                    request_timeline_if_needed(&mut model, socket_path, sender.clone());
                 }
                 dirty = true;
                 if complete {
@@ -143,7 +148,12 @@ pub fn run(
                 bail!(event.expect_err("guarded as failed wire event"))
             }
             Ok(RuntimeEvent::Terminal(event)) => {
+                let previous_run = model.selected_run_id().map(str::to_owned);
                 dirty = handle_terminal_event(event, &mut model, socket_path)?;
+                let selected_run = model.selected_run_id().map(str::to_owned);
+                if selected_run != previous_run && selected_run.is_some() {
+                    request_timeline_if_needed(&mut model, socket_path, sender.clone());
+                }
                 if model.detach_requested {
                     return Ok(TuiExit::Detach);
                 }
@@ -156,6 +166,13 @@ pub fn run(
                     });
                     return Ok(TuiExit::Reload(agent_view.flatten()));
                 }
+            }
+            Ok(RuntimeEvent::Timeline { run_id, result }) => {
+                match *result {
+                    Ok(activity) => model.apply_full_timeline(run_id, activity),
+                    Err(error) => model.fail_timeline_load(run_id, error),
+                }
+                dirty = true;
             }
             Err(RecvTimeoutError::Timeout) => {
                 // This is a presentation clock for idle/elapsed labels, never a state poll.
@@ -350,6 +367,43 @@ fn load_prompt_if_needed(model: &mut DashboardModel, socket_path: &str) -> Resul
         .context("run prompt response omitted prompt")?;
     model.run_prompts.insert(run_id, prompt.to_owned());
     Ok(())
+}
+
+fn request_timeline_if_needed(
+    model: &mut DashboardModel,
+    socket_path: &str,
+    sender: Sender<RuntimeEvent>,
+) {
+    let Some(run_id) = model.selected_run_id().map(str::to_owned) else {
+        return;
+    };
+    if !model.begin_timeline_load(&run_id) {
+        return;
+    }
+    let socket_path = socket_path.to_owned();
+    thread::spawn(move || {
+        let result = send_control_request(
+            &socket_path,
+            &json!({"command": "run_timeline", "run_id": run_id}),
+        )
+        .and_then(|response| {
+            if let Some(error) = response.get("error") {
+                bail!("{error}")
+            }
+            serde_json::from_value(
+                response
+                    .get("activity")
+                    .cloned()
+                    .context("timeline response omitted activity")?,
+            )
+            .context("invalid timeline activity")
+        })
+        .map_err(|error| error.to_string());
+        let _ = sender.send(RuntimeEvent::Timeline {
+            run_id,
+            result: Box::new(result),
+        });
+    });
 }
 
 fn handle_mouse_event(mouse: MouseEvent, model: &mut DashboardModel) -> bool {
