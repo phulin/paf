@@ -297,6 +297,11 @@ async def test_chapter_run_projection_lists_history_and_selected_recent_activity
     assert details["activity"]["current"] == "historical formalization"
     assert review.id != details["selected_run_id"]
 
+    prompt_path = state.logs_dir / f"{formalize.id}.prompt.md"
+    prompt_path.write_text("Formalize this chapter.", encoding="utf-8")
+    assert state.dashboard_run_prompt(formalize.id) == "Formalize this chapter."
+    assert state.dashboard_run_prompt("missing-run") is None
+
 
 async def test_native_tui_connects_renders_and_exits_with_pipeline(
     monkeypatch,

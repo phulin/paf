@@ -608,7 +608,7 @@ fn draw_detail(frame: &mut Frame<'_>, model: &mut DashboardModel) {
             .block(Block::default().borders(Borders::BOTTOM)),
         layout[3],
     );
-    let text = detail_text(model.detail_tab, activity);
+    let text = detail_text(model.detail_tab, activity, model.selected_prompt());
     draw_detail_content(frame, model, text, layout[4]);
     frame.render_widget(
         Paragraph::new("←→ runs  Tab/Shift-Tab views  ↑↓ scroll  r reload  d detach  Esc/q back")
@@ -648,7 +648,14 @@ fn draw_detail_content(
     }
 }
 
-fn detail_text(tab: DetailTab, activity: Option<&Activity>) -> Text<'static> {
+fn detail_text(tab: DetailTab, activity: Option<&Activity>, prompt: Option<&str>) -> Text<'static> {
+    if tab == DetailTab::Prompt {
+        return Text::from(match prompt {
+            Some("") => "No prompt was recorded for this run.".to_owned(),
+            Some(value) => value.to_owned(),
+            None => "Loading prompt…".to_owned(),
+        });
+    }
     match (tab, activity) {
         (_, None) => Text::from("No activity recorded for the latest run."),
         (DetailTab::Timeline, Some(activity)) => Text::from(
@@ -726,6 +733,7 @@ fn detail_text(tab: DetailTab, activity: Option<&Activity>) -> Text<'static> {
                 .map(|path| Line::from(format!("• {path}")))
                 .collect::<Vec<_>>(),
         ),
+        (DetailTab::Prompt, _) => unreachable!("prompt handled above"),
     }
 }
 

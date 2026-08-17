@@ -131,6 +131,7 @@ pub fn run(
                 model.apply(event)?;
                 if model.detail && model.detail_runs.is_empty() {
                     load_chapter_runs(&mut model, socket_path, None)?;
+                    load_prompt_if_needed(&mut model, socket_path)?;
                 }
                 dirty = true;
                 if complete {
@@ -251,6 +252,7 @@ fn handle_terminal_event(
             .detail_runs
             .get(model.selected_run)
             .map(|run| run.id.clone());
+        let previous_tab = model.detail_tab;
         let dirty = handle_detail_key(key, model)?;
         let selected_run = model
             .detail_runs
@@ -258,6 +260,9 @@ fn handle_terminal_event(
             .map(|run| run.id.clone());
         if selected_run != previous_run {
             load_chapter_runs(model, socket_path, selected_run.as_deref())?;
+        }
+        if model.detail_tab != previous_tab || selected_run != previous_run {
+            load_prompt_if_needed(model, socket_path)?;
         }
         return Ok(dirty);
     }
@@ -320,6 +325,31 @@ fn handle_terminal_event(
         }
         _ => Ok(false),
     }
+}
+
+fn load_prompt_if_needed(model: &mut DashboardModel, socket_path: &str) -> Result<()> {
+    if model.detail_tab != crate::model::DetailTab::Prompt {
+        return Ok(());
+    }
+    let Some(run_id) = model.selected_run_id().map(str::to_owned) else {
+        return Ok(());
+    };
+    if model.run_prompts.contains_key(&run_id) {
+        return Ok(());
+    }
+    let response = send_control_request(
+        socket_path,
+        &json!({"command": "run_prompt", "run_id": run_id}),
+    )?;
+    if let Some(error) = response.get("error") {
+        bail!("orchestrator rejected run prompt request: {error}")
+    }
+    let prompt = response
+        .get("prompt")
+        .and_then(Value::as_str)
+        .context("run prompt response omitted prompt")?;
+    model.run_prompts.insert(run_id, prompt.to_owned());
+    Ok(())
 }
 
 fn handle_mouse_event(mouse: MouseEvent, model: &mut DashboardModel) -> bool {

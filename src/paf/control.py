@@ -265,6 +265,14 @@ class ControlServer:
                         chapter, selected_run_id=run_id
                     ),
                 }
+            elif command == "run_prompt":
+                run_id = request.get("run_id")
+                if not isinstance(run_id, str) or not run_id:
+                    raise ValueError("run_prompt run_id must be a non-empty string")
+                prompt = self.orchestrator.state.dashboard_run_prompt(run_id)
+                if prompt is None:
+                    raise ValueError(f"unknown run: {run_id}")
+                response = {"protocol_version": PROTOCOL_VERSION, "prompt": prompt}
             elif command == "status":
                 response = self._status()
             else:

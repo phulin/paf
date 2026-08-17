@@ -151,7 +151,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
     parser.add_argument("--label", default="managed pipeline")
     parser.add_argument("--startup-warning", default="")
     parser.add_argument("--agent-view")
-    parser.add_argument("--detail-tab", choices=("timeline", "summary", "plan", "files"))
+    parser.add_argument("--detail-tab", choices=("timeline", "prompt", "summary", "plan", "files"))
     args = parser.parse_args(arguments)
     outcome = _native_run(
         args.socket,

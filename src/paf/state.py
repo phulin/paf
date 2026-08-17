@@ -1746,6 +1746,17 @@ class StateStore:
             "activity": activity.as_dict() if activity is not None else None,
         }
 
+    def dashboard_run_prompt(self, run_id: str) -> str | None:
+        """Read a run prompt only for an explicitly opened prompt tab."""
+
+        if run_id not in self._runs_by_id:
+            return None
+        path = self.logs_dir / f"{run_id}.prompt.md"
+        try:
+            return path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return ""
+
     def latest_run(self, chapter_id: str) -> RunRecord | None:
         return self.active_run(chapter_id) or self._latest_runs_by_chapter.get(chapter_id)
 

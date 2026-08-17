@@ -272,17 +272,25 @@ pub struct GlobalDelta {
 pub enum DetailTab {
     #[default]
     Timeline,
+    Prompt,
     Summary,
     Plan,
     Files,
 }
 
 impl DetailTab {
-    pub const ALL: [Self; 4] = [Self::Timeline, Self::Summary, Self::Plan, Self::Files];
+    pub const ALL: [Self; 5] = [
+        Self::Timeline,
+        Self::Prompt,
+        Self::Summary,
+        Self::Plan,
+        Self::Files,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
             Self::Timeline => "Timeline",
+            Self::Prompt => "Prompt",
             Self::Summary => "Update",
             Self::Plan => "Plan",
             Self::Files => "Files",
@@ -292,6 +300,7 @@ impl DetailTab {
     pub fn name(self) -> &'static str {
         match self {
             Self::Timeline => "timeline",
+            Self::Prompt => "prompt",
             Self::Summary => "summary",
             Self::Plan => "plan",
             Self::Files => "files",
@@ -301,6 +310,7 @@ impl DetailTab {
     fn from_name(name: &str) -> Self {
         match name {
             "summary" => Self::Summary,
+            "prompt" => Self::Prompt,
             "plan" => Self::Plan,
             "files" => Self::Files,
             _ => Self::Timeline,
@@ -321,6 +331,7 @@ pub struct DashboardModel {
     pub detail_follow_tail: bool,
     pub detail_runs: Vec<HistoricalRun>,
     pub selected_run: usize,
+    pub run_prompts: HashMap<String, String>,
     pub label: String,
     pub startup_warning: String,
     pub stopping: bool,
@@ -354,6 +365,7 @@ impl DashboardModel {
             detail_follow_tail: true,
             detail_runs: Vec::new(),
             selected_run: 0,
+            run_prompts: HashMap::new(),
             label,
             startup_warning,
             stopping: false,
@@ -543,9 +555,21 @@ impl DashboardModel {
         self.detail = false;
         self.detail_runs.clear();
         self.selected_run = 0;
+        self.run_prompts.clear();
         self.scroll = 0;
         self.detail_max_scroll = 0;
         self.detail_follow_tail = true;
+    }
+
+    pub fn selected_run_id(&self) -> Option<&str> {
+        self.detail_runs
+            .get(self.selected_run)
+            .map(|run| run.id.as_str())
+    }
+
+    pub fn selected_prompt(&self) -> Option<&str> {
+        self.selected_run_id()
+            .and_then(|run_id| self.run_prompts.get(run_id).map(String::as_str))
     }
 
     pub fn apply_chapter_runs(&mut self, details: ChapterRuns) {
@@ -883,6 +907,23 @@ mod tests {
         assert_eq!(model.selected_activity().unwrap().current, "reviewing");
         model.cycle_run(true);
         assert_eq!(model.selected_run, 0);
+    }
+
+    #[test]
+    fn prompt_tab_content_is_kept_per_run() {
+        let mut model = DashboardModel::loading("test".into(), String::new());
+        model.detail = true;
+        model.detail_tab = DetailTab::Prompt;
+        model.detail_runs = vec![HistoricalRun {
+            id: "review-2".into(),
+            ..HistoricalRun::default()
+        }];
+
+        assert_eq!(model.selected_prompt(), None);
+        model
+            .run_prompts
+            .insert("review-2".into(), "Review carefully.".into());
+        assert_eq!(model.selected_prompt(), Some("Review carefully."));
     }
 
     #[test]
