@@ -17,6 +17,7 @@ from paf.models import (
     BookConfig,
     Chapter,
     PipelineConfig,
+    ShepherdSettings,
     Stage,
     StageConfig,
     SwarmSettings,
@@ -523,6 +524,32 @@ def load_config(path: str | Path, *, project: Project | None = None) -> Pipeline
         raise ValueError("swarm.lean_mcp_tool_timeout_seconds must be positive")
 
     stages = _stage_configs(_table(data, "stages"), base)
+    raw_shepherd = _table(data, "shepherd")
+    shepherd = ShepherdSettings(
+        enabled=bool(raw_shepherd.get("enabled", False)),
+        model=str(raw_shepherd.get("model", "gpt-5.6-sol")),
+        reasoning_effort=str(raw_shepherd.get("reasoning_effort", "xhigh")),
+        worker_model=str(raw_shepherd.get("worker_model", "gpt-5.6-luna")),
+        worker_reasoning_effort=str(raw_shepherd.get("worker_reasoning_effort", "max")),
+        interval_seconds=float(raw_shepherd.get("interval_seconds", 1200)),
+        failure_threshold=int(raw_shepherd.get("failure_threshold", 10)),
+        maximum_failures_per_sweep=int(raw_shepherd.get("maximum_failures_per_sweep", 50)),
+        maximum_work_units_per_sweep=int(raw_shepherd.get("maximum_work_units_per_sweep", 32)),
+        maximum_sweeps_per_invocation=int(raw_shepherd.get("maximum_sweeps_per_invocation", 3)),
+        max_agents=int(raw_shepherd.get("max_agents", 2)),
+    )
+    if shepherd.interval_seconds <= 0:
+        raise ValueError("shepherd.interval_seconds must be positive")
+    if shepherd.failure_threshold < 1:
+        raise ValueError("shepherd.failure_threshold must be positive")
+    if shepherd.maximum_failures_per_sweep < 1:
+        raise ValueError("shepherd.maximum_failures_per_sweep must be positive")
+    if shepherd.maximum_work_units_per_sweep < 1:
+        raise ValueError("shepherd.maximum_work_units_per_sweep must be positive")
+    if shepherd.maximum_sweeps_per_invocation < 1:
+        raise ValueError("shepherd.maximum_sweeps_per_invocation must be positive")
+    if shepherd.max_agents < 1:
+        raise ValueError("shepherd.max_agents must be positive")
 
     source_defaults, source_rules, source_discovery = _read_source_settings(data)
     if "backend" in data and "target" in data:
@@ -623,6 +650,7 @@ def load_config(path: str | Path, *, project: Project | None = None) -> Pipeline
         path=config_path,
         settings=settings,
         stages=stages,
+        shepherd=shepherd,
         books=books,
         chapters=chapters,
         source_rules=source_rules,

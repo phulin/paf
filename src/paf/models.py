@@ -54,6 +54,28 @@ class SwarmSettings:
 
 
 @dataclass(frozen=True)
+class ShepherdSettings:
+    """Configuration for failure triage and repair work.
+
+    The Shepherd is deliberately opt-in because its planner uses a stronger,
+    more expensive model. Repair workers keep using the inexpensive editing
+    model and a high reasoning effort.
+    """
+
+    enabled: bool = False
+    model: str = "gpt-5.6-sol"
+    reasoning_effort: str = "xhigh"
+    worker_model: str = "gpt-5.6-luna"
+    worker_reasoning_effort: str = "max"
+    interval_seconds: float = 1200.0
+    failure_threshold: int = 10
+    maximum_failures_per_sweep: int = 50
+    maximum_work_units_per_sweep: int = 32
+    maximum_sweeps_per_invocation: int = 3
+    max_agents: int = 2
+
+
+@dataclass(frozen=True)
 class BookConfig:
     id: str
     title: str
@@ -372,6 +394,7 @@ class PipelineConfig:
     stages: dict[Stage, StageConfig]
     books: tuple[BookConfig, ...]
     chapters: tuple[Chapter, ...]
+    shepherd: ShepherdSettings = field(default_factory=ShepherdSettings)
     source_rules: tuple[dict[str, Any], ...] = ()
     source_roots: tuple[Path, ...] = ()
     source_include: tuple[str, ...] = ()

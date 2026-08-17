@@ -65,6 +65,49 @@ def test_loads_and_validates_discovery_concurrency(tmp_path: Path) -> None:
         load_config(path)
 
 
+def test_loads_and_validates_shepherd_settings(tmp_path: Path) -> None:
+    path = write_project(tmp_path)
+    text = path.read_text(encoding="utf-8")
+    path.write_text(
+        text
+        + """
+[shepherd]
+enabled = true
+model = "strong-planner"
+reasoning_effort = "xhigh"
+worker_model = "cheap-editor"
+worker_reasoning_effort = "max"
+interval_seconds = 1200
+failure_threshold = 10
+maximum_failures_per_sweep = 40
+maximum_work_units_per_sweep = 24
+maximum_sweeps_per_invocation = 2
+max_agents = 3
+""",
+        encoding="utf-8",
+    )
+
+    shepherd = load_config(path).shepherd
+
+    assert shepherd.enabled is True
+    assert shepherd.model == "strong-planner"
+    assert shepherd.worker_model == "cheap-editor"
+    assert shepherd.worker_reasoning_effort == "max"
+    assert shepherd.interval_seconds == 1200
+    assert shepherd.failure_threshold == 10
+    assert shepherd.maximum_failures_per_sweep == 40
+    assert shepherd.maximum_work_units_per_sweep == 24
+    assert shepherd.maximum_sweeps_per_invocation == 2
+    assert shepherd.max_agents == 3
+
+    path.write_text(
+        path.read_text(encoding="utf-8").replace("failure_threshold = 10", "failure_threshold = 0"),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match=r"shepherd\.failure_threshold"):
+        load_config(path)
+
+
 def test_selects_configured_chapters(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [2]"))
 

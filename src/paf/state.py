@@ -42,6 +42,23 @@ class TaskPhase(StrEnum):
     POSTPROCESS = "postprocess"
 
 
+class RepairCaseStatus(StrEnum):
+    OPEN = "open"
+    PLANNED = "planned"
+    REPAIRING = "repairing"
+    RESOLVED = "resolved"
+    EXHAUSTED = "exhausted"
+
+
+class RepairWorkUnitStatus(StrEnum):
+    PENDING = "pending"
+    RUNNING = "running"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    INTERRUPTED = "interrupted"
+    SUPERSEDED = "superseded"
+
+
 class UpstreamRequestStatus(StrEnum):
     """Completed durable facts for a missing interface in an earlier chapter."""
 
@@ -162,6 +179,10 @@ class TaskRecord:
     # Transient scheduling state: the task is runnable and is waiting for an
     # agent-capacity slot. It remains pending until a run is actually started.
     queued: bool = False
+    # Repair work is an overlay on the existing four-stage state machine. The
+    # underlying task remains failed/blocked until the repair is validated.
+    repairing: bool = False
+    repair_work_unit_id: str = ""
     # Proof completion is tied to the exact validated chapter sources. This is
     # populated only on the prove task.
     source_digest: str | None = None
@@ -184,6 +205,77 @@ class TaskRecord:
     @property
     def unit_title(self) -> str:
         return self.chapter_title
+
+
+@dataclass
+class ShepherdRecord:
+    enabled: bool = False
+    status: str = "idle"
+    model: str = ""
+    worker_model: str = ""
+    interval_seconds: float = 1200.0
+    failure_threshold: int = 10
+    current_sweep_id: str = ""
+    current_run_id: str = ""
+    last_started_at: str | None = None
+    last_finished_at: str | None = None
+    next_run_at: str | None = None
+    last_summary: str = ""
+    last_error: str = ""
+    pending_failures: int = 0
+    planned_units: int = 0
+    running_units: int = 0
+    succeeded_units: int = 0
+    failed_units: int = 0
+
+
+@dataclass
+class RepairCaseRecord:
+    id: str
+    task_key: str
+    chapter_id: str
+    stage: str
+    fingerprint: str
+    status: str = RepairCaseStatus.OPEN
+    opened_at: str = field(default_factory=timestamp)
+    updated_at: str = field(default_factory=timestamp)
+    sweep_id: str = ""
+    work_unit_ids: list[str] = field(default_factory=list)
+
+
+@dataclass
+class RepairSweepRecord:
+    id: str
+    status: str = "planning"
+    trigger: str = ""
+    failure_count: int = 0
+    started_at: str = field(default_factory=timestamp)
+    finished_at: str | None = None
+    run_id: str = ""
+    summary: str = ""
+    error: str = ""
+    case_ids: list[str] = field(default_factory=list)
+    work_unit_ids: list[str] = field(default_factory=list)
+
+
+@dataclass
+class RepairWorkUnitRecord:
+    id: str
+    sweep_id: str
+    case_ids: list[str]
+    task_keys: list[str]
+    owner_chapter_id: str
+    target_stage: str
+    objective: str
+    depends_on: list[str] = field(default_factory=list)
+    effort: str = "medium"
+    priority: float = 0.0
+    status: str = RepairWorkUnitStatus.PENDING
+    detail: str = ""
+    run_id: str = ""
+    created_at: str = field(default_factory=timestamp)
+    started_at: str | None = None
+    finished_at: str | None = None
 
 
 @dataclass
@@ -333,6 +425,17 @@ class StateStore:
         self.upstream_requests: dict[str, dict[str, Any]] = {}
         self.isolation: dict[str, Any] = {}
         self.coordinator_build = CoordinatorBuildRecord()
+        shepherd = config.shepherd
+        self.shepherd = ShepherdRecord(
+            enabled=shepherd.enabled,
+            model=shepherd.model,
+            worker_model=shepherd.worker_model,
+            interval_seconds=shepherd.interval_seconds,
+            failure_threshold=shepherd.failure_threshold,
+        )
+        self.repair_cases: dict[str, RepairCaseRecord] = {}
+        self.repair_sweeps: dict[str, RepairSweepRecord] = {}
+        self.repair_work_units: dict[str, RepairWorkUnitRecord] = {}
         self.created_at = timestamp()
         self.updated_at = self.created_at
         self._config_fingerprint = ""
@@ -419,6 +522,66 @@ class StateStore:
                         if name in CoordinatorBuildRecord.__dataclass_fields__
                     }
                 )
+            raw_shepherd = raw.get("shepherd")
+            if isinstance(raw_shepherd, dict):
+                persisted = {
+                    name: value
+                    for name, value in raw_shepherd.items()
+                    if name in ShepherdRecord.__dataclass_fields__
+                }
+                self.shepherd = ShepherdRecord(**persisted)
+                # Configuration, rather than old state, controls whether and
+                # how often a newly launched orchestrator runs the Shepherd.
+                self.shepherd.enabled = self.config.shepherd.enabled
+                self.shepherd.model = self.config.shepherd.model
+                self.shepherd.worker_model = self.config.shepherd.worker_model
+                self.shepherd.interval_seconds = self.config.shepherd.interval_seconds
+                self.shepherd.failure_threshold = self.config.shepherd.failure_threshold
+            raw_cases = raw.get("repair_cases")
+            if isinstance(raw_cases, dict):
+                for record_id, value in raw_cases.items():
+                    if not isinstance(record_id, str) or not isinstance(value, dict):
+                        continue
+                    fields = {
+                        name: item
+                        for name, item in value.items()
+                        if name in RepairCaseRecord.__dataclass_fields__
+                    }
+                    fields.setdefault("id", record_id)
+                    try:
+                        self.repair_cases[record_id] = RepairCaseRecord(**fields)
+                    except (TypeError, ValueError):
+                        continue
+            raw_sweeps = raw.get("repair_sweeps")
+            if isinstance(raw_sweeps, dict):
+                for record_id, value in raw_sweeps.items():
+                    if not isinstance(record_id, str) or not isinstance(value, dict):
+                        continue
+                    fields = {
+                        name: item
+                        for name, item in value.items()
+                        if name in RepairSweepRecord.__dataclass_fields__
+                    }
+                    fields.setdefault("id", record_id)
+                    try:
+                        self.repair_sweeps[record_id] = RepairSweepRecord(**fields)
+                    except (TypeError, ValueError):
+                        continue
+            raw_units = raw.get("repair_work_units")
+            if isinstance(raw_units, dict):
+                for record_id, value in raw_units.items():
+                    if not isinstance(record_id, str) or not isinstance(value, dict):
+                        continue
+                    fields = {
+                        name: item
+                        for name, item in value.items()
+                        if name in RepairWorkUnitRecord.__dataclass_fields__
+                    }
+                    fields.setdefault("id", record_id)
+                    try:
+                        self.repair_work_units[record_id] = RepairWorkUnitRecord(**fields)
+                    except (TypeError, ValueError):
+                        continue
             persisted_tasks = raw.get("tasks", {})
             legacy_workflow = isinstance(persisted_tasks, dict) and any(
                 isinstance(key, str) and key.endswith(":fixup") for key in persisted_tasks
@@ -473,6 +636,15 @@ class StateStore:
         configured = {chapter.id for chapter in self.config.work_units}
         self.tasks = {
             key: task for key, task in self.tasks.items() if task.chapter_id in configured
+        }
+        self.repair_cases = {
+            key: value for key, value in self.repair_cases.items() if value.chapter_id in configured
+        }
+        self.repair_work_units = {
+            key: value
+            for key, value in self.repair_work_units.items()
+            if value.owner_chapter_id in configured
+            and all(case_id in self.repair_cases for case_id in value.case_ids)
         }
         for chapter in self.config.work_units:
             for stage in Stage:
@@ -543,6 +715,19 @@ class StateStore:
                 task.phase = TaskPhase.IDLE
                 task.queued = False
                 task.detail = "recovered after interrupted orchestrator"
+            # A repair execution cannot survive its orchestrator process. Its
+            # durable unit is requeued below, so clear the transient cell flag.
+            task.repairing = False
+            task.repair_work_unit_id = ""
+        for unit in self.repair_work_units.values():
+            if unit.status == RepairWorkUnitStatus.RUNNING:
+                unit.status = RepairWorkUnitStatus.INTERRUPTED
+                unit.detail = "repair worker interrupted with the orchestrator"
+                unit.finished_at = timestamp()
+        if self.shepherd.status in {"planning", "repairing"}:
+            self.shepherd.status = "idle"
+            self.shepherd.current_run_id = ""
+            self.shepherd.running_units = 0
         if self.coordinator_build.active:
             self.coordinator_build.active = False
             self.coordinator_build.current_chapter_id = ""
@@ -641,6 +826,8 @@ class StateStore:
             "phase": str(task.phase),
             "detail": task.detail,
             "queued": task.queued,
+            "repairing": task.repairing,
+            "repair_work_unit_id": task.repair_work_unit_id,
             "source_digest": task.source_digest,
             "rounds": task.rounds,
             "updated_at": task.updated_at,
@@ -673,7 +860,7 @@ class StateStore:
         cost = self.total_cost()
         invocation_cost = self.invocation_cost()
         return {
-            "version": 15,
+            "version": 16,
             "history_database": DATABASE_NAME,
             "project_root": str(
                 self.config.project.root
@@ -698,6 +885,23 @@ class StateStore:
             "upstream_request_batches": self.upstream_request_batches(),
             "isolation": self.isolation,
             "coordinator_build": self._build_dict(self.coordinator_build),
+            "shepherd": {
+                name: getattr(self.shepherd, name) for name in ShepherdRecord.__dataclass_fields__
+            },
+            "repair_cases": {
+                key: {name: getattr(value, name) for name in RepairCaseRecord.__dataclass_fields__}
+                for key, value in sorted(self.repair_cases.items())
+            },
+            "repair_sweeps": {
+                key: {name: getattr(value, name) for name in RepairSweepRecord.__dataclass_fields__}
+                for key, value in sorted(self.repair_sweeps.items())
+            },
+            "repair_work_units": {
+                key: {
+                    name: getattr(value, name) for name in RepairWorkUnitRecord.__dataclass_fields__
+                }
+                for key, value in sorted(self.repair_work_units.items())
+            },
         }
 
     def _document_dicts(self) -> list[dict[str, Any]]:
@@ -2010,20 +2214,25 @@ class StateStore:
         *,
         role: str,
         request_ids: Iterable[str],
+        model: str | None = None,
     ) -> RunRecord:
         """Record a temporary agent without mutating the owner's chapter-stage state."""
 
         task = self.task(chapter_id, stage)
+        chapter = self.config.work_unit(chapter_id)
         role_round = 1 + sum((run.role or run.stage) == role for run in task.runs)
         run = RunRecord(
             id=uuid4().hex[:12],
             chapter_id=chapter_id,
             stage=stage.value,
             round=role_round,
-            model=self.config.model_for(stage),
+            model=model if model is not None else self.config.model_for(stage),
             role=role,
             auxiliary=True,
             request_ids=list(dict.fromkeys(request_ids)),
+            source=chapter.source.as_posix(),
+            source_start_line=chapter.source_span.start_line,
+            source_end_line=chapter.source_span.end_line,
             project_root=str(
                 self.config.project.root
                 if self.config.project is not None
@@ -2037,6 +2246,183 @@ class StateStore:
         self._mark_dirty(task=task, run=run)
         await self._persist()
         return run
+
+    def repairable_tasks(self) -> list[tuple[str, TaskRecord]]:
+        """Current terminal failures eligible for Shepherd triage."""
+
+        return sorted(
+            (
+                (key, task)
+                for key, task in self.tasks.items()
+                if task.status in {TaskStatus.FAILED, TaskStatus.BLOCKED} and not task.repairing
+            ),
+            key=lambda item: (item[1].updated_at, item[0]),
+        )
+
+    def ensure_repair_case(self, task_key: str) -> RepairCaseRecord:
+        task = self.tasks[task_key]
+        latest = task.runs[-1] if task.runs else None
+        evidence = {
+            "task_key": task_key,
+            "status": str(task.status),
+            "detail": task.detail,
+            "run_id": latest.id if latest is not None else "",
+            "exit_code": latest.exit_code if latest is not None else None,
+            "validation": latest.validation if latest is not None else None,
+        }
+        fingerprint = hashlib.sha256(json.dumpb(evidence, sort_keys=True)).hexdigest()
+        for case in self.repair_cases.values():
+            if case.task_key == task_key and case.fingerprint == fingerprint:
+                return case
+        case_id = hashlib.sha256(f"{task_key}:{fingerprint}".encode()).hexdigest()[:16]
+        case = RepairCaseRecord(
+            id=case_id,
+            task_key=task_key,
+            chapter_id=task.chapter_id,
+            stage=str(task.stage),
+            fingerprint=fingerprint,
+        )
+        self.repair_cases[case.id] = case
+        self._mark_dirty()
+        return case
+
+    async def start_repair_sweep(
+        self,
+        *,
+        trigger: str,
+        task_keys: Iterable[str],
+    ) -> RepairSweepRecord:
+        cases = [self.ensure_repair_case(key) for key in dict.fromkeys(task_keys)]
+        sweep = RepairSweepRecord(
+            id=uuid4().hex[:12],
+            trigger=trigger,
+            failure_count=len(cases),
+            case_ids=[case.id for case in cases],
+        )
+        self.repair_sweeps[sweep.id] = sweep
+        self.shepherd.status = "planning"
+        self.shepherd.current_sweep_id = sweep.id
+        self.shepherd.last_started_at = sweep.started_at
+        self.shepherd.last_error = ""
+        self.shepherd.pending_failures = len(cases)
+        self.shepherd.planned_units = 0
+        self.shepherd.running_units = 0
+        self.shepherd.succeeded_units = 0
+        self.shepherd.failed_units = 0
+        self._mark_dirty()
+        await self._persist()
+        return sweep
+
+    async def install_repair_plan(
+        self,
+        sweep_id: str,
+        units: Iterable[RepairWorkUnitRecord],
+        *,
+        summary: str,
+        run_id: str,
+    ) -> None:
+        sweep = self.repair_sweeps[sweep_id]
+        installed = list(units)
+        for unit in installed:
+            if unit.sweep_id != sweep_id:
+                raise ValueError(f"repair unit {unit.id} belongs to another sweep")
+            self.repair_work_units[unit.id] = unit
+            for case_id in unit.case_ids:
+                case = self.repair_cases[case_id]
+                case.status = RepairCaseStatus.PLANNED
+                case.sweep_id = sweep_id
+                if unit.id not in case.work_unit_ids:
+                    case.work_unit_ids.append(unit.id)
+                case.updated_at = timestamp()
+        sweep.status = "repairing" if installed else "completed"
+        sweep.summary = summary
+        sweep.run_id = run_id
+        sweep.work_unit_ids = [unit.id for unit in installed]
+        self.shepherd.status = "repairing" if installed else "idle"
+        self.shepherd.current_run_id = ""
+        self.shepherd.last_summary = summary
+        self.shepherd.planned_units = len(installed)
+        self._mark_dirty()
+        await self._persist()
+
+    async def start_repair_work_unit(self, unit_id: str) -> None:
+        unit = self.repair_work_units[unit_id]
+        unit.status = RepairWorkUnitStatus.RUNNING
+        unit.started_at = timestamp()
+        unit.finished_at = None
+        unit.detail = "repair worker running"
+        changed_tasks: list[TaskRecord] = []
+        for task_key in unit.task_keys:
+            task = self.tasks.get(task_key)
+            if task is None:
+                continue
+            task.repairing = True
+            task.repair_work_unit_id = unit.id
+            task.updated_at = timestamp()
+            changed_tasks.append(task)
+        for case_id in unit.case_ids:
+            case = self.repair_cases[case_id]
+            case.status = RepairCaseStatus.REPAIRING
+            case.updated_at = timestamp()
+        self.shepherd.running_units += 1
+        self._mark_dirty(tasks=changed_tasks)
+        await self._persist()
+
+    async def finish_repair_work_unit(
+        self,
+        unit_id: str,
+        *,
+        status: RepairWorkUnitStatus,
+        detail: str,
+        run_id: str = "",
+    ) -> None:
+        unit = self.repair_work_units[unit_id]
+        unit.status = status
+        unit.detail = detail
+        unit.run_id = run_id
+        unit.finished_at = timestamp()
+        changed_tasks: list[TaskRecord] = []
+        for task_key in unit.task_keys:
+            task = self.tasks.get(task_key)
+            if task is None:
+                continue
+            if task.repair_work_unit_id == unit.id:
+                task.repairing = False
+                task.repair_work_unit_id = ""
+                task.updated_at = timestamp()
+                changed_tasks.append(task)
+        self.shepherd.running_units = max(0, self.shepherd.running_units - 1)
+        if status == RepairWorkUnitStatus.SUCCEEDED:
+            self.shepherd.succeeded_units += 1
+        else:
+            self.shepherd.failed_units += 1
+        self._mark_dirty(tasks=changed_tasks)
+        await self._persist()
+
+    async def finish_repair_sweep(self, sweep_id: str, *, error: str = "") -> None:
+        sweep = self.repair_sweeps[sweep_id]
+        sweep.status = "failed" if error else "completed"
+        sweep.error = error
+        sweep.finished_at = timestamp()
+        for case_id in sweep.case_ids:
+            case = self.repair_cases[case_id]
+            task = self.tasks.get(case.task_key)
+            if task is not None and task.status not in {
+                TaskStatus.FAILED,
+                TaskStatus.BLOCKED,
+            }:
+                case.status = RepairCaseStatus.RESOLVED
+            elif case.status != RepairCaseStatus.RESOLVED:
+                case.status = RepairCaseStatus.EXHAUSTED
+            case.updated_at = timestamp()
+        self.shepherd.status = "error" if error else "idle"
+        self.shepherd.current_sweep_id = ""
+        self.shepherd.current_run_id = ""
+        self.shepherd.last_finished_at = sweep.finished_at
+        self.shepherd.last_error = error
+        self.shepherd.pending_failures = len(self.repairable_tasks())
+        self._mark_dirty()
+        await self._persist()
 
     async def update_run(self, run: RunRecord, *, deferred: bool = False, **changes: Any) -> None:
         old_usage = run.usage
