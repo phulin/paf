@@ -852,38 +852,43 @@ fn draw_timeline_content(frame: &mut Frame<'_>, model: &mut DashboardModel, area
     let inner = block.inner(area);
     let activity = model.selected_activity();
     let run_id = activity.map_or_else(String::new, |value| value.run_id.clone());
-    let sequence = activity.map_or(0, |value| value.sequence);
     let recent_len = activity.map_or(0, |value| value.recent.len());
+    let last_entry_sequence = activity
+        .and_then(|value| value.recent.last())
+        .map(|entry| entry.sequence);
     let status = model.selected_timeline_status().map(str::to_owned);
-    let cache_matches = {
+    let cache_base_matches = {
         let cache = &model.timeline_render_cache;
-        cache.run_id == run_id
-            && cache.sequence == sequence
-            && cache.recent_len == recent_len
-            && cache.status == status
-            && cache.width == inner.width
+        cache.run_id == run_id && cache.status == status && cache.width == inner.width
     };
-    if !cache_matches {
+    let is_append = cache_base_matches
+        && recent_len >= model.timeline_render_cache.recent_len
+        && (model.timeline_render_cache.recent_len == 0
+            || activity
+                .and_then(|value| value.recent.get(model.timeline_render_cache.recent_len - 1))
+                .map(|entry| entry.sequence)
+                == model.timeline_render_cache.last_entry_sequence);
+    if is_append && recent_len > model.timeline_render_cache.recent_len {
+        let append_from = model.timeline_render_cache.recent_len;
+        let lines = timeline_entry_lines(
+            &activity.expect("a non-empty timeline has activity").recent[append_from..],
+        );
+        append_wrapped_lines(&mut model.timeline_render_cache, lines, inner.width);
+        model.timeline_render_cache.recent_len = recent_len;
+        model.timeline_render_cache.last_entry_sequence = last_entry_sequence;
+    } else if !is_append {
         let text = detail_text(DetailTab::Timeline, activity, None, status.as_deref());
-        let mut offsets = Vec::with_capacity(text.lines.len() + 1);
-        let mut rendered_lines = 0usize;
-        offsets.push(rendered_lines);
-        for line in &text.lines {
-            rendered_lines += Paragraph::new(line.clone())
-                .wrap(Wrap { trim: false })
-                .line_count(inner.width);
-            offsets.push(rendered_lines);
-        }
-        model.timeline_render_cache = TimelineRenderCache {
+        let mut cache = TimelineRenderCache {
             run_id,
-            sequence,
             recent_len,
+            last_entry_sequence,
             status,
             width: inner.width,
-            lines: text.lines,
-            offsets,
-            rendered_lines,
+            offsets: vec![0],
+            ..TimelineRenderCache::default()
         };
+        append_wrapped_lines(&mut cache, text.lines, inner.width);
+        model.timeline_render_cache = cache;
     }
 
     let maximum = model
@@ -917,6 +922,18 @@ fn draw_timeline_content(frame: &mut Frame<'_>, model: &mut DashboardModel, area
         inner,
     );
     draw_detail_scrollbar(frame, model.scroll, maximum, inner.height, area);
+}
+
+fn append_wrapped_lines(cache: &mut TimelineRenderCache, lines: Vec<Line<'static>>, width: u16) {
+    cache.lines.reserve(lines.len());
+    cache.offsets.reserve(lines.len());
+    for line in lines {
+        cache.rendered_lines += Paragraph::new(line.clone())
+            .wrap(Wrap { trim: false })
+            .line_count(width);
+        cache.lines.push(line);
+        cache.offsets.push(cache.rendered_lines);
+    }
 }
 
 fn draw_detail_scrollbar(
@@ -966,38 +983,7 @@ fn detail_text(
                     ]
                 })
                 .unwrap_or_default();
-            lines.extend(
-                activity
-                    .recent
-                    .iter()
-                    .flat_map(|entry| {
-                        let clock = entry.at.get(11..19).unwrap_or(&entry.at);
-                        let mark = match entry.status.as_str() {
-                            "started" => "▶",
-                            "completed" => "✓",
-                            "failed" => "✗",
-                            _ => "•",
-                        };
-                        let mut lines = vec![Line::from(vec![
-                            Span::raw(format!("{clock} {mark} ")),
-                            Span::styled(
-                                format!("[{}]", activity_kind(&entry.kind)),
-                                Style::default()
-                                    .fg(kind_color(&entry.kind))
-                                    .add_modifier(Modifier::BOLD),
-                            ),
-                            Span::raw(format!(" {}", entry.title)),
-                        ])];
-                        lines.extend(
-                            entry
-                                .detail
-                                .lines()
-                                .map(|detail| Line::from(format!("    {detail}"))),
-                        );
-                        lines
-                    })
-                    .collect::<Vec<_>>(),
-            );
+            lines.extend(timeline_entry_lines(&activity.recent));
             Text::from(lines)
         }
         (DetailTab::Summary, Some(activity)) => {
@@ -1045,6 +1031,38 @@ fn detail_text(
         ),
         (DetailTab::Prompt, _) => unreachable!("prompt handled above"),
     }
+}
+
+fn timeline_entry_lines(entries: &[crate::model::ActivityEntry]) -> Vec<Line<'static>> {
+    entries
+        .iter()
+        .flat_map(|entry| {
+            let clock = entry.at.get(11..19).unwrap_or(&entry.at);
+            let mark = match entry.status.as_str() {
+                "started" => "▶",
+                "completed" => "✓",
+                "failed" => "✗",
+                _ => "•",
+            };
+            let mut lines = vec![Line::from(vec![
+                Span::raw(format!("{clock} {mark} ")),
+                Span::styled(
+                    format!("[{}]", activity_kind(&entry.kind)),
+                    Style::default()
+                        .fg(kind_color(&entry.kind))
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(format!(" {}", entry.title)),
+            ])];
+            lines.extend(
+                entry
+                    .detail
+                    .lines()
+                    .map(|detail| Line::from(format!("    {detail}"))),
+            );
+            lines
+        })
+        .collect()
 }
 
 fn latest_task<'a>(tasks: &'a HashMap<&str, &'a Task>) -> Option<&'a Task> {
@@ -1690,6 +1708,42 @@ mod tests {
         assert!(
             elapsed < Duration::from_millis(250),
             "cached timeline scroll took {elapsed:?}"
+        );
+
+        let first_line_text = model.timeline_render_cache.lines[0].spans[0]
+            .content
+            .as_ptr();
+        let prior_lines = model.timeline_render_cache.lines.len();
+        let prior_scroll = model.scroll;
+        let activity = model.state.activities.get_mut("long-run").unwrap();
+        activity.sequence += 1;
+        activity.recent.push(ActivityEntry {
+            sequence: 10_000,
+            at: "2026-08-16T00:00:01+00:00".into(),
+            kind: "message".into(),
+            status: "completed".into(),
+            title: "appended-event".into(),
+            detail: "appended-detail".into(),
+        });
+        let started = Instant::now();
+        terminal.draw(|frame| draw(frame, &mut model)).unwrap();
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            model.timeline_render_cache.lines[0].spans[0]
+                .content
+                .as_ptr(),
+            first_line_text,
+            "an append must retain the previously laid-out lines"
+        );
+        assert_eq!(model.timeline_render_cache.lines.len(), prior_lines + 2);
+        assert_eq!(
+            model.scroll, prior_scroll,
+            "an append must preserve scrollback"
+        );
+        assert!(
+            elapsed < Duration::from_millis(250),
+            "incremental timeline append took {elapsed:?}"
         );
     }
 

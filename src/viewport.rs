@@ -3,8 +3,8 @@ use ratatui::text::Line;
 #[derive(Clone, Debug, Default)]
 pub(crate) struct TimelineRenderCache {
     pub run_id: String,
-    pub sequence: u64,
     pub recent_len: usize,
+    pub last_entry_sequence: Option<u64>,
     pub status: Option<String>,
     pub width: u16,
     pub lines: Vec<Line<'static>>,
