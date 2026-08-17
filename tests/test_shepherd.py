@@ -1,11 +1,11 @@
 from pathlib import Path
 from dataclasses import replace
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
 from paf.config import load_config
-from paf.codex import AgentResult, CodexExecutor
+from paf.codex import REPAIR_WORKER_ROLE, AgentResult, CodexExecutor
 from paf.models import Stage
 from paf.scheduler import Orchestrator, ShepherdPlanError
 from paf.state import (
@@ -205,4 +205,40 @@ async def test_failure_threshold_launches_strong_shepherd_plan(
     sweep = next(iter(state.repair_sweeps.values()))
     assert sweep.trigger == "failure-threshold"
     assert state.task(first.id, Stage.DISCOVER).runs[-1].model == "gpt-5.6-sol"
+    await state.close()
+
+
+@pytest.mark.asyncio
+async def test_discovery_repair_uses_the_discovery_pool(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    state = StateStore(config)
+    await state.load_or_create()
+    orchestrator = Orchestrator(config, state)
+    selected: list[str] = []
+
+    class StopAcquire(RuntimeError):
+        pass
+
+    class RecordingLimiter:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        async def acquire(self, priority: float) -> None:
+            del priority
+            selected.append(self.name)
+            raise StopAcquire
+
+        def release(self) -> None:
+            raise AssertionError("an unacquired test slot must not be released")
+
+    orchestrator.discovery_slots = cast(Any, RecordingLimiter("discover"))
+    orchestrator.agent_slots = cast(Any, RecordingLimiter("mutating"))
+
+    with pytest.raises(StopAcquire):
+        await orchestrator._attempt(
+            config.work_units[0],
+            Stage.DISCOVER,
+            role=REPAIR_WORKER_ROLE,
+        )
+    assert selected == ["discover"]
     await state.close()

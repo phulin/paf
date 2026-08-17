@@ -952,7 +952,9 @@ class Orchestrator:
         chapter_lock_held = True
         slot_held = False
         slots = (
-            self.discovery_slots if stage is Stage.DISCOVER and not auxiliary else self.agent_slots
+            self.discovery_slots
+            if stage is Stage.DISCOVER and role != UPSTREAM_REPAIR_ROLE
+            else self.agent_slots
         )
         try:
             await self.control.checkpoint()
