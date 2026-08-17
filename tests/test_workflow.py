@@ -312,8 +312,9 @@ async def test_formalize_retries_diagnostics_and_finishes_with_clean_build(
 
 
 @pytest.mark.asyncio
-async def test_formalize_retries_agent_timeout_instead_of_failing_chapter(
-    tmp_path, monkeypatch
+@pytest.mark.parametrize("exit_code", [1, 124])
+async def test_formalize_retries_nonfatal_agent_failure_instead_of_failing_chapter(
+    tmp_path, monkeypatch, exit_code
 ) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
     state = StateStore(config)
@@ -332,17 +333,17 @@ async def test_formalize_retries_agent_timeout_instead_of_failing_chapter(
         nonlocal attempts
         del kwargs
         attempts += 1
-        timed_out = attempts == 1
+        failed = attempts == 1
         agent = SimpleNamespace(
-            succeeded=not timed_out,
-            exit_code=124 if timed_out else 0,
+            succeeded=not failed,
+            exit_code=exit_code if failed else 0,
             capacity_exhausted=False,
-            report={"complete": not timed_out},
+            report={"complete": not failed},
         )
         return SimpleNamespace(
             agent=agent,
-            validation=ValidationResult(not timed_out, 124 if timed_out else 0, ""),
-            feedback=lambda: "agent timed out",
+            validation=ValidationResult(not failed, exit_code if failed else 0, ""),
+            feedback=lambda: "agent attempt failed",
         )
 
     async def build(*args, snapshots, **kwargs):
