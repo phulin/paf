@@ -128,6 +128,7 @@ def result(
     complete: bool = True,
     issues: list[str] | None = None,
     failed_attempts: list[dict[str, Any]] | None = None,
+    finding_assessments: list[dict[str, str]] | None = None,
 ) -> AgentResult:
     report: dict[str, Any] = {
         "changed": changed,
@@ -137,6 +138,8 @@ def result(
     }
     if failed_attempts is not None:
         report["failed_attempts"] = failed_attempts
+    if finding_assessments is not None:
+        report["finding_assessments"] = finding_assessments
     return AgentResult(
         succeeded=True,
         exit_code=0,
@@ -508,6 +511,122 @@ async def test_proof_review_requests_persist_and_acknowledge_exact_findings(
         chapter.id: "new finding that arrived during review"
     }
     await reloaded.close()
+
+
+def test_proof_review_feedback_tags_each_finding_with_a_stable_id(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = config.chapters[0]
+    orchestrator = Orchestrator(config, StateStore(config))
+    request_id = "request-one"
+    orchestrator.state.proof_review_requests[request_id] = {
+        "feedback": {
+            chapter.id: "Proof findings:\n\nFailed proof `first` in `one.lean`:\n...\n\n"
+            "Failed proof `second` in `two.lean`:\n..."
+        },
+        "origin_run_id": "proof-run",
+    }
+
+    feedback, request_ids = orchestrator._proof_review_feedback(chapter.id)
+
+    assert request_ids == (request_id,)
+    assert "Finding ID: `request-one:1`" in feedback
+    assert "Finding ID: `request-one:2`" in feedback
+    assert orchestrator._expected_proof_finding_ids(chapter.id, request_ids) == (
+        "request-one:1",
+        "request-one:2",
+    )
+
+
+@pytest.mark.asyncio
+async def test_proof_review_does_not_acknowledge_missing_finding_assessments(
+    tmp_path: Path,
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = config.chapters[0]
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await orchestrator.prepare()
+    request_id, _ = await state.enqueue_proof_review_request(
+        {
+            chapter.id: (
+                "Proof work left checked failures.\n\n"
+                "Failed proof `Book.target` in `lean/Book/Chapter01.lean`:\n..."
+            )
+        },
+        origin_run_id="proof-run",
+    )
+    feedback, request_ids = orchestrator._proof_review_feedback(chapter.id)
+    orchestrator.executor = FakeExecutor(
+        state,
+        [result(changed=False, finding_assessments=[])],
+    )
+
+    succeeded = await orchestrator._review_chapter_to_clean(
+        chapter,
+        {chapter.id: 0},
+        rerun=True,
+        feedback=feedback,
+        proof_request_ids=request_ids,
+    )
+
+    assert not succeeded
+    assert request_id in state.proof_review_requests
+    review = state.task(chapter.id, Stage.REVIEW)
+    assert review.status == TaskStatus.FAILED
+    assert f"missing: {request_id}:1" in review.detail
+    assert review.runs[-1].request_ids == [request_id]
+    assert review.runs[-1].prompt_kind == "proof_review"
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_proof_review_acknowledges_exact_finding_assessments(
+    tmp_path: Path,
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = config.chapters[0]
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await orchestrator.prepare()
+    request_id, _ = await state.enqueue_proof_review_request(
+        {
+            chapter.id: (
+                "Proof work left checked failures.\n\n"
+                "Failed proof `Book.target` in `lean/Book/Chapter01.lean`:\n..."
+            )
+        },
+        origin_run_id="proof-run",
+    )
+    feedback, request_ids = orchestrator._proof_review_feedback(chapter.id)
+    orchestrator.executor = FakeExecutor(
+        state,
+        [
+            result(
+                changed=False,
+                finding_assessments=[
+                    {
+                        "finding_id": f"{request_id}:1",
+                        "finding": "Book.target",
+                        "assessment": "rejected",
+                        "explanation": "The statement is sound.",
+                    }
+                ],
+            )
+        ],
+    )
+
+    succeeded = await orchestrator._review_chapter_to_clean(
+        chapter,
+        {chapter.id: 0},
+        rerun=True,
+        feedback=feedback,
+        proof_request_ids=request_ids,
+    )
+
+    assert succeeded
+    assert request_id not in state.proof_review_requests
+    assert state.task(chapter.id, Stage.REVIEW).status == TaskStatus.SUCCEEDED
+    await orchestrator.shutdown()
 
 
 @pytest.mark.asyncio

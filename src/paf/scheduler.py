@@ -19,6 +19,7 @@ from paf.codex import (
     count_placeholders,
     declaration_uses_placeholder,
     declaration_uses_placeholder_in_chapter,
+    report_schema_key,
     scope_digest,
     scoped_files,
     validate,
@@ -965,12 +966,14 @@ class Orchestrator:
                 )
             else:
                 run = await self.state.start_run(chapter.id, stage)
+                run_updates: dict[str, Any] = {
+                    "prompt_kind": report_schema_key(stage, role=role, feedback=feedback),
+                }
                 if role:
-                    await self.state.update_run(
-                        run,
-                        role=role,
-                        request_ids=list(selected_request_ids),
-                    )
+                    run_updates["role"] = role
+                if selected_request_ids:
+                    run_updates["request_ids"] = list(selected_request_ids)
+                await self.state.update_run(run, **run_updates)
             if live_discovery:
                 workspace_root = self.config.settings.repo
             elif self.isolation.name == "shared":
@@ -1852,8 +1855,76 @@ class Orchestrator:
             if not isinstance(block, str) or not block.strip():
                 continue
             request_ids.append(request_id)
-            blocks[block] = None
+            blocks[self._tag_proof_findings(request_id, block)] = None
         return "\n\n".join(blocks), tuple(request_ids)
+
+    @staticmethod
+    def _proof_finding_ids(request_id: str, feedback: str) -> tuple[str, ...]:
+        count = len(re.findall(r"(?m)^Failed proof `", feedback))
+        return tuple(f"{request_id}:{index}" for index in range(1, count + 1))
+
+    @classmethod
+    def _tag_proof_findings(cls, request_id: str, feedback: str) -> str:
+        finding_ids = iter(cls._proof_finding_ids(request_id, feedback))
+        return re.sub(
+            r"(?m)^Failed proof `",
+            lambda _match: f"Finding ID: `{next(finding_ids)}`\nFailed proof `",
+            feedback,
+        )
+
+    def _expected_proof_finding_ids(
+        self,
+        chapter_id: str,
+        request_ids: Iterable[str],
+    ) -> tuple[str, ...]:
+        expected: list[str] = []
+        for request_id in request_ids:
+            value = self.state.proof_review_requests.get(request_id)
+            feedback = value.get("feedback") if isinstance(value, dict) else None
+            block = feedback.get(chapter_id) if isinstance(feedback, dict) else None
+            if isinstance(block, str):
+                expected.extend(self._proof_finding_ids(request_id, block))
+        return tuple(expected)
+
+    def _proof_review_assessment_error(
+        self,
+        chapter_id: str,
+        run_id: str,
+        expected_ids: Iterable[str],
+    ) -> str:
+        expected = tuple(expected_ids)
+        if not expected:
+            return ""
+        run = next(
+            (item for item in self.state.task(chapter_id, Stage.REVIEW).runs if item.id == run_id),
+            None,
+        )
+        if run is None:
+            return "proof-review run disappeared before finding assessments were validated"
+        self.state.load_run_details(run)
+        report = run.report if isinstance(run.report, dict) else {}
+        assessments = report.get("finding_assessments")
+        received = (
+            tuple(str(item.get("finding_id", "")) for item in assessments if isinstance(item, dict))
+            if isinstance(assessments, list)
+            else ()
+        )
+        if len(received) == len(expected) and set(received) == set(expected):
+            return ""
+        missing = sorted(set(expected).difference(received))
+        unexpected = sorted(set(received).difference(expected))
+        details = []
+        if missing:
+            details.append("missing: " + ", ".join(missing))
+        if unexpected:
+            details.append("unexpected: " + ", ".join(unexpected))
+        if len(received) != len(set(received)):
+            details.append("duplicate finding ids")
+        return (
+            "proof-review finding assessments did not match supplied findings ("
+            + "; ".join(details)
+            + ")"
+        )
 
     async def _queue_proof_review(
         self,
@@ -2626,6 +2697,7 @@ class Orchestrator:
         *,
         rerun: bool = False,
         feedback: str = "",
+        request_ids: Iterable[str] = (),
     ) -> ReviewOutcome:
         if not rerun and self._already_done(chapter, Stage.REVIEW):
             return ReviewOutcome(True, False, complete=True)
@@ -2633,6 +2705,7 @@ class Orchestrator:
             chapter,
             Stage.REVIEW,
             feedback=feedback,
+            request_ids=request_ids,
             queue_detail=(
                 "full-scope review of failed-proof findings"
                 if feedback
@@ -2854,12 +2927,26 @@ class Orchestrator:
                     chapter,
                     rerun=review_rerun,
                     feedback=review_feedback,
+                    request_ids=request_ids,
                 )
                 if review_feedback
                 else await self._review_once(chapter, rerun=review_rerun)
             )
             review_feedback = ""
             if not outcome.succeeded:
+                return False
+            expected_finding_ids = self._expected_proof_finding_ids(chapter.id, request_ids)
+            if assessment_error := self._proof_review_assessment_error(
+                chapter.id,
+                outcome.run_id,
+                expected_finding_ids,
+            ):
+                await self.state.set_task(
+                    chapter.id,
+                    Stage.REVIEW,
+                    TaskStatus.FAILED,
+                    assessment_error,
+                )
                 return False
             build_feedback: dict[str, str] = {}
             if outcome.changed:

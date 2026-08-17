@@ -149,6 +149,7 @@ _FINDING_ASSESSMENTS_PROPERTY: dict[str, Any] = {
         "type": "object",
         "additionalProperties": False,
         "properties": {
+            "finding_id": {"type": "string", "minLength": 1},
             "finding": {"type": "string", "minLength": 1},
             "assessment": {
                 "type": "string",
@@ -156,7 +157,7 @@ _FINDING_ASSESSMENTS_PROPERTY: dict[str, Any] = {
             },
             "explanation": {"type": "string", "minLength": 1},
         },
-        "required": ["finding", "assessment", "explanation"],
+        "required": ["finding_id", "finding", "assessment", "explanation"],
     },
 }
 
@@ -339,9 +340,9 @@ have stopped. It must describe the stable files on disk, not planned work. Use o
 - `source_issues`: genuine defects in the informal textbook; otherwise an empty list. Each entry
   must give `location`, an exact identifying `source_excerpt`, a mathematical `description`, and the
   smallest `suggested_correction`.
-- `finding_assessments`: one entry for each supplied proof finding. Copy a concise identifying
-  `finding`, classify its `assessment` as `confirmed`, `rejected`, or `reframed`, and give the
-  evidence in `explanation`.""",
+- `finding_assessments`: one entry for each supplied proof finding. Copy its exact `finding_id`,
+  copy a concise identifying `finding`, classify its `assessment` as `confirmed`, `rejected`,
+  or `reframed`, and give the evidence in `explanation`.""",
         }
     for key, value in values.items():
         template = template.replace("{" + key + "}", value)
@@ -927,6 +928,24 @@ class CodexExecutor:
             for key in REPORT_SCHEMAS
         }
 
+    def _resumable_run(
+        self,
+        run: RunRecord,
+        stage: Stage,
+    ) -> RunRecord | None:
+        runs = self.state.task(run.chapter_id, stage).runs
+        prior = runs[-2] if len(runs) >= 2 and runs[-1].id == run.id else None
+        return (
+            prior
+            if prior is not None
+            and prior.status == TaskStatus.INTERRUPTED
+            and prior.thread_id
+            and (prior.role or prior.stage) == (run.role or run.stage)
+            and prior.request_ids == run.request_ids
+            and (not prior.prompt_kind or prior.prompt_kind == run.prompt_kind)
+            else None
+        )
+
     async def prepare(self) -> None:
         self.config.settings.state_dir.mkdir(parents=True, exist_ok=True)
         legacy_path = self.config.settings.state_dir / "agent-report.schema.json"
@@ -1225,22 +1244,16 @@ whole-file diagnostics from prerequisites to dependents. Do not prepare every fi
         log_path = self.state.logs_dir / f"{run.id}.jsonl"
         usage = TokenUsage()
         report: dict[str, Any] = {}
-        resumable_run = next(
-            (
-                prior
-                for prior in reversed(self.state.task(run.chapter_id, stage).runs)
-                if prior.id != run.id
-                and prior.status == TaskStatus.INTERRUPTED
-                and prior.thread_id
-                and (prior.role or prior.stage) == (run.role or run.stage)
-                and prior.request_ids == run.request_ids
-            ),
-            None,
-        )
+        resumable_run = self._resumable_run(run, stage)
         thread_id = resumable_run.thread_id if self.resume_agents and resumable_run else None
         interrupted_resume = thread_id is not None
         if thread_id is not None:
-            await self.state.update_run(run, thread_id=thread_id)
+            assert resumable_run is not None
+            await self.state.update_run(
+                run,
+                thread_id=thread_id,
+                resumed_from_run_id=resumable_run.id,
+            )
         invocation_error = ""
         fatal_invocation_failure = False
         activity = await self.state.activities.start_async(

@@ -1194,6 +1194,37 @@ print(json.dumps({{"type": "item.completed", "item": {{
     assert "saved-session" in invocation["args"]
     assert result.succeeded
     assert result.thread_id == "saved-session"
+    assert run.resumed_from_run_id == interrupted.id
+
+
+@pytest.mark.asyncio
+async def test_executor_only_resumes_the_matching_immediate_predecessor(
+    tmp_path: Path,
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    state = StateStore(config)
+    await state.load_or_create()
+    interrupted = await state.start_run(config.chapters[0].id, Stage.REVIEW)
+    await state.finish_run(
+        interrupted,
+        status=TaskStatus.INTERRUPTED,
+        thread_id="saved-session",
+    )
+    executor = CodexExecutor(config, state, resume_agents=True)
+    await executor.prepare()
+
+    resumed = await state.start_run(config.chapters[0].id, Stage.REVIEW)
+    assert executor._resumable_run(resumed, Stage.REVIEW) is interrupted
+
+    await state.finish_run(resumed, status=TaskStatus.SUCCEEDED)
+    fresh = await state.start_run(config.chapters[0].id, Stage.REVIEW)
+    assert executor._resumable_run(fresh, Stage.REVIEW) is None
+
+    await state.finish_run(fresh, status=TaskStatus.INTERRUPTED, thread_id="other-session")
+    mismatched = await state.start_run(config.chapters[0].id, Stage.REVIEW)
+    await state.update_run(fresh, prompt_kind="review")
+    await state.update_run(mismatched, prompt_kind="proof_review")
+    assert executor._resumable_run(mismatched, Stage.REVIEW) is None
 
 
 @pytest.mark.asyncio

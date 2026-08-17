@@ -123,6 +123,8 @@ class RunRecord:
     finished_at: str | None = None
     pid: int | None = None
     thread_id: str | None = None
+    prompt_kind: str = ""
+    resumed_from_run_id: str = ""
     exit_code: int | None = None
     changed: bool | None = None
     placeholders: int | None = None
@@ -600,6 +602,8 @@ class StateStore:
             "finished_at": run.finished_at,
             "pid": run.pid,
             "thread_id": run.thread_id,
+            "prompt_kind": run.prompt_kind,
+            "resumed_from_run_id": run.resumed_from_run_id,
             "exit_code": run.exit_code,
             "changed": run.changed,
             "placeholders": run.placeholders,
