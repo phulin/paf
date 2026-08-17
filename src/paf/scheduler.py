@@ -31,7 +31,7 @@ from paf.corpus import (
     scheduling_snapshot,
 )
 from paf.diagnostics import unexpected_lean_warnings
-from paf.git import GitCommitter
+from paf.git import GitCommitError, GitCommitter
 from paf.isolation import IsolationResult, create_isolation
 from paf.models import PipelineConfig, Stage, WorkUnit, WorkUnitLike
 from paf.scope import ScopeMatcher
@@ -3524,19 +3524,28 @@ class Orchestrator:
                 targeted_retry = bool(targeted_request_ids)
                 if not targeted_retry:
                     continue
-            attempt = await self._attempt(
-                chapter,
-                Stage.PROVE,
-                feedback=feedback,
-                queue_detail=(
-                    "targeted downstream retry for upstream request(s): "
-                    + ", ".join(targeted_request_ids)
-                    if targeted_retry
-                    else f"proof round {proof_round + 1}/{proof_maximum}"
-                ),
-                role=DOWNSTREAM_RETRY_ROLE if targeted_retry else "",
-                request_ids=targeted_request_ids,
-            )
+            try:
+                attempt = await self._attempt(
+                    chapter,
+                    Stage.PROVE,
+                    feedback=feedback,
+                    queue_detail=(
+                        "targeted downstream retry for upstream request(s): "
+                        + ", ".join(targeted_request_ids)
+                        if targeted_retry
+                        else f"proof round {proof_round + 1}/{proof_maximum}"
+                    ),
+                    role=DOWNSTREAM_RETRY_ROLE if targeted_retry else "",
+                    request_ids=targeted_request_ids,
+                )
+            except GitCommitError as error:
+                await self.state.set_task(
+                    chapter.id,
+                    Stage.PROVE,
+                    TaskStatus.PENDING,
+                    f"proof retry deferred until dirty exclusive scope is reconciled: {error}",
+                )
+                return False
             if attempt.agent.capacity_exhausted:
                 if targeted_retry:
                     await self.state.finish_upstream_requests(

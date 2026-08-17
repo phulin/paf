@@ -16,6 +16,7 @@ from paf.codex import (
     scope_digest,
 )
 from paf.config import load_config
+from paf.git import GitCommitError
 from paf.models import Chapter, PipelineConfig, Stage
 from paf.scheduler import FormalizeOutcome, Orchestrator, ReviewOutcome
 from paf.state import (
@@ -2378,6 +2379,32 @@ async def test_review_failure_quarantines_branch_without_cancelling_unrelated_wo
     assert set(reviewed) == {first.id, third.id}
     assert state.task(first.id, Stage.REVIEW).status == TaskStatus.FAILED
     assert state.task(second.id, Stage.REVIEW).status == TaskStatus.BLOCKED
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_dirty_proof_scope_defers_only_that_chapter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = config.chapters[0]
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await orchestrator.prepare()
+    await mark_formalized(orchestrator)
+    orchestrator.force = True
+
+    async def dirty_attempt(*_args: object, **_kwargs: object) -> object:
+        raise GitCommitError(
+            "cannot start book/chapter-01 with uncommitted files in its exclusive scope"
+        )
+
+    monkeypatch.setattr(orchestrator, "_attempt", dirty_attempt)
+
+    assert not await orchestrator._prove(chapter, defer_review=True)
+    task = state.task(chapter.id, Stage.PROVE)
+    assert task.status == TaskStatus.PENDING
+    assert "dirty exclusive scope" in task.detail
     await orchestrator.shutdown()
 
 
