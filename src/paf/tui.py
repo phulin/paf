@@ -3,11 +3,13 @@ from __future__ import annotations
 import argparse
 import asyncio
 import importlib
+import json
 import os
 import shutil
 import subprocess
 import sys
 from collections.abc import Callable, Coroutine, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, NoReturn
 
@@ -38,21 +40,55 @@ __all__ = [
 TuiAction = Literal["success", "failure", "reload"]
 
 
-def _native_run(socket_path: str, label: str, startup_warning: str) -> TuiAction:
+@dataclass(frozen=True)
+class TuiOutcome:
+    action: TuiAction
+    agent_view: str | None = None
+    detail_tab: str | None = None
+
+
+def _native_run(
+    socket_path: str,
+    label: str,
+    startup_warning: str,
+    initial_agent_view: str | None = None,
+    initial_detail_tab: str | None = None,
+) -> TuiOutcome:
     try:
         _rust_tui = importlib.import_module("paf._rust_tui")
     except ImportError as error:
         raise RuntimeError(
             "the native PAF TUI is not installed; reinstall PAF from a wheel or with `uv sync`"
         ) from error
-    result = _rust_tui.run(socket_path, label, startup_warning)
+    if initial_agent_view is None:
+        result = _rust_tui.run(socket_path, label, startup_warning)
+    else:
+        result = _rust_tui.run(
+            socket_path,
+            label,
+            startup_warning,
+            initial_agent_view,
+            initial_detail_tab,
+        )
     # Accept the pre-reload extension during editable source upgrades. Fresh wheels return the
     # explicit action strings below.
     if isinstance(result, bool):
-        return "success" if result else "failure"
-    if result not in ("success", "failure", "reload"):
+        return TuiOutcome("success" if result else "failure")
+    if result in ("success", "failure", "reload"):
+        return TuiOutcome(result)
+    try:
+        payload = json.loads(result)
+    except (TypeError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"native PAF TUI returned an unknown action: {result!r}") from error
+    if not isinstance(payload, dict) or payload.get("action") != "reload":
         raise RuntimeError(f"native PAF TUI returned an unknown action: {result!r}")
-    return result
+    agent_view = payload.get("agent_view")
+    detail_tab = payload.get("detail_tab")
+    if agent_view is not None and not isinstance(agent_view, str):
+        raise RuntimeError(f"native PAF TUI returned an invalid agent view: {result!r}")
+    if detail_tab is not None and not isinstance(detail_tab, str):
+        raise RuntimeError(f"native PAF TUI returned an invalid detail tab: {result!r}")
+    return TuiOutcome("reload", agent_view, detail_tab)
 
 
 def _source_root() -> Path:
@@ -87,6 +123,8 @@ def _restart_native_tui(
     socket_path: str,
     label: str,
     startup_warning: str,
+    agent_view: str | None,
+    detail_tab: str | None,
 ) -> NoReturn:
     arguments = [
         sys.executable,
@@ -99,6 +137,10 @@ def _restart_native_tui(
         "--startup-warning",
         startup_warning,
     ]
+    if agent_view is not None:
+        arguments.extend(["--agent-view", agent_view])
+    if detail_tab is not None:
+        arguments.extend(["--detail-tab", detail_tab])
     os.execv(sys.executable, arguments)
     raise AssertionError("os.execv returned unexpectedly")
 
@@ -108,9 +150,17 @@ def main(arguments: Sequence[str] | None = None) -> int:
     parser.add_argument("--socket", required=True, help="orchestrator control socket")
     parser.add_argument("--label", default="managed pipeline")
     parser.add_argument("--startup-warning", default="")
+    parser.add_argument("--agent-view")
+    parser.add_argument("--detail-tab", choices=("timeline", "summary", "plan", "files"))
     args = parser.parse_args(arguments)
-    action = _native_run(args.socket, args.label, args.startup_warning)
-    if action == "reload":
+    outcome = _native_run(
+        args.socket,
+        args.label,
+        args.startup_warning,
+        args.agent_view,
+        args.detail_tab,
+    )
+    if outcome.action == "reload":
         warning = args.startup_warning
         try:
             _rebuild_native_tui()
@@ -118,8 +168,14 @@ def main(arguments: Sequence[str] | None = None) -> int:
             detail = f"TUI reload failed: {error}"
             print(detail, file=sys.stderr, flush=True)
             warning = f"{warning}\n{detail}" if warning else detail
-        _restart_native_tui(args.socket, args.label, warning)
-    return 0 if action == "success" else 1
+        _restart_native_tui(
+            args.socket,
+            args.label,
+            warning,
+            outcome.agent_view,
+            outcome.detail_tab,
+        )
+    return 0 if outcome.action == "success" else 1
 
 
 async def _run_tui(

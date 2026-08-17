@@ -27,6 +27,16 @@ from paf.state import StateStore, TokenUsage
 from tests.support import write_project
 
 
+class FakeRustTui:
+    def __init__(self, result: object) -> None:
+        self.result = result
+        self.calls: list[tuple[object, ...]] = []
+
+    def run(self, *args: object) -> object:
+        self.calls.append(args)
+        return self.result
+
+
 def test_activity_kinds_have_short_unique_labels_and_colors() -> None:
     expected_labels = {
         "agent": "agent",
@@ -78,11 +88,17 @@ def test_formats_measured_token_spend_without_double_counting_cache() -> None:
 
 
 def test_native_entry_point_forwards_connection_options(monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    received: list[tuple[str, str, str]] = []
+    received: list[tuple[str, str, str, str | None, str | None]] = []
 
-    def native_run(socket_path: str, label: str, warning: str) -> tui_module.TuiAction:
-        received.append((socket_path, label, warning))
-        return "success"
+    def native_run(
+        socket_path: str,
+        label: str,
+        warning: str,
+        agent_view: str | None,
+        detail_tab: str | None,
+    ) -> tui_module.TuiOutcome:
+        received.append((socket_path, label, warning, agent_view, detail_tab))
+        return tui_module.TuiOutcome("success")
 
     monkeypatch.setattr(tui_module, "_native_run", native_run)
     assert (
@@ -91,21 +107,51 @@ def test_native_entry_point_forwards_connection_options(monkeypatch) -> None:  #
         )
         == 0
     )
-    assert received == [("/tmp/paf.sock", "review", "rg")]
+    assert received == [("/tmp/paf.sock", "review", "rg", None, None)]
 
 
-def test_reload_rebuilds_and_restarts_with_the_same_connection(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+def test_native_reload_result_carries_the_open_agent_view(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    native = FakeRustTui('{"action":"reload","agent_view":"book/chapter-01","detail_tab":"files"}')
+    monkeypatch.setattr(tui_module.importlib, "import_module", lambda _: native)
+
+    outcome = tui_module._native_run("/tmp/live.sock", "review", "", None, None)
+
+    assert outcome == tui_module.TuiOutcome("reload", "book/chapter-01", "files")
+    assert native.calls == [("/tmp/live.sock", "review", "")]
+
+
+def test_native_restart_receives_the_agent_view_to_restore(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    native = FakeRustTui("success")
+    monkeypatch.setattr(tui_module.importlib, "import_module", lambda _: native)
+
+    outcome = tui_module._native_run("/tmp/live.sock", "review", "", "book/chapter-01", "summary")
+
+    assert outcome == tui_module.TuiOutcome("success")
+    assert native.calls == [("/tmp/live.sock", "review", "", "book/chapter-01", "summary")]
+
+
+def test_reload_rebuilds_and_restarts_with_the_same_agent_view(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     rebuilt: list[bool] = []
-    restarted: list[tuple[str, str, str]] = []
+    restarted: list[tuple[str, str, str, str | None, str | None]] = []
 
     class Restarted(Exception):
         pass
 
-    def restart(socket_path: str, label: str, warning: str) -> None:
-        restarted.append((socket_path, label, warning))
+    def restart(
+        socket_path: str,
+        label: str,
+        warning: str,
+        agent_view: str | None,
+        detail_tab: str | None,
+    ) -> None:
+        restarted.append((socket_path, label, warning, agent_view, detail_tab))
         raise Restarted
 
-    monkeypatch.setattr(tui_module, "_native_run", lambda *_: "reload")
+    monkeypatch.setattr(
+        tui_module,
+        "_native_run",
+        lambda *_: tui_module.TuiOutcome("reload", "book/chapter-01", "plan"),
+    )
     monkeypatch.setattr(tui_module, "_rebuild_native_tui", lambda: rebuilt.append(True))
     monkeypatch.setattr(tui_module, "_restart_native_tui", restart)
 
@@ -117,7 +163,7 @@ def test_reload_rebuilds_and_restarts_with_the_same_connection(monkeypatch) -> N
         raise AssertionError("reload did not restart the TUI process")
 
     assert rebuilt == [True]
-    assert restarted == [("/tmp/live.sock", "review", "")]
+    assert restarted == [("/tmp/live.sock", "review", "", "book/chapter-01", "plan")]
 
 
 def test_reload_builds_an_optimized_locked_native_extension(

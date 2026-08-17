@@ -241,6 +241,24 @@ impl DetailTab {
             Self::Files => "Files",
         }
     }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Timeline => "timeline",
+            Self::Summary => "summary",
+            Self::Plan => "plan",
+            Self::Files => "files",
+        }
+    }
+
+    fn from_name(name: &str) -> Self {
+        match name {
+            "summary" => Self::Summary,
+            "plan" => Self::Plan,
+            "files" => Self::Files,
+            _ => Self::Timeline,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -259,17 +277,28 @@ pub struct DashboardModel {
     pub stopping: bool,
     pub preparation: Option<Preparation>,
     pub reload_requested: bool,
+    restore_agent_view: Option<String>,
 }
 
 impl DashboardModel {
+    #[cfg(test)]
     pub fn loading(label: String, startup_warning: String) -> Self {
+        Self::loading_with_agent_view(label, startup_warning, None, None)
+    }
+
+    pub fn loading_with_agent_view(
+        label: String,
+        startup_warning: String,
+        agent_view: Option<String>,
+        detail_tab: Option<&str>,
+    ) -> Self {
         Self {
             state: SwarmState::default(),
             daemon_status: "connecting".into(),
             result: None,
             selected: 0,
             detail: false,
-            detail_tab: DetailTab::default(),
+            detail_tab: detail_tab.map(DetailTab::from_name).unwrap_or_default(),
             scroll: 0,
             detail_max_scroll: 0,
             detail_follow_tail: true,
@@ -282,6 +311,7 @@ impl DashboardModel {
                 total: 1,
             }),
             reload_requested: false,
+            restore_agent_view: agent_view,
         }
     }
 
@@ -303,6 +333,7 @@ impl DashboardModel {
                 )
                 .context("invalid dashboard model")?;
                 self.preparation = None;
+                self.restore_agent_view();
             }
             "delta" => self.apply_delta(event.delta.context("delta event has no delta")?)?,
             "preparation" => {
@@ -318,6 +349,20 @@ impl DashboardModel {
         }
         self.clamp_selection();
         Ok(())
+    }
+
+    fn restore_agent_view(&mut self) {
+        let Some(work_unit_id) = self.restore_agent_view.take() else {
+            return;
+        };
+        if let Some(selected) = self
+            .rows()
+            .iter()
+            .position(|row| row.unit.id == work_unit_id)
+        {
+            self.selected = selected;
+            self.enter_detail();
+        }
     }
 
     fn apply_delta(&mut self, delta: DashboardDelta) -> Result<()> {
@@ -680,6 +725,33 @@ mod tests {
 
         assert_eq!(model.selected_activity().unwrap().current, "checking goals");
         assert_eq!(model.state.revision, 4);
+    }
+
+    #[test]
+    fn restores_agent_view_by_work_unit_after_snapshot() {
+        let mut model = DashboardModel::loading_with_agent_view(
+            "test".into(),
+            String::new(),
+            Some("book/chapter-01".into()),
+            Some("plan"),
+        );
+
+        model
+            .apply(WireEvent {
+                protocol_version: PROTOCOL_VERSION,
+                event: "snapshot".into(),
+                status: "running".into(),
+                result: None,
+                snapshot: Some(snapshot()),
+                delta: None,
+                preparation: None,
+                message: String::new(),
+            })
+            .unwrap();
+
+        assert!(model.detail);
+        assert_eq!(model.detail_tab, DetailTab::Plan);
+        assert_eq!(model.selected_row().unwrap().unit.id, "book/chapter-01");
     }
 
     #[test]

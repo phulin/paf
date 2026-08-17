@@ -26,7 +26,12 @@ enum RuntimeEvent {
 
 pub enum TuiExit {
     Complete(bool),
-    Reload,
+    Reload(Option<AgentView>),
+}
+
+pub struct AgentView {
+    pub work_unit_id: String,
+    pub detail_tab: &'static str,
 }
 
 struct TerminalGuard;
@@ -74,7 +79,13 @@ impl Drop for DashboardStreamGuard {
     }
 }
 
-pub fn run(socket_path: &str, label: &str, startup_warning: &str) -> Result<TuiExit> {
+pub fn run(
+    socket_path: &str,
+    label: &str,
+    startup_warning: &str,
+    initial_agent_view: Option<&str>,
+    initial_detail_tab: Option<&str>,
+) -> Result<TuiExit> {
     // Establish the push stream before taking over the terminal so startup errors remain plain
     // shell diagnostics.
     let stream = subscribe(socket_path)?;
@@ -99,7 +110,12 @@ pub fn run(socket_path: &str, label: &str, startup_warning: &str) -> Result<TuiE
     let backend = CrosstermBackend::new(stdout());
     let mut terminal = Terminal::new(backend).context("could not initialize terminal")?;
 
-    let mut model = DashboardModel::loading(label.to_owned(), startup_warning.to_owned());
+    let mut model = DashboardModel::loading_with_agent_view(
+        label.to_owned(),
+        startup_warning.to_owned(),
+        initial_agent_view.map(str::to_owned),
+        initial_detail_tab,
+    );
     let mut dirty = true;
     loop {
         if dirty {
@@ -124,7 +140,13 @@ pub fn run(socket_path: &str, label: &str, startup_warning: &str) -> Result<TuiE
             Ok(RuntimeEvent::Terminal(event)) => {
                 dirty = handle_terminal_event(event, &mut model, socket_path)?;
                 if model.reload_requested {
-                    return Ok(TuiExit::Reload);
+                    let agent_view = model.detail.then(|| {
+                        model.selected_row().map(|row| AgentView {
+                            work_unit_id: row.unit.id.clone(),
+                            detail_tab: model.detail_tab.name(),
+                        })
+                    });
+                    return Ok(TuiExit::Reload(agent_view.flatten()));
                 }
             }
             Err(RecvTimeoutError::Timeout) => {
