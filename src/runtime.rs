@@ -16,7 +16,7 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use serde_json::{Value, json};
 
-use crate::model::{DashboardModel, WireEvent};
+use crate::model::{ChapterRuns, DashboardModel, WireEvent};
 use crate::ui;
 
 enum RuntimeEvent {
@@ -129,6 +129,9 @@ pub fn run(
                 let event = event.expect("guarded as successful wire event");
                 let complete = event.event == "complete";
                 model.apply(event)?;
+                if model.detail && model.detail_runs.is_empty() {
+                    load_chapter_runs(&mut model, socket_path, None)?;
+                }
                 dirty = true;
                 if complete {
                     terminal.draw(|frame| ui::draw(frame, &mut model))?;
@@ -244,7 +247,19 @@ fn handle_terminal_event(
         return Ok(true);
     }
     if model.detail {
-        return handle_detail_key(key, model);
+        let previous_run = model
+            .detail_runs
+            .get(model.selected_run)
+            .map(|run| run.id.clone());
+        let dirty = handle_detail_key(key, model)?;
+        let selected_run = model
+            .detail_runs
+            .get(model.selected_run)
+            .map(|run| run.id.clone());
+        if selected_run != previous_run {
+            load_chapter_runs(model, socket_path, selected_run.as_deref())?;
+        }
+        return Ok(dirty);
     }
     match key.code {
         KeyCode::Char('q') | KeyCode::Char('c')
@@ -263,6 +278,7 @@ fn handle_terminal_event(
         KeyCode::Char('i') | KeyCode::Enter => {
             if model.selected_row().is_some() {
                 model.enter_detail();
+                load_chapter_runs(model, socket_path, None)?;
             }
             Ok(true)
         }
@@ -330,6 +346,8 @@ fn handle_detail_key(key: KeyEvent, model: &mut DashboardModel) -> Result<bool> 
         }
         KeyCode::Tab => model.cycle_tab(key.modifiers.contains(KeyModifiers::SHIFT)),
         KeyCode::BackTab => model.cycle_tab(true),
+        KeyCode::Left | KeyCode::Char('h') => model.cycle_run(true),
+        KeyCode::Right | KeyCode::Char('l') => model.cycle_run(false),
         KeyCode::Up | KeyCode::Char('k') => model.scroll_detail(-1),
         KeyCode::Down | KeyCode::Char('j') => model.scroll_detail(1),
         KeyCode::PageUp => model.scroll_detail(-10),
@@ -341,10 +359,41 @@ fn handle_detail_key(key: KeyEvent, model: &mut DashboardModel) -> Result<bool> 
     Ok(true)
 }
 
+fn load_chapter_runs(
+    model: &mut DashboardModel,
+    socket_path: &str,
+    selected_run_id: Option<&str>,
+) -> Result<()> {
+    let Some(chapter) = model.selected_row().map(|row| row.unit.id.clone()) else {
+        return Ok(());
+    };
+    let mut request = json!({"command": "chapter_runs", "chapter": chapter});
+    if let Some(run_id) = selected_run_id {
+        request["run_id"] = Value::String(run_id.to_owned());
+    }
+    let response = send_control_request(socket_path, &request)?;
+    if let Some(error) = response.get("error") {
+        bail!("orchestrator rejected chapter history request: {error}")
+    }
+    let details: ChapterRuns = serde_json::from_value(
+        response
+            .get("chapter_runs")
+            .cloned()
+            .context("chapter history response omitted chapter_runs")?,
+    )
+    .context("invalid chapter history response")?;
+    model.apply_chapter_runs(details);
+    Ok(())
+}
+
 fn send_control(socket_path: &str, command: &str) -> Result<Value> {
-    let mut stream = UnixStream::connect(socket_path)
-        .with_context(|| format!("could not connect for {command} command"))?;
-    serde_json::to_writer(&mut stream, &json!({"command": command}))?;
+    send_control_request(socket_path, &json!({"command": command}))
+}
+
+fn send_control_request(socket_path: &str, request: &Value) -> Result<Value> {
+    let mut stream =
+        UnixStream::connect(socket_path).context("could not connect for control command")?;
+    serde_json::to_writer(&mut stream, request)?;
     stream.write_all(b"\n")?;
     let mut line = String::new();
     BufReader::new(stream).read_line(&mut line)?;

@@ -274,6 +274,30 @@ async def test_dashboard_projection_includes_ordered_units_and_bounded_activity(
     assert "work_unit_cost" in task
 
 
+async def test_chapter_run_projection_lists_history_and_selected_recent_activity(
+    tmp_path: Path,
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    state = StateStore(config)
+    await state.load_or_create()
+    chapter = config.chapters[0]
+    formalize = await state.start_run(chapter.id, Stage.FORMALIZE)
+    review = await state.start_run(chapter.id, Stage.REVIEW)
+    activity = state.activities.start(formalize.id, chapter.id, Stage.FORMALIZE.value)
+    activity.current = "historical formalization"
+    state.activities.save(activity)
+
+    details = state.dashboard_chapter_runs(chapter.id, selected_run_id=formalize.id)
+
+    assert [(run["stage"], run["round"]) for run in details["runs"]] == [
+        ("formalize", 1),
+        ("review", 1),
+    ]
+    assert details["selected_run_id"] == formalize.id
+    assert details["activity"]["current"] == "historical formalization"
+    assert review.id != details["selected_run_id"]
+
+
 async def test_native_tui_connects_renders_and_exits_with_pipeline(
     monkeypatch,
     tmp_path: Path,

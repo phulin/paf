@@ -519,6 +519,7 @@ fn draw_detail(frame: &mut Frame<'_>, model: &mut DashboardModel) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
+            Constraint::Length(3),
             Constraint::Length(5),
             Constraint::Length(3),
             Constraint::Min(4),
@@ -543,6 +544,23 @@ fn draw_detail(frame: &mut Frame<'_>, model: &mut DashboardModel) {
                 .title(" Agent detail "),
         ),
         layout[0],
+    );
+    let run_titles = if model.detail_runs.is_empty() {
+        vec![Line::from("No runs")]
+    } else {
+        model
+            .detail_runs
+            .iter()
+            .map(|run| Line::from(format!("{} round {}", title(&run.stage), run.round)))
+            .collect()
+    };
+    frame.render_widget(
+        Tabs::new(run_titles)
+            .select(model.selected_run)
+            .highlight_style(Style::default().fg(YELLOW).add_modifier(Modifier::BOLD))
+            .divider(" │ ")
+            .block(Block::default().borders(Borders::BOTTOM).title(" Runs ")),
+        layout[1],
     );
     let pending_reason = model.pending_reason(&row);
     let has_running_task = row
@@ -575,7 +593,7 @@ fn draw_detail(frame: &mut Frame<'_>, model: &mut DashboardModel) {
         Paragraph::new(metrics)
             .wrap(Wrap { trim: false })
             .block(Block::default().borders(Borders::ALL)),
-        layout[1],
+        layout[2],
     );
     let tab_titles = DetailTab::ALL.map(|tab| Line::from(tab.label()));
     let selected_tab = DetailTab::ALL
@@ -588,15 +606,15 @@ fn draw_detail(frame: &mut Frame<'_>, model: &mut DashboardModel) {
             .highlight_style(Style::default().fg(CYAN).add_modifier(Modifier::BOLD))
             .divider(" │ ")
             .block(Block::default().borders(Borders::BOTTOM)),
-        layout[2],
+        layout[3],
     );
     let text = detail_text(model.detail_tab, activity);
-    draw_detail_content(frame, model, text, layout[3]);
+    draw_detail_content(frame, model, text, layout[4]);
     frame.render_widget(
-        Paragraph::new("Tab/Shift-Tab switch  ↑↓ scroll  r reload TUI  d detach  Esc/q back")
+        Paragraph::new("←→ runs  Tab/Shift-Tab views  ↑↓ scroll  r reload  d detach  Esc/q back")
             .style(Style::default().fg(MUTED))
             .alignment(Alignment::Center),
-        layout[4],
+        layout[5],
     );
 }
 

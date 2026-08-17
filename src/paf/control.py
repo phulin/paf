@@ -250,6 +250,21 @@ class ControlServer:
                 response = self._status()
             elif command == "snapshot":
                 response = self._status(full=True)
+            elif command == "chapter_runs":
+                chapter = request.get("chapter")
+                run_id = request.get("run_id")
+                if not isinstance(chapter, str) or not chapter:
+                    raise ValueError("chapter_runs chapter must be a non-empty string")
+                if run_id is not None and (not isinstance(run_id, str) or not run_id):
+                    raise ValueError("chapter_runs run_id must be a non-empty string")
+                if chapter not in {unit.id for unit in self.orchestrator.config.work_units}:
+                    raise ValueError(f"unknown chapter: {chapter}")
+                response = {
+                    "protocol_version": PROTOCOL_VERSION,
+                    "chapter_runs": self.orchestrator.state.dashboard_chapter_runs(
+                        chapter, selected_run_id=run_id
+                    ),
+                }
             elif command == "status":
                 response = self._status()
             else:

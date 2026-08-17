@@ -136,6 +136,26 @@ pub struct Activity {
 
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default)]
+pub struct HistoricalRun {
+    pub id: String,
+    pub stage: String,
+    pub round: usize,
+    pub status: String,
+    pub started_at: String,
+    pub finished_at: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct ChapterRuns {
+    pub work_unit_id: String,
+    pub runs: Vec<HistoricalRun>,
+    pub selected_run_id: Option<String>,
+    pub activity: Option<Activity>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
 pub struct WorkUnit {
     pub id: String,
     pub document_id: String,
@@ -299,6 +319,8 @@ pub struct DashboardModel {
     pub scroll: u16,
     pub detail_max_scroll: u16,
     pub detail_follow_tail: bool,
+    pub detail_runs: Vec<HistoricalRun>,
+    pub selected_run: usize,
     pub label: String,
     pub startup_warning: String,
     pub stopping: bool,
@@ -330,6 +352,8 @@ impl DashboardModel {
             scroll: 0,
             detail_max_scroll: 0,
             detail_follow_tail: true,
+            detail_runs: Vec::new(),
+            selected_run: 0,
             label,
             startup_warning,
             stopping: false,
@@ -459,6 +483,11 @@ impl DashboardModel {
     }
 
     pub fn selected_activity(&self) -> Option<&Activity> {
+        if self.detail {
+            if let Some(run) = self.detail_runs.get(self.selected_run) {
+                return self.state.activities.get(&run.id);
+            }
+        }
         let row = self.selected_row()?;
         row.tasks
             .values()
@@ -503,6 +532,8 @@ impl DashboardModel {
 
     pub fn enter_detail(&mut self) {
         self.detail = true;
+        self.detail_runs.clear();
+        self.selected_run = 0;
         self.scroll = 0;
         self.detail_max_scroll = 0;
         self.detail_follow_tail = true;
@@ -510,6 +541,42 @@ impl DashboardModel {
 
     pub fn leave_detail(&mut self) {
         self.detail = false;
+        self.detail_runs.clear();
+        self.selected_run = 0;
+        self.scroll = 0;
+        self.detail_max_scroll = 0;
+        self.detail_follow_tail = true;
+    }
+
+    pub fn apply_chapter_runs(&mut self, details: ChapterRuns) {
+        let selected = details
+            .selected_run_id
+            .as_deref()
+            .and_then(|id| details.runs.iter().position(|run| run.id == id))
+            .unwrap_or_else(|| details.runs.len().saturating_sub(1));
+        if let Some(activity) = details.activity {
+            self.state
+                .activities
+                .insert(activity.run_id.clone(), activity);
+        }
+        self.detail_runs = details.runs;
+        self.selected_run = selected;
+        self.scroll = 0;
+        self.detail_max_scroll = 0;
+        self.detail_follow_tail = true;
+    }
+
+    pub fn cycle_run(&mut self, backwards: bool) {
+        if self.detail_runs.len() < 2 {
+            return;
+        }
+        self.selected_run = if backwards {
+            self.selected_run
+                .checked_sub(1)
+                .unwrap_or(self.detail_runs.len() - 1)
+        } else {
+            (self.selected_run + 1) % self.detail_runs.len()
+        };
         self.scroll = 0;
         self.detail_max_scroll = 0;
         self.detail_follow_tail = true;
@@ -782,6 +849,40 @@ mod tests {
         assert!(model.detail);
         assert_eq!(model.detail_tab, DetailTab::Plan);
         assert_eq!(model.selected_row().unwrap().unit.id, "book/chapter-01");
+    }
+
+    #[test]
+    fn chapter_run_tabs_select_history_and_switch_activity() {
+        let mut model = DashboardModel::loading("test".into(), String::new());
+        model.detail = true;
+        model.apply_chapter_runs(ChapterRuns {
+            runs: vec![
+                HistoricalRun {
+                    id: "formalize-3".into(),
+                    stage: "formalize".into(),
+                    round: 3,
+                    ..HistoricalRun::default()
+                },
+                HistoricalRun {
+                    id: "review-2".into(),
+                    stage: "review".into(),
+                    round: 2,
+                    ..HistoricalRun::default()
+                },
+            ],
+            selected_run_id: Some("review-2".into()),
+            activity: Some(Activity {
+                run_id: "review-2".into(),
+                current: "reviewing".into(),
+                ..Activity::default()
+            }),
+            ..ChapterRuns::default()
+        });
+
+        assert_eq!(model.selected_run, 1);
+        assert_eq!(model.selected_activity().unwrap().current, "reviewing");
+        model.cycle_run(true);
+        assert_eq!(model.selected_run, 0);
     }
 
     #[test]
