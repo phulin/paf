@@ -369,7 +369,7 @@ def test_shepherd_is_strong_read_only_and_repair_workers_use_luna_max(tmp_path: 
     assert "--dangerously-bypass-approvals-and-sandbox" not in shepherd
     assert shepherd[shepherd.index("--sandbox") + 1] == "read-only"
     assert shepherd[shepherd.index("--model") + 1] == "gpt-5.6-sol"
-    assert 'model_reasoning_effort="xhigh"' in shepherd
+    assert 'model_reasoning_effort="medium"' in shepherd
     assert repair[repair.index("--model") + 1] == "gpt-5.6-luna"
     assert 'model_reasoning_effort="max"' in repair
     prompt = executor.build_prompt(

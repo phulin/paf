@@ -42,10 +42,10 @@ export function StatusPill({
   queued?: boolean;
   phase?: TaskPhase;
 }) {
-  const displayStatus = repairing
-    ? "repairing"
-    : building
-      ? "building"
+  const displayStatus = building
+    ? "building"
+    : repairing
+      ? "repairing"
       : queued
         ? "queued"
         : status === "running" && phase === "postprocess"
@@ -53,12 +53,12 @@ export function StatusPill({
           : status;
   return (
     <span className={`status-pill status-${displayStatus}`}>
-      {repairing ? <RotateCw size={13} /> : <StatusIcon status={status} />}
+      {repairing && !building ? <RotateCw size={13} /> : <StatusIcon status={status} />}
       <span>
-        {repairing
-          ? "repairing"
-          : building
-            ? "building"
+        {building
+          ? "building"
+          : repairing
+            ? "repairing"
             : queued
               ? "queued"
               : displayStatus === "postprocess"

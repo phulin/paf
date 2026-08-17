@@ -771,10 +771,10 @@ fn row_spend(row: &RowModel<'_>) -> String {
 }
 
 fn task_mark(task: &Task, building: bool) -> String {
-    let mark = if task.repairing {
-        "↻ repairing"
-    } else if building {
+    let mark = if building {
         "◆ building"
+    } else if task.repairing {
+        "↻ repairing"
     } else if task.queued {
         "· queued"
     } else if task.status == "running" && task.phase == "postprocess" {
@@ -1064,7 +1064,7 @@ mod tests {
     }
 
     #[test]
-    fn repairing_overlay_wins_over_failed_task_and_build_state() {
+    fn coordinator_build_wins_over_repairing_overlay() {
         let task = Task {
             status: "failed".into(),
             repairing: true,
@@ -1073,7 +1073,7 @@ mod tests {
         };
 
         assert_eq!(task_mark(&task, false), "↻ repairing (2)");
-        assert_eq!(task_mark(&task, true), "↻ repairing (2)");
+        assert_eq!(task_mark(&task, true), "◆ building (2)");
     }
 
     #[test]

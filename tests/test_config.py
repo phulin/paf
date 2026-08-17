@@ -43,6 +43,10 @@ def test_discovers_chapters_and_renders_paths(tmp_path: Path) -> None:
     assert config.settings.codex_fd_recycle_attempts == 20
     assert config.settings.sandbox == "danger-full-access"
     assert config.settings.cache_compaction_layers == 32
+    assert config.shepherd.model == "gpt-5.6-sol"
+    assert config.shepherd.reasoning_effort == "medium"
+    assert config.shepherd.worker_model == "gpt-5.6-luna"
+    assert config.shepherd.worker_reasoning_effort == "max"
 
 
 def test_loads_and_validates_discovery_concurrency(tmp_path: Path) -> None:

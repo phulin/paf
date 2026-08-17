@@ -23,7 +23,7 @@ lean_mcp_tool_timeout_seconds = 300
 [shepherd]
 enabled = false
 model = "gpt-5.6-sol"
-reasoning_effort = "xhigh"
+reasoning_effort = "medium"
 worker_model = "gpt-5.6-luna"
 worker_reasoning_effort = "max"
 interval_seconds = 1200

@@ -64,7 +64,7 @@ class ShepherdSettings:
 
     enabled: bool = False
     model: str = "gpt-5.6-sol"
-    reasoning_effort: str = "xhigh"
+    reasoning_effort: str = "medium"
     worker_model: str = "gpt-5.6-luna"
     worker_reasoning_effort: str = "max"
     interval_seconds: float = 1200.0
