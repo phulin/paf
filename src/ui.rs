@@ -13,6 +13,7 @@ use crate::model::{
     Activity, DashboardModel, DetailTab, RowModel, STAGES, Task, compact_task_detail,
     elapsed_seconds,
 };
+use crate::viewport::TimelineRenderCache;
 
 const BLUE: Color = Color::Rgb(122, 162, 247);
 const CYAN: Color = Color::Rgb(125, 207, 255);
@@ -609,13 +610,17 @@ fn draw_detail(frame: &mut Frame<'_>, model: &mut DashboardModel) {
             .block(Block::default().borders(Borders::BOTTOM)),
         layout[3],
     );
-    let text = detail_text(
-        model.detail_tab,
-        activity,
-        model.selected_prompt(),
-        model.selected_timeline_status(),
-    );
-    draw_detail_content(frame, model, text, layout[4]);
+    if model.detail_tab == DetailTab::Timeline {
+        draw_timeline_content(frame, model, layout[4]);
+    } else {
+        let text = detail_text(
+            model.detail_tab,
+            activity,
+            model.selected_prompt(),
+            model.selected_timeline_status(),
+        );
+        draw_detail_content(frame, model, text, layout[4]);
+    }
     frame.render_widget(
         Paragraph::new("←→ runs  Tab/Shift-Tab views  ↑↓ scroll  r reload  d detach  Esc/q back")
             .style(Style::default().fg(MUTED))
@@ -725,6 +730,98 @@ fn draw_detail_content(
             &mut scrollbar,
         );
     }
+}
+
+fn draw_timeline_content(frame: &mut Frame<'_>, model: &mut DashboardModel, area: Rect) {
+    let block = Block::default().borders(Borders::ALL);
+    let inner = block.inner(area);
+    let activity = model.selected_activity();
+    let run_id = activity.map_or_else(String::new, |value| value.run_id.clone());
+    let sequence = activity.map_or(0, |value| value.sequence);
+    let recent_len = activity.map_or(0, |value| value.recent.len());
+    let status = model.selected_timeline_status().map(str::to_owned);
+    let cache_matches = {
+        let cache = &model.timeline_render_cache;
+        cache.run_id == run_id
+            && cache.sequence == sequence
+            && cache.recent_len == recent_len
+            && cache.status == status
+            && cache.width == inner.width
+    };
+    if !cache_matches {
+        let text = detail_text(DetailTab::Timeline, activity, None, status.as_deref());
+        let mut offsets = Vec::with_capacity(text.lines.len() + 1);
+        let mut rendered_lines = 0usize;
+        offsets.push(rendered_lines);
+        for line in &text.lines {
+            rendered_lines += Paragraph::new(line.clone())
+                .wrap(Wrap { trim: false })
+                .line_count(inner.width);
+            offsets.push(rendered_lines);
+        }
+        model.timeline_render_cache = TimelineRenderCache {
+            run_id,
+            sequence,
+            recent_len,
+            status,
+            width: inner.width,
+            lines: text.lines,
+            offsets,
+            rendered_lines,
+        };
+    }
+
+    let maximum = model
+        .timeline_render_cache
+        .rendered_lines
+        .saturating_sub(inner.height as usize)
+        .min(u16::MAX as usize) as u16;
+    model.sync_detail_viewport(maximum);
+
+    let cache = &model.timeline_render_cache;
+    let scroll = model.scroll as usize;
+    let start = cache
+        .offsets
+        .partition_point(|offset| *offset <= scroll)
+        .saturating_sub(1)
+        .min(cache.lines.len().saturating_sub(1));
+    let target = scroll.saturating_add(inner.height as usize);
+    let end = cache
+        .offsets
+        .partition_point(|offset| *offset < target)
+        .max(start + usize::from(!cache.lines.is_empty()))
+        .min(cache.lines.len());
+    let local_scroll = scroll.saturating_sub(cache.offsets.get(start).copied().unwrap_or(0));
+    let visible = cache.lines.get(start..end).unwrap_or_default().to_vec();
+
+    frame.render_widget(block, area);
+    frame.render_widget(
+        Paragraph::new(visible)
+            .wrap(Wrap { trim: false })
+            .scroll((local_scroll.min(u16::MAX as usize) as u16, 0)),
+        inner,
+    );
+    draw_detail_scrollbar(frame, model.scroll, maximum, inner.height, area);
+}
+
+fn draw_detail_scrollbar(
+    frame: &mut Frame<'_>,
+    scroll: u16,
+    maximum: u16,
+    viewport_height: u16,
+    area: Rect,
+) {
+    if maximum == 0 {
+        return;
+    }
+    let mut scrollbar = ScrollbarState::new(maximum as usize + 1)
+        .position(scroll as usize)
+        .viewport_content_length(viewport_height as usize);
+    frame.render_stateful_widget(
+        Scrollbar::new(ScrollbarOrientation::VerticalRight),
+        area,
+        &mut scrollbar,
+    );
 }
 
 fn detail_text(
@@ -1353,6 +1450,64 @@ mod tests {
         let buffer = terminal.backend().buffer();
         assert_eq!(buffer[(19, 8)].symbol(), "█");
         assert_eq!(buffer[(19, 9)].symbol(), "▼");
+    }
+
+    #[test]
+    fn long_timeline_scrolling_reuses_the_wrapped_layout() {
+        let mut model = DashboardModel::loading("timeline cache test".into(), String::new());
+        model.preparation = None;
+        model.state.work_units.push(WorkUnit {
+            id: "book/chapter-01".into(),
+            document_id: "book".into(),
+            title: "Opening".into(),
+            ordinal: 1,
+            ..WorkUnit::default()
+        });
+        model.state.tasks.insert(
+            "book/chapter-01:review".into(),
+            Task {
+                work_unit_id: "book/chapter-01".into(),
+                stage: "review".into(),
+                latest_run_id: Some("long-run".into()),
+                ..Task::default()
+            },
+        );
+        model.state.activities.insert(
+            "long-run".into(),
+            Activity {
+                run_id: "long-run".into(),
+                sequence: 10_000,
+                recent: (0..10_000)
+                    .map(|sequence| ActivityEntry {
+                        sequence,
+                        at: "2026-08-16T00:00:00+00:00".into(),
+                        kind: "message".into(),
+                        status: "completed".into(),
+                        title: format!(
+                            "event-{sequence:05} with enough content to wrap in a narrow terminal"
+                        ),
+                        detail: format!("detail-{sequence:05}"),
+                    })
+                    .collect(),
+                ..Activity::default()
+            },
+        );
+        model.enter_detail();
+        let backend = TestBackend::new(64, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| draw(frame, &mut model)).unwrap();
+        let cached_lines = model.timeline_render_cache.lines.as_ptr();
+        model.scroll_detail(-3);
+        let started = Instant::now();
+        terminal.draw(|frame| draw(frame, &mut model)).unwrap();
+        let elapsed = started.elapsed();
+
+        assert_eq!(model.timeline_render_cache.lines.as_ptr(), cached_lines);
+        assert!(
+            elapsed < Duration::from_millis(250),
+            "cached timeline scroll took {elapsed:?}"
+        );
     }
 
     #[test]

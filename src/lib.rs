@@ -1,6 +1,7 @@
 mod model;
 mod runtime;
 mod ui;
+mod viewport;
 
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
