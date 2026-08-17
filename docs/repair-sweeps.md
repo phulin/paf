@@ -1,6 +1,6 @@
-# Quiescent repair sweeps
+# Shepherd repair sweeps
 
-Status: proposed
+Status: core implementation landed; typed failure causality and manual controls remain future work
 
 ## Summary
 
@@ -10,20 +10,34 @@ misunderstands an import boundary, or reports completion without fixing the diag
 the retry. PAF should be able to spend a small, explicit budget on a stronger model to understand
 and schedule those exceptional cases without paying strong-model prices for every edit.
 
-The recommended design is a **quiescent repair sweep** with two model tiers. After the normal
-scheduler has drained all work it can do, a recovery controller identifies direct, locally
-repairable root failures. One read-only strong-model coordinator receives the global failure graph
-and emits a small, structured DAG of repair work units. Ordinary Luna/max workers execute those units
-in their individual scopes. PAF accepts a repair only when its own checks show that the named blocker
-is gone and the candidate introduces no new validation failure.
+The implemented design is a **Shepherd repair sweep** with two model tiers. Every 20 minutes, or when
+the configured failure threshold is reached, a recovery controller identifies locally repairable
+failures. One read-only strong-model Shepherd receives the failure dossier and emits a small,
+structured DAG of repair work units. Ordinary Luna/max workers execute those units in their
+individual scopes. PAF accepts a repair only when its own checks show that the candidate validates.
 
-The coordinator may group failures, identify an earlier owner, order repair units, and recommend an
+The Shepherd may group failures, identify an earlier owner, order repair units, and recommend an
 effort bucket, but it cannot edit files or assign arbitrary scheduler priorities. Each editing unit
 is still isolated to one existing exclusive scope. This keeps commits, stale-writer detection,
 chapter locks, validation, restart behavior, and causal unblocking understandable.
 
 Repair uses auxiliary run roles, not a fifth pipeline stage. The normal stage remains the owner of
 its completion predicate, and successful work still rejoins the ordinary fixed point.
+
+## Implementation status
+
+The current implementation persists `ShepherdRecord`, `RepairCaseRecord`, `RepairSweepRecord`, and
+`RepairWorkUnitRecord` in the global checkpoint; validates all Shepherd ids, stages, case coverage,
+and dependency cycles; inherits successor effort into repair priority; and schedules workers through
+the existing chapter locks, stage capacity, isolation, Git, and coordinator-build paths. A running
+unit overlays `repairing` on its exact owner/stage task cell without changing that task's underlying
+status. When the coordinator build begins validation, that cell switches to `building`. The TUI and
+web dashboard expose Shepherd state and repair counts.
+
+The stricter typed `TaskFailure`/`BlockerSpec` causality model, normalized repair tables, cost budgets,
+manual repair commands, and commit trailers described below are the hardening roadmap. Until those
+land, case fingerprints use the task status/detail plus latest run and validation evidence, and the
+feature remains disabled by default.
 
 ## Goals
 
@@ -53,12 +67,12 @@ its completion predicate, and successful work still rejoins the ordinary fixed p
 1. Each repair work unit is associated with at least one direct root failure and exactly one existing
    exclusive work-unit scope.
 2. Derived failed or blocked tasks are impact information, not repair targets.
-3. The strong coordinator is read-only. Its output is a proposal that must pass a deterministic plan
+3. The Shepherd is read-only. Its output is a proposal that must pass a deterministic plan
    validator before it changes scheduling state.
-4. Every repair coordinator and worker starts a fresh Codex thread. Only transient capacity/resource
+4. Every Shepherd and repair worker starts a fresh Codex thread. Only transient capacity/resource
    recovery may resume that same thread.
 5. Repair workers use the existing per-work-unit lock and count against the target stage's agent
-   pool. The coordinator has a separate concurrency limit of one and never holds a source lock.
+   pool. The Shepherd has a separate concurrency limit of one and never holds a source lock.
 6. The stage's ordinary write policy still applies. In particular, proof repair cannot change
    declaration interfaces, and discovery remains read-only.
 7. Candidate edits are validated before they are imported when transactional isolation is
@@ -80,7 +94,7 @@ flowchart TD
     R --> C{Direct repairable root failures?}
     C -->|no| X[Finish with the remaining failures]
     C -->|yes| Q[Persist repair cases and a sweep snapshot]
-    Q --> A[Strong read-only coordinator proposes a repair DAG]
+    Q --> A[Strong read-only Shepherd proposes a repair DAG]
     A --> H{Plan is valid and current?}
     H -->|no| E0[Reject or bounded replan]
     E0 --> B
@@ -101,12 +115,10 @@ flowchart TD
     M --> C
 ```
 
-The first implementation should invoke the strong coordinator only after a complete normal
-scheduling wave. That gives ordinary retries and specialized proof handoffs the first opportunity,
-produces a stable failure set, and prevents planning against work that was already going to fix the
-problem. Once a validated repair plan is persisted, its work units join the same dependency-aware
-scheduler as the four ordinary stages. A future component-level trigger could plan one quiescent
-dependency component while unrelated normal work continues, but it is not needed initially.
+The implementation invokes the Shepherd from a live periodic/threshold loop. A threshold sweep is
+also checked when a scheduling wave finishes, so a batch of failures cannot disappear with process
+shutdown before planning. Once a validated repair plan is persisted, its work units join the same
+dependency-aware scheduler as the four ordinary stages.
 
 ## Record failures as data
 
@@ -186,7 +198,7 @@ The fingerprint should hash the task key, stable failure code, normalized blocke
 source digest, relevant request/finding ids, and configuration fingerprint. It must not hash volatile
 timestamps, truncated log text, or attempt numbers.
 
-There is intentionally no durable `running` case state. Running or interrupted coordinator and
+There is intentionally no durable `running` case state. Running or interrupted Shepherd and
 worker runs, together with repair work-unit state, are the in-flight facts and the authority for
 live-agent counts. Case states remain simple aggregate facts:
 
@@ -201,9 +213,9 @@ Worker attempt counts increment when run rows are durably created, not when agen
 run and replan counts are tracked separately on the sweep. A hard kill therefore cannot create free
 retries. An explicit operator command may reopen an escalated case without deleting its history.
 
-## Strong coordinator and repair work units
+## Shepherd and repair work units
 
-One strong-model coordinator plans a bounded batch of cases. It is a read-only orchestration run,
+One strong-model Shepherd plans a bounded batch of cases. It is a read-only orchestration run,
 not a worker attached to a source task. Its input snapshot contains the current failures, causal
 links, ordinary stage states, source and import graphs, critical-path ranks, prior attempts, scopes,
 and registered blocker verifiers. Its structured `RepairPlan` must account for every selected case
@@ -231,7 +243,7 @@ The durable entities are:
 ```text
 RepairSweep
   id, state, snapshot_revision, plan_digest
-  case_ids, coordinator_run_ids
+  case_ids, shepherd_run_ids
   plan_attempt_count, replan_count
   created_at, updated_at
 
@@ -252,13 +264,13 @@ RepairWorkUnit
 `RepairWorkUnit` is intentionally distinct from the corpus `WorkUnit`. It is a dynamic recovery job
 over one corpus work unit, not a new source chapter. Its `target_stage` selects the existing prompt
 contract, tools, pool, validation, and write policy. Multiple scopes always become multiple repair
-work units, even if the coordinator considers them one mathematical fix.
+work units, even if the Shepherd considers them one mathematical fix.
 
 ## Eligibility and planning trigger
 
 Before spending model capacity, PAF should reconcile each apparent root failure against current
 sources. Another accepted edit may already have removed the diagnostic, supplied the declaration, or
-made the exact build fresh. Such a case is resolved without invoking the strong coordinator.
+made the exact build fresh. Such a case is resolved without invoking the Shepherd.
 
 The remaining cases are eligible only when:
 
@@ -268,8 +280,9 @@ The remaining cases are eligible only when:
 - the case, repair-unit, task, lineage, sweep, and optional cost budgets all permit more work;
 - the isolation backend can provide the required safety guarantees.
 
-The first version batches all eligible roots after the normal pipeline quiesces. The coordinator is
-invoked only if at least one fingerprint has not already been planned at the current source revision.
+The first version batches eligible roots every configured interval or when enough new fingerprints
+reach the failure threshold. The Shepherd is invoked only if at least one eligible fingerprint is
+available.
 A bounded replan may run after a worker supplies genuinely new evidence or a valid plan becomes stale;
 an ordinary worker failure alone does not recursively create a new case.
 
@@ -308,9 +321,8 @@ rank(node) = bounded_effort(node) + max(rank(successor), default=0)
 ```
 
 Ordinary nodes retain PAF's configured statement/proof effort and historical estimates; the model
-does not replace them. The coordinator chooses only a named repair effort bucket such as `tiny`,
-`small`, or `medium`. PAF maps that bucket to a configured value capped by the owner stage's effort.
-Its free-text `priority_rationale` is display-only.
+does not replace them. The Shepherd chooses only a named `small`, `medium`, or `large` repair effort
+bucket. PAF maps that bucket to a bounded value and combines it with the owner's existing schedule.
 
 This gives the desired cross-stage behavior without a brittle stage-wide precedence rule:
 
@@ -319,25 +331,24 @@ This gives the desired cross-stage behavior without a brittle stage-wide precede
 - a leaf proof repair does not jump ahead of critical-path discovery or formalization merely because
   it is repair work;
 - two repair units inherit the downstream value of the normal stage nodes they unblock;
-- the strong coordinator's effort bucket influences the unit's own bounded cost estimate, but cannot
+- the Shepherd's effort bucket influences the unit's own bounded cost estimate, but cannot
   overwhelm the dependency-derived rank.
 
 Normal and repair nodes compete by descending rank, then by oldest ready time and stable id. No
 running agent is preempted. A unit targeting discovery uses the discovery pool and remains read-only;
 units targeting formalize, review, or prove share the existing mutating `agent_slots` pool. A worker
 must acquire both the repair-worker limiter and its target-stage pool, so repair concurrency is an
-additional cap rather than extra edit capacity. The strong coordinator uses a separate one-slot
+additional cap rather than extra edit capacity. The Shepherd uses a separate one-slot
 planning limiter, is included in live-agent and cost accounting, and never occupies a work-unit lock.
 Coordinator builds continue through the existing serialized build queue.
 
-Initially, create plans only at global quiescence. Once a plan is persisted, resume the integrated
-scheduler immediately: ready repair units and any ordinary nodes reopened by accepted patches compete
-by augmented rank. Do not invoke the strong coordinator again until that combined wave quiesces.
-Component-level early planning can be added later without changing this rule.
+Once a plan is persisted, ready repair units run by augmented rank. Accepted repairs reset only their
+covered failures to `pending`, and a scheduling wave that observed repair progress runs the ordinary
+stage graph again.
 
-## Coordinator dossier and worker packets
+## Shepherd dossier and worker packets
 
-The strong coordinator receives one bounded sweep dossier rather than an unbounded concatenation of
+The Shepherd receives one bounded sweep dossier rather than an unbounded concatenation of
 JSONL logs. It should include:
 
 - all selected case ids, work-unit identities, source spans, stages, and exact write policies;
@@ -353,7 +364,7 @@ JSONL logs. It should include:
 
 Exact blockers must be retained even when older narrative history is truncated. The dossier should
 quote agent-produced and source-produced text as untrusted evidence and keep runtime instructions in
-a separate final section. The coordinator sees scope metadata but has a read-only sandbox and no
+a separate final section. The Shepherd sees scope metadata but has a read-only sandbox and no
 editing tools.
 
 After plan validation, PAF renders a smaller worker packet for each repair unit. It contains only the
@@ -381,20 +392,21 @@ profiles:
 
 ```text
 ExecutionProfile
-  role = "failure_repair_coordinator" | "failure_repair_worker"
+  role = "shepherd" | "repair_worker"
   model, reasoning_effort, timeout, sandbox
   prompt template and report-schema selector
   tool policy
 ```
 
-The coordinator profile uses the stronger model and a read-only sandbox. Its run is attached to a
-`RepairSweep`, not misleadingly to one chapter-stage task. The worker profile defaults to
+The Shepherd profile uses the stronger model and a read-only sandbox. Its auxiliary run anchors its
+history to one selected work unit while `ShepherdRecord.current_run_id` exposes its global identity.
+The worker profile defaults to
 `gpt-5.6-luna` with `max` reasoning and inherits the repair unit's `target_stage`. Its run is attached
 to the repair work unit and owner task, is auxiliary, and does not consume the task's ordinary round
 count. Both runs record their actual models for separate cost accounting and are never selected as
 the session to resume for an ordinary stage attempt.
 
-The coordinator has one strict `RepairPlan` schema. Worker schemas extend the relevant stage schema
+The Shepherd has one strict `RepairPlan` schema. Workers reuse the relevant stage schema
 rather than replace it: a discovery worker still returns dependencies, a review worker still assesses
 every supplied finding, and a proof worker still reports failed declarations and upstream requests.
 This lets existing stage acceptance logic remain authoritative while keeping the expensive model out
@@ -503,7 +515,7 @@ being separately mutable case facts.
 State changes occur at explicit transactional boundaries:
 
 1. A task terminal transition and its typed `TaskFailure` are persisted together.
-2. Eligible cases and the sweep snapshot revision are persisted before the strong coordinator starts.
+2. Eligible cases and the sweep snapshot revision are persisted before the Shepherd starts.
 3. A valid plan inserts all repair units and dependency edges and marks its cases `planned` in one
    transaction. Until that commit, none of the units is schedulable.
 4. A repair unit is marked `running` and its Luna worker `RunRecord` is inserted before acquiring a
@@ -531,7 +543,7 @@ blocker set is now empty:
 - successful tasks are not force-rerun merely because a repair sweep occurred;
 - run history and ordinary round counts are retained.
 
-The integrated scheduler then runs another wave over the augmented graph. The strong coordinator's
+The integrated scheduler then runs another wave over the augmented graph. The Shepherd's
 sweep dossier is recomputed only after that wave quiesces, so a patch that changes imports or
 diagnostics cannot leave stale planned units behind.
 
@@ -549,45 +561,32 @@ while pipeline is incomplete and repair_sweeps < max_sweeps:
 
 ## Configuration and controls
 
-The feature should ship disabled by default until the manual workflow has accumulated evidence. A
-proposed configuration is:
+The feature ships disabled by default. Its current configuration is:
 
 ```toml
-[repair]
+[shepherd]
 enabled = true
-trigger = "after-wave" # or "manual"
-coordinator_model = "gpt-5.6-sol"
-coordinator_reasoning_effort = "xhigh"
-coordinator_max_agents = 1
+model = "gpt-5.6-sol"
+reasoning_effort = "medium"
 worker_model = "gpt-5.6-luna"
 worker_reasoning_effort = "max"
-worker_max_agents = 1
-max_sweeps = 2
-max_cases_per_sweep = 8
-max_work_units_per_sweep = 12
-max_work_units_per_case = 3
-max_replans_per_sweep = 1
-max_worker_attempts_per_unit = 1
-max_worker_attempts_per_task = 6
-max_lineage_depth = 2
-coordinator_timeout_seconds = 3600
-worker_timeout_seconds = 7200
-# coordinator_max_cost_usd = 20.0 # optional soft launch budgets
-# worker_max_cost_usd = 30.0
-require_transactional_isolation = true
+interval_seconds = 1200
+failure_threshold = 10
+maximum_failures_per_sweep = 50
+maximum_work_units_per_sweep = 32
+maximum_sweeps_per_invocation = 3
+max_agents = 2
 ```
 
-The worker profile is independent of the coordinator profile and defaults to Luna/max even if the
-coordinator uses a stronger model. All limits except `max_sweeps` are enforced from durable history,
-not just process memory. A soft cost budget prevents new launches after completed measured spend
-reaches the limit; the attempt, work-unit, replan, and task caps remain the hard bound when usage is
-unavailable.
+The worker profile is independent of the Shepherd profile and defaults to Luna/max even when the
+Shepherd uses a stronger model. Sweep limits are currently per orchestrator invocation; case and
+work-unit history remains durable across restarts.
 
-Useful commands are:
+Planned manual controls are:
 
 - `paf repair TARGET --candidates` to show deterministic root cases, eligibility, impact, and
   fingerprints without launching a model;
-- `paf repair TARGET --plan` to run the strong coordinator, validate its plan, and print the proposed
+- `paf repair TARGET --plan` to run the Shepherd, validate its plan, and print the proposed
   repair DAG without launching Luna workers;
 - `paf repair TARGET [--case ID]` to run the bounded manual sweep;
 - `paf repair TARGET --retry CASE_ID` to explicitly reopen one escalated case;
@@ -599,13 +598,13 @@ explicit action.
 
 ## Persistence and crash recovery
 
-The database should add normalized `task_failures`, `repair_cases`, `repair_sweeps`,
-`repair_work_units`, and `repair_work_unit_dependencies` tables. Coordinator plans are stored with a
-schema version and digest. Compact current repair summaries remain in task and dashboard projections.
+The current database stores compact repair dictionaries in the global checkpoint and repair runs in
+the normalized run table. Future schema hardening should add normalized `task_failures`,
+`repair_cases`, `repair_sweeps`, `repair_work_units`, and dependency tables.
 Startup reconciliation handles each crash boundary idempotently:
 
 - cases persisted, no sweep: they remain `open`;
-- coordinator run interrupted before a valid plan: the sweep becomes `interrupted`; a bounded fresh
+- Shepherd run interrupted before a valid plan: the sweep becomes interrupted; a bounded fresh
   planning run may consume another planner attempt;
 - valid plan persisted: its pending units are reconstructed directly from the database, never by
   asking the model to recreate the same plan;
@@ -628,22 +627,22 @@ The TUI, web UI, status JSON, and final failure summary should expose:
 
 - open, running (derived from runs), patched, resolved, escalated, and superseded case counts;
 - the validated repair DAG, each unit's target stage, dependencies, augmented rank, and status;
-- coordinator versus Luna-worker model, usage, cost, elapsed time, and attempt budgets;
+- Shepherd versus Luna-worker model, usage, cost, elapsed time, and attempt budgets;
 - root failure code and exact blocker summary;
 - number and critical-path weight of blocked dependents;
 - candidate changed paths, validation result, commit, and why it was accepted or discarded;
 - explicit ineligibility or escalation reason.
 
-Planning and editing activity should appear in the existing run timeline with roles
-`failure_repair_coordinator` and `failure_repair_worker`, but should not inflate ordinary stage round
-counts. Aggregate spend should include both normally and provide coordinator/worker breakdowns.
+Planning and editing activity appears in the existing run timeline with roles `shepherd` and
+`repair_worker` and does not inflate ordinary stage round counts. Aggregate spend includes both
+through their persisted auxiliary runs.
 
 ## Rollout plan
 
 1. **Typed failures.** Add stable failure codes, causal links, blocker specs, database persistence,
    and the model-free `paf repair --candidates`. Convert all current terminal scheduler paths before
    enabling selection; do not fall back to parsing `detail`.
-2. **Strong planning.** Add repair sweeps, the read-only coordinator profile, strict `RepairPlan`
+2. **Strong planning.** Add repair sweeps, the read-only Shepherd profile, strict `RepairPlan`
    schema, plan validator, durable repair work-unit DAG, and `paf repair --plan`. No edits run yet.
 3. **Manual Luna workers.** Add the worker profile, stage-extended schemas, worker packets, FUSE
    preview/validation/import path, and `paf repair --case`. Support source-local formalize and prove
@@ -654,7 +653,7 @@ counts. Aggregate spend should include both normally and provide coordinator/wor
 5. **Review, discovery, and automatic sweeps.** Add their report-contract verifiers, wrap the normal
    pipeline in the bounded outer fixed point, and expose controls/metrics. Keep automation opt-in.
 6. **Evaluate before broadening.** Measure plan validity, replans, resolved-case rate, discarded
-   candidates, regressions, coordinator/worker cost, and repeated fingerprints. Only then consider
+   candidates, regressions, Shepherd/worker cost, and repeated fingerprints. Only then consider
    automatic handling of escalated upstream requests or component-level early triggering.
 
 ## Required tests
@@ -664,7 +663,7 @@ counts. Aggregate spend should include both normally and provide coordinator/wor
 - Derived failures collapse to one root case and are released only when all causes clear.
 - Fingerprints are stable across restart and change when relevant source, configuration, findings,
   or diagnostics change.
-- The coordinator is read-only, every plan id and edge is validated, invalid plans are atomic
+- The Shepherd is read-only, every plan id and edge is validated, invalid plans are atomic
   no-ops, plan DAGs are acyclic, and model priority hints are bounded.
 - Augmented bottom-level ranks place repair units relative to discover, formalize, review, and prove
   according to the ordinary work they unblock, without a global repair-stage override.
@@ -672,7 +671,7 @@ counts. Aggregate spend should include both normally and provide coordinator/wor
   still-failing candidate is discarded without changing the canonical tree.
 - A clean partial proof repair is committed, marks the case `patched`, and resumes ordinary proof
   work; a complete one resolves the task without another agent.
-- Coordinator runs use the configured strong model and read-only profile; worker runs use Luna/max,
+- Shepherd runs use the configured strong model and read-only profile; worker runs use Luna/max,
   the target-stage schema and pool, fresh threads, and normal token accounting.
 - Sweep, unit, case, and original-task transitions remain consistent across partial patches,
   complete repairs, failed units, bounded replans, and causal unblocking.

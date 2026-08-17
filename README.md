@@ -480,6 +480,7 @@ The dashboard shows:
   concurrency pool;
 - the active coordinator build's mode, stage, iteration, target progress, current chapter, owner, and
   queued build count;
+- Shepherd status, pending failure count, and planned/running repair units;
 - aggregate `pending`, `queued`, `running`, `succeeded`, `failed`, `blocked`, and `interrupted`
   chapter counts for discover, formalize, review, and prove;
 - each chapter's status and attempt count in every stage, plus independent exact-build freshness;
@@ -555,6 +556,9 @@ status (`pending`, `running`, `succeeded`, `failed`, `blocked`, or `interrupted`
 describing what
 a running or pending task is doing. A transient `queued` marker distinguishes runnable pending stages
 that are waiting for an agent slot, and both the TUI and web dashboard label them accordingly.
+An independent persisted `repairing` overlay and repair-work-unit id identify the exact stage cell
+currently owned by a Shepherd worker without mutating that task's ordinary state machine. An active
+coordinator validation build takes display precedence and labels that cell `building`.
 Successful discovery reports enter a short bounded batch: PAF merges the reports, rebuilds the source
 dependency graph once, and persists the graph plus all task promotions atomically. At most twice the
 configured discovery-agent pool is scheduled at once. Dashboards count live run records as working
@@ -665,6 +669,30 @@ cache_compaction_layers = 32 # asynchronously compact immutable cache layer stac
 lean_project = "lean" # relative to swarm.repo; contains lakefile and lean-toolchain
 lean_mcp_tool_timeout_seconds = 300
 ```
+
+Failure repair is opt-in. The Shepherd uses a strong read-only model to plan a bounded repair DAG
+every 20 minutes or whenever 10 new terminal failures accumulate; scoped editing remains on
+Luna/max workers and shares the ordinary stage locks and capacity:
+
+```toml
+[shepherd]
+enabled = true
+model = "gpt-5.6-sol"
+reasoning_effort = "medium"
+worker_model = "gpt-5.6-luna"
+worker_reasoning_effort = "max"
+interval_seconds = 1200
+failure_threshold = 10
+maximum_failures_per_sweep = 50
+maximum_work_units_per_sweep = 32
+maximum_sweeps_per_invocation = 3
+max_agents = 2
+```
+
+Repair is an auxiliary overlay, not a fifth stage. The Shepherd may target any existing
+discover/formalize/review/prove cell. While the Luna worker runs, the TUI and web matrix label that
+cell `repairing`; when the coordinator build validates it, the cell switches to `building`. The
+underlying task status changes only after validation succeeds.
 
 When Lean MCP is enabled, orchestrator startup bootstraps `lean_project` if it does not already
 contain both `lean-toolchain` and a Lake file. PAF pins the active Lean version, creates a matching
