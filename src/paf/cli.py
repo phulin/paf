@@ -905,7 +905,10 @@ def _start_agent(args: argparse.Namespace, config: PipelineConfig) -> int:
         )
     finally:
         log_handle.close()
-    deadline = time.monotonic() + 10
+    # Large resumed corpora can spend well over ten seconds loading and
+    # reconciling their persisted state before the control socket is ready.
+    # Do not kill an otherwise healthy daemon while it is still preparing.
+    deadline = time.monotonic() + 120
     response: dict[str, object] | None = None
     while time.monotonic() < deadline:
         if process.poll() is not None:
