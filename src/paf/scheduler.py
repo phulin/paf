@@ -1268,6 +1268,9 @@ class Orchestrator:
                 )
                 return FormalizeOutcome(False)
             if not attempt.agent.succeeded or not attempt.validation.succeeded:
+                if attempt.agent.exit_code == 124 or attempt.validation.timed_out:
+                    feedback = attempt.feedback()
+                    continue
                 await self.state.set_task(
                     chapter.id,
                     Stage.FORMALIZE,

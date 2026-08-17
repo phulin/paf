@@ -309,3 +309,57 @@ async def test_formalize_retries_diagnostics_and_finishes_with_clean_build(
     assert builds == 2
     assert "unknown identifier" in feedbacks[0]
     assert state.task(chapter.id, Stage.FORMALIZE).status == TaskStatus.SUCCEEDED
+
+
+@pytest.mark.asyncio
+async def test_formalize_retries_agent_timeout_instead_of_failing_chapter(
+    tmp_path, monkeypatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await orchestrator.prepare()
+    chapter = config.work_units[0]
+    scope_checks = 0
+    attempts = 0
+
+    async def scope_exists(_chapter):
+        nonlocal scope_checks
+        scope_checks += 1
+        return scope_checks >= 3
+
+    async def attempt(_chapter, _stage, **kwargs):
+        nonlocal attempts
+        del kwargs
+        attempts += 1
+        timed_out = attempts == 1
+        agent = SimpleNamespace(
+            succeeded=not timed_out,
+            exit_code=124 if timed_out else 0,
+            capacity_exhausted=False,
+            report={"complete": not timed_out},
+        )
+        return SimpleNamespace(
+            agent=agent,
+            validation=ValidationResult(not timed_out, 124 if timed_out else 0, ""),
+            feedback=lambda: "agent timed out",
+        )
+
+    async def build(*args, snapshots, **kwargs):
+        del args, kwargs
+        snapshots[chapter.id] = SimpleNamespace()
+        return {chapter.id: ValidationResult(True, 0, "")}
+
+    async def publish(_chapter, _snapshot):
+        return True
+
+    monkeypatch.setattr(orchestrator, "_scope_exists", scope_exists)
+    monkeypatch.setattr(orchestrator, "_attempt", attempt)
+    monkeypatch.setattr(orchestrator, "_build_chapters", build)
+    monkeypatch.setattr(orchestrator, "_publish_validated_build", publish)
+
+    outcome = await orchestrator._formalize(chapter)
+
+    assert outcome.succeeded
+    assert attempts == 2
+    assert state.task(chapter.id, Stage.FORMALIZE).status == TaskStatus.SUCCEEDED
