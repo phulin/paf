@@ -4,6 +4,7 @@ import sqlite3
 from collections.abc import Callable, Iterable
 from dataclasses import replace
 from pathlib import Path
+from threading import get_ident
 from typing import Any
 
 import pytest
@@ -1979,6 +1980,83 @@ def test_build_feedback_falls_back_to_build_target_for_unlocated_failure(
     assert set(diagnostics.actionable) == {first.id}
     assert "failed without a source-located diagnostic" in diagnostics.actionable[first.id]
     assert "validation timed out" in diagnostics.actionable[first.id]
+
+
+def test_build_feedback_parses_shared_batch_output_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    orchestrator = Orchestrator(config, StateStore(config))
+    first, second = config.chapters
+    result = ValidationResult(
+        False,
+        1,
+        "error: Book/Chapter02/Section.lean:8:3: unknown identifier `missing`\n",
+    )
+    parse_calls = 0
+    original = scheduler_module._lean_diagnostics
+
+    def tracked_diagnostics(output: str) -> tuple[scheduler_module.LeanDiagnostic, ...]:
+        nonlocal parse_calls
+        parse_calls += 1
+        return original(output)
+
+    monkeypatch.setattr(scheduler_module, "_lean_diagnostics", tracked_diagnostics)
+
+    diagnostics = orchestrator._build_feedback({first.id: result, second.id: result})
+
+    assert parse_calls == 1
+    assert set(diagnostics.actionable) == {second.id}
+
+
+def test_diagnostic_owner_lookup_uses_identifier_index_and_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    orchestrator = Orchestrator(config, StateStore(config))
+    _, second = config.chapters
+    diagnostic = scheduler_module.LeanDiagnostic(
+        "error",
+        "error: build failed",
+        "error: build failed while compiling Book.Chapter02.Section",
+    )
+
+    assert orchestrator._diagnostic_owner_ids(diagnostic) == (second.id,)
+
+    def unexpected_lookup(_text: str) -> tuple[str, ...]:
+        raise AssertionError("cached diagnostic performed another identifier lookup")
+
+    monkeypatch.setattr(orchestrator, "_identifier_owner_ids", unexpected_lookup)
+    assert orchestrator._diagnostic_owner_ids(diagnostic) == (second.id,)
+
+
+@pytest.mark.asyncio
+async def test_async_build_feedback_runs_off_event_loop_thread(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    orchestrator = Orchestrator(config, StateStore(config))
+    chapter = config.chapters[0]
+    result = ValidationResult(False, 1, "error: build failed")
+    event_loop_thread = get_ident()
+    routing_thread = event_loop_thread
+    original = orchestrator._build_feedback
+
+    def tracked_feedback(
+        results: dict[str, ValidationResult],
+        *,
+        blocked_owner_ids: set[str] | frozenset[str] = frozenset(),
+    ) -> scheduler_module.BuildDiagnostics:
+        nonlocal routing_thread
+        routing_thread = get_ident()
+        return original(results, blocked_owner_ids=blocked_owner_ids)
+
+    monkeypatch.setattr(orchestrator, "_build_feedback", tracked_feedback)
+
+    diagnostics = await orchestrator._build_feedback_async({chapter.id: result})
+
+    assert diagnostics.actionable
+    assert routing_thread != event_loop_thread
 
 
 @pytest.mark.asyncio

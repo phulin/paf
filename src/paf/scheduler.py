@@ -6,8 +6,9 @@ import re
 from collections import deque
 from collections.abc import Callable, Coroutine, Iterable
 from contextlib import suppress
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
+from threading import Lock
 from typing import Any
 from uuid import uuid4
 
@@ -196,6 +197,17 @@ PROOF_FEEDBACK_MAX_CHARS = 24_000
 PROOF_FEEDBACK_ROUNDS = 3
 DISCOVERY_BATCH_SECONDS = 0.025
 DISCOVERY_BATCH_MAXIMUM = 256
+DIAGNOSTIC_OWNER_CACHE_MAXIMUM = 16_384
+
+
+@dataclass
+class _IdentifierTrieNode:
+    children: dict[str, _IdentifierTrieNode] = field(default_factory=dict)
+    owner_ids: tuple[str, ...] = ()
+
+
+def _is_identifier_character(character: str) -> bool:
+    return character == "_" or (character.isascii() and character.isalnum())
 
 
 def _bounded_proof_feedback(blocks: Iterable[str]) -> str:
@@ -343,6 +355,14 @@ class Orchestrator:
             raise ValueError("pass work_units or legacy chapters, not both")
         selected_units = work_units if work_units is not None else chapters
         self.work_units = tuple(selected_units if selected_units is not None else config.work_units)
+        self._work_units_by_id = {chapter.id: chapter for chapter in self.work_units}
+        self._work_unit_order = {chapter.id: index for index, chapter in enumerate(self.work_units)}
+        self._path_owners: dict[str, list[str]] = {}
+        self._module_owners: dict[str, list[str]] = {}
+        self._identifier_trie = _IdentifierTrieNode()
+        self._diagnostic_owner_cache: dict[LeanDiagnostic, tuple[str, ...]] = {}
+        self._diagnostic_owner_cache_lock = Lock()
+        self._build_diagnostic_indexes()
         self.force = force
         self.resume_agents = resume_agents
         self.control = control or RunControl()
@@ -1403,9 +1423,8 @@ class Orchestrator:
                         "clean diagnostics and coordinator build in source dependency order",
                     )
                     return FormalizeOutcome(True)
-                feedback = self._build_feedback({chapter.id: validation}).actionable.get(
-                    chapter.id, validation.output
-                )
+                diagnostics = await self._build_feedback_async({chapter.id: validation})
+                feedback = diagnostics.actionable.get(chapter.id, validation.output)
 
             attempt = await self._attempt(
                 chapter,
@@ -1477,20 +1496,37 @@ class Orchestrator:
             )
         )
 
+    def _build_diagnostic_indexes(self) -> None:
+        """Index immutable work-unit names used to route coordinator diagnostics."""
+
+        lean_prefix = self.config.settings.lean_project.as_posix().rstrip("/") + "/"
+        for chapter in self.work_units:
+            root = (chapter.lean_root / chapter.chapter_path).as_posix()
+            for path_root in dict.fromkeys((root, root.removeprefix(lean_prefix))):
+                self._path_owners.setdefault(path_root, []).append(chapter.id)
+            self._module_owners.setdefault(chapter.chapter_module, []).append(chapter.id)
+            for identifier in self._chapter_identifiers(chapter):
+                node = self._identifier_trie
+                for character in identifier:
+                    node = node.children.setdefault(character, _IdentifierTrieNode())
+                if chapter.id not in node.owner_ids:
+                    node.owner_ids += (chapter.id,)
+
+    def _ordered_owner_ids(self, owner_ids: Iterable[str]) -> tuple[str, ...]:
+        return tuple(sorted(set(owner_ids), key=self._work_unit_order.__getitem__))
+
     def _path_owner_ids(self, path: str) -> tuple[str, ...]:
         normalized = path.replace("\\", "/")
         repo_prefix = self.config.settings.repo.as_posix().rstrip("/") + "/"
         normalized = normalized.removeprefix(repo_prefix).removeprefix("./")
         owners: list[str] = []
-        for chapter in self.work_units:
-            root = (chapter.lean_root / chapter.chapter_path).as_posix()
-            lean_prefix = self.config.settings.lean_project.as_posix().rstrip("/") + "/"
-            roots = (root, root.removeprefix(lean_prefix))
-            if any(
-                normalized == f"{item}.lean" or normalized.startswith(f"{item}/") for item in roots
-            ):
-                owners.append(chapter.id)
-        return tuple(dict.fromkeys(owners))
+        if normalized.endswith(".lean"):
+            owners.extend(self._path_owners.get(normalized.removesuffix(".lean"), ()))
+        parent = normalized
+        while "/" in parent:
+            parent = parent.rsplit("/", 1)[0]
+            owners.extend(self._path_owners.get(parent, ()))
+        return self._ordered_owner_ids(owners)
 
     def _is_earlier_work_unit(self, owner: WorkUnitLike, consumer: WorkUnitLike) -> bool:
         if owner.document_id == consumer.document_id:
@@ -2233,29 +2269,53 @@ class Orchestrator:
         await self._restore_unaffected_review_successes(pending_owners)
 
     def _module_owner_ids(self, module: str) -> tuple[str, ...]:
-        return tuple(
-            chapter.id
-            for chapter in self.work_units
-            if module == chapter.chapter_module or module.startswith(chapter.chapter_module + ".")
-        )
+        owners: list[str] = []
+        candidate = module
+        while candidate:
+            owners.extend(self._module_owners.get(candidate, ()))
+            candidate = candidate.rpartition(".")[0]
+        return self._ordered_owner_ids(owners)
+
+    def _identifier_owner_ids(self, text: str) -> tuple[str, ...]:
+        owners: list[str] = []
+        for start, character in enumerate(text):
+            if start and _is_identifier_character(text[start - 1]):
+                continue
+            node = self._identifier_trie.children.get(character)
+            if node is None:
+                continue
+            end = start + 1
+            while True:
+                if node.owner_ids and (end == len(text) or not _is_identifier_character(text[end])):
+                    owners.extend(node.owner_ids)
+                if end == len(text):
+                    break
+                node = node.children.get(text[end])
+                if node is None:
+                    break
+                end += 1
+        return self._ordered_owner_ids(owners)
 
     def _diagnostic_owner_ids(self, diagnostic: LeanDiagnostic) -> tuple[str, ...]:
+        with self._diagnostic_owner_cache_lock:
+            if diagnostic in self._diagnostic_owner_cache:
+                return self._diagnostic_owner_cache[diagnostic]
+
         message = diagnostic.header.split(":", 1)[1].lstrip()
         if location := LEAN_LOCATION_RE.match(message):
-            return self._path_owner_ids(location.group("path"))
+            owners = self._path_owner_ids(location.group("path"))
+        else:
+            # Some orchestration failures have no line/column but do name one or
+            # more modules or source roots. Matching only this diagnostic block is
+            # intentional: matching the complete Lake transcript over-assigns every
+            # replayed dependency and permitted `sorry` warning.
+            owners = self._identifier_owner_ids(diagnostic.text)
 
-        # Some orchestration failures have no line/column but do name one or
-        # more modules or source roots. Matching only this diagnostic block is
-        # intentional: matching the complete Lake transcript over-assigns every
-        # replayed dependency and permitted `sorry` warning.
-        owners: list[str] = []
-        for chapter in self.work_units:
-            for identifier in self._chapter_identifiers(chapter):
-                pattern = rf"(?<![A-Za-z0-9_]){re.escape(identifier)}(?![A-Za-z0-9_])"
-                if re.search(pattern, diagnostic.text):
-                    owners.append(chapter.id)
-                    break
-        return tuple(dict.fromkeys(owners))
+        with self._diagnostic_owner_cache_lock:
+            if len(self._diagnostic_owner_cache) >= DIAGNOSTIC_OWNER_CACHE_MAXIMUM:
+                self._diagnostic_owner_cache.pop(next(iter(self._diagnostic_owner_cache)))
+            self._diagnostic_owner_cache[diagnostic] = owners
+        return owners
 
     async def _build_chapters(
         self,
@@ -2410,7 +2470,7 @@ class Orchestrator:
                     finish_ready_requests()
                     continue
 
-                owners = set(self._build_feedback(attempt_results).actionable)
+                owners = set((await self._build_feedback_async(attempt_results)).actionable)
                 graph = self._observed_work_unit_graph()
                 affected = {
                     chapter_id
@@ -2491,7 +2551,7 @@ class Orchestrator:
                 by_id = {item.id: item for item in self.work_units}
                 build_required_ids = self._dependency_closure(build_graph, ids)
                 build_source_digests = await asyncio.to_thread(
-                    lambda: {
+                    lambda by_id=by_id, build_required_ids=build_required_ids: {
                         chapter_id: scope_digest(self.config.settings.repo, by_id[chapter_id])
                         for chapter_id in build_required_ids
                     }
@@ -2585,7 +2645,7 @@ class Orchestrator:
                         source_held = True
                     current_graph = self._observed_work_unit_graph()
                     current_source_digests = await asyncio.to_thread(
-                        lambda: {
+                        lambda by_id=by_id, build_required_ids=build_required_ids: {
                             chapter_id: scope_digest(self.config.settings.repo, by_id[chapter_id])
                             for chapter_id in build_required_ids
                         }
@@ -2655,15 +2715,19 @@ class Orchestrator:
         blocked_owner_ids: set[str] | frozenset[str] = frozenset(),
     ) -> BuildDiagnostics:
         feedback: dict[str, dict[str, None]] = {}
-        by_id = {chapter.id: chapter for chapter in self.work_units}
+        by_id = self._work_units_by_id
 
         def source_location(owner_id: str) -> str:
             owner = by_id[owner_id]
             return f"{owner.source}:{owner.source_span.start_line}-{owner.source_span.end_line}"
 
+        targets_by_result: dict[ValidationResult, list[str]] = {}
         for target_id, result in results.items():
             if result.succeeded:
                 continue
+            targets_by_result.setdefault(result, []).append(target_id)
+
+        for result, target_ids in targets_by_result.items():
             routed = False
             for diagnostic in _lean_diagnostics(result.output):
                 owners = self._diagnostic_owner_ids(diagnostic)
@@ -2693,12 +2757,13 @@ class Orchestrator:
                     feedback.setdefault(owner, {})[block] = None
 
             if not routed:
-                block = (
-                    f"Informal source: {source_location(target_id)}\n"
-                    f"Coordinator build of {by_id[target_id].chapter_module} failed without a "
-                    f"source-located diagnostic:\n{result.output[-12000:]}"
-                )
-                feedback.setdefault(target_id, {})[block] = None
+                for target_id in target_ids:
+                    block = (
+                        f"Informal source: {source_location(target_id)}\n"
+                        f"Coordinator build of {by_id[target_id].chapter_module} failed without a "
+                        f"source-located diagnostic:\n{result.output[-12000:]}"
+                    )
+                    feedback.setdefault(target_id, {})[block] = None
 
         deferred = tuple(sorted(blocked_owner_ids.intersection(feedback)))
         return BuildDiagnostics(
@@ -2708,6 +2773,20 @@ class Orchestrator:
                 if chapter_id not in blocked_owner_ids
             },
             deferred_owner_ids=deferred,
+        )
+
+    async def _build_feedback_async(
+        self,
+        results: dict[str, ValidationResult],
+        *,
+        blocked_owner_ids: set[str] | frozenset[str] = frozenset(),
+    ) -> BuildDiagnostics:
+        """Route build output without monopolizing the asyncio control thread."""
+
+        return await asyncio.to_thread(
+            self._build_feedback,
+            results,
+            blocked_owner_ids=blocked_owner_ids,
         )
 
     async def _discover_all(self) -> bool:
@@ -3025,7 +3104,7 @@ class Orchestrator:
                     "scope and complete the review against the fresh source."
                 )
             }
-        feedback = self._build_feedback({chapter.id: result}).actionable
+        feedback = (await self._build_feedback_async({chapter.id: result})).actionable
         return feedback or {chapter.id: result.output}
 
     async def _queue_review_feedback(
