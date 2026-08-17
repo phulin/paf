@@ -36,8 +36,7 @@ web dashboard expose Shepherd state and repair counts.
 
 The stricter typed `TaskFailure`/`BlockerSpec` causality model, normalized repair tables, cost budgets,
 manual repair commands, and commit trailers described below are the hardening roadmap. Until those
-land, case fingerprints use the task status/detail plus latest run and validation evidence, and the
-feature remains disabled by default.
+land, case fingerprints use the task status/detail plus latest run and validation evidence.
 
 ## Goals
 
@@ -561,7 +560,7 @@ while pipeline is incomplete and repair_sweeps < max_sweeps:
 
 ## Configuration and controls
 
-The feature ships disabled by default. Its current configuration is:
+The feature ships enabled by default. Its current configuration is:
 
 ```toml
 [shepherd]
@@ -577,6 +576,8 @@ maximum_work_units_per_sweep = 32
 maximum_sweeps_per_invocation = 3
 max_agents = 2
 ```
+
+Projects can set `enabled = false` to opt out.
 
 The worker profile is independent of the Shepherd profile and defaults to Luna/max even when the
 Shepherd uses a stronger model. Sweep limits are currently per orchestrator invocation; case and
@@ -651,7 +652,7 @@ through their persisted auxiliary runs.
    ranks, persist the linked state transitions, and schedule repair units through their target-stage
    pools.
 5. **Review, discovery, and automatic sweeps.** Add their report-contract verifiers, wrap the normal
-   pipeline in the bounded outer fixed point, and expose controls/metrics. Keep automation opt-in.
+   pipeline in the bounded outer fixed point, and expose controls/metrics. Preserve explicit opt-out.
 6. **Evaluate before broadening.** Measure plan validity, replans, resolved-case rate, discarded
    candidates, regressions, Shepherd/worker cost, and repeated fingerprints. Only then consider
    automatic handling of escalated upstream requests or component-level early triggering.

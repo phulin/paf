@@ -444,6 +444,10 @@ class Orchestrator:
         report("Checking the Git worktree", 8)
         await self.git.prepare()
         if self.config.shepherd.enabled:
+            self.state.shepherd.next_run_at = (
+                datetime.now(UTC) + timedelta(seconds=self.config.shepherd.interval_seconds)
+            ).isoformat()
+            await self.state.save()
             self._shepherd_task = asyncio.create_task(self._shepherd_loop(), name="paf-shepherd")
         report("Preparation complete", 9)
 
@@ -4270,8 +4274,6 @@ class Orchestrator:
         changes = self.state.change_bus.subscribe()
         interval = self.config.shepherd.interval_seconds
         due = datetime.now(UTC) + timedelta(seconds=interval)
-        self.state.shepherd.next_run_at = due.isoformat()
-        await self.state.save()
         try:
             while (
                 self._shepherd_sweeps_started < self.config.shepherd.maximum_sweeps_per_invocation

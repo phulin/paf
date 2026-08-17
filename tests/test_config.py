@@ -44,6 +44,7 @@ def test_discovers_chapters_and_renders_paths(tmp_path: Path) -> None:
     assert config.settings.sandbox == "danger-full-access"
     assert config.settings.cache_compaction_layers == 32
     assert config.shepherd.model == "gpt-5.6-sol"
+    assert config.shepherd.enabled is True
     assert config.shepherd.reasoning_effort == "medium"
     assert config.shepherd.worker_model == "gpt-5.6-luna"
     assert config.shepherd.worker_reasoning_effort == "max"
@@ -110,6 +111,16 @@ max_agents = 3
     )
     with pytest.raises(ValueError, match=r"shepherd\.failure_threshold"):
         load_config(path)
+
+
+def test_shepherd_can_be_disabled_explicitly(tmp_path: Path) -> None:
+    path = write_project(tmp_path)
+    path.write_text(
+        path.read_text(encoding="utf-8") + "\n[shepherd]\nenabled = false\n",
+        encoding="utf-8",
+    )
+
+    assert load_config(path).shepherd.enabled is False
 
 
 def test_selects_configured_chapters(tmp_path: Path) -> None:
@@ -237,6 +248,7 @@ def test_infers_zero_config_project_from_markdown(tmp_path: Path) -> None:
     assert config.settings.reasoning_effort == "max"
     assert config.settings.bypass_approvals_and_sandbox
     assert config.settings.isolation == "auto"
+    assert config.shepherd.enabled is True
     assert config.settings.state_dir == tmp_path / ".paf" / "book07"
     assert config.books[0].module == "LastLib.Book07ExistingAPI"
     assert [chapter.number for chapter in config.chapters] == [1, 2]

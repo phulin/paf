@@ -670,7 +670,8 @@ lean_project = "lean" # relative to swarm.repo; contains lakefile and lean-toolc
 lean_mcp_tool_timeout_seconds = 300
 ```
 
-Failure repair is opt-in. The Shepherd uses a strong read-only model to plan a bounded repair DAG
+Failure repair is enabled by default. The Shepherd uses a strong read-only model to plan a bounded
+repair DAG
 every 20 minutes or whenever 10 new terminal failures accumulate; scoped editing remains on
 Luna/max workers and shares the ordinary stage locks and capacity:
 
@@ -688,6 +689,8 @@ maximum_work_units_per_sweep = 32
 maximum_sweeps_per_invocation = 3
 max_agents = 2
 ```
+
+Set `enabled = false` to opt out for a project.
 
 Repair is an auxiliary overlay, not a fifth stage. The Shepherd may target any existing
 discover/formalize/review/prove cell. While the Luna worker runs, the TUI and web matrix label that

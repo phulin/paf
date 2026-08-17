@@ -21,7 +21,7 @@ lean_mcp_tool_timeout_seconds = 300
 # The Shepherd periodically triages accumulated terminal failures with a
 # stronger read-only planner, then dispatches bounded Luna/max repair units.
 [shepherd]
-enabled = false
+enabled = true
 model = "gpt-5.6-sol"
 reasoning_effort = "medium"
 worker_model = "gpt-5.6-luna"
