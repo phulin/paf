@@ -4416,39 +4416,51 @@ class Orchestrator:
                     proof_targets, self.config.settings.repo, chapter
                 )
                 if not discovered_targets:
-                    source_digest = await asyncio.to_thread(
-                        scope_digest, self.config.settings.repo, chapter
+                    remaining_placeholders = await asyncio.to_thread(
+                        count_placeholders, self.config.settings.repo, chapter
                     )
-                    await self._resolve_satisfied_proof_blockers(chapter)
-                    await self.state.set_task(
-                        chapter.id,
-                        Stage.PROVE,
-                        TaskStatus.SUCCEEDED,
-                        "all proof chunks completed and chapter elaborates",
-                        source_digest=source_digest,
-                    )
-                    return True
-                unavailable = skipped_target_ids | unavailable_target_ids(discovered_targets)
-                candidates = tuple(
-                    target for target in discovered_targets if target.fingerprint not in unavailable
-                )
-                if not candidates:
-                    break
-                if targeted_retry:
-                    requests = tuple(
-                        self.state.upstream_requests[request_id]
-                        for request_id in targeted_request_ids
-                        if request_id in self.state.upstream_requests
-                    )
-                    requested = tuple(
+                    if remaining_placeholders == 0:
+                        source_digest = await asyncio.to_thread(
+                            scope_digest, self.config.settings.repo, chapter
+                        )
+                        await self._resolve_satisfied_proof_blockers(chapter)
+                        await self.state.set_task(
+                            chapter.id,
+                            Stage.PROVE,
+                            TaskStatus.SUCCEEDED,
+                            "all proof chunks completed and chapter elaborates",
+                            source_digest=source_digest,
+                        )
+                        return True
+                    # Keep unusual declaration syntax safe: after all recognized chunks, hand any
+                    # remaining raw placeholders to the established whole-chapter fallback.
+                    chunked_proofs = False
+                    proof_round = 0
+                    assigned_targets = ()
+                if chunked_proofs:
+                    unavailable = skipped_target_ids | unavailable_target_ids(discovered_targets)
+                    candidates = tuple(
                         target
-                        for target in candidates
-                        if any(matches_target(request, target) for request in requests)
+                        for target in discovered_targets
+                        if target.fingerprint not in unavailable
                     )
-                    if requested:
-                        candidates = requested
-                assigned_targets = proof_target_chunk(candidates, proof_chunk_size)
-                chunk_round = 0
+                    if not candidates:
+                        break
+                    if targeted_retry:
+                        requests = tuple(
+                            self.state.upstream_requests[request_id]
+                            for request_id in targeted_request_ids
+                            if request_id in self.state.upstream_requests
+                        )
+                        requested = tuple(
+                            target
+                            for target in candidates
+                            if any(matches_target(request, target) for request in requests)
+                        )
+                        if requested:
+                            candidates = requested
+                    assigned_targets = proof_target_chunk(candidates, proof_chunk_size)
+                    chunk_round = 0
             try:
                 attempt = await self._attempt(
                     chapter,
@@ -4545,6 +4557,9 @@ class Orchestrator:
                 if chunked_proofs
                 else ()
             )
+            remaining_placeholder_count = await asyncio.to_thread(
+                count_placeholders, self.config.settings.repo, chapter
+            )
             assigned_ids = {target.fingerprint for target in assigned_targets}
             remaining_assigned = tuple(
                 target for target in remaining_targets if target.fingerprint in assigned_ids
@@ -4552,7 +4567,11 @@ class Orchestrator:
             if (
                 attempt.agent.succeeded
                 and attempt.validation.succeeded
-                and (not remaining_targets if chunked_proofs else attempt.agent.placeholders == 0)
+                and (
+                    remaining_placeholder_count == 0
+                    if chunked_proofs
+                    else attempt.agent.placeholders == 0
+                )
             ):
                 await self._resolve_satisfied_proof_blockers(chapter)
                 source_digest = await asyncio.to_thread(
@@ -4731,10 +4750,8 @@ class Orchestrator:
                 )
                 return False
 
-        unresolved_targets = (
-            await asyncio.to_thread(proof_targets, self.config.settings.repo, chapter)
-            if chunked_proofs
-            else ()
+        unresolved_placeholders = await asyncio.to_thread(
+            count_placeholders, self.config.settings.repo, chapter
         )
         await self.state.set_task(
             chapter.id,
@@ -4748,7 +4765,7 @@ class Orchestrator:
             else TaskStatus.FAILED,
             (
                 "proof chunks exhausted retries with "
-                f"{sum(target.placeholder_count for target in unresolved_targets)} "
+                f"{unresolved_placeholders} "
                 "placeholder(s) remaining; durable blockers retained"
                 if chunked_proofs
                 else (

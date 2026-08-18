@@ -450,6 +450,12 @@ LEAN_DECLARATION_RE = re.compile(
     r"(?P<name>[^\s([{:=]+)",
     re.MULTILINE,
 )
+LEAN_PROOF_DECLARATION_RE = re.compile(
+    r"^[ \t]*(?:(?:noncomputable|private|protected|unsafe|opaque)[ \t]+)*"
+    r"(?:(?:theorem|lemma|def|abbrev|structure|class|instance)[ \t]+"
+    r"(?P<name>[^\s([{:=]+)|(?P<anonymous>example)\b)",
+    re.MULTILINE,
+)
 
 
 def lean_mcp_executable() -> Path:
@@ -819,22 +825,23 @@ def proof_targets(repo: Path, chapter: WorkUnitLike) -> tuple[ProofTarget, ...]:
     targets: list[ProofTarget] = []
     for path in scoped_files(repo, chapter):
         text = path.read_text(encoding="utf-8")
-        matches = list(LEAN_DECLARATION_RE.finditer(text))
+        matches = list(LEAN_PROOF_DECLARATION_RE.finditer(text))
         name_ordinals: dict[str, int] = {}
         for index, match in enumerate(matches):
-            declaration = match.group("name")
+            declaration = match.group("name") or "example"
             ordinal = name_ordinals.get(declaration, 0)
             name_ordinals[declaration] = ordinal + 1
             stop = matches[index + 1].start() if index + 1 < len(matches) else len(text)
             placeholder_count = len(pattern.findall(_lean_code(text[match.start() : stop])))
             if not placeholder_count:
                 continue
+            display_name = declaration if match.group("name") else f"example #{ordinal + 1}"
             relative = path.relative_to(repo).as_posix()
             identity = f"{relative}\0{declaration}\0{ordinal}".encode()
             targets.append(
                 ProofTarget(
                     path=relative,
-                    declaration=declaration,
+                    declaration=display_name,
                     line=text.count("\n", 0, match.start()) + 1,
                     placeholder_count=placeholder_count,
                     fingerprint=hashlib.sha256(identity).hexdigest()[:16],

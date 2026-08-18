@@ -341,6 +341,24 @@ def test_proof_chunk_does_not_split_one_declaration(tmp_path: Path) -> None:
     assert [target.placeholder_count for target in proof_target_chunk(targets, 1)] == [2]
 
 
+def test_unnamed_examples_are_independent_proof_targets(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = config.chapters[0]
+    path = tmp_path / "lean" / "Book" / "Chapter01.lean"
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        "theorem named : True := by sorry\nexample : True := by sorry\n",
+        encoding="utf-8",
+    )
+
+    targets = proof_targets(tmp_path, chapter)
+
+    assert [(target.declaration, target.placeholder_count) for target in targets] == [
+        ("named", 1),
+        ("example #1", 1),
+    ]
+
+
 def test_proof_prompt_contains_only_the_assigned_chunk(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
     chapter = config.chapters[0]
