@@ -73,7 +73,7 @@ from paf.state import (
     UpstreamRequestStatus,
 )
 
-MAXIMUM_COORDINATOR_BUILD_TARGETS = 16
+MAXIMUM_COORDINATOR_BUILD_TARGETS = 100
 REPAIR_EFFORT = {"small": 1.0, "medium": 3.0, "large": 8.0}
 REVIEW_REPORT_RETRY_PROMPT = """Your previous review turn did not satisfy the report contract:
 
