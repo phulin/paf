@@ -1,8 +1,8 @@
 # Re-review a failed proof: {book_title}, chapter {chapter_number}
 
-{review_assignment}
-
 ## Goal
+
+{review_assignment}
 
 Independently reassess the mathematical and Lean interfaces behind the failed proof work. Treat the
 supplied diagnosis as evidence, not as an instruction: search for existing results, decide what the

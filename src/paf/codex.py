@@ -371,9 +371,9 @@ def report_schema_key(stage: Stage, *, role: str = "", feedback: str = "") -> st
 def render_review_variant(template: str, *, upstream: bool) -> str:
     if upstream:
         values = {
-            "review_assignment": """This is the targeted upstream variant. A later proof asks this
-earlier chapter for one or more reusable results. Review those requests and their evidence together;
-do not audit the rest of the chapter or work on unrelated placeholders.""",
+            "review_assignment": """Resolve the supplied requests from later proofs for reusable
+results in this earlier chapter. Review those requests and their evidence together; do not audit the
+rest of the chapter or work on unrelated placeholders.""",
             "review_goal_details": """For each request, decide whether the needed result already
 exists, belongs here as a new fully proved declaration, or depends on later material and should stay
 with the requesting chapter. Fully prove every declaration you add; this variant does not permit new
@@ -410,10 +410,9 @@ have stopped. It must describe the stable files on disk, not planned work. Use o
         }
     else:
         values = {
-            "review_assignment": """This is the full-chapter re-review variant.
-A proof attempt found evidence that one or more statements or supporting declarations may be wrong
-or hard to use.
-Review the complete assigned chapter, not only the declarations named in the evidence.""",
+            "review_assignment": """Re-review the complete assigned chapter after a proof attempt
+found evidence that one or more statements or supporting declarations may be wrong or hard to use.
+Do not limit the review to the declarations named in the evidence.""",
             "review_goal_details": """This remains statement review, not proof work. Repair every
 genuine statement or interface problem in the assigned files, but preserve sound statements when
 only the proof strategy failed. Existing proof placeholders may remain, and new proposition proofs
