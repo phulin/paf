@@ -2095,8 +2095,42 @@ class Orchestrator:
         if not owners:
             return StageOutcome(ExecutionDisposition.FAILED)
         await self._invalidate_build_records(owners)
+        formalize_owners = tuple(
+            owner_id for owner_id in owners if not self.state.later_stage_started(owner_id)
+        )
+        review_owners = tuple(
+            owner_id for owner_id in owners if self.state.later_stage_started(owner_id)
+        )
+        if review_owners:
+            routed = (await self._build_feedback_async({consumer.id: validation})).actionable
+            feedback = {
+                owner_id: routed.get(
+                    owner_id,
+                    (
+                        "A downstream coordinator build found a diagnostic owned by this "
+                        f"chapter while formalizing {consumer.id}:\n{validation.output[-12000:]}"
+                    ),
+                )
+                for owner_id in review_owners
+            }
+            digest = hashlib.sha256(validation.output.encode()).hexdigest()[:12]
+            await self._queue_review_feedback(
+                feedback,
+                origin=f"formalize-upstream:{consumer.id}:{digest}",
+            )
+        requirements = tuple(
+            Requirement(
+                RequirementKind.COORDINATOR_OWNER,
+                owner_task_key=self.state.key(
+                    owner_id,
+                    Stage.REVIEW if owner_id in review_owners else Stage.FORMALIZE,
+                ),
+                detail=f"coordinator diagnostic owned by {owner_id}",
+            )
+            for owner_id in owners
+        )
         async with self.state.batch():
-            for owner_id in owners:
+            for owner_id in formalize_owners:
                 owner_task = self.state.task(owner_id, Stage.FORMALIZE)
                 if owner_task.status == TaskStatus.RUNNING:
                     continue
@@ -2111,26 +2145,12 @@ class Orchestrator:
                 await self.state.set_task_waiting(
                     consumer.id,
                     Stage.FORMALIZE,
-                    (
-                        Requirement(
-                            RequirementKind.COORDINATOR_OWNER,
-                            owner_task_key=self.state.key(owner_id, Stage.FORMALIZE),
-                            detail=f"coordinator diagnostic owned by {owner_id}",
-                        )
-                        for owner_id in owners
-                    ),
+                    requirements,
                     "waiting for upstream coordinator diagnostic owners",
                 )
         return StageOutcome(
             ExecutionDisposition.WAITING,
-            tuple(
-                Requirement(
-                    RequirementKind.COORDINATOR_OWNER,
-                    owner_task_key=self.state.key(owner_id, Stage.FORMALIZE),
-                    detail=f"coordinator diagnostic owned by {owner_id}",
-                )
-                for owner_id in owners
-            ),
+            requirements,
         )
 
     def _chapter_identifiers(self, chapter: WorkUnitLike) -> tuple[str, ...]:

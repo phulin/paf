@@ -2438,6 +2438,57 @@ async def test_formalizer_blocks_on_upstream_diagnostics_without_running_consume
 
 
 @pytest.mark.asyncio
+async def test_formalizer_routes_late_upstream_diagnostics_to_review(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    owner, consumer = config.chapters
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await state.load_or_create()
+    await state.set_task(owner.id, Stage.FORMALIZE, TaskStatus.SUCCEEDED, "clean")
+    await state.set_task(owner.id, Stage.REVIEW, TaskStatus.RUNNING, "reviewing")
+    monkeypatch.setattr(orchestrator, "_scope_exists", lambda _chapter: asyncio.sleep(0, True))
+
+    async def build(*_args: object, **_kwargs: object) -> dict[str, ValidationResult]:
+        return {
+            consumer.id: ValidationResult(
+                False,
+                1,
+                "upstream diagnostic without a source location",
+                status=ValidationStatus.UPSTREAM_FAILED,
+                blocked_by=(owner.id,),
+            )
+        }
+
+    async def no_agent(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("consumer agent must not run for an upstream diagnostic")
+
+    monkeypatch.setattr(orchestrator, "_build_chapters", build)
+    monkeypatch.setattr(orchestrator, "_attempt", no_agent)
+    monkeypatch.setattr(
+        orchestrator,
+        "_invalidate_build_records",
+        lambda _ids: asyncio.sleep(0, {owner.id, consumer.id}),
+    )
+
+    outcome = await orchestrator._formalize(consumer)
+
+    owner_formalize = state.task(owner.id, Stage.FORMALIZE)
+    assert owner_formalize.status == TaskStatus.SUCCEEDED
+    owner_review = state.task(owner.id, Stage.REVIEW)
+    assert owner_review.status == TaskStatus.PENDING
+    assert (
+        "upstream diagnostic without a source location"
+        in orchestrator._proof_review_feedback(owner.id)[0]
+    )
+    requirement = outcome.waiting_on[0]
+    assert requirement.owner_task_key == state.key(owner.id, Stage.REVIEW)
+    assert state.task(consumer.id, Stage.FORMALIZE).waiting_on == (requirement,)
+    await state.close()
+
+
+@pytest.mark.asyncio
 async def test_shepherd_reconciliation_accepts_matching_clean_build_without_agent(
     tmp_path: Path,
 ) -> None:
