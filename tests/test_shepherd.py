@@ -76,6 +76,101 @@ async def test_repair_work_unit_overlays_existing_stage_and_persists(tmp_path: P
 
 
 @pytest.mark.asyncio
+async def test_shepherd_receives_root_failures_not_causal_blockers(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    state = StateStore(config)
+    await state.load_or_create()
+    root, consumer = config.work_units
+    await state.set_task(root.id, Stage.FORMALIZE, TaskStatus.FAILED, "local Lean error")
+    await state.set_task(
+        consumer.id,
+        Stage.FORMALIZE,
+        TaskStatus.BLOCKED,
+        "blocked by a failed source dependency formalization",
+    )
+    await state.set_task(
+        consumer.id,
+        Stage.REVIEW,
+        TaskStatus.BLOCKED,
+        "formalization did not complete",
+    )
+    await state.set_task(
+        consumer.id,
+        Stage.PROVE,
+        TaskStatus.BLOCKED,
+        "blocked because statement review did not complete",
+    )
+
+    assert [key for key, _task in state.shepherd_repairable_tasks()] == [
+        state.key(root.id, Stage.FORMALIZE)
+    ]
+    await state.close()
+
+
+@pytest.mark.asyncio
+async def test_legacy_derived_review_failure_migrates_to_blocked(tmp_path: Path) -> None:
+    config_path = write_project(tmp_path, chapters="chapters = [1]")
+    config = load_config(config_path)
+    state = StateStore(config)
+    await state.load_or_create()
+    chapter = config.work_units[0]
+    await state.set_task(
+        chapter.id,
+        Stage.REVIEW,
+        TaskStatus.FAILED,
+        "formalization did not complete",
+    )
+    await state.close()
+
+    recovered = StateStore(load_config(config_path))
+    await recovered.load_or_create()
+
+    assert recovered.task(chapter.id, Stage.REVIEW).status == TaskStatus.BLOCKED
+    assert recovered.shepherd_repairable_tasks() == []
+    await recovered.close()
+
+
+@pytest.mark.asyncio
+async def test_interrupted_repair_dag_resumes_without_replanning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    state = StateStore(config)
+    await state.load_or_create()
+    chapter = config.work_units[0]
+    await state.set_task(chapter.id, Stage.REVIEW, TaskStatus.FAILED, "root review error")
+    task_key = state.key(chapter.id, Stage.REVIEW)
+    sweep = await state.start_repair_sweep(trigger="test", task_keys=[task_key])
+    case = state.repair_cases[sweep.case_ids[0]]
+    unit = RepairWorkUnitRecord(
+        id="resume-me",
+        sweep_id=sweep.id,
+        case_ids=[case.id],
+        task_keys=[task_key],
+        owner_chapter_id=chapter.id,
+        target_stage=Stage.REVIEW,
+        objective="resume the existing repair",
+        status=RepairWorkUnitStatus.INTERRUPTED,
+    )
+    await state.install_repair_plan(sweep.id, [unit], summary="existing plan", run_id="planner")
+    unit.status = RepairWorkUnitStatus.INTERRUPTED
+    await state.save("repair_work_units")
+    orchestrator = Orchestrator(config, state)
+    resumed: list[str] = []
+
+    async def execute(units: Any) -> bool:
+        resumed.extend(item.id for item in units)
+        return False
+
+    monkeypatch.setattr(orchestrator, "_execute_repair_plan", execute)
+
+    assert not await orchestrator._resume_repair_dags(include_certification=True)
+    assert resumed == [unit.id]
+    assert len(state.repair_sweeps) == 1
+    await state.close()
+
+
+@pytest.mark.asyncio
 async def test_dashboard_exposes_live_shepherd_and_repair_worker_runs(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
     chapter = config.work_units[0]

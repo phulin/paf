@@ -15,10 +15,12 @@ from paf.codex import (
     AgentResult,
     CodexExecutor,
     ValidationResult,
+    ValidationStatus,
     scope_digest,
     scoped_files,
 )
 from paf.config import load_config
+from paf.corpus import WorkUnitImportGraph
 from paf.git import GitCommitError
 from paf.hashing import stable_digest_text
 from paf.models import Chapter, PipelineConfig, ProofTarget, Stage
@@ -2071,13 +2073,108 @@ async def test_concurrent_review_builds_share_commands_and_partition_diagnostics
 
     assert commands == [
         f"cd lean && lake build {target(first)} {target(second)} {target(third)}",
-        f"cd lean && lake build {target(second)} {target(third)}",
+        f"cd lean && lake build {target(second)}",
+        f"cd lean && lake build {target(third)}",
     ]
     assert set(first_feedback) == {first.id}
     assert "broken review output" in first_feedback[first.id]
     assert second_feedback == {}
     assert third_feedback == {}
     await orchestrator.shutdown()
+
+
+def test_failed_batch_diagnostics_are_partitioned_by_target_closure(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    owner, consumer = config.chapters
+    orchestrator = Orchestrator(config, StateStore(config))
+    graph = WorkUnitImportGraph(
+        dependencies={owner.id: frozenset(), consumer.id: frozenset({owner.id})},
+        successors={owner.id: frozenset({consumer.id}), consumer.id: frozenset()},
+        order=(owner.id, consumer.id),
+        edges=((owner.id, consumer.id),),
+    )
+    result = ValidationResult(
+        False,
+        1,
+        "error: Book/Chapter01/Section.lean:3:2: rejected declaration",
+        process_exit_code=1,
+    )
+
+    partitioned = orchestrator._partition_build_diagnostics(result, (owner.id, consumer.id), graph)
+
+    assert partitioned[owner.id].status is ValidationStatus.TARGET_FAILED
+    assert partitioned[consumer.id].status is ValidationStatus.UPSTREAM_FAILED
+    assert partitioned[consumer.id].blocked_by == (owner.id,)
+
+
+@pytest.mark.asyncio
+async def test_formalizer_blocks_on_upstream_diagnostics_without_running_consumer_agent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    owner, consumer = config.chapters
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await state.load_or_create()
+    await state.set_task(owner.id, Stage.FORMALIZE, TaskStatus.SUCCEEDED, "clean")
+    monkeypatch.setattr(orchestrator, "_scope_exists", lambda _chapter: asyncio.sleep(0, True))
+
+    async def build(*_args: object, **_kwargs: object) -> dict[str, ValidationResult]:
+        return {
+            consumer.id: ValidationResult(
+                False,
+                1,
+                "upstream diagnostic",
+                status=ValidationStatus.UPSTREAM_FAILED,
+                blocked_by=(owner.id,),
+            )
+        }
+
+    async def no_agent(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("consumer agent must not run for an upstream diagnostic")
+
+    async def invalidate(ids: Iterable[str]) -> set[str]:
+        assert tuple(ids) == (owner.id,)
+        return {owner.id, consumer.id}
+
+    monkeypatch.setattr(orchestrator, "_build_chapters", build)
+    monkeypatch.setattr(orchestrator, "_attempt", no_agent)
+    monkeypatch.setattr(orchestrator, "_invalidate_build_records", invalidate)
+
+    outcome = await orchestrator._formalize(consumer)
+
+    assert outcome.blocked_by == (owner.id,)
+    assert state.task(owner.id, Stage.FORMALIZE).status == TaskStatus.PENDING
+    assert state.task(consumer.id, Stage.FORMALIZE).status == TaskStatus.BLOCKED
+    assert state.task(consumer.id, Stage.FORMALIZE).rounds == 0
+    await state.close()
+
+
+@pytest.mark.asyncio
+async def test_shepherd_reconciliation_accepts_matching_clean_build_without_agent(
+    tmp_path: Path,
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = config.chapters[0]
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await state.load_or_create()
+    digest = scope_digest(config.settings.repo, chapter)
+    state.formalize_graph = {
+        "clean": {chapter.id: {"source_digest": digest, "build_generation": 1}}
+    }
+    await state.save("formalize_graph")
+    await state.set_task(
+        chapter.id,
+        Stage.FORMALIZE,
+        TaskStatus.FAILED,
+        "stale coordinator result",
+    )
+
+    assert await orchestrator._reconcile_stale_formalizations()
+    assert state.task(chapter.id, Stage.FORMALIZE).status == TaskStatus.SUCCEEDED
+    assert state.task(chapter.id, Stage.FORMALIZE).rounds == 0
+    await state.close()
 
 
 @pytest.mark.asyncio
@@ -2569,7 +2666,12 @@ async def test_coordinator_build_counts_only_errors_owned_by_each_target(
         on_output("error: Book/Chapter01/Section.lean:1:1: shared dependency failure\n")
         if config.chapters[1].build_command.rpartition(" ")[2] in chapter.build_command:
             on_output("error: Book/Chapter02/Section.lean:2:1: target failure\n")
-        return ValidationResult(False, 1, "build failed")
+        return ValidationResult(
+            False,
+            1,
+            "error: Book/Chapter01/Section.lean:1:1: shared dependency failure\n"
+            "error: Book/Chapter02/Section.lean:2:1: target failure",
+        )
 
     monkeypatch.setattr(scheduler_module, "validate", validation_with_replayed_dependency_error)
 

@@ -12,6 +12,7 @@ from collections.abc import Awaitable, Callable, Iterable
 from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from enum import StrEnum
 from importlib.resources import files
 from pathlib import Path
 from typing import Any, BinaryIO
@@ -484,6 +485,15 @@ def lean_mcp_path() -> str:
     return os.pathsep.join(dict.fromkeys([*prefixes, *current]))
 
 
+class ValidationStatus(StrEnum):
+    CLEAN = "clean"
+    DEFERRED = "deferred"
+    TARGET_FAILED = "target_failed"
+    UPSTREAM_FAILED = "upstream_failed"
+    UNATTRIBUTED_BUILD_FAILURE = "unattributed_build_failure"
+    STALE_SNAPSHOT = "stale_snapshot"
+
+
 @dataclass(frozen=True)
 class ValidationResult:
     succeeded: bool
@@ -494,6 +504,16 @@ class ValidationResult:
     # status separately so a successful Lake batch with one rejected warning
     # can still publish its artifacts and certify unrelated targets.
     process_exit_code: int | None = None
+    status: ValidationStatus | None = None
+    blocked_by: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.status is None:
+            object.__setattr__(
+                self,
+                "status",
+                ValidationStatus.CLEAN if self.succeeded else ValidationStatus.TARGET_FAILED,
+            )
 
     @property
     def compiler_succeeded(self) -> bool:
@@ -507,6 +527,8 @@ class ValidationResult:
             "output": self.output,
             "timed_out": self.timed_out,
             "process_exit_code": self.process_exit_code,
+            "status": self.status,
+            "blocked_by": list(self.blocked_by),
         }
 
 

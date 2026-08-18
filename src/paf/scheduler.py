@@ -21,6 +21,7 @@ from paf.codex import (
     AgentResult,
     CodexExecutor,
     ValidationResult,
+    ValidationStatus,
     count_placeholders,
     declaration_uses_placeholder,
     declaration_uses_placeholder_in_chapter,
@@ -128,6 +129,11 @@ class Attempt:
 @dataclass(frozen=True)
 class FormalizeOutcome:
     succeeded: bool
+    blocked_by: tuple[str, ...] = ()
+
+    @property
+    def blocked(self) -> bool:
+        return bool(self.blocked_by)
 
 
 @dataclass(frozen=True)
@@ -456,7 +462,8 @@ class Orchestrator:
         self._upstream_repair_tasks: dict[str, asyncio.Task[None]] = {}
         self._shepherd_task: asyncio.Task[None] | None = None
         self._shepherd_lock = asyncio.Lock()
-        self._shepherd_sweeps_started = 0
+        self._consecutive_no_progress_sweeps = 0
+        self._last_shepherd_case_fingerprints: tuple[str, ...] = ()
         self._repair_progress_generation = 0
         self._repair_slots = asyncio.Semaphore(config.shepherd.max_agents)
         self._live_agent_tasks: dict[
@@ -1689,6 +1696,7 @@ class Orchestrator:
                             False,
                             1,
                             "Source scope changed after the coordinator build; retry required.",
+                            status=ValidationStatus.STALE_SNAPSHOT,
                         )
                 elif stage is Stage.PROVE:
                     build_fresh = await self._proof_build_is_fresh(chapter)
@@ -1706,6 +1714,7 @@ class Orchestrator:
                         True,
                         0,
                         "validation deferred to the coordinator formalize loop",
+                        status=ValidationStatus.DEFERRED,
                     )
             else:
                 validation = ValidationResult(
@@ -1728,6 +1737,11 @@ class Orchestrator:
                 run,
                 isolation=isolated.as_dict(),
                 validation=validation.as_dict(),
+                source_digest=(
+                    await asyncio.to_thread(scope_digest, self.config.settings.repo, chapter)
+                    if isolated.accepted and agent.changed
+                    else None
+                ),
             )
         except BaseException as error:
             interrupted_isolation: dict[str, object] | None = None
@@ -1848,6 +1862,7 @@ class Orchestrator:
             return FormalizeOutcome(True)
         maximum = self.config.stages[Stage.FORMALIZE].max_rounds
         feedback = ""
+        last_attempt: Attempt | None = None
         for iteration in range(1, maximum + 1):
             if await self._scope_exists(chapter):
                 snapshots: dict[str, ValidatedBuildSnapshot] = {}
@@ -1863,6 +1878,8 @@ class Orchestrator:
                         snapshots=snapshots,
                     )
                 )[chapter.id]
+                if last_attempt is not None:
+                    await self.state.update_run(last_attempt.run, validation=validation.as_dict())
                 if validation.succeeded and await self._publish_validated_build(
                     chapter, snapshots[chapter.id]
                 ):
@@ -1873,6 +1890,12 @@ class Orchestrator:
                         "clean diagnostics and coordinator build in source dependency order",
                     )
                     return FormalizeOutcome(True)
+                if validation.status is ValidationStatus.UPSTREAM_FAILED:
+                    return await self._block_on_upstream_diagnostics(chapter, validation)
+                if validation.blocked_by:
+                    await self._block_on_upstream_diagnostics(
+                        chapter, validation, block_consumer=False
+                    )
                 diagnostics = await self._build_feedback_async({chapter.id: validation})
                 feedback = diagnostics.actionable.get(chapter.id, validation.output)
 
@@ -1882,6 +1905,7 @@ class Orchestrator:
                 feedback=feedback,
                 queue_detail=f"dependency-ready formalization pass {iteration}/{maximum}",
             )
+            last_attempt = attempt
             complete = bool(attempt.agent.report.get("complete"))
             if attempt.agent.capacity_exhausted:
                 await self.state.set_task(
@@ -1912,6 +1936,8 @@ class Orchestrator:
                     snapshots=snapshots,
                 )
             )[chapter.id]
+            if last_attempt is not None:
+                await self.state.update_run(last_attempt.run, validation=validation.as_dict())
             if validation.succeeded and await self._publish_validated_build(
                 chapter, snapshots[chapter.id]
             ):
@@ -1922,6 +1948,10 @@ class Orchestrator:
                     "clean diagnostics and coordinator build in source dependency order",
                 )
                 return FormalizeOutcome(True)
+            if validation.status is ValidationStatus.UPSTREAM_FAILED:
+                return await self._block_on_upstream_diagnostics(chapter, validation)
+            if validation.blocked_by:
+                await self._block_on_upstream_diagnostics(chapter, validation, block_consumer=False)
 
         await self.state.set_task(
             chapter.id,
@@ -1930,6 +1960,44 @@ class Orchestrator:
             f"formalization did not reach clean diagnostics in {maximum} attempts",
         )
         return FormalizeOutcome(False)
+
+    async def _block_on_upstream_diagnostics(
+        self,
+        consumer: WorkUnitLike,
+        validation: ValidationResult,
+        *,
+        block_consumer: bool = True,
+    ) -> FormalizeOutcome:
+        """Route a coordinator failure to its owners without spending a consumer round."""
+
+        owners = tuple(
+            owner_id
+            for owner_id in dict.fromkeys(validation.blocked_by)
+            if owner_id in self._work_units_by_id and owner_id != consumer.id
+        )
+        if not owners:
+            return FormalizeOutcome(False)
+        await self._invalidate_build_records(owners)
+        async with self.state.batch():
+            for owner_id in owners:
+                owner_task = self.state.task(owner_id, Stage.FORMALIZE)
+                if owner_task.status == TaskStatus.RUNNING:
+                    continue
+                owner_task.recovering_failure = True
+                await self.state.set_task(
+                    owner_id,
+                    Stage.FORMALIZE,
+                    TaskStatus.PENDING,
+                    f"requeued as owner of coordinator diagnostics blocking {consumer.id}",
+                )
+            if block_consumer:
+                await self.state.set_task(
+                    consumer.id,
+                    Stage.FORMALIZE,
+                    TaskStatus.BLOCKED,
+                    "blocked by upstream coordinator diagnostics",
+                )
+        return FormalizeOutcome(False, owners)
 
     def _chapter_identifiers(self, chapter: WorkUnitLike) -> tuple[str, ...]:
         root = (chapter.lean_root / chapter.chapter_path).as_posix()
@@ -2880,53 +2948,74 @@ class Orchestrator:
             self._diagnostic_owner_cache[diagnostic] = owners
         return owners
 
-    def _partition_successful_build_diagnostics(
+    def _partition_build_diagnostics(
         self,
         result: ValidationResult,
         target_ids: Iterable[str],
         graph: WorkUnitImportGraph,
     ) -> dict[str, ValidationResult]:
-        """Apply warning policy per target after one successful Lake process.
-
-        Lake may compile every requested target and exit successfully while
-        PAF rejects a warning from just one source file.  The combined process
-        result must not make unrelated targets fail validation.
-        """
+        """Project every combined Lake result onto each target's dependency closure."""
 
         ids = tuple(target_ids)
-        if result.succeeded or not result.compiler_succeeded:
-            return {target_id: result for target_id in ids}
+        if result.succeeded:
+            return {
+                target_id: replace(
+                    result,
+                    status=ValidationStatus.CLEAN,
+                    blocked_by=(),
+                )
+                for target_id in ids
+            }
         diagnostics = _lean_diagnostics(result.output)
         owned = tuple(
             (diagnostic, set(self._diagnostic_owner_ids(diagnostic))) for diagnostic in diagnostics
         )
-        # An unlocated warning cannot safely be assigned within this batch.
-        # Leave it shared so the batch dispatcher retries smaller groups.
-        if not diagnostics or any(not owners for _, owners in owned):
-            return {target_id: result for target_id in ids}
+        unattributed = not diagnostics or any(not owners for _, owners in owned)
 
         partitioned: dict[str, ValidationResult] = {}
         for target_id in ids:
             closure = self._dependency_closure(graph, (target_id,))
-            relevant = [diagnostic for diagnostic, owners in owned if closure & owners]
+            relevant = [
+                (diagnostic, owners & closure) for diagnostic, owners in owned if closure & owners
+            ]
             if relevant:
-                output = "\n\n".join(diagnostic.text for diagnostic in relevant)
+                output = "\n\n".join(diagnostic.text for diagnostic, _owners in relevant)
+                relevant_owners = set().union(*(owners for _diagnostic, owners in relevant))
+                blocked_by = tuple(sorted(relevant_owners - {target_id}))
+                status = (
+                    ValidationStatus.TARGET_FAILED
+                    if target_id in relevant_owners
+                    else ValidationStatus.UPSTREAM_FAILED
+                )
                 output += (
-                    f"\n\nCoordinator rejected {len(relevant)} non-sorry Lean warning(s) "
-                    f"relevant to {target_id}."
+                    f"\n\nCoordinator found {len(relevant)} Lean diagnostic(s) relevant "
+                    f"to {target_id}."
                 )
                 partitioned[target_id] = ValidationResult(
                     False,
-                    1,
+                    result.exit_code,
                     output[-20_000:],
-                    process_exit_code=0,
+                    timed_out=result.timed_out,
+                    process_exit_code=result.process_exit_code,
+                    status=status,
+                    blocked_by=blocked_by,
                 )
-            else:
+            elif result.compiler_succeeded and not unattributed:
                 partitioned[target_id] = ValidationResult(
                     True,
                     0,
                     "Lake build succeeded; diagnostics belonged to other batch targets.",
                     process_exit_code=0,
+                    status=ValidationStatus.CLEAN,
+                )
+            else:
+                partitioned[target_id] = ValidationResult(
+                    False,
+                    result.exit_code,
+                    result.output[-20_000:],
+                    timed_out=result.timed_out,
+                    process_exit_code=result.process_exit_code,
+                    status=ValidationStatus.UNATTRIBUTED_BUILD_FAILURE,
                 )
         return partitioned
 
@@ -3164,24 +3253,25 @@ class Orchestrator:
                 failed_ids = active_ids.difference(succeeded_ids)
                 if not failed_ids:
                     continue
-
-                failed_results = {
-                    chapter_id: attempt_results[chapter_id] for chapter_id in failed_ids
-                }
-                owners = set((await self._build_feedback_async(failed_results)).actionable)
-                graph = self._observed_work_unit_graph()
-                affected = {
+                unattributed = {
                     chapter_id
                     for chapter_id in failed_ids
-                    if self._dependency_closure(graph, (chapter_id,)) & owners
+                    if attempt_results[chapter_id].status
+                    is ValidationStatus.UNATTRIBUTED_BUILD_FAILURE
                 }
-                if not affected:
-                    if len(failed_ids) > 1:
-                        # No diagnostic could be attributed. Retry each target
-                        # independently instead of failing the complete batch.
-                        isolate.update(failed_ids)
-                        continue
-                    affected = failed_ids
+                if unattributed and len(active_ids) > 1:
+                    # A failed process may stop before compiling the other targets.
+                    # Rebuild every uncertain target alone instead of sharing the
+                    # process-level failure across the batch.
+                    attributed = failed_ids.difference(unattributed)
+                    results_by_id.update(
+                        (chapter_id, attempt_results[chapter_id]) for chapter_id in attributed
+                    )
+                    remaining.difference_update(attributed)
+                    isolate.update(unattributed)
+                    finish_ready_requests()
+                    continue
+                affected = failed_ids
                 results_by_id.update(
                     (chapter_id, attempt_results[chapter_id]) for chapter_id in affected
                 )
@@ -3351,11 +3441,7 @@ class Orchestrator:
                     await asyncio.gather(preemption, return_exceptions=True)
                     result = validation.result()
                     results.update(
-                        self._partition_successful_build_diagnostics(
-                            result,
-                            result_ids,
-                            build_graph,
-                        )
+                        self._partition_build_diagnostics(result, result_ids, build_graph)
                     )
                     await self.state.advance_coordinator_build(
                         work_unit_id=chapter.id,
@@ -3406,6 +3492,7 @@ class Orchestrator:
                             1,
                             "Source dependency scope changed during the coordinator build; "
                             "retry required.",
+                            status=ValidationStatus.STALE_SNAPSHOT,
                         )
                         results = {chapter_id: stale for chapter_id in results}
                         artifacts_built = False
@@ -4249,7 +4336,7 @@ class Orchestrator:
                             await self.state.set_tasks(
                                 failed_formalizations,
                                 Stage.REVIEW,
-                                TaskStatus.FAILED,
+                                TaskStatus.BLOCKED,
                                 "formalization did not complete",
                             )
                             if prove:
@@ -4548,6 +4635,7 @@ class Orchestrator:
                 False,
                 1,
                 "Source scope changed after the coordinator build; retry required.",
+                status=ValidationStatus.STALE_SNAPSHOT,
             )
         return validation
 
@@ -5118,7 +5206,7 @@ class Orchestrator:
     def _repair_cases(self, *, periodic: bool) -> list[RepairCaseRecord]:
         selected = {chapter.id for chapter in self.work_units}
         cases: list[RepairCaseRecord] = []
-        for task_key, task in self.state.repairable_tasks():
+        for task_key, task in self.state.shepherd_repairable_tasks():
             if task.chapter_id not in selected:
                 continue
             case = self.state.ensure_repair_case(task_key)
@@ -5171,6 +5259,72 @@ class Orchestrator:
                 else None
             ),
         }
+
+    async def _reconcile_stale_formalizations(self) -> bool:
+        """Resolve stale formalize failures from durable facts before hiring an agent."""
+
+        progressed = False
+        clean_value = self.state.formalize_graph.get("clean", {})
+        clean = clean_value if isinstance(clean_value, dict) else {}
+        for _task_key, task in tuple(self.state.shepherd_repairable_tasks()):
+            if task.stage != Stage.FORMALIZE or task.status != TaskStatus.FAILED:
+                continue
+            chapter = self._work_units_by_id.get(task.chapter_id)
+            if chapter is None:
+                continue
+            current_digest = await asyncio.to_thread(
+                scope_digest, self.config.settings.repo, chapter
+            )
+            record = clean.get(chapter.id)
+            if isinstance(record, dict) and record.get("source_digest") == current_digest:
+                task.recovering_failure = True
+                await self.state.set_task(
+                    chapter.id,
+                    Stage.FORMALIZE,
+                    TaskStatus.SUCCEEDED,
+                    "reconciled from matching published clean build",
+                )
+                progressed = True
+                continue
+            latest = task.runs[-1] if task.runs else None
+            if latest is None or latest.status != TaskStatus.SUCCEEDED:
+                continue
+            self.state.load_run_details(latest)
+            report = latest.report if isinstance(latest.report, dict) else {}
+            source_unchanged = latest.source_digest == current_digest or (
+                latest.source_digest is None and latest.changed is False
+            )
+            if report.get("complete") is not True or not source_unchanged:
+                continue
+            snapshots: dict[str, ValidatedBuildSnapshot] = {}
+            validation = (
+                await self._build_chapters(
+                    (chapter,),
+                    publish_if_clean=True,
+                    mode="shepherd-reconciliation",
+                    stage=Stage.FORMALIZE,
+                    priority=500.0,
+                    snapshots=snapshots,
+                )
+            )[chapter.id]
+            await self.state.update_run(latest, validation=validation.as_dict())
+            if validation.status is ValidationStatus.UPSTREAM_FAILED:
+                await self._block_on_upstream_diagnostics(chapter, validation)
+                progressed = True
+                continue
+            if not validation.succeeded or not await self._publish_validated_build(
+                chapter, snapshots[chapter.id]
+            ):
+                continue
+            task.recovering_failure = True
+            await self.state.set_task(
+                chapter.id,
+                Stage.FORMALIZE,
+                TaskStatus.SUCCEEDED,
+                "reconciled by targeted coordinator certification",
+            )
+            progressed = True
+        return progressed
 
     def _validate_shepherd_plan(
         self,
@@ -5323,6 +5477,10 @@ class Orchestrator:
                 detail="all covered failures were resolved before this repair ran",
             )
             return False
+        certification_only = unit.status in {
+            RepairWorkUnitStatus.WAITING_FOR_DEPENDENCIES,
+            RepairWorkUnitStatus.CERTIFICATION_PENDING,
+        }
         async with self._repair_slots:
             await self.state.start_repair_work_unit(unit.id)
             chapter = self.config.work_unit(unit.owner_chapter_id)
@@ -5340,6 +5498,56 @@ class Orchestrator:
                 "covered_failures": [self._repair_failure_evidence(case) for case in active_cases],
             }
             try:
+                if certification_only:
+                    snapshots: dict[str, ValidatedBuildSnapshot] = {}
+                    validation = (
+                        await self._build_chapters(
+                            (chapter,),
+                            publish_if_clean=True,
+                            mode="shepherd-repair-recertification",
+                            stage=stage,
+                            priority=unit.priority,
+                            preemptible=False,
+                            snapshots=snapshots,
+                        )
+                    )[chapter.id]
+                    if run := self.state.run(unit.run_id):
+                        await self.state.update_run(run, validation=validation.as_dict())
+                    if validation.status is ValidationStatus.UPSTREAM_FAILED:
+                        await self._block_on_upstream_diagnostics(
+                            chapter, validation, block_consumer=False
+                        )
+                        unit.blocked_by = list(validation.blocked_by)
+                        await self.state.finish_repair_work_unit(
+                            unit.id,
+                            status=RepairWorkUnitStatus.WAITING_FOR_DEPENDENCIES,
+                            detail="certification blocked by: " + ", ".join(validation.blocked_by),
+                            run_id=unit.run_id,
+                        )
+                        return False
+                    if validation.status in {
+                        ValidationStatus.UNATTRIBUTED_BUILD_FAILURE,
+                        ValidationStatus.STALE_SNAPSHOT,
+                    }:
+                        await self.state.finish_repair_work_unit(
+                            unit.id,
+                            status=RepairWorkUnitStatus.CERTIFICATION_PENDING,
+                            detail=validation.output[-4000:],
+                            run_id=unit.run_id,
+                        )
+                        return False
+                    if not validation.succeeded or not await self._publish_validated_build(
+                        chapter, snapshots[chapter.id]
+                    ):
+                        await self.state.finish_repair_work_unit(
+                            unit.id,
+                            status=RepairWorkUnitStatus.FAILED,
+                            detail=validation.output[-4000:],
+                            run_id=unit.run_id,
+                        )
+                        return False
+                    await self._accept_repair_work_unit(unit, active_cases)
+                    return True
                 attempt = await self._attempt(
                     chapter,
                     stage,
@@ -5371,6 +5579,7 @@ class Orchestrator:
                             False,
                             1,
                             "Source scope changed after the Shepherd repair build.",
+                            status=ValidationStatus.STALE_SNAPSHOT,
                         )
                     await self.state.update_run(
                         attempt.run,
@@ -5405,31 +5614,28 @@ class Orchestrator:
                         or attempt.agent.placeholders < before_placeholders
                     )
                 if not accepted:
+                    retry_status: RepairWorkUnitStatus | None = None
+                    if attempt.agent.succeeded and complete:
+                        if validation.status is ValidationStatus.UPSTREAM_FAILED:
+                            await self._block_on_upstream_diagnostics(
+                                chapter, validation, block_consumer=False
+                            )
+                            unit.blocked_by = list(validation.blocked_by)
+                            retry_status = RepairWorkUnitStatus.WAITING_FOR_DEPENDENCIES
+                        elif validation.status in {
+                            ValidationStatus.UNATTRIBUTED_BUILD_FAILURE,
+                            ValidationStatus.STALE_SNAPSHOT,
+                        }:
+                            retry_status = RepairWorkUnitStatus.CERTIFICATION_PENDING
                     detail = attempt.feedback()
                     await self.state.finish_repair_work_unit(
                         unit.id,
-                        status=RepairWorkUnitStatus.FAILED,
+                        status=retry_status or RepairWorkUnitStatus.FAILED,
                         detail=detail,
                         run_id=attempt.run.id,
                     )
                     return False
-                async with self.state.batch():
-                    for case in active_cases:
-                        task = self.state.tasks[case.task_key]
-                        if task.status in {TaskStatus.FAILED, TaskStatus.BLOCKED}:
-                            await self.state.set_task(
-                                task.chapter_id,
-                                Stage(task.stage),
-                                TaskStatus.PENDING,
-                                f"Shepherd repair {unit.id} accepted; stage retry required",
-                            )
-                    await self.state.finish_repair_work_unit(
-                        unit.id,
-                        status=RepairWorkUnitStatus.SUCCEEDED,
-                        detail="repair integrated and validated",
-                        run_id=attempt.run.id,
-                    )
-                self._repair_progress_generation += 1
+                await self._accept_repair_work_unit(unit, active_cases, run_id=attempt.run.id)
                 return True
             except asyncio.CancelledError:
                 await self.state.finish_repair_work_unit(
@@ -5446,6 +5652,31 @@ class Orchestrator:
                 )
                 return False
 
+    async def _accept_repair_work_unit(
+        self,
+        unit: RepairWorkUnitRecord,
+        active_cases: Iterable[RepairCaseRecord],
+        *,
+        run_id: str | None = None,
+    ) -> None:
+        async with self.state.batch():
+            for case in active_cases:
+                task = self.state.tasks[case.task_key]
+                if task.status in {TaskStatus.FAILED, TaskStatus.BLOCKED}:
+                    await self.state.set_task(
+                        task.chapter_id,
+                        Stage(task.stage),
+                        TaskStatus.PENDING,
+                        f"Shepherd repair {unit.id} accepted; stage retry required",
+                    )
+            await self.state.finish_repair_work_unit(
+                unit.id,
+                status=RepairWorkUnitStatus.SUCCEEDED,
+                detail="repair integrated and validated",
+                run_id=unit.run_id if run_id is None else run_id,
+            )
+        self._repair_progress_generation += 1
+
     async def _execute_repair_plan(self, units: Iterable[RepairWorkUnitRecord]) -> bool:
         pending = {unit.id: unit for unit in units}
         progressed = False
@@ -5456,7 +5687,6 @@ class Orchestrator:
                 if unit.status
                 in {
                     RepairWorkUnitStatus.FAILED,
-                    RepairWorkUnitStatus.INTERRUPTED,
                     RepairWorkUnitStatus.SUPERSEDED,
                 }
             }
@@ -5490,19 +5720,88 @@ class Orchestrator:
                 pending.pop(unit.id)
         return progressed
 
+    async def _resume_repair_dags(self, *, include_certification: bool) -> bool:
+        """Resume durable repair plans whose failure evidence is still current."""
+
+        retryable = {
+            RepairWorkUnitStatus.PENDING,
+            RepairWorkUnitStatus.INTERRUPTED,
+            RepairWorkUnitStatus.WAITING_FOR_DEPENDENCIES,
+        }
+        if include_certification:
+            retryable.add(RepairWorkUnitStatus.CERTIFICATION_PENDING)
+        candidates: list[RepairWorkUnitRecord] = []
+        for unit in self.state.repair_work_units.values():
+            if unit.status not in retryable:
+                continue
+            if unit.status == RepairWorkUnitStatus.WAITING_FOR_DEPENDENCIES and any(
+                owner_id not in self._work_units_by_id
+                or self.state.task(owner_id, Stage.FORMALIZE).status != TaskStatus.SUCCEEDED
+                for owner_id in unit.blocked_by
+            ):
+                continue
+            unchanged = True
+            for case_id in unit.case_ids:
+                case = self.state.repair_cases.get(case_id)
+                if case is None or case.task_key not in self.state.tasks:
+                    unchanged = False
+                    break
+                if self.state.ensure_repair_case(case.task_key).id != case_id:
+                    unchanged = False
+                    break
+            if unchanged:
+                candidates.append(unit)
+            else:
+                await self.state.finish_repair_work_unit(
+                    unit.id,
+                    status=RepairWorkUnitStatus.SUPERSEDED,
+                    detail="repair evidence fingerprint changed",
+                )
+        if not candidates:
+            return False
+        candidate_ids = {unit.id for unit in candidates}
+        succeeded_ids = {
+            unit.id
+            for unit in self.state.repair_work_units.values()
+            if unit.status == RepairWorkUnitStatus.SUCCEEDED
+        }
+        candidates = [
+            unit
+            for unit in candidates
+            if set(unit.depends_on).issubset(candidate_ids | succeeded_ids)
+        ]
+        if not candidates:
+            return False
+        async with self._shepherd_lock:
+            progressed = await self._execute_repair_plan(candidates)
+            for sweep_id in {unit.sweep_id for unit in candidates}:
+                if sweep_id in self.state.repair_sweeps:
+                    await self.state.finish_repair_sweep(sweep_id)
+            return progressed
+
     async def _run_shepherd_sweep(
         self,
         *,
         trigger: str,
         cases: Iterable[RepairCaseRecord],
     ) -> bool:
-        selected_cases = list(cases)[: self.config.shepherd.maximum_failures_per_sweep]
+        await self._reconcile_stale_formalizations()
+        repairable_keys = {key for key, _task in self.state.shepherd_repairable_tasks()}
+        selected_cases = [case for case in cases if case.task_key in repairable_keys][
+            : self.config.shepherd.maximum_failures_per_sweep
+        ]
         if not selected_cases:
             return False
+        fingerprints = tuple(sorted(case.fingerprint for case in selected_cases))
+        if fingerprints != self._last_shepherd_case_fingerprints:
+            self._consecutive_no_progress_sweeps = 0
+            self._last_shepherd_case_fingerprints = fingerprints
         async with self._shepherd_lock:
-            if self._shepherd_sweeps_started >= self.config.shepherd.maximum_sweeps_per_invocation:
+            if (
+                self._consecutive_no_progress_sweeps
+                >= self.config.shepherd.maximum_sweeps_per_invocation
+            ):
                 return False
-            self._shepherd_sweeps_started += 1
             sweep = await self.state.start_repair_sweep(
                 trigger=trigger,
                 task_keys=[case.task_key for case in selected_cases],
@@ -5541,6 +5840,10 @@ class Orchestrator:
                 )
                 progressed = await self._execute_repair_plan(units)
                 await self.state.finish_repair_sweep(sweep.id)
+                if progressed:
+                    self._consecutive_no_progress_sweeps = 0
+                else:
+                    self._consecutive_no_progress_sweeps += 1
                 return progressed
             except asyncio.CancelledError:
                 await self.state.finish_repair_sweep(
@@ -5552,6 +5855,7 @@ class Orchestrator:
                     sweep.id,
                     error=str(error) or type(error).__name__,
                 )
+                self._consecutive_no_progress_sweeps += 1
                 return False
             finally:
                 if planning_slot:
@@ -5570,17 +5874,17 @@ class Orchestrator:
         interval = self.config.shepherd.interval_seconds
         due = datetime.now(UTC) + timedelta(seconds=interval)
         try:
-            while (
-                self._shepherd_sweeps_started < self.config.shepherd.maximum_sweeps_per_invocation
-            ):
+            await self._resume_repair_dags(include_certification=True)
+            while True:
                 remaining = max(0.0, (due - datetime.now(UTC)).total_seconds())
                 timed_out = False
                 try:
                     await asyncio.wait_for(changes.get(), timeout=remaining)
                 except TimeoutError:
                     timed_out = True
+                await self._resume_repair_dags(include_certification=timed_out)
                 cases = self._repair_cases(periodic=timed_out)
-                pending = len(self.state.repairable_tasks())
+                pending = len(self.state.shepherd_repairable_tasks())
                 if self.state.shepherd.pending_failures != pending:
                     self.state.shepherd.pending_failures = pending
                     await self.state.save("state")

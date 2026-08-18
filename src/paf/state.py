@@ -76,6 +76,8 @@ class RepairWorkUnitStatus(StrEnum):
     SUCCEEDED = "succeeded"
     FAILED = "failed"
     INTERRUPTED = "interrupted"
+    WAITING_FOR_DEPENDENCIES = "waiting_for_dependencies"
+    CERTIFICATION_PENDING = "certification_pending"
     SUPERSEDED = "superseded"
 
 
@@ -201,6 +203,9 @@ class RunRecord:
     source_start_line: int = 1
     source_end_line: int = 1
     project_root: str = ""
+    # Digest of the integrated owner scope immediately after this run. Newer
+    # records let restart reconciliation certify without rerunning the agent.
+    source_digest: str | None = None
 
     @property
     def work_unit_id(self) -> str:
@@ -320,6 +325,7 @@ class RepairWorkUnitRecord:
     status: str = RepairWorkUnitStatus.PENDING
     detail: str = ""
     run_id: str = ""
+    blocked_by: list[str] = field(default_factory=list)
     created_at: str = field(default_factory=timestamp)
     started_at: str | None = None
     finished_at: str | None = None
@@ -683,6 +689,11 @@ class StateStore:
                         task_value["stage"] = "formalize"
                     legacy_review_green = value.get("review_green")
                     if task_value.get("stage") == Stage.REVIEW:
+                        if (
+                            task_value.get("status") == TaskStatus.FAILED
+                            and task_value.get("detail") == "formalization did not complete"
+                        ):
+                            task_value["status"] = TaskStatus.BLOCKED
                         if legacy_review_green is True:
                             task_value["status"] = TaskStatus.SUCCEEDED
                         elif (
@@ -2438,6 +2449,9 @@ class StateStore:
     def latest_run(self, chapter_id: str) -> RunRecord | None:
         return self.active_run(chapter_id) or self._latest_runs_by_chapter.get(chapter_id)
 
+    def run(self, run_id: str) -> RunRecord | None:
+        return self._runs_by_id.get(run_id)
+
     def active_run(self, chapter_id: str) -> RunRecord | None:
         return self._active_runs_by_chapter.get(chapter_id)
 
@@ -2940,6 +2954,7 @@ class StateStore:
             ready = False
             if stage is Stage.FORMALIZE and task.detail in {
                 "blocked by a failed source dependency formalization",
+                "blocked by upstream coordinator diagnostics",
                 "blocked by incomplete discovery or a source dependency cycle",
                 "blocked because source discovery failed",
             }:
@@ -2956,10 +2971,14 @@ class StateStore:
                     self.task(chapter_id, Stage.REVIEW).status == TaskStatus.SUCCEEDED
                     for chapter_id in dependencies
                 )
-            elif stage is Stage.PROVE and task.detail in {
-                "formalization failed; quarantined from proof",
-                "blocked because formalization did not complete",
-            }:
+            elif (stage is Stage.REVIEW and task.detail == "formalization did not complete") or (
+                stage is Stage.PROVE
+                and task.detail
+                in {
+                    "formalization failed; quarantined from proof",
+                    "blocked because formalization did not complete",
+                }
+            ):
                 ready = self.task(task.chapter_id, Stage.FORMALIZE).status == TaskStatus.SUCCEEDED
             elif (
                 stage is Stage.PROVE
@@ -3092,9 +3111,26 @@ class StateStore:
             key=lambda item: (item[1].updated_at, item[0]),
         )
 
+    def shepherd_repairable_tasks(self) -> list[tuple[str, TaskRecord]]:
+        """Root failures and durable proof escalations eligible for Shepherd triage."""
+
+        causal_details = {
+            "blocked by a failed source dependency formalization",
+            "formalization did not complete",
+            "blocked because formalization did not complete",
+            "blocked because statement review did not complete",
+            "blocked by upstream coordinator diagnostics",
+        }
+        return [
+            (key, task)
+            for key, task in self.repairable_tasks()
+            if task.detail not in causal_details
+            and not task.detail.startswith("blocked by a failed prerequisite review")
+        ]
+
     def ensure_repair_case(self, task_key: str) -> RepairCaseRecord:
         task = self.tasks[task_key]
-        latest = task.runs[-1] if task.runs else None
+        latest = next((run for run in reversed(task.runs) if not run.auxiliary), None)
         evidence = {
             "task_key": task_key,
             "status": str(task.status),
@@ -3230,7 +3266,13 @@ class StateStore:
         unit.status = status
         unit.detail = detail
         unit.run_id = run_id
-        unit.finished_at = timestamp()
+        if status != RepairWorkUnitStatus.WAITING_FOR_DEPENDENCIES:
+            unit.blocked_by = []
+        retryable = status in {
+            RepairWorkUnitStatus.WAITING_FOR_DEPENDENCIES,
+            RepairWorkUnitStatus.CERTIFICATION_PENDING,
+        }
+        unit.finished_at = None if retryable else timestamp()
         changed_tasks: list[TaskRecord] = []
         for task_key in unit.task_keys:
             task = self.tasks.get(task_key)
@@ -3251,7 +3293,18 @@ class StateStore:
 
     async def finish_repair_sweep(self, sweep_id: str, *, error: str = "") -> None:
         sweep = self.repair_sweeps[sweep_id]
-        sweep.status = "failed" if error else "completed"
+        retryable_statuses = {
+            RepairWorkUnitStatus.WAITING_FOR_DEPENDENCIES,
+            RepairWorkUnitStatus.CERTIFICATION_PENDING,
+            RepairWorkUnitStatus.INTERRUPTED,
+            RepairWorkUnitStatus.PENDING,
+        }
+        waiting = any(
+            self.repair_work_units[unit_id].status in retryable_statuses
+            for unit_id in sweep.work_unit_ids
+            if unit_id in self.repair_work_units
+        )
+        sweep.status = "failed" if error else "waiting" if waiting else "completed"
         sweep.error = error
         sweep.finished_at = timestamp()
         for case_id in sweep.case_ids:
@@ -3262,6 +3315,8 @@ class StateStore:
                 TaskStatus.BLOCKED,
             }:
                 case.status = RepairCaseStatus.RESOLVED
+            elif waiting and case.status != RepairCaseStatus.RESOLVED:
+                case.status = RepairCaseStatus.PLANNED
             elif case.status != RepairCaseStatus.RESOLVED:
                 case.status = RepairCaseStatus.EXHAUSTED
             case.updated_at = timestamp()
@@ -3270,7 +3325,7 @@ class StateStore:
         self.shepherd.current_run_id = ""
         self.shepherd.last_finished_at = sweep.finished_at
         self.shepherd.last_error = error
-        self.shepherd.pending_failures = len(self.repairable_tasks())
+        self.shepherd.pending_failures = len(self.shepherd_repairable_tasks())
         self._mark_dirty(sections={"repair_cases", "repair_sweeps"})
         await self._persist()
 
