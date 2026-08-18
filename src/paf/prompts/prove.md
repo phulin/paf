@@ -16,9 +16,9 @@ interfaces. The current Lean statements are authoritative, while the correspondi
 3. Try checked approaches and use the residual goal to guide the next change. Prefer an exact earlier
    result, focused rewriting or simplification, a standard constructor or equivalence, and then a
    lower-level construction.
-4. Extract focused private helpers when they make a large proof easier to check. Add a public helper
-   only when it is genuinely reusable and naturally belongs in this chapter; request an upstream
-   result instead when its proper owner is an earlier chapter.
+4. Extract focused private helpers when they make a large proof easier to check. Do not add a public
+   helper unless the handoff explicitly requests that API; request an upstream result when its proper
+   owner is an earlier chapter.
 5. Preserve independent clean progress. Remove speculative edits, unused helpers, and abandoned
    imports before finishing.
 6. After the last edit, prepare affected dependencies once and request fresh diagnostics for edited
