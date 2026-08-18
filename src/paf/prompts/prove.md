@@ -65,11 +65,15 @@ interfaces have already passed review and are fixed here.
 
 ### Fixed interfaces and proof scope
 
-Do not change declaration kinds, names, namespaces, arguments, hypotheses, result types, attributes,
-section behavior, or the bodies of existing definitions, structures, and instances. Work only on
-the declarations assigned to this attempt, apart from focused imports, fully proved helpers they
-need, and repairs demanded by supplied validation diagnostics. Do not prove, rewrite, or report
-failures for placeholders reserved for later chunks.
+Adding new fully proved lemmas is explicitly in scope: they may be private helpers or non-private
+reusable results. You may also revise an existing private helper when an assigned proof needs it. Do
+not change the statement or interface of an existing non-private declaration, including its kind,
+name, namespace, arguments, hypotheses, result type, attributes, or section behavior. For existing
+non-private declarations, replace only the proof bodies assigned to this attempt, and do not change
+the bodies of definitions, structures, or instances. Apart from assigned proofs and private-helper
+revisions, work only on focused imports, the new private or reusable lemmas those proofs need, and
+repairs demanded by supplied validation diagnostics. Do not prove, rewrite, or report failures for
+placeholders reserved for later chunks.
 
 ### Proof integrity
 
