@@ -245,6 +245,10 @@ def _lean_mcp_result_value(item: dict[str, Any]) -> Any:
 
 
 def _diagnostics_result(value: dict[str, Any]) -> str:
+    status = value.get("status")
+    if status in {"dependency_unavailable", "elaboration_unavailable"}:
+        reason = _compact(str(value.get("reason") or "Lean results unavailable"), limit=220)
+        return f"{str(status).replace('_', ' ')} · {reason}"
     items = value.get("items")
     if not isinstance(items, list):
         interactive = value.get("diagnostics")
@@ -283,6 +287,9 @@ def _diagnostics_result(value: dict[str, Any]) -> str:
 
 def _goal_result(value: dict[str, Any]) -> str:
     status = value.get("status")
+    if status in {"dependency_unavailable", "elaboration_unavailable"}:
+        reason = _compact(str(value.get("reason") or "Lean goals unavailable"), limit=220)
+        return f"{str(status).replace('_', ' ')} · {reason}"
     if status == "still_elaborating":
         return "still elaborating"
     if status == "complete":
@@ -300,6 +307,10 @@ def _goal_result(value: dict[str, Any]) -> str:
 
 
 def _multi_attempt_result(value: dict[str, Any]) -> str:
+    status = value.get("status")
+    if status in {"dependency_unavailable", "elaboration_unavailable"}:
+        reason = _compact(str(value.get("reason") or "Lean attempts unavailable"), limit=220)
+        return f"{str(status).replace('_', ' ')} · {reason}"
     items = value.get("items")
     if not isinstance(items, list):
         return _mcp_text(value)

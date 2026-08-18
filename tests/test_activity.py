@@ -500,6 +500,15 @@ def test_summarizes_each_enabled_lean_mcp_query(
             "R 1 error · 1 warning · L7:3 unknown identifier",
         ),
         (
+            "lean_diagnostic_messages",
+            {
+                "status": "dependency_unavailable",
+                "reason": "Imported file B.lean failed to build",
+                "items": [],
+            },
+            "R dependency unavailable · Imported file B.lean failed to build",
+        ),
+        (
             "lean_hover_info",
             {"symbol": "Nat.succ", "info": "Nat → Nat", "diagnostics": []},
             "R Nat.succ: Nat → Nat",
@@ -526,6 +535,16 @@ def test_summarizes_each_enabled_lean_mcp_query(
             "R 2→1 goals",
         ),
         (
+            "lean_goal",
+            {
+                "status": "elaboration_unavailable",
+                "reason": "an earlier declaration has errors",
+                "goals_before": [],
+                "goals_after": [],
+            },
+            "R elaboration unavailable · an earlier declaration has errors",
+        ),
+        (
             "lean_term_goal",
             {"line_context": "exact ?_", "expected_type": "Nat"},
             "R expected Nat",
@@ -545,6 +564,15 @@ def test_summarizes_each_enabled_lean_mcp_query(
                 ]
             },
             "R 3 attempts: 1 complete, 1 open, 1 failed · worked: exact h",
+        ),
+        (
+            "lean_multi_attempt",
+            {
+                "status": "dependency_unavailable",
+                "reason": "C.lean has no object file",
+                "items": [],
+            },
+            "R dependency unavailable · C.lean has no object file",
         ),
         (
             "lean_code_actions",
