@@ -12,11 +12,16 @@ from leanclient.aio import LeanClientError
 from paf.lean_mcp import (
     _bounded_tool_value,
     _force_prepare_dependencies,
+    _hover_columns,
     barrier_with_dependency_refresh,
     compact_target_diagnostics,
+    local_search_with_dependencies,
+    normalize_lean_project_root,
     prepare_dependencies,
     record_stale_dependency,
     reload_with_dependencies_when_stale,
+    resolve_attempt_line,
+    resolve_lean_input_path,
 )
 
 
@@ -42,6 +47,26 @@ def test_compact_diagnostics_returns_errors_and_warning_count() -> None:
     ]
 
 
+def test_compact_diagnostics_preserves_dependency_cause_at_any_position() -> None:
+    message = "lake setup-file A.lean failed\nerror: B.lean:4:2: unknown identifier 'x'"
+
+    result = compact_target_diagnostics(
+        [
+            {
+                "severity": 1,
+                "message": message,
+                "range": {
+                    "start": {"line": 8, "character": 3},
+                    "end": {"line": 8, "character": 4},
+                },
+            }
+        ],
+        build_success=False,
+    )
+
+    assert result.failed_dependencies == ["B.lean"]
+
+
 def test_bounded_tool_value_caps_nested_text() -> None:
     result = _bounded_tool_value({"content": "x" * 20_000}, [12 * 1024])
 
@@ -56,6 +81,7 @@ class FakeDocument:
     text: str
     stale_imports: bool = False
     diagnostics: list[dict[str, Any]] = field(default_factory=list)
+    virtual: bool = False
 
 
 class FakeClient:
@@ -89,6 +115,78 @@ def write(root: Path, path: str, text: str) -> None:
     destination = root / path
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text(text, encoding="utf-8")
+
+
+def write_lean_project(root: Path) -> None:
+    write(root, "lean-toolchain", "leanprover/lean4:v4.33.0-rc2\n")
+    write(root, "lakefile.toml", "name = 'test'\n")
+
+
+def test_normalizes_paf_merged_workspace_to_nested_lean_root(tmp_path: Path) -> None:
+    write_lean_project(tmp_path / "merged" / "lean")
+
+    assert (
+        normalize_lean_project_root(tmp_path / "merged") == (tmp_path / "merged" / "lean").resolve()
+    )
+
+
+def test_resolves_module_style_mathlib_path(tmp_path: Path) -> None:
+    root = tmp_path / "merged" / "lean"
+    write_lean_project(root)
+    write(root, ".lake/packages/mathlib/Mathlib/CategoryTheory/Foo.lean", "def foo := 1\n")
+    ctx: Any = SimpleNamespace(
+        request_context=SimpleNamespace(lifespan_context=SimpleNamespace(lean_project_path=root))
+    )
+
+    resolved = resolve_lean_input_path(ctx, "Mathlib/CategoryTheory/Foo.lean")
+
+    assert resolved == (root / ".lake/packages/mathlib/Mathlib/CategoryTheory/Foo.lean").resolve()
+
+
+def test_local_search_follows_shared_dependency_source_roots(tmp_path: Path) -> None:
+    root = tmp_path / "lean"
+    packages = tmp_path / "shared-packages"
+    write_lean_project(root)
+    write(
+        packages,
+        "mathlib/Mathlib/Dependency/SearchNeedle.lean",
+        "namespace Mathlib.Dependency\n\n"
+        "theorem searchNeedle : True := by trivial\n\n"
+        "end Mathlib.Dependency\n",
+    )
+    (root / ".lake").mkdir()
+    (root / ".lake" / "packages").symlink_to(packages, target_is_directory=True)
+
+    result = local_search_with_dependencies("searchNeedle", limit=5, project_root=root)
+
+    assert result == [
+        {
+            "name": "Mathlib.Dependency.searchNeedle",
+            "kind": "theorem",
+            "file": ".lake/packages/mathlib/Mathlib/Dependency/SearchNeedle.lean",
+        }
+    ]
+
+
+def test_hover_columns_skip_tactic_keyword_and_snap_to_identifier() -> None:
+    line = "  exact CategoryTheory.Functor.map_id F X"
+
+    columns = _hover_columns(line, 3)
+
+    assert columns[0] == line.index("CategoryTheory") + 1
+    assert line[columns[0] - 1 :].startswith("CategoryTheory.Functor.map_id")
+
+
+def test_multi_attempt_resolves_declaration_and_placeholder_anchors() -> None:
+    source = """theorem first : True := by
+  sorry
+
+theorem second : True := by
+  exact True.intro
+"""
+
+    assert resolve_attempt_line(source, None, "first", None) == 2
+    assert resolve_attempt_line(source, None, None, "exact True.intro") == 5
 
 
 @pytest.mark.asyncio
@@ -211,6 +309,25 @@ async def test_non_artifact_dependency_build_failure_does_not_trigger_build(
             )
         }
     ]
+    client.events.clear()
+
+    async def barrier(_client: Any, path: str, timeout: float | None) -> None:
+        client.events.append(("barrier", path, timeout))
+
+    await barrier_with_dependency_refresh(client, "A.lean", original=barrier)
+
+    assert client.events == [("barrier", "A.lean", None)]
+
+
+@pytest.mark.asyncio
+async def test_virtual_scratch_dependency_failure_is_not_reopened_from_disk(
+    tmp_path: Path,
+) -> None:
+    write(tmp_path, "A.lean", "import Missing\n")
+    client = FakeClient(tmp_path)
+    document = await client.open("A.lean", wait=False, dependency_build_mode="never")
+    document.virtual = True
+    document.stale_imports = True
     client.events.clear()
 
     async def barrier(_client: Any, path: str, timeout: float | None) -> None:
