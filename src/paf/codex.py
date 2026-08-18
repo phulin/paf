@@ -1484,6 +1484,8 @@ blocker evidence."""
                 + "."
             )
             declaration_count = len(selected_proof_targets)
+            declaration_label = "declaration" if declaration_count == 1 else "declarations"
+            hole_label = "proof hole" if assigned_placeholders == 1 else "proof holes"
             chunk_size = self.config.stages[Stage.PROVE].chunk_size or 4
             overflow = (
                 f" The configured chunk size is {chunk_size}, but PAF keeps all holes in one "
@@ -1493,8 +1495,8 @@ blocker evidence."""
             )
             proof_assignment = f"""## Authoritative assignment
 
-This attempt owns {declaration_count} declaration(s) containing {assigned_placeholders} proof
-hole(s).{overflow}
+This attempt owns exactly {declaration_count} {declaration_label} containing
+{assigned_placeholders} {hole_label}.{overflow}
 
 {chr(10).join(rendered_targets).rstrip()}
 

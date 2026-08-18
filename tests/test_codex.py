@@ -433,7 +433,7 @@ def test_proof_prompt_contains_only_the_assigned_chunk(tmp_path: Path) -> None:
     prompt = executor.build_prompt(chapter, Stage.PROVE, proof_targets=[assigned])
 
     assert "Authoritative assignment" in prompt
-    assert "1 declaration(s) containing 2 proof" in prompt
+    assert "exactly 1 declaration containing\n2 proof holes" in prompt
     assert "`Book.target`" in prompt
     assert "H1 at line 20: `left := by`" in prompt
     assert "H2 at line 23: `right := by`" in prompt
