@@ -549,7 +549,7 @@ async def test_state_persists_fixup_graph(tmp_path: Path) -> None:
     await reloaded.load_or_create()
 
     assert reloaded.fixup_graph == state.fixup_graph
-    assert reloaded.snapshot()["version"] == 17
+    assert reloaded.snapshot()["version"] == 18
 
 
 @pytest.mark.asyncio
@@ -1253,7 +1253,7 @@ async def test_hot_checkpoint_does_not_grow_with_run_payload_history(tmp_path: P
     hot = read_checkpoint(config.settings.state_dir)
     assert hot is not None
     task = hot["tasks"][f"{config.chapters[0].id}:formalize"]
-    assert hot["version"] == 17
+    assert hot["version"] == 18
     assert "source_issues" not in hot
     assert "runs" not in task
     assert task["run_count"] == 25
@@ -3843,6 +3843,124 @@ async def test_statement_finding_invalidates_only_its_review(tmp_path: Path) -> 
         proof = orchestrator.state.task(chapter.id, Stage.PROVE)
         assert proof.status == TaskStatus.SUCCEEDED
         assert proof.source_digest == f"proof-source-{chapter.number}"
+    await orchestrator.shutdown()
+
+
+def interface_record(digest: str) -> dict[str, object]:
+    return {
+        "artifact_digest": f"artifact-{digest}",
+        "interface_digest": digest,
+        "fingerprint_schema": "olean-proof-erased-v1",
+        "lean_version": "4.33.0:test",
+        "modules": [],
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("changed", [False, True])
+async def test_compiled_interface_controls_downstream_build_invalidation(
+    tmp_path: Path,
+    changed: bool,
+) -> None:
+    project = write_project(tmp_path, chapters="chapters = [1, 2, 3]")
+    with (tmp_path / "books" / "book.md").open("a", encoding="utf-8") as source:
+        source.write("\n## 3. Third chapter\n")
+    config = load_config(project)
+    config = replace(
+        config,
+        settings=replace(config.settings, interface_invalidation="interface"),
+    )
+    first, imported_successor, textbook_only = config.chapters
+    source_root = tmp_path / "lean" / "Book"
+    source_root.mkdir(parents=True)
+    for chapter in config.chapters:
+        (source_root / f"Chapter{chapter.number:02d}.lean").write_text(
+            f"def value{chapter.number} := {chapter.number}\n",
+            encoding="utf-8",
+        )
+    orchestrator = Orchestrator(config, StateStore(config))
+    await orchestrator.prepare()
+    await mark_clean_formalization(
+        orchestrator,
+        {
+            imported_successor.id: (first.id,),
+            textbook_only.id: (first.id,),
+        },
+    )
+    old = interface_record("old-interface")
+    orchestrator.state.formalize_graph.update(
+        {
+            "interfaces": {
+                chapter.id: interface_record(f"interface-{chapter.number}")
+                for chapter in config.chapters
+            }
+            | {first.id: old},
+            "interface_imports": {
+                first.id: [],
+                imported_successor.id: [first.id],
+                textbook_only.id: [],
+            },
+        }
+    )
+    await orchestrator.state.set_task(
+        imported_successor.id,
+        Stage.PROVE,
+        TaskStatus.SUCCEEDED,
+        "proved",
+        source_digest="proved-successor",
+    )
+    await orchestrator.state.save()
+
+    first_source = source_root / "Chapter01.lean"
+    first_source.write_text("def value1 := 10\n", encoding="utf-8")
+    initially_invalidated = await orchestrator._invalidate_build_records((first.id,))
+
+    assert initially_invalidated == {first.id}
+    assert set(orchestrator.state.formalize_graph["clean"]) == {
+        imported_successor.id,
+        textbook_only.id,
+    }
+    assert orchestrator.state.formalize_graph.get("interface_stale", []) == []
+    pending_successor_view = orchestrator.state.snapshot()["tasks"][
+        orchestrator.state.key(imported_successor.id, Stage.PROVE)
+    ]
+    assert pending_successor_view["interface_current"] is True
+    assert pending_successor_view["dependencies_current"] is True
+    assert pending_successor_view["head_build_status"] == "clean"
+    assert pending_successor_view["fully_certified"] is True
+
+    graph = orchestrator._observed_work_unit_graph()
+    new = interface_record("new-interface" if changed else "old-interface")
+    snapshot = scheduler_module.ValidatedBuildSnapshot(
+        graph=graph,
+        source_digests={
+            first.id: scope_digest(config.settings.repo, first),
+        },
+        fingerprint=new,
+        import_dependencies=(),
+    )
+
+    assert await orchestrator._publish_validated_build(first, snapshot)
+    clean = set(orchestrator.state.formalize_graph["clean"])
+    if changed:
+        assert clean == {first.id, textbook_only.id}
+        assert orchestrator.state.formalize_graph["dirty"] == [imported_successor.id]
+        assert orchestrator.state.formalize_graph["interface_stale"] == [imported_successor.id]
+    else:
+        assert clean == {first.id, imported_successor.id, textbook_only.id}
+        assert orchestrator.state.formalize_graph["dirty"] == []
+        assert orchestrator.state.formalize_graph["interface_stale"] == []
+    proof = orchestrator.state.task(imported_successor.id, Stage.PROVE)
+    assert proof.status == TaskStatus.SUCCEEDED
+    assert proof.source_digest == "proved-successor"
+    proof_view = orchestrator.state.snapshot()["tasks"][
+        orchestrator.state.key(imported_successor.id, Stage.PROVE)
+    ]
+    assert proof_view["proof_complete"] is True
+    assert proof_view["interface_current"] is (not changed)
+    assert proof_view["dependencies_current"] is (not changed)
+    assert proof_view["head_build_status"] == ("pending" if changed else "clean")
+    assert proof_view["fully_certified"] is (not changed)
     await orchestrator.shutdown()
 
 

@@ -273,10 +273,6 @@ def collect_interface_fingerprints(
 
     repository = (root or config.settings.repo).resolve()
     lean_project = repository / config.settings.lean_project
-    lean_version = _lean_identity(
-        lean_project,
-        timeout_seconds=config.settings.validation_timeout_seconds,
-    )
     sources_by_owner, module_owners = _owned_sources(repository, lean_project, work_units)
     artifacts: dict[str, tuple[Path, Path]] = {}
     for values in sources_by_owner.values():
@@ -285,6 +281,10 @@ def collect_interface_fingerprints(
             if artifact is None:
                 raise InterfaceFingerprintError(f"compiled artifact is missing for {module}")
             artifacts[module] = (source, artifact)
+    lean_version = _lean_identity(
+        lean_project,
+        timeout_seconds=config.settings.validation_timeout_seconds,
+    )
 
     helper_values: dict[str, dict[str, Any]] = {}
     serialized: dict[str, bytes] = {}

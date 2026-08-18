@@ -32,12 +32,18 @@ from paf.codex import (
 from paf.coordination import CoordinatorBuildQueue, PriorityLimiter
 from paf.corpus import (
     WorkUnitImportGraph,
+    build_compiled_import_graph,
     build_corpus_schedule,
     build_source_dependency_graph,
     scheduling_snapshot,
 )
 from paf.diagnostics import unexpected_lean_warnings
 from paf.git import GitCommitError, GitCommitter
+from paf.interface_fingerprint import (
+    FingerprintCollection,
+    InterfaceFingerprintError,
+    collect_interface_fingerprints,
+)
 from paf.isolation import IsolationResult, create_isolation
 from paf.models import PipelineConfig, Stage, WorkUnit, WorkUnitLike
 from paf.scope import ScopeMatcher
@@ -138,6 +144,9 @@ class BuildDiagnostics:
 class ValidatedBuildSnapshot:
     graph: WorkUnitImportGraph
     source_digests: dict[str, str]
+    fingerprint: dict[str, Any] | None = None
+    import_dependencies: tuple[str, ...] = ()
+    fingerprint_error: str = ""
 
 
 @dataclass(frozen=True)
@@ -754,20 +763,22 @@ class Orchestrator:
         graph: WorkUnitImportGraph,
         records: dict[str, Any],
     ) -> dict[str, dict[str, Any]]:
-        """Retain build records whose own source is unchanged."""
+        """Retain records whose own source is unchanged.
+
+        Dependency freshness is represented separately.  A proof-body change
+        upstream must not erase a descendant's locally validated build fact.
+        """
 
         def retain() -> dict[str, dict[str, Any]]:
             by_id = {chapter.id: chapter for chapter in self.work_units}
             retained: dict[str, dict[str, Any]] = {}
             for chapter_id in graph.order:
-                if not graph.dependencies[chapter_id].issubset(retained):
-                    continue
                 record = records.get(chapter_id)
                 if not isinstance(record, dict):
                     continue
                 source = scope_digest(self.config.settings.repo, by_id[chapter_id])
                 if record.get("source_digest") == source:
-                    retained[chapter_id] = {
+                    retained[chapter_id] = dict(record) | {
                         "source_digest": source,
                         "build_generation": int(record.get("build_generation", 0)),
                     }
@@ -834,6 +845,71 @@ class Orchestrator:
             persisted = self.state.formalize_graph.get("clean", {})
             records = persisted if isinstance(persisted, dict) else {}
             clean = await self._retain_formalize_clean(graph, records)
+            raw_interfaces = self.state.formalize_graph.get("interfaces", {})
+            interfaces = raw_interfaces if isinstance(raw_interfaces, dict) else {}
+            raw_imports = self.state.formalize_graph.get("interface_imports", {})
+            compiled_imports = (
+                {
+                    str(chapter_id): tuple(item for item in dependencies if isinstance(item, str))
+                    for chapter_id, dependencies in raw_imports.items()
+                    if isinstance(chapter_id, str) and isinstance(dependencies, list)
+                }
+                if isinstance(raw_imports, dict)
+                else {}
+            )
+            interface_updates = {
+                chapter_id: snapshot.fingerprint
+                for chapter_id, snapshot in snapshots.items()
+                if snapshot.fingerprint is not None
+            }
+            import_updates = {
+                chapter_id: snapshot.import_dependencies
+                for chapter_id, snapshot in snapshots.items()
+                if snapshot.fingerprint is not None
+            }
+            invalidation_graph = self._interface_invalidation_graph(
+                graph,
+                compiled_imports | import_updates,
+            )
+            if self.config.settings.interface_invalidation != "interface":
+                invalidation_graph = graph
+            invalidated: set[str] = set()
+            previous_dirty = set(self.state.formalize_graph.get("dirty", ()))
+            previous_stale = set(self.state.formalize_graph.get("interface_stale", ()))
+            metric_updates: dict[str, int] = {}
+            if self.config.settings.interface_invalidation != "observe":
+                for chapter_id, snapshot in snapshots.items():
+                    old = interfaces.get(chapter_id)
+                    new = snapshot.fingerprint
+                    old_digest = old.get("interface_digest") if isinstance(old, dict) else None
+                    new_digest = new.get("interface_digest") if isinstance(new, dict) else None
+                    if old_digest and new_digest:
+                        if old_digest != new_digest:
+                            changed_successors = self._successor_closure(
+                                invalidation_graph, (chapter_id,)
+                            ) - set(snapshots)
+                            invalidated.update(changed_successors)
+                            metric_updates["interface_changing_edits"] = (
+                                metric_updates.get("interface_changing_edits", 0) + 1
+                            )
+                            metric_updates["descendants_queued"] = metric_updates.get(
+                                "descendants_queued", 0
+                            ) + len(changed_successors)
+                        elif chapter_id in previous_dirty and chapter_id not in previous_stale:
+                            metric_updates["interface_preserving_edits"] = (
+                                metric_updates.get("interface_preserving_edits", 0) + 1
+                            )
+                    elif old_digest and not new_digest:
+                        # Fingerprinting failed after the source had taken the
+                        # selective path. Fall back to legacy invalidation.
+                        invalidated.update(
+                            self._successor_closure(graph, (chapter_id,)) - set(snapshots)
+                        )
+                        metric_updates["fingerprint_failures"] = (
+                            metric_updates.get("fingerprint_failures", 0) + 1
+                        )
+            for chapter_id in invalidated:
+                clean.pop(chapter_id, None)
             build_generation = int(self.state.formalize_graph.get("build_generation", 0))
             for chapter_id in graph.order:
                 if chapter_id not in required:
@@ -841,17 +917,34 @@ class Orchestrator:
                 source = captured[chapter_id]
                 record = clean.get(chapter_id)
                 if isinstance(record, dict) and record.get("source_digest") == source:
+                    if fingerprint := interface_updates.get(chapter_id):
+                        record.update(fingerprint)
                     continue
                 build_generation += 1
                 clean[chapter_id] = {
                     "source_digest": source,
                     "build_generation": build_generation,
-                }
+                } | interface_updates.get(chapter_id, {})
+            fingerprint_errors = tuple(
+                snapshot.fingerprint_error
+                for snapshot in snapshots.values()
+                if snapshot.fingerprint_error
+            )
+            automatically_rechecked = len(previous_stale & required)
+            if automatically_rechecked:
+                metric_updates["automatic_successful_rechecks"] = automatically_rechecked
             await self._save_formalize_graph(
                 graph,
                 clean,
                 build_generation=build_generation,
+                invalidated=invalidated,
                 validated=required,
+                interface_updates=interface_updates,
+                import_updates=import_updates,
+                fingerprint_error="\n\n".join(fingerprint_errors)[-4000:],
+                interface_invalidated=invalidated,
+                interface_validated=required,
+                metric_updates=metric_updates,
             )
             return True
 
@@ -874,20 +967,40 @@ class Orchestrator:
         return invalidated
 
     async def _invalidate_build_records(self, chapter_ids: Iterable[str]) -> set[str]:
-        """Mark an edited source closure stale before any verification is queued."""
+        """Mark edited sources stale while retaining known downstream interfaces."""
 
         graph = self._observed_work_unit_graph()
+        targets = set(chapter_ids)
         persisted = self.state.formalize_graph.get("clean", {})
         clean = await self._retain_formalize_clean(
             graph,
             persisted if isinstance(persisted, dict) else {},
         )
-        invalidated = self._invalidate_formalize_descendants(graph, clean, chapter_ids)
+        raw_interfaces = self.state.formalize_graph.get("interfaces", {})
+        interfaces = raw_interfaces if isinstance(raw_interfaces, dict) else {}
+        known = all(
+            isinstance(interfaces.get(chapter_id, persisted.get(chapter_id)), dict)
+            and bool(
+                interfaces.get(chapter_id, persisted.get(chapter_id, {})).get("interface_digest")
+            )
+            for chapter_id in targets
+        )
+        if self.config.settings.interface_invalidation == "observe" or not known:
+            invalidated = self._invalidate_formalize_descendants(graph, clean, targets)
+        else:
+            invalidated = targets
+            for chapter_id in targets:
+                clean.pop(chapter_id, None)
         await self._save_formalize_graph(
             graph,
             clean,
             build_generation=int(self.state.formalize_graph.get("build_generation", 0)),
             invalidated=invalidated,
+            metric_updates=(
+                {"unknown_interface_fallbacks": len(targets)}
+                if self.config.settings.interface_invalidation != "observe" and not known
+                else None
+            ),
         )
         return invalidated
 
@@ -899,6 +1012,12 @@ class Orchestrator:
         build_generation: int,
         invalidated: Iterable[str] = (),
         validated: Iterable[str] = (),
+        interface_updates: dict[str, dict[str, Any]] | None = None,
+        import_updates: dict[str, tuple[str, ...]] | None = None,
+        fingerprint_error: str = "",
+        interface_invalidated: Iterable[str] = (),
+        interface_validated: Iterable[str] = (),
+        metric_updates: dict[str, int] | None = None,
     ) -> int:
         async with self._formalize_graph_lock:
             explicitly_invalidated = set(invalidated)
@@ -934,15 +1053,118 @@ class Orchestrator:
             dirty = set(previous.get("dirty", ())) if isinstance(previous, dict) else set()
             dirty.update(explicitly_invalidated)
             dirty.difference_update(explicitly_validated)
+            raw_interfaces = previous.get("interfaces", {})
+            interfaces = (
+                {
+                    str(chapter_id): dict(record)
+                    for chapter_id, record in raw_interfaces.items()
+                    if isinstance(chapter_id, str) and isinstance(record, dict)
+                }
+                if isinstance(raw_interfaces, dict)
+                else {}
+            )
+            interfaces.update(interface_updates or {})
+            for chapter_id, record in clean.items():
+                if record.get("interface_digest") and chapter_id not in interfaces:
+                    interfaces[chapter_id] = {
+                        key: value
+                        for key, value in record.items()
+                        if key
+                        in {
+                            "artifact_digest",
+                            "interface_digest",
+                            "fingerprint_schema",
+                            "lean_version",
+                            "modules",
+                        }
+                    }
+            raw_imports = previous.get("interface_imports", {})
+            interface_imports = (
+                {
+                    str(chapter_id): tuple(item for item in required if isinstance(item, str))
+                    for chapter_id, required in raw_imports.items()
+                    if isinstance(chapter_id, str) and isinstance(required, list)
+                }
+                if isinstance(raw_imports, dict)
+                else {}
+            )
+            interface_imports.update(import_updates or {})
+            invalidation_graph = self._interface_invalidation_graph(graph, interface_imports)
+            interface_stale = set(previous.get("interface_stale", ()))
+            interface_stale.update(interface_invalidated)
+            interface_stale.difference_update(interface_validated)
+            raw_metrics = previous.get("fingerprint_metrics", {})
+            fingerprint_metrics = (
+                {
+                    str(name): int(value)
+                    for name, value in raw_metrics.items()
+                    if isinstance(name, str) and isinstance(value, int)
+                }
+                if isinstance(raw_metrics, dict)
+                else {}
+            )
+            for name, increment in (metric_updates or {}).items():
+                fingerprint_metrics[name] = fingerprint_metrics.get(name, 0) + increment
             self.state.formalize_graph = graph.snapshot() | {
                 "algorithm": "source-dependency-tree",
                 "revision": revision,
                 "build_generation": build_generation,
                 "clean": clean,
                 "dirty": sorted(dirty),
+                "interfaces": interfaces,
+                "interface_imports": {
+                    chapter_id: list(required)
+                    for chapter_id, required in sorted(interface_imports.items())
+                },
+                "interface_import_graph": invalidation_graph.snapshot()
+                | {"coverage": len(interface_imports)},
+                "fingerprint_schema": "olean-proof-erased-v1",
+                "fingerprint_mode": self.config.settings.interface_invalidation,
+                "last_fingerprint_error": fingerprint_error,
+                "interface_stale": sorted(interface_stale),
+                "fingerprint_metrics": fingerprint_metrics,
             }
             await self.state.save()
             return revision
+
+    def _interface_invalidation_graph(
+        self,
+        fallback: WorkUnitImportGraph,
+        compiled: dict[str, tuple[str, ...]],
+    ) -> WorkUnitImportGraph:
+        dependencies = {
+            chapter.id: set(compiled.get(chapter.id, fallback.dependencies[chapter.id]))
+            for chapter in self.work_units
+        }
+        try:
+            return build_compiled_import_graph(self.work_units, dependencies)
+        except ValueError:
+            # Partial migration can temporarily combine two individually valid
+            # graph revisions into a work-unit cycle. Stay conservative until
+            # the remaining compiled records replace the fallback edges.
+            return fallback
+
+    def _interface_dependencies_are_current(
+        self,
+        graph: WorkUnitImportGraph,
+        chapter_id: str,
+    ) -> bool:
+        stale_value = self.state.formalize_graph.get("interface_stale", ())
+        stale = set(stale_value) if isinstance(stale_value, list) else set()
+        if not stale:
+            return True
+        raw_imports = self.state.formalize_graph.get("interface_imports", {})
+        compiled = (
+            {
+                str(owner): tuple(item for item in dependencies if isinstance(item, str))
+                for owner, dependencies in raw_imports.items()
+                if isinstance(owner, str) and isinstance(dependencies, list)
+            }
+            if isinstance(raw_imports, dict)
+            else {}
+        )
+        interface_graph = self._interface_invalidation_graph(graph, compiled)
+        return not bool(self._dependency_closure(interface_graph, (chapter_id,)) & stale)
 
     async def _scope_exists(self, chapter: WorkUnitLike) -> bool:
         return await asyncio.to_thread(
@@ -959,7 +1181,7 @@ class Orchestrator:
             graph,
             persisted if isinstance(persisted, dict) else {},
         )
-        return chapter.id in clean
+        return chapter.id in clean and self._interface_dependencies_are_current(graph, chapter.id)
 
     async def _integrate_interrupted_workspace(
         self,
@@ -992,7 +1214,7 @@ class Orchestrator:
 
         payload = isolated.as_dict()
         payload["interrupted"] = True
-        if isolated.accepted and isolated.changed_paths and stage is not Stage.PROVE:
+        if isolated.accepted and isolated.changed_paths and stage is not Stage.DISCOVER:
             try:
                 invalidated_builds = await self._invalidate_build_records((chapter.id,))
                 if stage in (Stage.FORMALIZE, Stage.REVIEW):
@@ -1204,6 +1426,7 @@ class Orchestrator:
                 in (
                     Stage.FORMALIZE,
                     Stage.REVIEW,
+                    Stage.PROVE,
                 )
             ):
                 invalidated_builds = await self._invalidate_build_records((chapter.id,))
@@ -2373,6 +2596,25 @@ class Orchestrator:
             candidate = candidate.rpartition(".")[0]
         return self._ordered_owner_ids(owners)
 
+    def _fingerprint_dependencies(
+        self,
+        work_unit_id: str,
+        fingerprint: dict[str, Any],
+    ) -> tuple[str, ...]:
+        dependencies: set[str] = set()
+        modules = fingerprint.get("modules", ())
+        if not isinstance(modules, list):
+            return ()
+        for module in modules:
+            if not isinstance(module, dict) or not isinstance(module.get("imports"), list):
+                continue
+            for imported in module["imports"]:
+                if not isinstance(imported, str):
+                    continue
+                dependencies.update(self._module_owner_ids(imported))
+        dependencies.discard(work_unit_id)
+        return self._ordered_owner_ids(dependencies)
+
     def _identifier_owner_ids(self, text: str) -> tuple[str, ...]:
         owners: list[str] = []
         for start, character in enumerate(text):
@@ -2816,6 +3058,20 @@ class Orchestrator:
                     and bool(results)
                     and all(result.compiler_succeeded for result in results.values())
                 )
+                fingerprints: FingerprintCollection | None = None
+                fingerprint_error = ""
+                if artifacts_built and snapshots is not None:
+                    cached = self.state.formalize_graph.get("interfaces", {})
+                    try:
+                        fingerprints = await asyncio.to_thread(
+                            collect_interface_fingerprints,
+                            self.config,
+                            selected,
+                            root=build_workspace.root,
+                            cached_records=cached if isinstance(cached, dict) else {},
+                        )
+                    except InterfaceFingerprintError as error:
+                        fingerprint_error = str(error)[-4000:]
                 if artifacts_built:
                     if not source_held:
                         await self.source_lock.acquire()
@@ -2843,12 +3099,24 @@ class Orchestrator:
                     elif snapshots is not None:
                         for chapter in selected:
                             required = self._dependency_closure(build_graph, (chapter.id,))
+                            fingerprint = (
+                                fingerprints.records[chapter.id].as_dict()
+                                if fingerprints is not None and chapter.id in fingerprints.records
+                                else None
+                            )
                             snapshots[chapter.id] = ValidatedBuildSnapshot(
                                 graph=build_graph,
                                 source_digests={
                                     chapter_id: build_source_digests[chapter_id]
                                     for chapter_id in required
                                 },
+                                fingerprint=fingerprint,
+                                import_dependencies=(
+                                    self._fingerprint_dependencies(chapter.id, fingerprint)
+                                    if fingerprint is not None
+                                    else ()
+                                ),
+                                fingerprint_error=fingerprint_error,
                             )
                 await build_workspace.finish(
                     succeeded=artifacts_built,
@@ -3977,10 +4245,12 @@ class Orchestrator:
             )
             proof_task = self.state.task(chapter.id, Stage.PROVE)
             record = clean.get(chapter.id)
+            dependencies_current = self._interface_dependencies_are_current(graph, chapter.id)
             if (
                 proof_task.status == TaskStatus.SUCCEEDED
                 and isinstance(record, dict)
                 and proof_task.source_digest == record.get("source_digest")
+                and dependencies_current
             ):
                 await self._close_previously_satisfied_upstream_requests(
                     chapter,
@@ -3992,7 +4262,7 @@ class Orchestrator:
                 placeholders = await asyncio.to_thread(
                     count_placeholders, self.config.settings.repo, chapter
                 )
-                build_fresh = isinstance(record, dict)
+                build_fresh = isinstance(record, dict) and dependencies_current
                 if not build_fresh:
                     revalidation = await self._refresh_stale_proof_build(chapter)
                     if not revalidation.succeeded:

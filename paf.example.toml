@@ -17,6 +17,9 @@ isolation = "auto"
 cache_compaction_layers = 32
 lean_project = "lean"
 lean_mcp_tool_timeout_seconds = 300
+# "observe" retains legacy invalidation; "conservative" skips downstream
+# invalidation only when both compiled interface fingerprints are known.
+interface_invalidation = "conservative"
 
 # The Shepherd periodically triages accumulated terminal failures with a
 # stronger read-only planner, then dispatches bounded Luna/max repair units.

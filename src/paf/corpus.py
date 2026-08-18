@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import heapq
 import re
+from collections.abc import Mapping, Set
 from dataclasses import dataclass
 from itertools import pairwise
 from pathlib import Path
@@ -143,6 +144,62 @@ def build_work_unit_import_graph(
         detail = " -> ".join(cycle) if cycle else "unknown cycle"
         raise ValueError(f"observed chapter import graph contains a cycle: {detail}")
 
+    edges = tuple(
+        sorted(
+            (prerequisite, dependent)
+            for dependent, required in dependencies.items()
+            for prerequisite in required
+        )
+    )
+    return WorkUnitImportGraph(
+        dependencies={key: frozenset(value) for key, value in dependencies.items()},
+        successors={key: frozenset(value) for key, value in successors.items()},
+        order=tuple(order),
+        edges=edges,
+    )
+
+
+def build_compiled_import_graph(
+    work_units: tuple[WorkUnitLike, ...],
+    compiled_dependencies: Mapping[str, Set[str]],
+) -> WorkUnitImportGraph:
+    """Build the exact owned-module DAG read from compiled ``ModuleData``."""
+
+    by_id = {work_unit.id: work_unit for work_unit in work_units}
+    source_order = {work_unit.id: index for index, work_unit in enumerate(work_units)}
+    dependencies = {
+        work_unit.id: set(compiled_dependencies.get(work_unit.id, ())) for work_unit in work_units
+    }
+    missing = {
+        dependency
+        for required in dependencies.values()
+        for dependency in required
+        if dependency not in by_id
+    }
+    if missing:
+        raise ValueError(f"compiled imports reference unknown ids: {', '.join(sorted(missing))}")
+    if cycle := _chapter_cycle(dependencies):
+        raise ValueError("compiled work-unit imports contain a cycle: " + " -> ".join(cycle))
+
+    successors = {work_unit.id: set[str]() for work_unit in work_units}
+    for dependent, required in dependencies.items():
+        for prerequisite in required:
+            successors[prerequisite].add(dependent)
+    indegree = {work_unit_id: len(required) for work_unit_id, required in dependencies.items()}
+    ready = [
+        (source_order[work_unit_id], work_unit_id)
+        for work_unit_id, degree in indegree.items()
+        if degree == 0
+    ]
+    heapq.heapify(ready)
+    order: list[str] = []
+    while ready:
+        _, work_unit_id = heapq.heappop(ready)
+        order.append(work_unit_id)
+        for successor in sorted(successors[work_unit_id], key=source_order.__getitem__):
+            indegree[successor] -= 1
+            if indegree[successor] == 0:
+                heapq.heappush(ready, (source_order[successor], successor))
     edges = tuple(
         sorted(
             (prerequisite, dependent)

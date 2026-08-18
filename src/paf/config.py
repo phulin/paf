@@ -503,6 +503,7 @@ def load_config(path: str | Path, *, project: Project | None = None) -> Pipeline
             name="swarm.lean_project",
         ),
         lean_mcp_tool_timeout_seconds=float(swarm.get("lean_mcp_tool_timeout_seconds", 300)),
+        interface_invalidation=str(swarm.get("interface_invalidation", "conservative")),
     )
     if settings.max_agents < 1:
         raise ValueError("swarm.max_agents must be positive")
@@ -518,6 +519,8 @@ def load_config(path: str | Path, *, project: Project | None = None) -> Pipeline
         raise ValueError("swarm.codex_fd_recycle_attempts must be nonnegative")
     if settings.isolation not in {"auto", "fuse-overlay", "shared"}:
         raise ValueError("swarm.isolation must be auto, fuse-overlay, or shared")
+    if settings.interface_invalidation not in {"observe", "conservative", "interface"}:
+        raise ValueError("swarm.interface_invalidation must be observe, conservative, or interface")
     if settings.cache_compaction_layers < 2:
         raise ValueError("swarm.cache_compaction_layers must be at least 2")
     if settings.lean_mcp_tool_timeout_seconds <= 0:

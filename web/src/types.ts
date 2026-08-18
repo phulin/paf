@@ -22,6 +22,11 @@ export interface Task {
   rounds: number;
   updated_at: string;
   latest_run_id?: string | null;
+  proof_complete?: boolean;
+  interface_current?: boolean;
+  dependencies_current?: boolean;
+  head_build_status?: "clean" | "pending" | "failed" | "unknown";
+  fully_certified?: boolean;
 }
 
 export interface Usage {

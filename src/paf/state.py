@@ -889,8 +889,44 @@ class StateStore:
             }
         return value
 
-    @staticmethod
-    def _task_dict(task: TaskRecord) -> dict[str, Any]:
+    def _task_dict(self, task: TaskRecord) -> dict[str, Any]:
+        clean_value = self.formalize_graph.get("clean", {})
+        clean = clean_value if isinstance(clean_value, dict) else {}
+        interfaces_value = self.formalize_graph.get("interfaces", {})
+        interfaces = interfaces_value if isinstance(interfaces_value, dict) else {}
+        dirty_value = self.formalize_graph.get("dirty", ())
+        dirty = set(dirty_value) if isinstance(dirty_value, list) else set()
+        stale_value = self.formalize_graph.get("interface_stale", ())
+        stale = set(stale_value) if isinstance(stale_value, list) else set()
+        import_graph = self.formalize_graph.get("interface_import_graph", {})
+        dependencies_value = (
+            import_graph.get("dependencies", {}) if isinstance(import_graph, dict) else {}
+        )
+        dependencies = dependencies_value if isinstance(dependencies_value, dict) else {}
+        required = {task.chapter_id}
+        pending = [task.chapter_id]
+        while pending:
+            chapter_id = pending.pop()
+            values = dependencies.get(chapter_id, ())
+            if not isinstance(values, list):
+                continue
+            for dependency in values:
+                if isinstance(dependency, str) and dependency not in required:
+                    required.add(dependency)
+                    pending.append(dependency)
+        interface_current = task.chapter_id in interfaces and task.chapter_id not in stale
+        dependencies_current = not bool(required & stale)
+        if task.chapter_id in stale or task.chapter_id in dirty:
+            head_build_status = "pending"
+        elif task.chapter_id in clean:
+            head_build_status = "clean"
+        else:
+            head_build_status = "unknown"
+        proof_complete = (
+            task.stage == Stage.PROVE
+            and task.status == TaskStatus.SUCCEEDED
+            and task.source_digest is not None
+        )
         return {
             "work_unit_id": task.work_unit_id,
             "document_id": task.document_id,
@@ -914,6 +950,16 @@ class StateStore:
             "source": task.source,
             "source_start_line": task.source_start_line,
             "source_end_line": task.source_end_line,
+            "proof_complete": proof_complete,
+            "interface_current": interface_current,
+            "dependencies_current": dependencies_current,
+            "head_build_status": head_build_status,
+            "fully_certified": (
+                proof_complete
+                and interface_current
+                and dependencies_current
+                and head_build_status == "clean"
+            ),
         }
 
     @staticmethod
@@ -940,7 +986,7 @@ class StateStore:
         cost = self.total_cost()
         invocation_cost = self.invocation_cost()
         return {
-            "version": 17,
+            "version": 18,
             "history_database": DATABASE_NAME,
             "project_root": str(
                 self.config.project.root

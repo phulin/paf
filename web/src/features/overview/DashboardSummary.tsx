@@ -89,7 +89,10 @@ export function DashboardSummary({
 }) {
   const tasks = Object.values(state.tasks ?? {});
   const successful = tasks.filter((task) => task.status === "succeeded").length;
-  const chaptersDone = rows.filter((row) => row.stages.prove?.status === "succeeded").length;
+  const chaptersDone = rows.filter(
+    (row) => row.stages.prove?.proof_complete ?? row.stages.prove?.status === "succeeded",
+  ).length;
+  const headCertified = rows.filter((row) => row.stages.prove?.fully_certified).length;
   const runningTasks = tasks.filter((task) => task.status === "running").length;
   const activeAgents = state.agents?.active ?? runningTasks;
   const phasedTasks = tasks.some((task) => task.phase !== undefined);
@@ -135,7 +138,9 @@ export function DashboardSummary({
                 {successful} / {tasks.length} tasks
               </span>
               <i />
-              {chaptersDone} chapters proved
+              {chaptersDone} locally proved
+              <i />
+              {headCertified} HEAD-certified
             </>
           }
           accent="var(--green)"
