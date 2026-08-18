@@ -116,9 +116,7 @@ async def test_shepherd_receives_root_failures_not_causal_blockers(tmp_path: Pat
 
 
 @pytest.mark.asyncio
-async def test_interrupted_repair_dag_does_not_resume_causal_blockers(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+async def test_persisted_repair_plan_reopens_only_root_failures(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
     state = StateStore(config)
     await state.load_or_create()
@@ -167,20 +165,13 @@ async def test_interrupted_repair_dag_does_not_resume_causal_blockers(
     root_unit.status = RepairWorkUnitStatus.INTERRUPTED
     downstream_unit.status = RepairWorkUnitStatus.INTERRUPTED
     await state.save("repair_work_units")
-    orchestrator = Orchestrator(config, state)
-    resumed: list[str] = []
+    reopened = await Orchestrator(config, state)._discard_persisted_repair_plans()
 
-    async def execute(units: Any) -> bool:
-        resumed.extend(item.id for item in units)
-        return False
-
-    monkeypatch.setattr(orchestrator, "_execute_repair_plan", execute)
-
-    assert not await orchestrator._resume_repair_dags()
-    assert resumed == [root_unit.id]
-    assert root_unit.case_ids == [root_case.id]
-    assert downstream_unit.status == RepairWorkUnitStatus.SUPERSEDED
-    assert downstream_unit.detail == "covered failures are causal blockers, not repair targets"
+    assert [case.id for case in reopened] == [root_case.id]
+    assert state.repair_work_units == {}
+    assert state.repair_sweeps == {}
+    assert root_case.status == RepairCaseStatus.OPEN
+    assert consumer_case.status == RepairCaseStatus.EXHAUSTED
     await state.close()
 
 
@@ -208,9 +199,7 @@ async def test_legacy_derived_review_failure_migrates_to_blocked(tmp_path: Path)
 
 
 @pytest.mark.asyncio
-async def test_interrupted_repair_dag_resumes_without_replanning(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+async def test_interrupted_repair_dag_is_discarded_for_fresh_planning(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
     state = StateStore(config)
     await state.load_or_create()
@@ -237,18 +226,48 @@ async def test_interrupted_repair_dag_resumes_without_replanning(
     recovered = StateStore(config)
     await recovered.load_or_create()
     orchestrator = Orchestrator(config, recovered)
-    resumed: list[str] = []
+    reopened = await orchestrator._discard_persisted_repair_plans()
 
-    async def execute(units: Any) -> bool:
-        resumed.extend(item.id for item in units)
-        return False
-
-    monkeypatch.setattr(orchestrator, "_execute_repair_plan", execute)
-
-    assert not await orchestrator._resume_repair_dags()
-    assert resumed == [unit.id]
-    assert len(recovered.repair_sweeps) == 1
+    assert [item.id for item in reopened] == [case.id]
+    assert recovered.repair_work_units == {}
+    assert recovered.repair_sweeps == {}
+    assert recovered.repair_cases[case.id].status == RepairCaseStatus.OPEN
     await recovered.close()
+
+    verified = StateStore(config)
+    await verified.load_or_create()
+    assert verified.repair_work_units == {}
+    assert verified.repair_sweeps == {}
+    assert verified.repair_cases[case.id].status == RepairCaseStatus.OPEN
+    await verified.close()
+
+
+@pytest.mark.asyncio
+async def test_shepherd_loop_replans_discarded_cases_on_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    state = StateStore(config)
+    await state.load_or_create()
+    chapter = config.work_units[0]
+    await state.set_task(chapter.id, Stage.REVIEW, TaskStatus.FAILED, "root review error")
+    case = state.ensure_repair_case(state.key(chapter.id, Stage.REVIEW))
+    orchestrator = Orchestrator(config, state)
+    replanned: list[tuple[str, list[str]]] = []
+
+    class Replanned(RuntimeError):
+        pass
+
+    async def run_sweep(*, trigger: str, cases: Any) -> bool:
+        replanned.append((trigger, [item.id for item in cases]))
+        raise Replanned
+
+    monkeypatch.setattr(orchestrator, "_run_shepherd_sweep", run_sweep)
+
+    with pytest.raises(Replanned):
+        await orchestrator._shepherd_loop([case])
+    assert replanned == [("restart", [case.id])]
+    await state.close()
 
 
 @pytest.mark.asyncio

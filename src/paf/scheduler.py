@@ -518,11 +518,14 @@ class Orchestrator:
         report("Checking the Git worktree", 8)
         await self.git.prepare()
         if self.config.shepherd.enabled:
+            restart_cases = await self._discard_persisted_repair_plans()
             self.state.shepherd.next_run_at = (
                 datetime.now(UTC) + timedelta(seconds=self.config.shepherd.interval_seconds)
             ).isoformat()
             await self.state.save("state")
-            self._shepherd_task = asyncio.create_task(self._shepherd_loop(), name="paf-shepherd")
+            self._shepherd_task = asyncio.create_task(
+                self._shepherd_loop(restart_cases), name="paf-shepherd"
+            )
         report("Preparation complete", 9)
 
     async def _commit_agent_changes(
@@ -5619,8 +5622,8 @@ class Orchestrator:
             for task_key in unit.task_keys
         )
 
-    async def _resume_repair_dags(self) -> bool:
-        """Resume durable repair plans whose failure evidence is still current."""
+    async def _continue_repair_dags(self) -> bool:
+        """Continue a plan created by this orchestrator while its dependencies settle."""
 
         retryable = {
             RepairWorkUnitStatus.PENDING,
@@ -5688,6 +5691,93 @@ class Orchestrator:
                 if sweep_id in self.state.repair_sweeps:
                     await self.state.finish_repair_sweep(sweep_id)
             return progressed
+
+    async def _discard_persisted_repair_plans(self) -> list[RepairCaseRecord]:
+        """Discard unfinished plans from an earlier orchestrator and reopen current cases."""
+
+        retryable = {
+            RepairWorkUnitStatus.PENDING,
+            RepairWorkUnitStatus.INTERRUPTED,
+        }
+        stale_sweep_ids = {
+            sweep.id
+            for sweep in self.state.repair_sweeps.values()
+            if sweep.status in {"planning", "repairing", "waiting"}
+            or "interrupted with the orchestrator" in sweep.error
+        }
+        stale_sweep_ids.update(
+            unit.sweep_id
+            for unit in self.state.repair_work_units.values()
+            if unit.status in retryable
+        )
+        if not stale_sweep_ids:
+            return []
+
+        stale_case_ids = {
+            case_id
+            for sweep_id in stale_sweep_ids
+            if (sweep := self.state.repair_sweeps.get(sweep_id)) is not None
+            for case_id in sweep.case_ids
+        }
+        stale_unit_ids = {
+            unit_id
+            for unit_id, unit in self.state.repair_work_units.items()
+            if unit.sweep_id in stale_sweep_ids
+        }
+        stale_case_ids.update(
+            case_id
+            for unit_id in stale_unit_ids
+            for case_id in self.state.repair_work_units[unit_id].case_ids
+        )
+        for unit_id in stale_unit_ids:
+            self.state.repair_work_units.pop(unit_id, None)
+        for sweep_id in stale_sweep_ids:
+            self.state.repair_sweeps.pop(sweep_id, None)
+
+        repairable_keys = {key for key, _task in self.state.shepherd_repairable_tasks()}
+        reopened: dict[str, RepairCaseRecord] = {}
+        now = datetime.now(UTC).isoformat()
+        for case in tuple(self.state.repair_cases.values()):
+            if case.id not in stale_case_ids and not set(case.work_unit_ids).intersection(
+                stale_unit_ids
+            ):
+                continue
+            case.work_unit_ids = [
+                unit_id for unit_id in case.work_unit_ids if unit_id not in stale_unit_ids
+            ]
+            if case.sweep_id in stale_sweep_ids:
+                case.sweep_id = ""
+            if case.task_key in repairable_keys:
+                current = self.state.ensure_repair_case(case.task_key)
+                current.status = RepairCaseStatus.OPEN
+                current.sweep_id = ""
+                current.work_unit_ids = [
+                    unit_id for unit_id in current.work_unit_ids if unit_id not in stale_unit_ids
+                ]
+                current.updated_at = now
+                reopened[current.task_key] = current
+                if current.id != case.id:
+                    case.status = RepairCaseStatus.EXHAUSTED
+            elif (task := self.state.tasks.get(case.task_key)) is not None and task.status not in {
+                TaskStatus.FAILED,
+                TaskStatus.BLOCKED,
+            }:
+                case.status = RepairCaseStatus.RESOLVED
+            else:
+                case.status = RepairCaseStatus.EXHAUSTED
+            case.updated_at = now
+
+        self.state.shepherd.current_sweep_id = ""
+        self.state.shepherd.current_run_id = ""
+        self.state.shepherd.planned_units = 0
+        self.state.shepherd.running_units = 0
+        await self.state.save(
+            "state",
+            "repair_cases",
+            "repair_sweeps",
+            "repair_work_units",
+        )
+        return sorted(reopened.values(), key=lambda case: (case.updated_at, case.task_key))
 
     async def _run_shepherd_sweep(
         self,
@@ -5778,12 +5868,14 @@ class Orchestrator:
             return False
         return await self._run_shepherd_sweep(trigger="failure-threshold", cases=cases)
 
-    async def _shepherd_loop(self) -> None:
+    async def _shepherd_loop(self, restart_cases: Iterable[RepairCaseRecord] = ()) -> None:
         changes = self.state.change_bus.subscribe()
         interval = self.config.shepherd.interval_seconds
         due = datetime.now(UTC) + timedelta(seconds=interval)
         try:
-            await self._resume_repair_dags()
+            restart_cases = tuple(restart_cases)
+            if restart_cases:
+                await self._run_shepherd_sweep(trigger="restart", cases=restart_cases)
             while True:
                 remaining = max(0.0, (due - datetime.now(UTC)).total_seconds())
                 timed_out = False
@@ -5793,7 +5885,7 @@ class Orchestrator:
                 except TimeoutError:
                     timed_out = True
                 if change is not None and change.stages:
-                    await self._resume_repair_dags()
+                    await self._continue_repair_dags()
                 cases = self._repair_cases(periodic=timed_out)
                 pending = len(self.state.shepherd_repairable_tasks())
                 if self.state.shepherd.pending_failures != pending:

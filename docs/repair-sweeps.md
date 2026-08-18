@@ -116,8 +116,9 @@ flowchart TD
 
 The implementation invokes the Shepherd from a live periodic/threshold loop. A threshold sweep is
 also checked when a scheduling wave finishes, so a batch of failures cannot disappear with process
-shutdown before planning. Once a validated repair plan is persisted, its work units join the same
-dependency-aware scheduler as the four ordinary stages.
+shutdown before planning. Once a repair plan is validated, its work units join the same
+dependency-aware scheduler as the four ordinary stages for the lifetime of that orchestrator.
+Unfinished plans are discarded on restart and regenerated from current root failures.
 
 ## Record failures as data
 
@@ -581,7 +582,8 @@ Projects can set `enabled = false` to opt out.
 
 The worker profile is independent of the Shepherd profile and defaults to Luna/max even when the
 Shepherd uses a stronger model. Consecutive no-progress sweeps are bounded; progress or new failure
-fingerprints reset the backoff, and case/work-unit history remains durable across restarts.
+fingerprints reset the backoff. Completed case/work-unit history remains durable across restarts,
+but an unfinished plan does not.
 
 Planned manual controls are:
 
@@ -607,10 +609,10 @@ Startup reconciliation handles each crash boundary idempotently:
 - cases persisted, no sweep: they remain `open`;
 - Shepherd run interrupted before a valid plan: the sweep becomes interrupted; a bounded fresh
   planning run may consume another planner attempt;
-- valid plan persisted: its pending units are reconstructed directly from the database, never by
-  asking the model to recreate the same plan;
-- live Luna worker after shutdown: its run and unit become `interrupted`; the case remains `planned`,
-  and a fresh worker may retry the same immutable unit while still counting the attempt;
+- valid but unfinished plan persisted: startup deletes the sweep and its dynamic units, reopens its
+  still-current root cases, and immediately asks the Shepherd for a fresh plan;
+- live Luna worker after shutdown: its run becomes `interrupted`; its plan is discarded and its
+  still-current root case returns to fresh planning;
 - worker finished, no imported patch: replay collection only if the isolated workspace is known
   safe; otherwise retain the interrupted evidence and retry within budget;
 - commit exists but unit/case update is missing: find the case trailer, verify the recorded candidate
