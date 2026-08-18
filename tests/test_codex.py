@@ -34,6 +34,7 @@ from paf.codex import (
     lean_mcp_executable,
     lean_mcp_path,
     proof_target_chunk,
+    proof_target_spans,
     proof_targets,
     render_prompt,
     unexpected_lean_warnings,
@@ -321,6 +322,7 @@ def test_proof_targets_are_declaration_scoped_and_chunked_by_placeholder_count(
         remaining = remaining[len(chunk) :]
 
     assert [target.declaration for target in targets] == [f"target{i}" for i in range(1, 10)]
+    assert [(target.line, target.end_line) for target in targets[:2]] == [(3, 3), (4, 4)]
     assert [sum(target.placeholder_count for target in chunk) for chunk in chunks] == [4, 4, 1]
     assert len({target.fingerprint for target in targets}) == 9
 
@@ -339,6 +341,28 @@ def test_proof_chunk_does_not_split_one_declaration(tmp_path: Path) -> None:
     targets = proof_targets(tmp_path, chapter)
 
     assert [target.placeholder_count for target in proof_target_chunk(targets, 1)] == [2]
+
+
+def test_proof_target_spans_refresh_after_an_assigned_proof_expands(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = config.chapters[0]
+    path = tmp_path / "lean" / "Book" / "Chapter01.lean"
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        "theorem assigned : True := by sorry\ntheorem later : True := by sorry\n",
+        encoding="utf-8",
+    )
+    assigned = proof_targets(tmp_path, chapter)[0]
+    path.write_text(
+        "theorem assigned : True := by\n  have h : True := by trivial\n  exact h\n"
+        "theorem later : True := by sorry\n",
+        encoding="utf-8",
+    )
+
+    refreshed = proof_target_spans(tmp_path, chapter, (assigned,))[0]
+
+    assert refreshed.fingerprint == assigned.fingerprint
+    assert (refreshed.line, refreshed.end_line, refreshed.placeholder_count) == (1, 3, 0)
 
 
 def test_unnamed_examples_are_independent_proof_targets(tmp_path: Path) -> None:
@@ -377,6 +401,8 @@ def test_proof_prompt_contains_only_the_assigned_chunk(tmp_path: Path) -> None:
     assert "exactly these 2 unresolved placeholder(s)" in prompt
     assert "`Book.target`" in prompt
     assert "Other unresolved declarations are intentionally reserved" in prompt
+    assert "Resolve every error and every warning" in prompt
+    assert "only permitted warning is one caused by a `sorry` placeholder" in prompt
     assert "Set `complete` to `true` when every" in prompt
 
 

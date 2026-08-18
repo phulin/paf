@@ -37,6 +37,7 @@ class ProofTarget:
     path: str
     declaration: str
     line: int
+    end_line: int
     placeholder_count: int
     fingerprint: str
 
@@ -45,6 +46,7 @@ class ProofTarget:
             "path": self.path,
             "declaration": self.declaration,
             "line": self.line,
+            "end_line": self.end_line,
             "placeholder_count": self.placeholder_count,
             "fingerprint": self.fingerprint,
         }

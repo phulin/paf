@@ -18,7 +18,7 @@ from paf.codex import (
 )
 from paf.config import load_config
 from paf.git import GitCommitError
-from paf.models import Chapter, PipelineConfig, Stage
+from paf.models import Chapter, PipelineConfig, ProofTarget, Stage
 from paf.scheduler import FormalizeOutcome, Orchestrator, ReviewOutcome
 from paf.state import (
     RunRecord,
@@ -3133,6 +3133,109 @@ def test_proof_feedback_is_bounded_and_retains_latest_diagnostics() -> None:
     assert len(feedback) == scheduler_module.PROOF_FEEDBACK_MAX_CHARS
     assert "older proof feedback omitted" in feedback
     assert feedback.endswith("latest diagnostic")
+
+
+@pytest.mark.parametrize("severity", ["error", "warning"])
+def test_proof_chunk_validation_only_rejects_diagnostics_in_assigned_spans(
+    severity: str,
+) -> None:
+    target = ProofTarget(
+        path="lean/Book/Chapter01.lean",
+        declaration="assigned",
+        line=10,
+        end_line=20,
+        placeholder_count=1,
+        fingerprint="assigned-target",
+    )
+    outside = ValidationResult(
+        False,
+        1,
+        f"{severity}: lean/Book/Chapter01.lean:25:3: diagnostic outside the chunk",
+        process_exit_code=1 if severity == "error" else 0,
+    )
+    inside = ValidationResult(
+        False,
+        1,
+        f"{severity}: /workspace/lean/Book/Chapter01.lean:15:3: diagnostic in the chunk",
+        process_exit_code=1 if severity == "error" else 0,
+    )
+    unlocated = ValidationResult(False, 1, f"{severity}: dependency build failed")
+
+    scoped_outside = Orchestrator._proof_chunk_validation(outside, (target,))
+    scoped_inside = Orchestrator._proof_chunk_validation(inside, (target,))
+    scoped_unlocated = Orchestrator._proof_chunk_validation(unlocated, (target,))
+
+    assert scoped_outside.succeeded
+    assert "belonged to the assigned proof chunk" in scoped_outside.output
+    assert not scoped_inside.succeeded
+    assert "diagnostic in the chunk" in scoped_inside.output
+    assert scoped_unlocated.succeeded
+
+
+@pytest.mark.asyncio
+async def test_unrelated_diagnostic_does_not_consume_chunk_retries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    config = replace(
+        config,
+        stages={
+            **config.stages,
+            Stage.PROVE: replace(config.stages[Stage.PROVE], max_rounds=2, chunk_size=1),
+        },
+    )
+    chapter = config.chapters[0]
+    source = tmp_path / "lean" / "Book" / "Chapter01.lean"
+    source.parent.mkdir(parents=True)
+    source.write_text(
+        "theorem first : True := by sorry\n"
+        "theorem second : True := by sorry\n"
+        "theorem broken : True := by sorry\n",
+        encoding="utf-8",
+    )
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await orchestrator.prepare()
+    orchestrator.force = True
+    attempted: list[str] = []
+
+    async def attempt(*_args: object, **kwargs: object) -> scheduler_module.Attempt:
+        targets = kwargs["proof_targets"]
+        assert isinstance(targets, tuple)
+        target = targets[0]
+        attempted.append(target.declaration)
+        changed = target.declaration != "broken"
+        if changed:
+            source.write_text(
+                source.read_text(encoding="utf-8").replace(
+                    f"theorem {target.declaration} : True := by sorry",
+                    f"theorem {target.declaration} : True := by trivial",
+                ),
+                encoding="utf-8",
+            )
+        run = await state.start_run(chapter.id, Stage.PROVE)
+        run.proof_targets = [item.as_dict() for item in targets]
+        agent = result(changed=changed, placeholders=1)
+        await state.finish_run(
+            run,
+            status=TaskStatus.SUCCEEDED,
+            changed=changed,
+            placeholders=1,
+            report=agent.report,
+        )
+        validation = ValidationResult(
+            False,
+            1,
+            "error: lean/Book/Chapter01.lean:3:1: diagnostic in another declaration",
+            process_exit_code=1,
+        )
+        return scheduler_module.Attempt(agent, validation, run)
+
+    monkeypatch.setattr(orchestrator, "_attempt", attempt)
+
+    assert not await orchestrator._prove(chapter)
+    assert attempted == ["first", "second", "broken", "broken"]
+    await orchestrator.shutdown()
 
 
 @pytest.mark.asyncio

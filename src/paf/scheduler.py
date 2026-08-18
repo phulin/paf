@@ -25,6 +25,7 @@ from paf.codex import (
     declaration_uses_placeholder,
     declaration_uses_placeholder_in_chapter,
     proof_target_chunk,
+    proof_target_spans,
     proof_targets,
     report_schema_key,
     scope_digest,
@@ -2723,6 +2724,73 @@ class Orchestrator:
                 )
         return partitioned
 
+    @staticmethod
+    def _proof_chunk_validation(
+        result: ValidationResult,
+        targets: Iterable[ProofTarget],
+    ) -> ValidationResult:
+        """Project whole-build diagnostics onto the assigned declaration spans.
+
+        The coordinator still builds the chapter and its imported closure.  A proof
+        worker, however, can only act on its assigned declarations, so located Lean
+        errors and rejected warnings outside those declarations must not spend that
+        chunk's retry budget.
+        """
+
+        selected = tuple(targets)
+        if result.succeeded or not selected:
+            return result
+        diagnostics = _lean_diagnostics(result.output)
+        if not diagnostics:
+            # Timeouts and process failures without a parsed Lean diagnostic do not
+            # establish that the assigned declarations are clean.
+            return result
+
+        def same_path(left: str, right: str) -> bool:
+            normalized_left = Path(left).as_posix().lstrip("./")
+            normalized_right = Path(right).as_posix().lstrip("./")
+            return (
+                normalized_left == normalized_right
+                or normalized_left.endswith("/" + normalized_right)
+                or normalized_right.endswith("/" + normalized_left)
+            )
+
+        relevant: list[LeanDiagnostic] = []
+        for diagnostic in diagnostics:
+            message = diagnostic.header.split(":", 1)[1].lstrip()
+            location = LEAN_LOCATION_RE.match(message)
+            if location is None:
+                continue
+            line = int(location.group("line"))
+            if any(
+                same_path(location.group("path"), target.path)
+                and target.line <= line <= target.end_line
+                for target in selected
+            ):
+                relevant.append(diagnostic)
+
+        if relevant:
+            output = "\n\n".join(diagnostic.text for diagnostic in relevant)
+            output += (
+                f"\n\nCoordinator rejected {len(relevant)} Lean diagnostic(s) relevant "
+                "to the assigned proof chunk."
+            )
+            return ValidationResult(
+                False,
+                result.exit_code,
+                output[-20_000:],
+                timed_out=result.timed_out,
+                process_exit_code=result.process_exit_code,
+            )
+
+        return ValidationResult(
+            True,
+            0,
+            "Whole-chapter build failed, but no located Lean errors or rejected warnings "
+            "belonged to the assigned proof chunk.",
+            process_exit_code=result.process_exit_code,
+        )
+
     async def _build_chapters(
         self,
         chapters: Iterable[WorkUnitLike],
@@ -4523,6 +4591,21 @@ class Orchestrator:
                     ),
                 )
                 return False
+            coordinator_validation = attempt.validation
+            if chunked_proofs and assigned_targets:
+                validation_targets = await asyncio.to_thread(
+                    proof_target_spans,
+                    self.config.settings.repo,
+                    chapter,
+                    assigned_targets,
+                )
+                attempt = replace(
+                    attempt,
+                    validation=self._proof_chunk_validation(
+                        coordinator_validation,
+                        validation_targets,
+                    ),
+                )
             proof_round += 1
             if chunked_proofs:
                 chunk_round += 1
@@ -4581,7 +4664,7 @@ class Orchestrator:
             )
             if (
                 attempt.agent.succeeded
-                and attempt.validation.succeeded
+                and coordinator_validation.succeeded
                 and (
                     remaining_placeholder_count == 0
                     if chunked_proofs
@@ -4600,6 +4683,23 @@ class Orchestrator:
                     source_digest=source_digest,
                 )
                 return True
+            if (
+                chunked_proofs
+                and assigned_targets
+                and not remaining_assigned
+                and remaining_placeholder_count == 0
+                and attempt.agent.succeeded
+                and attempt.validation.succeeded
+                and not coordinator_validation.succeeded
+            ):
+                await self.state.set_task(
+                    chapter.id,
+                    Stage.PROVE,
+                    TaskStatus.PENDING,
+                    "all proof chunks completed; coordinator diagnostics remain outside the "
+                    "assigned declarations",
+                )
+                return False
             if (
                 chunked_proofs
                 and assigned_targets

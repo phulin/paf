@@ -813,16 +813,11 @@ def count_placeholders(repo: Path, chapter: WorkUnitLike) -> int:
     )
 
 
-def proof_targets(repo: Path, chapter: WorkUnitLike) -> tuple[ProofTarget, ...]:
-    """Return unresolved declarations in stable source order.
-
-    A declaration is the smallest safe proof assignment: placeholders within one declaration
-    often depend on local terms and must stay with the same agent. The ordinal disambiguates equal
-    short names in different namespaces without making the fingerprint sensitive to line movement.
-    """
+def _proof_declarations(repo: Path, chapter: WorkUnitLike) -> tuple[ProofTarget, ...]:
+    """Return every proof-capable declaration with its current source span."""
 
     pattern = re.compile(r"\b(?:sorry|admit)\b")
-    targets: list[ProofTarget] = []
+    declarations: list[ProofTarget] = []
     for path in scoped_files(repo, chapter):
         text = path.read_text(encoding="utf-8")
         matches = list(LEAN_PROOF_DECLARATION_RE.finditer(text))
@@ -832,22 +827,55 @@ def proof_targets(repo: Path, chapter: WorkUnitLike) -> tuple[ProofTarget, ...]:
             ordinal = name_ordinals.get(declaration, 0)
             name_ordinals[declaration] = ordinal + 1
             stop = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+            start_line = text.count("\n", 0, match.start()) + 1
+            end_line = (
+                text.count("\n", 0, stop)
+                if stop > 0 and text[stop - 1] == "\n"
+                else text.count("\n", 0, stop) + 1
+            )
             placeholder_count = len(pattern.findall(_lean_code(text[match.start() : stop])))
-            if not placeholder_count:
-                continue
             display_name = declaration if match.group("name") else f"example #{ordinal + 1}"
             relative = path.relative_to(repo).as_posix()
             identity = f"{relative}\0{declaration}\0{ordinal}".encode()
-            targets.append(
+            declarations.append(
                 ProofTarget(
                     path=relative,
                     declaration=display_name,
-                    line=text.count("\n", 0, match.start()) + 1,
+                    line=start_line,
+                    end_line=max(start_line, end_line),
                     placeholder_count=placeholder_count,
                     fingerprint=digest_bytes(identity),
                 )
             )
-    return tuple(targets)
+    return tuple(declarations)
+
+
+def proof_targets(repo: Path, chapter: WorkUnitLike) -> tuple[ProofTarget, ...]:
+    """Return unresolved declarations in stable source order.
+
+    A declaration is the smallest safe proof assignment: placeholders within one declaration
+    often depend on local terms and must stay with the same agent. The ordinal disambiguates equal
+    short names in different namespaces without making the fingerprint sensitive to line movement.
+    """
+
+    return tuple(
+        declaration
+        for declaration in _proof_declarations(repo, chapter)
+        if declaration.placeholder_count
+    )
+
+
+def proof_target_spans(
+    repo: Path,
+    chapter: WorkUnitLike,
+    targets: Iterable[ProofTarget],
+) -> tuple[ProofTarget, ...]:
+    """Refresh assigned declaration spans after an agent may have moved or expanded them."""
+
+    current = {
+        declaration.fingerprint: declaration for declaration in _proof_declarations(repo, chapter)
+    }
+    return tuple(current.get(target.fingerprint, target) for target in targets)
 
 
 def proof_target_chunk(
@@ -1239,8 +1267,11 @@ This attempt owns exactly these {assigned_placeholders} unresolved placeholder(s
 
 Work only on these declarations. Other unresolved declarations are intentionally reserved for
 later proof agents: do not prove, rewrite, or include them in `failed_attempts`. You may add imports
-and fully proved helpers needed by the assigned declarations. Set `complete` to `true` when every
-placeholder in this assigned chunk is resolved, even if other placeholders remain in the chapter."""
+and fully proved helpers needed by the assigned declarations. Resolve every error and every warning
+in the assigned declarations; the only permitted warning is one caused by a `sorry` placeholder
+reserved for a later chunk. Set `complete` to `true` when every placeholder in this assigned chunk
+is resolved and its declarations have no other errors or warnings, even if other placeholders
+remain in the chapter."""
         stage_contract = {
             Stage.DISCOVER: """This is read-only source analysis. Identify the earlier chapters
 that this chapter directly needs. Do not edit any file.""",
@@ -1254,8 +1285,9 @@ independently while still reviewing the complete chapter. Preserve proof placeho
 spend time proving propositions. PAF has already built the incoming files and will rebuild any
 changes.""",
             Stage.PROVE: """The assigned chapter has passed review and builds cleanly. Work directly
-on unresolved proofs rather than auditing or rechecking untouched files. PAF will build the chapter
-after the attempt."""
+on unresolved proofs rather than auditing or rechecking untouched files. Every assigned declaration
+must finish without errors or warnings; only `sorry` warnings from placeholders reserved for later
+chunks are permitted. PAF will build the chapter after the attempt."""
             + proof_retry_contract,
         }[stage]
         if role == UPSTREAM_REPAIR_ROLE:
@@ -1326,7 +1358,8 @@ Follow the formalization workflow above for when and where to request diagnostic
 Follow the review workflow above for when and where to request diagnostics.""",
                 Stage.PROVE: """Using a Lean tool opens and synchronizes the file it targets. Do not
 request diagnostics merely because you switched files. After editing, use goals and fresh
-diagnostics as needed to show that the changed proof is clean.""",
+diagnostics as needed to show that every assigned declaration has no errors and no warnings other
+than permitted `sorry` warnings from later chunks.""",
             }[stage]
             contract += f"""
 
