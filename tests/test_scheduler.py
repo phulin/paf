@@ -12,6 +12,7 @@ import pytest
 
 import paf.scheduler as scheduler_module
 from paf.codex import (
+    DIAGNOSTIC_REVIEW_ROLE,
     AgentResult,
     CodexExecutor,
     ValidationResult,
@@ -795,7 +796,123 @@ async def test_proof_review_requests_persist_and_acknowledge_exact_findings(
     assert reloaded.proof_review_requests[second_id]["feedback"] == {
         chapter.id: "new finding that arrived during review"
     }
+    assert reloaded.proof_review_requests[second_id]["kind"] == "proof_finding"
     await reloaded.close()
+
+
+@pytest.mark.asyncio
+async def test_diagnostic_requests_select_targeted_review_role(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = config.chapters[0]
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await orchestrator.prepare()
+    request_id, _ = await state.enqueue_proof_review_request(
+        {chapter.id: "warning: Book/Chapter01.lean:3:1: unused variable"},
+        origin_run_id="coordinator-build",
+        kind="diagnostic",
+    )
+
+    _, request_ids = orchestrator._proof_review_feedback(chapter.id)
+
+    assert request_ids == (request_id,)
+    assert orchestrator._proof_review_role(request_ids) == DIAGNOSTIC_REVIEW_ROLE
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_diagnostic_review_records_distinct_run_role_and_schema(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = config.chapters[0]
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await orchestrator.prepare()
+    orchestrator.executor = FakeExecutor(state, [result(changed=False)])
+
+    outcome = await orchestrator._review_once(
+        chapter,
+        rerun=True,
+        feedback="error: Book/Chapter01.lean:3:1: unknown identifier",
+        role=DIAGNOSTIC_REVIEW_ROLE,
+        request_ids=("diagnostic-request",),
+    )
+
+    assert outcome.succeeded
+    run = state.task(chapter.id, Stage.REVIEW).runs[-1]
+    assert run.role == DIAGNOSTIC_REVIEW_ROLE
+    assert run.prompt_kind == DIAGNOSTIC_REVIEW_ROLE
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_no_change_diagnostic_review_reuses_clean_source_digest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = config.chapters[0]
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await orchestrator.prepare()
+    await mark_clean_formalization(orchestrator)
+    request_id, _ = await state.enqueue_proof_review_request(
+        {chapter.id: "error: Book/Chapter01.lean:3:1: unknown identifier"},
+        origin_run_id="coordinator-build",
+        kind="diagnostic",
+    )
+    orchestrator.executor = FakeExecutor(state, [result(changed=False)])
+
+    async def forbidden_build(_chapter: Chapter) -> dict[str, str]:
+        raise AssertionError("an unchanged certified digest must not be rebuilt")
+
+    monkeypatch.setattr(orchestrator, "_review_build", forbidden_build)
+
+    assert await orchestrator._review_chapter_to_clean(
+        chapter,
+        {chapter.id: 0},
+        rerun=True,
+        feedback="error: Book/Chapter01.lean:3:1: unknown identifier",
+        role=DIAGNOSTIC_REVIEW_ROLE,
+        proof_request_ids=(request_id,),
+    )
+    assert request_id not in state.proof_review_requests
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_no_change_diagnostic_review_does_not_rebuild_uncertified_digest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = config.chapters[0]
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await orchestrator.prepare()
+    request_id, _ = await state.enqueue_proof_review_request(
+        {chapter.id: "error: Book/Chapter01.lean:3:1: unknown identifier"},
+        origin_run_id="coordinator-build",
+        kind="diagnostic",
+    )
+    orchestrator.executor = FakeExecutor(state, [result(changed=False)] * 3)
+    builds = 0
+
+    async def forbidden_build(_chapter: Chapter) -> dict[str, str]:
+        nonlocal builds
+        builds += 1
+        return {}
+
+    monkeypatch.setattr(orchestrator, "_review_build", forbidden_build)
+
+    assert not await orchestrator._review_chapter_to_clean(
+        chapter,
+        {chapter.id: 0},
+        rerun=True,
+        feedback="error: Book/Chapter01.lean:3:1: unknown identifier",
+        role=DIAGNOSTIC_REVIEW_ROLE,
+        proof_request_ids=(request_id,),
+    )
+    assert builds == 0
+    assert request_id in state.proof_review_requests
+    await orchestrator.shutdown()
 
 
 def test_proof_review_feedback_tags_each_finding_with_a_stable_id(tmp_path: Path) -> None:
@@ -3283,6 +3400,13 @@ async def test_review_is_capped_at_three_edit_rebuild_cycles(
         nonlocal reviews
         assert rerun == (reviews > 0)
         reviews += 1
+        path = tmp_path / "lean" / "Book" / "Chapter01.lean"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            (path.read_text(encoding="utf-8") if path.exists() else "")
+            + f"\n-- review pass {reviews}\n",
+            encoding="utf-8",
+        )
         return ReviewOutcome(True, True)
 
     async def review_build(_chapter: Chapter) -> dict[str, str]:
@@ -3642,13 +3766,15 @@ async def test_placeholder_free_proof_does_not_run_agent_after_failed_refresh(
     assert builds == 1
     proof = orchestrator.state.task(chapter.id, Stage.PROVE)
     assert proof.status == TaskStatus.PENDING
-    assert proof.detail == "current sources failed coordinator build refresh"
+    assert proof.detail == "pre-existing coordinator diagnostics routed before proof work"
     assert proof.rounds == 0
+    request = next(iter(orchestrator.state.proof_review_requests.values()))
+    assert request["kind"] == "diagnostic"
     await orchestrator.shutdown()
 
 
 @pytest.mark.asyncio
-async def test_noop_proof_cannot_reuse_failed_certification(
+async def test_dirty_proof_baseline_routes_diagnostics_before_placeholder_chunk(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = with_example_modules(load_config(write_project(tmp_path, chapters="chapters = [1]")))
@@ -3676,21 +3802,14 @@ async def test_noop_proof_cannot_reuse_failed_certification(
     )
 
     assert not await orchestrator._prove(chapter)
-    assert builds == 2
+    assert builds == 1
     proof = orchestrator.state.task(chapter.id, Stage.PROVE)
-    assert proof.status == TaskStatus.FAILED
-    assert proof.detail == (
-        "proof chunks exhausted retries with 1 placeholder(s) remaining; durable blockers retained"
-    )
-    assert all(run.validation is not None for run in proof.runs)
-    assert [run.validation["succeeded"] for run in proof.runs if run.validation is not None] == [
-        False,
-        False,
-        False,
-    ]
-    final_validation = proof.runs[-1].validation
-    assert final_validation is not None
-    assert final_validation["output"] == ("unchanged proof source has no clean coordinator build")
+    assert proof.status == TaskStatus.PENDING
+    assert proof.rounds == 0
+    assert len(orchestrator.executor.results) == 3
+    request = next(iter(orchestrator.state.proof_review_requests.values()))
+    assert request["kind"] == "diagnostic"
+    assert chapter.id in request["feedback"]
     await orchestrator.shutdown()
 
 
@@ -5177,6 +5296,115 @@ async def test_prove_retries_the_same_chunk_before_advancing(
     assert runs[0].proof_targets == runs[1].proof_targets
     assert runs[2].proof_targets != runs[1].proof_targets
     assert [target["declaration"] for target in runs[2].proof_targets] == ["target5"]
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_proof_validation_routes_foreign_diagnostic_to_its_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    first, second = config.chapters
+    first_path = tmp_path / "lean" / "Book" / "Chapter01.lean"
+    second_path = tmp_path / "lean" / "Book" / "Chapter02.lean"
+    first_path.parent.mkdir(parents=True)
+    first_path.write_text("theorem target : True := by sorry\n", encoding="utf-8")
+    second_path.write_text("theorem other : True := by trivial\n", encoding="utf-8")
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await orchestrator.prepare()
+    orchestrator.force = True
+    executor = FakeExecutor(state, [result(changed=True, placeholders=0)])
+    orchestrator.executor = executor
+
+    async def validation(*_args: object, **_kwargs: object) -> ValidationResult:
+        return ValidationResult(
+            False,
+            1,
+            "error: Book/Chapter02.lean:1:1: unknown identifier `missing`",
+        )
+
+    monkeypatch.setattr(scheduler_module, "validate", validation)
+
+    assert not await orchestrator._prove(first)
+    assert state.task(first.id, Stage.PROVE).rounds == 1
+    request = next(iter(state.proof_review_requests.values()))
+    assert request["kind"] == "diagnostic"
+    assert set(request["feedback"]) == {second.id}
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_proof_validation_resumes_originating_chunk_for_local_diagnostic(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = config.chapters[0]
+    source = tmp_path / "lean" / "Book" / "Chapter01.lean"
+    source.parent.mkdir(parents=True)
+    source.write_text(
+        "theorem target : True := by sorry\ntheorem downstream : True := by trivial\n",
+        encoding="utf-8",
+    )
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await orchestrator.prepare()
+    orchestrator.force = True
+    executor = FakeExecutor(
+        state,
+        [
+            replace(result(changed=True, placeholders=0), thread_id="proof-session"),
+            result(changed=True, placeholders=0),
+        ],
+    )
+    original_run = executor.run
+
+    async def solve_target(
+        attempted: Chapter,
+        stage: Stage,
+        run: RunRecord,
+        *,
+        feedback: str = "",
+        workspace_root: Path | None = None,
+    ) -> AgentResult:
+        agent = await original_run(
+            attempted,
+            stage,
+            run,
+            feedback=feedback,
+            workspace_root=workspace_root,
+        )
+        assert workspace_root is not None
+        target = workspace_root / "lean" / "Book" / "Chapter01.lean"
+        target.write_text(
+            target.read_text(encoding="utf-8").replace("by sorry", "by trivial", 1),
+            encoding="utf-8",
+        )
+        return agent
+
+    validations = iter(
+        (
+            ValidationResult(
+                False,
+                1,
+                "warning: Book/Chapter01.lean:2:1: downstream diagnostic",
+                process_exit_code=0,
+            ),
+            ValidationResult(True, 0, "ok"),
+        )
+    )
+
+    async def validation(*_args: object, **_kwargs: object) -> ValidationResult:
+        return next(validations)
+
+    monkeypatch.setattr(executor, "run", solve_target)
+    monkeypatch.setattr(scheduler_module, "validate", validation)
+    orchestrator.executor = executor
+
+    assert await orchestrator._prove(chapter)
+    assert executor.resume_thread_ids == [None, "proof-session"]
+    assert "downstream diagnostic" in executor.feedbacks[1]
+    assert state.proof_review_requests == {}
     await orchestrator.shutdown()
 
 

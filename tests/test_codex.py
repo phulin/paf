@@ -12,6 +12,7 @@ import pytest
 import paf.codex as codex_module
 from paf.activity import EVENT_TIMESTAMP_FIELD
 from paf.codex import (
+    DIAGNOSTIC_REVIEW_ROLE,
     DOWNSTREAM_RETRY_ROLE,
     REPAIR_WORKER_ROLE,
     REPORT_SCHEMAS,
@@ -100,6 +101,13 @@ def test_report_schemas_contain_only_fields_used_by_each_agent() -> None:
         "discover": {"complete", "summary", "issues", "source_dependencies"},
         "formalize": {"changed", "complete", "summary", "issues", "source_issues"},
         "review": {"changed", "complete", "summary", "issues", "source_issues"},
+        "diagnostic_review": {
+            "changed",
+            "complete",
+            "summary",
+            "issues",
+            "source_issues",
+        },
         "proof_review": {
             "changed",
             "complete",
@@ -572,6 +580,13 @@ async def test_executor_selects_a_distinct_schema_for_each_agent(tmp_path: Path)
         "formalize": schema_path(executor.command(Stage.FORMALIZE)),
         "review": schema_path(executor.command(Stage.REVIEW)),
         "proof_review": schema_path(executor.command(Stage.REVIEW, feedback="evidence")),
+        "diagnostic_review": schema_path(
+            executor.command(
+                Stage.REVIEW,
+                feedback="diagnostic",
+                role=DIAGNOSTIC_REVIEW_ROLE,
+            )
+        ),
         "prove": schema_path(executor.command(Stage.PROVE)),
         "downstream_retry": schema_path(executor.command(Stage.PROVE, role=DOWNSTREAM_RETRY_ROLE)),
         "upstream_repair": schema_path(executor.command(Stage.PROVE, role=UPSTREAM_REPAIR_ROLE)),
@@ -582,6 +597,25 @@ async def test_executor_selects_a_distinct_schema_for_each_agent(tmp_path: Path)
     for key, path in selected.items():
         assert json.loads(path.read_text(encoding="utf-8")) == REPORT_SCHEMAS[key]
     assert not (config.settings.state_dir / "agent-report.schema.json").exists()
+
+
+def test_diagnostic_review_has_proof_capable_lean_tools(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    executor = CodexExecutor(config, StateStore(config))
+
+    command = executor.command(
+        Stage.REVIEW,
+        feedback="diagnostic",
+        role=DIAGNOSTIC_REVIEW_ROLE,
+    )
+    overrides = {
+        command[index + 1].split("=", 1)[0]: json.loads(command[index + 1].split("=", 1)[1])
+        for index, item in enumerate(command[:-1])
+        if item == "--config"
+    }
+
+    assert "lean_goal" in overrides["mcp_servers.paf_lean.enabled_tools"]
+    assert "lean_multi_attempt" in overrides["mcp_servers.paf_lean.enabled_tools"]
 
 
 def test_lean_mcp_does_not_prewarm_files(tmp_path: Path) -> None:

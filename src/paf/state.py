@@ -2343,9 +2343,10 @@ class StateStore:
         feedback: dict[str, str],
         *,
         origin_run_id: str,
+        kind: str = "proof_finding",
         request_id: str | None = None,
     ) -> tuple[str, bool]:
-        """Persist proof findings before invalidating their review closure."""
+        """Persist proof findings or diagnostics before invalidating their review closure."""
 
         for existing_id, value in self.proof_review_requests.items():
             if value.get("origin_run_id") == origin_run_id:
@@ -2354,6 +2355,7 @@ class StateStore:
         self.proof_review_requests[request_id] = {
             "feedback": dict(feedback),
             "origin_run_id": origin_run_id,
+            "kind": kind,
             "created_at": timestamp(),
         }
         self._mark_dirty(global_state=False, sections={"proof_review_requests"})

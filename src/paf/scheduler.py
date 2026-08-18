@@ -14,6 +14,7 @@ from uuid import uuid4
 
 from paf import json_codec as json
 from paf.codex import (
+    DIAGNOSTIC_REVIEW_ROLE,
     DOWNSTREAM_RETRY_ROLE,
     REPAIR_WORKER_ROLE,
     SHEPHERD_ROLE,
@@ -80,6 +81,11 @@ LIVE_AGENT_RETRY_PROMPT = """An operator requested a targeted retry of this live
 the same assignment from the current files and conversation. Re-read the assignment instructions,
 correct the issue that prevented the prior turn from completing, and return the required structured
 report only after the work is stable."""
+PROOF_VALIDATION_RETRY_PROMPT = """PAF's authoritative build rejected the proof changes. Continue
+the same proof assignment, use the attached validation diagnostics as required work, and repair the
+cause within your assigned proof edits, focused helpers, or imports. Do not edit an unrelated
+declaration merely because it reports a downstream symptom. Return only after validation is clean or
+you have precise new blocker evidence."""
 
 
 class ShepherdPlanError(ValueError):
@@ -107,7 +113,7 @@ class Attempt:
     validation: ValidationResult
     run: RunRecord
 
-    def feedback(self) -> str:
+    def feedback(self, *, validation_output: str | None = None) -> str:
         parts = []
         if self.agent.error:
             parts.append(self.agent.error)
@@ -121,8 +127,9 @@ class Attempt:
             f"Scoped changes: {self.agent.changed}; remaining proof placeholders: "
             f"{self.agent.placeholders}."
         )
-        if not self.validation.succeeded:
-            parts.append("Validation failed:\n" + self.validation.output)
+        output = self.validation.output if validation_output is None else validation_output
+        if not self.validation.succeeded and output:
+            parts.append("Validation failed:\n" + output)
         return "\n\n".join(parts)
 
 
@@ -2724,6 +2731,17 @@ class Orchestrator:
             blocks[self._tag_proof_findings(request_id, block)] = None
         return "\n\n".join(blocks), tuple(request_ids)
 
+    def _proof_review_role(self, request_ids: Iterable[str]) -> str:
+        """Use targeted diagnostic repair only when every queued item is a diagnostic."""
+
+        kinds = {
+            str(value.get("kind", "proof_finding"))
+            for request_id in request_ids
+            for value in (self.state.proof_review_requests.get(request_id),)
+            if isinstance(value, dict)
+        }
+        return DIAGNOSTIC_REVIEW_ROLE if kinds == {"diagnostic"} else ""
+
     @staticmethod
     def _proof_finding_ids(request_id: str, feedback: str) -> tuple[str, ...]:
         count = len(re.findall(r"(?m)^Failed proof `", feedback))
@@ -2813,6 +2831,7 @@ class Orchestrator:
         _, created = await self.state.enqueue_proof_review_request(
             feedback,
             origin_run_id=origin_run_id,
+            kind="proof_finding",
         )
         targets = {chapter.id}
         if not created:
@@ -3859,6 +3878,7 @@ class Orchestrator:
         *,
         rerun: bool = False,
         feedback: str = "",
+        role: str = "",
         request_ids: Iterable[str] = (),
         resume_thread_id: str | None = None,
         resume_run_id: str = "",
@@ -3870,9 +3890,12 @@ class Orchestrator:
             chapter,
             Stage.REVIEW,
             feedback=feedback,
+            role=role,
             request_ids=request_ids,
             queue_detail=(
-                "full-scope review of failed-proof findings"
+                "targeted repair of coordinator diagnostics"
+                if role == DIAGNOSTIC_REVIEW_ROLE
+                else "full-scope review of failed-proof findings"
                 if feedback
                 else "source-faithful editing review"
             ),
@@ -4052,6 +4075,7 @@ class Orchestrator:
         request_id, created = await self.state.enqueue_proof_review_request(
             feedback,
             origin_run_id=origin,
+            kind="diagnostic",
         )
         if not created:
             return request_id, set()
@@ -4069,6 +4093,7 @@ class Orchestrator:
         *,
         rerun: bool = False,
         feedback: str = "",
+        role: str = "",
         proof_request_ids: tuple[str, ...] = (),
     ) -> bool:
         """Run at most five edit/rebuild cycles for one reviewable chapter."""
@@ -4159,9 +4184,16 @@ class Orchestrator:
             review_rerun = rerun or rounds_used[chapter.id] > 1
             finding_guided = bool(review_feedback)
             attempt_feedback = review_feedback
+            source_digest_before = await asyncio.to_thread(
+                scope_digest, self.config.settings.repo, chapter
+            )
             review_options: dict[str, Any] = {"rerun": review_rerun}
             if review_feedback:
-                review_options.update(feedback=review_feedback, request_ids=request_ids)
+                review_options.update(
+                    feedback=review_feedback,
+                    role=role,
+                    request_ids=request_ids,
+                )
             if resume_thread_id is not None:
                 review_options.update(
                     resume_thread_id=resume_thread_id,
@@ -4169,6 +4201,10 @@ class Orchestrator:
                     resume_prompt=resume_prompt,
                 )
             outcome = await self._review_once(chapter, **review_options)
+            source_digest_after = await asyncio.to_thread(
+                scope_digest, self.config.settings.repo, chapter
+            )
+            source_changed = source_digest_after != source_digest_before
             resume_thread_id = None
             resume_run_id = ""
             resume_prompt = ""
@@ -4176,7 +4212,7 @@ class Orchestrator:
             if not outcome.succeeded:
                 if outcome.report_error:
                     review_feedback = attempt_feedback
-                    if outcome.changed:
+                    if source_changed:
                         malformed_build_feedback = await self._review_build(chapter)
                         if malformed_build_feedback and not await route_feedback(
                             malformed_build_feedback,
@@ -4197,7 +4233,7 @@ class Orchestrator:
                     continue
                 return False
             build_feedback: dict[str, str] = {}
-            if outcome.changed:
+            if source_changed:
                 build_feedback = await self._review_build(chapter)
                 if build_feedback and not await route_feedback(
                     build_feedback,
@@ -4221,6 +4257,14 @@ class Orchestrator:
                 ):
                     continue
                 return False
+            if role == DIAGNOSTIC_REVIEW_ROLE and not await self._proof_build_is_fresh(chapter):
+                review_feedback = attempt_feedback
+                if await queue_report_retry(
+                    outcome,
+                    "current source digest is not certified by a clean coordinator build",
+                ):
+                    continue
+                return False
             if finding_guided:
                 return await self._complete_review(
                     chapter,
@@ -4228,7 +4272,7 @@ class Orchestrator:
                     expected_generation=review_generation,
                     proof_request_ids=request_ids,
                 )
-            if not outcome.changed:
+            if not source_changed:
                 return await self._complete_review(
                     chapter,
                     "editing review found no actionable issues",
@@ -4488,6 +4532,7 @@ class Orchestrator:
                     ):
                         dependencies = graph.dependencies[chapter_id]
                         proof_feedback, proof_request_ids = self._proof_review_feedback(chapter_id)
+                        proof_review_role = self._proof_review_role(proof_request_ids)
                         review_rerun = rerun or chapter_id in attempted or review_task.rounds > 0
                         await self.state.set_task(
                             chapter_id,
@@ -4499,13 +4544,18 @@ class Orchestrator:
                                 else "waiting for dependency-ordered coordinator build"
                             ),
                         )
+                        review_feedback_options: dict[str, Any] = {
+                            "rerun": review_rerun,
+                            "feedback": proof_feedback,
+                            "proof_request_ids": proof_request_ids,
+                        }
+                        if proof_review_role:
+                            review_feedback_options["role"] = proof_review_role
                         review_operation = (
                             self._review_chapter_to_clean(
                                 by_id[chapter_id],
                                 rounds_used,
-                                rerun=review_rerun,
-                                feedback=proof_feedback,
-                                proof_request_ids=proof_request_ids,
+                                **review_feedback_options,
                             )
                             if proof_feedback
                             else self._review_chapter_to_clean(
@@ -4719,7 +4769,6 @@ class Orchestrator:
         return validation.succeeded
 
     async def _prove(self, chapter: WorkUnitLike, *, defer_review: bool = False) -> bool:
-        initial_feedback = ""
         build_fresh = False
         if not self.force:
             graph = self._observed_work_unit_graph()
@@ -4748,18 +4797,30 @@ class Orchestrator:
                 if not build_fresh:
                     revalidation = await self._refresh_stale_proof_build(chapter)
                     if not revalidation.succeeded:
+                        routed = (
+                            await self._build_feedback_async({chapter.id: revalidation})
+                        ).actionable
+                        diagnostic_feedback = routed or {
+                            chapter.id: (
+                                "Coordinator validation of the current sources failed before proof "
+                                "work:\n" + revalidation.output
+                            )
+                        }
+                        origin = (
+                            f"proof-refresh:{chapter.id}:"
+                            + hashlib.sha256(revalidation.output.encode()).hexdigest()[:12]
+                        )
+                        await self._queue_review_feedback(
+                            diagnostic_feedback,
+                            origin=origin,
+                        )
                         await self.state.set_task(
                             chapter.id,
                             Stage.PROVE,
                             TaskStatus.PENDING,
-                            "current sources failed coordinator build refresh",
+                            "pre-existing coordinator diagnostics routed before proof work",
                         )
-                        initial_feedback = (
-                            "Coordinator validation of the current sources failed before proof "
-                            "work:\n" + revalidation.output
-                        )
-                        if placeholders == 0:
-                            return False
+                        return False
                     else:
                         build_fresh = True
                         if placeholders > 0:
@@ -4828,10 +4889,8 @@ class Orchestrator:
                 if blocker.get("status") == ProofBlockerStatus.REVIEW_REQUESTED.value
             )
             await self.state.set_proof_blocker_status(reviewed_blockers, ProofBlockerStatus.OPEN)
-        feedback = initial_feedback
+        feedback = ""
         feedback_ledger: deque[str] = deque(maxlen=PROOF_FEEDBACK_ROUNDS)
-        if initial_feedback:
-            feedback_ledger.append(initial_feedback)
         if durable_feedback := self._durable_blocker_feedback(chapter.id):
             feedback_ledger.append(durable_feedback)
             feedback = _bounded_proof_feedback(feedback_ledger)
@@ -4867,6 +4926,9 @@ class Orchestrator:
             )
             return False
         targeted_request_ids = answered_ids
+        proof_resume_thread_id: str | None = None
+        proof_resume_run_id = ""
+        proof_resume_prompt = ""
         if targeted_request_ids:
             feedback = self._upstream_retry_feedback(
                 targeted_request_ids,
@@ -4954,6 +5016,9 @@ class Orchestrator:
                     role=DOWNSTREAM_RETRY_ROLE if targeted_retry else "",
                     request_ids=targeted_request_ids,
                     proof_targets=assigned_targets,
+                    resume_thread_id=proof_resume_thread_id,
+                    resume_run_id=proof_resume_run_id,
+                    resume_prompt=proof_resume_prompt,
                 )
             except GitCommitError as error:
                 await self.state.set_task(
@@ -4997,9 +5062,33 @@ class Orchestrator:
                         validation_targets,
                     ),
                 )
+            proof_resume_thread_id = None
+            proof_resume_run_id = ""
+            proof_resume_prompt = ""
             proof_round += 1
             if chunked_proofs:
                 chunk_round += 1
+            routed_validation_output = attempt.validation.output
+            foreign_validation_feedback: dict[str, str] = {}
+            if not attempt.validation.succeeded:
+                routed_validation = (
+                    await self._build_feedback_async({chapter.id: attempt.validation})
+                ).actionable
+                routed_validation_output = routed_validation.pop(chapter.id, "")
+                foreign_validation_feedback = routed_validation
+                if not routed_validation_output and not foreign_validation_feedback:
+                    # Keep unattributed compiler failures with the originating
+                    # proof assignment instead of silently dropping them.
+                    routed_validation_output = attempt.validation.output
+                if foreign_validation_feedback:
+                    await self._queue_review_feedback(
+                        foreign_validation_feedback,
+                        origin=f"proof-validation:{attempt.run.id}",
+                    )
+                if routed_validation_output and attempt.agent.thread_id:
+                    proof_resume_thread_id = attempt.agent.thread_id
+                    proof_resume_run_id = attempt.run.id
+                    proof_resume_prompt = PROOF_VALIDATION_RETRY_PROMPT
             if targeted_retry:
                 succeeded_request_ids = self._succeeded_upstream_request_ids(
                     targeted_request_ids,
@@ -5011,7 +5100,11 @@ class Orchestrator:
                     retry_error = (
                         "blocked declaration remained unresolved after a clean targeted retry"
                         if attempt.validation.succeeded
-                        else "targeted retry did not validate: " + attempt.validation.output[-4000:]
+                        else "targeted retry did not validate: "
+                        + (
+                            routed_validation_output
+                            or "diagnostics were routed to their source owners"
+                        )[-4000:]
                     )
                 await self.state.finish_upstream_requests(
                     targeted_request_ids,
@@ -5022,7 +5115,8 @@ class Orchestrator:
                 targeted_request_ids = ()
                 if unresolved:
                     feedback_ledger.append(
-                        f"Targeted downstream retry {proof_round}:\n{attempt.feedback()}"
+                        f"Targeted downstream retry {proof_round}:\n"
+                        + attempt.feedback(validation_output=routed_validation_output)
                     )
                     await self._record_upstream_requests(
                         chapter,
@@ -5041,6 +5135,18 @@ class Orchestrator:
                         "targeted downstream retry did not prove: " + ", ".join(sorted(unresolved)),
                     )
                     return False
+            if (
+                not attempt.validation.succeeded
+                and not routed_validation_output
+                and foreign_validation_feedback
+            ):
+                await self.state.set_task(
+                    chapter.id,
+                    Stage.PROVE,
+                    TaskStatus.PENDING,
+                    "proof validation diagnostics routed to their source owners",
+                )
+                return False
             remaining_targets = (
                 await asyncio.to_thread(proof_targets, self.config.settings.repo, chapter)
                 if chunked_proofs
@@ -5112,7 +5218,10 @@ class Orchestrator:
                 continue
 
             feedback_ledger.clear()
-            feedback_ledger.append(f"Proof attempt {proof_round}:\n{attempt.feedback()}")
+            feedback_ledger.append(
+                f"Proof attempt {proof_round}:\n"
+                + attempt.feedback(validation_output=routed_validation_output)
+            )
             blockers = await self._record_proof_blocker_deltas(
                 chapter, attempt.run, attempt.agent.report
             )
@@ -5230,6 +5339,25 @@ class Orchestrator:
                 )
                 return False
             placeholders = attempt.agent.placeholders
+            validation_retry_exhausted = (
+                not attempt.validation.succeeded
+                and bool(routed_validation_output)
+                and (
+                    chunk_round >= proof_maximum if chunked_proofs else proof_round >= proof_maximum
+                )
+            )
+            if validation_retry_exhausted:
+                await self._queue_review_feedback(
+                    {chapter.id: routed_validation_output},
+                    origin=f"proof-validation-exhausted:{attempt.run.id}",
+                )
+                await self.state.set_task(
+                    chapter.id,
+                    Stage.PROVE,
+                    TaskStatus.PENDING,
+                    "proof-local validation retries exhausted; diagnostic repair queued",
+                )
+                return False
             if chunked_proofs:
                 if chunk_round >= proof_maximum:
                     skipped_target_ids.update(target.fingerprint for target in assigned_targets)

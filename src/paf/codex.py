@@ -280,6 +280,10 @@ REPORT_SCHEMAS: dict[str, dict[str, Any]] = {
         "PAF statement review report",
         _REPORT_BASE_PROPERTIES | {"source_issues": _SOURCE_ISSUES_PROPERTY},
     ),
+    "diagnostic_review": _report_schema(
+        "PAF diagnostic repair report",
+        _REPORT_BASE_PROPERTIES | {"source_issues": _SOURCE_ISSUES_PROPERTY},
+    ),
     "proof_review": _report_schema(
         "PAF failed-proof review report",
         _REPORT_BASE_PROPERTIES
@@ -354,6 +358,7 @@ UPSTREAM_REPAIR_ROLE = "upstream_repair"
 DOWNSTREAM_RETRY_ROLE = "downstream_retry"
 SHEPHERD_ROLE = "shepherd"
 REPAIR_WORKER_ROLE = "repair_worker"
+DIAGNOSTIC_REVIEW_ROLE = "diagnostic_review"
 
 
 def report_schema_key(stage: Stage, *, role: str = "", feedback: str = "") -> str:
@@ -363,13 +368,15 @@ def report_schema_key(stage: Stage, *, role: str = "", feedback: str = "") -> st
         return UPSTREAM_REPAIR_ROLE
     if role == DOWNSTREAM_RETRY_ROLE:
         return DOWNSTREAM_RETRY_ROLE
+    if role == DIAGNOSTIC_REVIEW_ROLE:
+        return DIAGNOSTIC_REVIEW_ROLE
     if stage is Stage.REVIEW and feedback:
         return "proof_review"
     return stage.value
 
 
-def render_review_variant(template: str, *, upstream: bool) -> str:
-    if upstream:
+def render_review_variant(template: str, *, role: str = "") -> str:
+    if role == UPSTREAM_REPAIR_ROLE:
         values = {
             "review_assignment": """This is a targeted upstream-support review. One or more later
 proofs request reusable mathematics from this earlier chapter. Answer those requests together; do
@@ -411,6 +418,40 @@ have stopped. It must describe the stable files on disk, not planned work. Use o
   concrete `usage_guidance`, and a `rejection_reason`. For `downstream`, leave `declarations` empty
   and explain why this earlier chapter is not the right owner. For the other dispositions, leave
   `rejection_reason` empty.""",
+        }
+    elif role == DIAGNOSTIC_REVIEW_ROLE:
+        values = {
+            "review_assignment": """This is a targeted diagnostic repair. The coordinator found
+exact errors or non-`sorry` warnings in source that was expected to be clean. Repair the supplied
+diagnostics and only the declarations, imports, or definitions needed to clear them.""",
+            "review_goal_details": """This is not a full-chapter re-review or open-ended proof
+search. Existing proposition placeholders may remain. When a supplied diagnostic is inside a proof
+body, repair that body as narrowly as possible; do not revisit unrelated statements or try to prove
+unassigned theorems.""",
+            "review_workflow_details": """Cover every supplied diagnostic and its source owner.
+Trace secondary diagnostics to their earliest cause, group findings with the same cause, and check
+the affected dependent files. Do not audit source sections or declarations unrelated to those
+diagnostics.""",
+            "review_guardrails": """Do not return a no-change report while a supplied diagnostic
+still applies. If a diagnostic belongs to an out-of-scope dependency, leave local source unchanged
+and identify the exact owner path in `issues`. Do not add new placeholders merely to silence an
+error.""",
+            "review_definition_of_done": """Every supplied diagnostic has been removed at its
+cause, affected files and dependents have no errors or non-`sorry` warnings, no unrelated interface
+was changed, and any genuinely out-of-scope owner is identified precisely.""",
+            "review_output_format": """Return the structured report once, after tool use and edits
+have stopped. It must describe the stable files on disk, not planned work. Use only these fields:
+
+- `changed`: `true` exactly when an allowed edit remains.
+- `complete`: `true` only when every supplied in-scope diagnostic is resolved and the definition of
+  done is met.
+- `summary`: when files changed, concise past-tense prose naming the repaired diagnostics and their
+  causes, suitable for a commit body; otherwise, why no edit was retained.
+- `issues`: precise remaining diagnostic, tooling, or out-of-scope blockers; otherwise an empty
+  list.
+- `source_issues`: genuine defects in the informal textbook; otherwise an empty list. Each entry
+  must give `location`, an exact identifying `source_excerpt`, a mathematical `description`, and the
+  smallest `suggested_correction`.""",
         }
     else:
         values = {
@@ -1247,13 +1288,15 @@ class CodexExecutor:
         upstream_requests: Iterable[dict[str, Any]] = (),
         proof_targets: Iterable[ProofTarget | dict[str, Any]] = (),
     ) -> str:
-        if role == UPSTREAM_REPAIR_ROLE or (stage is Stage.REVIEW and feedback):
+        if role in {UPSTREAM_REPAIR_ROLE, DIAGNOSTIC_REVIEW_ROLE} or (
+            stage is Stage.REVIEW and feedback
+        ):
             prompt_path = PROOF_REVIEW_PROMPT_PATH
         else:
             prompt_path = self.config.stages[stage].prompt
         template = prompt_path.read_text(encoding="utf-8")
         if prompt_path == PROOF_REVIEW_PROMPT_PATH:
-            template = render_review_variant(template, upstream=role == UPSTREAM_REPAIR_ROLE)
+            template = render_review_variant(template, role=role)
         base = render_prompt(template, chapter)
         if role == REPAIR_WORKER_ROLE:
             instruction = feedback
@@ -1456,6 +1499,8 @@ whole-file diagnostics from prerequisites to dependents. Do not prepare every fi
                 if role == DOWNSTREAM_RETRY_ROLE
                 else "Shepherd repair dossier"
                 if role == REPAIR_WORKER_ROLE
+                else "PAF validation diagnostics to repair"
+                if role == DIAGNOSTIC_REVIEW_ROLE
                 else {
                     Stage.DISCOVER: "Discovery feedback",
                     Stage.FORMALIZE: "PAF build diagnostics and reported findings",
@@ -1552,7 +1597,8 @@ whole-file diagnostics from prerequisites to dependents. Do not prepare every fi
                 project=settings.lean_project,
                 mcp_tool_timeout_seconds=settings.lean_mcp_tool_timeout_seconds,
             )
-            mcp_config = backend.mcp_config(root, stage)
+            tool_stage = Stage.PROVE if role == DIAGNOSTIC_REVIEW_ROLE else stage
+            mcp_config = backend.mcp_config(root, tool_stage)
             for key, value in mcp_config.items():
                 command.extend(["--config", f"{key}={json.dumps(value)}"])
         if resume_thread_id is not None:
