@@ -2713,6 +2713,15 @@ class Orchestrator:
             "fail" in text or "before" in text or "could not" in text
         )
 
+    @staticmethod
+    def _normalized_blocker_goal(blocker: dict[str, Any]) -> str:
+        goal = re.sub(r"\s+", " ", str(blocker.get("remaining_goal", ""))).strip()
+        goal = goal.removeprefix("⊢ ")
+        if goal.startswith("Nonempty (") and goal.endswith(")"):
+            goal = goal[len("Nonempty (") : -1]
+        goal = goal.replace("BaseChangeData.leftSquare B", "B.leftSquare")
+        return goal.replace("BaseChangeData.outerSquare B", "B.outerSquare")
+
     async def _resolve_obsolete_dependency_blockers(self, chapter_id: str) -> None:
         stale = (
             str(blocker["id"])
@@ -2751,7 +2760,7 @@ class Orchestrator:
             key = (
                 str(blocker.get("path", "")),
                 str(blocker.get("declaration", "")).rsplit(".", 1)[-1],
-                re.sub(r"\s+", " ", str(blocker.get("remaining_goal", ""))).strip(),
+                self._normalized_blocker_goal(blocker),
             )
             previous = deduplicated.get(key)
             if previous is None or str(blocker.get("updated_at", "")) >= str(

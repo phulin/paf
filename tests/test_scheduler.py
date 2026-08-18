@@ -3816,7 +3816,7 @@ def test_proof_feedback_is_target_filtered_and_deduplicated(tmp_path: Path) -> N
             "consumer_chapter_id": config.chapters[0].id,
             "path": "lean/Book/Chapter01.lean",
             "declaration": "Book.assigned",
-            "remaining_goal": "⊢ True",
+            "remaining_goal": "⊢ Nonempty (True)",
             "obstruction": "old evidence",
             "status": ProofBlockerStatus.OPEN.value,
             "updated_at": "2026-01-01T00:00:00+00:00",
