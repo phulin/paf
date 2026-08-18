@@ -46,7 +46,7 @@ pub struct CoordinatorBuild {
     pub total: usize,
     pub iteration: usize,
     pub maximum_iterations: usize,
-    pub target_work_unit_ids: Vec<String>,
+    pub target_work_unit_ids: HashSet<String>,
     pub error_count: usize,
     pub warning_count: usize,
     pub current_work_unit_id: Option<String>,
@@ -826,18 +826,10 @@ impl DashboardModel {
         self.detail_follow_tail = true;
     }
 
-    pub fn build_targets(&self) -> HashSet<&str> {
-        let mut targets: HashSet<&str> = self
-            .state
-            .coordinator_build
-            .target_work_unit_ids
-            .iter()
-            .map(String::as_str)
-            .collect();
-        if let Some(current) = self.state.coordinator_build.current_work_unit_id.as_deref() {
-            targets.insert(current);
-        }
-        targets
+    pub fn is_build_target(&self, work_unit_id: &str) -> bool {
+        let build = &self.state.coordinator_build;
+        build.target_work_unit_ids.contains(work_unit_id)
+            || build.current_work_unit_id.as_deref() == Some(work_unit_id)
     }
 
     pub fn is_building(&self, work_unit_id: &str, stage: &str) -> bool {
@@ -845,7 +837,7 @@ impl DashboardModel {
         build.active
             && build.completed < build.total
             && build.stage == stage
-            && self.build_targets().contains(work_unit_id)
+            && self.is_build_target(work_unit_id)
     }
 
     /// Explain the first pending stage that is actually able to make progress.
@@ -1216,7 +1208,7 @@ mod tests {
             stage: "formalize".into(),
             completed: 3,
             total: 3,
-            target_work_unit_ids: vec!["book/chapter-01".into()],
+            target_work_unit_ids: ["book/chapter-01".into()].into_iter().collect(),
             ..CoordinatorBuild::default()
         };
 

@@ -1089,7 +1089,7 @@ fn current_activity(
     if model.is_building(row.unit.id.as_str(), build.stage.as_str()) {
         return format!("{} coordinator build", build.mode);
     }
-    if build.active && model.build_targets().contains(row.unit.id.as_str()) {
+    if build.active && model.is_build_target(row.unit.id.as_str()) {
         return format!("{} coordinator finalize", build.mode);
     }
     let has_running_task = row
@@ -1508,7 +1508,7 @@ mod tests {
             stage: "formalize".into(),
             completed: 3,
             total: 3,
-            target_work_unit_ids: vec!["book/chapter-01".into()],
+            target_work_unit_ids: ["book/chapter-01".into()].into_iter().collect(),
             ..crate::model::CoordinatorBuild::default()
         };
         model.state.work_units.push(WorkUnit {
@@ -1759,7 +1759,7 @@ mod tests {
     }
 
     #[test]
-    fn renders_a_ten_thousand_unit_viewport_without_materializing_table_rows() {
+    fn renders_a_ten_thousand_unit_active_build_without_materializing_table_rows() {
         let mut model = DashboardModel::loading("scale test".into(), String::new());
         for ordinal in 0..10_000 {
             let id = format!("book/chapter-{ordinal:05}");
@@ -1784,6 +1784,19 @@ mod tests {
                 );
             }
         }
+        model.state.coordinator_build = crate::model::CoordinatorBuild {
+            active: true,
+            mode: "review".into(),
+            stage: "review".into(),
+            total: model.state.work_units.len(),
+            target_work_unit_ids: model
+                .state
+                .work_units
+                .iter()
+                .map(|unit| unit.id.clone())
+                .collect(),
+            ..crate::model::CoordinatorBuild::default()
+        };
         model.selected = 9_999;
         let backend = TestBackend::new(180, 40);
         let mut terminal = Terminal::new(backend).unwrap();
