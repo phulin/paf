@@ -5,7 +5,6 @@ import re
 from collections import deque
 from collections.abc import AsyncIterator, Iterable
 from contextlib import asynccontextmanager, suppress
-from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -509,7 +508,7 @@ class StateStore:
         self._persisted_section_object_ids: dict[str, int] = {}
         self._persisted_header_object_ids: dict[str, int] = {}
         self._dirty_sections: set[str] = set()
-        self._collection_cache: dict[str, dict[str, tuple[int, Any]]] = {}
+        self._collection_cache: dict[str, dict[str, tuple[int, bytes]]] = {}
         self._graph_cache: dict[str, GraphSnapshot] = {}
         self._coordinator_build_dirty = False
         self._thread_usage_dirty = False
@@ -1321,7 +1320,12 @@ class StateStore:
 
     def _seed_normalized_caches(self) -> None:
         self._collection_cache = {
-            section: deepcopy(collection_snapshot(section, self._section_value(section)))
+            section: {
+                key: (ordinal, json.dumpb(payload))
+                for key, (ordinal, payload) in collection_snapshot(
+                    section, self._section_value(section)
+                ).items()
+            }
             for section in COLLECTION_SECTIONS
         }
         self._graph_cache = {
@@ -1335,11 +1339,14 @@ class StateStore:
 
     @staticmethod
     def _cache_graph_snapshot(snapshot: GraphSnapshot) -> GraphSnapshot:
-        """Detach mutable payloads without copying immutable edge keys."""
+        """Serialize mutable payloads into compact immutable cache values."""
 
         return GraphSnapshot(
-            deepcopy(snapshot.metadata),
-            deepcopy(snapshot.nodes),
+            {key: json.dumpb(payload) for key, payload in snapshot.metadata.items()},
+            {
+                key: (ordinal, json.dumpb(payload))
+                for key, (ordinal, payload) in snapshot.nodes.items()
+            },
             dict(snapshot.edges),
         )
 
@@ -1725,7 +1732,11 @@ class StateStore:
             self._issues_dirty = False
             self._static_dirty = False
             task_context = self._task_snapshot_context() if task_keys else None
-            failure_roots = self._failure_roots_index() if len(task_keys) > 1 else None
+            failure_roots = (
+                self._failure_roots_index()
+                if len(task_keys) >= max(32, len(self.tasks) // 8)
+                else None
+            )
             task_payloads = {
                 key: json.dumpb(self._hot_task_dict(self.tasks[key], task_context, failure_roots))
                 for key in sorted(task_keys)
@@ -1772,24 +1783,26 @@ class StateStore:
                 else {}
             )
             collection_writes: dict[str, CollectionWrite] = {}
-            next_collection_cache: dict[str, dict[str, tuple[int, Any]]] = {}
+            next_collection_cache: dict[str, dict[str, tuple[int, bytes]]] = {}
             for section in sorted(dirty_sections.intersection(COLLECTION_SECTIONS)):
                 current = collection_snapshot(section, self._section_value(section))
-                previous = self._collection_cache.get(section, {})
-                upserts = {
+                serialized = {
                     key: (ordinal, json.dumpb(payload))
                     for key, (ordinal, payload) in current.items()
-                    if previous.get(key) != (ordinal, payload)
                 }
-                deletes = frozenset(previous.keys() - current.keys())
+                previous = self._collection_cache.get(section, {})
+                upserts = {
+                    key: value for key, value in serialized.items() if previous.get(key) != value
+                }
+                deletes = frozenset(previous.keys() - serialized.keys())
                 if upserts or deletes:
                     collection_writes[section] = CollectionWrite(upserts, deletes)
-                next_collection_cache[section] = deepcopy(current)
-            incremental_collection_cache_updates: dict[str, dict[str, tuple[int, Any]]] = {}
+                next_collection_cache[section] = serialized
+            incremental_collection_cache_updates: dict[str, dict[str, tuple[int, bytes]]] = {}
             if dirty_thread_usage_ids and "thread_cumulative_usage" not in dirty_sections:
                 section = "thread_cumulative_usage"
                 previous = self._collection_cache.get(section, {})
-                current = {
+                current_values = {
                     thread_id: (
                         previous.get(thread_id, (len(previous), None))[0],
                         self._usage_dict(self.thread_cumulative_usage[thread_id]),
@@ -1797,28 +1810,31 @@ class StateStore:
                     for thread_id in dirty_thread_usage_ids
                     if thread_id in self.thread_cumulative_usage
                 }
-                upserts = {
+                current = {
                     key: (ordinal, json.dumpb(payload))
-                    for key, (ordinal, payload) in current.items()
-                    if previous.get(key) != (ordinal, payload)
+                    for key, (ordinal, payload) in current_values.items()
+                }
+                upserts = {
+                    key: value for key, value in current.items() if previous.get(key) != value
                 }
                 if upserts:
                     collection_writes[section] = CollectionWrite(upserts, frozenset())
-                incremental_collection_cache_updates[section] = deepcopy(current)
+                incremental_collection_cache_updates[section] = current
             graph_writes: dict[str, GraphWrite] = {}
             next_graph_cache: dict[str, GraphSnapshot] = {}
             for section in sorted(dirty_sections.intersection(GRAPH_SECTIONS)):
                 current = graph_snapshot(section, self._section_value(section))
+                serialized = self._cache_graph_snapshot(current)
                 previous = self._graph_cache.get(section, GraphSnapshot({}, {}, {}))
                 metadata_upserts = {
-                    key: json.dumpb(payload)
-                    for key, payload in current.metadata.items()
+                    key: payload
+                    for key, payload in serialized.metadata.items()
                     if previous.metadata.get(key) != payload
                 }
                 node_upserts = {
-                    key: (ordinal, json.dumpb(payload))
-                    for key, (ordinal, payload) in current.nodes.items()
-                    if previous.nodes.get(key) != (ordinal, payload)
+                    key: value
+                    for key, value in serialized.nodes.items()
+                    if previous.nodes.get(key) != value
                 }
                 delta = GraphWrite(
                     metadata_upserts=metadata_upserts,
@@ -1841,7 +1857,7 @@ class StateStore:
                     or delta.edge_deletes
                 ):
                     graph_writes[section] = delta
-                next_graph_cache[section] = self._cache_graph_snapshot(current)
+                next_graph_cache[section] = serialized
             changed_sections = set(collection_writes) | set(graph_writes)
             changed_work_units = {self.tasks[key].chapter_id for key in task_payloads} | {
                 run.chapter_id for run_id in runs if (run := self._runs_by_id.get(run_id))
