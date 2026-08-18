@@ -34,10 +34,12 @@ returning.
   result type, attributes, or section behavior.
 - You may replace assigned proof bodies, revise private helpers used by them, add focused imports,
   and add fully proved private helpers.
+- Keep imports focused and chronological; do not use umbrella `Mathlib` or `LastLib` imports.
 - Do not add `sorry`, `admit`, axioms, unsafe declarations, `sorryAx`, artificial contradictions,
   circular helpers, diagnostic suppression, or heartbeat-limit workarounds.
 - Do not add or invoke `aesop`. Use focused lemmas and ordinary tactics.
 - Leave proof holes outside the authoritative assignment unchanged.
+- Preserve unrelated work and leave no scratch, backup, or exploratory files.
 
 If concrete mathematics shows that a fixed statement or interface is defective, leave it unchanged
 and report the smallest required correction. If a missing reusable result belongs to an earlier

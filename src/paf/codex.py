@@ -1396,7 +1396,7 @@ how to perform and report the work.
 {base}"""
         common = (
             ""
-            if stage is Stage.DISCOVER
+            if stage in (Stage.DISCOVER, Stage.PROVE)
             else render_prompt(COMMON_PROMPT_PATH.read_text(encoding="utf-8"), chapter)
         )
         scope = "\n".join(f"- `{item}`" for item in chapter.scope)
@@ -1520,11 +1520,9 @@ spend time proving propositions. PAF has already built the incoming files unless
 diagnostics supplied below say otherwise; those diagnostics describe the current source and override
 the earlier clean-build fact. PAF will rebuild any changes.""",
             Stage.PROVE: """The assigned chapter passed review and was clean before proof work
-began. Work directly on unresolved proofs rather than auditing or rechecking untouched files. Every
-assigned declaration must finish without errors or warnings; only `sorry` warnings from
-placeholders reserved for later chunks are permitted. PAF will build the chapter after the attempt.
-Any validation diagnostics supplied below describe the newer current source and override that
-earlier clean-build fact."""
+began. Work directly on the listed holes rather than auditing untouched files. The assigned span
+must finish without errors or warnings. PAF will build the chapter after the attempt; supplied
+current diagnostics override the earlier clean-build fact."""
             + proof_retry_contract,
         }[stage]
         if role == UPSTREAM_REPAIR_ROLE:
@@ -1586,8 +1584,7 @@ Follow the formalization workflow above for when and where to request diagnostic
 Follow the review workflow above for when and where to request diagnostics.""",
                 Stage.PROVE: """Using a Lean tool opens and synchronizes the file it targets. Do not
 request diagnostics merely because you switched files. After editing, use goals and fresh
-diagnostics as needed to show that every assigned declaration has no errors and no warnings other
-than permitted `sorry` warnings from later chunks.""",
+diagnostics as needed to show that the assigned span has no errors or warnings.""",
             }[stage]
             contract += f"""
 
