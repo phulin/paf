@@ -35,7 +35,7 @@ build-backend = "maturin"
 python-source = "src"
 module-name = "paf._rust_tui"
 features = ["pyo3/extension-module"]
-include = ["src/paf/prompts/*.md", "src/paf/web_dist/**"]
+include = ["src/paf/prompts/*.md", "src/paf/lean/*.lean", "src/paf/web_dist/**"]
 strip = true
 
 [tool.pytest.ini_options]
