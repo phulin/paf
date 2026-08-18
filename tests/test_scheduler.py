@@ -4445,6 +4445,31 @@ async def test_build_invalidation_does_not_rescan_untouched_clean_records(
 
 
 @pytest.mark.asyncio
+async def test_repeated_build_invalidation_reuses_persisted_graphs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    orchestrator = Orchestrator(config, StateStore(config))
+    await orchestrator.prepare()
+    await mark_clean_formalization(orchestrator)
+    first, second = config.chapters
+
+    await orchestrator._invalidate_build_records((first.id,))
+
+    def unexpected_graph_build(*_args: object, **_kwargs: object) -> WorkUnitImportGraph:
+        raise AssertionError("unchanged compiled imports should reuse their graph")
+
+    def unexpected_snapshot(_graph: WorkUnitImportGraph) -> dict[str, object]:
+        raise AssertionError("unchanged graph structure should reuse its snapshot")
+
+    monkeypatch.setattr(scheduler_module, "build_compiled_import_graph", unexpected_graph_build)
+    monkeypatch.setattr(WorkUnitImportGraph, "snapshot", unexpected_snapshot)
+
+    assert await orchestrator._invalidate_build_records((second.id,)) == {second.id}
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_build_publication_hashes_only_its_dependency_closure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -397,6 +397,13 @@ class Orchestrator:
         self._interface_graph_key: tuple[int, int, int, int] | None = None
         self._interface_graph_cache: WorkUnitImportGraph | None = None
         self._interface_stale_cache: set[str] = set()
+        self._compiled_interface_state: dict[str, Any] | None = None
+        self._compiled_interface_imports: object | None = None
+        self._compiled_interface_fallback: WorkUnitImportGraph | None = None
+        self._compiled_interface_graph: WorkUnitImportGraph | None = None
+        self._saved_dependency_state: dict[str, Any] | None = None
+        self._saved_dependency_edges: object | None = None
+        self._saved_dependency_graph: WorkUnitImportGraph | None = None
         self._build_diagnostic_indexes()
         self.force = force
         self.resume_agents = resume_agents
@@ -1084,10 +1091,16 @@ class Orchestrator:
                 for chapter_id, snapshot in snapshots.items()
                 if snapshot.fingerprint is not None
             }
-            invalidation_graph = self._interface_invalidation_graph(
-                graph,
-                compiled_imports | import_updates,
+            imports_changed = any(
+                compiled_imports.get(chapter_id) != dependencies
+                for chapter_id, dependencies in import_updates.items()
             )
+            compiled_invalidation_graph = (
+                self._interface_invalidation_graph(graph, compiled_imports | import_updates)
+                if imports_changed
+                else self._persisted_interface_invalidation_graph(graph, compiled_imports)
+            )
+            invalidation_graph = compiled_invalidation_graph
             if self.config.settings.interface_invalidation != "interface":
                 invalidation_graph = graph
             invalidated: set[str] = set()
@@ -1237,7 +1250,24 @@ class Orchestrator:
             explicitly_invalidated = set(invalidated)
             explicitly_validated = set(validated)
             previous = self.state.formalize_graph
-            previous_edges = previous.get("edges") if isinstance(previous, dict) else None
+            graph_unchanged = (
+                previous is self._saved_dependency_state
+                and previous.get("edges") is self._saved_dependency_edges
+                and graph is self._saved_dependency_graph
+            )
+            if graph_unchanged:
+                dependency_snapshot = {
+                    key: previous[key]
+                    for key in ("algorithm", "order", "edges", "dependencies")
+                    if key in previous
+                }
+            else:
+                dependency_snapshot = graph.snapshot()
+                previous_edges = previous.get("edges") if isinstance(previous, dict) else None
+                graph_unchanged = (
+                    previous.get("algorithm") == "source-dependency-tree"
+                    and previous_edges == dependency_snapshot["edges"]
+                )
             current = previous.get("clean", {}) if isinstance(previous, dict) else {}
             if isinstance(current, dict):
                 for chapter_id, record in current.items():
@@ -1253,9 +1283,8 @@ class Orchestrator:
                     # resurrecting records this caller explicitly invalidated.
                     if int(record.get("build_generation", 0)) >= local_generation:
                         clean[chapter_id] = dict(record)
-            edges = [list(edge) for edge in graph.edges]
             revision = int(previous.get("revision", 0)) if isinstance(previous, dict) else 0
-            if previous.get("algorithm") != "source-dependency-tree" or previous_edges != edges:
+            if not graph_unchanged:
                 revision += 1
             build_generation = max(
                 build_generation,
@@ -1299,8 +1328,16 @@ class Orchestrator:
                 if isinstance(raw_imports, dict)
                 else {}
             )
+            imports_changed = any(
+                interface_imports.get(chapter_id) != dependencies
+                for chapter_id, dependencies in (import_updates or {}).items()
+            )
             interface_imports.update(import_updates or {})
-            invalidation_graph = self._interface_invalidation_graph(graph, interface_imports)
+            invalidation_graph = (
+                self._interface_invalidation_graph(graph, interface_imports)
+                if imports_changed
+                else self._persisted_interface_invalidation_graph(graph, interface_imports)
+            )
             interface_stale = set(previous.get("interface_stale", ()))
             interface_stale.update(interface_invalidated)
             interface_stale.difference_update(interface_validated)
@@ -1316,7 +1353,15 @@ class Orchestrator:
             )
             for name, increment in (metric_updates or {}).items():
                 fingerprint_metrics[name] = fingerprint_metrics.get(name, 0) + increment
-            self.state.formalize_graph = graph.snapshot() | {
+            previous_interface_graph = previous.get("interface_import_graph")
+            interface_graph_snapshot = (
+                previous_interface_graph
+                if graph_unchanged
+                and not imports_changed
+                and isinstance(previous_interface_graph, dict)
+                else invalidation_graph.snapshot() | {"coverage": len(interface_imports)}
+            )
+            self.state.formalize_graph = dependency_snapshot | {
                 "algorithm": "source-dependency-tree",
                 "revision": revision,
                 "build_generation": build_generation,
@@ -1327,16 +1372,37 @@ class Orchestrator:
                     chapter_id: list(required)
                     for chapter_id, required in sorted(interface_imports.items())
                 },
-                "interface_import_graph": invalidation_graph.snapshot()
-                | {"coverage": len(interface_imports)},
+                "interface_import_graph": interface_graph_snapshot,
                 "fingerprint_schema": "olean-proof-erased-v1",
                 "fingerprint_mode": self.config.settings.interface_invalidation,
                 "last_fingerprint_error": fingerprint_error,
                 "interface_stale": sorted(interface_stale),
                 "fingerprint_metrics": fingerprint_metrics,
             }
+            self._saved_dependency_state = self.state.formalize_graph
+            self._saved_dependency_edges = self.state.formalize_graph.get("edges")
+            self._saved_dependency_graph = graph
+            self._compiled_interface_state = self.state.formalize_graph
+            self._compiled_interface_imports = self.state.formalize_graph.get("interface_imports")
+            self._compiled_interface_fallback = graph
+            self._compiled_interface_graph = invalidation_graph
             await self.state.save("formalize_graph")
             return revision
+
+    def _persisted_interface_invalidation_graph(
+        self,
+        fallback: WorkUnitImportGraph,
+        compiled: dict[str, tuple[str, ...]],
+    ) -> WorkUnitImportGraph:
+        if (
+            self.state.formalize_graph is self._compiled_interface_state
+            and self.state.formalize_graph.get("interface_imports")
+            is self._compiled_interface_imports
+            and fallback is self._compiled_interface_fallback
+            and self._compiled_interface_graph is not None
+        ):
+            return self._compiled_interface_graph
+        return self._interface_invalidation_graph(fallback, compiled)
 
     def _interface_invalidation_graph(
         self,
@@ -1382,7 +1448,7 @@ class Orchestrator:
             if isinstance(raw_imports, dict)
             else {}
         )
-        interface_graph = self._interface_invalidation_graph(graph, compiled)
+        interface_graph = self._persisted_interface_invalidation_graph(graph, compiled)
         self._interface_graph_key = cache_key
         self._interface_graph_cache = interface_graph
         self._interface_stale_cache = self._successor_closure(interface_graph, stale)
