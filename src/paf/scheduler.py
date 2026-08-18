@@ -149,6 +149,10 @@ class ExecutionDisposition(StrEnum):
 class StageOutcome:
     disposition: ExecutionDisposition
     waiting_on: tuple[Requirement, ...] = ()
+    changed: bool = False
+    complete: bool = True
+    run_id: str = ""
+    report_error: str = ""
 
     def __post_init__(self) -> None:
         if not isinstance(self.disposition, ExecutionDisposition):
@@ -168,14 +172,6 @@ class StageOutcome:
 
     def __bool__(self) -> bool:
         return self.succeeded
-
-
-@dataclass(frozen=True)
-class ReviewOutcome(StageOutcome):
-    changed: bool = False
-    complete: bool = True
-    run_id: str = ""
-    report_error: str = ""
 
 
 @dataclass(frozen=True)
@@ -3955,9 +3951,9 @@ class Orchestrator:
         resume_thread_id: str | None = None,
         resume_run_id: str = "",
         resume_prompt: str = "",
-    ) -> ReviewOutcome:
+    ) -> StageOutcome:
         if not rerun and self._already_done(chapter, Stage.REVIEW):
-            return ReviewOutcome(ExecutionDisposition.SUCCEEDED, changed=False, complete=True)
+            return StageOutcome(ExecutionDisposition.SUCCEEDED, changed=False, complete=True)
         attempt = await self._attempt(
             chapter,
             Stage.REVIEW,
@@ -3984,7 +3980,7 @@ class Orchestrator:
                 TaskStatus.FAILED,
                 "model capacity remained unavailable after the configured retries",
             )
-            return ReviewOutcome(
+            return StageOutcome(
                 ExecutionDisposition.FAILED,
                 changed=attempt.agent.changed,
                 complete=False,
@@ -4003,7 +3999,7 @@ class Orchestrator:
                     TaskStatus.RUNNING,
                     "review changes merged; coordinator verification queued",
                 )
-            return ReviewOutcome(
+            return StageOutcome(
                 ExecutionDisposition.SUCCEEDED,
                 changed=attempt.agent.changed,
                 complete=True,
@@ -4016,7 +4012,7 @@ class Orchestrator:
                 TaskStatus.RUNNING,
                 "invalid review report; session retry queued",
             )
-            return ReviewOutcome(
+            return StageOutcome(
                 ExecutionDisposition.WAITING,
                 changed=attempt.agent.changed,
                 complete=False,
@@ -4030,7 +4026,7 @@ class Orchestrator:
                 TaskStatus.RUNNING,
                 "incomplete review report; session retry queued",
             )
-            return ReviewOutcome(
+            return StageOutcome(
                 ExecutionDisposition.WAITING,
                 changed=attempt.agent.changed,
                 complete=False,
@@ -4042,7 +4038,7 @@ class Orchestrator:
             TaskStatus.FAILED,
             "editing review failed",
         )
-        return ReviewOutcome(
+        return StageOutcome(
             ExecutionDisposition.SUCCEEDED if succeeded else ExecutionDisposition.FAILED,
             changed=attempt.agent.changed,
             complete=complete,
@@ -4242,7 +4238,7 @@ class Orchestrator:
         resume_run_id = ""
         resume_prompt = ""
 
-        async def queue_report_retry(outcome: ReviewOutcome, error: str) -> bool:
+        async def queue_report_retry(outcome: StageOutcome, error: str) -> bool:
             nonlocal resume_thread_id, resume_run_id, resume_prompt
             if rounds_used[chapter.id] >= maximum:
                 await self.state.set_task(

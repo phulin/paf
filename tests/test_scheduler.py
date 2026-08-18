@@ -31,7 +31,6 @@ from paf.scheduler import (
     BUILD_WARNING_REVIEW_KIND,
     ExecutionDisposition,
     Orchestrator,
-    ReviewOutcome,
     StageOutcome,
 )
 from paf.state import (
@@ -948,15 +947,25 @@ async def test_review_build_warning_switches_follow_up_to_warning_role(
     await mark_clean_formalization(orchestrator)
     roles: list[str] = []
 
-    async def review_once(_chapter: Chapter, **options: Any) -> ReviewOutcome:
+    async def review_once(_chapter: Chapter, **options: Any) -> StageOutcome:
         roles.append(str(options.get("role", "")))
         if len(roles) == 1:
             source.write_text(
                 "theorem target : True := by\n  sorry\n",
                 encoding="utf-8",
             )
-            return ReviewOutcome(True, True, complete=True, run_id="initial-review")
-        return ReviewOutcome(True, False, complete=True, run_id="warning-review")
+            return StageOutcome(
+                ExecutionDisposition.SUCCEEDED,
+                changed=True,
+                complete=True,
+                run_id="initial-review",
+            )
+        return StageOutcome(
+            ExecutionDisposition.SUCCEEDED,
+            changed=False,
+            complete=True,
+            run_id="warning-review",
+        )
 
     async def review_build(_chapter: Chapter) -> dict[str, str]:
         return {chapter.id: "warning: Book/Chapter01.lean:1:1: unused variable"}
@@ -3565,7 +3574,7 @@ async def test_review_is_capped_at_three_edit_rebuild_cycles(
 
     async def changed_review(
         _chapter: Chapter, *, rerun: bool = False, feedback: str = ""
-    ) -> ReviewOutcome:
+    ) -> StageOutcome:
         del feedback
         nonlocal reviews
         assert rerun == (reviews > 0)
@@ -3577,7 +3586,7 @@ async def test_review_is_capped_at_three_edit_rebuild_cycles(
             + f"\n-- review pass {reviews}\n",
             encoding="utf-8",
         )
-        return ReviewOutcome(ExecutionDisposition.SUCCEEDED, changed=True)
+        return StageOutcome(ExecutionDisposition.SUCCEEDED, changed=True)
 
     async def review_build(_chapter: Chapter) -> dict[str, str]:
         nonlocal rebuilds
@@ -3601,14 +3610,12 @@ async def test_capacity_failure_consumes_a_review_round(
     chapter = config.chapters[0]
     orchestrator = Orchestrator(config, StateStore(config))
     await orchestrator.prepare()
-    outcomes = iter((ReviewOutcome(ExecutionDisposition.FAILED, changed=False, complete=False),))
+    outcomes = iter((StageOutcome(ExecutionDisposition.FAILED, changed=False, complete=False),))
 
     async def clean(*_args: object, **_kwargs: object) -> dict[str, str]:
         return {}
 
-    async def review(
-        _chapter: Chapter, *, rerun: bool = False, feedback: str = ""
-    ) -> ReviewOutcome:
+    async def review(_chapter: Chapter, *, rerun: bool = False, feedback: str = "") -> StageOutcome:
         del rerun, feedback
         return next(outcomes)
 
@@ -4530,8 +4537,8 @@ async def test_pending_review_is_not_recovered_from_historical_runs(
     restarted = Orchestrator(config, StateStore(config))
     await restarted.prepare()
 
-    async def review_again(*_args: object, **_kwargs: object) -> ReviewOutcome:
-        return ReviewOutcome(ExecutionDisposition.SUCCEEDED, changed=False)
+    async def review_again(*_args: object, **_kwargs: object) -> StageOutcome:
+        return StageOutcome(ExecutionDisposition.SUCCEEDED, changed=False)
 
     async def forbidden_agent(*_args: object, **_kwargs: object) -> AgentResult:
         raise AssertionError("current placeholder-free proof must not rerun an agent")
