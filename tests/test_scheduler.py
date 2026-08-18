@@ -912,14 +912,14 @@ async def test_review_tree_runs_diagnostics_before_pending_proof_review(
         _chapter: Chapter,
         _rounds_used: dict[str, int],
         **options: Any,
-    ) -> bool:
+    ) -> StageOutcome:
         calls.append(
             (
                 str(options.get("role", "")),
                 tuple(options.get("proof_request_ids", ())),
             )
         )
-        return True
+        return StageOutcome(ExecutionDisposition.SUCCEEDED)
 
     monkeypatch.setattr(orchestrator, "_review_chapter_to_clean", review)
 
