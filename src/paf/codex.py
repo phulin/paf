@@ -2140,7 +2140,9 @@ class _ProcessTreeTracker:
     def descriptor_count(self) -> int:
         # Include remembered descendants that detached or were reparented after a
         # previous scan; Codex's code-mode and Lean transports both use setsid().
-        processes = self.scan() | self.live_known()
+        # ``scan`` already starts from every remembered PID and validates its
+        # identity, so a second ``live_known`` pass only rereads every proc stat.
+        processes = self.scan()
         return sum(_open_descriptor_count(pid) for pid in processes)
 
 
@@ -2175,7 +2177,11 @@ async def _wait_for_fd_pressure(
         count = process_tree.descriptor_count()
         if resumable() and count >= threshold:
             return count
-        await asyncio.sleep(1)
+        # Trees far below the limit cannot reach it without opening hundreds of
+        # descriptors. Poll them less aggressively; large swarms otherwise walk
+        # the same procfs process trees once per agent per second.
+        interval = 1 if count >= threshold // 2 else 3
+        await asyncio.sleep(interval)
     return 0
 
 

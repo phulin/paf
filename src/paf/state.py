@@ -445,7 +445,8 @@ class StateStore:
         self._latest_runs_by_chapter: dict[str, RunRecord] = {}
         self._usage_cache: dict[tuple[bool, str | None], TokenUsage] = {}
         self._cost_cache: dict[tuple[bool, str | None], CostEstimate] = {}
-        self._indexed_task_states: dict[str, tuple[str, str, bool, str]] = {}
+        self._indexed_task_states: dict[str, tuple[str, str, bool, str, bool]] = {}
+        self._repairable_task_keys: set[str] = set()
         self._active_run_ids: set[str] = set()
         self._active_runs_by_chapter: dict[str, RunRecord] = {}
         self._stage_count_cache: dict[str, dict[str, int]] = {}
@@ -2230,6 +2231,7 @@ class StateStore:
             for stage in Stage
         }
         self._indexed_task_states.clear()
+        self._repairable_task_keys.clear()
         for key, task in self.tasks.items():
             bucket = "queued" if task.queued else str(task.status)
             self._stage_count_cache[task.stage][bucket] += 1
@@ -2240,7 +2242,10 @@ class StateStore:
                 str(task.status),
                 task.queued,
                 str(task.phase),
+                task.repairing,
             )
+            if task.status in {TaskStatus.FAILED, TaskStatus.BLOCKED} and not task.repairing:
+                self._repairable_task_keys.add(key)
         self._active_run_ids = {
             run.id for run in self._runs_by_id.values() if run.status == TaskStatus.RUNNING
         }
@@ -2255,11 +2260,11 @@ class StateStore:
             return
         key = self.key(task.chapter_id, Stage(task.stage))
         previous = self._indexed_task_states.get(key)
-        current = (task.stage, str(task.status), task.queued, str(task.phase))
+        current = (task.stage, str(task.status), task.queued, str(task.phase), task.repairing)
         if previous == current:
             return
         if previous is not None:
-            old_stage, old_status, old_queued, old_phase = previous
+            old_stage, old_status, old_queued, old_phase, _old_repairing = previous
             old_bucket = "queued" if old_queued else old_status
             self._stage_count_cache[old_stage][old_bucket] -= 1
             if old_status == TaskStatus.RUNNING and old_phase == TaskPhase.POSTPROCESS:
@@ -2269,6 +2274,10 @@ class StateStore:
         if task.status == TaskStatus.RUNNING and task.phase == TaskPhase.POSTPROCESS:
             self._stage_count_cache[task.stage]["postprocess"] += 1
         self._indexed_task_states[key] = current
+        if task.status in {TaskStatus.FAILED, TaskStatus.BLOCKED} and not task.repairing:
+            self._repairable_task_keys.add(key)
+        else:
+            self._repairable_task_keys.discard(key)
 
     def agent_summary(self) -> dict[str, Any]:
         if not self._stage_count_cache:
@@ -2803,12 +2812,10 @@ class StateStore:
     def repairable_tasks(self) -> list[tuple[str, TaskRecord]]:
         """Current terminal failures eligible for Shepherd triage."""
 
+        if not self._stage_count_cache:
+            self._rebuild_status_indexes()
         return sorted(
-            (
-                (key, task)
-                for key, task in self.tasks.items()
-                if task.status in {TaskStatus.FAILED, TaskStatus.BLOCKED} and not task.repairing
-            ),
+            ((key, self.tasks[key]) for key in self._repairable_task_keys),
             key=lambda item: (item[1].updated_at, item[0]),
         )
 

@@ -41,6 +41,7 @@ async def test_repair_work_unit_overlays_existing_stage_and_persists(tmp_path: P
         priority=7.0,
     )
     await state.install_repair_plan(sweep.id, [unit], summary="one repair", run_id="plan-run")
+    assert [key for key, _task in state.repairable_tasks()] == [task_key]
 
     await state.start_repair_work_unit(unit.id)
 
@@ -50,6 +51,7 @@ async def test_repair_work_unit_overlays_existing_stage_and_persists(tmp_path: P
     assert task.repair_work_unit_id == unit.id
     assert state.hot_snapshot()["tasks"][task_key]["repairing"] is True
     assert case.status == RepairCaseStatus.REPAIRING
+    assert state.repairable_tasks() == []
 
     await state.finish_repair_work_unit(
         unit.id,
@@ -57,6 +59,7 @@ async def test_repair_work_unit_overlays_existing_stage_and_persists(tmp_path: P
         detail="validated",
         run_id="worker-run",
     )
+    assert [key for key, _task in state.repairable_tasks()] == [task_key]
     await state.set_task(chapter.id, Stage.REVIEW, TaskStatus.PENDING, "repair accepted")
     await state.finish_repair_sweep(sweep.id)
     await state.close()
