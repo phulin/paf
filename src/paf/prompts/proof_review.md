@@ -29,6 +29,10 @@ project API.
 6. Use the attached Lean tools after editing. Prepare affected dependencies once, then check changed
    files and their dependents in import order. Fix every diagnostic except an explicitly permitted
    `sorry` warning for this assignment.
+7. If the supplied handoff contains PAF coordinator or validation diagnostics, treat each one as
+   required repair work. In particular, an error-free typecheck does not clear a warning from the
+   authoritative build. Resolve every warning that still applies except the exact permitted
+   declaration-uses-`sorry` warning.
 
 {review_workflow_details}
 

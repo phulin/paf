@@ -30,6 +30,12 @@ Fix the cause of diagnostics. Do not hide warnings with options, disable linters
 suppression tricks in the source. Remove exploratory commands and scratch, backup, or log files before
 finishing. Preserve unrelated work.
 
+Lean accepting a file is not the same as PAF accepting it: PAF rejects every warning except the exact
+warning that a declaration uses `sorry`. When a PAF handoff supplies a warning, it remains required
+work even if a later tool response has no errors, reports that the file typechecks, or summarizes
+warning bodies only as a count. Do not return a no-change report until every supplied warning has
+either been fixed or identified as the permitted `sorry` warning.
+
 ### Keep searches and tool output bounded
 
 Never search, list, read, or recurse into `.paf/logs`, `.paf/isolation`, or any isolation/worktree

@@ -422,7 +422,9 @@ every declaration in the assigned chapter. Check source coverage, mathematical m
 and a plausible proof route through earlier results. Account for every supplied finding as
 confirmed, rejected, or reframed.""",
             "review_guardrails": """Do not restrict the review to the failed declarations. A
-no-change review needs no diagnostic calls because PAF's incoming build is authoritative.""",
+no-change review needs no diagnostic calls only when the supplied handoff contains no PAF build or
+validation diagnostics. Supplied diagnostics override the earlier clean-build assumption and must
+all be resolved except for explicitly permitted `sorry` warnings.""",
             "review_definition_of_done": """The complete assigned chapter has been re-reviewed,
 every supplied finding has been evaluated, all warranted in-scope repairs have been made, existing
 library and earlier-chapter APIs have been reused wherever possible, imports remain chronological,
@@ -1305,7 +1307,9 @@ or try a meaningfully different one: search for another earlier theorem, unfold 
 definition, prove a focused helper, construct the object directly, or change the tactic structure.
 Try several checked approaches before concluding that the same obstruction remains. If a concrete
 mathematical argument shows that an earlier declaration must change, report the smallest required
-change through the proof report instead of repeating that no library result was found."""
+change through the proof report instead of repeating that no library result was found. If the
+history contains PAF validation diagnostics, resolve all of them before returning. In particular,
+do not report no changes or “typecheck clean” while a supplied non-`sorry` warning still applies."""
         selected_proof_targets = tuple(proof_targets)
         proof_assignment = ""
         if stage is Stage.PROVE and selected_proof_targets and role != UPSTREAM_REPAIR_ROLE:
@@ -1344,12 +1348,15 @@ PAF will run the authoritative build after your work.""",
             Stage.REVIEW: """Review the entire assigned chapter and make every warranted statement
 or interface change that belongs in its files. When proof findings are attached, evaluate them
 independently while still reviewing the complete chapter. Preserve proof placeholders and do not
-spend time proving propositions. PAF has already built the incoming files and will rebuild any
-changes.""",
-            Stage.PROVE: """The assigned chapter has passed review and builds cleanly. Work directly
-on unresolved proofs rather than auditing or rechecking untouched files. Every assigned declaration
-must finish without errors or warnings; only `sorry` warnings from placeholders reserved for later
-chunks are permitted. PAF will build the chapter after the attempt."""
+spend time proving propositions. PAF has already built the incoming files unless validation
+diagnostics supplied below say otherwise; those diagnostics describe the current source and override
+the earlier clean-build fact. PAF will rebuild any changes.""",
+            Stage.PROVE: """The assigned chapter passed review and was clean before proof work
+began. Work directly on unresolved proofs rather than auditing or rechecking untouched files. Every
+assigned declaration must finish without errors or warnings; only `sorry` warnings from placeholders
+reserved for later chunks are permitted. PAF will build the chapter after the attempt. Any validation
+diagnostics supplied below describe the newer current source and override that earlier clean-build
+fact."""
             + proof_retry_contract,
         }[stage]
         if role == UPSTREAM_REPAIR_ROLE:
@@ -1447,8 +1454,8 @@ whole-file diagnostics from prerequisites to dependents. Do not prepare every fi
                 else {
                     Stage.DISCOVER: "Discovery feedback",
                     Stage.FORMALIZE: "PAF build diagnostics and reported findings",
-                    Stage.REVIEW: "Failed proof findings to evaluate",
-                    Stage.PROVE: "Earlier proof attempts",
+                    Stage.REVIEW: "Proof findings and PAF validation diagnostics",
+                    Stage.PROVE: "Earlier proof attempts and PAF validation diagnostics",
                 }[stage]
             )
             contract += f"\n## {feedback_heading}\n\n```text\n{_bounded_feedback(feedback)}\n```\n"

@@ -37,7 +37,12 @@ bodies, add focused imports, and add fully proved helper lemmas when they are ge
    put that ID in `blocker_refs` instead of repeating the failed attempt.
 8. Complete the assigned targets in each file before moving to the next. After all targets have been visited, check every edited
    file and the assigned files that depend on it. Remove or revert any speculative edit that does not
-   pass diagnostics; every retained proof and helper must be accepted by Lean.
+   pass diagnostics; every retained proof and helper must be accepted by Lean. Fix every error and
+   every warning except the exact warning that a declaration uses `sorry`. A file that elaborates
+   without errors is not clean while another warning remains.
+9. On a retry, treat every supplied PAF validation diagnostic as required work. Resolve each warning
+   that still applies even if the attached Lean tools report no errors or otherwise say the file
+   typechecks. PAF's coordinator build enforces a stricter warning policy than mere elaboration.
 
 ## Guardrails
 
@@ -66,10 +71,11 @@ at least two meaningfully different attempts. Continue proving independent decla
 
 ## Definition of done
 
-All placeholders in the assigned proof chunk have been replaced by Lean-checked proofs. For each
-remaining assigned proof, report its checked attempts and exact residual goal. Set `complete` to
-`true` when no assigned placeholder remains; placeholders reserved for later chunks do not make this
-report incomplete.
+All placeholders in the assigned proof chunk have been replaced by Lean-checked proofs, and the
+assigned files have no errors or warnings other than the exact warning for a declaration that still
+uses `sorry`. For each remaining assigned proof, report its checked attempts and exact residual goal.
+Set `complete` to `true` when no assigned placeholder and no non-`sorry` diagnostic remains;
+placeholders reserved for later chunks do not make this report incomplete.
 
 ## Output format
 
