@@ -518,7 +518,7 @@ class Orchestrator:
             self.state.shepherd.next_run_at = (
                 datetime.now(UTC) + timedelta(seconds=self.config.shepherd.interval_seconds)
             ).isoformat()
-            await self.state.save()
+            await self.state.save("state")
             self._shepherd_task = asyncio.create_task(self._shepherd_loop(), name="paf-shepherd")
         report("Preparation complete", 9)
 
@@ -894,7 +894,7 @@ class Orchestrator:
                 "nodes": nodes,
             }
             async with self.state.batch():
-                await self.state.save()
+                await self.state.save("source_dependency_tree")
                 await self.state.set_tasks(
                     (pending.chapter.id for pending in valid),
                     Stage.DISCOVER,
@@ -1329,7 +1329,7 @@ class Orchestrator:
                 "interface_stale": sorted(interface_stale),
                 "fingerprint_metrics": fingerprint_metrics,
             }
-            await self.state.save()
+            await self.state.save("formalize_graph")
             return revision
 
     def _interface_invalidation_graph(
@@ -5521,7 +5521,7 @@ class Orchestrator:
                     model=self.config.shepherd.model,
                 )
                 self.state.shepherd.current_run_id = run.id
-                await self.state.save()
+                await self.state.save("state")
                 result = await self.executor.run_shepherd(
                     anchor,
                     run,
@@ -5583,7 +5583,7 @@ class Orchestrator:
                 pending = len(self.state.repairable_tasks())
                 if self.state.shepherd.pending_failures != pending:
                     self.state.shepherd.pending_failures = pending
-                    await self.state.save()
+                    await self.state.save("state")
                 if not timed_out and len(cases) >= self.config.shepherd.failure_threshold:
                     await self._run_shepherd_sweep(trigger="failure-threshold", cases=cases)
                 elif timed_out:
@@ -5591,7 +5591,7 @@ class Orchestrator:
                         await self._run_shepherd_sweep(trigger="interval", cases=cases)
                     due = datetime.now(UTC) + timedelta(seconds=interval)
                     self.state.shepherd.next_run_at = due.isoformat()
-                    await self.state.save()
+                    await self.state.save("state")
         finally:
             self.state.change_bus.unsubscribe(changes)
 

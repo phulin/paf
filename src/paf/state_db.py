@@ -15,8 +15,391 @@ from paf import json_codec as json
 
 DATABASE_NAME = "state.sqlite3"
 LEGACY_BACKUP_NAME = "state.legacy-v6.json"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 CHANGE_RETENTION = 10_000
+
+COLLECTION_SECTIONS = frozenset(
+    {
+        "scheduling",
+        "fixup_requests",
+        "proof_review_requests",
+        "upstream_requests",
+        "proof_blockers",
+        "thread_cumulative_usage",
+        "repair_cases",
+        "repair_sweeps",
+        "repair_work_units",
+        "coordinator_targets",
+    }
+)
+GRAPH_SECTIONS = frozenset({"source_dependency_tree", "formalize_graph"})
+NORMALIZED_STATE_KEYS = COLLECTION_SECTIONS.difference({"coordinator_targets"}) | GRAPH_SECTIONS
+
+
+@dataclass(frozen=True)
+class CollectionWrite:
+    upserts: dict[str, tuple[int, bytes]] = field(default_factory=dict)
+    deletes: frozenset[str] = frozenset()
+
+
+@dataclass(frozen=True)
+class GraphSnapshot:
+    metadata: dict[str, Any]
+    nodes: dict[tuple[str, str], tuple[int, Any]]
+    edges: frozenset[tuple[str, str, str]]
+
+
+@dataclass(frozen=True)
+class GraphWrite:
+    metadata_upserts: dict[str, bytes] = field(default_factory=dict)
+    metadata_deletes: frozenset[str] = frozenset()
+    node_upserts: dict[tuple[str, str], tuple[int, bytes]] = field(default_factory=dict)
+    node_deletes: frozenset[tuple[str, str]] = frozenset()
+    edge_upserts: frozenset[tuple[str, str, str]] = frozenset()
+    edge_deletes: frozenset[tuple[str, str, str]] = frozenset()
+
+
+def bounded_global_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
+    """Return the O(1)-sized header retained in ``globals.state``."""
+
+    header = {
+        key: value
+        for key, value in snapshot.items()
+        if key
+        not in NORMALIZED_STATE_KEYS
+        | {
+            "documents",
+            "work_units",
+            "tasks",
+            "source_issues",
+            "upstream_request_batches",
+            "coordinator_build",
+        }
+    }
+    shepherd = header.get("shepherd")
+    if isinstance(shepherd, dict) and "agents" in shepherd:
+        header["shepherd"] = {key: value for key, value in shepherd.items() if key != "agents"}
+    return header
+
+
+def collection_snapshot(section: str, value: Any) -> dict[str, tuple[int, Any]]:
+    """Split an unbounded state collection into independently writable rows."""
+
+    if section == "scheduling":
+        scheduling = value if isinstance(value, dict) else {}
+        rows: dict[str, tuple[int, Any]] = {
+            "@meta": (
+                0,
+                {
+                    key: item
+                    for key, item in scheduling.items()
+                    if key not in {"statements", "proofs"}
+                },
+            )
+        }
+        ordinal = 1
+        for phase in ("statements", "proofs"):
+            raw_phase = scheduling.get(phase)
+            if not isinstance(raw_phase, dict):
+                continue
+            order = [item for item in raw_phase.get("order", []) if isinstance(item, str)]
+            critical = [
+                item for item in raw_phase.get("critical_path", []) if isinstance(item, str)
+            ]
+            rank = raw_phase.get("rank", {})
+            effort = raw_phase.get("effort", {})
+            rank = rank if isinstance(rank, dict) else {}
+            effort = effort if isinstance(effort, dict) else {}
+            ids = dict.fromkeys((*order, *critical, *map(str, rank), *map(str, effort)))
+            rows[f"@phase:{phase}"] = (
+                ordinal,
+                {
+                    key: item
+                    for key, item in raw_phase.items()
+                    if key not in {"order", "critical_path", "rank", "effort"}
+                },
+            )
+            ordinal += 1
+            order_positions = {item: index for index, item in enumerate(order)}
+            critical_positions = {item: index for index, item in enumerate(critical)}
+            for item_id in ids:
+                rows[f"{phase}\0{item_id}"] = (
+                    ordinal,
+                    {
+                        "order": order_positions.get(item_id),
+                        "critical_path": critical_positions.get(item_id),
+                        "rank": rank.get(item_id),
+                        "effort": effort.get(item_id),
+                    },
+                )
+                ordinal += 1
+        return rows
+    if section == "coordinator_targets":
+        values = value if isinstance(value, (list, tuple)) else ()
+        return {str(item): (ordinal, None) for ordinal, item in enumerate(values)}
+    if not isinstance(value, dict):
+        return {}
+    return {
+        str(key): (ordinal, item)
+        for ordinal, (key, item) in enumerate(sorted(value.items(), key=lambda pair: str(pair[0])))
+    }
+
+
+def restore_collection(section: str, rows: list[tuple[str, int, Any]]) -> Any:
+    if section == "scheduling":
+        by_key = {key: value for key, _, value in rows}
+        meta = by_key.get("@meta", {})
+        scheduling = dict(meta) if isinstance(meta, dict) else {}
+        for phase in ("statements", "proofs"):
+            phase_meta = by_key.get(f"@phase:{phase}", {})
+            phase_value = dict(phase_meta) if isinstance(phase_meta, dict) else {}
+            items: list[tuple[str, dict[str, Any]]] = []
+            for key, _, payload in rows:
+                prefix = f"{phase}\0"
+                if key.startswith(prefix) and isinstance(payload, dict):
+                    items.append((key[len(prefix) :], payload))
+            phase_value["order"] = [
+                item_id
+                for item_id, _ in sorted(
+                    (item for item in items if item[1].get("order") is not None),
+                    key=lambda item: int(item[1]["order"]),
+                )
+            ]
+            phase_value["critical_path"] = [
+                item_id
+                for item_id, _ in sorted(
+                    (item for item in items if item[1].get("critical_path") is not None),
+                    key=lambda item: int(item[1]["critical_path"]),
+                )
+            ]
+            phase_value["rank"] = {
+                item_id: payload["rank"]
+                for item_id, payload in items
+                if payload.get("rank") is not None
+            }
+            phase_value["effort"] = {
+                item_id: payload["effort"]
+                for item_id, payload in items
+                if payload.get("effort") is not None
+            }
+            if items or f"@phase:{phase}" in by_key:
+                scheduling[phase] = phase_value
+        return scheduling
+    if section == "coordinator_targets":
+        return [key for key, _, _ in sorted(rows, key=lambda row: row[1])]
+    return {key: value for key, _, value in rows}
+
+
+def graph_snapshot(section: str, value: Any) -> GraphSnapshot:
+    graph = value if isinstance(value, dict) else {}
+    if section == "source_dependency_tree":
+        excluded = {"order", "edges", "dependencies", "nodes"}
+        metadata = {key: item for key, item in graph.items() if key not in excluded}
+        metadata["__paf_shape"] = sorted(excluded.intersection(graph))
+        order = [item for item in graph.get("order", []) if isinstance(item, str)]
+        dependencies = graph.get("dependencies", {})
+        dependencies = dependencies if isinstance(dependencies, dict) else {}
+        records = graph.get("nodes", {})
+        records = records if isinstance(records, dict) else {}
+        node_ids = dict.fromkeys((*order, *map(str, dependencies), *map(str, records)))
+        positions = {item: index for index, item in enumerate(order)}
+        nodes = {
+            ("dependency", node_id): (
+                positions.get(node_id, len(positions)),
+                (
+                    {key: item for key, item in record.items() if key != "dependencies"}
+                    if isinstance((record := records.get(node_id)), dict)
+                    else None
+                ),
+            )
+            for node_id in node_ids
+        }
+        edges = frozenset(
+            ("dependency", str(prerequisite), str(dependent))
+            for dependent, required in dependencies.items()
+            if isinstance(required, list)
+            for prerequisite in required
+            if isinstance(prerequisite, str)
+        )
+        if not edges:
+            edges = frozenset(
+                ("dependency", str(edge[0]), str(edge[1]))
+                for edge in graph.get("edges", [])
+                if isinstance(edge, list) and len(edge) == 2
+            )
+        return GraphSnapshot(metadata, nodes, edges)
+
+    excluded = {
+        "order",
+        "edges",
+        "dependencies",
+        "clean",
+        "dirty",
+        "interfaces",
+        "interface_imports",
+        "interface_import_graph",
+        "interface_stale",
+    }
+    metadata = {key: item for key, item in graph.items() if key not in excluded}
+    metadata["__paf_shape"] = sorted(excluded.intersection(graph))
+    clean = graph.get("clean", {})
+    clean = clean if isinstance(clean, dict) else {}
+    interfaces = graph.get("interfaces", {})
+    interfaces = interfaces if isinstance(interfaces, dict) else {}
+    imports = graph.get("interface_imports", {})
+    imports = imports if isinstance(imports, dict) else {}
+    dirty = {str(item) for item in graph.get("dirty", [])}
+    stale = {str(item) for item in graph.get("interface_stale", [])}
+    dependencies = graph.get("dependencies", {})
+    dependencies = dependencies if isinstance(dependencies, dict) else {}
+    order = [item for item in graph.get("order", []) if isinstance(item, str)]
+    node_ids = dict.fromkeys(
+        (
+            *order,
+            *map(str, dependencies),
+            *map(str, clean),
+            *map(str, interfaces),
+            *map(str, imports),
+            *dirty,
+            *stale,
+        )
+    )
+    positions = {item: index for index, item in enumerate(order)}
+    nodes: dict[tuple[str, str], tuple[int, Any]] = {
+        ("dependency", node_id): (
+            positions.get(node_id, len(positions)),
+            {
+                "clean": clean.get(node_id),
+                "interface": interfaces.get(node_id),
+                "dirty": node_id in dirty,
+                "stale": node_id in stale,
+                "interface_imports": node_id in imports,
+            },
+        )
+        for node_id in node_ids
+    }
+    edges = {
+        ("dependency", str(prerequisite), str(dependent))
+        for dependent, required in dependencies.items()
+        if isinstance(required, list)
+        for prerequisite in required
+        if isinstance(prerequisite, str)
+    }
+    interface_graph = graph.get("interface_import_graph", {})
+    interface_graph = interface_graph if isinstance(interface_graph, dict) else {}
+    interface_order = [item for item in interface_graph.get("order", []) if isinstance(item, str)]
+    interface_dependencies = interface_graph.get("dependencies", {})
+    interface_dependencies = (
+        interface_dependencies if isinstance(interface_dependencies, dict) else {}
+    )
+    interface_ids = dict.fromkeys((*interface_order, *map(str, interface_dependencies)))
+    interface_positions = {item: index for index, item in enumerate(interface_order)}
+    nodes.update(
+        {
+            ("interface", node_id): (
+                interface_positions.get(node_id, len(interface_positions)),
+                None,
+            )
+            for node_id in interface_ids
+        }
+    )
+    edges.update(
+        ("interface", str(prerequisite), str(dependent))
+        for dependent, required in interface_dependencies.items()
+        if isinstance(required, list)
+        for prerequisite in required
+        if isinstance(prerequisite, str)
+    )
+    metadata["interface_graph_algorithm"] = interface_graph.get(
+        "algorithm", "observed-lean-imports"
+    )
+    metadata["interface_graph_coverage"] = interface_graph.get("coverage", len(imports))
+    return GraphSnapshot(metadata, nodes, frozenset(edges))
+
+
+def restore_graph(snapshot: GraphSnapshot, section: str) -> dict[str, Any]:
+    metadata = dict(snapshot.metadata)
+    raw_shape = metadata.pop("__paf_shape", ())
+    shape = {str(key) for key in raw_shape} if isinstance(raw_shape, list) else set()
+
+    def projection(kind: str) -> tuple[list[str], list[list[str]], dict[str, list[str]]]:
+        ordered = sorted(
+            (
+                (node_id, ordinal)
+                for (node_kind, node_id), (ordinal, _) in snapshot.nodes.items()
+                if node_kind == kind
+            ),
+            key=lambda item: (item[1], item[0]),
+        )
+        order = [node_id for node_id, _ in ordered]
+        dependencies = {node_id: [] for node_id in order}
+        edges = sorted(
+            (source, target) for edge_kind, source, target in snapshot.edges if edge_kind == kind
+        )
+        for source, target in edges:
+            dependencies.setdefault(source, [])
+            dependencies.setdefault(target, []).append(source)
+        for required in dependencies.values():
+            required.sort()
+        return order, [[source, target] for source, target in edges], dependencies
+
+    order, edges, dependencies = projection("dependency")
+    if section == "source_dependency_tree":
+        records: dict[str, Any] = {}
+        for (kind, node_id), (_, payload) in snapshot.nodes.items():
+            if kind != "dependency" or not isinstance(payload, dict):
+                continue
+            records[node_id] = dict(payload) | {"dependencies": dependencies.get(node_id, [])}
+        projections = {
+            "order": order,
+            "edges": edges,
+            "dependencies": dependencies,
+            "nodes": records,
+        }
+        return metadata | {key: value for key, value in projections.items() if key in shape}
+
+    clean: dict[str, Any] = {}
+    interfaces: dict[str, Any] = {}
+    dirty: list[str] = []
+    stale: list[str] = []
+    imports_present: set[str] = set()
+    for (kind, node_id), (_, payload) in snapshot.nodes.items():
+        if kind != "dependency" or not isinstance(payload, dict):
+            continue
+        if isinstance(payload.get("clean"), dict):
+            clean[node_id] = payload["clean"]
+        if isinstance(payload.get("interface"), dict):
+            interfaces[node_id] = payload["interface"]
+        if payload.get("dirty"):
+            dirty.append(node_id)
+        if payload.get("stale"):
+            stale.append(node_id)
+        if payload.get("interface_imports"):
+            imports_present.add(node_id)
+    interface_order, interface_edges, interface_dependencies = projection("interface")
+    interface_imports = {
+        node_id: interface_dependencies.get(node_id, []) for node_id in sorted(imports_present)
+    }
+    interface_algorithm = metadata.pop("interface_graph_algorithm", "observed-lean-imports")
+    interface_coverage = metadata.pop("interface_graph_coverage", len(interface_imports))
+    projections = {
+        "order": order,
+        "edges": edges,
+        "dependencies": dependencies,
+        "clean": clean,
+        "dirty": sorted(dirty),
+        "interfaces": interfaces,
+        "interface_imports": interface_imports,
+        "interface_import_graph": {
+            "algorithm": interface_algorithm,
+            "order": interface_order,
+            "edges": interface_edges,
+            "dependencies": interface_dependencies,
+            "coverage": interface_coverage,
+        },
+        "interface_stale": sorted(stale),
+    }
+    return metadata | {key: value for key, value in projections.items() if key in shape}
 
 
 def _connect(path: Path) -> sqlite3.Connection:
@@ -64,6 +447,7 @@ def _create_schema(connection: sqlite3.Connection) -> None:
     writes never update it; normalized rows are authoritative in schema v2.
     """
 
+    previous_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
     _create_v1_schema(connection)
     connection.executescript(
         """
@@ -112,6 +496,44 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             revision INTEGER NOT NULL,
             payload BLOB NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS state_items (
+            section TEXT NOT NULL,
+            item_key TEXT NOT NULL,
+            ordinal INTEGER NOT NULL,
+            revision INTEGER NOT NULL DEFAULT 0,
+            payload BLOB NOT NULL,
+            PRIMARY KEY(section, item_key)
+        );
+        CREATE INDEX IF NOT EXISTS state_items_order
+            ON state_items(section, ordinal, item_key);
+        CREATE TABLE IF NOT EXISTS graph_metadata (
+            graph TEXT NOT NULL,
+            key TEXT NOT NULL,
+            revision INTEGER NOT NULL DEFAULT 0,
+            payload BLOB NOT NULL,
+            PRIMARY KEY(graph, key)
+        );
+        CREATE TABLE IF NOT EXISTS graph_nodes (
+            graph TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            node_id TEXT NOT NULL,
+            ordinal INTEGER NOT NULL,
+            revision INTEGER NOT NULL DEFAULT 0,
+            payload BLOB NOT NULL,
+            PRIMARY KEY(graph, kind, node_id)
+        );
+        CREATE INDEX IF NOT EXISTS graph_nodes_order
+            ON graph_nodes(graph, kind, ordinal, node_id);
+        CREATE TABLE IF NOT EXISTS graph_edges (
+            graph TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            source_id TEXT NOT NULL,
+            target_id TEXT NOT NULL,
+            revision INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY(graph, kind, source_id, target_id)
+        );
+        CREATE INDEX IF NOT EXISTS graph_edges_target
+            ON graph_edges(graph, kind, target_id, source_id);
         CREATE TABLE IF NOT EXISTS changes (
             revision INTEGER NOT NULL,
             entity_type TEXT NOT NULL,
@@ -132,17 +554,15 @@ def _create_schema(connection: sqlite3.Connection) -> None:
     ):
         if name not in columns:
             connection.execute(f"ALTER TABLE runs ADD COLUMN {name} {declaration}")
+    if previous_version == 2:
+        _migrate_v2_globals(connection)
     connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
 
 def _split_checkpoint(
     checkpoint: dict[str, Any],
 ) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]], dict[str, dict[str, Any]]]:
-    header = {
-        key: value
-        for key, value in checkpoint.items()
-        if key not in {"documents", "work_units", "tasks", "source_issues"}
-    }
+    header = bounded_global_snapshot(checkpoint)
     documents = [value for value in checkpoint.get("documents", []) if isinstance(value, dict)]
     work_units = [value for value in checkpoint.get("work_units", []) if isinstance(value, dict)]
     raw_tasks = checkpoint.get("tasks", {})
@@ -152,6 +572,82 @@ def _split_checkpoint(
         else {}
     )
     return header, documents, work_units, tasks
+
+
+def _replace_collection(connection: sqlite3.Connection, section: str, value: Any) -> None:
+    connection.execute("DELETE FROM state_items WHERE section=?", (section,))
+    rows = collection_snapshot(section, value)
+    connection.executemany(
+        "INSERT INTO state_items(section, item_key, ordinal, payload) VALUES(?, ?, ?, ?)",
+        ((section, key, ordinal, json.dumpb(payload)) for key, (ordinal, payload) in rows.items()),
+    )
+
+
+def _replace_graph(connection: sqlite3.Connection, section: str, value: Any) -> None:
+    snapshot = graph_snapshot(section, value)
+    connection.execute("DELETE FROM graph_metadata WHERE graph=?", (section,))
+    connection.execute("DELETE FROM graph_nodes WHERE graph=?", (section,))
+    connection.execute("DELETE FROM graph_edges WHERE graph=?", (section,))
+    connection.executemany(
+        "INSERT INTO graph_metadata(graph, key, payload) VALUES(?, ?, ?)",
+        ((section, key, json.dumpb(payload)) for key, payload in snapshot.metadata.items()),
+    )
+    connection.executemany(
+        "INSERT INTO graph_nodes(graph, kind, node_id, ordinal, payload) VALUES(?, ?, ?, ?, ?)",
+        (
+            (section, kind, node_id, ordinal, json.dumpb(payload))
+            for (kind, node_id), (ordinal, payload) in snapshot.nodes.items()
+        ),
+    )
+    connection.executemany(
+        "INSERT INTO graph_edges(graph, kind, source_id, target_id) VALUES(?, ?, ?, ?)",
+        ((section, kind, source, target) for kind, source, target in snapshot.edges),
+    )
+
+
+def _migrate_v2_globals(connection: sqlite3.Connection) -> None:
+    row = connection.execute("SELECT payload FROM globals WHERE key='state'").fetchone()
+    if row is None:
+        return
+    checkpoint = json.loads(row[0])
+    if not isinstance(checkpoint, dict):
+        raise ValueError("invalid global state while migrating schema v2")
+    thread_row = connection.execute(
+        "SELECT payload FROM globals WHERE key='thread_cumulative_usage'"
+    ).fetchone()
+    if thread_row is not None:
+        thread_usage = json.loads(thread_row[0])
+        if isinstance(thread_usage, dict):
+            checkpoint["thread_cumulative_usage"] = thread_usage
+    for section in COLLECTION_SECTIONS.difference({"coordinator_targets"}):
+        _replace_collection(connection, section, checkpoint.get(section, {}))
+    for section in GRAPH_SECTIONS:
+        _replace_graph(connection, section, checkpoint.get(section, {}))
+    coordinator_row = connection.execute(
+        "SELECT payload FROM globals WHERE key='coordinator_build'"
+    ).fetchone()
+    coordinator = (
+        json.loads(coordinator_row[0])
+        if coordinator_row is not None
+        else checkpoint.get("coordinator_build")
+    )
+    if isinstance(coordinator, dict):
+        coordinator = dict(coordinator)
+        targets = coordinator.pop("target_work_unit_ids", coordinator.pop("target_chapter_ids", []))
+        _replace_collection(connection, "coordinator_targets", targets)
+        connection.execute(
+            """
+            INSERT INTO globals(key, revision, payload)
+            SELECT 'coordinator_build', revision, ? FROM meta WHERE singleton=1
+            ON CONFLICT(key) DO UPDATE SET payload=excluded.payload
+            """,
+            (json.dumpb(coordinator),),
+        )
+    connection.execute(
+        "UPDATE globals SET payload=? WHERE key='state'",
+        (json.dumpb(bounded_global_snapshot(checkpoint)),),
+    )
+    connection.execute("DELETE FROM globals WHERE key='thread_cumulative_usage'")
 
 
 def _upsert_normalized_checkpoint(
@@ -168,6 +664,10 @@ def _upsert_normalized_checkpoint(
         """,
         (revision, json.dumpb(header)),
     )
+    for section in COLLECTION_SECTIONS.difference({"coordinator_targets"}):
+        _replace_collection(connection, section, checkpoint.get(section, {}))
+    for section in GRAPH_SECTIONS:
+        _replace_graph(connection, section, checkpoint.get(section, {}))
     connection.executemany(
         """
         INSERT INTO documents(id, ordinal, payload) VALUES(?, ?, ?)
@@ -293,6 +793,82 @@ def _agent_summary(connection: sqlite3.Connection, base_agents: dict[str, Any]) 
     }
 
 
+def _load_collection(connection: sqlite3.Connection, section: str) -> Any:
+    rows = [
+        (str(key), int(ordinal), json.loads(payload))
+        for key, ordinal, payload in connection.execute(
+            """
+            SELECT item_key, ordinal, payload FROM state_items
+            WHERE section=? ORDER BY ordinal, item_key
+            """,
+            (section,),
+        )
+    ]
+    return restore_collection(section, rows)
+
+
+def _load_graph(connection: sqlite3.Connection, section: str) -> dict[str, Any]:
+    metadata = {
+        str(key): json.loads(payload)
+        for key, payload in connection.execute(
+            "SELECT key, payload FROM graph_metadata WHERE graph=?", (section,)
+        )
+    }
+    nodes = {
+        (str(kind), str(node_id)): (int(ordinal), json.loads(payload))
+        for kind, node_id, ordinal, payload in connection.execute(
+            """
+            SELECT kind, node_id, ordinal, payload FROM graph_nodes
+            WHERE graph=? ORDER BY kind, ordinal, node_id
+            """,
+            (section,),
+        )
+    }
+    edges = frozenset(
+        (str(kind), str(source), str(target))
+        for kind, source, target in connection.execute(
+            """
+            SELECT kind, source_id, target_id FROM graph_edges
+            WHERE graph=? ORDER BY kind, source_id, target_id
+            """,
+            (section,),
+        )
+    )
+    return restore_graph(GraphSnapshot(metadata, nodes, edges), section)
+
+
+def _upstream_request_batches(requests: Any) -> dict[str, list[str]]:
+    batches: dict[str, list[str]] = {}
+    if not isinstance(requests, dict):
+        return batches
+    for request_id, request in sorted(requests.items()):
+        if not isinstance(request, dict) or request.get("status") != "requested":
+            continue
+        owner = request.get("owner_chapter_id")
+        if isinstance(owner, str) and owner:
+            batches.setdefault(owner, []).append(str(request_id))
+    return batches
+
+
+def _hydrate_normalized_state(
+    connection: sqlite3.Connection,
+    checkpoint: dict[str, Any],
+    *,
+    sections: set[str] | frozenset[str] | None = None,
+) -> None:
+    selected = NORMALIZED_STATE_KEYS if sections is None else sections
+    for section in COLLECTION_SECTIONS.difference({"coordinator_targets"}):
+        if section in selected:
+            checkpoint[section] = _load_collection(connection, section)
+    for section in GRAPH_SECTIONS:
+        if section in selected:
+            checkpoint[section] = _load_graph(connection, section)
+    if "upstream_requests" in selected:
+        checkpoint["upstream_request_batches"] = _upstream_request_batches(
+            checkpoint.get("upstream_requests")
+        )
+
+
 def _migrate_v1(connection: sqlite3.Connection) -> None:
     row = connection.execute("SELECT payload FROM checkpoint WHERE singleton=1").fetchone()
     checkpoint = json.loads(row[0]) if row is not None else None
@@ -409,11 +985,15 @@ def initialize_database(state_dir: Path) -> Path:
             if version == 1:
                 with connection:
                     _migrate_v1(connection)
+            elif version == 2:
+                with connection:
+                    _create_schema(connection)
             elif version != SCHEMA_VERSION:
                 raise ValueError(
                     f"unsupported swarm database schema {version}; expected {SCHEMA_VERSION}"
                 )
-            _create_schema(connection)
+            else:
+                _create_schema(connection)
         return database_path
 
     state_path = state_dir / "state.json"
@@ -518,6 +1098,8 @@ class DatabaseWrite:
 
     updated_at: str
     globals: dict[str, bytes] = field(default_factory=dict)
+    collections: dict[str, CollectionWrite] = field(default_factory=dict)
+    graphs: dict[str, GraphWrite] = field(default_factory=dict)
     tasks: dict[str, bytes] = field(default_factory=dict)
     runs: dict[str, tuple[str, bytes]] = field(default_factory=dict)
     source_issues: dict[str, bytes] = field(default_factory=dict)
@@ -531,6 +1113,8 @@ class DatabaseWrite:
 
 def _coalesce_writes(writes: list[DatabaseWrite]) -> DatabaseWrite:
     globals_: dict[str, bytes] = {}
+    collections: dict[str, CollectionWrite] = {}
+    graphs: dict[str, GraphWrite] = {}
     tasks: dict[str, bytes] = {}
     runs: dict[str, tuple[str, bytes]] = {}
     issues: dict[str, bytes] = {}
@@ -542,6 +1126,51 @@ def _coalesce_writes(writes: list[DatabaseWrite]) -> DatabaseWrite:
     config_fingerprint: str | None = None
     for write in writes:
         globals_.update(write.globals)
+        for section, delta in write.collections.items():
+            previous = collections.get(section, CollectionWrite())
+            upserts = dict(previous.upserts)
+            deletes = set(previous.deletes)
+            for key in delta.deletes:
+                upserts.pop(key, None)
+                deletes.add(key)
+            for key, value in delta.upserts.items():
+                deletes.discard(key)
+                upserts[key] = value
+            collections[section] = CollectionWrite(upserts, frozenset(deletes))
+        for section, delta in write.graphs.items():
+            previous = graphs.get(section, GraphWrite())
+            metadata_upserts = dict(previous.metadata_upserts)
+            metadata_deletes = set(previous.metadata_deletes)
+            node_upserts = dict(previous.node_upserts)
+            node_deletes = set(previous.node_deletes)
+            edge_upserts = set(previous.edge_upserts)
+            edge_deletes = set(previous.edge_deletes)
+            for key in delta.metadata_deletes:
+                metadata_upserts.pop(key, None)
+                metadata_deletes.add(key)
+            for key, value in delta.metadata_upserts.items():
+                metadata_deletes.discard(key)
+                metadata_upserts[key] = value
+            for key in delta.node_deletes:
+                node_upserts.pop(key, None)
+                node_deletes.add(key)
+            for key, value in delta.node_upserts.items():
+                node_deletes.discard(key)
+                node_upserts[key] = value
+            for edge in delta.edge_deletes:
+                edge_upserts.discard(edge)
+                edge_deletes.add(edge)
+            for edge in delta.edge_upserts:
+                edge_deletes.discard(edge)
+                edge_upserts.add(edge)
+            graphs[section] = GraphWrite(
+                metadata_upserts,
+                frozenset(metadata_deletes),
+                node_upserts,
+                frozenset(node_deletes),
+                frozenset(edge_upserts),
+                frozenset(edge_deletes),
+            )
         tasks.update(write.tasks)
         runs.update(write.runs)
         if write.replace_source_issues:
@@ -557,6 +1186,8 @@ def _coalesce_writes(writes: list[DatabaseWrite]) -> DatabaseWrite:
     return DatabaseWrite(
         updated_at=writes[-1].updated_at,
         globals=globals_,
+        collections=collections,
+        graphs=graphs,
         tasks=tasks,
         runs=runs,
         source_issues=issues,
@@ -690,6 +1321,81 @@ class StateDatabase:
                             revision=excluded.revision, payload=excluded.payload
                         """,
                         (key, revision, payload),
+                    )
+                for section, delta in write.collections.items():
+                    connection.executemany(
+                        "DELETE FROM state_items WHERE section=? AND item_key=?",
+                        ((section, key) for key in delta.deletes),
+                    )
+                    connection.executemany(
+                        """
+                        INSERT INTO state_items(section, item_key, ordinal, revision, payload)
+                        VALUES(?, ?, ?, ?, ?)
+                        ON CONFLICT(section, item_key) DO UPDATE SET
+                            ordinal=excluded.ordinal,
+                            revision=excluded.revision,
+                            payload=excluded.payload
+                        """,
+                        (
+                            (section, key, ordinal, revision, payload)
+                            for key, (ordinal, payload) in delta.upserts.items()
+                        ),
+                    )
+                for section, delta in write.graphs.items():
+                    connection.executemany(
+                        "DELETE FROM graph_metadata WHERE graph=? AND key=?",
+                        ((section, key) for key in delta.metadata_deletes),
+                    )
+                    connection.executemany(
+                        """
+                        INSERT INTO graph_metadata(graph, key, revision, payload)
+                        VALUES(?, ?, ?, ?)
+                        ON CONFLICT(graph, key) DO UPDATE SET
+                            revision=excluded.revision, payload=excluded.payload
+                        """,
+                        (
+                            (section, key, revision, payload)
+                            for key, payload in delta.metadata_upserts.items()
+                        ),
+                    )
+                    connection.executemany(
+                        "DELETE FROM graph_nodes WHERE graph=? AND kind=? AND node_id=?",
+                        ((section, kind, node_id) for kind, node_id in delta.node_deletes),
+                    )
+                    connection.executemany(
+                        """
+                        INSERT INTO graph_nodes(graph, kind, node_id, ordinal, revision, payload)
+                        VALUES(?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(graph, kind, node_id) DO UPDATE SET
+                            ordinal=excluded.ordinal,
+                            revision=excluded.revision,
+                            payload=excluded.payload
+                        """,
+                        (
+                            (section, kind, node_id, ordinal, revision, payload)
+                            for (kind, node_id), (ordinal, payload) in delta.node_upserts.items()
+                        ),
+                    )
+                    connection.executemany(
+                        """
+                        DELETE FROM graph_edges
+                        WHERE graph=? AND kind=? AND source_id=? AND target_id=?
+                        """,
+                        (
+                            (section, kind, source, target)
+                            for kind, source, target in delta.edge_deletes
+                        ),
+                    )
+                    connection.executemany(
+                        """
+                        INSERT OR IGNORE INTO graph_edges(
+                            graph, kind, source_id, target_id, revision
+                        ) VALUES(?, ?, ?, ?, ?)
+                        """,
+                        (
+                            (section, kind, source, target, revision)
+                            for kind, source, target in delta.edge_upserts
+                        ),
                     )
                 for key, payload in write.tasks.items():
                     value = json.loads(payload)
@@ -829,14 +1535,16 @@ class StateDatabase:
             value = json.loads(row[0])
             if not isinstance(value, dict):
                 raise ValueError(f"invalid global state in {self.path}")
-            for key in ("coordinator_build", "thread_cumulative_usage"):
-                section_row = connection.execute(
-                    "SELECT payload FROM globals WHERE key=?", (key,)
-                ).fetchone()
-                if section_row is not None:
-                    section = json.loads(section_row[0])
-                    if isinstance(section, dict):
-                        value[key] = section
+            section_row = connection.execute(
+                "SELECT payload FROM globals WHERE key='coordinator_build'"
+            ).fetchone()
+            if section_row is not None:
+                section = json.loads(section_row[0])
+                if isinstance(section, dict):
+                    value["coordinator_build"] = section | {
+                        "target_work_unit_ids": _load_collection(connection, "coordinator_targets")
+                    }
+            _hydrate_normalized_state(connection, value, sections={"scheduling"})
             base_agents = value.get("agents", {})
             value["agents"] = _agent_summary(
                 connection, dict(base_agents) if isinstance(base_agents, dict) else {}
@@ -998,19 +1706,20 @@ class StateDatabase:
                     globals_["revision"] = current
                     if current_row is not None:
                         globals_["updated_at"] = str(current_row[1])
-                for key in sorted(global_ids.difference({"state"})):
+                normalized_ids = global_ids.intersection(NORMALIZED_STATE_KEYS)
+                _hydrate_normalized_state(connection, globals_, sections=normalized_ids)
+                if "coordinator_build" in global_ids:
                     section_row = connection.execute(
-                        "SELECT payload FROM globals WHERE key=?", (key,)
+                        "SELECT payload FROM globals WHERE key='coordinator_build'"
                     ).fetchone()
                     if section_row is not None:
-                        globals_[key] = json.loads(section_row[0])
-                if "state" in global_ids:
-                    for key in ("coordinator_build", "thread_cumulative_usage"):
-                        section_row = connection.execute(
-                            "SELECT payload FROM globals WHERE key=?", (key,)
-                        ).fetchone()
-                        if section_row is not None:
-                            globals_[key] = json.loads(section_row[0])
+                        section = json.loads(section_row[0])
+                        if isinstance(section, dict):
+                            globals_["coordinator_build"] = section | {
+                                "target_work_unit_ids": _load_collection(
+                                    connection, "coordinator_targets"
+                                )
+                            }
             task_or_run_changed = any(
                 change["entity_type"] in {"task", "run", "work_unit"} for change in changes
             )
@@ -1052,14 +1761,18 @@ class StateDatabase:
             checkpoint = json.loads(global_row[0]) if global_row is not None else None
             if isinstance(checkpoint, dict):
                 checkpoint = dict(checkpoint)
-                for key in ("coordinator_build", "thread_cumulative_usage"):
-                    section_row = connection.execute(
-                        "SELECT payload FROM globals WHERE key=?", (key,)
-                    ).fetchone()
-                    if section_row is not None:
-                        section = json.loads(section_row[0])
-                        if isinstance(section, dict):
-                            checkpoint[key] = section
+                section_row = connection.execute(
+                    "SELECT payload FROM globals WHERE key='coordinator_build'"
+                ).fetchone()
+                if section_row is not None:
+                    section = json.loads(section_row[0])
+                    if isinstance(section, dict):
+                        checkpoint["coordinator_build"] = section | {
+                            "target_work_unit_ids": _load_collection(
+                                connection, "coordinator_targets"
+                            )
+                        }
+                _hydrate_normalized_state(connection, checkpoint)
                 revision_row = connection.execute(
                     "SELECT revision, updated_at FROM meta WHERE singleton=1"
                 ).fetchone()

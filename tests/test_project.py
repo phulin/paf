@@ -13,7 +13,7 @@ from paf.config import infer_config, load_config
 from paf.models import PipelineConfig, Stage
 from paf.project import ProjectResolver
 from paf.state import StateStore, TaskStatus, TokenUsage
-from paf.state_db import read_checkpoint, read_full_snapshot
+from paf.state_db import StateDatabase, read_checkpoint, read_full_snapshot
 from tests.support import write_project
 
 
@@ -33,6 +33,17 @@ async def test_task_and_build_deltas_do_not_rewrite_global_checkpoint(tmp_path: 
 
     checkpoint = global_row("state")
     assert checkpoint is not None
+    header = json.loads(checkpoint[1])
+    assert not {
+        "scheduling",
+        "source_dependency_tree",
+        "formalize_graph",
+        "upstream_requests",
+        "proof_blockers",
+        "repair_cases",
+        "thread_cumulative_usage",
+    }.intersection(header)
+    assert len(checkpoint[1]) < 10_000
     chapter = config.chapters[0]
     await state.set_task(chapter.id, Stage.FORMALIZE, TaskStatus.RUNNING, "agent running")
     assert global_row("state") == checkpoint
@@ -59,12 +70,91 @@ async def test_task_and_build_deltas_do_not_rewrite_global_checkpoint(tmp_path: 
         TokenUsage(input_tokens=100, output_tokens=10, measured=True),
         deferred=False,
     )
-    usage = global_row("thread_cumulative_usage")
-    assert usage is not None
-    assert len(usage[1]) < 10_000
+    assert global_row("thread_cumulative_usage") is None
+    with sqlite3.connect(database) as connection:
+        usage_row = connection.execute(
+            """
+            SELECT payload FROM state_items
+            WHERE section='thread_cumulative_usage' AND item_key='thread-1'
+            """
+        ).fetchone()
+    assert usage_row is not None
+    usage_payload = json.loads(usage_row[0])
+    assert usage_payload["input_tokens"] + usage_payload["output_tokens"] == 110
     assert global_row("state") == checkpoint
     await state.finish_coordinator_build()
     await state.close()
+
+
+@pytest.mark.asyncio
+async def test_schema_v2_global_graphs_migrate_to_relational_rows(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    state = StateStore(config)
+    await state.load_or_create()
+    first, second = config.chapters
+    state.source_dependency_tree = {
+        "algorithm": "source-discovery",
+        "revision": 1,
+        "order": [first.id, second.id],
+        "edges": [[first.id, second.id]],
+        "dependencies": {first.id: [], second.id: [first.id]},
+        "nodes": {
+            first.id: {"dependencies": [], "summary": "root"},
+            second.id: {"dependencies": [first.id], "summary": "dependent"},
+        },
+    }
+    state.upstream_requests["request-1"] = {
+        "id": "request-1",
+        "status": "requested",
+        "owner_chapter_id": first.id,
+    }
+    await state.save()
+    await state.close()
+
+    snapshot = read_full_snapshot(config.settings.state_dir)
+    assert snapshot is not None
+    legacy_header = {
+        key: value
+        for key, value in snapshot.items()
+        if key not in {"documents", "work_units", "tasks", "source_issues"}
+    }
+    with sqlite3.connect(state.database_path) as connection, connection:
+        connection.execute("DELETE FROM state_items")
+        connection.execute("DELETE FROM graph_metadata")
+        connection.execute("DELETE FROM graph_nodes")
+        connection.execute("DELETE FROM graph_edges")
+        connection.execute(
+            "UPDATE globals SET payload=? WHERE key='state'",
+            (json.dumps(legacy_header).encode(),),
+        )
+        connection.execute("PRAGMA user_version=2")
+
+    StateDatabase(config.settings.state_dir).initialize()
+
+    with sqlite3.connect(state.database_path) as connection:
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+        header_payload = connection.execute(
+            "SELECT payload FROM globals WHERE key='state'"
+        ).fetchone()[0]
+        edge_count = connection.execute(
+            """
+            SELECT count(*) FROM graph_edges
+            WHERE graph='source_dependency_tree' AND source_id=? AND target_id=?
+            """,
+            (first.id, second.id),
+        ).fetchone()[0]
+        request_count = connection.execute(
+            "SELECT count(*) FROM state_items WHERE section='upstream_requests'"
+        ).fetchone()[0]
+    assert version == 3
+    assert len(header_payload) < 10_000
+    assert "source_dependency_tree" not in json.loads(header_payload)
+    assert edge_count == 1
+    assert request_count == 1
+    migrated = read_full_snapshot(config.settings.state_dir)
+    assert migrated is not None
+    assert migrated["source_dependency_tree"]["edges"] == [[first.id, second.id]]
+    assert migrated["upstream_requests"]["request-1"]["status"] == "requested"
 
 
 def test_explicit_project_and_paf_toml_resolve_all_project_paths(tmp_path: Path) -> None:

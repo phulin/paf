@@ -4,6 +4,7 @@ import asyncio
 import re
 from collections.abc import AsyncIterator, Iterable
 from contextlib import asynccontextmanager, suppress
+from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -24,7 +25,19 @@ from paf.hashing import (
 )
 from paf.models import PipelineConfig, Stage, WorkUnitLike
 from paf.pricing import LEGACY_MODEL, CostEstimate, estimate_cost
-from paf.state_db import DATABASE_NAME, DatabaseWrite, StateDatabase, StateWriter
+from paf.state_db import (
+    COLLECTION_SECTIONS,
+    DATABASE_NAME,
+    GRAPH_SECTIONS,
+    CollectionWrite,
+    DatabaseWrite,
+    GraphSnapshot,
+    GraphWrite,
+    StateDatabase,
+    StateWriter,
+    collection_snapshot,
+    graph_snapshot,
+)
 
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 LAKE_PROGRESS_RE = re.compile(r"\[(?P<completed>\d+)/(?P<total>\d+)\]\s+\S+\s+(?P<target>\S+)")
@@ -434,7 +447,11 @@ class StateStore:
         self._telemetry_flush_task: asyncio.Task[None] | None = None
         self._batch_depth = 0
         self._checkpoint_dirty = False
-        self._persisted_global_object_signature: tuple[int, ...] | None = None
+        self._persisted_section_object_ids: dict[str, int] = {}
+        self._persisted_header_object_ids: dict[str, int] = {}
+        self._dirty_sections: set[str] = set()
+        self._collection_cache: dict[str, dict[str, tuple[int, Any]]] = {}
+        self._graph_cache: dict[str, GraphSnapshot] = {}
         self._coordinator_build_dirty = False
         self._thread_usage_dirty = False
         self._static_dirty = False
@@ -674,6 +691,7 @@ class StateStore:
                         ):
                             task_value["status"] = TaskStatus.PENDING
                     self.tasks[key] = TaskRecord(**task_value)
+        self._seed_normalized_caches()
         for value in persisted_source_issues:
             if isinstance(value, dict):
                 issue_value = dict(value)
@@ -802,6 +820,9 @@ class StateStore:
         self._invalidate_aggregates()
         self._rebuild_status_indexes()
         self._checkpoint_dirty = True
+        self._dirty_sections.update(COLLECTION_SECTIONS | GRAPH_SECTIONS)
+        if raw is None:
+            self._coordinator_build_dirty = True
         config_payload = json.dumpb(
             {
                 "documents": self._document_dicts(),
@@ -1036,11 +1057,16 @@ class StateStore:
             "current_work_unit_id": build.current_work_unit_id,
         }
 
-    def _global_snapshot(self) -> dict[str, Any]:
+    def _bounded_global_snapshot(self, *, include_shepherd_agents: bool) -> dict[str, Any]:
         usage = self.total_usage()
         invocation_usage = self.invocation_usage()
         cost = self.total_cost()
         invocation_cost = self.invocation_cost()
+        shepherd = {
+            name: getattr(self.shepherd, name) for name in ShepherdRecord.__dataclass_fields__
+        }
+        if include_shepherd_agents:
+            shepherd["agents"] = self._shepherd_agent_views()
         return {
             "version": 18,
             "history_database": DATABASE_NAME,
@@ -1058,6 +1084,12 @@ class StateStore:
             "cost": cost.as_dict(),
             "invocation_cost": invocation_cost.as_dict(),
             "agents": self.agent_summary(),
+            "isolation": self.isolation,
+            "shepherd": shepherd,
+        }
+
+    def _global_snapshot(self) -> dict[str, Any]:
+        return self._bounded_global_snapshot(include_shepherd_agents=True) | {
             "scheduling": self.scheduling,
             "source_dependency_tree": self.source_dependency_tree,
             "formalize_graph": self.formalize_graph,
@@ -1070,12 +1102,7 @@ class StateStore:
                 for thread_id, usage in sorted(self.thread_cumulative_usage.items())
             },
             "upstream_request_batches": self.upstream_request_batches(),
-            "isolation": self.isolation,
             "coordinator_build": self._build_dict(self.coordinator_build),
-            "shepherd": {
-                name: getattr(self.shepherd, name) for name in ShepherdRecord.__dataclass_fields__
-            }
-            | {"agents": self._shepherd_agent_views()},
             "repair_cases": {
                 key: {name: getattr(value, name) for name in RepairCaseRecord.__dataclass_fields__}
                 for key, value in sorted(self.repair_cases.items())
@@ -1092,25 +1119,57 @@ class StateStore:
             },
         }
 
-    def _global_object_signature(self) -> tuple[int, ...]:
-        """Detect compatibility callers that replace a global state container directly."""
+    def _section_value(self, section: str) -> Any:
+        if section == "thread_cumulative_usage":
+            return {
+                thread_id: self._usage_dict(usage)
+                for thread_id, usage in sorted(self.thread_cumulative_usage.items())
+            }
+        if section == "repair_cases":
+            return {
+                key: {name: getattr(value, name) for name in RepairCaseRecord.__dataclass_fields__}
+                for key, value in sorted(self.repair_cases.items())
+            }
+        if section == "repair_sweeps":
+            return {
+                key: {name: getattr(value, name) for name in RepairSweepRecord.__dataclass_fields__}
+                for key, value in sorted(self.repair_sweeps.items())
+            }
+        if section == "repair_work_units":
+            return {
+                key: {
+                    name: getattr(value, name) for name in RepairWorkUnitRecord.__dataclass_fields__
+                }
+                for key, value in sorted(self.repair_work_units.items())
+            }
+        if section == "coordinator_targets":
+            return self.coordinator_build.target_work_unit_ids
+        return getattr(self, section)
 
-        return tuple(
-            id(value)
-            for value in (
-                self.scheduling,
-                self.source_dependency_tree,
-                self.formalize_graph,
-                self.fixup_requests,
-                self.proof_review_requests,
-                self.upstream_requests,
-                self.proof_blockers,
-                self.isolation,
-                self.repair_cases,
-                self.repair_sweeps,
-                self.repair_work_units,
+    def _section_object_ids(self) -> dict[str, int]:
+        values = {
+            section: id(getattr(self, section))
+            for section in (COLLECTION_SECTIONS | GRAPH_SECTIONS).difference(
+                {"coordinator_targets"}
             )
-        )
+        }
+        values["coordinator_targets"] = id(self.coordinator_build.target_work_unit_ids)
+        return values
+
+    def _seed_normalized_caches(self) -> None:
+        self._collection_cache = {
+            section: deepcopy(collection_snapshot(section, self._section_value(section)))
+            for section in COLLECTION_SECTIONS
+        }
+        self._graph_cache = {
+            section: deepcopy(graph_snapshot(section, self._section_value(section)))
+            for section in GRAPH_SECTIONS
+        }
+        self._persisted_section_object_ids = self._section_object_ids()
+        self._persisted_header_object_ids = self._header_object_ids()
+
+    def _header_object_ids(self) -> dict[str, int]:
+        return {"isolation": id(self.isolation)}
 
     def _shepherd_agent_views(self) -> list[dict[str, Any]]:
         """Return the planner and repair workers belonging to the current or latest sweep."""
@@ -1280,16 +1339,21 @@ class StateStore:
         )
         global_names = change.globals.difference({"activity"})
         if "state" in global_names:
-            globals_ = self._global_snapshot() | {"revision": self.revision}
+            globals_ = self._bounded_global_snapshot(include_shepherd_agents=True) | {
+                "revision": self.revision
+            }
         else:
             globals_ = {}
-            if "coordinator_build" in global_names:
-                globals_["coordinator_build"] = self._build_dict(self.coordinator_build)
-            if "thread_cumulative_usage" in global_names:
-                globals_["thread_cumulative_usage"] = {
-                    thread_id: self._usage_dict(usage)
-                    for thread_id, usage in sorted(self.thread_cumulative_usage.items())
-                }
+        if "coordinator_build" in global_names:
+            globals_["coordinator_build"] = self._build_dict(self.coordinator_build)
+        for section in sorted(
+            global_names.intersection(COLLECTION_SECTIONS | GRAPH_SECTIONS).difference(
+                {"coordinator_targets"}
+            )
+        ):
+            globals_[section] = self._section_value(section)
+        if "upstream_requests" in global_names:
+            globals_["upstream_request_batches"] = self.upstream_request_batches()
         if change.stages or change.runs:
             globals_["agents"] = self.agent_summary()
         shepherd = globals_.get("shepherd", {})
@@ -1390,8 +1454,10 @@ class StateStore:
         issues: bool = False,
         static: bool = False,
         global_state: bool = True,
+        sections: Iterable[str] = (),
     ) -> None:
         self._checkpoint_dirty = self._checkpoint_dirty or global_state
+        self._dirty_sections.update(sections)
         changed_tasks = [*tasks]
         if task is not None:
             changed_tasks.append(task)
@@ -1425,9 +1491,11 @@ class StateStore:
 
     def _mark_coordinator_build_dirty(self) -> None:
         self._coordinator_build_dirty = True
+        self._dirty_sections.add("coordinator_targets")
 
     def _mark_thread_usage_dirty(self) -> None:
         self._thread_usage_dirty = True
+        self._dirty_sections.add("thread_cumulative_usage")
 
     async def _persist(self) -> None:
         if self._batch_depth:
@@ -1437,16 +1505,20 @@ class StateStore:
 
     async def flush(self) -> None:
         async with self._flush_lock:
-            global_object_signature = self._global_object_signature()
-            if (
-                self._persisted_global_object_signature is not None
-                and global_object_signature != self._persisted_global_object_signature
-            ):
+            section_object_ids = self._section_object_ids()
+            header_object_ids = self._header_object_ids()
+            if header_object_ids != self._persisted_header_object_ids:
                 self._checkpoint_dirty = True
+            self._dirty_sections.update(
+                section
+                for section, object_id in section_object_ids.items()
+                if self._persisted_section_object_ids.get(section) != object_id
+            )
             if not (
                 self._checkpoint_dirty
                 or self._coordinator_build_dirty
                 or self._thread_usage_dirty
+                or self._dirty_sections
                 or self._dirty_task_keys
                 or self._dirty_run_ids
                 or self._issues_dirty
@@ -1458,7 +1530,7 @@ class StateStore:
             self.updated_at = timestamp()
             globals_dirty = self._checkpoint_dirty
             coordinator_build_dirty = self._coordinator_build_dirty
-            thread_usage_dirty = self._thread_usage_dirty
+            dirty_sections = self._dirty_sections
             task_keys = self._dirty_task_keys
             dirty_runs = self._dirty_run_ids
             issues_dirty = self._issues_dirty
@@ -1468,6 +1540,7 @@ class StateStore:
             self._checkpoint_dirty = False
             self._coordinator_build_dirty = False
             self._thread_usage_dirty = False
+            self._dirty_sections = set()
             self._issues_dirty = False
             self._static_dirty = False
             task_context = self._task_snapshot_context() if task_keys else None
@@ -1516,6 +1589,54 @@ class StateStore:
                 if static_dirty
                 else {}
             )
+            collection_writes: dict[str, CollectionWrite] = {}
+            next_collection_cache: dict[str, dict[str, tuple[int, Any]]] = {}
+            for section in sorted(dirty_sections.intersection(COLLECTION_SECTIONS)):
+                current = collection_snapshot(section, self._section_value(section))
+                previous = self._collection_cache.get(section, {})
+                upserts = {
+                    key: (ordinal, json.dumpb(payload))
+                    for key, (ordinal, payload) in current.items()
+                    if previous.get(key) != (ordinal, payload)
+                }
+                deletes = frozenset(previous.keys() - current.keys())
+                if upserts or deletes:
+                    collection_writes[section] = CollectionWrite(upserts, deletes)
+                next_collection_cache[section] = deepcopy(current)
+            graph_writes: dict[str, GraphWrite] = {}
+            next_graph_cache: dict[str, GraphSnapshot] = {}
+            for section in sorted(dirty_sections.intersection(GRAPH_SECTIONS)):
+                current = graph_snapshot(section, self._section_value(section))
+                previous = self._graph_cache.get(section, GraphSnapshot({}, {}, frozenset()))
+                metadata_upserts = {
+                    key: json.dumpb(payload)
+                    for key, payload in current.metadata.items()
+                    if previous.metadata.get(key) != payload
+                }
+                node_upserts = {
+                    key: (ordinal, json.dumpb(payload))
+                    for key, (ordinal, payload) in current.nodes.items()
+                    if previous.nodes.get(key) != (ordinal, payload)
+                }
+                delta = GraphWrite(
+                    metadata_upserts=metadata_upserts,
+                    metadata_deletes=frozenset(previous.metadata.keys() - current.metadata.keys()),
+                    node_upserts=node_upserts,
+                    node_deletes=frozenset(previous.nodes.keys() - current.nodes.keys()),
+                    edge_upserts=current.edges - previous.edges,
+                    edge_deletes=previous.edges - current.edges,
+                )
+                if (
+                    delta.metadata_upserts
+                    or delta.metadata_deletes
+                    or delta.node_upserts
+                    or delta.node_deletes
+                    or delta.edge_upserts
+                    or delta.edge_deletes
+                ):
+                    graph_writes[section] = delta
+                next_graph_cache[section] = deepcopy(current)
+            changed_sections = set(collection_writes) | set(graph_writes)
             changed_work_units = {self.tasks[key].chapter_id for key in task_payloads} | {
                 run.chapter_id for run_id in runs if (run := self._runs_by_id.get(run_id))
             }
@@ -1531,32 +1652,40 @@ class StateStore:
                 changes.add(("global", "state"))
             if coordinator_build_dirty:
                 changes.add(("global", "coordinator_build"))
-            if thread_usage_dirty:
-                changes.add(("global", "thread_cumulative_usage"))
+            changes.update(
+                ("global", section)
+                for section in changed_sections.difference({"coordinator_targets"})
+            )
             if issues_dirty:
                 changes.add(("source_issues", "*"))
             if static_dirty:
                 changes.add(("resync", "*"))
             write = DatabaseWrite(
                 updated_at=self.updated_at,
-                globals=({"state": json.dumpb(self._global_snapshot())} if globals_dirty else {})
-                | (
-                    {"coordinator_build": json.dumpb(self._build_dict(self.coordinator_build))}
-                    if coordinator_build_dirty
+                globals=(
+                    {
+                        "state": json.dumpb(
+                            self._bounded_global_snapshot(include_shepherd_agents=False)
+                        )
+                    }
+                    if globals_dirty
                     else {}
                 )
                 | (
                     {
-                        "thread_cumulative_usage": json.dumpb(
+                        "coordinator_build": json.dumpb(
                             {
-                                thread_id: self._usage_dict(usage)
-                                for thread_id, usage in sorted(self.thread_cumulative_usage.items())
+                                key: value
+                                for key, value in self._build_dict(self.coordinator_build).items()
+                                if key != "target_work_unit_ids"
                             }
                         )
                     }
-                    if thread_usage_dirty
+                    if coordinator_build_dirty
                     else {}
                 ),
+                collections=collection_writes,
+                graphs=graph_writes,
                 tasks=task_payloads,
                 runs=runs,
                 source_issues=issues,
@@ -1569,8 +1698,11 @@ class StateStore:
             )
             revision = await asyncio.wrap_future(self._writer.submit(write))
             assert revision is not None
+            self._collection_cache.update(next_collection_cache)
+            self._graph_cache.update(next_graph_cache)
+            self._persisted_section_object_ids.update(section_object_ids)
             if globals_dirty:
-                self._persisted_global_object_signature = global_object_signature
+                self._persisted_header_object_ids = header_object_ids
             self.revision = revision
             self.change_bus.publish(
                 ChangeSet(
@@ -1580,15 +1712,16 @@ class StateStore:
                     globals=frozenset(
                         ({"state"} if globals_dirty else set())
                         | ({"coordinator_build"} if coordinator_build_dirty else set())
-                        | ({"thread_cumulative_usage"} if thread_usage_dirty else set())
+                        | changed_sections.difference({"coordinator_targets"})
                     ),
                     stages=frozenset(changed_stages),
                     full_resync=static_dirty,
                 )
             )
 
-    async def save(self) -> None:
-        self._mark_dirty()
+    async def save(self, *sections: str) -> None:
+        selected = set(sections) if sections else set(COLLECTION_SECTIONS | GRAPH_SECTIONS)
+        self._mark_dirty(global_state=not sections or "state" in selected, sections=selected)
         await self._persist()
 
     async def save_digest_migration(
@@ -1618,7 +1751,11 @@ class StateStore:
             changed_tasks.append(task)
         if changed_tasks:
             self._invalidate_status_summaries()
-        self._mark_dirty(tasks=changed_tasks)
+        self._mark_dirty(
+            tasks=changed_tasks,
+            global_state=False,
+            sections={"source_dependency_tree", "formalize_graph"},
+        )
         await self._persist()
 
     def _normalize_upstream_request_state(self) -> None:
@@ -1802,7 +1939,7 @@ class StateStore:
             blocker["updated_at"] = timestamp()
             changed[str(blocker["id"])] = blocker
         if changed:
-            self._mark_dirty()
+            self._mark_dirty(global_state=False, sections={"proof_blockers"})
             await self._persist()
         return tuple(changed.values())
 
@@ -1824,7 +1961,7 @@ class StateStore:
                 blocker["request_id"] = request_id
             changed = True
         if changed:
-            self._mark_dirty()
+            self._mark_dirty(global_state=False, sections={"proof_blockers"})
             await self._persist()
 
     def upstream_requests_for_consumer(
@@ -1874,7 +2011,7 @@ class StateStore:
                 origin_run_ids.append(origin_run_id)
             existing["sightings"] = int(existing.get("sightings", 1)) + 1
             existing["updated_at"] = timestamp()
-            self._mark_dirty()
+            self._mark_dirty(global_state=False, sections={"upstream_requests"})
             await self._persist()
             return request_id, False
 
@@ -1926,7 +2063,7 @@ class StateStore:
             record["escalated_at"] = now
             record["escalated_by_run_id"] = origin_run_id
         self.upstream_requests[request_id] = record
-        self._mark_dirty()
+        self._mark_dirty(global_state=False, sections={"upstream_requests"})
         await self._persist()
         return request_id, True
 
@@ -1974,7 +2111,7 @@ class StateStore:
                 request.pop("escalated_by_run_id", None)
                 changed = True
             if changed:
-                self._mark_dirty()
+                self._mark_dirty(global_state=False, sections={"upstream_requests"})
                 await self._persist()
 
     async def finish_upstream_requests(
@@ -2027,7 +2164,7 @@ class StateStore:
                 request["updated_at"] = timestamp()
                 changed = True
             if changed:
-                self._mark_dirty()
+                self._mark_dirty(global_state=False, sections={"upstream_requests"})
                 await self._persist()
         return tuple(closed)
 
@@ -2054,7 +2191,7 @@ class StateStore:
             request.pop("escalated_by_run_id", None)
             reopened.append(request_id)
         if reopened:
-            self._mark_dirty()
+            self._mark_dirty(global_state=False, sections={"upstream_requests"})
             await self._persist()
         return reopened
 
@@ -2075,7 +2212,7 @@ class StateStore:
             "origin_run_id": origin_run_id,
             "created_at": timestamp(),
         }
-        self._mark_dirty()
+        self._mark_dirty(global_state=False, sections={"fixup_requests"})
         await self._persist()
         return request_id
 
@@ -2084,7 +2221,7 @@ class StateStore:
         for request_id in request_ids:
             changed = self.fixup_requests.pop(request_id, None) is not None or changed
         if changed:
-            self._mark_dirty()
+            self._mark_dirty(global_state=False, sections={"fixup_requests"})
             await self._persist()
 
     async def migrate_post_review_fixups(self) -> set[str]:
@@ -2147,7 +2284,7 @@ class StateStore:
                     TaskStatus.PENDING,
                     "recovered post-review findings",
                 )
-            self._mark_dirty()
+            self._mark_dirty(global_state=False, sections={"fixup_requests"})
             await self._persist()
         return migrated
 
@@ -2169,7 +2306,7 @@ class StateStore:
             "origin_run_id": origin_run_id,
             "created_at": timestamp(),
         }
-        self._mark_dirty()
+        self._mark_dirty(global_state=False, sections={"proof_review_requests"})
         await self._persist()
         return request_id, True
 
@@ -2193,7 +2330,7 @@ class StateStore:
             if not feedback:
                 self.proof_review_requests.pop(request_id, None)
         if changed:
-            self._mark_dirty()
+            self._mark_dirty(global_state=False, sections={"proof_review_requests"})
             await self._persist()
 
     async def close(self) -> None:
@@ -2981,7 +3118,7 @@ class StateStore:
             fingerprint=fingerprint,
         )
         self.repair_cases[case.id] = case
-        self._mark_dirty()
+        self._mark_dirty(global_state=False, sections={"repair_cases"})
         return case
 
     async def start_repair_sweep(
@@ -3007,7 +3144,7 @@ class StateStore:
         self.shepherd.running_units = 0
         self.shepherd.succeeded_units = 0
         self.shepherd.failed_units = 0
-        self._mark_dirty()
+        self._mark_dirty(sections={"repair_cases", "repair_sweeps"})
         await self._persist()
         return sweep
 
@@ -3040,7 +3177,7 @@ class StateStore:
         self.shepherd.current_run_id = ""
         self.shepherd.last_summary = summary
         self.shepherd.planned_units = len(installed)
-        self._mark_dirty()
+        self._mark_dirty(sections={"repair_cases", "repair_sweeps", "repair_work_units"})
         await self._persist()
 
     async def start_repair_work_unit(self, unit_id: str) -> None:
@@ -3063,7 +3200,10 @@ class StateStore:
             case.status = RepairCaseStatus.REPAIRING
             case.updated_at = timestamp()
         self.shepherd.running_units += 1
-        self._mark_dirty(tasks=changed_tasks)
+        self._mark_dirty(
+            tasks=changed_tasks,
+            sections={"repair_cases", "repair_work_units"},
+        )
         await self._persist()
 
     async def link_repair_work_unit_run(self, unit_id: str, run_id: str) -> None:
@@ -3071,7 +3211,7 @@ class StateStore:
 
         unit = self.repair_work_units[unit_id]
         unit.run_id = run_id
-        self._mark_dirty()
+        self._mark_dirty(global_state=False, sections={"repair_work_units"})
         await self._persist()
 
     async def finish_repair_work_unit(
@@ -3102,7 +3242,7 @@ class StateStore:
             self.shepherd.succeeded_units += 1
         elif status in {RepairWorkUnitStatus.FAILED, RepairWorkUnitStatus.INTERRUPTED}:
             self.shepherd.failed_units += 1
-        self._mark_dirty(tasks=changed_tasks)
+        self._mark_dirty(tasks=changed_tasks, sections={"repair_work_units"})
         await self._persist()
 
     async def finish_repair_sweep(self, sweep_id: str, *, error: str = "") -> None:
@@ -3127,7 +3267,7 @@ class StateStore:
         self.shepherd.last_finished_at = sweep.finished_at
         self.shepherd.last_error = error
         self.shepherd.pending_failures = len(self.repairable_tasks())
-        self._mark_dirty()
+        self._mark_dirty(sections={"repair_cases", "repair_sweeps"})
         await self._persist()
 
     async def update_run(self, run: RunRecord, *, deferred: bool = False, **changes: Any) -> None:

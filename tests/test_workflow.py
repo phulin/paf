@@ -1,4 +1,6 @@
 import asyncio
+import json
+import sqlite3
 from types import SimpleNamespace
 
 import pytest
@@ -77,6 +79,44 @@ async def test_source_dependency_tree_survives_restart(tmp_path) -> None:
     await orchestrator._persist_source_dependencies(
         second, (first.id,), {"summary": "dependent", "issues": []}
     )
+
+    with sqlite3.connect(state.database_path) as connection:
+        header = connection.execute("SELECT payload FROM globals WHERE key='state'").fetchone()[0]
+        assert "source_dependency_tree" not in json.loads(header)
+        assert (
+            connection.execute(
+                """
+            SELECT count(*) FROM graph_edges
+            WHERE graph='source_dependency_tree' AND kind='dependency'
+                AND source_id=? AND target_id=?
+            """,
+                (first.id, second.id),
+            ).fetchone()[0]
+            == 1
+        )
+        revisions = dict(
+            connection.execute(
+                """
+                SELECT node_id, revision FROM graph_nodes
+                WHERE graph='source_dependency_tree' AND kind='dependency'
+                """
+            )
+        )
+
+    await orchestrator._persist_source_dependencies(
+        first, (), {"summary": "updated root", "issues": []}
+    )
+    with sqlite3.connect(state.database_path) as connection:
+        updated_revisions = dict(
+            connection.execute(
+                """
+                SELECT node_id, revision FROM graph_nodes
+                WHERE graph='source_dependency_tree' AND kind='dependency'
+                """
+            )
+        )
+    assert updated_revisions[first.id] > revisions[first.id]
+    assert updated_revisions[second.id] == revisions[second.id]
 
     reloaded = StateStore(config)
     await reloaded.load_or_create()
