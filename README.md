@@ -436,8 +436,8 @@ After the daemon exits, `status`, `snapshot`, and `wait` fall back to the persis
   branch drains, such a chunk remains a visible failed leaf task without failing the enclosing
   pipeline invocation. A cumulative attempt ledger is prior inventory: retry
   agents must refine an earlier proof using new evidence or try a materially different route instead
-  of rereading the chapter, reconfirming clean diagnostics, or echoing a missing-API claim. The stage
-  proof task succeeds only when the scoped Lean code has no
+  of rereading the chapter, reconfirming clean diagnostics, or echoing a missing-API claim. The proof
+  task succeeds only when the scoped Lean code has no
   `sorry` or `admit` tokens and final Lake validation succeeds without any warning other than
   “declaration uses `sorry`”. The exact validated source digest is persisted independently of review
   status. If it is stale after restart, the coordinator rebuilds and recounts placeholders first; a
