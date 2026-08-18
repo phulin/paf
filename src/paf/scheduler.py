@@ -24,6 +24,8 @@ from paf.codex import (
     count_placeholders,
     declaration_uses_placeholder,
     declaration_uses_placeholder_in_chapter,
+    proof_target_chunk,
+    proof_targets,
     report_schema_key,
     scope_digest,
     scoped_files,
@@ -45,7 +47,7 @@ from paf.interface_fingerprint import (
     collect_interface_fingerprints,
 )
 from paf.isolation import IsolationResult, create_isolation
-from paf.models import PipelineConfig, Stage, WorkUnit, WorkUnitLike
+from paf.models import PipelineConfig, ProofTarget, Stage, WorkUnit, WorkUnitLike
 from paf.scope import ScopeMatcher
 from paf.state import (
     ProofBlockerStatus,
@@ -1234,6 +1236,7 @@ class Orchestrator:
         role: str = "",
         request_ids: Iterable[str] = (),
         upstream_requests: Iterable[dict[str, Any]] = (),
+        proof_targets: Iterable[ProofTarget] = (),
         priority_override: float | None = None,
         resume_thread_id: str | None = None,
         resume_run_id: str = "",
@@ -1243,6 +1246,7 @@ class Orchestrator:
         upstream_repair = role == UPSTREAM_REPAIR_ROLE
         selected_request_ids = tuple(dict.fromkeys(request_ids))
         selected_upstream_requests = tuple(upstream_requests)
+        selected_proof_targets = tuple(proof_targets)
         await self.control.checkpoint()
         schedule = (
             self.statement_schedule
@@ -1311,6 +1315,10 @@ class Orchestrator:
                     run_updates["role"] = role
                 if selected_request_ids:
                     run_updates["request_ids"] = list(selected_request_ids)
+                if selected_proof_targets:
+                    run_updates["proof_targets"] = [
+                        target.as_dict() for target in selected_proof_targets
+                    ]
                 await self.state.update_run(started, **run_updates)
             return started
 
@@ -4304,6 +4312,35 @@ class Orchestrator:
                     )
                     return True
         proof_maximum = self.config.stages[Stage.PROVE].max_rounds
+        proof_chunk_size = self.config.stages[Stage.PROVE].chunk_size or 4
+        discovered_targets = await asyncio.to_thread(
+            proof_targets, self.config.settings.repo, chapter
+        )
+        chunked_proofs = bool(discovered_targets)
+        assigned_targets: tuple[ProofTarget, ...] = ()
+        chunk_round = 0
+        skipped_target_ids: set[str] = set()
+
+        def matches_target(value: dict[str, Any], target: ProofTarget) -> bool:
+            path = str(value.get("path", value.get("consumer_path", "")))
+            declaration = str(value.get("declaration", value.get("blocked_declaration", "")))
+            same_declaration = declaration == target.declaration or declaration.endswith(
+                "." + target.declaration
+            )
+            return path == target.path and same_declaration
+
+        def unavailable_target_ids(targets: Iterable[ProofTarget]) -> set[str]:
+            blockers = self.state.proof_blockers_for_consumer(chapter.id, active_only=False)
+            return {
+                target.fingerprint
+                for target in targets
+                if any(
+                    blocker.get("status") != ProofBlockerStatus.OPEN.value
+                    and matches_target(blocker, target)
+                    for blocker in blockers
+                )
+            }
+
         pending_review = any(
             isinstance(value, dict)
             and isinstance(value.get("feedback"), dict)
@@ -4361,7 +4398,7 @@ class Orchestrator:
                 targeted_request_ids,
                 _bounded_proof_feedback(feedback_ledger),
             )
-        while proof_round < proof_maximum or targeted_request_ids:
+        while chunked_proofs or proof_round < proof_maximum or targeted_request_ids:
             targeted_retry = bool(targeted_request_ids)
             if targeted_retry:
                 # The durable fact remains `answered` until this fresh run has a terminal result.
@@ -4374,6 +4411,44 @@ class Orchestrator:
                 targeted_retry = bool(targeted_request_ids)
                 if not targeted_retry:
                     continue
+            if chunked_proofs and not assigned_targets:
+                discovered_targets = await asyncio.to_thread(
+                    proof_targets, self.config.settings.repo, chapter
+                )
+                if not discovered_targets:
+                    source_digest = await asyncio.to_thread(
+                        scope_digest, self.config.settings.repo, chapter
+                    )
+                    await self._resolve_satisfied_proof_blockers(chapter)
+                    await self.state.set_task(
+                        chapter.id,
+                        Stage.PROVE,
+                        TaskStatus.SUCCEEDED,
+                        "all proof chunks completed and chapter elaborates",
+                        source_digest=source_digest,
+                    )
+                    return True
+                unavailable = skipped_target_ids | unavailable_target_ids(discovered_targets)
+                candidates = tuple(
+                    target for target in discovered_targets if target.fingerprint not in unavailable
+                )
+                if not candidates:
+                    break
+                if targeted_retry:
+                    requests = tuple(
+                        self.state.upstream_requests[request_id]
+                        for request_id in targeted_request_ids
+                        if request_id in self.state.upstream_requests
+                    )
+                    requested = tuple(
+                        target
+                        for target in candidates
+                        if any(matches_target(request, target) for request in requests)
+                    )
+                    if requested:
+                        candidates = requested
+                assigned_targets = proof_target_chunk(candidates, proof_chunk_size)
+                chunk_round = 0
             try:
                 attempt = await self._attempt(
                     chapter,
@@ -4383,10 +4458,16 @@ class Orchestrator:
                         "targeted downstream retry for upstream request(s): "
                         + ", ".join(targeted_request_ids)
                         if targeted_retry
-                        else f"proof round {proof_round + 1}/{proof_maximum}"
+                        else (
+                            f"proof chunk retry {chunk_round + 1}/{proof_maximum}: "
+                            + ", ".join(target.declaration for target in assigned_targets)
+                            if chunked_proofs
+                            else f"proof round {proof_round + 1}/{proof_maximum}"
+                        )
                     ),
                     role=DOWNSTREAM_RETRY_ROLE if targeted_retry else "",
                     request_ids=targeted_request_ids,
+                    proof_targets=assigned_targets,
                 )
             except GitCommitError as error:
                 await self.state.set_task(
@@ -4416,6 +4497,8 @@ class Orchestrator:
                 )
                 return False
             proof_round += 1
+            if chunked_proofs:
+                chunk_round += 1
             if targeted_retry:
                 succeeded_request_ids = self._succeeded_upstream_request_ids(
                     targeted_request_ids,
@@ -4457,10 +4540,19 @@ class Orchestrator:
                         "targeted downstream retry did not prove: " + ", ".join(sorted(unresolved)),
                     )
                     return False
+            remaining_targets = (
+                await asyncio.to_thread(proof_targets, self.config.settings.repo, chapter)
+                if chunked_proofs
+                else ()
+            )
+            assigned_ids = {target.fingerprint for target in assigned_targets}
+            remaining_assigned = tuple(
+                target for target in remaining_targets if target.fingerprint in assigned_ids
+            )
             if (
                 attempt.agent.succeeded
                 and attempt.validation.succeeded
-                and attempt.agent.placeholders == 0
+                and (not remaining_targets if chunked_proofs else attempt.agent.placeholders == 0)
             ):
                 await self._resolve_satisfied_proof_blockers(chapter)
                 source_digest = await asyncio.to_thread(
@@ -4474,6 +4566,25 @@ class Orchestrator:
                     source_digest=source_digest,
                 )
                 return True
+            if (
+                chunked_proofs
+                and assigned_targets
+                and not remaining_assigned
+                and attempt.agent.succeeded
+                and attempt.validation.succeeded
+            ):
+                await self._resolve_satisfied_proof_blockers(chapter)
+                await self.state.set_task(
+                    chapter.id,
+                    Stage.PROVE,
+                    TaskStatus.PENDING,
+                    f"completed proof chunk with {len(remaining_targets)} declaration(s) remaining",
+                )
+                assigned_targets = ()
+                chunk_round = 0
+                feedback_ledger.clear()
+                feedback = ""
+                continue
 
             feedback_ledger.clear()
             feedback_ledger.append(f"Proof attempt {proof_round}:\n{attempt.feedback()}")
@@ -4574,6 +4685,17 @@ class Orchestrator:
                     feedback,
                 )
                 continue
+            if (
+                chunked_proofs
+                and terminal_blockers
+                and not self.state.proof_blockers_for_consumer(chapter.id)
+            ):
+                skipped_target_ids.update(target.fingerprint for target in assigned_targets)
+                assigned_targets = ()
+                chunk_round = 0
+                feedback_ledger.clear()
+                feedback = ""
+                continue
             if terminal_blockers and not self.state.proof_blockers_for_consumer(chapter.id):
                 await self.state.set_task(
                     chapter.id,
@@ -4583,6 +4705,18 @@ class Orchestrator:
                 )
                 return False
             placeholders = attempt.agent.placeholders
+            if chunked_proofs:
+                if chunk_round >= proof_maximum:
+                    skipped_target_ids.update(target.fingerprint for target in assigned_targets)
+                    assigned_targets = ()
+                    chunk_round = 0
+                    feedback_ledger.clear()
+                    feedback = ""
+                elif remaining_assigned:
+                    # Refresh line numbers and placeholder counts after partial progress while
+                    # retaining the retry budget for this logical chunk.
+                    assigned_targets = remaining_assigned
+                continue
             if previous_placeholders is not None and placeholders >= previous_placeholders:
                 stalled_rounds += 1
             else:
@@ -4597,6 +4731,11 @@ class Orchestrator:
                 )
                 return False
 
+        unresolved_targets = (
+            await asyncio.to_thread(proof_targets, self.config.settings.repo, chapter)
+            if chunked_proofs
+            else ()
+        )
         await self.state.set_task(
             chapter.id,
             Stage.PROVE,
@@ -4607,7 +4746,16 @@ class Orchestrator:
                 for blocker in self.state.proof_blockers_for_consumer(chapter.id, active_only=False)
             )
             else TaskStatus.FAILED,
-            f"proof pass did not converge in {proof_maximum} rounds; durable blockers retained",
+            (
+                "proof chunks exhausted retries with "
+                f"{sum(target.placeholder_count for target in unresolved_targets)} "
+                "placeholder(s) remaining; durable blockers retained"
+                if chunked_proofs
+                else (
+                    f"proof pass did not converge in {proof_maximum} rounds; "
+                    "durable blockers retained"
+                )
+            ),
         )
         return False
 

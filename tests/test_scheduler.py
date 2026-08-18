@@ -3127,7 +3127,7 @@ async def test_stale_build_is_refreshed_before_proof_agent_with_placeholders(
     monkeypatch.setattr(scheduler_module, "validate", validation)
     orchestrator = Orchestrator(config, StateStore(config))
     await orchestrator.prepare()
-    fake = FakeExecutor(orchestrator.state, [result(changed=False, placeholders=0)])
+    fake = FakeExecutor(orchestrator.state, [result(changed=True, placeholders=0)])
     original_run = fake.run
 
     async def tracked_agent(
@@ -3139,20 +3139,27 @@ async def test_stale_build_is_refreshed_before_proof_agent_with_placeholders(
         workspace_root: Path | None = None,
     ) -> AgentResult:
         events.append("agent")
-        return await original_run(
+        agent = await original_run(
             attempted,
             stage,
             run,
             feedback=feedback,
             workspace_root=workspace_root,
         )
+        assert workspace_root is not None
+        target = workspace_root / "lean" / "Book" / "Chapter01.lean"
+        target.write_text(
+            target.read_text(encoding="utf-8").replace("by sorry", "by trivial"),
+            encoding="utf-8",
+        )
+        return agent
 
     monkeypatch.setattr(fake, "run", tracked_agent)
     orchestrator.executor = fake
 
     assert await orchestrator._prove(chapter)
     assert events[:2] == ["build", "agent"]
-    assert events.count("build") == 1
+    assert events.count("build") == 2
     await orchestrator.shutdown()
 
 
@@ -3221,7 +3228,9 @@ async def test_noop_proof_cannot_reuse_failed_certification(
     assert builds == 2
     proof = orchestrator.state.task(chapter.id, Stage.PROVE)
     assert proof.status == TaskStatus.FAILED
-    assert proof.detail == "proof pass stalled with 0 placeholders"
+    assert proof.detail == (
+        "proof chunks exhausted retries with 1 placeholder(s) remaining; durable blockers retained"
+    )
     assert all(run.validation is not None for run in proof.runs)
     assert [run.validation["succeeded"] for run in proof.runs if run.validation is not None] == [
         False,
@@ -4378,6 +4387,12 @@ async def test_prove_builds_run_after_agents_and_are_serialized_in_main_worktree
             feedback=feedback,
             workspace_root=workspace_root,
         )
+        assert workspace_root is not None
+        target = workspace_root / chapter.lean_root / f"{chapter.chapter_path}.lean"
+        target.write_text(
+            target.read_text(encoding="utf-8").replace("by sorry", "by trivial"),
+            encoding="utf-8",
+        )
         completed_agents.add(chapter.id)
         return agent
 
@@ -4403,6 +4418,251 @@ async def test_prove_builds_run_after_agents_and_are_serialized_in_main_worktree
 
     assert await orchestrator.run_stage(Stage.PROVE)
     assert maximum_active_builds == 1
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_prove_assigns_source_ordered_chunks_of_four_and_persists_them(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = config.chapters[0]
+    source = tmp_path / "lean" / "Book" / "Chapter01.lean"
+    source.parent.mkdir(parents=True)
+    source.write_text(
+        "\n".join(f"theorem target{i} : True := by sorry" for i in range(1, 10)) + "\n",
+        encoding="utf-8",
+    )
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await orchestrator.prepare()
+    orchestrator.force = True
+    fake = FakeExecutor(
+        state,
+        [
+            result(changed=True, placeholders=5),
+            result(changed=True, placeholders=1),
+            result(changed=True, placeholders=0),
+        ],
+    )
+    original_run = fake.run
+
+    async def solve_assigned(
+        attempted: Chapter,
+        stage: Stage,
+        run: RunRecord,
+        *,
+        feedback: str = "",
+        workspace_root: Path | None = None,
+    ) -> AgentResult:
+        agent = await original_run(
+            attempted,
+            stage,
+            run,
+            feedback=feedback,
+            workspace_root=workspace_root,
+        )
+        assert workspace_root is not None
+        target_path = workspace_root / "lean" / "Book" / "Chapter01.lean"
+        text = target_path.read_text(encoding="utf-8")
+        for target in run.proof_targets:
+            declaration = target["declaration"]
+            text = text.replace(
+                f"theorem {declaration} : True := by sorry",
+                f"theorem {declaration} : True := by trivial",
+            )
+        target_path.write_text(text, encoding="utf-8")
+        return agent
+
+    async def validation(*_args: object, **_kwargs: object) -> ValidationResult:
+        return ValidationResult(True, 0, "ok")
+
+    monkeypatch.setattr(fake, "run", solve_assigned)
+    monkeypatch.setattr(scheduler_module, "validate", validation)
+    orchestrator.executor = fake
+
+    assert await orchestrator._prove(chapter)
+    runs = state.task(chapter.id, Stage.PROVE).runs
+    assert [sum(target["placeholder_count"] for target in run.proof_targets) for run in runs] == [
+        4,
+        4,
+        1,
+    ]
+    assert [[target["declaration"] for target in run.proof_targets] for run in runs] == [
+        ["target1", "target2", "target3", "target4"],
+        ["target5", "target6", "target7", "target8"],
+        ["target9"],
+    ]
+    await orchestrator.shutdown()
+
+    recovered = StateStore(config)
+    await recovered.load_or_create()
+    persisted = recovered.task(chapter.id, Stage.PROVE).runs
+    assert [run.proof_targets for run in persisted] == [run.proof_targets for run in runs]
+    await recovered.close()
+
+
+@pytest.mark.asyncio
+async def test_prove_retries_the_same_chunk_before_advancing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    config = replace(
+        config,
+        stages={
+            **config.stages,
+            Stage.PROVE: replace(config.stages[Stage.PROVE], max_rounds=2),
+        },
+    )
+    chapter = config.chapters[0]
+    source = tmp_path / "lean" / "Book" / "Chapter01.lean"
+    source.parent.mkdir(parents=True)
+    source.write_text(
+        "\n".join(f"theorem target{i} : True := by sorry" for i in range(1, 6)) + "\n",
+        encoding="utf-8",
+    )
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await orchestrator.prepare()
+    orchestrator.force = True
+    fake = FakeExecutor(
+        state,
+        [
+            result(changed=False, placeholders=5),
+            result(changed=True, placeholders=1),
+            result(changed=True, placeholders=0),
+        ],
+    )
+    original_run = fake.run
+    calls = 0
+
+    async def solve_after_first_attempt(
+        attempted: Chapter,
+        stage: Stage,
+        run: RunRecord,
+        *,
+        feedback: str = "",
+        workspace_root: Path | None = None,
+    ) -> AgentResult:
+        nonlocal calls
+        calls += 1
+        agent = await original_run(
+            attempted,
+            stage,
+            run,
+            feedback=feedback,
+            workspace_root=workspace_root,
+        )
+        if calls == 1:
+            return agent
+        assert workspace_root is not None
+        target_path = workspace_root / "lean" / "Book" / "Chapter01.lean"
+        text = target_path.read_text(encoding="utf-8")
+        for target in run.proof_targets:
+            declaration = target["declaration"]
+            text = text.replace(
+                f"theorem {declaration} : True := by sorry",
+                f"theorem {declaration} : True := by trivial",
+            )
+        target_path.write_text(text, encoding="utf-8")
+        return agent
+
+    async def validation(*_args: object, **_kwargs: object) -> ValidationResult:
+        return ValidationResult(True, 0, "ok")
+
+    monkeypatch.setattr(fake, "run", solve_after_first_attempt)
+    monkeypatch.setattr(scheduler_module, "validate", validation)
+    orchestrator.executor = fake
+
+    assert await orchestrator._prove(chapter)
+    runs = state.task(chapter.id, Stage.PROVE).runs
+    assert runs[0].proof_targets == runs[1].proof_targets
+    assert runs[2].proof_targets != runs[1].proof_targets
+    assert [target["declaration"] for target in runs[2].proof_targets] == ["target5"]
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_blocked_proof_chunk_does_not_prevent_independent_chunk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    config = replace(
+        config,
+        stages={
+            **config.stages,
+            Stage.PROVE: replace(config.stages[Stage.PROVE], chunk_size=1),
+        },
+    )
+    chapter = config.chapters[0]
+    source = tmp_path / "lean" / "Book" / "Chapter01.lean"
+    source.parent.mkdir(parents=True)
+    source.write_text(
+        "theorem first : True := by sorry\ntheorem second : True := by sorry\n",
+        encoding="utf-8",
+    )
+    obstruction = failed_attempt(
+        "no proof can be constructed from the current interface",
+        path="lean/Book/Chapter01.lean",
+        declaration="first",
+    ) | {"disposition": "genuine_blocker"}
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await orchestrator.prepare()
+    orchestrator.force = True
+    fake = FakeExecutor(
+        state,
+        [
+            result(changed=False, placeholders=2, failed_attempts=[obstruction]),
+            result(changed=False, placeholders=2, failed_attempts=[obstruction]),
+            result(changed=True, placeholders=1, failed_attempts=[]),
+        ],
+    )
+    original_run = fake.run
+
+    async def solve_second(
+        attempted: Chapter,
+        stage: Stage,
+        run: RunRecord,
+        *,
+        feedback: str = "",
+        workspace_root: Path | None = None,
+    ) -> AgentResult:
+        agent = await original_run(
+            attempted,
+            stage,
+            run,
+            feedback=feedback,
+            workspace_root=workspace_root,
+        )
+        if run.proof_targets[0]["declaration"] == "second":
+            assert workspace_root is not None
+            target_path = workspace_root / "lean" / "Book" / "Chapter01.lean"
+            target_path.write_text(
+                target_path.read_text(encoding="utf-8").replace(
+                    "theorem second : True := by sorry",
+                    "theorem second : True := by trivial",
+                ),
+                encoding="utf-8",
+            )
+        return agent
+
+    async def validation(*_args: object, **_kwargs: object) -> ValidationResult:
+        return ValidationResult(True, 0, "ok")
+
+    monkeypatch.setattr(fake, "run", solve_second)
+    monkeypatch.setattr(scheduler_module, "validate", validation)
+    orchestrator.executor = fake
+
+    assert not await orchestrator._prove(chapter)
+    runs = state.task(chapter.id, Stage.PROVE).runs
+    assert [run.proof_targets[0]["declaration"] for run in runs] == [
+        "first",
+        "first",
+        "second",
+    ]
+    assert state.task(chapter.id, Stage.PROVE).status == TaskStatus.BLOCKED
+    assert "theorem second : True := by trivial" in source.read_text(encoding="utf-8")
     await orchestrator.shutdown()
 
 

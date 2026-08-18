@@ -1121,6 +1121,7 @@ class CodexExecutor:
             and prior.thread_id
             and (prior.role or prior.stage) == (run.role or run.stage)
             and prior.request_ids == run.request_ids
+            and prior.proof_targets == run.proof_targets
             and (not prior.prompt_kind or prior.prompt_kind == run.prompt_kind)
             else None
         )
