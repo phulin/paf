@@ -416,6 +416,11 @@ def test_unnamed_examples_are_independent_proof_targets(tmp_path: Path) -> None:
 def test_proof_prompt_contains_only_the_assigned_chunk(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
     chapter = config.chapters[0]
+    config.stages[Stage.PROVE].prompt.write_text(
+        "# Prove {book_title}\n\n## Mission\n\nProve the assigned holes.\n\n"
+        "## Working method\n\nUse checked evidence.\n",
+        encoding="utf-8",
+    )
     executor = CodexExecutor(config, StateStore(config))
     assigned = {
         "path": "lean/Book/Chapter01.lean",
@@ -438,7 +443,8 @@ def test_proof_prompt_contains_only_the_assigned_chunk(tmp_path: Path) -> None:
     assert "H1 at line 20: `left := by`" in prompt
     assert "H2 at line 23: `right := by`" in prompt
     assert "There are no unassigned placeholders" in prompt
-    assert prompt.splitlines()[1] == "## Authoritative assignment"
+    assert prompt.index("## Mission") < prompt.index("## Authoritative assignment")
+    assert prompt.index("## Authoritative assignment") < prompt.index("## Working method")
     assert "Resolve every\nlisted hole" in prompt
 
 

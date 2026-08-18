@@ -1506,8 +1506,15 @@ Work only on the assigned declaration bodies and focused private helpers they re
 listed hole and every diagnostic in the assigned span. Set `complete` to `true` only when all listed
 holes are gone and no non-`sorry` diagnostic remains.
 """
-            title, separator, remainder = base.partition("\n")
-            base = f"{title}{separator}\n{proof_assignment}\n{remainder.lstrip()}"
+            workflow_heading = "\n## Working method\n"
+            if workflow_heading in base:
+                base = base.replace(
+                    workflow_heading,
+                    f"\n{proof_assignment}\n## Working method\n",
+                    1,
+                )
+            else:
+                base = f"{base.rstrip()}\n\n{proof_assignment}"
         stage_contract = {
             Stage.DISCOVER: """This is read-only source analysis. Identify the earlier chapters
 that this chapter directly needs. Do not edit any file.""",
