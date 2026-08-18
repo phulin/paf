@@ -8,6 +8,7 @@ from collections.abc import Callable, Coroutine, Iterable
 from contextlib import suppress
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
+from enum import StrEnum
 from pathlib import Path
 from threading import Lock
 from typing import Any
@@ -63,6 +64,8 @@ from paf.state import (
     RepairCaseStatus,
     RepairWorkUnitRecord,
     RepairWorkUnitStatus,
+    Requirement,
+    RequirementKind,
     RunRecord,
     StateStore,
     TaskPhase,
@@ -136,10 +139,38 @@ class Attempt:
         return "\n\n".join(parts)
 
 
+class FormalizeDisposition(StrEnum):
+    SUCCEEDED = "succeeded"
+    WAITING = "waiting"
+    FAILED = "failed"
+
+
 @dataclass(frozen=True)
 class FormalizeOutcome:
-    succeeded: bool
-    blocked_by: tuple[str, ...] = ()
+    disposition: FormalizeDisposition
+    waiting_on: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.disposition, FormalizeDisposition):
+            raise TypeError("FormalizeOutcome requires an explicit FormalizeDisposition")
+
+    @property
+    def succeeded(self) -> bool:
+        return self.disposition is FormalizeDisposition.SUCCEEDED
+
+    @property
+    def failed(self) -> bool:
+        return self.disposition is FormalizeDisposition.FAILED
+
+    @property
+    def waiting(self) -> bool:
+        return self.disposition is FormalizeDisposition.WAITING
+
+    @property
+    def blocked_by(self) -> tuple[str, ...]:
+        """Compatibility name for coordinator diagnostic owners."""
+
+        return self.waiting_on
 
 
 @dataclass(frozen=True)
@@ -1894,7 +1925,7 @@ class Orchestrator:
 
     async def _discover(self, chapter: WorkUnitLike, *, rerun: bool = False) -> FormalizeOutcome:
         if not rerun and not self.force and self._discovery_is_current(chapter):
-            return FormalizeOutcome(True)
+            return FormalizeOutcome(FormalizeDisposition.SUCCEEDED)
         attempt = await self._attempt(
             chapter,
             Stage.DISCOVER,
@@ -1920,7 +1951,7 @@ class Orchestrator:
                 TaskStatus.FAILED,
                 "discovery must be read-only",
             )
-            return FormalizeOutcome(False)
+            return FormalizeOutcome(FormalizeDisposition.FAILED)
         if attempt.agent.succeeded and attempt.validation.succeeded and complete and not invalid:
             try:
                 await self._persist_source_dependencies(chapter, dependencies, attempt.agent.report)
@@ -1928,11 +1959,11 @@ class Orchestrator:
                 await self.state.set_task(
                     chapter.id,
                     Stage.DISCOVER,
-                    TaskStatus.BLOCKED,
+                    TaskStatus.FAILED,
                     str(error),
                 )
-                return FormalizeOutcome(False)
-            return FormalizeOutcome(True)
+                return FormalizeOutcome(FormalizeDisposition.FAILED)
+            return FormalizeOutcome(FormalizeDisposition.SUCCEEDED)
         await self.state.set_task(
             chapter.id,
             Stage.DISCOVER,
@@ -1943,11 +1974,11 @@ class Orchestrator:
                 else "source dependency discovery was incomplete"
             ),
         )
-        return FormalizeOutcome(False)
+        return FormalizeOutcome(FormalizeDisposition.FAILED)
 
     async def _formalize(self, chapter: WorkUnitLike, *, rerun: bool = False) -> FormalizeOutcome:
         if self._already_done(chapter, Stage.FORMALIZE):
-            return FormalizeOutcome(True)
+            return FormalizeOutcome(FormalizeDisposition.SUCCEEDED)
         maximum = self.config.stages[Stage.FORMALIZE].max_rounds
         feedback = ""
         last_attempt: Attempt | None = None
@@ -1980,7 +2011,7 @@ class Orchestrator:
                         TaskStatus.SUCCEEDED,
                         "clean diagnostics and coordinator build in source dependency order",
                     )
-                    return FormalizeOutcome(True)
+                    return FormalizeOutcome(FormalizeDisposition.SUCCEEDED)
                 if validation.status is ValidationStatus.UPSTREAM_FAILED:
                     return await self._block_on_upstream_diagnostics(chapter, validation)
                 if validation.blocked_by:
@@ -2005,7 +2036,7 @@ class Orchestrator:
                     TaskStatus.FAILED,
                     "model capacity remained unavailable after the configured retries",
                 )
-                return FormalizeOutcome(False)
+                return FormalizeOutcome(FormalizeDisposition.FAILED)
             if not attempt.agent.succeeded or not attempt.validation.succeeded:
                 feedback = attempt.feedback()
                 continue
@@ -2041,7 +2072,7 @@ class Orchestrator:
                     TaskStatus.SUCCEEDED,
                     "clean diagnostics and coordinator build in source dependency order",
                 )
-                return FormalizeOutcome(True)
+                return FormalizeOutcome(FormalizeDisposition.SUCCEEDED)
             if validation.status is ValidationStatus.UPSTREAM_FAILED:
                 return await self._block_on_upstream_diagnostics(chapter, validation)
             if validation.blocked_by:
@@ -2053,7 +2084,7 @@ class Orchestrator:
             TaskStatus.FAILED,
             f"formalization did not reach clean diagnostics in {maximum} attempts",
         )
-        return FormalizeOutcome(False)
+        return FormalizeOutcome(FormalizeDisposition.FAILED)
 
     async def _block_on_upstream_diagnostics(
         self,
@@ -2070,7 +2101,7 @@ class Orchestrator:
             if owner_id in self._work_units_by_id and owner_id != consumer.id
         )
         if not owners:
-            return FormalizeOutcome(False)
+            return FormalizeOutcome(FormalizeDisposition.FAILED)
         await self._invalidate_build_records(owners)
         async with self.state.batch():
             for owner_id in owners:
@@ -2085,13 +2116,20 @@ class Orchestrator:
                     f"requeued as owner of coordinator diagnostics blocking {consumer.id}",
                 )
             if block_consumer:
-                await self.state.set_task(
+                await self.state.set_task_waiting(
                     consumer.id,
                     Stage.FORMALIZE,
-                    TaskStatus.BLOCKED,
-                    "blocked by upstream coordinator diagnostics",
+                    (
+                        Requirement(
+                            RequirementKind.COORDINATOR_OWNER,
+                            owner_task_key=self.state.key(owner_id, Stage.FORMALIZE),
+                            detail=f"coordinator diagnostic owned by {owner_id}",
+                        )
+                        for owner_id in owners
+                    ),
+                    "waiting for upstream coordinator diagnostic owners",
                 )
-        return FormalizeOutcome(False, owners)
+        return FormalizeOutcome(FormalizeDisposition.WAITING, owners)
 
     def _chapter_identifiers(self, chapter: WorkUnitLike) -> tuple[str, ...]:
         root = (chapter.lean_root / chapter.chapter_path).as_posix()
@@ -3815,7 +3853,6 @@ class Orchestrator:
 
         fill_discovery_window()
         formalize_tasks: dict[str, asyncio.Task[FormalizeOutcome]] = {}
-        failed: set[str] = set()
 
         async def cancel_all() -> None:
             tasks = [*discovery_tasks.values(), *formalize_tasks.values()]
@@ -3833,39 +3870,27 @@ class Orchestrator:
                     if self.state.task(chapter_id, Stage.FORMALIZE).status == TaskStatus.SUCCEEDED
                 }
                 for chapter_id in graph.order:
+                    formalize_task = self.state.task(chapter_id, Stage.FORMALIZE)
                     if (
                         chapter_id in succeeded
-                        or chapter_id in failed
                         or chapter_id in formalize_tasks
+                        or formalize_task.status
+                        in {TaskStatus.FAILED, TaskStatus.INTERRUPTED, TaskStatus.RUNNING}
                     ):
                         continue
                     if self.state.task(chapter_id, Stage.DISCOVER).status != TaskStatus.SUCCEEDED:
                         continue
                     dependencies = graph.dependencies[chapter_id]
-                    if dependencies.issubset(succeeded):
+                    if (
+                        dependencies.issubset(succeeded)
+                        and self.state.readiness(formalize_task).ready
+                    ):
                         formalize_tasks[chapter_id] = asyncio.create_task(
                             self._formalize(by_id[chapter_id])
-                        )
-                    elif dependencies & failed:
-                        failed.add(chapter_id)
-                        await self.state.set_task(
-                            chapter_id,
-                            Stage.FORMALIZE,
-                            TaskStatus.BLOCKED,
-                            "blocked by a failed source dependency formalization",
                         )
 
                 live = [*discovery_tasks.values(), *formalize_tasks.values()]
                 if not live:
-                    unresolved = set(by_id).difference(succeeded | failed)
-                    if unresolved:
-                        failed.update(unresolved)
-                        await self.state.set_tasks(
-                            unresolved,
-                            Stage.FORMALIZE,
-                            TaskStatus.BLOCKED,
-                            "blocked by incomplete discovery or a source dependency cycle",
-                        )
                     break
 
                 done, _ = await asyncio.wait(live, return_when=asyncio.FIRST_COMPLETED)
@@ -3873,27 +3898,39 @@ class Orchestrator:
                     if task not in done:
                         continue
                     discovery_tasks.pop(chapter_id)
-                    if not task.result().succeeded:
-                        failed.add(chapter_id)
+                    outcome = task.result()
+                    if (
+                        outcome.failed
+                        and self.state.task(chapter_id, Stage.DISCOVER).status != TaskStatus.FAILED
+                    ):
                         await self.state.set_task(
                             chapter_id,
-                            Stage.FORMALIZE,
-                            TaskStatus.BLOCKED,
-                            "blocked because source discovery failed",
+                            Stage.DISCOVER,
+                            TaskStatus.FAILED,
+                            "source discovery failed",
                         )
                 for chapter_id, task in tuple(formalize_tasks.items()):
                     if task not in done:
                         continue
                     formalize_tasks.pop(chapter_id)
-                    if not task.result().succeeded:
-                        failed.add(chapter_id)
+                    outcome = task.result()
+                    if (
+                        outcome.failed
+                        and self.state.task(chapter_id, Stage.FORMALIZE).status != TaskStatus.FAILED
+                    ):
+                        await self.state.set_task(
+                            chapter_id,
+                            Stage.FORMALIZE,
+                            TaskStatus.FAILED,
+                            "formalization execution failed",
+                        )
                 if progress_event is not None:
                     progress_event.set()
         except BaseException:
             await cancel_all()
             raise
 
-        return not failed and all(
+        return all(
             self.state.task(chapter_id, Stage.FORMALIZE).status == TaskStatus.SUCCEEDED
             for chapter_id in by_id
         )
@@ -4054,12 +4091,18 @@ class Orchestrator:
                     self._review_invalidation_generation(chapter_id) + 1
                 )
             self._invalidated_reviews.update(targets)
-            await self.state.set_tasks(
-                targets,
-                Stage.REVIEW,
-                TaskStatus.PENDING,
-                detail,
-            )
+            changed_targets = {
+                chapter_id
+                for chapter_id in targets
+                if self.state.task(chapter_id, Stage.REVIEW).status != TaskStatus.PENDING
+            }
+            if changed_targets:
+                await self.state.set_tasks(
+                    changed_targets,
+                    Stage.REVIEW,
+                    TaskStatus.PENDING,
+                    detail,
+                )
         return targets
 
     async def _review_build(self, chapter: WorkUnitLike) -> dict[str, str]:
@@ -4351,12 +4394,13 @@ class Orchestrator:
         try:
             initial_graph = self._observed_work_unit_graph()
         except ValueError as error:
-            await self.state.set_tasks(
-                by_id,
-                Stage.REVIEW,
-                TaskStatus.FAILED,
-                str(error),
-            )
+            self.state.scheduling["graph_failure"] = {
+                "kind": "source_dependency_graph",
+                "detail": str(error),
+                "members": sorted(by_id),
+                "updated_at": datetime.now(UTC).isoformat(),
+            }
+            await self.state.save("state")
             return False
         if self.force:
             await self._invalidate_reviews(
@@ -4398,49 +4442,6 @@ class Orchestrator:
         def formalize_ready(chapter_id: str) -> bool:
             return self.state.task(chapter_id, Stage.FORMALIZE).status == TaskStatus.SUCCEEDED
 
-        async with self.state.batch():
-            if quarantined_ids:
-                await self.state.set_tasks(
-                    quarantined_ids,
-                    Stage.REVIEW,
-                    TaskStatus.FAILED,
-                    "formalization failed; quarantined from review",
-                )
-                await self.state.set_tasks(
-                    quarantined_ids,
-                    Stage.PROVE,
-                    TaskStatus.FAILED,
-                    "formalization failed; quarantined from proof",
-                )
-            for chapter_id in initial_graph.order:
-                if chapter_id not in reviewed:
-                    if not formalize_ready(chapter_id):
-                        await self.state.set_task(
-                            chapter_id,
-                            Stage.REVIEW,
-                            TaskStatus.PENDING,
-                            "waiting for clean formalization",
-                        )
-                    else:
-                        required_reviews = self._dependency_closure(
-                            initial_graph, (chapter_id,)
-                        ).difference({chapter_id})
-                        missing = required_reviews.difference(reviewed)
-                        if missing:
-                            await self.state.set_task(
-                                chapter_id,
-                                Stage.REVIEW,
-                                TaskStatus.PENDING,
-                                "waiting: " + ", ".join(sorted(missing)),
-                            )
-                if chapter_id not in reviewed:
-                    await self.state.set_task(
-                        chapter_id,
-                        Stage.PROVE,
-                        TaskStatus.PENDING,
-                        "waiting for successful review",
-                    )
-
         async def cancel_all() -> None:
             tasks = [handle.task for handle in review_tasks.values()]
             tasks.extend(rebuild_tasks.values())
@@ -4458,12 +4459,13 @@ class Orchestrator:
                 try:
                     graph = self._observed_work_unit_graph()
                 except ValueError as error:
-                    await self.state.set_tasks(
-                        by_id,
-                        Stage.REVIEW,
-                        TaskStatus.FAILED,
-                        str(error),
-                    )
+                    self.state.scheduling["graph_failure"] = {
+                        "kind": "source_dependency_graph",
+                        "detail": str(error),
+                        "members": sorted(by_id),
+                        "updated_at": datetime.now(UTC).isoformat(),
+                    }
+                    await self.state.save("state")
                     return False
 
                 if (
@@ -4498,20 +4500,6 @@ class Orchestrator:
                             failed_formalizations,
                             detail="review blocked by failed formalization",
                         )
-                        async with self.state.batch():
-                            await self.state.set_tasks(
-                                failed_formalizations,
-                                Stage.REVIEW,
-                                TaskStatus.BLOCKED,
-                                "formalization did not complete",
-                            )
-                            if prove:
-                                await self.state.set_tasks(
-                                    failed_formalizations,
-                                    Stage.PROVE,
-                                    TaskStatus.BLOCKED,
-                                    "blocked because formalization did not complete",
-                                )
                     formalize_failures_applied = True
 
                 # Pull durable successes into readiness and remove reviews with
@@ -4576,7 +4564,7 @@ class Orchestrator:
                         and chapter_id not in review_tasks
                         and chapter_id not in proof_tasks
                         and chapter_id not in rebuild_tasks
-                        and (rereview or formalize_ready(chapter_id))
+                        and formalize_ready(chapter_id)
                         and (rereview or chapter_id in review_frontiers_ready)
                     ):
                         dependencies = graph.dependencies[chapter_id]
@@ -4668,19 +4656,6 @@ class Orchestrator:
                                 "review scheduler has unresolved chapters but no runnable tasks"
                             )
                         review_blocked.update(unresolved)
-                        await self.state.set_tasks(
-                            unresolved,
-                            Stage.REVIEW,
-                            TaskStatus.BLOCKED,
-                            "blocked by a failed prerequisite review; unrelated branches completed",
-                        )
-                        if prove:
-                            await self.state.set_tasks(
-                                unresolved | review_failures,
-                                Stage.PROVE,
-                                TaskStatus.BLOCKED,
-                                "blocked because statement review did not complete",
-                            )
                         break
                     if not prove or all(chapter_id in proof_results for chapter_id in reviewed):
                         break
@@ -5731,7 +5706,7 @@ class Orchestrator:
             self.state.repair_cases[case_id]
             for case_id in unit.case_ids
             if self.state.tasks[self.state.repair_cases[case_id].task_key].status
-            in {TaskStatus.FAILED, TaskStatus.BLOCKED}
+            == TaskStatus.FAILED
         ]
         if not active_cases:
             await self.state.finish_repair_work_unit(
@@ -5832,7 +5807,7 @@ class Orchestrator:
         async with self.state.batch():
             for case in active_cases:
                 task = self.state.tasks[case.task_key]
-                if task.status in {TaskStatus.FAILED, TaskStatus.BLOCKED}:
+                if task.status == TaskStatus.FAILED:
                     await self.state.set_task(
                         task.chapter_id,
                         Stage(task.stage),
@@ -6033,10 +6008,9 @@ class Orchestrator:
                 reopened[current.task_key] = current
                 if current.id != case.id:
                     case.status = RepairCaseStatus.EXHAUSTED
-            elif (task := self.state.tasks.get(case.task_key)) is not None and task.status not in {
-                TaskStatus.FAILED,
-                TaskStatus.BLOCKED,
-            }:
+            elif (task := self.state.tasks.get(case.task_key)) is not None and task.status != (
+                TaskStatus.FAILED
+            ):
                 case.status = RepairCaseStatus.RESOLVED
             else:
                 case.status = RepairCaseStatus.EXHAUSTED

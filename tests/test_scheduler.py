@@ -29,6 +29,7 @@ from paf.models import Chapter, PipelineConfig, ProofTarget, Stage
 from paf.scheduler import (
     BUILD_ERROR_REVIEW_KIND,
     BUILD_WARNING_REVIEW_KIND,
+    FormalizeDisposition,
     FormalizeOutcome,
     Orchestrator,
     ReviewOutcome,
@@ -515,7 +516,7 @@ async def test_discovery_scheduler_bounds_created_coroutines(
         if len(started) == 2:
             window_full.set()
         await release.wait()
-        return FormalizeOutcome(True)
+        return FormalizeOutcome(FormalizeDisposition.SUCCEEDED)
 
     monkeypatch.setattr(orchestrator, "_discover", discover)
     operation = asyncio.create_task(orchestrator._discover_all())
@@ -2416,8 +2417,13 @@ async def test_formalizer_blocks_on_upstream_diagnostics_without_running_consume
     outcome = await orchestrator._formalize(consumer)
 
     assert outcome.blocked_by == (owner.id,)
+    assert outcome.disposition is FormalizeDisposition.WAITING
     assert state.task(owner.id, Stage.FORMALIZE).status == TaskStatus.PENDING
-    assert state.task(consumer.id, Stage.FORMALIZE).status == TaskStatus.BLOCKED
+    consumer_task = state.task(consumer.id, Stage.FORMALIZE)
+    assert consumer_task.status == TaskStatus.PENDING
+    assert [requirement.owner_task_key for requirement in consumer_task.waiting_on] == [
+        state.key(owner.id, Stage.FORMALIZE)
+    ]
     assert state.task(consumer.id, Stage.FORMALIZE).rounds == 0
     await state.close()
 
@@ -2770,11 +2776,11 @@ async def test_capacity_exhaustion_is_a_bounded_formalizer_failure(
         attempts[chapter.number] += 1
         order.append((chapter.number, rerun))
         if chapter.number == 1:
-            return FormalizeOutcome(False)
+            return FormalizeOutcome(FormalizeDisposition.FAILED)
         await orchestrator.state.set_task(
             chapter.id, Stage.FORMALIZE, TaskStatus.SUCCEEDED, "formalized"
         )
-        return FormalizeOutcome(True)
+        return FormalizeOutcome(FormalizeDisposition.SUCCEEDED)
 
     monkeypatch.setattr(orchestrator, "_formalize", formalize)
 
@@ -2798,13 +2804,13 @@ async def test_formalizer_failure_does_not_cancel_healthy_workers(
         nonlocal healthy_finished
         assert not rerun
         if chapter.number == 1:
-            return FormalizeOutcome(False)
+            return FormalizeOutcome(FormalizeDisposition.FAILED)
         await asyncio.sleep(0.01)
         healthy_finished = True
         await orchestrator.state.set_task(
             chapter.id, Stage.FORMALIZE, TaskStatus.SUCCEEDED, "formalized"
         )
-        return FormalizeOutcome(True)
+        return FormalizeOutcome(FormalizeDisposition.SUCCEEDED)
 
     monkeypatch.setattr(orchestrator, "_formalize", formalize)
 
@@ -5778,7 +5784,7 @@ chapters = [1]
         await asyncio.sleep(0)
         events.append(f"end:{chapter.book_id}")
         await state.set_task(chapter.id, Stage.FORMALIZE, TaskStatus.SUCCEEDED, "formalized")
-        return FormalizeOutcome(True)
+        return FormalizeOutcome(FormalizeDisposition.SUCCEEDED)
 
     monkeypatch.setattr(orchestrator, "_formalize", formalize)
 

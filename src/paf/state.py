@@ -62,6 +62,35 @@ class TaskPhase(StrEnum):
     POSTPROCESS = "postprocess"
 
 
+class RequirementKind(StrEnum):
+    """A durable reason why a pending task is not ready to run."""
+
+    SOURCE_DISCOVERY = "source_discovery"
+    SOURCE_DEPENDENCY = "source_dependency"
+    STAGE_DEPENDENCY = "stage_dependency"
+    COORDINATOR_OWNER = "coordinator_owner"
+    BUILD_FRESHNESS = "build_freshness"
+    UPSTREAM_REQUEST = "upstream_request"
+    PROOF_REVIEW_REQUEST = "proof_review_request"
+    REPAIR_DEPENDENCY = "repair_dependency"
+    GRAPH = "graph"
+    LEGACY_BLOCK = "legacy_block"
+
+
+@dataclass(frozen=True)
+class Requirement:
+    kind: RequirementKind
+    owner_task_key: str | None = None
+    request_id: str | None = None
+    detail: str = ""
+
+
+@dataclass(frozen=True)
+class Readiness:
+    ready: bool
+    waiting: tuple[Requirement, ...] = ()
+
+
 class RepairCaseStatus(StrEnum):
     OPEN = "open"
     PLANNED = "planned"
@@ -223,9 +252,12 @@ class TaskRecord:
     status: str = TaskStatus.PENDING
     phase: str = TaskPhase.IDLE
     detail: str = ""
-    # Transient scheduling state: the task is runnable and is waiting for an
-    # agent-capacity slot. It remains pending until a run is actually started.
+    # Transient scheduling state: requirements are satisfied and the task is
+    # waiting for an agent-capacity slot. A bare pending task is not runnable.
     queued: bool = False
+    # Orthogonal readiness state. These requirements explain why a pending task
+    # cannot run yet without turning dependency impact into an execution result.
+    waiting_on: tuple[Requirement, ...] = ()
     # Repair work is an overlay on the existing four-stage state machine. The
     # underlying task remains failed/blocked until the repair is validated.
     repairing: bool = False
@@ -681,6 +713,26 @@ class StateStore:
                     task_value.setdefault("book_id", value.get("document_id"))
                     task_value.setdefault("chapter_number", value.get("ordinal"))
                     task_value.setdefault("chapter_title", value.get("unit_title"))
+                    raw_waiting = task_value.get("waiting_on", ())
+                    task_value["waiting_on"] = tuple(
+                        Requirement(
+                            kind=RequirementKind(str(item.get("kind"))),
+                            owner_task_key=(
+                                str(item["owner_task_key"])
+                                if item.get("owner_task_key") is not None
+                                else None
+                            ),
+                            request_id=(
+                                str(item["request_id"])
+                                if item.get("request_id") is not None
+                                else None
+                            ),
+                            detail=str(item.get("detail", "")),
+                        )
+                        for item in raw_waiting
+                        if isinstance(item, dict)
+                        and str(item.get("kind", "")) in RequirementKind._value2member_map_
+                    )
                     if legacy_workflow and task_value.get("stage") == "formalize":
                         task_value["stage"] = "discover"
                     elif task_value.get("stage") in {"repair", "fixup"}:
@@ -699,6 +751,17 @@ class StateStore:
                             and task_value.get("status") == TaskStatus.SUCCEEDED
                         ):
                             task_value["status"] = TaskStatus.PENDING
+                    if task_value.get("status") == TaskStatus.BLOCKED:
+                        # BLOCKED was historically persisted as a task result. Preserve the
+                        # explanation, but migrate it to orthogonal readiness metadata.
+                        task_value["status"] = TaskStatus.PENDING
+                        if not task_value["waiting_on"]:
+                            task_value["waiting_on"] = (
+                                Requirement(
+                                    RequirementKind.LEGACY_BLOCK,
+                                    detail=str(task_value.get("detail", "legacy blocked task")),
+                                ),
+                            )
                     self.tasks[key] = TaskRecord(**task_value)
         self._seed_normalized_caches()
         for value in persisted_source_issues:
@@ -1013,6 +1076,16 @@ class StateStore:
             and task.status == TaskStatus.SUCCEEDED
             and task.source_digest is not None
         )
+        waiting_on = [
+            {
+                "kind": str(requirement.kind),
+                "owner_task_key": requirement.owner_task_key,
+                "request_id": requirement.request_id,
+                "detail": requirement.detail,
+            }
+            for requirement in task.waiting_on
+        ]
+        failed_requirements = self.failed_requirements(task)
         return {
             "work_unit_id": task.work_unit_id,
             "document_id": task.document_id,
@@ -1027,6 +1100,23 @@ class StateStore:
             "phase": str(task.phase),
             "detail": task.detail,
             "queued": task.queued,
+            "waiting_on": waiting_on,
+            "scheduling_status": (
+                "queued"
+                if task.queued
+                else "blocked"
+                if failed_requirements
+                else "waiting"
+                if task.status == TaskStatus.PENDING
+                else "executing"
+                if task.status == TaskStatus.RUNNING
+                else "complete"
+            ),
+            "blocked_by": [
+                requirement.owner_task_key
+                for requirement in failed_requirements
+                if requirement.owner_task_key is not None
+            ],
             "repairing": task.repairing,
             "repair_work_unit_id": task.repair_work_unit_id,
             "recovering_failure": task.recovering_failure,
@@ -2565,7 +2655,7 @@ class StateStore:
                 str(task.phase),
                 task.repairing,
             )
-            if task.status in {TaskStatus.FAILED, TaskStatus.BLOCKED} and not task.repairing:
+            if task.status == TaskStatus.FAILED and not task.repairing:
                 self._repairable_task_keys.add(key)
         self._active_run_ids = {
             run.id for run in self._runs_by_id.values() if run.status == TaskStatus.RUNNING
@@ -2595,7 +2685,7 @@ class StateStore:
         if task.status == TaskStatus.RUNNING and task.phase == TaskPhase.POSTPROCESS:
             self._stage_count_cache[task.stage]["postprocess"] += 1
         self._indexed_task_states[key] = current
-        if task.status in {TaskStatus.FAILED, TaskStatus.BLOCKED} and not task.repairing:
+        if task.status == TaskStatus.FAILED and not task.repairing:
             self._repairable_task_keys.add(key)
         else:
             self._repairable_task_keys.discard(key)
@@ -2795,6 +2885,7 @@ class StateStore:
         *,
         source_digest: str | None = None,
         queued: bool = False,
+        waiting_on: Iterable[Requirement] | None = None,
     ) -> None:
         task = self.task(chapter_id, stage)
         if task.status == TaskStatus.INTERRUPTED and status not in (
@@ -2802,38 +2893,24 @@ class StateStore:
             TaskStatus.SUCCEEDED,
         ):
             return
-        if (
-            stage is Stage.FORMALIZE
-            and status != TaskStatus.SUCCEEDED
-            and self.later_stage_started(chapter_id)
-        ):
-            status = TaskStatus.SUCCEEDED
-            detail = "formalization completed before review"
         changed_tasks = [task]
-        if stage in (Stage.REVIEW, Stage.PROVE) and status in (
-            TaskStatus.RUNNING,
-            TaskStatus.SUCCEEDED,
-        ):
-            formalize = self.task(chapter_id, Stage.FORMALIZE)
-            if formalize.status != TaskStatus.SUCCEEDED:
-                formalize.status = TaskStatus.SUCCEEDED
-                formalize.phase = TaskPhase.IDLE
-                formalize.queued = False
-                formalize.detail = "formalization completed before review"
-                formalize.updated_at = timestamp()
-                changed_tasks.append(formalize)
         recovered = task.recovering_failure and status == TaskStatus.SUCCEEDED
         task.status = status
         task.phase = TaskPhase.POSTPROCESS if status == TaskStatus.RUNNING else TaskPhase.IDLE
         task.queued = queued and status == TaskStatus.PENDING
+        task.waiting_on = (
+            tuple(dict.fromkeys(waiting_on or ()))
+            if status == TaskStatus.PENDING and not task.queued
+            else ()
+        )
         if stage is Stage.PROVE:
             task.source_digest = source_digest if status == TaskStatus.SUCCEEDED else None
         task.detail = detail
         task.updated_at = timestamp()
         if status in {TaskStatus.SUCCEEDED, TaskStatus.FAILED, TaskStatus.BLOCKED}:
             task.recovering_failure = False
-        if recovered:
-            changed_tasks.extend(self._release_failure_blocked_tasks())
+        if recovered or status == TaskStatus.SUCCEEDED:
+            changed_tasks.extend(self._refresh_waiting_tasks())
         self._invalidate_status_summaries()
         self._mark_dirty(tasks=changed_tasks, global_state=False)
         await self._persist()
@@ -2861,25 +2938,6 @@ class StateStore:
                 continue
             task_status = status
             task_detail = detail
-            if (
-                stage is Stage.FORMALIZE
-                and status != TaskStatus.SUCCEEDED
-                and self.later_stage_started(chapter_id)
-            ):
-                task_status = TaskStatus.SUCCEEDED
-                task_detail = "formalization completed before review"
-            if stage in (Stage.REVIEW, Stage.PROVE) and status in (
-                TaskStatus.RUNNING,
-                TaskStatus.SUCCEEDED,
-            ):
-                formalize = self.task(chapter_id, Stage.FORMALIZE)
-                if formalize.status != TaskStatus.SUCCEEDED:
-                    formalize.status = TaskStatus.SUCCEEDED
-                    formalize.phase = TaskPhase.IDLE
-                    formalize.queued = False
-                    formalize.detail = "formalization completed before review"
-                    formalize.updated_at = updated_at
-                    changed_tasks.append(formalize)
             recovered = recovered or (
                 task.recovering_failure and task_status == TaskStatus.SUCCEEDED
             )
@@ -2888,6 +2946,7 @@ class StateStore:
                 TaskPhase.POSTPROCESS if task_status == TaskStatus.RUNNING else TaskPhase.IDLE
             )
             task.queued = False
+            task.waiting_on = ()
             if stage is Stage.PROVE and task_status != TaskStatus.SUCCEEDED:
                 task.source_digest = None
             task.detail = task_detail
@@ -2896,12 +2955,45 @@ class StateStore:
                 task.recovering_failure = False
             changed_tasks.append(task)
             changed = True
-        if recovered:
-            changed_tasks.extend(self._release_failure_blocked_tasks())
+        if recovered or status == TaskStatus.SUCCEEDED:
+            changed_tasks.extend(self._refresh_waiting_tasks())
         if changed:
             self._invalidate_status_summaries()
             self._mark_dirty(tasks=changed_tasks, global_state=False)
             await self._persist()
+
+    async def set_task_waiting(
+        self,
+        chapter_id: str,
+        stage: Stage,
+        requirements: Iterable[Requirement],
+        detail: str,
+    ) -> None:
+        """Persist why a pending task cannot run without recording an execution failure."""
+
+        waiting = tuple(dict.fromkeys(requirements))
+        if not waiting:
+            raise ValueError("a waiting task requires at least one unmet requirement")
+        await self.set_task(
+            chapter_id,
+            stage,
+            TaskStatus.PENDING,
+            detail,
+            waiting_on=waiting,
+        )
+
+    async def set_tasks_waiting(
+        self,
+        chapter_ids: Iterable[str],
+        stage: Stage,
+        requirements: dict[str, Iterable[Requirement]],
+        detail: str,
+    ) -> None:
+        async with self.batch():
+            for chapter_id in chapter_ids:
+                waiting = tuple(requirements.get(chapter_id, ()))
+                if waiting:
+                    await self.set_task_waiting(chapter_id, stage, waiting, detail)
 
     async def set_task_phase(
         self,
@@ -2922,15 +3014,16 @@ class StateStore:
         await self._persist()
 
     async def unblock(self) -> list[str]:
-        """Reset blocked tasks to pending without discarding attempt history."""
+        """Clear legacy blocked states and explicit wait metadata."""
         changed: list[str] = []
         proof_chapters: set[str] = set()
         for key, task in self.tasks.items():
-            if task.status != TaskStatus.BLOCKED:
+            if task.status != TaskStatus.BLOCKED and not task.waiting_on:
                 continue
             task.status = TaskStatus.PENDING
             task.phase = TaskPhase.IDLE
             task.queued = False
+            task.waiting_on = ()
             if task.stage == Stage.PROVE:
                 task.source_digest = None
                 proof_chapters.add(task.chapter_id)
@@ -2954,6 +3047,7 @@ class StateStore:
             task.status = TaskStatus.PENDING
             task.phase = TaskPhase.IDLE
             task.queued = False
+            task.waiting_on = ()
             if task.stage == Stage.PROVE:
                 task.source_digest = None
             task.detail = "manually retried"
@@ -2976,61 +3070,169 @@ class StateStore:
         raw = node.get("dependencies", ()) if isinstance(node, dict) else ()
         return {item for item in raw if isinstance(item, str)} if isinstance(raw, list) else set()
 
-    def _release_failure_blocked_tasks(self) -> list[TaskRecord]:
-        """Release blocked tasks whose failed prerequisites have now recovered."""
+    def _task_key_requirement(
+        self,
+        kind: RequirementKind,
+        chapter_id: str,
+        stage: Stage,
+        detail: str,
+    ) -> Requirement:
+        return Requirement(kind, owner_task_key=self.key(chapter_id, stage), detail=detail)
 
-        released: list[TaskRecord] = []
-        for task in self.tasks.values():
-            if task.status != TaskStatus.BLOCKED:
-                continue
-            stage = Stage(task.stage)
-            dependencies = self._source_dependencies(task.chapter_id)
-            ready = False
-            if stage is Stage.FORMALIZE and task.detail in {
-                "blocked by a failed source dependency formalization",
-                "blocked by upstream coordinator diagnostics",
-                "blocked by incomplete discovery or a source dependency cycle",
-                "blocked because source discovery failed",
-            }:
-                ready = self.task(task.chapter_id, Stage.DISCOVER).status == TaskStatus.SUCCEEDED
-                ready = ready and all(
-                    self.task(chapter_id, Stage.FORMALIZE).status == TaskStatus.SUCCEEDED
-                    for chapter_id in dependencies
+    def task_requirements(self, task: TaskRecord) -> tuple[Requirement, ...]:
+        """Return current requirements without mutating descendant task rows."""
+
+        requirements = list(task.waiting_on)
+        stage = Stage(task.stage)
+        if stage is Stage.FORMALIZE:
+            requirements.append(
+                self._task_key_requirement(
+                    RequirementKind.SOURCE_DISCOVERY,
+                    task.chapter_id,
+                    Stage.DISCOVER,
+                    "waiting for source discovery",
                 )
-            elif stage is Stage.REVIEW and task.detail == (
-                "blocked by a failed prerequisite review; unrelated branches completed"
-            ):
-                ready = self.task(task.chapter_id, Stage.FORMALIZE).status == TaskStatus.SUCCEEDED
-                ready = ready and all(
-                    self.task(chapter_id, Stage.REVIEW).status == TaskStatus.SUCCEEDED
-                    for chapter_id in dependencies
+            )
+            requirements.extend(
+                self._task_key_requirement(
+                    RequirementKind.SOURCE_DEPENDENCY,
+                    dependency,
+                    Stage.FORMALIZE,
+                    f"waiting for source dependency {dependency}",
                 )
-            elif (stage is Stage.REVIEW and task.detail == "formalization did not complete") or (
-                stage is Stage.PROVE
-                and task.detail
-                in {
-                    "formalization failed; quarantined from proof",
-                    "blocked because formalization did not complete",
+                for dependency in sorted(self._source_dependencies(task.chapter_id))
+            )
+        elif stage is Stage.REVIEW:
+            requirements.append(
+                self._task_key_requirement(
+                    RequirementKind.STAGE_DEPENDENCY,
+                    task.chapter_id,
+                    Stage.FORMALIZE,
+                    "waiting for clean formalization",
+                )
+            )
+            # Initial reviews are dependency ordered. Targeted later reviews are not.
+            if task.rounds == 0:
+                requirements.extend(
+                    self._task_key_requirement(
+                        RequirementKind.STAGE_DEPENDENCY,
+                        dependency,
+                        Stage.REVIEW,
+                        f"waiting for dependency review {dependency}",
+                    )
+                    for dependency in sorted(self._source_dependencies(task.chapter_id))
+                )
+        elif stage is Stage.PROVE:
+            requirements.extend(
+                (
+                    self._task_key_requirement(
+                        RequirementKind.STAGE_DEPENDENCY,
+                        task.chapter_id,
+                        Stage.FORMALIZE,
+                        "waiting for clean formalization",
+                    ),
+                    self._task_key_requirement(
+                        RequirementKind.STAGE_DEPENDENCY,
+                        task.chapter_id,
+                        Stage.REVIEW,
+                        "waiting for successful review",
+                    ),
+                )
+            )
+        return tuple(
+            dict.fromkeys(
+                requirement
+                for requirement in requirements
+                if not self.requirement_satisfied(requirement)
+            )
+        )
+
+    def requirement_satisfied(self, requirement: Requirement) -> bool:
+        if requirement.owner_task_key is not None:
+            owner = self.tasks.get(requirement.owner_task_key)
+            return owner is not None and owner.status == TaskStatus.SUCCEEDED
+        if requirement.request_id is not None:
+            if requirement.kind is RequirementKind.UPSTREAM_REQUEST:
+                request = self.upstream_requests.get(requirement.request_id, {})
+                return request.get("status") in {
+                    UpstreamRequestStatus.ANSWERED,
+                    UpstreamRequestStatus.CLOSED,
                 }
-            ):
-                ready = self.task(task.chapter_id, Stage.FORMALIZE).status == TaskStatus.SUCCEEDED
-            elif (
-                stage is Stage.PROVE
-                and task.detail == "blocked because statement review did not complete"
-            ):
-                ready = self.task(task.chapter_id, Stage.REVIEW).status == TaskStatus.SUCCEEDED
-            if not ready:
-                continue
-            task.status = TaskStatus.PENDING
-            task.phase = TaskPhase.IDLE
-            task.queued = False
-            if stage is Stage.PROVE:
-                task.source_digest = None
-            task.detail = "automatically unblocked after failed prerequisite recovered"
-            task.recovering_failure = True
-            task.updated_at = timestamp()
-            released.append(task)
-        return released
+            if requirement.kind is RequirementKind.PROOF_REVIEW_REQUEST:
+                request = self.proof_review_requests.get(requirement.request_id, {})
+                return request.get("status") == "closed"
+        return False
+
+    def readiness(self, task: TaskRecord) -> Readiness:
+        waiting = self.task_requirements(task)
+        return Readiness(ready=task.status == TaskStatus.PENDING and not waiting, waiting=waiting)
+
+    def failure_roots(self, task: TaskRecord) -> tuple[str, ...]:
+        """Find direct execution failures behind a derived pending wait."""
+
+        roots: set[str] = set()
+        visited: set[str] = set()
+
+        def visit(candidate: TaskRecord) -> None:
+            key = self.key(candidate.chapter_id, Stage(candidate.stage))
+            if key in visited:
+                return
+            visited.add(key)
+            for requirement in self.task_requirements(candidate):
+                if requirement.owner_task_key is None:
+                    continue
+                owner = self.tasks.get(requirement.owner_task_key)
+                if owner is None:
+                    continue
+                if owner.status == TaskStatus.FAILED:
+                    roots.add(requirement.owner_task_key)
+                elif owner.status == TaskStatus.PENDING:
+                    visit(owner)
+
+        visit(task)
+        return tuple(sorted(roots))
+
+    def failed_requirements(self, task: TaskRecord) -> tuple[Requirement, ...]:
+        roots = set(self.failure_roots(task))
+        return tuple(
+            Requirement(
+                RequirementKind.STAGE_DEPENDENCY,
+                owner_task_key=key,
+                detail="waiting on a failed prerequisite",
+            )
+            for key in sorted(roots)
+        )
+
+    def _refresh_waiting_tasks(self) -> list[TaskRecord]:
+        """Drop satisfied explicit waits to a fixed point, independent of row order."""
+
+        changed: list[TaskRecord] = []
+        changed_ids: set[int] = set()
+        while True:
+            progress = False
+            for task in self.tasks.values():
+                if task.status != TaskStatus.PENDING or not task.waiting_on:
+                    continue
+                waiting = tuple(
+                    requirement
+                    for requirement in task.waiting_on
+                    if not self.requirement_satisfied(requirement)
+                )
+                if waiting == task.waiting_on:
+                    continue
+                task.waiting_on = waiting
+                task.detail = (
+                    "waiting for scheduling requirements"
+                    if waiting
+                    else "requirements satisfied; awaiting scheduler"
+                )
+                task.updated_at = timestamp()
+                if id(task) not in changed_ids:
+                    changed.append(task)
+                    changed_ids.add(id(task))
+                progress = True
+            if not progress:
+                return changed
 
     async def requeue_interrupted(self, *, resume_agents: bool) -> list[str]:
         """Requeue interrupted tasks while retaining their optional session history."""
@@ -3042,6 +3244,7 @@ class StateStore:
             task.status = TaskStatus.PENDING
             task.phase = TaskPhase.IDLE
             task.queued = False
+            task.waiting_on = ()
             if task.stage == Stage.PROVE:
                 task.source_digest = None
             task.detail = (
@@ -3067,6 +3270,7 @@ class StateStore:
         task.status = TaskStatus.RUNNING
         task.phase = TaskPhase.AGENT
         task.queued = False
+        task.waiting_on = ()
         if stage is Stage.PROVE:
             task.source_digest = None
         task.rounds += 1
@@ -3331,10 +3535,7 @@ class StateStore:
         for case_id in sweep.case_ids:
             case = self.repair_cases[case_id]
             task = self.tasks.get(case.task_key)
-            if task is not None and task.status not in {
-                TaskStatus.FAILED,
-                TaskStatus.BLOCKED,
-            }:
+            if task is not None and task.status != TaskStatus.FAILED:
                 case.status = RepairCaseStatus.RESOLVED
             elif waiting and case.status != RepairCaseStatus.RESOLVED:
                 case.status = RepairCaseStatus.PLANNED
