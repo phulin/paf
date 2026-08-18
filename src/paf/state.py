@@ -1515,7 +1515,11 @@ class StateStore:
             for key in task_keys
         }
         active_run_ids = sorted(self._active_run_ids)
-        run_ids = set(change.runs) | set(active_run_ids)
+        # The initial snapshot seeds every active activity.  Subsequent deltas only need activity
+        # records whose run or owning task changed; active_run_ids is a separate membership signal.
+        # Including every active activity here made each terminal frame O(active agents), even for
+        # a single agent's update.
+        run_ids = set(change.runs)
         run_ids.update(
             run_id
             for task in tasks.values()

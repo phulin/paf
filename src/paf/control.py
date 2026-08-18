@@ -21,7 +21,9 @@ SOCKET_NAME = "control.sock"
 PID_NAME = "daemon.pid"
 RESULT_NAME = "daemon-result.json"
 LOG_NAME = "daemon.log"
-DASHBOARD_FRAME_INTERVAL_SECONDS = 1 / 60
+# Agent activity can arrive much faster than a human-readable terminal needs to refresh.  Keep
+# enough headroom for responsive progress while bounding JSON projection and native redraw work.
+DASHBOARD_FRAME_INTERVAL_SECONDS = 0.1
 
 
 def control_socket(state_dir: Path) -> Path:

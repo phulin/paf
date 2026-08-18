@@ -232,6 +232,32 @@ async def test_hot_snapshot_batches_failure_roots_without_recursive_walks(
 
 
 @pytest.mark.asyncio
+async def test_dashboard_delta_does_not_reserialize_unchanged_active_activities(tmp_path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    state = StateStore(config)
+    await state.load_or_create()
+    first, second = config.work_units
+    first_run = await state.start_run(first.id, Stage.REVIEW)
+    second_run = await state.start_run(second.id, Stage.REVIEW)
+    for run in (first_run, second_run):
+        activity = state.activities.start(run.id, run.chapter_id, Stage.REVIEW.value)
+        activity.current = f"working on {run.chapter_id}"
+        state.activities.save(activity)
+
+    delta = state.dashboard_delta(
+        ChangeSet(
+            revision=state.revision,
+            work_units=frozenset({first.id}),
+            runs=frozenset({first_run.id}),
+        )
+    )
+
+    assert set(delta["active_run_ids"]) == {first_run.id, second_run.id}
+    assert set(delta["activities"]) == {first_run.id}
+    await state.close()
+
+
+@pytest.mark.asyncio
 async def test_subset_failure_routing_matches_full_walk_for_shared_roots_and_recovery(
     tmp_path,
 ) -> None:
