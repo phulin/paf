@@ -1455,6 +1455,10 @@ class StateStore:
             "revision": self.revision,
             "source": str(self.database_path),
         }
+        # Task rows already project build freshness.  The native dashboard previously received
+        # the complete normalized graph (several MiB on large corpora) only to test clean-member
+        # membership while drawing each row.
+        snapshot.pop("formalize_graph", None)
         tasks = snapshot["tasks"]
         recent_run_ids: list[str] = []
         if isinstance(tasks, dict):
@@ -1525,7 +1529,7 @@ class StateStore:
             for task in tasks.values()
             if isinstance((run_id := task.get("latest_run_id")), str)
         )
-        global_names = change.globals.difference({"activity"})
+        global_names = change.globals.difference({"activity", "formalize_graph"})
         if "state" in global_names:
             globals_ = self._bounded_global_snapshot(include_shepherd_agents=True) | {
                 "revision": self.revision
@@ -1867,6 +1871,15 @@ class StateStore:
             changed_work_units = {self.tasks[key].chapter_id for key in task_payloads} | {
                 run.chapter_id for run_id in runs if (run := self._runs_by_id.get(run_id))
             }
+            formalize_write = graph_writes.get("formalize_graph")
+            if formalize_write is not None:
+                changed_work_units.update(
+                    node_id
+                    for kind, node_id in (
+                        set(formalize_write.node_upserts) | set(formalize_write.node_deletes)
+                    )
+                    if kind == "dependency"
+                )
             changed_stages = {self.tasks[key].stage for key in task_payloads} | {
                 run.stage for run_id in runs if (run := self._runs_by_id.get(run_id))
             }

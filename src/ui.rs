@@ -467,12 +467,10 @@ fn draw_task_table(frame: &mut Frame<'_>, model: &DashboardModel, area: Rect) {
             );
             cells.push(Cell::from(value));
         }
-        let fresh = model
-            .state
-            .formalize_graph
-            .get("clean")
-            .and_then(serde_json::Value::as_object)
-            .is_some_and(|clean| clean.contains_key(&row.unit.id));
+        let fresh = row
+            .tasks
+            .values()
+            .any(|task| task.head_build_status == "clean");
         cells.push(Cell::from(if fresh { "✓ fresh" } else { "○ stale" }));
         cells.push(Cell::from(current_activity(model, row, activity)));
         cells.push(Cell::from(row_spend(row)));

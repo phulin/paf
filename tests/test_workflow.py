@@ -232,6 +232,37 @@ async def test_hot_snapshot_batches_failure_roots_without_recursive_walks(
 
 
 @pytest.mark.asyncio
+async def test_dashboard_projects_build_freshness_without_shipping_formalize_graph(
+    tmp_path,
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    state = StateStore(config)
+    await state.load_or_create()
+    chapter = config.work_units[0]
+    state.formalize_graph = {
+        "clean": {chapter.id: {"source_digest": "digest"}},
+        "order": [chapter.id],
+        "edges": [],
+        "dependencies": {chapter.id: []},
+    }
+
+    snapshot = state.dashboard_snapshot()
+    assert "formalize_graph" not in snapshot
+    assert snapshot["tasks"][state.key(chapter.id, Stage.REVIEW)]["head_build_status"] == "clean"
+
+    delta = state.dashboard_delta(
+        ChangeSet(
+            revision=state.revision,
+            work_units=frozenset({chapter.id}),
+            globals=frozenset({"formalize_graph"}),
+        )
+    )
+    assert "formalize_graph" not in delta["globals"]
+    assert delta["tasks"][state.key(chapter.id, Stage.REVIEW)]["head_build_status"] == "clean"
+    await state.close()
+
+
+@pytest.mark.asyncio
 async def test_dashboard_delta_does_not_reserialize_unchanged_active_activities(tmp_path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
     state = StateStore(config)
