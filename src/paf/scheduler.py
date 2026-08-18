@@ -1878,8 +1878,11 @@ class Orchestrator:
                         snapshots=snapshots,
                     )
                 )[chapter.id]
-                if last_attempt is not None:
-                    await self.state.update_run(last_attempt.run, validation=validation.as_dict())
+                if (
+                    last_attempt is not None
+                    and (previous_run := getattr(last_attempt, "run", None)) is not None
+                ):
+                    await self.state.update_run(previous_run, validation=validation.as_dict())
                 if validation.succeeded and await self._publish_validated_build(
                     chapter, snapshots[chapter.id]
                 ):
@@ -1936,8 +1939,11 @@ class Orchestrator:
                     snapshots=snapshots,
                 )
             )[chapter.id]
-            if last_attempt is not None:
-                await self.state.update_run(last_attempt.run, validation=validation.as_dict())
+            if (
+                last_attempt is not None
+                and (previous_run := getattr(last_attempt, "run", None)) is not None
+            ):
+                await self.state.update_run(previous_run, validation=validation.as_dict())
             if validation.succeeded and await self._publish_validated_build(
                 chapter, snapshots[chapter.id]
             ):
