@@ -2599,6 +2599,87 @@ async def test_coordinator_queue_routes_one_bounded_slice_at_a_time(
     await orchestrator.shutdown()
 
 
+@pytest.mark.asyncio
+async def test_overlapping_multi_target_callers_retain_partial_results_across_slices(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = write_project(tmp_path, chapters="chapters = [1, 2, 3]")
+    with (tmp_path / "books" / "book.md").open("a", encoding="utf-8") as source:
+        source.write("\n## 3. Third chapter\n")
+    config = load_config(project)
+    first, second, third = config.chapters
+    orchestrator = Orchestrator(config, StateStore(config))
+    await orchestrator.prepare()
+    commands: list[str] = []
+
+    async def validation(
+        _config: object,
+        chapter: Chapter,
+        **_kwargs: object,
+    ) -> ValidationResult:
+        commands.append(chapter.build_command)
+        return ValidationResult(True, 0, "ok")
+
+    monkeypatch.setattr(scheduler_module, "MAXIMUM_COORDINATOR_BUILD_TARGETS", 1)
+    monkeypatch.setattr(scheduler_module, "validate", validation)
+    left_snapshots: dict[str, scheduler_module.ValidatedBuildSnapshot] = {}
+
+    left, right = await asyncio.gather(
+        orchestrator._build_chapters(
+            (first, second), publish_if_clean=False, snapshots=left_snapshots
+        ),
+        orchestrator._build_chapters((second, third), publish_if_clean=False),
+    )
+
+    assert [command.rpartition(" ")[2] for command in commands] == [
+        first.build_command.rpartition(" ")[2],
+        second.build_command.rpartition(" ")[2],
+        third.build_command.rpartition(" ")[2],
+    ]
+    assert set(left) == {first.id, second.id}
+    assert set(right) == {second.id, third.id}
+    assert set(left_snapshots) == {first.id, second.id}
+    assert all(result.succeeded for result in (*left.values(), *right.values()))
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_cancelling_build_dispatcher_cancels_callers_and_stops_worker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    orchestrator = Orchestrator(config, StateStore(config))
+    await orchestrator.prepare()
+    started = asyncio.Event()
+    validation_cancelled = asyncio.Event()
+
+    async def validation(*_args: object, **_kwargs: object) -> ValidationResult:
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            validation_cancelled.set()
+            raise
+        raise AssertionError("unreachable validation completion")
+
+    monkeypatch.setattr(scheduler_module, "validate", validation)
+    caller = asyncio.create_task(
+        orchestrator._build_chapters((config.chapters[0],), publish_if_clean=False)
+    )
+    await started.wait()
+    assert orchestrator._build_dispatch_task is not None
+
+    orchestrator._build_dispatch_task.cancel()
+    await asyncio.gather(orchestrator._build_dispatch_task, return_exceptions=True)
+
+    with pytest.raises(asyncio.CancelledError):
+        await caller
+    assert validation_cancelled.is_set()
+    assert orchestrator._build_dispatch_task is None
+    assert orchestrator._pending_build_requests == []
+    await orchestrator.shutdown()
+
+
 def test_failed_batch_diagnostics_are_partitioned_by_target_closure(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
     owner, consumer = config.chapters

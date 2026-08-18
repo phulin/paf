@@ -3526,13 +3526,14 @@ class Orchestrator:
                 if remaining:
                     requeue_unfinished()
                     return
+        except asyncio.CancelledError:
+            for request in requests:
+                if not request.future.done():
+                    request.future.cancel()
+            raise
         except BaseException as error:
             for request in requests:
-                if request.future.done():
-                    continue
-                if isinstance(error, asyncio.CancelledError):
-                    request.future.cancel()
-                else:
+                if not request.future.done():
                     request.future.set_exception(error)
         finally:
             finish_ready_requests()
