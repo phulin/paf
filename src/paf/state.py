@@ -176,6 +176,7 @@ class RunRecord:
     role: str = ""
     auxiliary: bool = False
     request_ids: list[str] = field(default_factory=list)
+    proof_targets: list[dict[str, Any]] = field(default_factory=list)
     source: str = ""
     source_start_line: int = 1
     source_end_line: int = 1
@@ -876,6 +877,7 @@ class StateStore:
             "role": run.role,
             "auxiliary": run.auxiliary,
             "request_ids": list(run.request_ids),
+            "proof_targets": [dict(target) for target in run.proof_targets],
             "source": run.source,
             "source_start_line": run.source_start_line,
             "source_end_line": run.source_end_line,

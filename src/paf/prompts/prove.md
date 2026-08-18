@@ -2,19 +2,18 @@
 
 ## Goal
 
-Replace as many `sorry` or `admit` placeholders as possible with proofs that Lean checks. Spend the
-attempt constructing, testing, and improving proofs. A difficult proof is the work of this stage, not
-by itself a reason to stop.
+Replace the `sorry` or `admit` placeholders in the assigned proof chunk with proofs that Lean checks.
+Spend the attempt constructing, testing, and improving those proofs. A difficult proof is the work
+of this stage, not by itself a reason to stop.
 
 Do not change theorem statements or existing definitions to make proofs easier. You may change proof
 bodies, add focused imports, and add fully proved helper lemmas when they are genuinely needed.
 
 ## Workflow
 
-1. Find every unresolved placeholder in the assigned files and order those files from prerequisites
-   to dependents using their imports. Use `update_plan` to create one checklist item for each file that
-   contains work, in that order, followed by a final diagnostic check. Keep exactly one item in
-   progress.
+1. Read the authoritative assigned-proof-chunk list in the PAF requirements. Order its files from
+   prerequisites to dependents using their imports. Use `update_plan` to create checklist items only
+   for those targets, followed by a final diagnostic check. Keep exactly one item in progress.
 2. For the active file, add the unresolved declaration names to its checklist item. Read each
    declaration, its surrounding code, and the relevant part of chapter {chapter_number} in `{source}`.
 3. Use the book's informal proof as the default mathematical plan. Search earlier project chapters
@@ -33,10 +32,10 @@ bodies, add focused imports, and add fully proved helper lemmas when they are ge
    directly, or change the tactic structure. One guessed name or failed tactic is not enough reason to
    stop.
 7. If repeated concrete attempts expose the same obstruction, preserve every clean proof and useful
-   helper, record only new evidence, and continue with independent placeholders. When the handoff
+   helper, record only new evidence, and continue with independent assigned placeholders. When the handoff
    names a durable blocker ID and its path, declaration, residual goal, and obstruction are unchanged,
    put that ID in `blocker_refs` instead of repeating the failed attempt.
-8. Complete each file before moving to the next. After all files have been visited, check every edited
+8. Complete the assigned targets in each file before moving to the next. After all targets have been visited, check every edited
    file and the assigned files that depend on it. Remove or revert any speculative edit that does not
    pass diagnostics; every retained proof and helper must be accepted by Lean.
 
@@ -67,9 +66,10 @@ at least two meaningfully different attempts. Continue proving independent decla
 
 ## Definition of done
 
-All placeholders that this attempt can prove have been replaced by Lean-checked proofs. For each
-remaining proof, report its checked attempts and exact residual goal. Set `complete` to `true` only
-when no placeholder remains.
+All placeholders in the assigned proof chunk have been replaced by Lean-checked proofs. For each
+remaining assigned proof, report its checked attempts and exact residual goal. Set `complete` to
+`true` when no assigned placeholder remains; placeholders reserved for later chunks do not make this
+report incomplete.
 
 ## Output format
 
@@ -77,7 +77,7 @@ Return the structured report once, after tool use and edits have stopped. It mus
 files on disk, not planned work. Use only these fields:
 
 - `changed`: `true` exactly when an allowed edit remains.
-- `complete`: `true` only when no placeholder remains.
+- `complete`: `true` only when no assigned placeholder remains.
 - `summary`: when files changed, concise past-tense prose naming the proved declarations and important
   helpers, suitable for a commit body; otherwise, why no edit was retained.
 - `issues`: tooling, diagnostic, or out-of-scope problems that are not individual proof attempts;

@@ -25,8 +25,29 @@ class StageConfig:
     prompt: Path
     max_rounds: int
     max_agents: int | None = None
+    chunk_size: int | None = None
     model: str | None = None
     reasoning_effort: str | None = None
+
+
+@dataclass(frozen=True)
+class ProofTarget:
+    """One declaration containing proof placeholders assigned as a unit."""
+
+    path: str
+    declaration: str
+    line: int
+    placeholder_count: int
+    fingerprint: str
+
+    def as_dict(self) -> dict[str, str | int]:
+        return {
+            "path": self.path,
+            "declaration": self.declaration,
+            "line": self.line,
+            "placeholder_count": self.placeholder_count,
+            "fingerprint": self.fingerprint,
+        }
 
 
 @dataclass(frozen=True)

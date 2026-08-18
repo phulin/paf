@@ -20,7 +20,7 @@ from paf import json_codec as json
 from paf.activity import EVENT_TIMESTAMP_FIELD, activity_timestamp
 from paf.backends import LeanBackend
 from paf.diagnostics import unexpected_lean_warnings
-from paf.models import PipelineConfig, Stage, WorkUnitLike
+from paf.models import PipelineConfig, ProofTarget, Stage, WorkUnitLike
 from paf.scope import ScopeMatcher
 from paf.state import RunRecord, StateStore, TaskStatus, TokenUsage
 
@@ -807,6 +807,60 @@ def count_placeholders(repo: Path, chapter: WorkUnitLike) -> int:
     )
 
 
+def proof_targets(repo: Path, chapter: WorkUnitLike) -> tuple[ProofTarget, ...]:
+    """Return unresolved declarations in stable source order.
+
+    A declaration is the smallest safe proof assignment: placeholders within one declaration
+    often depend on local terms and must stay with the same agent. The ordinal disambiguates equal
+    short names in different namespaces without making the fingerprint sensitive to line movement.
+    """
+
+    pattern = re.compile(r"\b(?:sorry|admit)\b")
+    targets: list[ProofTarget] = []
+    for path in scoped_files(repo, chapter):
+        text = path.read_text(encoding="utf-8")
+        matches = list(LEAN_DECLARATION_RE.finditer(text))
+        name_ordinals: dict[str, int] = {}
+        for index, match in enumerate(matches):
+            declaration = match.group("name")
+            ordinal = name_ordinals.get(declaration, 0)
+            name_ordinals[declaration] = ordinal + 1
+            stop = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+            placeholder_count = len(pattern.findall(_lean_code(text[match.start() : stop])))
+            if not placeholder_count:
+                continue
+            relative = path.relative_to(repo).as_posix()
+            identity = f"{relative}\0{declaration}\0{ordinal}".encode()
+            targets.append(
+                ProofTarget(
+                    path=relative,
+                    declaration=declaration,
+                    line=text.count("\n", 0, match.start()) + 1,
+                    placeholder_count=placeholder_count,
+                    fingerprint=hashlib.sha256(identity).hexdigest()[:16],
+                )
+            )
+    return tuple(targets)
+
+
+def proof_target_chunk(
+    targets: Iterable[ProofTarget],
+    chunk_size: int,
+) -> tuple[ProofTarget, ...]:
+    """Select the next source-ordered chunk without splitting a declaration."""
+
+    selected: list[ProofTarget] = []
+    assigned = 0
+    for target in targets:
+        if selected and assigned + target.placeholder_count > chunk_size:
+            break
+        selected.append(target)
+        assigned += target.placeholder_count
+        if assigned >= chunk_size:
+            break
+    return tuple(selected)
+
+
 def _find_thread_id(event: Any) -> str | None:
     if not isinstance(event, dict):
         return None
@@ -1087,6 +1141,7 @@ class CodexExecutor:
         workspace_root: Path | None = None,
         role: str = "",
         upstream_requests: Iterable[dict[str, Any]] = (),
+        proof_targets: Iterable[ProofTarget | dict[str, Any]] = (),
     ) -> str:
         if role == UPSTREAM_REPAIR_ROLE or (stage is Stage.REVIEW and feedback):
             prompt_path = PROOF_REVIEW_PROMPT_PATH
@@ -1127,6 +1182,31 @@ definition, prove a focused helper, construct the object directly, or change the
 Try several checked approaches before concluding that the same obstruction remains. If a concrete
 mathematical argument shows that an earlier declaration must change, report the smallest required
 change through the proof report instead of repeating that no library result was found."""
+        selected_proof_targets = tuple(proof_targets)
+        proof_assignment = ""
+        if stage is Stage.PROVE and selected_proof_targets and role != UPSTREAM_REPAIR_ROLE:
+            rendered_targets: list[str] = []
+            assigned_placeholders = 0
+            for target in selected_proof_targets:
+                value = target.as_dict() if isinstance(target, ProofTarget) else target
+                count = int(value.get("placeholder_count", 0))
+                assigned_placeholders += count
+                rendered_targets.append(
+                    f"- `{value.get('path', '')}:{value.get('line', '')}` — "
+                    f"`{value.get('declaration', '')}` ({count} placeholder(s); "
+                    f"target `{value.get('fingerprint', '')}`)"
+                )
+            proof_assignment = f"""
+
+### Assigned proof chunk
+
+This attempt owns exactly these {assigned_placeholders} unresolved placeholder(s):
+{chr(10).join(rendered_targets)}
+
+Work only on these declarations. Other unresolved declarations are intentionally reserved for
+later proof agents: do not prove, rewrite, or include them in `failed_attempts`. You may add imports
+and fully proved helpers needed by the assigned declarations. Set `complete` to `true` when every
+placeholder in this assigned chunk is resolved, even if other placeholders remain in the chapter."""
         stage_contract = {
             Stage.DISCOVER: """This is read-only source analysis. Identify the earlier chapters
 that this chapter directly needs. Do not edit any file.""",
@@ -1195,6 +1275,7 @@ isolation/worktree trees. Bound each command's output to roughly 12 KiB with nar
 limits, or small source windows. {stage_contract}
 {input_catalog}
 {validation_contract}
+{proof_assignment}
 """
         if stage in (Stage.FORMALIZE, Stage.REVIEW, Stage.PROVE):
             capabilities = (
@@ -1354,6 +1435,7 @@ whole-file diagnostics from prerequisites to dependents. Do not prepare every fi
             feedback=feedback,
             workspace_root=root,
             role=run.role,
+            proof_targets=run.proof_targets,
         )
         return await self._run_prompt(
             chapter,
@@ -1385,6 +1467,7 @@ whole-file diagnostics from prerequisites to dependents. Do not prepare every fi
             feedback=feedback,
             workspace_root=root,
             role=run.role,
+            proof_targets=run.proof_targets,
         )
         return await self._run_prompt(
             chapter,

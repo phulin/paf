@@ -74,6 +74,10 @@ STAGE_MAX_AGENTS = {
     Stage.DISCOVER: 40,
 }
 
+STAGE_CHUNK_SIZES = {
+    Stage.PROVE: 4,
+}
+
 
 def standard_prompt_path(stage: Stage) -> Path:
     resource = files("paf.prompts").joinpath(f"{stage.value}.md")
@@ -116,6 +120,12 @@ def _stage_configs(raw_stages: dict[str, Any], base: Path) -> dict[Stage, StageC
         max_agents = int(max_agents_value) if max_agents_value is not None else None
         if max_agents is not None and max_agents < 1:
             raise ValueError(f"stages.{stage.value}.max_agents must be positive")
+        chunk_size_value = raw.get("chunk_size", STAGE_CHUNK_SIZES.get(stage))
+        if chunk_size_value is not None and stage is not Stage.PROVE:
+            raise ValueError("chunk_size is only supported for stages.prove")
+        chunk_size = int(chunk_size_value) if chunk_size_value is not None else None
+        if chunk_size is not None and chunk_size < 1:
+            raise ValueError(f"stages.{stage.value}.chunk_size must be positive")
         if not prompt.is_file():
             raise ValueError(f"prompt does not exist: {prompt}")
         model_value = raw.get("model", STAGE_MODELS.get(stage))
@@ -128,6 +138,7 @@ def _stage_configs(raw_stages: dict[str, Any], base: Path) -> dict[Stage, StageC
             prompt=prompt,
             max_rounds=max_rounds,
             max_agents=max_agents,
+            chunk_size=chunk_size,
             model=model_value,
             reasoning_effort=reasoning_value,
         )

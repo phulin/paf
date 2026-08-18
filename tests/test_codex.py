@@ -33,6 +33,8 @@ from paf.codex import (
     declaration_uses_placeholder_in_chapter,
     lean_mcp_executable,
     lean_mcp_path,
+    proof_target_chunk,
+    proof_targets,
     render_prompt,
     unexpected_lean_warnings,
     validate,
@@ -293,6 +295,71 @@ theorem second : True := by admit
     )
 
     assert count_placeholders(tmp_path, chapter) == 2
+
+
+def test_proof_targets_are_declaration_scoped_and_chunked_by_placeholder_count(
+    tmp_path: Path,
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = config.chapters[0]
+    path = tmp_path / "lean" / "Book" / "Chapter01.lean"
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        "-- theorem ignored : True := by sorry\n"
+        'def message := "sorry"\n'
+        + "\n".join(f"theorem target{i} : True := by sorry" for i in range(1, 10))
+        + "\n",
+        encoding="utf-8",
+    )
+
+    targets = proof_targets(tmp_path, chapter)
+    chunks = []
+    remaining = targets
+    while remaining:
+        chunk = proof_target_chunk(remaining, 4)
+        chunks.append(chunk)
+        remaining = remaining[len(chunk) :]
+
+    assert [target.declaration for target in targets] == [f"target{i}" for i in range(1, 10)]
+    assert [sum(target.placeholder_count for target in chunk) for chunk in chunks] == [4, 4, 1]
+    assert len({target.fingerprint for target in targets}) == 9
+
+
+def test_proof_chunk_does_not_split_one_declaration(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = config.chapters[0]
+    path = tmp_path / "lean" / "Book" / "Chapter01.lean"
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        "theorem large : True := by\n  have a : True := by sorry\n  sorry\n"
+        "theorem later : True := by sorry\n",
+        encoding="utf-8",
+    )
+
+    targets = proof_targets(tmp_path, chapter)
+
+    assert [target.placeholder_count for target in proof_target_chunk(targets, 1)] == [2]
+
+
+def test_proof_prompt_contains_only_the_assigned_chunk(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = config.chapters[0]
+    executor = CodexExecutor(config, StateStore(config))
+    assigned = {
+        "path": "lean/Book/Chapter01.lean",
+        "declaration": "Book.target",
+        "line": 17,
+        "placeholder_count": 2,
+        "fingerprint": "abc123",
+    }
+
+    prompt = executor.build_prompt(chapter, Stage.PROVE, proof_targets=[assigned])
+
+    assert "Assigned proof chunk" in prompt
+    assert "exactly these 2 unresolved placeholder(s)" in prompt
+    assert "`Book.target`" in prompt
+    assert "Other unresolved declarations are intentionally reserved" in prompt
+    assert "Set `complete` to `true` when every" in prompt
 
 
 def test_executor_uses_machine_readable_codex_mode(tmp_path: Path) -> None:
