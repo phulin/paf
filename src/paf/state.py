@@ -3127,6 +3127,7 @@ class StateStore:
         """Reset every failed task to pending without discarding attempt history."""
 
         changed: list[str] = []
+        failure_changed = False
         for key, task in self.tasks.items():
             if task.status != TaskStatus.FAILED:
                 continue
@@ -3140,9 +3141,14 @@ class StateStore:
             task.recovering_failure = True
             task.updated_at = timestamp()
             changed.append(key)
+            failure_changed = self._sync_failure_record(task) or failure_changed
         if changed:
             self._invalidate_status_summaries()
-            self._mark_dirty(tasks=(self.tasks[key] for key in changed), global_state=False)
+            self._mark_dirty(
+                tasks=(self.tasks[key] for key in changed),
+                global_state=False,
+                sections={"failure_records"} if failure_changed else (),
+            )
             await self._persist()
         return changed
 
@@ -3466,8 +3472,14 @@ class StateStore:
         task.runs.append(run)
         self._index_run(run)
         self._payload_loaded_run_ids.add(run.id)
+        failure_changed = self._sync_failure_record(task)
         self._invalidate_status_summaries()
-        self._mark_dirty(task=task, run=run, global_state=False)
+        self._mark_dirty(
+            task=task,
+            run=run,
+            global_state=False,
+            sections={"failure_records"} if failure_changed else (),
+        )
         await self._persist()
         return run
 

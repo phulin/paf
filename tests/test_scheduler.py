@@ -1629,6 +1629,7 @@ async def test_successful_failure_retry_releases_only_its_blocked_dependents(
     )
 
     assert await state.retry_failed() == [f"{first.id}:review"]
+    assert state.shepherd_failure_records() == []
     await state.close()
 
     recovered = StateStore(config)
