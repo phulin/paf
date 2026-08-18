@@ -8,6 +8,10 @@ Independently determine whether the supplied proof work exposes a genuine proble
 statements or interfaces, a missing reusable earlier result, or only an unsuccessful proof strategy.
 Make the smallest justified in-scope repair and preserve every sound established interface.
 
+It is not your job to complete proofs, but do not delete prior proof work. If a proof no longer
+completes after your changes, finish it with `sorry`. If a proof no longer compiles, move the relevant
+failing steps into a comment labeled as a prior attempt before replacing them with `sorry`.
+
 {review_goal_details}
 
 Deliver the complete assigned Lean scope with zero errors and zero non-`sorry` warnings. The only

@@ -8,9 +8,11 @@ Repair every supplied diagnostic at its cause, making only the smallest changes 
 imports, or definitions needed to clear it. This is targeted diagnostic repair, not a failed proof
 attempt or a full-chapter statement review.
 
-Existing proposition placeholders may remain. When a supplied diagnostic is inside a proof body,
-repair that body as narrowly as possible; do not revisit unrelated statements or try to prove
-unassigned theorems.
+It is not your job to complete proofs, but do not delete prior proof work. If a proof no longer
+completes after your changes, finish it with `sorry`. If a proof no longer compiles, move the relevant
+failing steps into a comment labeled as a prior attempt before replacing them with `sorry`. When a
+supplied diagnostic is inside a proof body, repair that body as narrowly as possible; do not revisit
+unrelated statements or try to prove unassigned theorems.
 
 Deliver the complete assigned Lean scope with zero errors and zero non-`sorry` warnings. The only
 permitted warnings are exact declaration-uses-`sorry` warnings for allowed proof placeholders. This
@@ -52,7 +54,8 @@ delivery state has been established.
 
 Do not return a no-change report while a supplied diagnostic still applies. If a diagnostic belongs
 to an out-of-scope dependency, leave local source unchanged and identify the exact owner path in
-`issues`. Do not add placeholders merely to silence an error or warning.
+`issues`. Do not add placeholders merely to silence an error or warning except as directed above for
+a proof broken by your changes.
 
 Do not hide diagnostics, weaken validators, disable warnings or linters, or leave scratch
 declarations and unused helpers. Do not run Lean, Lake, or another language server directly; use the

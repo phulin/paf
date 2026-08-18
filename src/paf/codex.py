@@ -426,8 +426,7 @@ triggered by failed proof evidence. Review the complete assigned chapter, not on
 named in the supplied findings.""",
             "review_goal_details": """This remains review work, not a second proof attempt. Repair
 every genuine statement or supporting-interface problem, but preserve a sound interface when only
-the proof strategy failed. Existing proposition placeholders may remain, and a new proposition proof
-may use `by sorry` when proving it would distract from the review.""",
+the proof strategy failed.""",
             "review_workflow_details": """Cover every numbered source section and every assigned
 Lean declaration, followed by a chapter-wide coverage, import, and diagnostic check. For each main
 theorem, verify the statement's mathematical meaning and a plausible route through earlier results.

@@ -5,8 +5,10 @@
 Independently verify that the assigned Lean files accurately and completely represent chapter
 {chapter_number}, “{chapter_title},” from {book_title}. Repair every statement, definition, import, or
 supporting interface that is inaccurate or unusable. This stage reviews the formalization; it does
-not prove theorem bodies, so existing proof placeholders may remain and new proposition proofs may
-use `by sorry`.
+not prove theorem bodies. It is not your job to complete proofs, but do not delete prior proof work.
+If a proof no longer completes after your changes, finish it with `sorry`. If a proof no longer
+compiles, move the relevant failing steps into a comment labeled as a prior attempt before replacing
+them with `sorry`.
 
 Verify that this chapter has its own chapter-specific top-level file
 `{lean_root}/{chapter_path}.lean`; create it if it is missing rather than leaving the chapter's
