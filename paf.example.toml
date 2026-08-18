@@ -75,6 +75,7 @@ max_rounds = 3
 max_rounds = 3
 
 [stages.prove]
+chunk_size = 4
 max_rounds = 3
 
 # Adapter defaults apply to every configured source. Ordered path rules can

@@ -301,10 +301,11 @@ local source search, proof goals, completions, code actions, batched tactic tria
 dependency preparation. Remote search, local Loogle, and the MCP's general `lean_build` tool remain
 absent from the allowlist.
 
-Proof agents first read and attempt the entire assigned file set without checking each speculative
-proof separately. They then request whole-file diagnostics and iterate only over failing proofs and
-their dependent declarations. The MCP opens files against the certified cache without requesting a
-build and retains warm file workers across ordinary body edits. A stale-import notification,
+Proof agents receive a source-ordered chunk containing at most four placeholders by default. A
+declaration is never split between agents, so one declaration with more than four placeholders is
+assigned alone. Agents then request whole-file diagnostics and iterate only over their assigned
+proofs and dependent declarations. The MCP opens files against the certified cache without
+requesting a build and retains warm file workers across ordinary body edits. A stale-import notification,
 stale-import diagnostic, or import-header edit enters one per-server preparation coordinator: it
 serializes the actual `lake setup-file` work through the freshness barrier, retries the query once,
 and lets queued files first test the cache produced by the preceding preparation. Repeated failed
@@ -426,11 +427,15 @@ After the daemon exits, `status`, `snapshot`, and `wait` fall back to the persis
   pinned clean snapshot instead of being cancelled. Downstream reviews and proofs remain green unless
   an actual source edit makes their coordinator build fail. Ordinary proof edits and restart
   reconciliation do not reopen review.
-- **Prove** sends one chapter to an agent and asks it to work directly on unresolved placeholders.
-  A cumulative attempt ledger is prior inventory: later agents must refine an earlier proof using
-  new evidence or try a materially different route instead of rereading the chapter, reconfirming
-  clean diagnostics, or echoing a missing-API claim. Two consecutive rounds without reducing the
-  placeholder count stop the proof loop. The stage succeeds only when the scoped Lean code has no
+- **Prove** scans one chapter into declaration-level targets and sends each agent a source-ordered
+  chunk bounded by `stages.prove.chunk_size`. The assignment is persisted with the run and repeated
+  explicitly in the generated prompt; placeholders outside it are reserved for later agents.
+  `max_rounds` is the retry budget for one chunk, not a cap on the number of chunks in the chapter.
+  A completed chunk starts with a fresh budget, while an exhausted or durable blocked chunk does not
+  prevent independent chunks from running. A cumulative attempt ledger is prior inventory: retry
+  agents must refine an earlier proof using new evidence or try a materially different route instead
+  of rereading the chapter, reconfirming clean diagnostics, or echoing a missing-API claim. The stage
+  succeeds only when the scoped Lean code has no
   `sorry` or `admit` tokens and final Lake validation succeeds without any warning other than
   “declaration uses `sorry`”. The exact validated source digest is persisted independently of review
   status. If it is stale after restart, the coordinator rebuilds and recounts placeholders first; a
@@ -735,6 +740,10 @@ max_rounds = 12
 [stages.review]
 prompt = "my-prompts/strict-review.md"
 max_rounds = 6
+
+[stages.prove]
+chunk_size = 4 # maximum placeholders per agent; declarations are never split
+max_rounds = 3 # retries for each chunk
 ```
 
 Books are repeatable. Chapters omitted from `chapters` are discovered from every matching Markdown
