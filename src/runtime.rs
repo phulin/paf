@@ -22,9 +22,26 @@ use crate::ui;
 enum RuntimeEvent {
     Terminal(Event),
     Wire(Box<Result<WireEvent, String>>),
+    ChapterRuns {
+        chapter: String,
+        selected_run_id: Option<String>,
+        result: Box<Result<ChapterRuns, String>>,
+    },
+    Prompt {
+        run_id: String,
+        result: Result<String, String>,
+    },
     Timeline {
         run_id: String,
-        result: Box<Result<crate::model::Activity, String>>,
+        result: Box<
+            Result<
+                (
+                    crate::model::Activity,
+                    Option<crate::viewport::TimelineRenderCache>,
+                ),
+                String,
+            >,
+        >,
     },
 }
 
@@ -134,9 +151,7 @@ pub fn run(
                 let complete = event.event == "complete";
                 model.apply(event)?;
                 if model.detail && model.detail_runs.is_empty() {
-                    load_chapter_runs(&mut model, socket_path, None)?;
-                    load_prompt_if_needed(&mut model, socket_path)?;
-                    request_timeline_if_needed(&mut model, socket_path, sender.clone());
+                    request_chapter_runs(&mut model, socket_path, None, sender.clone());
                 }
                 dirty = true;
                 if complete {
@@ -149,7 +164,12 @@ pub fn run(
             }
             Ok(RuntimeEvent::Terminal(event)) => {
                 let previous_run = model.trace_run_id().map(str::to_owned);
-                dirty = handle_terminal_event(event, &mut model, socket_path)?;
+                dirty = handle_terminal_event_with_sender(
+                    event,
+                    &mut model,
+                    socket_path,
+                    sender.clone(),
+                )?;
                 let selected_run = model.trace_run_id().map(str::to_owned);
                 if selected_run != previous_run && selected_run.is_some() {
                     request_timeline_if_needed(&mut model, socket_path, sender.clone());
@@ -167,9 +187,36 @@ pub fn run(
                     return Ok(TuiExit::Reload(agent_view.flatten()));
                 }
             }
+            Ok(RuntimeEvent::ChapterRuns {
+                chapter,
+                selected_run_id,
+                result,
+            }) => {
+                let details = result.map_err(anyhow::Error::msg)?;
+                if model.apply_loaded_chapter_runs(&chapter, selected_run_id.as_deref(), details) {
+                    request_prompt_if_needed(&mut model, socket_path, sender.clone());
+                    request_timeline_if_needed(&mut model, socket_path, sender.clone());
+                }
+                dirty = true;
+            }
+            Ok(RuntimeEvent::Prompt { run_id, result }) => {
+                match result {
+                    Ok(prompt) => model.apply_loaded_prompt(run_id, prompt),
+                    Err(error) => model.fail_prompt_load(run_id, error),
+                }
+                dirty = true;
+            }
             Ok(RuntimeEvent::Timeline { run_id, result }) => {
                 match *result {
-                    Ok(activity) => model.apply_full_timeline(run_id, activity),
+                    Ok((activity, cache)) => {
+                        model.apply_full_timeline(run_id.clone(), activity);
+                        if model.detail
+                            && model.selected_run_id() == Some(run_id.as_str())
+                            && let Some(cache) = cache
+                        {
+                            model.timeline_render_cache = cache;
+                        }
+                    }
                     Err(error) => model.fail_timeline_load(run_id, error),
                 }
                 dirty = true;
@@ -237,10 +284,11 @@ fn spawn_terminal_reader(sender: Sender<RuntimeEvent>) {
     });
 }
 
-fn handle_terminal_event(
+fn handle_terminal_event_with_sender(
     event: Event,
     model: &mut DashboardModel,
     socket_path: &str,
+    sender: Sender<RuntimeEvent>,
 ) -> Result<bool> {
     let key = match event {
         Event::Key(key) => key,
@@ -276,15 +324,15 @@ fn handle_terminal_event(
             .get(model.selected_run)
             .map(|run| run.id.clone());
         if selected_run != previous_run {
-            load_chapter_runs(model, socket_path, selected_run.as_deref())?;
+            request_chapter_runs(model, socket_path, selected_run.as_deref(), sender.clone());
         }
         if model.detail_tab != previous_tab || selected_run != previous_run {
-            load_prompt_if_needed(model, socket_path)?;
+            request_prompt_if_needed(model, socket_path, sender);
         }
         return Ok(dirty);
     }
     if model.shepherd_detail {
-        return handle_shepherd_key(key, model, socket_path);
+        return handle_shepherd_key(key, model, socket_path, sender);
     }
     match key.code {
         KeyCode::Char('q') | KeyCode::Char('c')
@@ -303,7 +351,7 @@ fn handle_terminal_event(
         KeyCode::Char('i') | KeyCode::Enter => {
             if model.selected_row().is_some() {
                 model.enter_detail();
-                load_chapter_runs(model, socket_path, None)?;
+                request_chapter_runs(model, socket_path, None, sender);
             }
             Ok(true)
         }
@@ -351,29 +399,49 @@ fn handle_terminal_event(
     }
 }
 
-fn load_prompt_if_needed(model: &mut DashboardModel, socket_path: &str) -> Result<()> {
+#[cfg(test)]
+fn handle_terminal_event(
+    event: Event,
+    model: &mut DashboardModel,
+    socket_path: &str,
+) -> Result<bool> {
+    let (sender, _receiver) = mpsc::channel();
+    handle_terminal_event_with_sender(event, model, socket_path, sender)
+}
+
+fn request_prompt_if_needed(
+    model: &mut DashboardModel,
+    socket_path: &str,
+    sender: Sender<RuntimeEvent>,
+) {
     if model.detail_tab != crate::model::DetailTab::Prompt {
-        return Ok(());
+        return;
     }
     let Some(run_id) = model.selected_run_id().map(str::to_owned) else {
-        return Ok(());
+        return;
     };
-    if model.run_prompts.contains_key(&run_id) {
-        return Ok(());
+    if !model.begin_prompt_load(&run_id) {
+        return;
     }
-    let response = send_control_request(
-        socket_path,
-        &json!({"command": "run_prompt", "run_id": run_id}),
-    )?;
-    if let Some(error) = response.get("error") {
-        bail!("orchestrator rejected run prompt request: {error}")
-    }
-    let prompt = response
-        .get("prompt")
-        .and_then(Value::as_str)
-        .context("run prompt response omitted prompt")?;
-    model.run_prompts.insert(run_id, prompt.to_owned());
-    Ok(())
+    let socket_path = socket_path.to_owned();
+    thread::spawn(move || {
+        let result = send_control_request(
+            &socket_path,
+            &json!({"command": "run_prompt", "run_id": run_id}),
+        )
+        .and_then(|response| {
+            if let Some(error) = response.get("error") {
+                bail!("orchestrator rejected run prompt request: {error}")
+            }
+            response
+                .get("prompt")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .context("run prompt response omitted prompt")
+        })
+        .map_err(|error| error.to_string());
+        let _ = sender.send(RuntimeEvent::Prompt { run_id, result });
+    });
 }
 
 fn request_timeline_if_needed(
@@ -387,6 +455,7 @@ fn request_timeline_if_needed(
     if !model.begin_timeline_load(&run_id) {
         return;
     }
+    let layout_width = model.timeline_render_cache.width;
     let socket_path = socket_path.to_owned();
     thread::spawn(move || {
         let result = send_control_request(
@@ -397,13 +466,16 @@ fn request_timeline_if_needed(
             if let Some(error) = response.get("error") {
                 bail!("{error}")
             }
-            serde_json::from_value(
+            let activity = serde_json::from_value(
                 response
                     .get("activity")
                     .cloned()
                     .context("timeline response omitted activity")?,
             )
-            .context("invalid timeline activity")
+            .context("invalid timeline activity")?;
+            let cache = (layout_width > 0)
+                .then(|| ui::build_timeline_render_cache(Some(&activity), None, layout_width));
+            Ok((activity, cache))
         })
         .map_err(|error| error.to_string());
         let _ = sender.send(RuntimeEvent::Timeline {
@@ -434,6 +506,7 @@ fn handle_shepherd_key(
     key: KeyEvent,
     model: &mut DashboardModel,
     socket_path: &str,
+    sender: Sender<RuntimeEvent>,
 ) -> Result<bool> {
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('s') => {
@@ -461,7 +534,9 @@ fn handle_shepherd_key(
             };
             model.selected = selected;
             model.enter_detail();
-            load_chapter_runs(model, socket_path, Some(&agent.run_id))?;
+            // Applying the chapter response schedules the selected run's transcript.
+            // History loading itself must never block input handling.
+            request_chapter_runs(model, socket_path, Some(&agent.run_id), sender);
         }
         _ => return Ok(false),
     }
@@ -488,31 +563,45 @@ fn handle_detail_key(key: KeyEvent, model: &mut DashboardModel) -> Result<bool> 
     Ok(true)
 }
 
-fn load_chapter_runs(
+fn request_chapter_runs(
     model: &mut DashboardModel,
     socket_path: &str,
     selected_run_id: Option<&str>,
-) -> Result<()> {
+    sender: Sender<RuntimeEvent>,
+) {
     let Some(chapter) = model.selected_row().map(|row| row.unit.id.clone()) else {
-        return Ok(());
+        return;
     };
+    if !model.begin_chapter_runs_load(&chapter, selected_run_id) {
+        return;
+    }
+    let selected_run_id = selected_run_id.map(str::to_owned);
     let mut request = json!({"command": "chapter_runs", "chapter": chapter});
-    if let Some(run_id) = selected_run_id {
-        request["run_id"] = Value::String(run_id.to_owned());
+    if let Some(run_id) = &selected_run_id {
+        request["run_id"] = Value::String(run_id.clone());
     }
-    let response = send_control_request(socket_path, &request)?;
-    if let Some(error) = response.get("error") {
-        bail!("orchestrator rejected chapter history request: {error}")
-    }
-    let details: ChapterRuns = serde_json::from_value(
-        response
-            .get("chapter_runs")
-            .cloned()
-            .context("chapter history response omitted chapter_runs")?,
-    )
-    .context("invalid chapter history response")?;
-    model.apply_chapter_runs(details);
-    Ok(())
+    let socket_path = socket_path.to_owned();
+    thread::spawn(move || {
+        let result = send_control_request(&socket_path, &request)
+            .and_then(|response| {
+                if let Some(error) = response.get("error") {
+                    bail!("orchestrator rejected chapter history request: {error}")
+                }
+                serde_json::from_value(
+                    response
+                        .get("chapter_runs")
+                        .cloned()
+                        .context("chapter history response omitted chapter_runs")?,
+                )
+                .context("invalid chapter history response")
+            })
+            .map_err(|error| error.to_string());
+        let _ = sender.send(RuntimeEvent::ChapterRuns {
+            chapter,
+            selected_run_id,
+            result: Box::new(result),
+        });
+    });
 }
 
 fn send_control(socket_path: &str, command: &str) -> Result<Value> {
@@ -533,6 +622,8 @@ fn send_control_request(socket_path: &str, request: &Value) -> Result<Value> {
 mod tests {
     use super::*;
     use crate::model::{Task, WorkUnit};
+    use std::os::unix::net::UnixListener;
+    use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
     #[test]
     fn mouse_capture_uses_sgr_without_motion_tracking() {
@@ -542,6 +633,70 @@ mod tests {
         assert!(enabled.contains("\x1b[?1006h"));
         assert!(!enabled.contains("?1002h"));
         assert!(!enabled.contains("?1003h"));
+    }
+
+    #[test]
+    fn opening_agent_detail_does_not_wait_for_chapter_history() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let socket_path = std::env::temp_dir().join(format!(
+            "paf-tui-open-agent-{}-{nonce}.sock",
+            std::process::id()
+        ));
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut request)
+                .unwrap();
+            assert!(request.contains("\"command\":\"chapter_runs\""));
+            thread::sleep(Duration::from_millis(500));
+            stream
+                .write_all(b"{\"chapter_runs\":{\"work_unit_id\":\"book/chapter-01\",\"runs\":[],\"selected_run_id\":null,\"activity\":null}}\n")
+                .unwrap();
+        });
+
+        let mut model = DashboardModel::loading("test".into(), String::new());
+        model.preparation = None;
+        model.state.work_units.push(WorkUnit {
+            id: "book/chapter-01".into(),
+            ..WorkUnit::default()
+        });
+        model.state.tasks.insert(
+            "book/chapter-01:review".into(),
+            Task {
+                work_unit_id: "book/chapter-01".into(),
+                stage: "review".into(),
+                ..Task::default()
+            },
+        );
+        let (sender, receiver) = mpsc::channel();
+
+        let started = Instant::now();
+        let changed = handle_terminal_event_with_sender(
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            &mut model,
+            socket_path.to_str().unwrap(),
+            sender,
+        )
+        .unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(changed);
+        assert!(model.detail);
+        assert!(
+            elapsed < Duration::from_millis(250),
+            "opening the agent view waited for history I/O: {elapsed:?}"
+        );
+        assert!(matches!(
+            receiver.recv_timeout(Duration::from_secs(2)).unwrap(),
+            RuntimeEvent::ChapterRuns { .. }
+        ));
+        server.join().unwrap();
+        std::fs::remove_file(socket_path).unwrap();
     }
 
     #[test]

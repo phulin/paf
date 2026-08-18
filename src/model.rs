@@ -350,6 +350,8 @@ pub struct DashboardModel {
     pub detail_runs: Vec<HistoricalRun>,
     pub selected_run: usize,
     pub run_prompts: HashMap<String, String>,
+    loading_chapter_runs: Option<(String, Option<String>)>,
+    loading_prompt_runs: HashSet<String>,
     pub full_timeline_runs: HashSet<String>,
     pub loading_timeline_runs: HashSet<String>,
     pub timeline_errors: HashMap<String, String>,
@@ -390,6 +392,8 @@ impl DashboardModel {
             detail_runs: Vec::new(),
             selected_run: 0,
             run_prompts: HashMap::new(),
+            loading_chapter_runs: None,
+            loading_prompt_runs: HashSet::new(),
             full_timeline_runs: HashSet::new(),
             loading_timeline_runs: HashSet::new(),
             timeline_errors: HashMap::new(),
@@ -576,6 +580,7 @@ impl DashboardModel {
         self.detail = true;
         self.shepherd_detail = false;
         self.detail_runs.clear();
+        self.loading_chapter_runs = None;
         self.selected_run = 0;
         self.scroll = 0;
         self.detail_max_scroll = 0;
@@ -585,6 +590,7 @@ impl DashboardModel {
     pub fn leave_detail(&mut self) {
         self.detail = false;
         self.detail_runs.clear();
+        self.loading_chapter_runs = None;
         self.selected_run = 0;
         self.run_prompts.clear();
         self.scroll = 0;
@@ -657,6 +663,56 @@ impl DashboardModel {
     pub fn selected_prompt(&self) -> Option<&str> {
         self.selected_run_id()
             .and_then(|run_id| self.run_prompts.get(run_id).map(String::as_str))
+    }
+
+    pub fn begin_chapter_runs_load(
+        &mut self,
+        chapter: &str,
+        selected_run_id: Option<&str>,
+    ) -> bool {
+        let request = (chapter.to_owned(), selected_run_id.map(str::to_owned));
+        if self.loading_chapter_runs.as_ref() == Some(&request) {
+            return false;
+        }
+        self.loading_chapter_runs = Some(request);
+        true
+    }
+
+    pub fn apply_loaded_chapter_runs(
+        &mut self,
+        chapter: &str,
+        selected_run_id: Option<&str>,
+        details: ChapterRuns,
+    ) -> bool {
+        let request = (chapter.to_owned(), selected_run_id.map(str::to_owned));
+        if self.loading_chapter_runs.as_ref() != Some(&request)
+            || !self.detail
+            || self.selected_row().map(|row| row.unit.id.as_str()) != Some(chapter)
+        {
+            return false;
+        }
+        self.loading_chapter_runs = None;
+        self.apply_chapter_runs(details);
+        true
+    }
+
+    pub fn begin_prompt_load(&mut self, run_id: &str) -> bool {
+        if self.run_prompts.contains_key(run_id) || self.loading_prompt_runs.contains(run_id) {
+            return false;
+        }
+        self.loading_prompt_runs.insert(run_id.to_owned());
+        true
+    }
+
+    pub fn apply_loaded_prompt(&mut self, run_id: String, prompt: String) {
+        self.loading_prompt_runs.remove(&run_id);
+        self.run_prompts.insert(run_id, prompt);
+    }
+
+    pub fn fail_prompt_load(&mut self, run_id: String, error: String) {
+        self.loading_prompt_runs.remove(&run_id);
+        self.run_prompts
+            .insert(run_id, format!("Prompt unavailable: {error}"));
     }
 
     pub fn selected_timeline_status(&self) -> Option<&str> {
@@ -1006,6 +1062,54 @@ mod tests {
         assert!(model.detail);
         assert_eq!(model.detail_tab, DetailTab::Plan);
         assert_eq!(model.selected_row().unwrap().unit.id, "book/chapter-01");
+    }
+
+    #[test]
+    fn stale_chapter_history_does_not_replace_a_newer_run_request() {
+        let mut model = DashboardModel::loading("test".into(), String::new());
+        model
+            .apply(WireEvent {
+                protocol_version: PROTOCOL_VERSION,
+                event: "snapshot".into(),
+                status: "running".into(),
+                result: None,
+                snapshot: Some(snapshot()),
+                delta: None,
+                preparation: None,
+                message: String::new(),
+            })
+            .unwrap();
+        model.enter_detail();
+        assert!(model.begin_chapter_runs_load("book/chapter-01", None));
+        assert!(model.begin_chapter_runs_load("book/chapter-01", Some("run-2")));
+
+        assert!(!model.apply_loaded_chapter_runs(
+            "book/chapter-01",
+            None,
+            ChapterRuns {
+                selected_run_id: Some("run-1".into()),
+                runs: vec![HistoricalRun {
+                    id: "run-1".into(),
+                    ..HistoricalRun::default()
+                }],
+                ..ChapterRuns::default()
+            },
+        ));
+        assert!(model.detail_runs.is_empty());
+
+        assert!(model.apply_loaded_chapter_runs(
+            "book/chapter-01",
+            Some("run-2"),
+            ChapterRuns {
+                selected_run_id: Some("run-2".into()),
+                runs: vec![HistoricalRun {
+                    id: "run-2".into(),
+                    ..HistoricalRun::default()
+                }],
+                ..ChapterRuns::default()
+            },
+        ));
+        assert_eq!(model.selected_run_id(), Some("run-2"));
     }
 
     #[test]

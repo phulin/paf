@@ -877,18 +877,8 @@ fn draw_timeline_content(frame: &mut Frame<'_>, model: &mut DashboardModel, area
         model.timeline_render_cache.recent_len = recent_len;
         model.timeline_render_cache.last_entry_sequence = last_entry_sequence;
     } else if !is_append {
-        let text = detail_text(DetailTab::Timeline, activity, None, status.as_deref());
-        let mut cache = TimelineRenderCache {
-            run_id,
-            recent_len,
-            last_entry_sequence,
-            status,
-            width: inner.width,
-            offsets: vec![0],
-            ..TimelineRenderCache::default()
-        };
-        append_wrapped_lines(&mut cache, text.lines, inner.width);
-        model.timeline_render_cache = cache;
+        model.timeline_render_cache =
+            build_timeline_render_cache(activity, status.as_deref(), inner.width);
     }
 
     let maximum = model
@@ -922,6 +912,27 @@ fn draw_timeline_content(frame: &mut Frame<'_>, model: &mut DashboardModel, area
         inner,
     );
     draw_detail_scrollbar(frame, model.scroll, maximum, inner.height, area);
+}
+
+pub(crate) fn build_timeline_render_cache(
+    activity: Option<&Activity>,
+    status: Option<&str>,
+    width: u16,
+) -> TimelineRenderCache {
+    let text = detail_text(DetailTab::Timeline, activity, None, status);
+    let mut cache = TimelineRenderCache {
+        run_id: activity.map_or_else(String::new, |value| value.run_id.clone()),
+        recent_len: activity.map_or(0, |value| value.recent.len()),
+        last_entry_sequence: activity
+            .and_then(|value| value.recent.last())
+            .map(|entry| entry.sequence),
+        status: status.map(str::to_owned),
+        width,
+        offsets: vec![0],
+        ..TimelineRenderCache::default()
+    };
+    append_wrapped_lines(&mut cache, text.lines, width);
+    cache
 }
 
 fn append_wrapped_lines(cache: &mut TimelineRenderCache, lines: Vec<Line<'static>>, width: u16) {
