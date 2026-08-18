@@ -4197,11 +4197,10 @@ class Orchestrator:
         finally:
             await cancel_all()
 
-        return (
-            not review_failures
-            and not review_blocked
-            and (not prove or all(proof_results.values()))
-        )
+        # Proofs are terminal leaves in the task graph. Their durable FAILED status
+        # remains visible and retryable, but cannot block any downstream work
+        # or turn an otherwise drained review tree into an orchestration failure.
+        return not review_failures and not review_blocked
 
     async def _review_until_clean(self, *, rerun: bool = False) -> bool:
         return await self._review_tree(rerun=rerun)
@@ -4388,7 +4387,7 @@ class Orchestrator:
             await self.state.set_task(
                 chapter.id,
                 Stage.PROVE,
-                TaskStatus.BLOCKED,
+                TaskStatus.FAILED,
                 "upstream request requires manual escalation: " + ", ".join(escalated),
             )
             return False
@@ -4500,7 +4499,7 @@ class Orchestrator:
                 await self.state.set_task(
                     chapter.id,
                     Stage.PROVE,
-                    TaskStatus.BLOCKED if targeted_retry else TaskStatus.FAILED,
+                    TaskStatus.FAILED,
                     (
                         "targeted downstream retry requires manual escalation"
                         if targeted_retry
@@ -4548,7 +4547,7 @@ class Orchestrator:
                     await self.state.set_task(
                         chapter.id,
                         Stage.PROVE,
-                        TaskStatus.BLOCKED,
+                        TaskStatus.FAILED,
                         "targeted downstream retry did not prove: " + ", ".join(sorted(unresolved)),
                     )
                     return False
@@ -4694,7 +4693,7 @@ class Orchestrator:
                     await self.state.set_task(
                         chapter.id,
                         Stage.PROVE,
-                        TaskStatus.BLOCKED,
+                        TaskStatus.FAILED,
                         "upstream request requires manual escalation: " + ", ".join(escalated),
                     )
                     return False
@@ -4719,7 +4718,7 @@ class Orchestrator:
                 await self.state.set_task(
                     chapter.id,
                     Stage.PROVE,
-                    TaskStatus.BLOCKED,
+                    TaskStatus.FAILED,
                     "unchanged proof blocker(s): " + ", ".join(terminal_blockers),
                 )
                 return False
@@ -4756,13 +4755,7 @@ class Orchestrator:
         await self.state.set_task(
             chapter.id,
             Stage.PROVE,
-            TaskStatus.BLOCKED
-            if any(
-                blocker.get("status")
-                in {ProofBlockerStatus.OPEN.value, ProofBlockerStatus.BLOCKED.value}
-                for blocker in self.state.proof_blockers_for_consumer(chapter.id, active_only=False)
-            )
-            else TaskStatus.FAILED,
+            TaskStatus.FAILED,
             (
                 "proof chunks exhausted retries with "
                 f"{unresolved_placeholders} "

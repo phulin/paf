@@ -431,11 +431,13 @@ After the daemon exits, `status`, `snapshot`, and `wait` fall back to the persis
   chunk bounded by `stages.prove.chunk_size`. The assignment is persisted with the run and repeated
   explicitly in the generated prompt; placeholders outside it are reserved for later agents.
   `max_rounds` is the retry budget for one chunk, not a cap on the number of chunks in the chapter.
-  A completed chunk starts with a fresh budget, while an exhausted or durable blocked chunk does not
-  prevent independent chunks from running. A cumulative attempt ledger is prior inventory: retry
+  A completed chunk starts with a fresh budget, while an exhausted or durably obstructed chunk does
+  not prevent independent chunks from running or block downstream tasks. After every runnable
+  branch drains, such a chunk remains a visible failed leaf task without failing the enclosing
+  pipeline invocation. A cumulative attempt ledger is prior inventory: retry
   agents must refine an earlier proof using new evidence or try a materially different route instead
   of rereading the chapter, reconfirming clean diagnostics, or echoing a missing-API claim. The stage
-  succeeds only when the scoped Lean code has no
+  proof task succeeds only when the scoped Lean code has no
   `sorry` or `admit` tokens and final Lake validation succeeds without any warning other than
   “declaration uses `sorry`”. The exact validated source digest is persisted independently of review
   status. If it is stale after restart, the coordinator rebuilds and recounts placeholders first; a

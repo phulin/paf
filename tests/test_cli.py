@@ -174,6 +174,56 @@ def test_run_prints_failure_summary_after_tui_closes(
     assert events == ["tui-closed", "summary-printed"]
 
 
+def test_run_completes_with_visible_local_task_failures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    state = StateStore(config)
+
+    async def populate() -> None:
+        await state.load_or_create()
+        await state.set_task(
+            config.chapters[0].id,
+            Stage.PROVE,
+            TaskStatus.FAILED,
+            "proof chunks exhausted retries",
+        )
+
+    asyncio.run(populate())
+    events: list[str] = []
+
+    def run_tui(*_args: object, **_kwargs: object) -> bool:
+        return True
+
+    def print_summary(
+        actual_state: StateStore,
+        _console: Console,
+        *,
+        chapter_ids: set[str] | None = None,
+    ) -> None:
+        assert actual_state is state
+        assert chapter_ids == {config.chapters[0].id}
+        events.append("summary-printed")
+
+    monkeypatch.setattr(cli_module, "StateStore", lambda _config: state)
+    monkeypatch.setattr(cli_module, "run_tui", run_tui)
+    monkeypatch.setattr(cli_module, "_print_failure_summary", print_summary)
+    args = argparse.Namespace(
+        book=[],
+        chapter=[],
+        force=False,
+        command="pipeline",
+        no_tui=False,
+        startup_warning="",
+    )
+    output = StringIO()
+    console = Console(file=output, force_terminal=False, color_system=None)
+
+    assert cli_module._run(args, config, console) == 0
+    assert "Completed with task failures" in output.getvalue()
+    assert events == ["summary-printed"]
+
+
 def test_run_prints_abort_error_after_tui_closes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

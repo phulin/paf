@@ -3630,7 +3630,7 @@ async def test_upstream_request_escalates_only_after_failed_targeted_retry(
     assert request["answer"]["disposition"] == "downstream"
     assert request["retry_run_id"] == orchestrator.state.task(consumer.id, Stage.PROVE).runs[-1].id
     assert "blocked declaration remained unresolved" in request["escalation_reason"]
-    assert orchestrator.state.task(consumer.id, Stage.PROVE).status == TaskStatus.BLOCKED
+    assert orchestrator.state.task(consumer.id, Stage.PROVE).status == TaskStatus.FAILED
     await orchestrator.shutdown()
 
 
@@ -4503,6 +4503,37 @@ async def test_prove_assigns_source_ordered_chunks_of_four_and_persists_them(
 
 
 @pytest.mark.asyncio
+async def test_proof_task_failure_does_not_fail_or_block_the_review_tree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = config.chapters[0]
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await orchestrator.prepare()
+    await mark_formalized(orchestrator)
+    await state.set_task(chapter.id, Stage.REVIEW, TaskStatus.SUCCEEDED, "reviewed")
+
+    async def failed_proof(attempted: Chapter, *, defer_review: bool = False) -> bool:
+        assert attempted.id == chapter.id
+        assert defer_review
+        await state.set_task(
+            chapter.id,
+            Stage.PROVE,
+            TaskStatus.FAILED,
+            "proof chunks exhausted retries",
+        )
+        return False
+
+    monkeypatch.setattr(orchestrator, "_prove", failed_proof)
+
+    assert await orchestrator._review_tree(prove=True)
+    assert state.task(chapter.id, Stage.PROVE).status == TaskStatus.FAILED
+    assert all(task.status != TaskStatus.BLOCKED for task in state.tasks.values())
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_prove_retries_the_same_chunk_before_advancing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -4583,7 +4614,7 @@ async def test_prove_retries_the_same_chunk_before_advancing(
 
 
 @pytest.mark.asyncio
-async def test_blocked_proof_chunk_does_not_prevent_independent_chunk(
+async def test_obstructed_proof_chunk_does_not_prevent_independent_chunk(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
@@ -4661,7 +4692,7 @@ async def test_blocked_proof_chunk_does_not_prevent_independent_chunk(
         "first",
         "second",
     ]
-    assert state.task(chapter.id, Stage.PROVE).status == TaskStatus.BLOCKED
+    assert state.task(chapter.id, Stage.PROVE).status == TaskStatus.FAILED
     assert "theorem second : True := by trivial" in source.read_text(encoding="utf-8")
     await orchestrator.shutdown()
 

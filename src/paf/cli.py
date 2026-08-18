@@ -808,11 +808,24 @@ def _run(args: argparse.Namespace, config: PipelineConfig, console: Console) -> 
     lifetime_usage = state.total_usage()
     cost = state.invocation_cost()
     lifetime_cost = state.total_cost()
+    selected_chapter_ids = {chapter.id for chapter in chapters}
+    local_task_failures = any(
+        task.chapter_id in selected_chapter_ids
+        and task.status in {TaskStatus.FAILED, TaskStatus.BLOCKED}
+        for task in state.tasks.values()
+    )
     console.print(format_usage(usage, label="This invocation"))
     console.print(f"API-equivalent cost: {format_usd(cost)}")
     console.print(f"Lifetime tokens: {format_count(lifetime_usage.total_tokens)}")
     console.print(f"Lifetime API-equivalent cost: {format_usd(lifetime_cost)}")
-    if succeeded:
+    if succeeded and local_task_failures:
+        console.print("Completed with task failures")
+        _print_failure_summary(
+            state,
+            console,
+            chapter_ids=selected_chapter_ids,
+        )
+    elif succeeded:
         console.print("Completed successfully")
     else:
         console.print("Finished with failures")
@@ -823,7 +836,7 @@ def _run(args: argparse.Namespace, config: PipelineConfig, console: Console) -> 
         _print_failure_summary(
             state,
             console,
-            chapter_ids={chapter.id for chapter in chapters},
+            chapter_ids=selected_chapter_ids,
         )
     return 0 if succeeded else 1
 
