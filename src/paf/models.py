@@ -95,9 +95,7 @@ class ShepherdSettings:
     failure_threshold: int = 10
     maximum_failures_per_sweep: int = 50
     maximum_work_units_per_sweep: int = 32
-    # Compatibility name: this now bounds consecutive no-progress sweeps, not
-    # the lifetime number of sweeps in a long-running invocation.
-    maximum_sweeps_per_invocation: int = 3
+    maximum_consecutive_no_progress_sweeps: int = 3
     max_agents: int = 2
 
 

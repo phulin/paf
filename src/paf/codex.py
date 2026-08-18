@@ -543,7 +543,6 @@ class AgentResult:
     thread_id: str | None = None
     error: str = ""
     capacity_exhausted: bool = False
-    source_digest: str = ""
 
 
 class FatalCodexInvocationError(RuntimeError):
@@ -2012,6 +2011,7 @@ whole-file diagnostics from prerequisites to dependents. Do not prepare every fi
             report=report or None,
             usage=usage,
             thread_id=thread_id,
+            source_digest=after,
         )
         result = AgentResult(
             succeeded=succeeded,
@@ -2023,7 +2023,6 @@ whole-file diagnostics from prerequisites to dependents. Do not prepare every fi
             thread_id=thread_id,
             error=error,
             capacity_exhausted=capacity_failure and exit_code != 0,
-            source_digest=after,
         )
         if fatal_invocation_failure and exit_code != 0:
             raise FatalCodexInvocationError(error or "Codex rejected the invocation")

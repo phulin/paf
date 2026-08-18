@@ -201,8 +201,8 @@ class RunRecord:
     source_start_line: int = 1
     source_end_line: int = 1
     project_root: str = ""
-    # Digest of the integrated owner scope immediately after this run. Newer
-    # records let restart reconciliation certify without rerunning the agent.
+    # Digest of the agent result scope. It lets restart reconciliation detect
+    # whether that completed result still matches the current source.
     source_digest: str | None = None
 
     @property
@@ -624,11 +624,6 @@ class StateStore:
                         if name in RepairCaseRecord.__dataclass_fields__
                     }
                     fields.setdefault("id", record_id)
-                    if fields.get("status") in {
-                        "waiting_for_dependencies",
-                        "certification_pending",
-                    }:
-                        fields["status"] = RepairWorkUnitStatus.PENDING
                     try:
                         self.repair_cases[record_id] = RepairCaseRecord(**fields)
                     except (TypeError, ValueError):

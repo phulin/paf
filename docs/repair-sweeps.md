@@ -573,15 +573,15 @@ interval_seconds = 1200
 failure_threshold = 10
 maximum_failures_per_sweep = 50
 maximum_work_units_per_sweep = 32
-maximum_sweeps_per_invocation = 3
+maximum_consecutive_no_progress_sweeps = 3
 max_agents = 2
 ```
 
 Projects can set `enabled = false` to opt out.
 
 The worker profile is independent of the Shepherd profile and defaults to Luna/max even when the
-Shepherd uses a stronger model. Sweep limits are currently per orchestrator invocation; case and
-work-unit history remains durable across restarts.
+Shepherd uses a stronger model. Consecutive no-progress sweeps are bounded; progress or new failure
+fingerprints reset the backoff, and case/work-unit history remains durable across restarts.
 
 Planned manual controls are:
 

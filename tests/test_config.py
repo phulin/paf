@@ -125,7 +125,7 @@ max_agents = 3
     assert shepherd.failure_threshold == 10
     assert shepherd.maximum_failures_per_sweep == 40
     assert shepherd.maximum_work_units_per_sweep == 24
-    assert shepherd.maximum_sweeps_per_invocation == 2
+    assert shepherd.maximum_consecutive_no_progress_sweeps == 2
     assert shepherd.max_agents == 3
 
     path.write_text(

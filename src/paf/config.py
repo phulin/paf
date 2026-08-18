@@ -549,7 +549,12 @@ def load_config(path: str | Path, *, project: Project | None = None) -> Pipeline
         failure_threshold=int(raw_shepherd.get("failure_threshold", 10)),
         maximum_failures_per_sweep=int(raw_shepherd.get("maximum_failures_per_sweep", 50)),
         maximum_work_units_per_sweep=int(raw_shepherd.get("maximum_work_units_per_sweep", 32)),
-        maximum_sweeps_per_invocation=int(raw_shepherd.get("maximum_sweeps_per_invocation", 3)),
+        maximum_consecutive_no_progress_sweeps=int(
+            raw_shepherd.get(
+                "maximum_consecutive_no_progress_sweeps",
+                raw_shepherd.get("maximum_sweeps_per_invocation", 3),
+            )
+        ),
         max_agents=int(raw_shepherd.get("max_agents", 2)),
     )
     if shepherd.interval_seconds <= 0:
@@ -560,8 +565,8 @@ def load_config(path: str | Path, *, project: Project | None = None) -> Pipeline
         raise ValueError("shepherd.maximum_failures_per_sweep must be positive")
     if shepherd.maximum_work_units_per_sweep < 1:
         raise ValueError("shepherd.maximum_work_units_per_sweep must be positive")
-    if shepherd.maximum_sweeps_per_invocation < 1:
-        raise ValueError("shepherd.maximum_sweeps_per_invocation must be positive")
+    if shepherd.maximum_consecutive_no_progress_sweeps < 1:
+        raise ValueError("shepherd.maximum_consecutive_no_progress_sweeps must be positive")
     if shepherd.max_agents < 1:
         raise ValueError("shepherd.max_agents must be positive")
 

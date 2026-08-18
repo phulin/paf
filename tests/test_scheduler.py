@@ -2171,7 +2171,9 @@ async def test_shepherd_reconciliation_accepts_matching_clean_build_without_agen
         "stale coordinator result",
     )
 
-    assert await orchestrator._reconcile_stale_formalizations()
+    assert await orchestrator._reconcile_stale_formalizations(
+        (state.key(chapter.id, Stage.FORMALIZE),)
+    )
     assert state.task(chapter.id, Stage.FORMALIZE).status == TaskStatus.SUCCEEDED
     assert state.task(chapter.id, Stage.FORMALIZE).rounds == 0
     await state.close()
@@ -2207,7 +2209,9 @@ async def test_shepherd_reconciliation_queues_completed_unchanged_agent_for_norm
 
     monkeypatch.setattr(orchestrator, "_build_chapters", build)
 
-    assert await orchestrator._reconcile_stale_formalizations()
+    assert await orchestrator._reconcile_stale_formalizations(
+        (state.key(chapter.id, Stage.FORMALIZE),)
+    )
     assert state.task(chapter.id, Stage.FORMALIZE).status == TaskStatus.PENDING
     assert run.validation is None
     await state.close()

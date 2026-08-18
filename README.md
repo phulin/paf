@@ -708,7 +708,7 @@ interval_seconds = 1200
 failure_threshold = 10
 maximum_failures_per_sweep = 50
 maximum_work_units_per_sweep = 32
-maximum_sweeps_per_invocation = 3
+maximum_consecutive_no_progress_sweeps = 3
 max_agents = 2
 ```
 
@@ -716,8 +716,8 @@ Set `enabled = false` to opt out for a project.
 
 Repair is an auxiliary overlay, not a fifth stage. The Shepherd may target any existing
 discover/formalize/review/prove cell. While the Luna worker runs, the TUI and web matrix label that
-cell `repairing`; when the coordinator build validates it, the cell switches to `building`. The
-underlying task status changes only after validation succeeds.
+cell `repairing`; after its edits integrate, the underlying task returns to the normal stage queue
+for building and validation.
 
 When Lean MCP is enabled, orchestrator startup bootstraps `lean_project` if it does not already
 contain both `lean-toolchain` and a Lake file. PAF pins the active Lean version, creates a matching

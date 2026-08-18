@@ -207,7 +207,7 @@ async def test_repair_worker_returns_integrated_edit_to_normal_stage_scheduler(
     orchestrator = Orchestrator(config, state)
 
     async def attempt(*_args: object, **kwargs: object) -> object:
-        assert kwargs["defer_validation"] is True
+        assert kwargs["role"] == REPAIR_WORKER_ROLE
         return SimpleNamespace(
             agent=SimpleNamespace(
                 succeeded=True,

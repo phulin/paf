@@ -131,10 +131,6 @@ class FormalizeOutcome:
     succeeded: bool
     blocked_by: tuple[str, ...] = ()
 
-    @property
-    def blocked(self) -> bool:
-        return bool(self.blocked_by)
-
 
 @dataclass(frozen=True)
 class ReviewOutcome:
@@ -1462,7 +1458,6 @@ class Orchestrator:
         resume_thread_id: str | None = None,
         resume_run_id: str = "",
         resume_prompt: str = "",
-        defer_validation: bool = False,
     ) -> Attempt:
         auxiliary = role in {UPSTREAM_REPAIR_ROLE, REPAIR_WORKER_ROLE}
         upstream_repair = role == UPSTREAM_REPAIR_ROLE
@@ -1665,7 +1660,7 @@ class Orchestrator:
                 if stage is Stage.REVIEW or auxiliary:
                     self._proof_rechecks.update(invalidated_builds)
             if isolated.accepted:
-                if defer_validation:
+                if role == REPAIR_WORKER_ROLE:
                     validation = ValidationResult(
                         True,
                         0,
@@ -1745,9 +1740,6 @@ class Orchestrator:
                 run,
                 isolation=isolated.as_dict(),
                 validation=validation.as_dict(),
-                source_digest=(
-                    agent.source_digest if isolated.accepted and agent.source_digest else None
-                ),
             )
         except BaseException as error:
             interrupted_isolation: dict[str, object] | None = None
@@ -5272,13 +5264,16 @@ class Orchestrator:
             ),
         }
 
-    async def _reconcile_stale_formalizations(self) -> bool:
+    async def _reconcile_stale_formalizations(self, task_keys: Iterable[str]) -> bool:
         """Resolve stale formalize failures from durable facts before hiring an agent."""
 
         progressed = False
         clean_value = self.state.formalize_graph.get("clean", {})
         clean = clean_value if isinstance(clean_value, dict) else {}
-        for _task_key, task in tuple(self.state.shepherd_repairable_tasks()):
+        for task_key in dict.fromkeys(task_keys):
+            task = self.state.tasks.get(task_key)
+            if task is None:
+                continue
             if task.stage != Stage.FORMALIZE or task.status != TaskStatus.FAILED:
                 continue
             chapter = self._work_units_by_id.get(task.chapter_id)
@@ -5492,7 +5487,6 @@ class Orchestrator:
                     role=REPAIR_WORKER_ROLE,
                     request_ids=[unit.id, *(case.id for case in active_cases)],
                     priority_override=unit.priority,
-                    defer_validation=True,
                 )
                 complete = bool(attempt.agent.report.get("complete"))
                 validation = attempt.validation
@@ -5681,11 +5675,10 @@ class Orchestrator:
         trigger: str,
         cases: Iterable[RepairCaseRecord],
     ) -> bool:
-        await self._reconcile_stale_formalizations()
+        candidate_cases = list(cases)[: self.config.shepherd.maximum_failures_per_sweep]
+        await self._reconcile_stale_formalizations(case.task_key for case in candidate_cases)
         repairable_keys = {key for key, _task in self.state.shepherd_repairable_tasks()}
-        selected_cases = [case for case in cases if case.task_key in repairable_keys][
-            : self.config.shepherd.maximum_failures_per_sweep
-        ]
+        selected_cases = [case for case in candidate_cases if case.task_key in repairable_keys]
         if not selected_cases:
             return False
         fingerprints = tuple(sorted(case.fingerprint for case in selected_cases))
@@ -5695,7 +5688,7 @@ class Orchestrator:
         async with self._shepherd_lock:
             if (
                 self._consecutive_no_progress_sweeps
-                >= self.config.shepherd.maximum_sweeps_per_invocation
+                >= self.config.shepherd.maximum_consecutive_no_progress_sweeps
             ):
                 return False
             sweep = await self.state.start_repair_sweep(
@@ -5774,11 +5767,13 @@ class Orchestrator:
             while True:
                 remaining = max(0.0, (due - datetime.now(UTC)).total_seconds())
                 timed_out = False
+                change = None
                 try:
-                    await asyncio.wait_for(changes.get(), timeout=remaining)
+                    change = await asyncio.wait_for(changes.get(), timeout=remaining)
                 except TimeoutError:
                     timed_out = True
-                await self._resume_repair_dags()
+                if change is not None and change.stages:
+                    await self._resume_repair_dags()
                 cases = self._repair_cases(periodic=timed_out)
                 pending = len(self.state.shepherd_repairable_tasks())
                 if self.state.shepherd.pending_failures != pending:
