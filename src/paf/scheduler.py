@@ -24,6 +24,7 @@ from paf.codex import (
     count_placeholders,
     declaration_uses_placeholder,
     declaration_uses_placeholder_in_chapter,
+    migrate_scope_digests,
     proof_target_chunk,
     proof_target_spans,
     proof_targets,
@@ -42,7 +43,7 @@ from paf.corpus import (
 )
 from paf.diagnostics import unexpected_lean_warnings
 from paf.git import GitCommitError, GitCommitter
-from paf.hashing import digest_text
+from paf.hashing import is_legacy_digest, migrate_digest_text, tagged_digest_text
 from paf.interface_fingerprint import (
     FingerprintCollection,
     InterfaceFingerprintError,
@@ -488,6 +489,7 @@ class Orchestrator:
         report("Recovering upstream requests", 4)
         await self._recover_upstream_requests()
         report("Migrating persisted workflow state", 5)
+        await self._migrate_persisted_content_digests()
         migrated = await self.state.migrate_post_review_fixups()
         if migrated:
             # The normal review scheduler reports an invalid import graph.
@@ -626,7 +628,79 @@ class Orchestrator:
         selected = "\n".join(
             lines[chapter.source_span.start_line - 1 : chapter.source_span.end_line]
         )
-        return digest_text(f"{chapter.id}\0{selected}")
+        return tagged_digest_text(f"{chapter.id}\0{selected}")
+
+    async def _migrate_persisted_content_digests(self) -> None:
+        """Replace verified SHA/unversioned cache digests with tagged XXH digests."""
+
+        by_id = {chapter.id: chapter for chapter in self.work_units}
+
+        def migrate() -> tuple[bool, dict[str, str], set[str]]:
+            changed = False
+            current_discoveries: set[str] = set()
+            source_lines: dict[Path, list[str]] = {}
+            raw_nodes = self.state.source_dependency_tree.get("nodes", {})
+            nodes = raw_nodes if isinstance(raw_nodes, dict) else {}
+            for chapter_id, raw_record in nodes.items():
+                chapter = by_id.get(chapter_id)
+                if chapter is None or not isinstance(raw_record, dict):
+                    continue
+                stored = raw_record.get("source_digest")
+                if not isinstance(stored, str):
+                    continue
+                path = self.config.settings.repo / chapter.source
+                lines = source_lines.get(path)
+                if lines is None:
+                    lines = path.read_text(encoding="utf-8").splitlines()
+                    source_lines[path] = lines
+                selected = "\n".join(
+                    lines[chapter.source_span.start_line - 1 : chapter.source_span.end_line]
+                )
+                migrated = migrate_digest_text(stored, f"{chapter.id}\0{selected}")
+                if migrated is not None and migrated != stored:
+                    raw_record["source_digest"] = migrated
+                    changed = True
+                    if is_legacy_digest(stored):
+                        current_discoveries.add(chapter_id)
+
+            raw_clean = self.state.formalize_graph.get("clean", {})
+            clean = raw_clean if isinstance(raw_clean, dict) else {}
+            proof_migrations: dict[str, str] = {}
+            for chapter_id, chapter in by_id.items():
+                raw_record = clean.get(chapter_id)
+                record = raw_record if isinstance(raw_record, dict) else None
+                proof_digest = self.state.task(chapter_id, Stage.PROVE).source_digest
+                stored = {
+                    value
+                    for value in (
+                        record.get("source_digest") if record is not None else None,
+                        proof_digest,
+                    )
+                    if isinstance(value, str)
+                }
+                migrations = migrate_scope_digests(
+                    self.config.settings.repo,
+                    chapter,
+                    stored,
+                )
+                if record is not None:
+                    old = record.get("source_digest")
+                    migrated = migrations.get(old) if isinstance(old, str) else None
+                    if migrated is not None and migrated != old:
+                        record["source_digest"] = migrated
+                        changed = True
+                if isinstance(proof_digest, str):
+                    migrated = migrations.get(proof_digest)
+                    if migrated is not None and migrated != proof_digest:
+                        proof_migrations[chapter_id] = migrated
+            return changed, proof_migrations, current_discoveries
+
+        changed, proof_migrations, current_discoveries = await asyncio.to_thread(migrate)
+        if changed or proof_migrations or current_discoveries:
+            await self.state.save_digest_migration(
+                proof_migrations,
+                current_discoveries=current_discoveries,
+            )
 
     def _discovery_is_current(self, chapter: WorkUnitLike) -> bool:
         nodes = self.state.source_dependency_tree.get("nodes", {})

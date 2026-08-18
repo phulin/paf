@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import sqlite3
 from collections.abc import Callable, Iterable
@@ -15,9 +16,11 @@ from paf.codex import (
     CodexExecutor,
     ValidationResult,
     scope_digest,
+    scoped_files,
 )
 from paf.config import load_config
 from paf.git import GitCommitError
+from paf.hashing import stable_digest_text
 from paf.models import Chapter, PipelineConfig, ProofTarget, Stage
 from paf.scheduler import FormalizeOutcome, Orchestrator, ReviewOutcome
 from paf.state import (
@@ -243,6 +246,105 @@ async def mark_clean_formalization(
         "dirty": [],
     }
     await orchestrator.state.save()
+
+
+def legacy_scope_digest(root: Path, chapter: Chapter) -> str:
+    digest = hashlib.sha256()
+    for path in scoped_files(root, chapter):
+        digest.update(path.relative_to(root).as_posix().encode())
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+@pytest.mark.asyncio
+async def test_prepare_migrates_legacy_discovery_and_build_digests(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = config.chapters[0]
+    source = tmp_path / "lean" / "Book" / "Chapter01.lean"
+    source.parent.mkdir(parents=True)
+    source.write_text("theorem complete : True := by trivial\n", encoding="utf-8")
+    orchestrator = Orchestrator(config, StateStore(config))
+    await orchestrator.prepare()
+
+    lines = (tmp_path / chapter.source).read_text(encoding="utf-8").splitlines()
+    selected = "\n".join(lines[chapter.source_span.start_line - 1 : chapter.source_span.end_line])
+    legacy_discovery = stable_digest_text(f"{chapter.id}\0{selected}")
+    legacy_scope = legacy_scope_digest(tmp_path, chapter)
+    orchestrator.state.source_dependency_tree = {
+        "nodes": {chapter.id: {"dependencies": [], "source_digest": legacy_discovery}}
+    }
+    orchestrator.state.formalize_graph = {
+        "clean": {chapter.id: {"source_digest": legacy_scope, "build_generation": 1}}
+    }
+    await orchestrator.state.set_task(
+        chapter.id,
+        Stage.DISCOVER,
+        TaskStatus.PENDING,
+        "queued by the unversioned hash transition",
+    )
+    await orchestrator.state.set_task(
+        chapter.id,
+        Stage.PROVE,
+        TaskStatus.SUCCEEDED,
+        "proved before the hash transition",
+        source_digest=legacy_scope,
+    )
+    await orchestrator.state.save()
+    await orchestrator.shutdown()
+
+    restarted = Orchestrator(config, StateStore(config))
+    await restarted.prepare()
+
+    migrated_discovery = restarted.state.source_dependency_tree["nodes"][chapter.id][
+        "source_digest"
+    ]
+    migrated_scope = restarted.state.formalize_graph["clean"][chapter.id]["source_digest"]
+    assert migrated_discovery.startswith("xxh3-64:")
+    assert migrated_scope == scope_digest(tmp_path, chapter)
+    assert restarted.state.task(chapter.id, Stage.DISCOVER).status == TaskStatus.SUCCEEDED
+    assert restarted.state.task(chapter.id, Stage.PROVE).source_digest == migrated_scope
+    assert restarted._discovery_is_current(chapter)
+    await restarted.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_prepare_does_not_migrate_changed_legacy_discovery_digest(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = config.chapters[0]
+    orchestrator = Orchestrator(config, StateStore(config))
+    await orchestrator.prepare()
+    source = tmp_path / chapter.source
+    lines = source.read_text(encoding="utf-8").splitlines()
+    selected = "\n".join(lines[chapter.source_span.start_line - 1 : chapter.source_span.end_line])
+    legacy_discovery = stable_digest_text(f"{chapter.id}\0{selected}")
+    orchestrator.state.source_dependency_tree = {
+        "nodes": {chapter.id: {"dependencies": [], "source_digest": legacy_discovery}}
+    }
+    await orchestrator.state.set_task(
+        chapter.id,
+        Stage.DISCOVER,
+        TaskStatus.PENDING,
+        "awaiting freshness check",
+    )
+    await orchestrator.state.save()
+    await orchestrator.shutdown()
+
+    source.write_text(
+        source.read_text(encoding="utf-8").replace("Text.", "Changed.", 1),
+        encoding="utf-8",
+    )
+    restarted = Orchestrator(config, StateStore(config))
+    await restarted.prepare()
+
+    assert (
+        restarted.state.source_dependency_tree["nodes"][chapter.id]["source_digest"]
+        == legacy_discovery
+    )
+    assert restarted.state.task(chapter.id, Stage.DISCOVER).status == TaskStatus.PENDING
+    assert not restarted._discovery_is_current(chapter)
+    await restarted.shutdown()
 
 
 @pytest.mark.asyncio

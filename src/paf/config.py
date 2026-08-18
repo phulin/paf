@@ -12,7 +12,7 @@ from typing import Any
 from paf.adapters import LatexAdapter, MarkdownAdapter, TextAdapter, format_for_path
 from paf.backends import LeanBackend, TargetTemplates, lean_backend_from_config
 from paf.corpus import build_corpus_schedule
-from paf.hashing import digest_text
+from paf.hashing import digest_text, stable_digest_text
 from paf.models import (
     BookConfig,
     Chapter,
@@ -966,10 +966,18 @@ def infer_corpus(
     )
     if output_target is not None:
         identity += f"\ntarget={backend.templates.root}"
-    corpus_id = digest_text(identity)[:10]
+    # Corpus IDs are durable state namespaces, not disposable cache keys. Keep
+    # the original SHA-based identity stable across hashing implementations.
+    corpus_id = stable_digest_text(identity)[:10]
+    state_dir = repo / ".paf" / f"corpus-{corpus_id}"
+    transitional_id = digest_text(identity)[:10]
+    transitional_state_dir = repo / ".paf" / f"corpus-{transitional_id}"
+    if not state_dir.exists() and transitional_state_dir.exists():
+        # Preserve state created during the brief unversioned XXH transition.
+        state_dir = transitional_state_dir
     settings = SwarmSettings(
         repo=repo,
-        state_dir=repo / ".paf" / f"corpus-{corpus_id}",
+        state_dir=state_dir,
         model="gpt-5.6-luna",
         reasoning_effort="xhigh",
         lean_project=backend.project,

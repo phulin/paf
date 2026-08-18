@@ -14,7 +14,14 @@ from uuid import uuid4
 from paf import json_codec as json
 from paf.activity import ActivityStore, shorten_book_paths
 from paf.diagnostics import lean_diagnostic_counts
-from paf.hashing import digest_bytes, digest_text
+from paf.hashing import (
+    digest_bytes,
+    digest_text,
+    migrate_digest_bytes,
+    stable_digest_bytes,
+    stable_digest_text,
+    tagged_digest_bytes,
+)
 from paf.models import PipelineConfig, Stage, WorkUnitLike
 from paf.pricing import LEGACY_MODEL, CostEstimate, estimate_cost
 from paf.state_db import DATABASE_NAME, DatabaseWrite, StateDatabase, StateWriter
@@ -788,17 +795,19 @@ class StateStore:
         self._invalidate_aggregates()
         self._rebuild_status_indexes()
         self._checkpoint_dirty = True
-        self._config_fingerprint = digest_bytes(
-            json.dumpb(
-                {
-                    "documents": self._document_dicts(),
-                    "work_units": self._work_unit_dicts(),
-                },
-                sort_keys=True,
-            )
+        config_payload = json.dumpb(
+            {
+                "documents": self._document_dicts(),
+                "work_units": self._work_unit_dicts(),
+            },
+            sort_keys=True,
         )
+        self._config_fingerprint = tagged_digest_bytes(config_payload)
         persisted_fingerprint = await asyncio.to_thread(self._database.config_fingerprint)
-        self._static_dirty = persisted_fingerprint != self._config_fingerprint
+        matching_fingerprint = migrate_digest_bytes(persisted_fingerprint, config_payload)
+        self._static_dirty = (
+            matching_fingerprint is None or persisted_fingerprint != matching_fingerprint
+        )
         self._dirty_task_keys.update(self.tasks)
         self._issues_dirty = True
         self._dirty_run_ids.update(run.id for run in (*recovered_runs, *migrated_usage_runs))
@@ -1449,6 +1458,36 @@ class StateStore:
         self._mark_dirty()
         await self._persist()
 
+    async def save_digest_migration(
+        self,
+        proof_source_digests: dict[str, str],
+        *,
+        current_discoveries: Iterable[str] = (),
+    ) -> None:
+        """Persist global cache-digest rewrites and matching proof-task rewrites atomically."""
+
+        changed_tasks: list[TaskRecord] = []
+        for chapter_id in current_discoveries:
+            task = self.task(chapter_id, Stage.DISCOVER)
+            if task.status not in {TaskStatus.PENDING, TaskStatus.INTERRUPTED}:
+                continue
+            task.status = TaskStatus.SUCCEEDED
+            task.phase = TaskPhase.IDLE
+            task.queued = False
+            task.detail = "verified and migrated legacy source digest"
+            task.updated_at = timestamp()
+            changed_tasks.append(task)
+        for chapter_id, source_digest in proof_source_digests.items():
+            task = self.task(chapter_id, Stage.PROVE)
+            if task.source_digest == source_digest:
+                continue
+            task.source_digest = source_digest
+            changed_tasks.append(task)
+        if changed_tasks:
+            self._invalidate_status_summaries()
+        self._mark_dirty(tasks=changed_tasks)
+        await self._persist()
+
     def _normalize_upstream_request_state(self) -> None:
         """Migrate legacy request records to completed-fact durable states."""
 
@@ -1514,6 +1553,16 @@ class StateStore:
             str(attempt.get("remaining_goal", "")).strip(),
             str(attempt.get("obstruction", "")).strip(),
         )
+        return stable_digest_text("\0".join(fields))[:20]
+
+    @staticmethod
+    def _transitional_proof_blocker_fingerprint(attempt: dict[str, Any]) -> str:
+        fields = (
+            str(attempt.get("path", "")).strip(),
+            str(attempt.get("declaration", "")).strip(),
+            str(attempt.get("remaining_goal", "")).strip(),
+            str(attempt.get("obstruction", "")).strip(),
+        )
         return digest_text("\0".join(fields))
 
     def proof_blockers_for_consumer(
@@ -1552,6 +1601,11 @@ class StateStore:
                 continue
             fingerprint = self._proof_blocker_fingerprint(raw)
             blocker: dict[str, Any] | None = by_fingerprint.get(fingerprint)
+            if blocker is None:
+                blocker = by_fingerprint.get(self._transitional_proof_blocker_fingerprint(raw))
+                if blocker is not None:
+                    blocker["fingerprint"] = fingerprint
+                    by_fingerprint[fingerprint] = blocker
             if blocker is None:
                 prior_numbers = (int(key[1:]) for key in self.proof_blockers if key[1:].isdigit())
                 blocker_id = f"B{1 + max(prior_numbers, default=0)}"
@@ -1673,12 +1727,15 @@ class StateStore:
             str(request.get("needed_result", "")).strip(),
             owner_chapter_id,
         )
-        fingerprint = digest_text("\0".join(fingerprint_fields))
+        identity = "\0".join(fingerprint_fields)
+        fingerprint = stable_digest_text(identity)[:16]
+        transitional_fingerprint = digest_text(identity)
         for request_id, existing in self.upstream_requests.items():
-            if existing.get("fingerprint") != fingerprint:
+            if existing.get("fingerprint") not in {fingerprint, transitional_fingerprint}:
                 continue
             if existing.get("status") == UpstreamRequestStatus.CLOSED.value:
                 continue
+            existing["fingerprint"] = fingerprint
             origin_run_ids = existing.setdefault("origin_run_ids", [])
             if isinstance(origin_run_ids, list) and origin_run_id not in origin_run_ids:
                 origin_run_ids.append(origin_run_id)
@@ -2271,7 +2328,17 @@ class StateStore:
             fingerprint = "\0".join(
                 (chapter.source.as_posix(), chapter.id, anchor.casefold())
             ).encode()
-            issue_id = digest_bytes(fingerprint)
+            issue_id = stable_digest_bytes(fingerprint)[:16]
+            transitional_issue_id = digest_bytes(fingerprint)
+            existing_issue_id = next(
+                (
+                    candidate
+                    for candidate in (issue_id, transitional_issue_id)
+                    if candidate in self.source_issues
+                ),
+                issue_id,
+            )
+            issue_id = existing_issue_id
             issue_ids.append(issue_id)
             seen_at = run.finished_at or timestamp()
             if existing := self.source_issues.get(issue_id):
@@ -2756,11 +2823,17 @@ class StateStore:
             "exit_code": latest.exit_code if latest is not None else None,
             "validation": latest.validation if latest is not None else None,
         }
-        fingerprint = digest_bytes(json.dumpb(evidence, sort_keys=True))
+        encoded_evidence = json.dumpb(evidence, sort_keys=True)
+        fingerprint = stable_digest_bytes(encoded_evidence)
+        transitional_fingerprint = digest_bytes(encoded_evidence)
         for case in self.repair_cases.values():
-            if case.task_key == task_key and case.fingerprint == fingerprint:
+            if case.task_key == task_key and case.fingerprint in {
+                fingerprint,
+                transitional_fingerprint,
+            }:
+                case.fingerprint = fingerprint
                 return case
-        case_id = digest_text(f"{task_key}:{fingerprint}")
+        case_id = stable_digest_text(f"{task_key}:{fingerprint}")[:16]
         case = RepairCaseRecord(
             id=case_id,
             task_key=task_key,

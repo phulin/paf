@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import errno
+import hashlib
 import os
 import re
 import shutil
@@ -19,7 +20,12 @@ from paf import json_codec as json
 from paf.activity import EVENT_TIMESTAMP_FIELD, activity_timestamp
 from paf.backends import LeanBackend
 from paf.diagnostics import unexpected_lean_warnings
-from paf.hashing import digest_bytes, new_digest
+from paf.hashing import (
+    ALGORITHM,
+    STABLE_ALGORITHM,
+    new_digest,
+    stable_digest_bytes,
+)
 from paf.models import PipelineConfig, ProofTarget, Stage, WorkUnitLike
 from paf.scope import ScopeMatcher
 from paf.state import RunRecord, StateStore, TaskStatus, TokenUsage
@@ -760,7 +766,42 @@ def scope_digest(repo: Path, chapter: WorkUnitLike) -> str:
         digest.update(b"\0")
         digest.update(path.read_bytes())
         digest.update(b"\0")
-    return digest.hexdigest()
+    return f"{ALGORITHM}:{digest.hexdigest()}"
+
+
+def migrate_scope_digests(
+    repo: Path,
+    chapter: WorkUnitLike,
+    stored: Iterable[str],
+) -> dict[str, str]:
+    """Verify old scope digests and return their canonical XXH replacements."""
+
+    values = set(stored)
+    if not values:
+        return {}
+    current = new_digest()
+    needs_legacy = any(
+        not value.startswith(f"{ALGORITHM}:") and len(value) != 16 for value in values
+    )
+    legacy = hashlib.sha256() if needs_legacy else None
+    for path in scoped_files(repo, chapter):
+        chunks = (
+            path.relative_to(repo).as_posix().encode(),
+            b"\0",
+            path.read_bytes(),
+            b"\0",
+        )
+        for chunk in chunks:
+            current.update(chunk)
+            if legacy is not None:
+                legacy.update(chunk)
+    current_raw = current.hexdigest()
+    canonical = f"{ALGORITHM}:{current_raw}"
+    compatible = {canonical, current_raw}
+    if legacy is not None:
+        legacy_raw = legacy.hexdigest()
+        compatible.update({legacy_raw, f"{STABLE_ALGORITHM}:{legacy_raw}"})
+    return {value: canonical for value in values if value in compatible}
 
 
 def _lean_code(text: str) -> str:
@@ -844,7 +885,7 @@ def _proof_declarations(repo: Path, chapter: WorkUnitLike) -> tuple[ProofTarget,
                     line=start_line,
                     end_line=max(start_line, end_line),
                     placeholder_count=placeholder_count,
-                    fingerprint=digest_bytes(identity),
+                    fingerprint=stable_digest_bytes(identity)[:16],
                 )
             )
     return tuple(declarations)

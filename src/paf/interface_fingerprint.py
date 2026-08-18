@@ -11,11 +11,11 @@ from pathlib import Path
 from typing import Any
 
 from paf import json_codec as json
-from paf.hashing import ALGORITHM, digest_fields, digest_file
+from paf.hashing import ALGORITHM, digest_file, stable_digest_fields
 from paf.models import PipelineConfig, WorkUnitLike
 from paf.scope import ScopeMatcher
 
-FINGERPRINT_SCHEMA = "olean-proof-erased-v2"
+FINGERPRINT_SCHEMA = "olean-proof-erased-v1"
 _HELPER_BATCH_SIZE = 512
 
 
@@ -93,13 +93,13 @@ def aggregate_module_digests(
     lean_version: str,
 ) -> tuple[str, str]:
     ordered = tuple(sorted(modules, key=lambda item: item.module))
-    artifact = digest_fields(
+    artifact = stable_digest_fields(
         "paf-work-unit-artifact-v1",
         FINGERPRINT_SCHEMA,
         lean_version,
         *(value for item in ordered for value in (item.module, item.artifact_digest)),
     )
-    interface = digest_fields(
+    interface = stable_digest_fields(
         "paf-work-unit-interface-v1",
         FINGERPRINT_SCHEMA,
         lean_version,
@@ -341,7 +341,7 @@ def collect_interface_fingerprints(
             modules_by_owner[module_owners[module]].append(cached)
             continue
         value = helper_values[module]
-        interface_digest = digest_fields(
+        interface_digest = stable_digest_fields(
             "paf-module-interface-v1",
             FINGERPRINT_SCHEMA,
             lean_version,
