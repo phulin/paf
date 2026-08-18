@@ -4309,6 +4309,10 @@ class Orchestrator:
         persisted = self.state.formalize_graph.get("clean", {})
         records = persisted if isinstance(persisted, dict) else {}
         was_clean = await self._retained_formalize_record(chapter, records) is not None
+        # Diagnostic reports and coordinator certification are separate facts. Remember a clean
+        # verification obtained during this operation so a later dependency invalidation does not
+        # turn a valid report into an agent-report retry.
+        coordinator_verified = was_clean
         if not was_clean and not rerun:
             build_feedback = await self._review_build(chapter)
             if build_feedback and not await route_feedback(
@@ -4316,6 +4320,7 @@ class Orchestrator:
                 origin=f"review-build:{chapter.id}:{uuid4().hex[:12]}",
             ):
                 return StageOutcome(ExecutionDisposition.FAILED)
+            coordinator_verified = not build_feedback
 
         maximum = min(self.config.stages[Stage.REVIEW].max_rounds, 5)
         resume_thread_id: str | None = None
@@ -4383,6 +4388,8 @@ class Orchestrator:
                 scope_digest, self.config.settings.repo, chapter
             )
             source_changed = source_digest_after != source_digest_before
+            if source_changed:
+                coordinator_verified = False
             resume_thread_id = None
             resume_run_id = ""
             resume_prompt = ""
@@ -4396,6 +4403,7 @@ class Orchestrator:
                         origin=f"review-build:{outcome.run_id or uuid4().hex[:12]}",
                     ):
                         return StageOutcome(ExecutionDisposition.FAILED)
+                    coordinator_verified = not malformed_build_feedback
                 if await queue_report_retry(outcome, outcome.report_error):
                     continue
             if outcome.failed:
@@ -4418,6 +4426,7 @@ class Orchestrator:
                     origin=f"review-build:{outcome.run_id or uuid4().hex[:12]}",
                 ):
                     return StageOutcome(ExecutionDisposition.FAILED)
+                coordinator_verified = not build_feedback
             if review_feedback:
                 if rounds_used[chapter.id] >= maximum:
                     await self.state.set_task(
@@ -4435,14 +4444,51 @@ class Orchestrator:
                 ):
                     continue
                 return StageOutcome(ExecutionDisposition.FAILED)
-            if role in DIAGNOSTIC_REVIEW_ROLES and not await self._proof_build_is_fresh(chapter):
-                review_feedback = attempt_feedback
-                if await queue_report_retry(
-                    outcome,
-                    "current source digest is not certified by a clean coordinator build",
-                ):
-                    continue
-                return StageOutcome(ExecutionDisposition.FAILED)
+            if role in DIAGNOSTIC_REVIEW_ROLES and not coordinator_verified:
+                certification_feedback = await self._review_build(chapter)
+                if certification_feedback:
+                    if not await route_feedback(
+                        certification_feedback,
+                        origin=f"review-certification:{outcome.run_id or uuid4().hex[:12]}",
+                    ):
+                        return StageOutcome(ExecutionDisposition.FAILED)
+                    if review_feedback:
+                        if rounds_used[chapter.id] < maximum:
+                            continue
+                        await self.state.set_task(
+                            chapter.id,
+                            Stage.REVIEW,
+                            TaskStatus.FAILED,
+                            f"review follow-up remained unresolved after {maximum} cycles",
+                        )
+                        return StageOutcome(ExecutionDisposition.FAILED)
+                    owner_ids = tuple(
+                        owner_id for owner_id in certification_feedback if owner_id != chapter.id
+                    )
+                    if owner_ids:
+                        requirements = tuple(
+                            Requirement(
+                                RequirementKind.COORDINATOR_OWNER,
+                                owner_task_key=self.state.key(owner_id, Stage.REVIEW),
+                                detail=f"coordinator diagnostic owned by {owner_id}",
+                            )
+                            for owner_id in owner_ids
+                        )
+                        await self.state.set_task_waiting(
+                            chapter.id,
+                            Stage.REVIEW,
+                            requirements,
+                            "waiting for upstream coordinator diagnostic owners",
+                        )
+                        return StageOutcome(ExecutionDisposition.WAITING, requirements)
+                    await self.state.set_task(
+                        chapter.id,
+                        Stage.REVIEW,
+                        TaskStatus.FAILED,
+                        "coordinator verification failed without actionable feedback",
+                    )
+                    return StageOutcome(ExecutionDisposition.FAILED)
+                coordinator_verified = True
             if finding_guided:
                 completed = await self._complete_review(
                     chapter,
@@ -4660,6 +4706,7 @@ class Orchestrator:
                         and chapter_id not in proof_tasks
                         and chapter_id not in rebuild_tasks
                         and formalize_ready(chapter_id)
+                        and self.state.readiness(review_task).ready
                         and (rereview or chapter_id in review_frontiers_ready)
                     ):
                         dependencies = graph.dependencies[chapter_id]

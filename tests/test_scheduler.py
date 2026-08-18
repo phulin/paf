@@ -948,6 +948,7 @@ async def test_review_build_warning_switches_follow_up_to_warning_role(
     await orchestrator.prepare()
     await mark_clean_formalization(orchestrator)
     roles: list[str] = []
+    builds = 0
 
     async def review_once(_chapter: Chapter, **options: Any) -> StageOutcome:
         roles.append(str(options.get("role", "")))
@@ -970,17 +971,18 @@ async def test_review_build_warning_switches_follow_up_to_warning_role(
         )
 
     async def review_build(_chapter: Chapter) -> dict[str, str]:
-        return {chapter.id: "warning: Book/Chapter01.lean:1:1: unused variable"}
-
-    async def build_is_fresh(_chapter: Chapter) -> bool:
-        return True
+        nonlocal builds
+        builds += 1
+        return (
+            {chapter.id: "warning: Book/Chapter01.lean:1:1: unused variable"} if builds == 1 else {}
+        )
 
     monkeypatch.setattr(orchestrator, "_review_once", review_once)
     monkeypatch.setattr(orchestrator, "_review_build", review_build)
-    monkeypatch.setattr(orchestrator, "_proof_build_is_fresh", build_is_fresh)
 
     assert await orchestrator._review_chapter_to_clean(chapter, {chapter.id: 0})
     assert roles == ["", WARNING_REVIEW_ROLE]
+    assert builds == 2
     assert state.proof_review_requests == {}
     await orchestrator.shutdown()
 
@@ -1044,7 +1046,7 @@ async def test_no_change_diagnostic_review_reuses_clean_source_digest(
 
 
 @pytest.mark.asyncio
-async def test_no_change_diagnostic_review_does_not_rebuild_uncertified_digest(
+async def test_no_change_diagnostic_review_rebuilds_uncertified_digest(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
@@ -1060,14 +1062,18 @@ async def test_no_change_diagnostic_review_does_not_rebuild_uncertified_digest(
     orchestrator.executor = FakeExecutor(state, [result(changed=False)] * 3)
     builds = 0
 
-    async def forbidden_build(_chapter: Chapter) -> dict[str, str]:
+    async def review_build(_chapter: Chapter) -> dict[str, str]:
         nonlocal builds
         builds += 1
         return {}
 
-    monkeypatch.setattr(orchestrator, "_review_build", forbidden_build)
+    async def forbidden_freshness_check(_chapter: Chapter) -> bool:
+        raise AssertionError("a completed coordinator verification must be retained locally")
 
-    assert not await orchestrator._review_chapter_to_clean(
+    monkeypatch.setattr(orchestrator, "_review_build", review_build)
+    monkeypatch.setattr(orchestrator, "_proof_build_is_fresh", forbidden_freshness_check)
+
+    assert await orchestrator._review_chapter_to_clean(
         chapter,
         {chapter.id: 0},
         rerun=True,
@@ -1075,8 +1081,56 @@ async def test_no_change_diagnostic_review_does_not_rebuild_uncertified_digest(
         role=DIAGNOSTIC_REVIEW_ROLE,
         proof_request_ids=(request_id,),
     )
-    assert builds == 0
+    assert builds == 1
+    assert request_id not in state.proof_review_requests
+    assert state.task(chapter.id, Stage.REVIEW).rounds == 1
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_diagnostic_review_waits_for_upstream_certification_feedback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    owner, consumer = config.chapters
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await orchestrator.prepare()
+    await mark_formalized(orchestrator, {consumer.id: (owner.id,)})
+    request_id, _ = await state.enqueue_proof_review_request(
+        {consumer.id: "error: Book/Chapter02.lean:3:1: unknown identifier"},
+        origin_run_id="coordinator-build",
+        kind="diagnostic",
+    )
+    orchestrator.executor = FakeExecutor(state, [result(changed=False)])
+
+    async def review_build(_chapter: Chapter) -> dict[str, str]:
+        return {owner.id: "error: Book/Chapter01.lean:3:1: unknown identifier"}
+
+    monkeypatch.setattr(orchestrator, "_review_build", review_build)
+
+    outcome = await orchestrator._review_chapter_to_clean(
+        consumer,
+        {consumer.id: 0},
+        rerun=True,
+        feedback="error: Book/Chapter02.lean:3:1: unknown identifier",
+        role=DIAGNOSTIC_REVIEW_ROLE,
+        proof_request_ids=(request_id,),
+    )
+
+    assert outcome.waiting
     assert request_id in state.proof_review_requests
+    consumer_review = state.task(consumer.id, Stage.REVIEW)
+    assert consumer_review.status == TaskStatus.PENDING
+    assert [requirement.owner_task_key for requirement in consumer_review.waiting_on] == [
+        state.key(owner.id, Stage.REVIEW)
+    ]
+    assert not state.readiness(consumer_review).ready
+    assert any(
+        owner.id in request["feedback"]
+        for candidate_id, request in state.proof_review_requests.items()
+        if candidate_id != request_id
+    )
     await orchestrator.shutdown()
 
 
