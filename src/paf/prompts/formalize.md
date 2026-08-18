@@ -34,9 +34,10 @@ declaration that uses `sorry`.
    that already exist in Mathlib or earlier chapters. Add a new supporting interface only when that
    search shows a real gap and the new declaration has a named user in this chapter.
 6. Preserve source order and dependency order. No file belonging to this chapter may import a future
-   chapter. An introduction chapter must contain only its own mathematical content and likewise must
-   not import any future chapter. Finish and check the active section before moving to the next one.
-   After all sections are complete, perform the planned chapter-wide coverage and import check.
+   chapter in this book. An introduction chapter must contain only its own mathematical content and
+   likewise must not import any future chapter in this book. Finish and check the active section
+   before moving to the next one. After all sections are complete, perform the planned chapter-wide
+   coverage and import check.
 7. Use the attached Lean tools after editing. Prepare the affected dependent files once, then request
    whole-file diagnostics from prerequisites to dependents. Fix every error and every warning except
    the exact warning that a declaration uses `sorry`. Replace time-consuming proposition proofs with
@@ -59,9 +60,11 @@ normalization conventions, and assumptions such as finiteness, separation, compl
 characteristic exactly.
 
 Keep chapter ownership and import direction explicit: create the file for this specific chapter, and
-never add a forward import from one of its files to a later chapter. In particular, an introduction
-file contains only the introduction's mathematical content; it must not serve as an import hub for
-future chapters or import them to make declarations available.
+never add a forward import—an import of a later chapter in this book—from one of its files. In
+particular, an introduction file contains only the introduction's mathematical content; it must not
+serve as an import hub for future chapters in this book or import them to make declarations
+available. This forward-import rule concerns only chapter order within this book; it does not by
+itself prohibit imports from Mathlib or other external libraries.
 
 If the source contains a genuinely false or underspecified assertion, make only the smallest
 mathematically principled correction and record the problem in `source_issues`. If an essential
@@ -76,11 +79,11 @@ the authoritative build after each attempt.
 Every substantive source assertion is represented or explicitly accounted for. Existing Mathlib and
 earlier-chapter APIs have been reused wherever possible, new interfaces fill demonstrated gaps, the
 declarations follow source and dependency order, definitions have real bodies where practical, and
-the chapter has its own file with no forward imports, and diagnostics are clean except for
-declarations using `sorry`. Introduction files contain only their chapter's mathematical content and
-do not import future chapters. Report remaining coverage gaps, source problems, and important
-interface choices. Set `complete` to `true` only after the full coverage/import check and the clean
-diagnostic check are finished.
+the chapter has its own file with no imports of future chapters in this book, and diagnostics are
+clean except for declarations using `sorry`. Introduction files contain only their chapter's
+mathematical content and do not import future chapters in this book. Report remaining coverage gaps,
+source problems, and important interface choices. Set `complete` to `true` only after the full
+coverage/import check and the clean diagnostic check are finished.
 
 ## Output format
 

@@ -43,9 +43,10 @@ delivery state has been established.
    or otherwise unprovable interface. Add a new supporting declaration only after the searches in
    step 2 show that no suitable declaration already exists.
 7. After all sections are complete, perform the planned chapter-wide coverage and import check. No
-   file belonging to this chapter may import a future chapter. An introduction chapter must contain
-   only its own mathematical content and must not import any future chapter. Do not defer a repair
-   that belongs in the assigned files; describe any exact out-of-scope blocker in `issues`.
+   file belonging to this chapter may import a future chapter in this book. An introduction chapter
+   must contain only its own mathematical content and must not import any future chapter in this
+   book. Do not defer a repair that belongs in the assigned files; describe any exact out-of-scope
+   blocker in `issues`.
 8. Use the attached Lean tools as needed while investigating. After the final edit, check the edited
    files and every assigned file that depends on them, from prerequisites to dependents. Fix every
    warning and error except the exact warning that a declaration uses `sorry`.
@@ -65,9 +66,11 @@ the attached Lean tools. Edit only the assigned paths. A no-change review needs 
 because the incoming build is already clean.
 
 Keep chapter ownership and import direction explicit: every chapter gets its own file, and no file
-from that chapter may have a forward import to a later chapter. In particular, an introduction file
-contains only the introduction's mathematical content; it must not serve as an import hub for future
-chapters or import them to make declarations available.
+from that chapter may have a forward import—an import of a later chapter in this book. In particular,
+an introduction file contains only the introduction's mathematical content; it must not serve as an
+import hub for future chapters in this book or import them to make declarations available. This
+forward-import rule concerns only chapter order within this book; it does not by itself prohibit
+imports from Mathlib or other external libraries.
 
 ## Definition of done
 
@@ -76,8 +79,8 @@ and earlier-chapter APIs have been reused wherever possible, all warranted in-sc
 made, the chapter has its own file, imports remain focused, cycle-free, and free of forward imports,
 and the complete assigned Lean scope has zero errors and zero warnings except permitted exact
 declaration-uses-`sorry` warnings. Introduction files contain only their chapter's mathematical
-content and do not import future chapters. Report source problems and any exact out-of-scope changes
-still required.
+content and do not import future chapters in this book. Here, a forward import means an import of a
+later chapter in this book. Report source problems and any exact out-of-scope changes still required.
 
 ## Output format
 
