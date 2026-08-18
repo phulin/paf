@@ -74,6 +74,23 @@ async def test_control_server_accepts_bash_friendly_commands(
     assert unblocked["unblocked_tasks"] == ["book/chapter-01:review"]
     assert unblocked["tasks"]["blocked"] == 0
     assert state.task(config.chapters[0].id, Stage.REVIEW).status == TaskStatus.PENDING
+    request_id, _ = await state.enqueue_upstream_request(
+        {
+            "blocked_declaration": "target",
+            "consumer_path": "lean/Book/Chapter01.lean",
+            "needed_result": "a helper lemma",
+        },
+        consumer_chapter_id=config.chapters[0].id,
+        origin_run_id="proof-run",
+        owner_chapter_id=config.chapters[0].id,
+        previous_attempts="attempt one",
+    )
+    cleared = await asyncio.to_thread(
+        send_command, config.settings.state_dir, "clear-upstream-requests"
+    )
+    assert cleared["cleared"] == 1
+    assert cleared["cleared_upstream_requests"] == [request_id]
+    assert state.upstream_requests[request_id]["status"] == "closed"
     paused = await asyncio.to_thread(send_command, config.settings.state_dir, "pause")
     assert paused["status"] == "paused"
     resumed = await asyncio.to_thread(send_command, config.settings.state_dir, "resume")

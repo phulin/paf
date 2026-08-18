@@ -348,6 +348,7 @@ uv run paf agent resume "$TARGET"
 uv run paf agent retry "$TARGET" --chapter book02/chapter-08
 uv run paf agent retry "$TARGET"
 uv run paf agent unblock "$TARGET"
+uv run paf agent clear-upstream-requests "$TARGET"
 uv run paf agent snapshot "$TARGET"
 uv run paf agent snapshot "$TARGET" --output snapshot.json
 uv run paf agent inspect "$TARGET" --chapter 8
@@ -377,6 +378,9 @@ handoffs.
 be issued against either a live daemon or offline state; pending tasks are eligible the next time the
 corresponding stage is scheduled. For a manually escalated upstream proof request, it also reopens
 the durable handoff while retaining any existing answer and all repair/retry evidence.
+`clear-upstream-requests` manually closes every outstanding upstream request while retaining its
+history. It makes the affected proofs eligible for a later retry, which may issue a fresh request if
+the upstream dependency is still missing. The command does not retry or unblock tasks itself.
 
 For a long-lived managing agent, the `rpc` facade accepts newline-delimited JSON commands on stdin and
 returns one JSON response per line:
@@ -386,8 +390,9 @@ printf '%s\n' '{"command":"status"}' '{"command":"snapshot"}' \
   | uv run paf agent rpc "$TARGET"
 ```
 
-Accepted RPC commands are `status`, `snapshot`, `pause`, `resume`, `retry`, `unblock`, `stop`, `wait`,
-and `inspect`. A retry request may include `chapter`; omitting it retries every failed task.
+Accepted RPC commands are `status`, `snapshot`, `pause`, `resume`, `retry`, `unblock`,
+`clear-upstream-requests`, `stop`, `wait`, and `inspect`. A retry request may include `chapter`;
+omitting it retries every failed task.
 Inspection requests may include `chapter` or `run`, for example
 `{"command":"inspect","chapter":"book02/chapter-08"}`. The daemon
 stores its socket, PID, JSON result, and combined stdout/stderr log under the inferred state directory.

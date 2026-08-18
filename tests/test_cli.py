@@ -496,12 +496,18 @@ def test_agent_rpc_reads_jsonl_from_stdin(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config_path = write_project(tmp_path, chapters="chapters = [1]")
-    monkeypatch.setattr(sys, "stdin", StringIO('{"command":"status"}\n'))
+    monkeypatch.setattr(
+        sys,
+        "stdin",
+        StringIO('{"command":"status"}\n{"command":"clear-upstream-requests"}\n'),
+    )
 
     assert main(["agent", "rpc", "--config", str(config_path)]) == 0
-    response = json.loads(capsys.readouterr().out)
-    assert response["status"] == "not-started"
-    assert response["scheduling"]["algorithm"] == "weighted-critical-path-list-scheduling"
+    status, cleared = (json.loads(line) for line in capsys.readouterr().out.splitlines())
+    assert status["status"] == "not-started"
+    assert status["scheduling"]["algorithm"] == "weighted-critical-path-list-scheduling"
+    assert cleared["cleared"] == 0
+    assert cleared["cleared_upstream_requests"] == []
 
 
 def test_agent_retry_sends_targeted_chapter_and_stage(
@@ -639,6 +645,44 @@ def test_agent_unblock_updates_offline_state(
     assert len(task["runs"]) == 1
     assert snapshot["scheduling"] == {"algorithm": "saved-schedule"}
     assert snapshot["isolation"] == {"backend": "saved-isolation"}
+
+
+def test_agent_clear_upstream_requests_updates_offline_state(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config_path = write_project(tmp_path, chapters="chapters = [1]")
+    config = load_config(config_path)
+    state = StateStore(config)
+
+    async def populate() -> str:
+        await state.load_or_create()
+        request_id, _ = await state.enqueue_upstream_request(
+            {
+                "blocked_declaration": "target",
+                "consumer_path": "lean/Book/Chapter01.lean",
+                "needed_result": "a helper lemma",
+            },
+            consumer_chapter_id=config.chapters[0].id,
+            origin_run_id="proof-run",
+            owner_chapter_id=config.chapters[0].id,
+            previous_attempts="attempt one",
+        )
+        await state.close()
+        return request_id
+
+    request_id = asyncio.run(populate())
+
+    assert main(["agent", "clear-upstream-requests", "--config", str(config_path)]) == 0
+    response = json.loads(capsys.readouterr().out)
+    assert response["status"] == "offline"
+    assert response["cleared"] == 1
+    assert response["cleared_upstream_requests"] == [request_id]
+
+    snapshot = read_full_snapshot(config.settings.state_dir)
+    assert snapshot is not None
+    request = snapshot["upstream_requests"][request_id]
+    assert request["status"] == "closed"
+    assert request["closed_reason"] == "manually cleared"
 
 
 def test_agent_retry_without_chapter_requeues_failed_but_not_blocked_tasks(

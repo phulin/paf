@@ -2448,6 +2448,50 @@ class StateStore:
             await self._persist()
         return reopened
 
+    async def clear_upstream_requests(self) -> list[str]:
+        """Manually close every outstanding upstream request.
+
+        Closed records retain their origin run ids so restart recovery does not recreate the
+        requests. Any affected proof becomes eligible for a later retry, which may enqueue a new
+        request when the upstream dependency is still missing.
+        """
+
+        cleared: list[str] = []
+        blockers_changed = False
+        now = timestamp()
+        for request_id, request in self.upstream_requests.items():
+            if request.get("status") == UpstreamRequestStatus.CLOSED.value:
+                continue
+            request["status"] = UpstreamRequestStatus.CLOSED.value
+            request["closed_at"] = now
+            request["closed_by_run_id"] = None
+            request["closed_reason"] = "manually cleared"
+            request["updated_at"] = now
+            request.pop("escalation_reason", None)
+            request.pop("escalated_at", None)
+            request.pop("escalated_by_run_id", None)
+            cleared.append(request_id)
+
+        cleared_ids = set(cleared)
+        for blocker in self.proof_blockers.values():
+            if (
+                blocker.get("request_id") not in cleared_ids
+                or blocker.get("status") != ProofBlockerStatus.UPSTREAM_REQUESTED.value
+            ):
+                continue
+            blocker["status"] = ProofBlockerStatus.OPEN.value
+            blocker["updated_at"] = now
+            blocker.pop("request_id", None)
+            blockers_changed = True
+
+        if cleared:
+            sections = {"upstream_requests"}
+            if blockers_changed:
+                sections.add("proof_blockers")
+            self._mark_dirty(global_state=False, sections=sections)
+            await self._persist()
+        return cleared
+
     async def reopen_proof_blockers(self, chapter_ids: Iterable[str]) -> list[str]:
         """Start a fresh retry window for unresolved proof evidence."""
 

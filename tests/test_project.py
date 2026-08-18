@@ -326,9 +326,19 @@ def test_explicit_project_works_outside_checkout_for_source_and_control_commands
         return 0
 
     monkeypatch.setattr(cli_module, "_agent_command", agent_command)
-    for command in ("status", "snapshot", "pause", "resume", "unblock", "stop", "wait", "rpc"):
+    for command in (
+        "status",
+        "snapshot",
+        "pause",
+        "resume",
+        "unblock",
+        "clear-upstream-requests",
+        "stop",
+        "wait",
+        "rpc",
+    ):
         assert main(["agent", command, "--project", str(project)]) == 0
-    assert observed == [project] * 8
+    assert observed == [project] * 9
 
 
 def test_absolute_target_works_outside_checkout_and_keeps_legacy_target_semantics(

@@ -232,6 +232,12 @@ class ControlServer:
                     "unblocked": len(tasks),
                     "unblocked_tasks": tasks,
                 }
+            elif command == "clear-upstream-requests":
+                requests = await self.orchestrator.state.clear_upstream_requests()
+                response = self._status() | {
+                    "cleared": len(requests),
+                    "cleared_upstream_requests": requests,
+                }
             elif command == "retry":
                 chapter = request.get("chapter")
                 if chapter is None:

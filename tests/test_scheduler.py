@@ -1394,6 +1394,52 @@ async def test_upstream_requests_persist_answers_and_batch_by_owner(tmp_path: Pa
     await reloaded.close()
 
 
+@pytest.mark.asyncio
+async def test_clear_upstream_requests_closes_requests_and_reopens_linked_blockers(
+    tmp_path: Path,
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    owner, consumer = config.chapters
+    state = StateStore(config)
+    await state.load_or_create()
+    request_id, _ = await state.enqueue_upstream_request(
+        {
+            "blocked_declaration": "consumerTarget",
+            "consumer_path": "lean/Book/Chapter02.lean",
+            "residual_goal": "⊢ Result x",
+            "needed_result": "A transport lemma from Input x to Result x",
+            "owner_chapter_id": owner.id,
+            "owner_paths": ["lean/Book/Chapter01.lean"],
+            "attempted_alternatives": ["simp", "exact candidate"],
+        },
+        consumer_chapter_id=consumer.id,
+        origin_run_id="proof-run",
+        owner_chapter_id=owner.id,
+        previous_attempts="attempt one",
+    )
+    state.proof_blockers["B1"] = {
+        "id": "B1",
+        "status": ProofBlockerStatus.UPSTREAM_REQUESTED.value,
+        "consumer_chapter_id": consumer.id,
+        "request_id": request_id,
+    }
+
+    assert await state.clear_upstream_requests() == [request_id]
+    assert state.upstream_request_batches() == {}
+    assert state.upstream_requests[request_id]["status"] == UpstreamRequestStatus.CLOSED
+    assert state.upstream_requests[request_id]["closed_reason"] == "manually cleared"
+    assert state.proof_blockers["B1"]["status"] == ProofBlockerStatus.OPEN
+    assert "request_id" not in state.proof_blockers["B1"]
+    assert await state.clear_upstream_requests() == []
+    await state.close()
+
+    recovered = StateStore(config)
+    await recovered.load_or_create()
+    assert recovered.upstream_requests[request_id]["status"] == UpstreamRequestStatus.CLOSED
+    assert recovered.proof_blockers["B1"]["status"] == ProofBlockerStatus.OPEN
+    await recovered.close()
+
+
 def test_upstream_request_uses_unique_path_owner_over_agent_label(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
     owner, consumer = config.chapters

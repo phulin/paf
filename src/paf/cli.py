@@ -245,6 +245,7 @@ def parser() -> argparse.ArgumentParser:
         ("pause", "pause before new chapter attempts"),
         ("resume", "release paused chapter attempts"),
         ("unblock", "reset blocked tasks to pending"),
+        ("clear-upstream-requests", "close all outstanding upstream requests"),
         ("stop", "cancel the pipeline and active subprocesses"),
         ("wait", "block until the managed pipeline exits"),
     ):
@@ -1183,6 +1184,25 @@ def _control_response(
                     "updated_at": state.updated_at,
                     "tasks": counts,
                 }
+        elif command == "clear-upstream-requests":
+            if read_checkpoint(config.settings.state_dir) is None:
+                response = offline_status(config.settings.state_dir) | {
+                    "cleared": 0,
+                    "cleared_upstream_requests": [],
+                }
+            else:
+                state = StateStore(config)
+
+                async def clear_upstream_requests() -> list[str]:
+                    await state.load_or_create()
+                    return await state.clear_upstream_requests()
+
+                requests = asyncio.run(clear_upstream_requests())
+                response = offline_status(config.settings.state_dir) | {
+                    "cleared": len(requests),
+                    "cleared_upstream_requests": requests,
+                    "updated_at": state.updated_at,
+                }
         elif command == "retry" and not parameters:
             if read_checkpoint(config.settings.state_dir) is None:
                 response = offline_status(config.settings.state_dir) | {
@@ -1230,6 +1250,7 @@ def _agent_rpc(config: PipelineConfig) -> int:
         "resume",
         "retry",
         "unblock",
+        "clear-upstream-requests",
         "stop",
         "wait",
         "inspect",
