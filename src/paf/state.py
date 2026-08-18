@@ -434,6 +434,7 @@ class StateStore:
         self._telemetry_flush_task: asyncio.Task[None] | None = None
         self._batch_depth = 0
         self._checkpoint_dirty = False
+        self._persisted_global_object_signature: tuple[int, ...] | None = None
         self._coordinator_build_dirty = False
         self._thread_usage_dirty = False
         self._static_dirty = False
@@ -1091,6 +1092,26 @@ class StateStore:
             },
         }
 
+    def _global_object_signature(self) -> tuple[int, ...]:
+        """Detect compatibility callers that replace a global state container directly."""
+
+        return tuple(
+            id(value)
+            for value in (
+                self.scheduling,
+                self.source_dependency_tree,
+                self.formalize_graph,
+                self.fixup_requests,
+                self.proof_review_requests,
+                self.upstream_requests,
+                self.proof_blockers,
+                self.isolation,
+                self.repair_cases,
+                self.repair_sweeps,
+                self.repair_work_units,
+            )
+        )
+
     def _shepherd_agent_views(self) -> list[dict[str, Any]]:
         """Return the planner and repair workers belonging to the current or latest sweep."""
 
@@ -1416,6 +1437,12 @@ class StateStore:
 
     async def flush(self) -> None:
         async with self._flush_lock:
+            global_object_signature = self._global_object_signature()
+            if (
+                self._persisted_global_object_signature is not None
+                and global_object_signature != self._persisted_global_object_signature
+            ):
+                self._checkpoint_dirty = True
             if not (
                 self._checkpoint_dirty
                 or self._coordinator_build_dirty
@@ -1542,6 +1569,8 @@ class StateStore:
             )
             revision = await asyncio.wrap_future(self._writer.submit(write))
             assert revision is not None
+            if globals_dirty:
+                self._persisted_global_object_signature = global_object_signature
             self.revision = revision
             self.change_bus.publish(
                 ChangeSet(

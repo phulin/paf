@@ -241,6 +241,58 @@ def _task_row(task_key: str, task: dict[str, Any]) -> tuple[Any, ...]:
     )
 
 
+def _agent_summary(connection: sqlite3.Connection, base_agents: dict[str, Any]) -> dict[str, Any]:
+    """Project live agent counters from normalized task and run rows."""
+
+    stage_names = set(base_agents.get("by_stage", {}))
+    stage_names.update(
+        str(row[0]) for row in connection.execute("SELECT DISTINCT stage FROM tasks")
+    )
+    by_stage = {stage: 0 for stage in stage_names}
+    by_role: dict[str, int] = {}
+    for stage, role, count in connection.execute(
+        """
+        SELECT stage, role, count(*)
+        FROM runs WHERE status='running'
+        GROUP BY stage, role
+        """
+    ):
+        stage_name = str(stage)
+        active = int(count)
+        by_stage[stage_name] = by_stage.get(stage_name, 0) + active
+        role_name = str(role or stage)
+        by_role[role_name] = by_role.get(role_name, 0) + active
+
+    postprocessing_by_stage = {
+        stage: 0 for stage in set(base_agents.get("postprocessing_by_stage", {})).union(stage_names)
+    }
+    queued = 0
+    postprocessing = 0
+    for stage, queued_count, postprocess_count in connection.execute(
+        """
+        SELECT stage,
+            sum(CASE WHEN queued != 0 THEN 1 ELSE 0 END),
+            sum(CASE WHEN status='running'
+                AND json_extract(payload, '$.phase')='postprocess' THEN 1 ELSE 0 END)
+        FROM tasks GROUP BY stage
+        """
+    ):
+        stage_name = str(stage)
+        queued += int(queued_count or 0)
+        current_postprocessing = int(postprocess_count or 0)
+        postprocessing += current_postprocessing
+        postprocessing_by_stage[stage_name] = current_postprocessing
+
+    return base_agents | {
+        "active": sum(by_stage.values()),
+        "queued": queued,
+        "postprocessing": postprocessing,
+        "postprocessing_by_stage": postprocessing_by_stage,
+        "by_stage": by_stage,
+        "by_role": by_role,
+    }
+
+
 def _migrate_v1(connection: sqlite3.Connection) -> None:
     row = connection.execute("SELECT payload FROM checkpoint WHERE singleton=1").fetchone()
     checkpoint = json.loads(row[0]) if row is not None else None
@@ -785,6 +837,10 @@ class StateDatabase:
                     section = json.loads(section_row[0])
                     if isinstance(section, dict):
                         value[key] = section
+            base_agents = value.get("agents", {})
+            value["agents"] = _agent_summary(
+                connection, dict(base_agents) if isinstance(base_agents, dict) else {}
+            )
             counts = {
                 str(status): int(count)
                 for status, count in connection.execute(
@@ -967,38 +1023,7 @@ class StateDatabase:
                     base = json.loads(global_row[0])
                     if isinstance(base, dict) and isinstance(base.get("agents"), dict):
                         base_agents = dict(base["agents"])
-                by_stage = {
-                    str(stage): int(count)
-                    for stage, count in connection.execute(
-                        "SELECT stage, count(*) FROM runs WHERE status='running' GROUP BY stage"
-                    )
-                }
-                by_role: dict[str, int] = {}
-                for role, stage, count in connection.execute(
-                    """
-                    SELECT json_extract(payload, '$.role'), stage, count(*)
-                    FROM runs WHERE status='running'
-                    GROUP BY json_extract(payload, '$.role'), stage
-                    """
-                ):
-                    name = str(role or stage)
-                    by_role[name] = by_role.get(name, 0) + int(count)
-                task_activity = connection.execute(
-                    """
-                    SELECT
-                        sum(CASE WHEN queued != 0 THEN 1 ELSE 0 END),
-                        sum(CASE WHEN status='running'
-                            AND json_extract(payload, '$.phase')='postprocess' THEN 1 ELSE 0 END)
-                    FROM tasks
-                    """
-                ).fetchone()
-                globals_["agents"] = base_agents | {
-                    "active": sum(by_stage.values()),
-                    "queued": int(task_activity[0] or 0),
-                    "postprocessing": int(task_activity[1] or 0),
-                    "by_stage": dict(base_agents.get("by_stage", {})) | by_stage,
-                    "by_role": by_role,
-                }
+                globals_["agents"] = _agent_summary(connection, base_agents)
             active_run_ids = [
                 str(row[0])
                 for row in connection.execute(
@@ -1072,6 +1097,10 @@ class StateDatabase:
                         "SELECT task_key, payload FROM tasks ORDER BY task_key"
                     )
                 }
+                base_agents = checkpoint.get("agents", {})
+                checkpoint["agents"] = _agent_summary(
+                    connection, dict(base_agents) if isinstance(base_agents, dict) else {}
+                )
             summaries = [
                 json.loads(row[0])
                 for row in connection.execute("SELECT summary FROM runs ORDER BY started_at, id")
