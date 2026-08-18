@@ -1,10 +1,18 @@
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
 
-from paf.codex import REPAIR_WORKER_ROLE, SHEPHERD_ROLE, AgentResult, CodexExecutor
+from paf.codex import (
+    REPAIR_WORKER_ROLE,
+    SHEPHERD_ROLE,
+    AgentResult,
+    CodexExecutor,
+    ValidationResult,
+    ValidationStatus,
+)
 from paf.config import load_config
 from paf.models import Stage
 from paf.scheduler import Orchestrator, ShepherdPlanError
@@ -168,10 +176,63 @@ async def test_interrupted_repair_dag_resumes_without_replanning(
 
     monkeypatch.setattr(orchestrator, "_execute_repair_plan", execute)
 
-    assert not await orchestrator._resume_repair_dags(include_certification=True)
+    assert not await orchestrator._resume_repair_dags()
     assert resumed == [unit.id]
     assert len(recovered.repair_sweeps) == 1
     await recovered.close()
+
+
+@pytest.mark.asyncio
+async def test_repair_worker_returns_integrated_edit_to_normal_stage_scheduler(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    state = StateStore(config)
+    await state.load_or_create()
+    chapter = config.work_units[0]
+    await state.set_task(chapter.id, Stage.REVIEW, TaskStatus.FAILED, "root review error")
+    task_key = state.key(chapter.id, Stage.REVIEW)
+    sweep = await state.start_repair_sweep(trigger="test", task_keys=[task_key])
+    case = state.repair_cases[sweep.case_ids[0]]
+    unit = RepairWorkUnitRecord(
+        id="normal-build",
+        sweep_id=sweep.id,
+        case_ids=[case.id],
+        task_keys=[task_key],
+        owner_chapter_id=chapter.id,
+        target_stage=Stage.REVIEW,
+        objective="repair the statement",
+    )
+    await state.install_repair_plan(sweep.id, [unit], summary="repair", run_id="planner")
+    orchestrator = Orchestrator(config, state)
+
+    async def attempt(*_args: object, **kwargs: object) -> object:
+        assert kwargs["defer_validation"] is True
+        return SimpleNamespace(
+            agent=SimpleNamespace(
+                succeeded=True,
+                report={"complete": True},
+            ),
+            validation=ValidationResult(
+                True,
+                0,
+                "deferred",
+                status=ValidationStatus.DEFERRED,
+            ),
+            run=SimpleNamespace(id="worker"),
+        )
+
+    async def no_build(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("repair worker must not launch a coordinator build")
+
+    monkeypatch.setattr(orchestrator, "_attempt", attempt)
+    monkeypatch.setattr(orchestrator, "_build_chapters", no_build)
+
+    assert await orchestrator._run_repair_work_unit(unit)
+    assert unit.status == RepairWorkUnitStatus.SUCCEEDED
+    assert state.task(chapter.id, Stage.REVIEW).status == TaskStatus.PENDING
+    assert "normal stage validation" in unit.detail
+    await state.close()
 
 
 @pytest.mark.asyncio

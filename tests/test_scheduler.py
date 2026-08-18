@@ -6,7 +6,6 @@ from collections.abc import Callable, Iterable
 from dataclasses import replace
 from pathlib import Path
 from threading import Event, get_ident
-from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -2179,7 +2178,7 @@ async def test_shepherd_reconciliation_accepts_matching_clean_build_without_agen
 
 
 @pytest.mark.asyncio
-async def test_shepherd_reconciliation_certifies_completed_unchanged_agent(
+async def test_shepherd_reconciliation_queues_completed_unchanged_agent_for_normal_build(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
@@ -2202,23 +2201,15 @@ async def test_shepherd_reconciliation_certifies_completed_unchanged_agent(
         TaskStatus.FAILED,
         "coordinator result was interrupted",
     )
-    snapshot = SimpleNamespace()
 
-    async def build(*_args: object, snapshots: dict[str, object], **_kwargs: object):
-        snapshots[chapter.id] = snapshot
-        return {chapter.id: ValidationResult(True, 0, "clean")}
-
-    async def publish(_chapter: object, built: object) -> bool:
-        assert built is snapshot
-        return True
+    async def build(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("shepherd reconciliation must not run Lean")
 
     monkeypatch.setattr(orchestrator, "_build_chapters", build)
-    monkeypatch.setattr(orchestrator, "_publish_validated_build", publish)
 
     assert await orchestrator._reconcile_stale_formalizations()
-    assert state.task(chapter.id, Stage.FORMALIZE).status == TaskStatus.SUCCEEDED
-    assert run.validation is not None
-    assert run.validation["status"] == ValidationStatus.CLEAN
+    assert state.task(chapter.id, Stage.FORMALIZE).status == TaskStatus.PENDING
+    assert run.validation is None
     await state.close()
 
 

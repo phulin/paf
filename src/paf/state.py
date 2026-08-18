@@ -76,8 +76,6 @@ class RepairWorkUnitStatus(StrEnum):
     SUCCEEDED = "succeeded"
     FAILED = "failed"
     INTERRUPTED = "interrupted"
-    WAITING_FOR_DEPENDENCIES = "waiting_for_dependencies"
-    CERTIFICATION_PENDING = "certification_pending"
     SUPERSEDED = "superseded"
 
 
@@ -325,7 +323,6 @@ class RepairWorkUnitRecord:
     status: str = RepairWorkUnitStatus.PENDING
     detail: str = ""
     run_id: str = ""
-    blocked_by: list[str] = field(default_factory=list)
     created_at: str = field(default_factory=timestamp)
     started_at: str | None = None
     finished_at: str | None = None
@@ -627,6 +624,11 @@ class StateStore:
                         if name in RepairCaseRecord.__dataclass_fields__
                     }
                     fields.setdefault("id", record_id)
+                    if fields.get("status") in {
+                        "waiting_for_dependencies",
+                        "certification_pending",
+                    }:
+                        fields["status"] = RepairWorkUnitStatus.PENDING
                     try:
                         self.repair_cases[record_id] = RepairCaseRecord(**fields)
                     except (TypeError, ValueError):
@@ -2449,9 +2451,6 @@ class StateStore:
     def latest_run(self, chapter_id: str) -> RunRecord | None:
         return self.active_run(chapter_id) or self._latest_runs_by_chapter.get(chapter_id)
 
-    def run(self, run_id: str) -> RunRecord | None:
-        return self._runs_by_id.get(run_id)
-
     def active_run(self, chapter_id: str) -> RunRecord | None:
         return self._active_runs_by_chapter.get(chapter_id)
 
@@ -3266,13 +3265,7 @@ class StateStore:
         unit.status = status
         unit.detail = detail
         unit.run_id = run_id
-        if status != RepairWorkUnitStatus.WAITING_FOR_DEPENDENCIES:
-            unit.blocked_by = []
-        retryable = status in {
-            RepairWorkUnitStatus.WAITING_FOR_DEPENDENCIES,
-            RepairWorkUnitStatus.CERTIFICATION_PENDING,
-        }
-        unit.finished_at = None if retryable else timestamp()
+        unit.finished_at = timestamp()
         changed_tasks: list[TaskRecord] = []
         for task_key in unit.task_keys:
             task = self.tasks.get(task_key)
@@ -3294,8 +3287,6 @@ class StateStore:
     async def finish_repair_sweep(self, sweep_id: str, *, error: str = "") -> None:
         sweep = self.repair_sweeps[sweep_id]
         retryable_statuses = {
-            RepairWorkUnitStatus.WAITING_FOR_DEPENDENCIES,
-            RepairWorkUnitStatus.CERTIFICATION_PENDING,
             RepairWorkUnitStatus.INTERRUPTED,
             RepairWorkUnitStatus.PENDING,
         }
