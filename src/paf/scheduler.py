@@ -1146,17 +1146,28 @@ class Orchestrator:
             previous_dirty = set(self.state.formalize_graph.get("dirty", ()))
             previous_stale = set(self.state.formalize_graph.get("interface_stale", ()))
             metric_updates: dict[str, int] = {}
+            invalidation_events: list[tuple[str, str, str | None, str | None, tuple[str, ...]]] = []
             if self.config.settings.interface_invalidation != "observe":
                 for chapter_id, snapshot in snapshots.items():
                     old = interfaces.get(chapter_id)
                     new = snapshot.fingerprint
-                    old_digest = old.get("interface_digest") if isinstance(old, dict) else None
-                    new_digest = new.get("interface_digest") if isinstance(new, dict) else None
-                    if old_digest and new_digest:
-                        if old_digest != new_digest:
+                    old_files = self._file_interface_digests(old)
+                    new_files = self._file_interface_digests(new)
+                    if new_files is not None:
+                        previous = old_files or {}
+                        changed_files = [
+                            (chapter_id, source, previous.get(source), new_files.get(source))
+                            for source in sorted(set(previous) | set(new_files))
+                            if previous.get(source) != new_files.get(source)
+                        ]
+                        if changed_files:
                             changed_successors = self._successor_closure(
                                 invalidation_graph, (chapter_id,)
                             ) - set(snapshots)
+                            invalidation_events.extend(
+                                (*changed_file, tuple(sorted(changed_successors)))
+                                for changed_file in changed_files
+                            )
                             invalidated.update(changed_successors)
                             metric_updates["interface_changing_edits"] = (
                                 metric_updates.get("interface_changing_edits", 0) + 1
@@ -1164,11 +1175,15 @@ class Orchestrator:
                             metric_updates["descendants_queued"] = metric_updates.get(
                                 "descendants_queued", 0
                             ) + len(changed_successors)
+                            if old_files is None:
+                                metric_updates["unknown_interface_fallbacks"] = (
+                                    metric_updates.get("unknown_interface_fallbacks", 0) + 1
+                                )
                         elif chapter_id in previous_dirty and chapter_id not in previous_stale:
                             metric_updates["interface_preserving_edits"] = (
                                 metric_updates.get("interface_preserving_edits", 0) + 1
                             )
-                    elif old_digest and not new_digest:
+                    elif old_files is not None:
                         # Fingerprinting failed after the source had taken the
                         # selective path. Fall back to legacy invalidation.
                         invalidated.update(
@@ -1215,6 +1230,21 @@ class Orchestrator:
                 interface_validated=required,
                 metric_updates=metric_updates,
             )
+            for (
+                chapter_id,
+                source_file,
+                old_digest,
+                new_digest,
+                affected_ids,
+            ) in invalidation_events:
+                with suppress(Exception):
+                    await self.state.record_interface_invalidation(
+                        work_unit_id=chapter_id,
+                        source_file=source_file,
+                        old_digest=old_digest,
+                        new_digest=new_digest,
+                        invalidated_work_unit_ids=affected_ids,
+                    )
             return True
 
     async def _publish_validated_build(
@@ -1223,6 +1253,23 @@ class Orchestrator:
         snapshot: ValidatedBuildSnapshot,
     ) -> bool:
         return await self._publish_validated_builds({chapter.id: snapshot})
+
+    @staticmethod
+    def _file_interface_digests(record: Any) -> dict[str, str] | None:
+        """Return the persisted file/signature pairs from one fingerprint record."""
+
+        if not isinstance(record, dict) or not isinstance(record.get("modules"), list):
+            return None
+        pairs: dict[str, str] = {}
+        for module in record["modules"]:
+            if not isinstance(module, dict):
+                return None
+            source = module.get("source")
+            digest = module.get("interface_digest")
+            if not isinstance(source, str) or not isinstance(digest, str) or not digest:
+                return None
+            pairs[source] = digest
+        return pairs or None
 
     @staticmethod
     def _invalidate_formalize_descendants(
@@ -1242,16 +1289,7 @@ class Orchestrator:
         targets = set(chapter_ids)
         persisted = self.state.formalize_graph.get("clean", {})
         clean = self._copy_formalize_clean(persisted if isinstance(persisted, dict) else {})
-        raw_interfaces = self.state.formalize_graph.get("interfaces", {})
-        interfaces = raw_interfaces if isinstance(raw_interfaces, dict) else {}
-        known = all(
-            isinstance(interfaces.get(chapter_id, persisted.get(chapter_id)), dict)
-            and bool(
-                interfaces.get(chapter_id, persisted.get(chapter_id, {})).get("interface_digest")
-            )
-            for chapter_id in targets
-        )
-        if self.config.settings.interface_invalidation == "observe" or not known:
+        if self.config.settings.interface_invalidation == "observe":
             invalidated = self._invalidate_formalize_descendants(graph, clean, targets)
         else:
             invalidated = targets
@@ -1262,11 +1300,6 @@ class Orchestrator:
             clean,
             build_generation=int(self.state.formalize_graph.get("build_generation", 0)),
             invalidated=invalidated,
-            metric_updates=(
-                {"unknown_interface_fallbacks": len(targets)}
-                if self.config.settings.interface_invalidation != "observe" and not known
-                else None
-            ),
         )
         return invalidated
 

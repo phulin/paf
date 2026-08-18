@@ -5032,7 +5032,17 @@ def interface_record(digest: str) -> dict[str, object]:
         "interface_digest": digest,
         "fingerprint_schema": "olean-proof-erased-v1",
         "lean_version": "4.33.0:test",
-        "modules": [],
+        "modules": [
+            {
+                "module": "Book.Chapter",
+                "source": "lean/Book/Chapter.lean",
+                "artifact": "lean/.lake/build/lib/lean/Book/Chapter.olean",
+                "imports": [],
+                "artifact_digest": f"artifact-{digest}",
+                "interface_digest": digest,
+                "declaration_count": 1,
+            }
+        ],
     }
 
 
@@ -5141,6 +5151,83 @@ async def test_compiled_interface_controls_downstream_build_invalidation(
     assert proof_view["dependencies_current"] is (not changed)
     assert proof_view["head_build_status"] == ("pending" if changed else "clean")
     assert proof_view["fully_certified"] is (not changed)
+    with sqlite3.connect(orchestrator.state.database_path) as connection:
+        events = connection.execute(
+            """
+            SELECT source_file, old_digest, new_digest, invalidated_work_unit_ids
+            FROM interface_invalidation_events
+            """
+        ).fetchall()
+    if changed:
+        assert events == [
+            (
+                "lean/Book/Chapter.lean",
+                "old-interface",
+                "new-interface",
+                json.dumps([imported_successor.id], separators=(",", ":")).encode(),
+            )
+        ]
+    else:
+        assert events == []
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_proof_only_file_signature_change_does_not_invalidate_descendants(
+    tmp_path: Path,
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    first, second = config.chapters
+    orchestrator = Orchestrator(config, StateStore(config))
+    await orchestrator.prepare()
+    await mark_clean_formalization(orchestrator, {second.id: (first.id,)})
+    old = interface_record("same-file-interface")
+    old["interface_digest"] = "old-work-unit-aggregate"
+    orchestrator.state.formalize_graph["interfaces"] = {first.id: old}
+    await orchestrator._invalidate_build_records((first.id,))
+
+    new = interface_record("same-file-interface")
+    new["interface_digest"] = "new-work-unit-aggregate"
+    graph = orchestrator._observed_work_unit_graph()
+    snapshot = scheduler_module.ValidatedBuildSnapshot(
+        graph=graph,
+        source_digests={first.id: scope_digest(config.settings.repo, first)},
+        fingerprint=new,
+        import_dependencies=(),
+    )
+
+    assert await orchestrator._publish_validated_build(first, snapshot)
+    assert set(orchestrator.state.formalize_graph["clean"]) == {first.id, second.id}
+    assert orchestrator.state.formalize_graph["interface_stale"] == []
+    with sqlite3.connect(orchestrator.state.database_path) as connection:
+        count = connection.execute("SELECT count(*) FROM interface_invalidation_events").fetchone()[
+            0
+        ]
+    assert count == 0
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_missing_file_signature_falls_back_only_after_owner_build(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    first, second = config.chapters
+    orchestrator = Orchestrator(config, StateStore(config))
+    await orchestrator.prepare()
+    await mark_clean_formalization(orchestrator, {second.id: (first.id,)})
+
+    assert await orchestrator._invalidate_build_records((first.id,)) == {first.id}
+    assert second.id in orchestrator.state.formalize_graph["clean"]
+
+    graph = orchestrator._observed_work_unit_graph()
+    snapshot = scheduler_module.ValidatedBuildSnapshot(
+        graph=graph,
+        source_digests={first.id: scope_digest(config.settings.repo, first)},
+        fingerprint=interface_record("initial-file-interface"),
+        import_dependencies=(),
+    )
+    assert await orchestrator._publish_validated_build(first, snapshot)
+    assert second.id not in orchestrator.state.formalize_graph["clean"]
+    assert orchestrator.state.formalize_graph["interface_stale"] == [second.id]
     await orchestrator.shutdown()
 
 

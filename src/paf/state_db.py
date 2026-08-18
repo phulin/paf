@@ -15,7 +15,7 @@ from paf import json_codec as json
 
 DATABASE_NAME = "state.sqlite3"
 LEGACY_BACKUP_NAME = "state.legacy-v6.json"
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 CHANGE_RETENTION = 10_000
 
 COLLECTION_SECTIONS = frozenset(
@@ -576,6 +576,17 @@ def _create_schema(connection: sqlite3.Connection) -> None:
         );
         CREATE INDEX IF NOT EXISTS changes_entity
             ON changes(entity_type, entity_id, revision);
+        CREATE TABLE IF NOT EXISTS interface_invalidation_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            occurred_at TEXT NOT NULL,
+            work_unit_id TEXT NOT NULL,
+            source_file TEXT NOT NULL,
+            old_digest TEXT,
+            new_digest TEXT,
+            invalidated_work_unit_ids BLOB NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS interface_invalidation_events_source
+            ON interface_invalidation_events(source_file, id);
         """
     )
     columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(runs)").fetchall()}
@@ -590,6 +601,10 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             connection.execute(f"ALTER TABLE runs ADD COLUMN {name} {declaration}")
     if previous_version == 2:
         _migrate_v2_globals(connection)
+    connection.execute(
+        "UPDATE meta SET schema_version=? WHERE singleton=1",
+        (SCHEMA_VERSION,),
+    )
     connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
 
@@ -1025,7 +1040,7 @@ def initialize_database(state_dir: Path) -> Path:
             if version == 1:
                 with connection:
                     _migrate_v1(connection)
-            elif version == 2:
+            elif version in {2, 3}:
                 with connection:
                     _create_schema(connection)
             elif version != SCHEMA_VERSION:
@@ -1335,6 +1350,36 @@ class StateDatabase:
         """Return the long-lived connection owned by a StateWriter thread."""
 
         return _connect(self.path)
+
+    def record_interface_invalidation(
+        self,
+        *,
+        occurred_at: str,
+        work_unit_id: str,
+        source_file: str,
+        old_digest: str | None,
+        new_digest: str | None,
+        invalidated_work_unit_ids: tuple[str, ...],
+    ) -> None:
+        """Append analysis-only provenance for one changed file interface."""
+
+        with _connect(self.path) as connection, connection:
+            connection.execute(
+                """
+                INSERT INTO interface_invalidation_events(
+                    occurred_at, work_unit_id, source_file, old_digest, new_digest,
+                    invalidated_work_unit_ids
+                ) VALUES(?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    occurred_at,
+                    work_unit_id,
+                    source_file,
+                    old_digest,
+                    new_digest,
+                    json.dumpb(list(invalidated_work_unit_ids)),
+                ),
+            )
 
     def write_delta(
         self, write: DatabaseWrite, *, connection: sqlite3.Connection | None = None

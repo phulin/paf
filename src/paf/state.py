@@ -4126,6 +4126,28 @@ class StateStore:
         )
         await self._persist()
 
+    async def record_interface_invalidation(
+        self,
+        *,
+        work_unit_id: str,
+        source_file: str,
+        old_digest: str | None,
+        new_digest: str | None,
+        invalidated_work_unit_ids: Iterable[str],
+    ) -> None:
+        """Persist analysis-only provenance without changing scheduler state."""
+
+        invalidated = tuple(sorted(set(invalidated_work_unit_ids)))
+        await asyncio.to_thread(
+            self._database.record_interface_invalidation,
+            occurred_at=timestamp(),
+            work_unit_id=work_unit_id,
+            source_file=source_file,
+            old_digest=old_digest,
+            new_digest=new_digest,
+            invalidated_work_unit_ids=invalidated,
+        )
+
     async def start_coordinator_build(
         self,
         *,

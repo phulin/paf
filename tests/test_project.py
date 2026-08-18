@@ -232,7 +232,7 @@ async def test_schema_v2_global_graphs_migrate_to_relational_rows(tmp_path: Path
         request_count = connection.execute(
             "SELECT count(*) FROM state_items WHERE section='upstream_requests'"
         ).fetchone()[0]
-    assert version == 3
+    assert version == 4
     assert len(header_payload) < 10_000
     assert "source_dependency_tree" not in json.loads(header_payload)
     assert edge_count == 1
@@ -241,6 +241,33 @@ async def test_schema_v2_global_graphs_migrate_to_relational_rows(tmp_path: Path
     assert migrated is not None
     assert migrated["source_dependency_tree"]["edges"] == [[first.id, second.id]]
     assert migrated["upstream_requests"]["request-1"]["status"] == "requested"
+
+
+@pytest.mark.asyncio
+async def test_schema_v3_adds_interface_invalidation_events(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path))
+    state = StateStore(config)
+    await state.load_or_create()
+    await state.close()
+    with sqlite3.connect(state.database_path) as connection, connection:
+        connection.execute("DROP TABLE interface_invalidation_events")
+        connection.execute("UPDATE meta SET schema_version=3 WHERE singleton=1")
+        connection.execute("PRAGMA user_version=3")
+
+    StateDatabase(config.settings.state_dir).initialize()
+
+    with sqlite3.connect(state.database_path) as connection:
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+        meta_version = connection.execute(
+            "SELECT schema_version FROM meta WHERE singleton=1"
+        ).fetchone()[0]
+        event_table = connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name='interface_invalidation_events'"
+        ).fetchone()
+    assert version == 4
+    assert meta_version == 4
+    assert event_table == ("interface_invalidation_events",)
 
 
 def test_explicit_project_and_paf_toml_resolve_all_project_paths(tmp_path: Path) -> None:
