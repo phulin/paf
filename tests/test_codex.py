@@ -4,6 +4,7 @@ import os
 import signal
 from collections.abc import Callable
 from dataclasses import replace
+from io import BytesIO
 from pathlib import Path
 
 import pytest
@@ -23,6 +24,7 @@ from paf.codex import (
     _complete_lines,
     _is_capacity_failure,
     _is_fatal_invocation_failure,
+    _record_jsonl_line,
     _rollout_usage,
     _tail_rollout_usage,
     _upstream_source_bundle,
@@ -40,6 +42,53 @@ from paf.models import Stage
 from paf.state import StateStore, TaskStatus, TokenUsage
 from paf.state_db import read_full_snapshot
 from tests.support import write_project
+
+
+def test_record_jsonl_line_wraps_raw_process_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(codex_module, "activity_timestamp", lambda: "2026-08-18T01:02:03Z")
+    log = BytesIO()
+
+    event, received_at = _record_jsonl_line(
+        log,
+        b"ERROR codex_core::tools::router: apply_patch failed",
+        terminated=True,
+    )
+
+    persisted = json.loads(log.getvalue())
+    assert event == persisted
+    assert received_at == "2026-08-18T01:02:03Z"
+    assert persisted == {
+        "type": "paf.raw_output",
+        "text": "ERROR codex_core::tools::router: apply_patch failed",
+        "terminated": True,
+        EVENT_TIMESTAMP_FIELD: "2026-08-18T01:02:03Z",
+    }
+
+
+def test_record_jsonl_line_deduplicates_structured_mcp_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(codex_module, "activity_timestamp", lambda: "2026-08-18T01:02:03Z")
+    source = {
+        "type": "item.completed",
+        "item": {
+            "type": "mcp_tool_call",
+            "result": {
+                "content": [{"type": "text", "text": '{"items": []}'}],
+                "structured_content": {"items": []},
+            },
+        },
+    }
+    log = BytesIO()
+
+    event, _ = _record_jsonl_line(log, json.dumps(source).encode(), terminated=True)
+
+    persisted = json.loads(log.getvalue())
+    assert "content" not in persisted["item"]["result"]
+    assert persisted["item"]["result"]["structured_content"] == {"items": []}
+    assert event["item"]["result"]["content"] == source["item"]["result"]["content"]
 
 
 def test_report_schemas_contain_only_fields_used_by_each_agent() -> None:

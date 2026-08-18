@@ -944,14 +944,36 @@ def _record_jsonl_line(
     try:
         event = json.loads(line)
     except (json.JSONDecodeError, UnicodeDecodeError):
-        log.write(line + (b"\n" if terminated else b""))
-        return None, None
+        received_at = activity_timestamp()
+        event = {
+            "type": "paf.raw_output",
+            "text": line.decode("utf-8", errors="replace"),
+            "terminated": terminated,
+            EVENT_TIMESTAMP_FIELD: received_at,
+        }
+        log.write(json.dumpb(event) + b"\n")
+        return event, received_at
     received_at = activity_timestamp()
     if isinstance(event, dict):
         event = {**event, EVENT_TIMESTAMP_FIELD: received_at}
-        log.write(json.dumpb(event) + b"\n")
+        persisted = event
+        item = event.get("item")
+        if isinstance(item, dict) and item.get("type") == "mcp_tool_call":
+            result = item.get("result")
+            if isinstance(result, dict) and result.get("structured_content") is not None:
+                # FastMCP mirrors structured results into a JSON text content
+                # block. Codex has already delivered both forms to the agent;
+                # retaining both nearly doubles every PAF transcript.
+                persisted = {
+                    **event,
+                    "item": {
+                        **item,
+                        "result": {key: value for key, value in result.items() if key != "content"},
+                    },
+                }
+        log.write(json.dumpb(persisted) + b"\n")
     else:
-        log.write(line + (b"\n" if terminated else b""))
+        log.write(json.dumpb(event) + b"\n")
     return event, received_at
 
 
