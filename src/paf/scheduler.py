@@ -2704,11 +2704,63 @@ class Orchestrator:
             )
         return "\n\n".join(blocks)
 
-    def _durable_blocker_feedback(self, chapter_id: str) -> str:
-        """Render compact blocker identities, not their accumulated attempt transcripts."""
+    @staticmethod
+    def _obsolete_dependency_blocker(blocker: dict[str, Any]) -> bool:
+        text = " ".join(
+            str(blocker.get(field, "")) for field in ("remaining_goal", "obstruction")
+        ).casefold()
+        return ("dependency" in text or "imported" in text or "prerequisite" in text) and (
+            "fail" in text or "before" in text or "could not" in text
+        )
+
+    async def _resolve_obsolete_dependency_blockers(self, chapter_id: str) -> None:
+        stale = (
+            str(blocker["id"])
+            for blocker in self.state.proof_blockers_for_consumer(chapter_id)
+            if self._obsolete_dependency_blocker(blocker)
+        )
+        await self.state.set_proof_blocker_status(stale, ProofBlockerStatus.RESOLVED)
+
+    def _durable_blocker_feedback(
+        self,
+        chapter_id: str,
+        targets: Iterable[ProofTarget] = (),
+    ) -> str:
+        """Render deduplicated blockers relevant to the current proof assignment."""
+
+        selected = tuple(targets)
+
+        def matches(blocker: dict[str, Any]) -> bool:
+            if not selected:
+                return True
+            path = str(blocker.get("path", ""))
+            declaration = str(blocker.get("declaration", ""))
+            return any(
+                path == target.path
+                and (
+                    declaration == target.declaration
+                    or declaration.endswith("." + target.declaration)
+                )
+                for target in selected
+            )
+
+        deduplicated: dict[tuple[str, str, str], dict[str, Any]] = {}
+        for blocker in self.state.proof_blockers_for_consumer(chapter_id):
+            if not matches(blocker):
+                continue
+            key = (
+                str(blocker.get("path", "")),
+                str(blocker.get("declaration", "")).rsplit(".", 1)[-1],
+                re.sub(r"\s+", " ", str(blocker.get("remaining_goal", ""))).strip(),
+            )
+            previous = deduplicated.get(key)
+            if previous is None or str(blocker.get("updated_at", "")) >= str(
+                previous.get("updated_at", "")
+            ):
+                deduplicated[key] = blocker
 
         blocks = []
-        for blocker in self.state.proof_blockers_for_consumer(chapter_id):
+        for blocker in sorted(deduplicated.values(), key=lambda value: str(value.get("id", ""))):
             blocks.append(
                 f"{blocker['id']} — `{blocker.get('declaration', '')}` in "
                 f"`{blocker.get('path', '')}` (seen {blocker.get('sightings', 1)} time(s))\n"
@@ -4957,6 +5009,8 @@ class Orchestrator:
         discovered_targets = await asyncio.to_thread(
             proof_targets, self.config.settings.repo, chapter
         )
+        if build_fresh:
+            await self._resolve_obsolete_dependency_blockers(chapter.id)
         chunked_proofs = bool(discovered_targets)
         assigned_targets: tuple[ProofTarget, ...] = ()
         chunk_round = 0
@@ -4997,9 +5051,6 @@ class Orchestrator:
             await self.state.set_proof_blocker_status(reviewed_blockers, ProofBlockerStatus.OPEN)
         feedback = ""
         feedback_ledger: deque[str] = deque(maxlen=PROOF_FEEDBACK_ROUNDS)
-        if durable_feedback := self._durable_blocker_feedback(chapter.id):
-            feedback_ledger.append(durable_feedback)
-            feedback = _bounded_proof_feedback(feedback_ledger)
         stalled_rounds = 0
         previous_placeholders: int | None = None
         proof_round = 0
@@ -5103,6 +5154,13 @@ class Orchestrator:
                             candidates = requested
                     assigned_targets = proof_target_chunk(candidates, proof_chunk_size)
                     chunk_round = 0
+                    if not feedback and (
+                        durable_feedback := self._durable_blocker_feedback(
+                            chapter.id, assigned_targets
+                        )
+                    ):
+                        feedback_ledger.append(durable_feedback)
+                        feedback = _bounded_proof_feedback(feedback_ledger)
             try:
                 attempt = await self._attempt(
                     chapter,
@@ -5372,7 +5430,7 @@ class Orchestrator:
             blockers = await self._record_proof_blocker_deltas(
                 chapter, attempt.run, attempt.agent.report
             )
-            if durable_feedback := self._durable_blocker_feedback(chapter.id):
+            if durable_feedback := self._durable_blocker_feedback(chapter.id, assigned_targets):
                 feedback_ledger.append(durable_feedback)
             feedback = _bounded_proof_feedback(feedback_ledger)
             raw_upstream = attempt.agent.report.get("upstream_requests")

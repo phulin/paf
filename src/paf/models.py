@@ -31,6 +31,24 @@ class StageConfig:
 
 
 @dataclass(frozen=True)
+class ProofObligation:
+    """One concrete placeholder inside an assigned proof declaration."""
+
+    ordinal: int
+    line: int
+    context: str
+    fingerprint: str
+
+    def as_dict(self) -> dict[str, str | int]:
+        return {
+            "ordinal": self.ordinal,
+            "line": self.line,
+            "context": self.context,
+            "fingerprint": self.fingerprint,
+        }
+
+
+@dataclass(frozen=True)
 class ProofTarget:
     """One declaration containing proof placeholders assigned as a unit."""
 
@@ -40,8 +58,9 @@ class ProofTarget:
     end_line: int
     placeholder_count: int
     fingerprint: str
+    obligations: tuple[ProofObligation, ...] = ()
 
-    def as_dict(self) -> dict[str, str | int]:
+    def as_dict(self) -> dict[str, Any]:
         return {
             "path": self.path,
             "declaration": self.declaration,
@@ -49,6 +68,7 @@ class ProofTarget:
             "end_line": self.end_line,
             "placeholder_count": self.placeholder_count,
             "fingerprint": self.fingerprint,
+            "obligations": [obligation.as_dict() for obligation in self.obligations],
         }
 
 

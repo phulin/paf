@@ -327,6 +327,7 @@ def test_proof_targets_are_declaration_scoped_and_chunked_by_placeholder_count(
 
     assert [target.declaration for target in targets] == [f"target{i}" for i in range(1, 10)]
     assert [(target.line, target.end_line) for target in targets[:2]] == [(3, 3), (4, 4)]
+    assert [[hole.line for hole in target.obligations] for target in targets[:2]] == [[3], [4]]
     assert [sum(target.placeholder_count for target in chunk) for chunk in chunks] == [4, 4, 1]
     assert len({target.fingerprint for target in targets}) == 9
 
@@ -369,6 +370,31 @@ def test_proof_target_spans_refresh_after_an_assigned_proof_expands(tmp_path: Pa
     assert (refreshed.line, refreshed.end_line, refreshed.placeholder_count) == (1, 3, 0)
 
 
+def test_proof_obligation_identity_survives_an_earlier_hole_being_solved(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = config.chapters[0]
+    path = tmp_path / "lean" / "Book" / "Chapter01.lean"
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        "theorem assigned : True := by\n"
+        "  have left : True := by sorry\n"
+        "  have right : True := by sorry\n"
+        "  exact right\n",
+        encoding="utf-8",
+    )
+    original = proof_targets(tmp_path, chapter)[0]
+    second_fingerprint = original.obligations[1].fingerprint
+    path.write_text(
+        path.read_text(encoding="utf-8").replace("by sorry", "by trivial", 1),
+        encoding="utf-8",
+    )
+
+    remaining = proof_targets(tmp_path, chapter)[0]
+
+    assert remaining.placeholder_count == 1
+    assert remaining.obligations[0].fingerprint == second_fingerprint
+
+
 def test_unnamed_examples_are_independent_proof_targets(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
     chapter = config.chapters[0]
@@ -395,19 +421,25 @@ def test_proof_prompt_contains_only_the_assigned_chunk(tmp_path: Path) -> None:
         "path": "lean/Book/Chapter01.lean",
         "declaration": "Book.target",
         "line": 17,
+        "end_line": 24,
         "placeholder_count": 2,
         "fingerprint": "abc123",
+        "obligations": [
+            {"ordinal": 1, "line": 20, "context": "left := by", "fingerprint": "hole1"},
+            {"ordinal": 2, "line": 23, "context": "right := by", "fingerprint": "hole2"},
+        ],
     }
 
     prompt = executor.build_prompt(chapter, Stage.PROVE, proof_targets=[assigned])
 
-    assert "Assigned proof chunk" in prompt
-    assert "exactly these 2 unresolved placeholder(s)" in prompt
+    assert "Authoritative assignment" in prompt
+    assert "1 declaration(s) containing 2 proof" in prompt
     assert "`Book.target`" in prompt
-    assert "Other unresolved declarations are intentionally reserved" in prompt
-    assert "Resolve every error and every warning" in prompt
-    assert "only permitted warning is one caused by a `sorry` placeholder" in prompt
-    assert "Set `complete` to `true` when every" in prompt
+    assert "H1 at line 20: `left := by`" in prompt
+    assert "H2 at line 23: `right := by`" in prompt
+    assert "There are no unassigned placeholders" in prompt
+    assert prompt.splitlines()[1] == "## Authoritative assignment"
+    assert "Resolve every\nlisted hole" in prompt
 
 
 def test_executor_uses_machine_readable_codex_mode(tmp_path: Path) -> None:

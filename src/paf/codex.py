@@ -27,7 +27,7 @@ from paf.hashing import (
     new_digest,
     stable_digest_bytes,
 )
-from paf.models import PipelineConfig, ProofTarget, Stage, WorkUnitLike
+from paf.models import PipelineConfig, ProofObligation, ProofTarget, Stage, WorkUnitLike
 from paf.scope import ScopeMatcher
 from paf.state import RunRecord, StateStore, TaskStatus, TokenUsage
 
@@ -878,6 +878,80 @@ def _lean_code(text: str) -> str:
     return "".join(result)
 
 
+def _placeholder_offsets(text: str) -> tuple[int, ...]:
+    """Return source offsets of Lean placeholders, ignoring comments and strings."""
+
+    offsets: list[int] = []
+    index = 0
+    block_depth = 0
+    in_string = False
+    while index < len(text):
+        pair = text[index : index + 2]
+        char = text[index]
+        if block_depth:
+            if pair == "/-":
+                block_depth += 1
+                index += 2
+            elif pair == "-/":
+                block_depth -= 1
+                index += 2
+            else:
+                index += 1
+            continue
+        if in_string:
+            if char == "\\":
+                index += 2
+            elif char == '"':
+                in_string = False
+                index += 1
+            else:
+                index += 1
+            continue
+        if pair == "--":
+            newline = text.find("\n", index)
+            index = len(text) if newline < 0 else newline + 1
+            continue
+        if pair == "/-":
+            block_depth = 1
+            index += 2
+            continue
+        if char == '"':
+            in_string = True
+            index += 1
+            continue
+        match = re.match(r"(?:sorry|admit)\b", text[index:])
+        if match and (index == 0 or not (text[index - 1].isalnum() or text[index - 1] == "_")):
+            offsets.append(index)
+            index += len(match.group(0))
+            continue
+        index += 1
+    return tuple(offsets)
+
+
+def _placeholder_context(text: str, offset: int) -> str:
+    """Return a compact nearby source label for one proof hole."""
+
+    prefix = text[:offset].splitlines()
+    for line in reversed(prefix[-6:]):
+        stripped = line.strip()
+        if stripped and not stripped.startswith(("/-", "--", "*")):
+            return stripped[:160]
+    return "proof obligation"
+
+
+def _placeholder_signature(text: str, offset: int) -> str:
+    """Describe a hole from nearby source so its identity survives other holes being solved."""
+
+    before = _placeholder_context(text, offset)
+    after = ""
+    for line in text[offset:].splitlines()[1:7]:
+        stripped = line.strip()
+        if stripped and not stripped.startswith(("/-", "--", "*")):
+            after = stripped[:160]
+            break
+    return f"{before}\0{after}"
+
+
 def count_placeholders(repo: Path, chapter: WorkUnitLike) -> int:
     pattern = re.compile(r"\b(?:sorry|admit)\b")
     return sum(
@@ -889,7 +963,6 @@ def count_placeholders(repo: Path, chapter: WorkUnitLike) -> int:
 def _proof_declarations(repo: Path, chapter: WorkUnitLike) -> tuple[ProofTarget, ...]:
     """Return every proof-capable declaration with its current source span."""
 
-    pattern = re.compile(r"\b(?:sorry|admit)\b")
     declarations: list[ProofTarget] = []
     for path in scoped_files(repo, chapter):
         text = path.read_text(encoding="utf-8")
@@ -906,10 +979,33 @@ def _proof_declarations(repo: Path, chapter: WorkUnitLike) -> tuple[ProofTarget,
                 if stop > 0 and text[stop - 1] == "\n"
                 else text.count("\n", 0, stop) + 1
             )
-            placeholder_count = len(pattern.findall(_lean_code(text[match.start() : stop])))
+            declaration_text = text[match.start() : stop]
+            placeholder_offsets = _placeholder_offsets(declaration_text)
+            placeholder_count = len(placeholder_offsets)
             display_name = declaration if match.group("name") else f"example #{ordinal + 1}"
             relative = path.relative_to(repo).as_posix()
             identity = f"{relative}\0{declaration}\0{ordinal}".encode()
+            target_fingerprint = stable_digest_bytes(identity)[:16]
+            signature_ordinals: dict[str, int] = {}
+            obligation_specs: list[tuple[int, str, int]] = []
+            for offset in placeholder_offsets:
+                signature = _placeholder_signature(declaration_text, offset)
+                signature_ordinal = signature_ordinals.get(signature, 0)
+                signature_ordinals[signature] = signature_ordinal + 1
+                obligation_specs.append((offset, signature, signature_ordinal))
+            obligations = tuple(
+                ProofObligation(
+                    ordinal=obligation_index,
+                    line=text.count("\n", 0, match.start() + offset) + 1,
+                    context=_placeholder_context(declaration_text, offset),
+                    fingerprint=stable_digest_bytes(
+                        f"{target_fingerprint}\0{signature}\0{signature_ordinal}".encode()
+                    )[:16],
+                )
+                for obligation_index, (offset, signature, signature_ordinal) in enumerate(
+                    obligation_specs, start=1
+                )
+            )
             declarations.append(
                 ProofTarget(
                     path=relative,
@@ -917,7 +1013,8 @@ def _proof_declarations(repo: Path, chapter: WorkUnitLike) -> tuple[ProofTarget,
                     line=start_line,
                     end_line=max(start_line, end_line),
                     placeholder_count=placeholder_count,
-                    fingerprint=stable_digest_bytes(identity)[:16],
+                    fingerprint=target_fingerprint,
+                    obligations=obligations,
                 )
             )
     return tuple(declarations)
@@ -1321,15 +1418,9 @@ how to perform and report the work.
         proof_retry_contract = ""
         if stage is Stage.PROVE and feedback and role != UPSTREAM_REPAIR_ROLE:
             proof_retry_contract = """
-This is another attempt. The history appended below records earlier work; do not simply repeat or
-summarize it. Choose one remaining placeholder and use new evidence to improve a previous approach,
-or try a meaningfully different one: search for another earlier theorem, unfold a relevant
-definition, prove a focused helper, construct the object directly, or change the tactic structure.
-Try several checked approaches before concluding that the same obstruction remains. If a concrete
-mathematical argument shows that an earlier declaration must change, report the smallest required
-change through the proof report instead of repeating that no library result was found. If the
-history contains PAF validation diagnostics, resolve all of them before returning. In particular,
-do not report no changes or “typecheck clean” while a supplied non-`sorry` warning still applies."""
+This is a retry. Use the target-specific handoff below to improve a prior approach or try a
+meaningfully different one. Resolve supplied current diagnostics and do not restate unchanged
+blocker evidence."""
         selected_proof_targets = tuple(proof_targets)
         proof_assignment = ""
         if stage is Stage.PROVE and selected_proof_targets and role != UPSTREAM_REPAIR_ROLE:
@@ -1339,26 +1430,82 @@ do not report no changes or “typecheck clean” while a supplied non-`sorry` w
                 value = target.as_dict() if isinstance(target, ProofTarget) else target
                 count = int(value.get("placeholder_count", 0))
                 assigned_placeholders += count
-                rendered_targets.append(
-                    f"- `{value.get('path', '')}:{value.get('line', '')}` — "
-                    f"`{value.get('declaration', '')}` ({count} placeholder(s); "
-                    f"target `{value.get('fingerprint', '')}`)"
+                obligations = value.get("obligations", [])
+                rendered_targets.extend(
+                    [
+                        f"### `{value.get('declaration', '')}`",
+                        "",
+                        f"- File: `{value.get('path', '')}`",
+                        f"- Declaration span: lines {value.get('line', '')}-"
+                        f"{value.get('end_line', '')}",
+                        f"- Target ID: `{value.get('fingerprint', '')}`",
+                        "- Proof holes:",
+                    ]
                 )
-            proof_assignment = f"""
+                if isinstance(obligations, list) and obligations:
+                    for index, obligation in enumerate(obligations, start=1):
+                        if not isinstance(obligation, dict):
+                            continue
+                        rendered_targets.append(
+                            f"  - H{obligation.get('ordinal', index)} at line "
+                            f"{obligation.get('line', '')}: "
+                            f"`{obligation.get('context', 'proof obligation')}` "
+                            f"(`{obligation.get('fingerprint', '')}`)"
+                        )
+                else:
+                    rendered_targets.append(
+                        f"  - {count} hole location(s) unavailable in this legacy assignment; "
+                        "locate them before editing."
+                    )
+                rendered_targets.append("")
+            root = workspace_root or self.config.settings.repo
+            try:
+                all_targets = _proof_declarations(root, chapter)
+            except OSError:
+                all_targets = ()
+            selected_ids = {
+                str(
+                    (target.as_dict() if isinstance(target, ProofTarget) else target).get(
+                        "fingerprint", ""
+                    )
+                )
+                for target in selected_proof_targets
+            }
+            reserved = tuple(
+                target
+                for target in all_targets
+                if target.placeholder_count and target.fingerprint not in selected_ids
+            )
+            reservation = (
+                "There are no unassigned placeholders in this chapter."
+                if not reserved
+                else "Reserved for later agents: "
+                + ", ".join(f"`{target.declaration}`" for target in reserved)
+                + "."
+            )
+            declaration_count = len(selected_proof_targets)
+            chunk_size = self.config.stages[Stage.PROVE].chunk_size or 4
+            overflow = (
+                f" The configured chunk size is {chunk_size}, but PAF keeps all holes in one "
+                "declaration with the same agent because they can share local terms."
+                if declaration_count == 1 and assigned_placeholders > chunk_size
+                else ""
+            )
+            proof_assignment = f"""## Authoritative assignment
 
-### Assigned proof chunk
+This attempt owns {declaration_count} declaration(s) containing {assigned_placeholders} proof
+hole(s).{overflow}
 
-This attempt owns exactly these {assigned_placeholders} unresolved placeholder(s):
-{chr(10).join(rendered_targets)}
+{chr(10).join(rendered_targets).rstrip()}
 
-Work only on these declarations. Other unresolved declarations are intentionally reserved for later
-proof agents: do not prove, rewrite, or include them in `failed_attempts`. Outside the assigned
-proof bodies, make only focused import or fully proved helper edits they need and repairs required
-by a supplied PAF validation diagnostic. Resolve every error and every warning in the assigned
-declarations; the only permitted warning is one caused by a `sorry` placeholder reserved for a later
-chunk. Set `complete` to `true` when every placeholder in this assigned chunk is resolved and no
-non-`sorry` diagnostic remains, even if other placeholders
-remain in the chapter."""
+{reservation}
+
+Work only on the assigned declaration bodies and focused private helpers they require. Resolve every
+listed hole and every diagnostic in the assigned span. Set `complete` to `true` only when all listed
+holes are gone and no non-`sorry` diagnostic remains.
+"""
+            title, separator, remainder = base.partition("\n")
+            base = f"{title}{separator}\n{proof_assignment}\n{remainder.lstrip()}"
         stage_contract = {
             Stage.DISCOVER: """This is read-only source analysis. Identify the earlier chapters
 that this chapter directly needs. Do not edit any file.""",
@@ -1410,13 +1557,8 @@ write any file."""
 You may edit only these paths:
 {scope}
 
-This is a strict boundary. You may read files elsewhere for
-context, but do not create, modify, move, delete, format, or otherwise write any path outside this
-scope. In particular, do not edit `.paf`, `README.md`, repository-level documentation, prompts,
-scripts, orchestration code, configuration, or tests, even if changing them seems useful for this
-task. If a source repair requires an out-of-scope write, do not make that edit; explain the blocker
-and exact paths as directed by the stage prompt. Before every edit, verify that its target matches
-one of the listed scope paths. Any out-of-scope write causes PAF to reject the entire attempt."""
+This boundary is strict: reads elsewhere are allowed, but any write outside these paths rejects the
+attempt. Report a required out-of-scope repair instead of making it."""
         )
         contract = f"""
 
@@ -1424,14 +1566,10 @@ one of the listed scope paths. Any out-of-scope write causes PAF to reject the e
 
 {file_contract}
 
-Do not commit and do not wait for another worker.
-Do not run `lake build`, `lake env lean`, raw `lean`, or another compiler command. Builds belong to
-PAF and use its single writable build cache. Never search or read `.paf/logs`, `.paf/isolation`, or
-isolation/worktree trees. Bound each command's output to roughly 12 KiB with narrow paths, match
-limits, or small source windows. {stage_contract}
+Do not commit, wait for another worker, invoke a compiler directly, or inspect `.paf` logs or
+isolation trees. Keep command output below roughly 12 KiB. {stage_contract}
 {input_catalog}
 {validation_contract}
-{proof_assignment}
 """
         if stage in (Stage.FORMALIZE, Stage.REVIEW, Stage.PROVE):
             capabilities = (
@@ -1455,16 +1593,12 @@ than permitted `sorry` warnings from later chunks.""",
 
 ### Attached Lean tools (MCP)
 
-A private `paf_lean` tool server is attached to this attempt through MCP. It works on this attempt's
-private Lean project. Use it for {capabilities}. It intentionally does not provide a build command
-or remote search. Tool paths are relative to the Lean project root: use `LastLib/...`, not
-`lean/LastLib/...`.
+A private `paf_lean` server provides {capabilities}. Paths are relative to the Lean project root:
+use `LastLib/...`, not `lean/LastLib/...`.
 {mcp_workflow}
-The tool server automatically prepares imported files when Lean reports that they are stale. Do not
-start another language server or work around stale imports with a compiler command. When checking
-more than one edited file, call `lean_prepare_dependencies` once with the edited files at the end of
-the dependency chain; the tool will prepare everything they import together. Then request final
-whole-file diagnostics from prerequisites to dependents. Do not prepare every file separately.
+The server prepares stale imports automatically. For multiple edited files, call
+`lean_prepare_dependencies` once on the files at the end of the dependency chain, then request final
+diagnostics from prerequisites to dependents.
 """
         if feedback:
             feedback_heading = (

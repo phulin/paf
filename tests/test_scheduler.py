@@ -35,6 +35,7 @@ from paf.scheduler import (
     StageOutcome,
 )
 from paf.state import (
+    ProofBlockerStatus,
     RunRecord,
     StateStore,
     TaskPhase,
@@ -3804,6 +3805,62 @@ def test_proof_feedback_is_bounded_and_retains_latest_diagnostics() -> None:
     assert len(feedback) == scheduler_module.PROOF_FEEDBACK_MAX_CHARS
     assert "older proof feedback omitted" in feedback
     assert feedback.endswith("latest diagnostic")
+
+
+def test_proof_feedback_is_target_filtered_and_deduplicated(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    state = StateStore(config)
+    state.proof_blockers = {
+        "B1": {
+            "id": "B1",
+            "consumer_chapter_id": config.chapters[0].id,
+            "path": "lean/Book/Chapter01.lean",
+            "declaration": "Book.assigned",
+            "remaining_goal": "⊢ True",
+            "obstruction": "old evidence",
+            "status": ProofBlockerStatus.OPEN.value,
+            "updated_at": "2026-01-01T00:00:00+00:00",
+        },
+        "B2": {
+            "id": "B2",
+            "consumer_chapter_id": config.chapters[0].id,
+            "path": "lean/Book/Chapter01.lean",
+            "declaration": "Book.assigned",
+            "remaining_goal": "  ⊢   True ",
+            "obstruction": "latest evidence",
+            "status": ProofBlockerStatus.OPEN.value,
+            "updated_at": "2026-01-02T00:00:00+00:00",
+        },
+        "B3": {
+            "id": "B3",
+            "consumer_chapter_id": config.chapters[0].id,
+            "path": "lean/Book/Chapter01.lean",
+            "declaration": "Book.reserved",
+            "remaining_goal": "⊢ False",
+            "obstruction": "unrelated",
+            "status": ProofBlockerStatus.OPEN.value,
+            "updated_at": "2026-01-03T00:00:00+00:00",
+        },
+    }
+    orchestrator = Orchestrator(config, state)
+    target = ProofTarget(
+        path="lean/Book/Chapter01.lean",
+        declaration="assigned",
+        line=1,
+        end_line=2,
+        placeholder_count=1,
+        fingerprint="target",
+    )
+
+    feedback = orchestrator._durable_blocker_feedback(config.chapters[0].id, (target,))
+
+    assert "B2" in feedback
+    assert "latest evidence" in feedback
+    assert "B1" not in feedback
+    assert "B3" not in feedback
+    assert Orchestrator._obsolete_dependency_blocker(
+        {"obstruction": "The imported dependency failed before the target was checked."}
+    )
 
 
 @pytest.mark.parametrize("severity", ["error", "warning"])
