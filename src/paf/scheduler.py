@@ -959,6 +959,22 @@ class Orchestrator:
                     pending.append(successor)
         return affected
 
+    @staticmethod
+    def _dependency_frontiers_ready(
+        graph: WorkUnitImportGraph,
+        completed: set[str],
+    ) -> set[str]:
+        """Return nodes whose entire transitive prerequisite frontier is complete."""
+
+        ready: set[str] = set()
+        for chapter_id in graph.order:
+            if all(
+                dependency in completed and dependency in ready
+                for dependency in graph.dependencies.get(chapter_id, frozenset())
+            ):
+                ready.add(chapter_id)
+        return ready
+
     async def _publish_validated_builds(
         self,
         snapshots: dict[str, ValidatedBuildSnapshot],
@@ -4211,15 +4227,13 @@ class Orchestrator:
                                     "prerequisite review was invalidated during review",
                                 )
 
+                review_frontiers_ready = self._dependency_frontiers_ready(graph, reviewed)
                 for chapter_id in graph.order:
                     review_task = self.state.task(chapter_id, Stage.REVIEW)
                     # A forced pipeline run is not itself evidence that this node has
                     # already been reviewed. Only actual prior/active review work may
                     # bypass dependency-review ordering.
                     rereview = chapter_id in attempted or review_task.rounds > 0
-                    required_reviews = self._dependency_closure(graph, (chapter_id,)).difference(
-                        {chapter_id}
-                    )
                     if (
                         chapter_id not in reviewed
                         and chapter_id not in review_failures
@@ -4228,7 +4242,7 @@ class Orchestrator:
                         and chapter_id not in proof_tasks
                         and chapter_id not in rebuild_tasks
                         and (rereview or formalize_ready(chapter_id))
-                        and (rereview or required_reviews.issubset(reviewed))
+                        and (rereview or chapter_id in review_frontiers_ready)
                     ):
                         dependencies = graph.dependencies[chapter_id]
                         proof_feedback, proof_request_ids = self._proof_review_feedback(chapter_id)

@@ -445,6 +445,8 @@ class StateStore:
         self._latest_runs_by_chapter: dict[str, RunRecord] = {}
         self._usage_cache: dict[tuple[bool, str | None], TokenUsage] = {}
         self._cost_cache: dict[tuple[bool, str | None], CostEstimate] = {}
+        self._task_snapshot_context_key: tuple[int, ...] | None = None
+        self._task_snapshot_context_cache: dict[str, Any] | None = None
         self._indexed_task_states: dict[str, tuple[str, str, bool, str, bool]] = {}
         self._repairable_task_keys: set[str] = set()
         self._active_run_ids: set[str] = set()
@@ -905,15 +907,26 @@ class StateStore:
         """Precompute build-freshness sets shared by every projected task row."""
 
         clean_value = self.formalize_graph.get("clean", {})
-        clean = clean_value if isinstance(clean_value, dict) else {}
         interfaces_value = self.formalize_graph.get("interfaces", {})
-        interfaces = interfaces_value if isinstance(interfaces_value, dict) else {}
         dirty_value = self.formalize_graph.get("dirty", ())
-        dirty = set(dirty_value) if isinstance(dirty_value, list) else set()
         stale_value = self.formalize_graph.get("interface_stale", ())
-        stale = set(stale_value) if isinstance(stale_value, list) else set()
         import_graph = self.formalize_graph.get("interface_import_graph", {})
         raw_edges = import_graph.get("edges", ()) if isinstance(import_graph, dict) else ()
+        key = (
+            id(self.formalize_graph),
+            id(clean_value),
+            id(interfaces_value),
+            id(dirty_value),
+            id(stale_value),
+            id(import_graph),
+            id(raw_edges),
+        )
+        if key == self._task_snapshot_context_key and self._task_snapshot_context_cache is not None:
+            return self._task_snapshot_context_cache
+        clean = clean_value if isinstance(clean_value, dict) else {}
+        interfaces = interfaces_value if isinstance(interfaces_value, dict) else {}
+        dirty = set(dirty_value) if isinstance(dirty_value, list) else set()
+        stale = set(stale_value) if isinstance(stale_value, list) else set()
         successors: dict[str, list[str]] = {}
         if isinstance(raw_edges, list):
             for edge in raw_edges:
@@ -931,13 +944,16 @@ class StateStore:
                 if successor not in stale_dependencies:
                     stale_dependencies.add(successor)
                     pending.append(successor)
-        return {
+        context = {
             "clean": clean,
             "interfaces": interfaces,
             "dirty": dirty,
             "stale": stale,
             "stale_dependencies": stale_dependencies,
         }
+        self._task_snapshot_context_key = key
+        self._task_snapshot_context_cache = context
+        return context
 
     def _task_dict(
         self,
@@ -1400,7 +1416,7 @@ class StateStore:
             self._checkpoint_dirty = False
             self._issues_dirty = False
             self._static_dirty = False
-            task_context = self._task_snapshot_context()
+            task_context = self._task_snapshot_context() if task_keys else None
             task_payloads = {
                 key: json.dumpb(self._hot_task_dict(self.tasks[key], task_context))
                 for key in sorted(task_keys)
