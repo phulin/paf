@@ -414,7 +414,7 @@ report = {"complete": True, "summary": "done", "issues": []}
 if "discover" in schema:
     report["source_dependencies"] = []
 else:
-    report.update({"changed": False, "source_issues": []})
+    report["source_issues"] = []
 if "formalize" in schema:
     target = Path("lean/Book/Chapter01.lean")
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -422,7 +422,6 @@ if "formalize" in schema:
     section = Path("lean/Book/Chapter01/Section.lean")
     section.parent.mkdir(parents=True, exist_ok=True)
     section.write_text("def formalized := True\\n")
-    report["changed"] = True
 if "prove" in schema:
     report.update({"failed_attempts": [], "blocker_refs": [], "upstream_requests": []})
 print(json.dumps({"type": "item.completed", "item": {

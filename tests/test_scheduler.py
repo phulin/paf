@@ -177,7 +177,6 @@ def result(
     finding_assessments: list[dict[str, str]] | None = None,
 ) -> AgentResult:
     report: dict[str, Any] = {
-        "changed": changed,
         "complete": complete,
         "summary": "reviewed",
         "issues": issues or [],
@@ -3986,7 +3985,6 @@ async def test_proof_upstream_request_runs_repair_then_targeted_retry(
                 changed=True,
                 placeholders=0,
                 report={
-                    "changed": True,
                     "complete": True,
                     "summary": "Used the repaired upstream bridge.",
                     "issues": [],
@@ -4000,7 +3998,6 @@ async def test_proof_upstream_request_runs_repair_then_targeted_retry(
             changed=False,
             placeholders=1,
             report={
-                "changed": False,
                 "complete": False,
                 "summary": "Preserved the blocked proof after exhausting local routes.",
                 "issues": [],
@@ -4044,7 +4041,6 @@ async def test_proof_upstream_request_runs_repair_then_targeted_retry(
             changed=True,
             placeholders=0,
             report={
-                "changed": True,
                 "complete": True,
                 "summary": "Added and proved the requested upstream truth bridge.",
                 "issues": [],
@@ -4152,7 +4148,6 @@ async def test_upstream_request_escalates_only_after_failed_targeted_retry(
         return await persist(
             run,
             {
-                "changed": False,
                 "complete": False,
                 "summary": "The target remains blocked.",
                 "issues": [],
@@ -4172,7 +4167,6 @@ async def test_upstream_request_escalates_only_after_failed_targeted_retry(
         return await persist(
             run,
             {
-                "changed": False,
                 "complete": True,
                 "summary": "The bridge belongs in the consumer.",
                 "issues": [],
@@ -4265,7 +4259,6 @@ async def test_requested_upstream_requests_for_one_owner_share_one_repair_agent(
         selected = tuple(str(request["id"]) for request in requests)
         batches.append(selected)
         report = {
-            "changed": False,
             "complete": True,
             "summary": "Identified the existing shared bridge.",
             "issues": [],

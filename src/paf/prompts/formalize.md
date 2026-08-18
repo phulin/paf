@@ -77,10 +77,9 @@ check and the clean diagnostic check are finished.
 Return the structured report once, after tool use and edits have stopped. It must describe the stable
 files on disk, not planned work. Use only these fields:
 
-- `changed`: `true` exactly when an allowed edit remains.
 - `complete`: `true` only when the definition of done is met.
-- `summary`: when files changed, concise past-tense prose naming the main files or declarations and
-  the purpose of the edits, suitable for a commit body; otherwise, why no edit was needed.
+- `summary`: if edits remain, concise past-tense prose naming the main files or declarations and the
+  purpose of the edits, suitable for a commit body; otherwise, why no edit was needed.
 - `issues`: precise remaining coverage, Lean-interface, diagnostic, tooling, or out-of-scope blockers;
   otherwise an empty list.
 - `source_issues`: genuine defects in the informal textbook; otherwise an empty list. Each entry must

@@ -117,7 +117,6 @@ def agent_result(summary: str) -> AgentResult:
         placeholders=0,
         usage=TokenUsage(),
         report={
-            "changed": True,
             "complete": True,
             "summary": summary,
             "issues": [],

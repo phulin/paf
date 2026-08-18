@@ -107,9 +107,8 @@ If an assigned target remains unresolved, preserve all independent clean progres
 Return the structured report once, after tool use and edits have stopped. It must describe the stable
 files on disk, not planned work. Use only these fields:
 
-- `changed`: `true` exactly when an allowed edit remains.
 - `complete`: `true` exactly when no assigned placeholder or non-`sorry` diagnostic remains.
-- `summary`: when files changed, concise past-tense prose naming the proved declarations and important
+- `summary`: if edits remain, concise past-tense prose naming the proved declarations and important
   helpers, suitable for a commit body; otherwise, why no edit was retained.
 - `issues`: tooling, diagnostic, or out-of-scope problems that are not individual proof attempts;
   otherwise an empty list.

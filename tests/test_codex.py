@@ -99,17 +99,15 @@ def test_report_schemas_contain_only_fields_used_by_each_agent() -> None:
     expected = {
         "shepherd": {"complete", "summary", "issues", "dispositions", "work_units"},
         "discover": {"complete", "summary", "issues", "source_dependencies"},
-        "formalize": {"changed", "complete", "summary", "issues", "source_issues"},
-        "review": {"changed", "complete", "summary", "issues", "source_issues"},
+        "formalize": {"complete", "summary", "issues", "source_issues"},
+        "review": {"complete", "summary", "issues", "source_issues"},
         "diagnostic_review": {
-            "changed",
             "complete",
             "summary",
             "issues",
             "source_issues",
         },
         "proof_review": {
-            "changed",
             "complete",
             "summary",
             "issues",
@@ -117,7 +115,6 @@ def test_report_schemas_contain_only_fields_used_by_each_agent() -> None:
             "finding_assessments",
         },
         "prove": {
-            "changed",
             "complete",
             "summary",
             "issues",
@@ -127,7 +124,6 @@ def test_report_schemas_contain_only_fields_used_by_each_agent() -> None:
             "upstream_requests",
         },
         "downstream_retry": {
-            "changed",
             "complete",
             "summary",
             "issues",
@@ -137,7 +133,6 @@ def test_report_schemas_contain_only_fields_used_by_each_agent() -> None:
             "upstream_requests",
         },
         "upstream_repair": {
-            "changed",
             "complete",
             "summary",
             "issues",
@@ -945,7 +940,7 @@ print(json.dumps({"type": "thread.started", "thread_id": "thread-123"}))
 print(json.dumps({"type": "turn.completed", "usage": {
     "input_tokens": 100, "cached_input_tokens": 80, "output_tokens": 25,
     "reasoning_output_tokens": 10}}))
-report = {"changed": False, "complete": True,
+report = {"complete": True,
           "summary": "done", "issues": []}
 print(json.dumps({"type": "item.completed", "item": {
     "type": "agent_message", "text": json.dumps(report)}}))
@@ -1014,7 +1009,7 @@ if "resume" not in sys.argv:
     print(json.dumps({{"type": "error", "message": message}}))
     print(json.dumps({{"type": "turn.failed", "error": {{"message": message}}}}))
     raise SystemExit(1)
-report = {{"changed": False, "complete": True,
+report = {{"complete": True,
           "summary": "resumed successfully", "issues": []}}
 print(json.dumps({{"type": "turn.started"}}))
 print(json.dumps({{"type": "item.completed", "item": {{
@@ -1171,7 +1166,7 @@ with Path({str(invocations_path)!r}).open("a", encoding="utf-8") as handle:
 if "resume" not in sys.argv:
     print(json.dumps({{"type": "thread.started", "thread_id": "fd-thread"}}), flush=True)
     time.sleep(60)
-report = {{"changed": False, "complete": True,
+report = {{"complete": True,
           "summary": "resumed after fd recycle", "issues": []}}
 print(json.dumps({{"type": "item.completed", "item": {{
     "type": "agent_message", "text": json.dumps(report)}}}}))
@@ -1300,7 +1295,7 @@ print(json.dumps({"type": "item.completed", "item": {
 print(json.dumps({"type": "turn.completed", "usage": {
     "input_tokens": 100, "cached_input_tokens": 80, "output_tokens": 25,
     "reasoning_output_tokens": 10}}))
-report = {"changed": False, "complete": True,
+report = {"complete": True,
           "summary": "large event drained", "issues": []}
 print(json.dumps({"type": "item.completed", "item": {
     "type": "agent_message", "text": json.dumps(report)}}))
@@ -1401,7 +1396,7 @@ from pathlib import Path
 prompt = sys.stdin.read()
 with Path({str(invocations_path)!r}).open("a", encoding="utf-8") as handle:
     handle.write(json.dumps({{"args": sys.argv[1:], "prompt": prompt}}) + "\\n")
-report = {{"changed": False, "complete": True,
+report = {{"complete": True,
           "summary": "resumed interrupted work", "issues": []}}
 print(json.dumps({{"type": "thread.started", "thread_id": "saved-session"}}))
 print(json.dumps({{"type": "item.completed", "item": {{
@@ -1481,7 +1476,7 @@ with Path({str(invocations_path)!r}).open("a", encoding="utf-8") as handle:
 if "resume" in sys.argv:
     print(json.dumps({{"type": "error", "message": "session not found"}}))
     raise SystemExit(1)
-report = {{"changed": False, "complete": True,
+report = {{"complete": True,
           "summary": "started replacement agent", "issues": []}}
 print(json.dumps({{"type": "thread.started", "thread_id": "replacement-session"}}))
 print(json.dumps({{"type": "item.completed", "item": {{
@@ -1616,7 +1611,7 @@ for _ in range(200):
     if Path({str(child_pid_path)!r}).is_file():
         break
     time.sleep(0.01)
-report = {{"changed": False, "complete": True,
+report = {{"complete": True,
           "summary": "done", "issues": []}}
 print(json.dumps({{"type": "item.completed", "item": {{
     "type": "agent_message", "text": json.dumps(report)}}}}), flush=True)

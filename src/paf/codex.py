@@ -32,7 +32,6 @@ from paf.scope import ScopeMatcher
 from paf.state import RunRecord, StateStore, TaskStatus, TokenUsage
 
 _REPORT_BASE_PROPERTIES: dict[str, Any] = {
-    "changed": {"type": "boolean"},
     "complete": {"type": "boolean"},
     "summary": {
         "type": "string",
@@ -269,8 +268,7 @@ REPORT_SCHEMAS: dict[str, dict[str, Any]] = {
     ),
     "discover": _report_schema(
         "PAF discovery report",
-        {key: value for key, value in _REPORT_BASE_PROPERTIES.items() if key != "changed"}
-        | {"source_dependencies": _SOURCE_DEPENDENCIES_PROPERTY},
+        _REPORT_BASE_PROPERTIES | {"source_dependencies": _SOURCE_DEPENDENCIES_PROPERTY},
     ),
     "formalize": _report_schema(
         "PAF formalization report",
@@ -400,9 +398,8 @@ changed.""",
             "review_output_format": """Return the structured report once, after tool use and edits
 have stopped. It must describe the stable files on disk, not planned work. Use only these fields:
 
-- `changed`: `true` exactly when an allowed edit remains.
 - `complete`: `true` only when the definition of done is met.
-- `summary`: when files changed, concise past-tense prose naming the added declarations and their
+- `summary`: if edits remain, concise past-tense prose naming the added declarations and their
   purpose, suitable for a commit body; otherwise, why no edit was needed.
 - `issues`: tooling, diagnostic, or out-of-scope blockers; otherwise an empty list.
 - `source_issues`: genuine defects in the informal textbook; otherwise an empty list. Each entry
@@ -442,10 +439,9 @@ was changed, and any genuinely out-of-scope owner is identified precisely.""",
             "review_output_format": """Return the structured report once, after tool use and edits
 have stopped. It must describe the stable files on disk, not planned work. Use only these fields:
 
-- `changed`: `true` exactly when an allowed edit remains.
 - `complete`: `true` only when every supplied in-scope diagnostic is resolved and the definition of
   done is met.
-- `summary`: when files changed, concise past-tense prose naming the repaired diagnostics and their
+- `summary`: if edits remain, concise past-tense prose naming the repaired diagnostics and their
   causes, suitable for a commit body; otherwise, why no edit was retained.
 - `issues`: precise remaining diagnostic, tooling, or out-of-scope blockers; otherwise an empty
   list.
@@ -477,10 +473,9 @@ files have no diagnostics except permitted exact `sorry` warnings.""",
             "review_output_format": """Return the structured report once, after tool use and edits
 have stopped. It must describe the stable files on disk, not planned work. Use only these fields:
 
-- `changed`: `true` exactly when an allowed edit remains.
 - `complete`: `true` only when the definition of done is met.
-- `summary`: when files changed, concise past-tense prose naming the main files or declarations and
-  the purpose of the edits, suitable for a commit body; otherwise, why no edit was needed.
+- `summary`: if edits remain, concise past-tense prose naming the main files or declarations and the
+  purpose of the edits, suitable for a commit body; otherwise, why no edit was needed.
 - `issues`: precise remaining statement, interface, diagnostic, tooling, or out-of-scope blockers;
   otherwise an empty list.
 - `source_issues`: genuine defects in the informal textbook; otherwise an empty list. Each entry

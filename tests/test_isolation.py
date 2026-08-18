@@ -719,7 +719,7 @@ aggregator.write_text("import Book.Chapter01.Section\\n", encoding="utf-8")
 artifact = pathlib.Path("lean/.lake/build/lib/lean/Book/Chapter01.olean")
 artifact.parent.mkdir(parents=True, exist_ok=True)
 artifact.write_bytes(b"compiled")
-report = {"changed": True, "complete": True,
+report = {"complete": True,
           "summary": "isolated", "issues": []}
 print(json.dumps({"type": "item.completed", "item": {
     "type": "agent_message", "text": json.dumps(report)}}))
