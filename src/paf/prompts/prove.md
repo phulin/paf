@@ -34,18 +34,19 @@ interfaces have already passed review and are fixed here.
    Lean objects, equalities, equivalences, coercions, or instances each step requires.
 3. Search Mathlib and earlier project chapters by concept and type signature as well as likely names.
    Inspect theorem statements and existing uses. Prefer a direct established theorem or a small
-   standard adaptation over unfolding implementation details or creating a new helper.
-4. Try a concrete proof term or focused tactic sequence and inspect the resulting goals. Prefer, in
+   standard adaptation over duplicating a result that already exists.
+4. After checking for existing results, aggressively decompose the proof roadmap into focused private
+   or reusable lemmas. Give each lemma one meaningful mathematical step, such as an intermediate
+   equality, equivalence, coercion bridge, closure fact, or construction. Use a private lemma when the
+   fact is specific to this file; add a reusable lemma when it is a natural result for later proofs.
+   Put each lemma at the earliest valid point, prove it fully, and use it in an assigned target.
+5. Try a concrete proof term or focused tactic sequence and inspect the resulting goals. Prefer, in
    order, direct computation, an exact earlier theorem, focused rewriting or simplification, a
    standard constructor or equivalence, and only then lower-level construction.
-5. Iterate on checked evidence. When an approach fails, use the residual goal to change one material
+6. Iterate on checked evidence. When an approach fails, use the residual goal to change one material
    part of the strategy: choose another theorem, expose a relevant definition, prove an intermediate
    fact, construct the object directly, or reorganize the tactic structure. One guessed declaration
    name, tactic failure, coercion error, or timeout is not enough reason to stop.
-6. Add a local, private, or reusable helper only after the search shows that no existing result
-   supplies the needed step. Every helper must state useful mathematics, be fully proved, be used by
-   an assigned target, and appear at the earliest valid point. Keep any added import focused and
-   chronological.
 7. Finish all tractable targets in the assignment and preserve clean partial progress. Remove
    speculative edits, unused helpers, and abandoned imports. If a target remains blocked after several
    meaningfully different checked attempts, capture its exact residual goal and obstruction, then
