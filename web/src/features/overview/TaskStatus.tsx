@@ -8,7 +8,7 @@ import {
   XCircle,
 } from "lucide-react";
 import { compactTaskDetail, timeAgo } from "../../lib/format";
-import type { AgentActivity, Task, TaskPhase, TaskStatus } from "../../types";
+import type { AgentActivity, SchedulingStatus, Task, TaskPhase, TaskStatus } from "../../types";
 
 function StatusIcon({ status }: { status?: TaskStatus }) {
   switch (status) {
@@ -33,6 +33,7 @@ export function StatusPill({
   building = false,
   repairing = false,
   queued = false,
+  schedulingStatus,
   phase = "idle",
 }: {
   status?: TaskStatus;
@@ -40,8 +41,11 @@ export function StatusPill({
   building?: boolean;
   repairing?: boolean;
   queued?: boolean;
+  schedulingStatus?: SchedulingStatus;
   phase?: TaskPhase;
 }) {
+  const effectiveStatus: TaskStatus =
+    status === "pending" && schedulingStatus === "blocked" ? "blocked" : status;
   const displayStatus = building
     ? "building"
     : repairing
@@ -50,10 +54,10 @@ export function StatusPill({
         ? "queued"
         : status === "running" && phase === "postprocess"
           ? "postprocess"
-          : status;
+          : effectiveStatus;
   return (
     <span className={`status-pill status-${displayStatus}`}>
-      {repairing && !building ? <RotateCw size={13} /> : <StatusIcon status={status} />}
+      {repairing && !building ? <RotateCw size={13} /> : <StatusIcon status={effectiveStatus} />}
       <span>
         {building
           ? "building"
@@ -63,9 +67,9 @@ export function StatusPill({
               ? "queued"
               : displayStatus === "postprocess"
                 ? "postprocess"
-                : status === "succeeded"
+                : effectiveStatus === "succeeded"
                   ? "done"
-                  : status}
+                  : effectiveStatus}
       </span>
       {Boolean(rounds) && <span className="round-count">×{rounds}</span>}
     </span>

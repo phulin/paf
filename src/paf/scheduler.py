@@ -5945,6 +5945,9 @@ class Orchestrator:
             ready = [unit for unit in pending.values() if set(unit.depends_on).issubset(succeeded)]
             if not ready:
                 break
+            async with self.state.batch():
+                for unit in ready:
+                    await self.state.queue_repair_work_unit(unit.id)
             results = await _gather_cancel_on_error(
                 self._run_repair_work_unit(unit) for unit in ready
             )

@@ -34,7 +34,10 @@ export function TaskTable({
     if (filter === "issues")
       return tasks.some(
         (task) =>
-          task?.status === "failed" || task?.status === "blocked" || task?.status === "interrupted",
+          task?.status === "failed" ||
+          task?.status === "blocked" ||
+          task?.status === "interrupted" ||
+          task?.scheduling_status === "blocked",
       );
     if (filter === "active")
       return tasks.some((task) => task?.repairing || task?.status !== "succeeded");
@@ -103,6 +106,7 @@ export function TaskTable({
                       status={row.stages[stage]?.status}
                       rounds={row.stages[stage]?.rounds}
                       queued={row.stages[stage]?.queued}
+                      schedulingStatus={row.stages[stage]?.scheduling_status}
                       phase={row.stages[stage]?.phase}
                       repairing={row.stages[stage]?.repairing}
                       building={build.active && build.stage === stage && buildTargets.has(row.id)}

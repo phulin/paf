@@ -593,7 +593,10 @@ def _print_failure_summary(
         ),
         key=lambda task: (task.book_id, task.chapter_number, task.stage),
     )
-    graph_error = state.formalize_graph.get("error")
+    scheduler_graph_failure = state.scheduling.get("graph_failure", {})
+    graph_error = (
+        scheduler_graph_failure.get("detail") if isinstance(scheduler_graph_failure, dict) else None
+    ) or state.formalize_graph.get("error")
     graph_failure = graph_error if isinstance(graph_error, str) and graph_error else None
     graph_failed = [task for task in failed if task.detail == graph_failure]
     if graph_failed:
@@ -602,7 +605,11 @@ def _print_failure_summary(
         (
             task
             for task in state.tasks.values()
-            if selected(task) and task.status == TaskStatus.BLOCKED
+            if selected(task)
+            and (
+                task.status == TaskStatus.BLOCKED
+                or (task.status == TaskStatus.PENDING and state.failure_roots(task))
+            )
         ),
         key=lambda task: (task.book_id, task.chapter_number, task.stage),
     )
@@ -645,8 +652,10 @@ def _print_failure_summary(
     if blocked:
         console.print(f"Blocked dependents ({len(blocked)})", style="bold yellow")
         for task in blocked:
+            roots = state.failure_roots(task)
             console.print(
-                f"- {task.chapter_id} [{task.stage}]: {task.detail}",
+                f"- {task.chapter_id} [{task.stage}]: "
+                + (f"waiting on {', '.join(roots)}" if roots else task.detail),
                 markup=False,
             )
     if interrupted:
@@ -810,8 +819,7 @@ def _run(args: argparse.Namespace, config: PipelineConfig, console: Console) -> 
     lifetime_cost = state.total_cost()
     selected_chapter_ids = {chapter.id for chapter in chapters}
     local_task_failures = any(
-        task.chapter_id in selected_chapter_ids
-        and task.status in {TaskStatus.FAILED, TaskStatus.BLOCKED}
+        task.chapter_id in selected_chapter_ids and task.status == TaskStatus.FAILED
         for task in state.tasks.values()
     )
     console.print(format_usage(usage, label="This invocation"))

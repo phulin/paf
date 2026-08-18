@@ -132,6 +132,7 @@ export function ChapterInspector({
                     status={task?.status}
                     rounds={task?.rounds}
                     queued={task?.queued}
+                    schedulingStatus={task?.scheduling_status}
                     phase={task?.phase}
                     repairing={task?.repairing}
                   />

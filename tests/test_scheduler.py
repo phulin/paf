@@ -2786,6 +2786,9 @@ async def test_capacity_exhaustion_is_a_bounded_formalizer_failure(
     assert not await orchestrator._formalize_all()
     assert attempts == {1: 1, 2: 1}
     assert order == [(1, False), (2, False)]
+    assert [record.task_key for record in orchestrator.state.shepherd_failure_records()] == [
+        orchestrator.state.key(config.chapters[0].id, Stage.FORMALIZE)
+    ]
     await orchestrator.shutdown()
 
 

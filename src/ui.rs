@@ -346,7 +346,7 @@ fn draw_stage_cards(frame: &mut Frame<'_>, model: &DashboardModel, area: Rect) {
             continue;
         };
         let current = &mut statistics[index];
-        match task.status.as_str() {
+        match task_display_status(task) {
             "succeeded" => current.succeeded += 1,
             "failed" => current.failed += 1,
             "blocked" => current.blocked += 1,
@@ -642,7 +642,7 @@ fn draw_detail(frame: &mut Frame<'_>, model: &mut DashboardModel) {
             row.unit.ordinal,
             row.unit.title,
             active_task
-                .map(|task| format!("{} {}", title(&task.stage), task.status))
+                .map(|task| format!("{} {}", title(&task.stage), task_display_status(task)))
                 .unwrap_or_else(|| "no run".into())
         ))
         .style(Style::default().fg(CYAN).add_modifier(Modifier::BOLD))
@@ -1145,7 +1145,7 @@ fn task_mark(task: &Task, building: bool) -> String {
     } else if task.status == "running" && task.phase == "postprocess" {
         "◇ postprocess"
     } else {
-        match task.status.as_str() {
+        match task_display_status(task) {
             "running" => "▶ running",
             "succeeded" => "✓ done",
             "failed" => "✗ failed",
@@ -1158,6 +1158,14 @@ fn task_mark(task: &Task, building: bool) -> String {
         format!("{mark} ({})", task.rounds)
     } else {
         mark.into()
+    }
+}
+
+fn task_display_status(task: &Task) -> &str {
+    if task.status == "pending" && task.scheduling_status == "blocked" {
+        "blocked"
+    } else {
+        task.status.as_str()
     }
 }
 

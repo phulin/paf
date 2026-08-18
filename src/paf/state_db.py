@@ -26,6 +26,7 @@ COLLECTION_SECTIONS = frozenset(
         "upstream_requests",
         "proof_blockers",
         "thread_cumulative_usage",
+        "failure_records",
         "repair_cases",
         "repair_sweeps",
         "repair_work_units",

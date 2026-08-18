@@ -91,6 +91,27 @@ class Readiness:
     waiting: tuple[Requirement, ...] = ()
 
 
+class FailureKind(StrEnum):
+    DISCOVER = "discover"
+    FORMALIZE = "formalize"
+    REVIEW = "review"
+    PROVE = "prove"
+
+
+@dataclass
+class FailureRecord:
+    id: str
+    task_key: str
+    kind: FailureKind
+    repairable: bool
+    run_id: str = ""
+    diagnostics: dict[str, Any] = field(default_factory=dict)
+    active: bool = True
+    created_at: str = field(default_factory=timestamp)
+    updated_at: str = field(default_factory=timestamp)
+    resolved_at: str | None = None
+
+
 class RepairCaseStatus(StrEnum):
     OPEN = "open"
     PLANNED = "planned"
@@ -353,6 +374,8 @@ class RepairWorkUnitRecord:
     effort: str = "medium"
     priority: float = 0.0
     status: str = RepairWorkUnitStatus.PENDING
+    queued: bool = False
+    waiting_on: tuple[str, ...] = ()
     detail: str = ""
     run_id: str = ""
     created_at: str = field(default_factory=timestamp)
@@ -529,6 +552,7 @@ class StateStore:
             failure_threshold=shepherd.failure_threshold,
         )
         self.repair_cases: dict[str, RepairCaseRecord] = {}
+        self.failure_records: dict[str, FailureRecord] = {}
         self.repair_sweeps: dict[str, RepairSweepRecord] = {}
         self.repair_work_units: dict[str, RepairWorkUnitRecord] = {}
         self.created_at = timestamp()
@@ -661,6 +685,22 @@ class StateStore:
                         self.repair_cases[record_id] = RepairCaseRecord(**fields)
                     except (TypeError, ValueError):
                         continue
+            raw_failures = raw.get("failure_records")
+            if isinstance(raw_failures, dict):
+                for record_id, value in raw_failures.items():
+                    if not isinstance(record_id, str) or not isinstance(value, dict):
+                        continue
+                    fields = {
+                        name: item
+                        for name, item in value.items()
+                        if name in FailureRecord.__dataclass_fields__
+                    }
+                    fields.setdefault("id", record_id)
+                    try:
+                        fields["kind"] = FailureKind(str(fields["kind"]))
+                        self.failure_records[record_id] = FailureRecord(**fields)
+                    except (KeyError, TypeError, ValueError):
+                        continue
             raw_sweeps = raw.get("repair_sweeps")
             if isinstance(raw_sweeps, dict):
                 for record_id, value in raw_sweeps.items():
@@ -687,6 +727,7 @@ class StateStore:
                         if name in RepairWorkUnitRecord.__dataclass_fields__
                     }
                     fields.setdefault("id", record_id)
+                    fields["waiting_on"] = tuple(fields.get("waiting_on", ()))
                     try:
                         self.repair_work_units[record_id] = RepairWorkUnitRecord(**fields)
                     except (TypeError, ValueError):
@@ -786,6 +827,11 @@ class StateStore:
         self.repair_cases = {
             key: value for key, value in self.repair_cases.items() if value.chapter_id in configured
         }
+        self.failure_records = {
+            key: value
+            for key, value in self.failure_records.items()
+            if value.task_key in self.tasks
+        }
         self.repair_work_units = {
             key: value
             for key, value in self.repair_work_units.items()
@@ -853,6 +899,7 @@ class StateStore:
             self._index_run(run)
         for task in self.tasks.values():
             task.runs.sort(key=lambda run: (run.started_at, run.id))
+            self._sync_failure_record(task)
         for runs in self._chapter_runs.values():
             runs.sort(key=lambda run: (run.started_at, run.id))
         migrated_usage_runs = self._normalize_cumulative_thread_usage()
@@ -1208,6 +1255,10 @@ class StateStore:
                 key: {name: getattr(value, name) for name in RepairCaseRecord.__dataclass_fields__}
                 for key, value in sorted(self.repair_cases.items())
             },
+            "failure_records": {
+                key: {name: getattr(value, name) for name in FailureRecord.__dataclass_fields__}
+                for key, value in sorted(self.failure_records.items())
+            },
             "repair_sweeps": {
                 key: {name: getattr(value, name) for name in RepairSweepRecord.__dataclass_fields__}
                 for key, value in sorted(self.repair_sweeps.items())
@@ -1230,6 +1281,11 @@ class StateStore:
             return {
                 key: {name: getattr(value, name) for name in RepairCaseRecord.__dataclass_fields__}
                 for key, value in sorted(self.repair_cases.items())
+            }
+        if section == "failure_records":
+            return {
+                key: {name: getattr(value, name) for name in FailureRecord.__dataclass_fields__}
+                for key, value in sorted(self.failure_records.items())
             }
         if section == "repair_sweeps":
             return {
@@ -2921,8 +2977,13 @@ class StateStore:
             task.recovering_failure = False
         if recovered or status == TaskStatus.SUCCEEDED:
             changed_tasks.extend(self._refresh_waiting_tasks())
+        failure_changed = self._sync_failure_record(task)
         self._invalidate_status_summaries()
-        self._mark_dirty(tasks=changed_tasks, global_state=False)
+        self._mark_dirty(
+            tasks=changed_tasks,
+            global_state=False,
+            sections={"failure_records"} if failure_changed else (),
+        )
         await self._persist()
 
     async def set_tasks(
@@ -2976,8 +3037,15 @@ class StateStore:
         if recovered or status == TaskStatus.SUCCEEDED:
             changed_tasks.extend(self._refresh_waiting_tasks())
         if changed:
+            failure_changed = False
+            for changed_task in changed_tasks:
+                failure_changed = self._sync_failure_record(changed_task) or failure_changed
             self._invalidate_status_summaries()
-            self._mark_dirty(tasks=changed_tasks, global_state=False)
+            self._mark_dirty(
+                tasks=changed_tasks,
+                global_state=False,
+                sections={"failure_records"} if failure_changed else (),
+            )
             await self._persist()
 
     async def set_task_waiting(
@@ -3453,6 +3521,75 @@ class StateStore:
             key=lambda item: (item[1].updated_at, item[0]),
         )
 
+    def _sync_failure_record(self, task: TaskRecord) -> bool:
+        task_key = self.key(task.chapter_id, Stage(task.stage))
+        active = [
+            record
+            for record in self.failure_records.values()
+            if record.task_key == task_key and record.active
+        ]
+        if task.status != TaskStatus.FAILED:
+            if not active:
+                return False
+            now = timestamp()
+            for record in active:
+                record.active = False
+                record.resolved_at = now
+                record.updated_at = now
+            return True
+
+        latest = next((run for run in reversed(task.runs) if not run.auxiliary), None)
+        diagnostics = {
+            "detail": task.detail,
+            "validation": latest.validation if latest is not None else None,
+            "exit_code": latest.exit_code if latest is not None else None,
+        }
+        run_id = latest.id if latest is not None else ""
+        if active:
+            record = active[-1]
+            if (
+                record.run_id == run_id
+                and diagnostics["detail"] == record.diagnostics.get("detail")
+                and diagnostics["validation"] is None
+            ):
+                return False
+            if record.run_id == run_id and record.diagnostics == diagnostics:
+                return False
+            record.run_id = run_id
+            record.diagnostics = diagnostics
+            record.updated_at = timestamp()
+            return True
+
+        now = timestamp()
+        record_id = stable_digest_text(f"{task_key}:{run_id}:{now}")[:16]
+        self.failure_records[record_id] = FailureRecord(
+            id=record_id,
+            task_key=task_key,
+            kind=FailureKind(task.stage),
+            repairable=True,
+            run_id=run_id,
+            diagnostics=diagnostics,
+            created_at=now,
+            updated_at=now,
+        )
+        return True
+
+    def shepherd_failure_records(self) -> list[FailureRecord]:
+        """Active direct execution failures eligible for Shepherd triage."""
+
+        return sorted(
+            (
+                record
+                for record in self.failure_records.values()
+                if record.active
+                and record.repairable
+                and (task := self.tasks.get(record.task_key)) is not None
+                and task.status == TaskStatus.FAILED
+                and not task.repairing
+            ),
+            key=lambda record: (record.updated_at, record.task_key, record.id),
+        )
+
     def shepherd_repairable_tasks(self) -> list[tuple[str, TaskRecord]]:
         """Direct failures, including durable proof escalations, eligible for triage.
 
@@ -3462,7 +3599,8 @@ class StateStore:
         """
 
         return [
-            (key, task) for key, task in self.repairable_tasks() if task.status == TaskStatus.FAILED
+            (record.task_key, self.tasks[record.task_key])
+            for record in self.shepherd_failure_records()
         ]
 
     def ensure_repair_case(self, task_key: str) -> RepairCaseRecord:
@@ -3538,6 +3676,8 @@ class StateStore:
         for unit in installed:
             if unit.sweep_id != sweep_id:
                 raise ValueError(f"repair unit {unit.id} belongs to another sweep")
+            unit.queued = False
+            unit.waiting_on = tuple(unit.depends_on)
             self.repair_work_units[unit.id] = unit
             for case_id in unit.case_ids:
                 case = self.repair_cases[case_id]
@@ -3557,9 +3697,25 @@ class StateStore:
         self._mark_dirty(sections={"repair_cases", "repair_sweeps", "repair_work_units"})
         await self._persist()
 
+    async def queue_repair_work_unit(self, unit_id: str) -> None:
+        unit = self.repair_work_units[unit_id]
+        if unit.status not in {
+            RepairWorkUnitStatus.PENDING,
+            RepairWorkUnitStatus.INTERRUPTED,
+        }:
+            return
+        unit.status = RepairWorkUnitStatus.PENDING
+        unit.queued = True
+        unit.waiting_on = ()
+        unit.detail = "repair ready; waiting for worker capacity"
+        self._mark_dirty(global_state=False, sections={"repair_work_units"})
+        await self._persist()
+
     async def start_repair_work_unit(self, unit_id: str) -> None:
         unit = self.repair_work_units[unit_id]
         unit.status = RepairWorkUnitStatus.RUNNING
+        unit.queued = False
+        unit.waiting_on = ()
         unit.started_at = timestamp()
         unit.finished_at = None
         unit.detail = "repair worker running"
@@ -3601,6 +3757,8 @@ class StateStore:
     ) -> None:
         unit = self.repair_work_units[unit_id]
         unit.status = status
+        unit.queued = False
+        unit.waiting_on = ()
         unit.detail = detail
         unit.run_id = run_id
         unit.finished_at = timestamp()

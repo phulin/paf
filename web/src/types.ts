@@ -1,6 +1,14 @@
 export type Stage = "discover" | "formalize" | "review" | "prove";
 export type TaskStatus = "pending" | "running" | "succeeded" | "failed" | "blocked" | "interrupted";
 export type TaskPhase = "idle" | "agent" | "postprocess";
+export type SchedulingStatus = "waiting" | "queued" | "blocked" | "executing" | "complete";
+
+export interface Requirement {
+  kind: string;
+  owner_task_key?: string | null;
+  request_id?: string | null;
+  detail: string;
+}
 
 export interface Task {
   work_unit_id: string;
@@ -15,6 +23,9 @@ export interface Task {
   stage: Stage;
   status: TaskStatus;
   queued?: boolean;
+  waiting_on?: Requirement[];
+  scheduling_status?: SchedulingStatus;
+  blocked_by?: string[];
   repairing?: boolean;
   repair_work_unit_id?: string;
   phase?: TaskPhase;

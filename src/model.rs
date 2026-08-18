@@ -102,6 +102,8 @@ pub struct Task {
     pub phase: String,
     pub detail: String,
     pub queued: bool,
+    pub scheduling_status: String,
+    pub blocked_by: Vec<String>,
     pub repairing: bool,
     pub repair_work_unit_id: String,
     pub rounds: usize,

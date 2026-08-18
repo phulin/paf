@@ -633,7 +633,9 @@ def test_agent_retry_without_chapter_requeues_failed_but_not_blocked_tasks(
     assert snapshot is not None
     assert snapshot["tasks"]["book/chapter-01:review"]["status"] == "pending"
     assert snapshot["tasks"]["book/chapter-01:review"]["detail"] == "manually retried"
-    assert snapshot["tasks"]["book/chapter-01:prove"]["status"] == "blocked"
+    proof = snapshot["tasks"]["book/chapter-01:prove"]
+    assert proof["status"] == "pending"
+    assert proof["waiting_on"]
 
 
 def test_agent_inspect_reports_compact_live_activity(

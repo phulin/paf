@@ -9,7 +9,7 @@ from paf.codex import ValidationResult
 from paf.config import load_config
 from paf.models import Stage
 from paf.scheduler import ExecutionDisposition, Orchestrator, StageOutcome
-from paf.state import StateStore, TaskStatus
+from paf.state import Requirement, RequirementKind, StateStore, TaskStatus
 from tests.support import write_project
 
 
@@ -65,6 +65,196 @@ async def test_discovery_streams_into_dependency_ready_formalization(tmp_path, m
 
     assert await pipeline
     assert state.source_dependency_tree["dependencies"][second.id] == [first.id]
+
+
+@pytest.mark.asyncio
+async def test_waiting_owner_recovery_retries_consumer_in_same_run(tmp_path, monkeypatch) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await orchestrator.prepare()
+    owner, consumer = config.work_units
+    await orchestrator._persist_source_dependencies(owner, (), {"summary": "root", "issues": []})
+    await orchestrator._persist_source_dependencies(
+        consumer, (owner.id,), {"summary": "dependent", "issues": []}
+    )
+    await state.set_tasks(
+        (owner.id, consumer.id), Stage.DISCOVER, TaskStatus.SUCCEEDED, "discovered"
+    )
+    await state.set_task(owner.id, Stage.FORMALIZE, TaskStatus.SUCCEEDED, "initially clean")
+    events: list[str] = []
+
+    async def formalize(chapter, *, rerun=False):
+        del rerun
+        events.append(chapter.id)
+        if chapter.id == consumer.id and events.count(consumer.id) == 1:
+            requirement = Requirement(
+                RequirementKind.COORDINATOR_OWNER,
+                owner_task_key=state.key(owner.id, Stage.FORMALIZE),
+                detail="coordinator diagnostic owner",
+            )
+            await state.set_task(
+                owner.id,
+                Stage.FORMALIZE,
+                TaskStatus.PENDING,
+                "requeued diagnostic owner",
+            )
+            await state.set_task_waiting(
+                consumer.id,
+                Stage.FORMALIZE,
+                (requirement,),
+                "waiting for diagnostic owner",
+            )
+            return StageOutcome(ExecutionDisposition.WAITING, (requirement,))
+        await state.set_task(chapter.id, Stage.FORMALIZE, TaskStatus.SUCCEEDED, "clean")
+        return StageOutcome(ExecutionDisposition.SUCCEEDED)
+
+    monkeypatch.setattr(orchestrator, "_formalize", formalize)
+
+    assert await orchestrator._discover_and_formalize(discover=False)
+    assert events == [consumer.id, owner.id, consumer.id]
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_transient_wait_does_not_write_descendant_task_rows(tmp_path, monkeypatch) -> None:
+    config_path = write_project(tmp_path, chapters="chapters = [1, 2, 3]")
+    with (tmp_path / "books" / "book.md").open("a", encoding="utf-8") as source:
+        source.write("\n## 3. Third chapter\n")
+    config = load_config(config_path)
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await orchestrator.prepare()
+    owner, consumer, descendant = config.work_units
+    dependencies = {owner.id: (), consumer.id: (owner.id,), descendant.id: (consumer.id,)}
+    for chapter in config.work_units:
+        await orchestrator._persist_source_dependencies(
+            chapter,
+            dependencies[chapter.id],
+            {"summary": "dependency graph", "issues": []},
+        )
+    await state.set_tasks(
+        (chapter.id for chapter in config.work_units),
+        Stage.DISCOVER,
+        TaskStatus.SUCCEEDED,
+        "discovered",
+    )
+    await state.set_task(owner.id, Stage.FORMALIZE, TaskStatus.SUCCEEDED, "initially clean")
+    baseline_revision = state.revision
+
+    async def formalize(chapter, *, rerun=False):
+        del rerun
+        if chapter.id == consumer.id:
+            requirement = Requirement(
+                RequirementKind.COORDINATOR_OWNER,
+                owner_task_key=state.key(owner.id, Stage.FORMALIZE),
+                detail="coordinator diagnostic owner",
+            )
+            await state.set_task(owner.id, Stage.FORMALIZE, TaskStatus.PENDING, "owner requeued")
+            await state.set_task_waiting(
+                consumer.id,
+                Stage.FORMALIZE,
+                (requirement,),
+                "waiting for diagnostic owner",
+            )
+            return StageOutcome(ExecutionDisposition.WAITING, (requirement,))
+        await state.set_task(owner.id, Stage.FORMALIZE, TaskStatus.FAILED, "owner failed")
+        return StageOutcome(ExecutionDisposition.FAILED)
+
+    monkeypatch.setattr(orchestrator, "_formalize", formalize)
+
+    assert not await orchestrator._discover_and_formalize(discover=False)
+    descendant_task = state.task(descendant.id, Stage.FORMALIZE)
+    assert descendant_task.status == TaskStatus.PENDING
+    assert state.failure_roots(descendant_task) == (state.key(owner.id, Stage.FORMALIZE),)
+    assert (
+        state.hot_snapshot()["tasks"][state.key(descendant.id, Stage.FORMALIZE)][
+            "scheduling_status"
+        ]
+        == "blocked"
+    )
+    assert [record.task_key for record in state.shepherd_failure_records()] == [
+        state.key(owner.id, Stage.FORMALIZE)
+    ]
+    with sqlite3.connect(state.database_path) as connection:
+        descendant_writes = connection.execute(
+            """
+            SELECT count(*) FROM changes
+            WHERE revision > ? AND entity_type = 'task' AND entity_id = ?
+            """,
+            (baseline_revision, state.key(descendant.id, Stage.FORMALIZE)),
+        ).fetchone()[0]
+    assert descendant_writes == 0
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_structured_wait_and_direct_failure_survive_restart(tmp_path) -> None:
+    config_path = write_project(tmp_path, chapters="chapters = [1, 2]")
+    config = load_config(config_path)
+    state = StateStore(config)
+    await state.load_or_create()
+    owner, consumer = config.work_units
+    requirement = Requirement(
+        RequirementKind.COORDINATOR_OWNER,
+        owner_task_key=state.key(owner.id, Stage.FORMALIZE),
+        detail="coordinator diagnostic owner",
+    )
+    await state.set_task(owner.id, Stage.FORMALIZE, TaskStatus.FAILED, "owner failed")
+    await state.set_task_waiting(
+        consumer.id,
+        Stage.FORMALIZE,
+        (requirement,),
+        "waiting for diagnostic owner",
+    )
+    failure_id = state.shepherd_failure_records()[0].id
+    await state.close()
+
+    recovered = StateStore(load_config(config_path))
+    await recovered.load_or_create()
+    consumer_task = recovered.task(consumer.id, Stage.FORMALIZE)
+    assert consumer_task.status == TaskStatus.PENDING
+    assert consumer_task.waiting_on == (requirement,)
+    assert recovered.shepherd_failure_records()[0].id == failure_id
+    assert recovered.failure_roots(consumer_task) == (recovered.key(owner.id, Stage.FORMALIZE),)
+    await recovered.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reverse_tasks", [False, True])
+async def test_wait_recovery_is_independent_of_task_insertion_order(
+    tmp_path, reverse_tasks
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    state = StateStore(config)
+    await state.load_or_create()
+    owner, consumer = config.work_units
+    owner_key = state.key(owner.id, Stage.FORMALIZE)
+    requirement = Requirement(
+        RequirementKind.COORDINATOR_OWNER,
+        owner_task_key=owner_key,
+        detail="coordinator diagnostic owner",
+    )
+    await state.set_task_waiting(
+        consumer.id,
+        Stage.FORMALIZE,
+        (requirement,),
+        "waiting for diagnostic owner",
+    )
+    await state.set_task_waiting(
+        consumer.id,
+        Stage.REVIEW,
+        (requirement,),
+        "waiting for diagnostic owner",
+    )
+    if reverse_tasks:
+        state.tasks = dict(reversed(tuple(state.tasks.items())))
+
+    await state.set_task(owner.id, Stage.FORMALIZE, TaskStatus.SUCCEEDED, "owner recovered")
+
+    assert state.task(consumer.id, Stage.FORMALIZE).waiting_on == ()
+    assert state.task(consumer.id, Stage.REVIEW).waiting_on == ()
+    await state.close()
 
 
 @pytest.mark.asyncio
