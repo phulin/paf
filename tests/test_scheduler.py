@@ -2506,8 +2506,7 @@ async def test_concurrent_review_builds_share_commands_and_partition_diagnostics
 
     assert commands == [
         f"cd lean && lake build {target(first)} {target(second)} {target(third)}",
-        f"cd lean && lake build {target(second)}",
-        f"cd lean && lake build {target(third)}",
+        f"cd lean && lake build {target(second)} {target(third)}",
     ]
     assert set(first_feedback) == {first.id}
     assert "broken review output" in first_feedback[first.id]
