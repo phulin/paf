@@ -280,6 +280,32 @@ def test_source_input_digests_read_shared_document_once(
     assert reads == [source]
 
 
+def test_observed_graph_is_reused_until_dependency_state_is_replaced(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    orchestrator = Orchestrator(config, StateStore(config))
+    original_build = scheduler_module.build_source_dependency_graph
+    builds = 0
+
+    def counted_build(*args: Any, **kwargs: Any) -> Any:
+        nonlocal builds
+        builds += 1
+        return original_build(*args, **kwargs)
+
+    monkeypatch.setattr(scheduler_module, "build_source_dependency_graph", counted_build)
+
+    first = orchestrator._observed_work_unit_graph()
+    second = orchestrator._observed_work_unit_graph()
+    assert first is second
+    assert builds == 1
+
+    orchestrator.state.source_dependency_tree = dict(orchestrator.state.source_dependency_tree)
+    third = orchestrator._observed_work_unit_graph()
+    assert third is not second
+    assert builds == 2
+
+
 @pytest.mark.asyncio
 async def test_prepare_migrates_legacy_discovery_and_build_digests(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))

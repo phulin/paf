@@ -385,6 +385,8 @@ class Orchestrator:
         self._identifier_trie = _IdentifierTrieNode()
         self._diagnostic_owner_cache: dict[LeanDiagnostic, tuple[str, ...]] = {}
         self._diagnostic_owner_cache_lock = Lock()
+        self._observed_graph_source: dict[str, Any] | None = None
+        self._observed_graph_cache: WorkUnitImportGraph | None = None
         self._build_diagnostic_indexes()
         self.force = force
         self.resume_agents = resume_agents
@@ -616,11 +618,17 @@ class Orchestrator:
         }
 
     def _observed_work_unit_graph(self) -> WorkUnitImportGraph:
-        nodes = self.state.source_dependency_tree.get("nodes", {})
-        return build_source_dependency_graph(
+        source = self.state.source_dependency_tree
+        if source is self._observed_graph_source and self._observed_graph_cache is not None:
+            return self._observed_graph_cache
+        nodes = source.get("nodes", {})
+        graph = build_source_dependency_graph(
             self.work_units,
             nodes if isinstance(nodes, dict) else {},
         )
+        self._observed_graph_source = source
+        self._observed_graph_cache = graph
+        return graph
 
     def _source_input_digests(
         self,
