@@ -1953,6 +1953,17 @@ class StateStore:
         self._mark_dirty(global_state=not sections or "state" in selected, sections=selected)
         await self._persist()
 
+    def save_deferred(self, *sections: str) -> None:
+        """Mark state for a short, coalescing durability flush.
+
+        Use this for high-frequency derived state whose in-memory value is authoritative to the
+        running scheduler. Shutdown still flushes the latest value before closing the database.
+        """
+
+        selected = set(sections) if sections else set(COLLECTION_SECTIONS | GRAPH_SECTIONS)
+        self._mark_dirty(global_state=not sections or "state" in selected, sections=selected)
+        self._schedule_telemetry_flush()
+
     async def save_digest_migration(
         self,
         proof_source_digests: dict[str, str],

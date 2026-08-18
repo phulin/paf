@@ -11,6 +11,7 @@ from typing import Any
 import pytest
 
 import paf.scheduler as scheduler_module
+import paf.state as state_module
 from paf.codex import (
     DIAGNOSTIC_REVIEW_ROLE,
     WARNING_REVIEW_ROLE,
@@ -4808,6 +4809,34 @@ async def test_repeated_build_invalidation_reuses_persisted_graphs(
     monkeypatch.setattr(WorkUnitImportGraph, "snapshot", unexpected_snapshot)
 
     assert await orchestrator._invalidate_build_records((second.id,)) == {second.id}
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_build_graph_publications_coalesce_normalized_database_projection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    orchestrator = Orchestrator(config, StateStore(config))
+    await orchestrator.prepare()
+    await mark_clean_formalization(orchestrator)
+    first, second = config.chapters
+    calls = 0
+    original = state_module.graph_snapshot
+
+    def counted_snapshot(section: str, value: Any):
+        nonlocal calls
+        calls += section == "formalize_graph"
+        return original(section, value)
+
+    monkeypatch.setattr(state_module, "graph_snapshot", counted_snapshot)
+
+    await orchestrator._invalidate_build_records((first.id,))
+    await orchestrator._invalidate_build_records((second.id,))
+    assert calls == 0
+
+    await orchestrator.state.flush()
+    assert calls == 1
     await orchestrator.shutdown()
 
 

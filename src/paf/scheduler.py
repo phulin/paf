@@ -1430,7 +1430,10 @@ class Orchestrator:
             self._compiled_interface_imports = self.state.formalize_graph.get("interface_imports")
             self._compiled_interface_fallback = graph
             self._compiled_interface_graph = invalidation_graph
-            await self.state.save("formalize_graph")
+            # Parallel builds often publish in bursts.  The scheduler consumes this graph from
+            # memory, so coalesce its expensive normalized database projection without delaying
+            # downstream scheduling; StateStore.close still provides a durability barrier.
+            self.state.save_deferred("formalize_graph")
             return revision
 
     def _persisted_interface_invalidation_graph(
