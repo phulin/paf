@@ -622,13 +622,28 @@ class Orchestrator:
             nodes if isinstance(nodes, dict) else {},
         )
 
+    def _source_input_digests(
+        self,
+        chapters: Iterable[WorkUnitLike],
+    ) -> dict[str, str]:
+        """Hash source excerpts while reading each shared document only once."""
+
+        source_lines: dict[Path, list[str]] = {}
+        digests: dict[str, str] = {}
+        for chapter in chapters:
+            path = self.config.settings.repo / chapter.source
+            lines = source_lines.get(path)
+            if lines is None:
+                lines = path.read_text(encoding="utf-8").splitlines()
+                source_lines[path] = lines
+            selected = "\n".join(
+                lines[chapter.source_span.start_line - 1 : chapter.source_span.end_line]
+            )
+            digests[chapter.id] = tagged_digest_text(f"{chapter.id}\0{selected}")
+        return digests
+
     def _source_input_digest(self, chapter: WorkUnitLike) -> str:
-        path = self.config.settings.repo / chapter.source
-        lines = path.read_text(encoding="utf-8").splitlines()
-        selected = "\n".join(
-            lines[chapter.source_span.start_line - 1 : chapter.source_span.end_line]
-        )
-        return tagged_digest_text(f"{chapter.id}\0{selected}")
+        return self._source_input_digests((chapter,))[chapter.id]
 
     async def _migrate_persisted_content_digests(self) -> None:
         """Replace verified SHA/unversioned cache digests with tagged XXH digests."""
@@ -702,13 +717,19 @@ class Orchestrator:
                 current_discoveries=current_discoveries,
             )
 
-    def _discovery_is_current(self, chapter: WorkUnitLike) -> bool:
+    def _discovery_is_current(
+        self,
+        chapter: WorkUnitLike,
+        *,
+        source_digest: str | None = None,
+    ) -> bool:
         nodes = self.state.source_dependency_tree.get("nodes", {})
         record = nodes.get(chapter.id, {}) if isinstance(nodes, dict) else {}
         return (
             self.state.task(chapter.id, Stage.DISCOVER).status == TaskStatus.SUCCEEDED
             and isinstance(record, dict)
-            and record.get("source_digest") == self._source_input_digest(chapter)
+            and record.get("source_digest")
+            == (source_digest if source_digest is not None else self._source_input_digest(chapter))
         )
 
     async def _persist_source_dependencies(
@@ -3455,8 +3476,16 @@ class Orchestrator:
         pending_discoveries: deque[WorkUnitLike] = deque()
         discovery_tasks: dict[str, asyncio.Task[FormalizeOutcome]] = {}
         if discover:
+            discovery_digests = (
+                {}
+                if self.force
+                else await asyncio.to_thread(self._source_input_digests, self.work_units)
+            )
             for chapter in self.work_units:
-                if self.force or not self._discovery_is_current(chapter):
+                if self.force or not self._discovery_is_current(
+                    chapter,
+                    source_digest=discovery_digests[chapter.id],
+                ):
                     pending_discoveries.append(chapter)
         discovery_maximum = self.config.stages[Stage.DISCOVER].max_agents
         assert discovery_maximum is not None
@@ -3466,7 +3495,8 @@ class Orchestrator:
             while pending_discoveries and len(discovery_tasks) < discovery_window:
                 chapter = pending_discoveries.popleft()
                 discovery_tasks[chapter.id] = asyncio.create_task(
-                    self._discover(chapter, rerun=self.force)
+                    # This queue contains only chapters already classified as stale.
+                    self._discover(chapter, rerun=True)
                 )
 
         fill_discovery_window()

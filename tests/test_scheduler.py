@@ -258,6 +258,28 @@ def legacy_scope_digest(root: Path, chapter: Chapter) -> str:
     return digest.hexdigest()
 
 
+def test_source_input_digests_read_shared_document_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    orchestrator = Orchestrator(config, StateStore(config))
+    source = tmp_path / "books" / "book.md"
+    original_read_text = Path.read_text
+    reads: list[Path] = []
+
+    def counted_read_text(path: Path, *args: Any, **kwargs: Any) -> str:
+        if path == source:
+            reads.append(path)
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", counted_read_text)
+
+    digests = orchestrator._source_input_digests(config.chapters)
+
+    assert set(digests) == {chapter.id for chapter in config.chapters}
+    assert reads == [source]
+
+
 @pytest.mark.asyncio
 async def test_prepare_migrates_legacy_discovery_and_build_digests(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
