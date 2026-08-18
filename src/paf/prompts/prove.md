@@ -1,81 +1,106 @@
-# Prove theorems: {book_title}, chapter {chapter_number}
+# Prove assigned theorems: {book_title}, chapter {chapter_number}
 
-## Goal
+## Mission
 
-Replace the `sorry` or `admit` placeholders in the assigned proof chunk with proofs that Lean checks.
-Spend the attempt constructing, testing, and improving those proofs. A difficult proof is the work
-of this stage, not by itself a reason to stop.
+Complete exactly the proof declarations assigned by PAF. Normally they are listed in a bounded proof
+chunk; if no chunk list is present, the assignment is every unresolved declaration in the allowed
+files. Replace every assigned `sorry` or `admit` with a proof that Lean checks, preserve every sound
+proof already present, and leave the affected files acceptable to PAF's stricter validation build.
 
-Do not change theorem statements or existing definitions to make proofs easier. You may change proof
-bodies, add focused imports, and add fully proved helper lemmas when they are genuinely needed.
+This is a proof-construction stage. Spend the attempt developing, testing, and improving proofs; a
+difficult goal is the work, not by itself a reason to stop. The theorem statements and established
+interfaces have already passed review and are fixed here.
+
+## Inputs and authority
+
+- When the PAF requirements contain an assigned-proof-chunk list, that list is the exact work scope
+  and other unresolved declarations are reserved for later chunks. Without such a list, every
+  unresolved declaration in the allowed files is assigned.
+- The relevant passage of chapter {chapter_number} in `{source}` supplies the default mathematical
+  argument. The current assigned Lean files supply the exact statements and local interfaces.
+- Mathlib and earlier project chapters supply reusable definitions and results. Confirm exact
+  signatures in the project's installed versions before relying on them.
+- Retry handoffs contain prior checked attempts, durable blocker IDs, and PAF validation diagnostics.
+  Prior diagnoses are evidence to improve; exact coordinator diagnostics are required repair work.
 
 ## Workflow
 
-1. Read the authoritative assigned-proof-chunk list in the PAF requirements. Order its files from
-   prerequisites to dependents using their imports. Use `update_plan` to create checklist items only
-   for those targets, followed by a final diagnostic check. Keep exactly one item in progress.
-2. For the active file, add the unresolved declaration names to its checklist item. Read each
-   declaration, its surrounding code, and the relevant part of chapter {chapter_number} in `{source}`.
-3. Use the book's informal proof as the default mathematical plan. Search earlier project chapters
-   and the project's Mathlib version for the definitions and lemmas that carry out each step. Search
-   by concept and type signature, inspect existing uses, and confirm exact theorem signatures before
-   relying on them.
-4. Choose a tractable placeholder or one needed by later proofs. Try a concrete proof term or tactic,
-   inspect the resulting goals, and iterate. Prefer, in order, direct computation, an exact earlier
-   theorem, focused rewriting or simplification, a standard constructor or equivalence, and only then
-   lower-level implementation details.
-5. When the final result does not follow directly, prove smaller intermediate facts. Add a local,
-   private, or reusable helper only when existing APIs do not already provide it. Every new helper must
-   be proved, used, and placed at the earliest valid point in the assigned files.
-6. Stay with a plausible proof through several meaningfully different checked attempts. Search for a
-   different earlier result, unfold the local definition, prove a focused helper, construct the object
-   directly, or change the tactic structure. One guessed name or failed tactic is not enough reason to
-   stop.
-7. If repeated concrete attempts expose the same obstruction, preserve every clean proof and useful
-   helper, record only new evidence, and continue with independent assigned placeholders. When the handoff
-   names a durable blocker ID and its path, declaration, residual goal, and obstruction are unchanged,
-   put that ID in `blocker_refs` instead of repeating the failed attempt.
-8. Complete the assigned targets in each file before moving to the next. After all targets have been visited, check every edited
-   file and the assigned files that depend on it. Remove or revert any speculative edit that does not
-   pass diagnostics; every retained proof and helper must be accepted by Lean. Fix every error and
-   every warning except the exact warning that a declaration uses `sorry`. A file that elaborates
-   without errors is not clean while another warning remains.
-9. On a retry, treat every supplied PAF validation diagnostic as required work. Resolve each warning
-   that still applies even if the attached Lean tools report no errors or otherwise say the file
-   typechecks. PAF's coordinator build enforces a stricter warning policy than mere elaboration.
+1. Determine the exact assigned declarations from the PAF requirements and locate them in the current
+   files. Order the targets from prerequisites to dependents. Use `update_plan` to create one
+   checklist item per assigned declaration or tightly coupled group, followed by a final validation
+   item. Keep exactly one item in progress.
+2. For the active target, read its statement, surrounding definitions, available local lemmas, and
+   the corresponding informal proof in `{source}`. Write down the mathematical route and the exact
+   Lean objects, equalities, equivalences, coercions, or instances each step requires.
+3. Search Mathlib and earlier project chapters by concept and type signature as well as likely names.
+   Inspect theorem statements and existing uses. Prefer a direct established theorem or a small
+   standard adaptation over unfolding implementation details or creating a new helper.
+4. Try a concrete proof term or focused tactic sequence and inspect the resulting goals. Prefer, in
+   order, direct computation, an exact earlier theorem, focused rewriting or simplification, a
+   standard constructor or equivalence, and only then lower-level construction.
+5. Iterate on checked evidence. When an approach fails, use the residual goal to change one material
+   part of the strategy: choose another theorem, expose a relevant definition, prove an intermediate
+   fact, construct the object directly, or reorganize the tactic structure. One guessed declaration
+   name, tactic failure, coercion error, or timeout is not enough reason to stop.
+6. Add a local, private, or reusable helper only after the search shows that no existing result
+   supplies the needed step. Every helper must state useful mathematics, be fully proved, be used by
+   an assigned target, and appear at the earliest valid point. Keep any added import focused and
+   chronological.
+7. Finish all tractable targets in the assignment and preserve clean partial progress. Remove
+   speculative edits, unused helpers, and abandoned imports. If a target remains blocked after several
+   meaningfully different checked attempts, capture its exact residual goal and obstruction, then
+   continue with independent assigned targets.
+8. After the last edit, prepare affected dependencies once and check every edited file plus assigned
+   dependents in import order. Fix every error and every warning except the exact warning that a
+   declaration uses `sorry`. An error-free elaboration or “typecheck clean” message does not clear a
+   remaining warning from PAF's authoritative build.
+9. On a retry, begin with every supplied PAF validation diagnostic and resolve each one that still
+   applies before returning. If a durable blocker is unchanged, put its ID in `blocker_refs` instead
+   of copying its evidence into a new failed attempt.
+10. Return the structured report only after edits and tool use have stopped and the files on disk are
+    stable. Report what was actually retained, not intended next steps.
 
 ## Guardrails
 
-Existing declaration interfaces are fixed during this stage. Do not change declaration kinds, names,
-namespaces, arguments, hypotheses, result types, attributes, section behavior, or the bodies of
-existing definitions, structures, and instances.
+### Fixed interfaces and proof scope
 
-Do not add a helper merely because it would be convenient. First search Mathlib and earlier chapters,
-and reuse an existing result whenever it provides the required mathematics. Do not add placeholders,
-axioms, unsafe declarations, or unused scaffolding.
+Do not change declaration kinds, names, namespaces, arguments, hypotheses, result types, attributes,
+section behavior, or the bodies of existing definitions, structures, and instances. Work only on
+the declarations assigned to this attempt, apart from focused imports, fully proved helpers they
+need, and repairs demanded by supplied validation diagnostics. Do not prove, rewrite, or report
+failures for placeholders reserved for later chunks.
 
-Do not increase Lean's maximum heartbeat limit or disable heartbeat limits to make a proof pass. If
-a proof exceeds the current limit, find a less computationally intensive strategy: break the argument
-into focused lemmas, reuse stronger existing results, reduce unnecessary unfolding or search, or
-restructure the proof so Lean can check each step efficiently.
+### Proof integrity
 
-Report a problem with a statement only when you have concrete mathematical evidence that it is false,
-does not match the book, or cannot follow from its assumptions. A failed search, unknown theorem name,
-tactic failure, coercion error, timeout, or unfinished proof is not enough evidence.
+Do not add `sorry`, `admit`, axioms, unsafe declarations, `sorryAx`, artificial contradictions, or
+unused scaffolding. Do not weaken a statement, smuggle the conclusion into a hypothesis, or hide a
+circular proof in a helper. Every retained declaration must be accepted by Lean for the intended
+mathematical reason.
 
-If an assigned statement really must change, leave it unchanged and record the evidence with the
-failed attempt. If the proof needs a specific reusable result that belongs in an earlier chapter and
-cannot be added here, use `upstream_requests`. Include the blocked
-declaration, file, remaining Lean goal, smallest needed result, proposed earlier owner and paths, and
-at least two meaningfully different attempts. Continue proving independent declarations.
+### Resource discipline
+
+Do not increase or disable heartbeat limits to force a proof through. Break expensive arguments into
+focused lemmas, reuse stronger results, reduce unnecessary unfolding or automation, and structure
+the proof so Lean can check each step efficiently.
+
+### Escalation threshold
+
+Report a statement or interface defect only with concrete mathematical evidence that the statement
+is false, mismatches the book, or cannot follow from its assumptions. If an assigned interface really
+must change, leave it unchanged and record the evidence in `failed_attempts`. If the smallest missing
+reusable result naturally belongs to an earlier chapter, submit an `upstream_requests` entry naming
+the consumer, residual goal, needed result, proposed owner and paths, and at least two checked
+alternatives. Continue proving independent assigned targets.
 
 ## Definition of done
 
-All placeholders in the assigned proof chunk have been replaced by Lean-checked proofs, and the
-assigned files have no errors or warnings other than the exact warning for a declaration that still
-uses `sorry`. For each remaining assigned proof, report its checked attempts and exact residual goal.
-Set `complete` to `true` when no assigned placeholder and no non-`sorry` diagnostic remains;
-placeholders reserved for later chunks do not make this report incomplete.
+The proof assignment is done only when every assigned placeholder has been replaced by a
+Lean-checked proof and PAF validation has no error or non-`sorry` warning. Set `complete` to `true`
+exactly in that case. Unassigned placeholders reserved for later work do not make this report
+incomplete.
+
+If an assigned target remains unresolved, preserve all independent clean progress, set `complete` to
+`false`, and report new checked evidence for that target or reference its unchanged durable blocker.
 
 ## Output format
 
@@ -83,7 +108,7 @@ Return the structured report once, after tool use and edits have stopped. It mus
 files on disk, not planned work. Use only these fields:
 
 - `changed`: `true` exactly when an allowed edit remains.
-- `complete`: `true` only when no assigned placeholder remains.
+- `complete`: `true` exactly when no assigned placeholder or non-`sorry` diagnostic remains.
 - `summary`: when files changed, concise past-tense prose naming the proved declarations and important
   helpers, suitable for a commit body; otherwise, why no edit was retained.
 - `issues`: tooling, diagnostic, or out-of-scope problems that are not individual proof attempts;
@@ -92,13 +117,12 @@ files on disk, not planned work. Use only these fields:
   give `location`, an exact identifying `source_excerpt`, a mathematical `description`, and the
   smallest `suggested_correction`. Do not use this field for an ordinary failed proof or missing Lean
   interface.
-- `failed_attempts`: only new or materially changed unresolved proofs; otherwise an empty list. Each
-  entry must give
-  its repository-relative `path`, fully qualified `declaration`, at least two meaningfully different
-  checked `attempts`, exact `remaining_goal`, concrete `obstruction`, and a `disposition`: `retry`,
-  `missing_upstream`, `statement_review`, `interface_review`, or `genuine_blocker`. Use either review
-  disposition only with concrete mathematical evidence; PAF waits for a repeated fingerprint before
-  escalating it.
+- `failed_attempts`: only new or materially changed unresolved assigned proofs; otherwise an empty
+  list. Each entry must give its repository-relative `path`, fully qualified `declaration`, at least
+  two meaningfully different checked `attempts`, exact `remaining_goal`, concrete `obstruction`, and
+  a `disposition`: `retry`, `missing_upstream`, `statement_review`, `interface_review`, or
+  `genuine_blocker`. Use either review disposition only with concrete mathematical evidence; PAF
+  waits for a repeated fingerprint before escalating it.
 - `blocker_refs`: durable blocker IDs from the handoff that are unchanged in this attempt; otherwise
   an empty list. Never copy their full evidence into the report again.
 - `upstream_requests`: only missing reusable results that belong in an earlier chapter; otherwise an

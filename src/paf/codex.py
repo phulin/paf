@@ -371,23 +371,25 @@ def report_schema_key(stage: Stage, *, role: str = "", feedback: str = "") -> st
 def render_review_variant(template: str, *, upstream: bool) -> str:
     if upstream:
         values = {
-            "review_assignment": """Resolve the supplied requests from later proofs for reusable
-results in this earlier chapter. Review those requests and their evidence together; do not audit the
-rest of the chapter or work on unrelated placeholders.""",
-            "review_goal_details": """For each request, decide whether the needed result already
-exists, belongs here as a new fully proved declaration, or depends on later material and should stay
-with the requesting chapter. Fully prove every declaration you add; this variant does not permit new
+            "review_assignment": """This is a targeted upstream-support review. One or more later
+proofs request reusable mathematics from this earlier chapter. Answer those requests together; do
+not audit the rest of the chapter or work on unrelated proof placeholders.""",
+            "review_goal_details": """For every request, decide whether the needed result already
+exists, naturally belongs in this earlier chapter as a new declaration, or depends on later material
+and must remain downstream. Fully prove every declaration you add. This assignment permits no new
 placeholders.""",
-            "review_workflow_details": """Group requests that need the same result. If an existing
-declaration solves a request, record its exact fully qualified name and concrete usage. If a result
-is missing and naturally belongs here, add the smallest reusable version and prove it completely. If
-it depends on later-only data, explain why and give a viable downstream direction. Return one answer
-for every supplied request id.""",
-            "review_guardrails": """Do not change existing interfaces or the requesting chapter. Do
-not add `sorry`, `admit`, axioms, unused helpers, cosmetic aliases, or a theorem tailored merely to
-restate the later proof's final goal.""",
-            "review_definition_of_done": """Every request id has an evidence-backed answer, every
-new declaration is fully proved and clean, and no unrelated source was changed.""",
+            "review_workflow_details": """Cover every supplied upstream request ID and only the
+earlier-chapter declarations needed to answer it. Group requests that need the same result. For an
+existing result, record its exact fully qualified name and concrete use. For a genuine earlier gap,
+add and fully prove the smallest reusable result. For a downstream result, explain the ownership
+boundary and give a viable later-chapter direction.""",
+            "review_guardrails": """Do not change existing interfaces or edit the requesting
+chapter. Do not add `sorry`, `admit`, axioms, unsafe declarations, unused helpers, cosmetic aliases,
+or a theorem tailored merely to restate a later proof's final goal.""",
+            "review_definition_of_done": """Every supplied request ID has one evidence-backed
+answer, every added declaration is fully proved and free of diagnostics, all requesting proofs have
+concrete usage guidance or a justified downstream disposition, and no unrelated source was
+changed.""",
             "review_output_format": """Return the structured report once, after tool use and edits
 have stopped. It must describe the stable files on disk, not planned work. Use only these fields:
 
@@ -401,7 +403,9 @@ have stopped. It must describe the stable files on disk, not planned work. Use o
   smallest `suggested_correction`.
 - `failed_attempts`: any new supporting declaration that could not be proved; otherwise an empty
   list. Each entry must give its repository-relative `path`, fully qualified `declaration`, at least
-  two meaningfully different checked `attempts`, exact `remaining_goal`, and concrete `obstruction`.
+  two meaningfully different checked `attempts`, exact `remaining_goal`, concrete `obstruction`, and
+  a `disposition`: `retry`, `missing_upstream`, `statement_review`, `interface_review`, or
+  `genuine_blocker`.
 - `upstream_answers`: one answer for every supplied request id. Each entry gives `request_ids`, a
   `disposition` of `added`, `existing`, or `downstream`, exact fully qualified `declarations`,
   concrete `usage_guidance`, and a `rejection_reason`. For `downstream`, leave `declarations` empty
@@ -410,25 +414,25 @@ have stopped. It must describe the stable files on disk, not planned work. Use o
         }
     else:
         values = {
-            "review_assignment": """Re-review the complete assigned chapter after a proof attempt
-found evidence that one or more statements or supporting declarations may be wrong or hard to use.
-Do not limit the review to the declarations named in the evidence.""",
-            "review_goal_details": """This remains statement review, not proof work. Repair every
-genuine statement or interface problem in the assigned files, but preserve sound statements when
-only the proof strategy failed. Existing proof placeholders may remain, and new proposition proofs
-may use `by sorry` when proving them would distract from the review.""",
-            "review_workflow_details": """After resolving the supplied findings, continue through
-every declaration in the assigned chapter. Check source coverage, mathematical meaning, hypotheses,
-and a plausible proof route through earlier results. Account for every supplied finding as
-confirmed, rejected, or reframed.""",
-            "review_guardrails": """Do not restrict the review to the failed declarations. A
-no-change review needs no diagnostic calls only when the supplied handoff contains no PAF build or
-validation diagnostics. Supplied diagnostics override the earlier clean-build assumption and must
-all be resolved except for explicitly permitted `sorry` warnings.""",
+            "review_assignment": """This is a full-chapter statement and interface re-review
+triggered by failed proof evidence. Review the complete assigned chapter, not only the declarations
+named in the supplied findings.""",
+            "review_goal_details": """This remains review work, not a second proof attempt. Repair
+every genuine statement or supporting-interface problem, but preserve a sound interface when only
+the proof strategy failed. Existing proposition placeholders may remain, and a new proposition proof
+may use `by sorry` when proving it would distract from the review.""",
+            "review_workflow_details": """Cover every numbered source section and every assigned
+Lean declaration, followed by a chapter-wide coverage, import, and diagnostic check. For each main
+theorem, verify the statement's mathematical meaning and a plausible route through earlier results.
+Account for every supplied finding ID as confirmed, rejected, or reframed.""",
+            "review_guardrails": """Do not spend the assignment proving existing proposition
+placeholders or restrict review to the failed declarations. A no-change review needs no diagnostic
+calls only when the handoff contains no PAF build or validation diagnostics. Supplied diagnostics
+must all be resolved except for explicitly permitted exact `sorry` warnings.""",
             "review_definition_of_done": """The complete assigned chapter has been re-reviewed,
-every supplied finding has been evaluated, all warranted in-scope repairs have been made, existing
-library and earlier-chapter APIs have been reused wherever possible, imports remain chronological,
-and edited files are clean except for permitted `sorry` warnings.""",
+every supplied finding has an evidence-backed assessment, all warranted in-scope repairs have been
+made, established APIs have been reused wherever possible, imports remain chronological, and edited
+files have no diagnostics except permitted exact `sorry` warnings.""",
             "review_output_format": """Return the structured report once, after tool use and edits
 have stopped. It must describe the stable files on disk, not planned work. Use only these fields:
 
@@ -1331,12 +1335,13 @@ do not report no changes or “typecheck clean” while a supplied non-`sorry` w
 This attempt owns exactly these {assigned_placeholders} unresolved placeholder(s):
 {chr(10).join(rendered_targets)}
 
-Work only on these declarations. Other unresolved declarations are intentionally reserved for
-later proof agents: do not prove, rewrite, or include them in `failed_attempts`. You may add imports
-and fully proved helpers needed by the assigned declarations. Resolve every error and every warning
-in the assigned declarations; the only permitted warning is one caused by a `sorry` placeholder
-reserved for a later chunk. Set `complete` to `true` when every placeholder in this assigned chunk
-is resolved and its declarations have no other errors or warnings, even if other placeholders
+Work only on these declarations. Other unresolved declarations are intentionally reserved for later
+proof agents: do not prove, rewrite, or include them in `failed_attempts`. Outside the assigned
+proof bodies, make only focused import or fully proved helper edits they need and repairs required
+by a supplied PAF validation diagnostic. Resolve every error and every warning in the assigned
+declarations; the only permitted warning is one caused by a `sorry` placeholder reserved for a later
+chunk. Set `complete` to `true` when every placeholder in this assigned chunk is resolved and no
+non-`sorry` diagnostic remains, even if other placeholders
 remain in the chapter."""
         stage_contract = {
             Stage.DISCOVER: """This is read-only source analysis. Identify the earlier chapters
