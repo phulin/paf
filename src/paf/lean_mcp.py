@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import inspect
 import re
 from collections.abc import Awaitable, Callable
@@ -16,6 +15,7 @@ from mcp.types import ToolAnnotations
 from pydantic import BaseModel, Field
 
 from paf.diagnostics import LEAN_WARNING_RE, lean_diagnostic_counts
+from paf.hashing import digest_text
 
 # pydantic-settings 2.15 detects the forward reference to FastMCP in the MCP
 # SDK's generic settings model.  Rebuild it after its module has finished
@@ -405,7 +405,7 @@ def _dependency_epoch(client: Any, path: str) -> int:
 
 
 def _source_digest(text: str) -> str:
-    return hashlib.sha256(text.encode()).hexdigest()
+    return digest_text(text)
 
 
 def _imports(text: str) -> tuple[str, ...]:

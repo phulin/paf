@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import os
 import re
 import shutil
@@ -12,10 +11,11 @@ from pathlib import Path
 from typing import Any
 
 from paf import json_codec as json
+from paf.hashing import ALGORITHM, digest_fields, digest_file
 from paf.models import PipelineConfig, WorkUnitLike
 from paf.scope import ScopeMatcher
 
-FINGERPRINT_SCHEMA = "olean-proof-erased-v1"
+FINGERPRINT_SCHEMA = "olean-proof-erased-v2"
 _HELPER_BATCH_SIZE = 512
 
 
@@ -87,30 +87,19 @@ class FingerprintCollection:
     lean_version: str
 
 
-def _sha256_fields(domain: str, *fields: str | bytes) -> str:
-    digest = hashlib.sha256()
-    digest.update(domain.encode())
-    digest.update(b"\0")
-    for field in fields:
-        value = field.encode() if isinstance(field, str) else field
-        digest.update(len(value).to_bytes(8, "big"))
-        digest.update(value)
-    return digest.hexdigest()
-
-
 def aggregate_module_digests(
     modules: tuple[ModuleFingerprint, ...],
     *,
     lean_version: str,
 ) -> tuple[str, str]:
     ordered = tuple(sorted(modules, key=lambda item: item.module))
-    artifact = _sha256_fields(
+    artifact = digest_fields(
         "paf-work-unit-artifact-v1",
         FINGERPRINT_SCHEMA,
         lean_version,
         *(value for item in ordered for value in (item.module, item.artifact_digest)),
     )
-    interface = _sha256_fields(
+    interface = digest_fields(
         "paf-work-unit-interface-v1",
         FINGERPRINT_SCHEMA,
         lean_version,
@@ -158,7 +147,7 @@ def _artifact_digest(path: Path) -> str:
         value = hash_path.read_text(encoding="ascii").strip()
         if value:
             return f"lake:{value}"
-    return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+    return f"{ALGORITHM}:{digest_file(path)}"
 
 
 def _helper_path() -> Path:
@@ -352,7 +341,7 @@ def collect_interface_fingerprints(
             modules_by_owner[module_owners[module]].append(cached)
             continue
         value = helper_values[module]
-        interface_digest = _sha256_fields(
+        interface_digest = digest_fields(
             "paf-module-interface-v1",
             FINGERPRINT_SCHEMA,
             lean_version,

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import os
 import re
 import threading
@@ -17,6 +16,7 @@ from starlette.routing import Route
 
 from paf import json_codec as json
 from paf.config import resolve_config
+from paf.hashing import digest_text
 from paf.models import PipelineConfig
 from paf.project import Project, ProjectResolver
 from paf.state_db import DATABASE_NAME, StateDatabase, read_checkpoint, read_status_view
@@ -304,9 +304,7 @@ def _parse_declarations(path: Path, target_root: Path, project_root: Path) -> li
         excerpt_end = min(stop, start + 30)
         signature = _signature(lines, start, stop)
         body = "\n".join(lines[start:stop])
-        identifier = hashlib.sha1(
-            f"{relative}:{start + 1}:{name}".encode(), usedforsecurity=False
-        ).hexdigest()[:12]
+        identifier = digest_text(f"{relative}:{start + 1}:{name}")[:12]
         result.append(
             {
                 "id": identifier,

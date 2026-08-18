@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import os
 import shutil
 import stat
@@ -10,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
 
+from paf.hashing import digest_bytes, new_digest
 from paf.models import SwarmSettings, WorkUnitLike
 from paf.scope import ScopeMatcher
 
@@ -90,10 +90,10 @@ def _fingerprint(path: Path) -> FileFingerprint:
     metadata = path.lstat()
     mode = stat.S_IMODE(metadata.st_mode)
     if stat.S_ISREG(metadata.st_mode):
-        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        digest = digest_bytes(path.read_bytes())
         return FileFingerprint("file", digest, mode)
     if stat.S_ISLNK(metadata.st_mode):
-        digest = hashlib.sha256(os.readlink(path).encode()).hexdigest()
+        digest = digest_bytes(os.readlink(path).encode())
         return FileFingerprint("symlink", digest, mode)
     return FileFingerprint("special", "", mode)
 
@@ -600,7 +600,7 @@ class FuseOverlayIsolation:
         )
 
     def _dependency_key(self) -> str:
-        digest = hashlib.sha256()
+        digest = new_digest()
         for relative in (
             Path("lean-toolchain"),
             self.settings.lean_project / "lake-manifest.json",
@@ -609,7 +609,7 @@ class FuseOverlayIsolation:
             path = self.settings.repo / relative
             if path.is_file():
                 digest.update(path.read_bytes())
-        return digest.hexdigest()[:16]
+        return digest.hexdigest()
 
     async def _copy_dependency_cache(self, destination: Path) -> None:
         command = [

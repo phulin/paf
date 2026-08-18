@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-import hashlib
 import shutil
 import subprocess
 from pathlib import Path
 
 import pytest
 
+from paf.hashing import digest_file
 from paf.interface_fingerprint import (
     ModuleFingerprint,
     _run_helper,
@@ -73,10 +73,7 @@ def test_lean_helper_erases_proofs_but_retains_interfaces(tmp_path: Path) -> Non
     )
     values = _run_helper(tmp_path, requests, timeout_seconds=120)
     assert all(value["module"] == "InterfaceCase" for value in values)
-    digests = {
-        name: hashlib.sha256((artifact_dir / f"{name}.sanitized.olean").read_bytes()).hexdigest()
-        for name in variants
-    }
+    digests = {name: digest_file(artifact_dir / f"{name}.sanitized.olean") for name in variants}
     assert digests["proof-a"] == digests["proof-b"]
     assert digests["proof-a"] != digests["statement"]
     assert digests["definition-a"] != digests["definition-b"]

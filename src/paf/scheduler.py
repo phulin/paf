@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import re
 from collections import deque
 from collections.abc import Callable, Coroutine, Iterable
@@ -42,6 +41,7 @@ from paf.corpus import (
 )
 from paf.diagnostics import unexpected_lean_warnings
 from paf.git import GitCommitError, GitCommitter
+from paf.hashing import digest_text
 from paf.interface_fingerprint import (
     FingerprintCollection,
     InterfaceFingerprintError,
@@ -625,7 +625,7 @@ class Orchestrator:
         selected = "\n".join(
             lines[chapter.source_span.start_line - 1 : chapter.source_span.end_line]
         )
-        return hashlib.sha256(f"{chapter.id}\0{selected}".encode()).hexdigest()
+        return digest_text(f"{chapter.id}\0{selected}")
 
     def _discovery_is_current(self, chapter: WorkUnitLike) -> bool:
         nodes = self.state.source_dependency_tree.get("nodes", {})

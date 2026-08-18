@@ -9,7 +9,6 @@ also detects input files whose timestamp happens to be older than the bundle.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import re
 import shutil
@@ -18,8 +17,10 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from xxhash import xxh3_64
+
 MANIFEST_NAME = "bundle-manifest.json"
-MANIFEST_VERSION = 1
+MANIFEST_VERSION = 2
 HASHED_ASSET = re.compile(r"^assets/.+-[A-Za-z0-9_-]{8,}\.[^.]+$")
 WEB_CONFIG_FILES = (
     "index.html",
@@ -36,8 +37,8 @@ class BundleError(RuntimeError):
     """A generated bundle is absent, corrupt, or stale."""
 
 
-def sha256(path: Path) -> str:
-    digest = hashlib.sha256()
+def content_digest(path: Path) -> str:
+    digest = xxh3_64()
     with path.open("rb") as stream:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
@@ -65,13 +66,13 @@ def input_paths(root: Path) -> list[Path]:
 
 
 def input_hashes(root: Path) -> dict[str, str]:
-    return {path.relative_to(root).as_posix(): sha256(path) for path in input_paths(root)}
+    return {path.relative_to(root).as_posix(): content_digest(path) for path in input_paths(root)}
 
 
 def output_hashes(root: Path) -> dict[str, str]:
     output = root / "src" / "paf" / "web_dist"
     return {
-        path.as_posix(): sha256(output / path)
+        path.as_posix(): content_digest(output / path)
         for path in relative_files(output)
         if path.as_posix() != MANIFEST_NAME
     }

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import re
 from collections.abc import AsyncIterator, Iterable
 from contextlib import asynccontextmanager, suppress
@@ -15,6 +14,7 @@ from uuid import uuid4
 from paf import json_codec as json
 from paf.activity import ActivityStore, shorten_book_paths
 from paf.diagnostics import lean_diagnostic_counts
+from paf.hashing import digest_bytes, digest_text
 from paf.models import PipelineConfig, Stage, WorkUnitLike
 from paf.pricing import LEGACY_MODEL, CostEstimate, estimate_cost
 from paf.state_db import DATABASE_NAME, DatabaseWrite, StateDatabase, StateWriter
@@ -788,7 +788,7 @@ class StateStore:
         self._invalidate_aggregates()
         self._rebuild_status_indexes()
         self._checkpoint_dirty = True
-        self._config_fingerprint = hashlib.sha256(
+        self._config_fingerprint = digest_bytes(
             json.dumpb(
                 {
                     "documents": self._document_dicts(),
@@ -796,7 +796,7 @@ class StateStore:
                 },
                 sort_keys=True,
             )
-        ).hexdigest()
+        )
         persisted_fingerprint = await asyncio.to_thread(self._database.config_fingerprint)
         self._static_dirty = persisted_fingerprint != self._config_fingerprint
         self._dirty_task_keys.update(self.tasks)
@@ -1514,7 +1514,7 @@ class StateStore:
             str(attempt.get("remaining_goal", "")).strip(),
             str(attempt.get("obstruction", "")).strip(),
         )
-        return hashlib.sha256("\0".join(fields).encode()).hexdigest()[:20]
+        return digest_text("\0".join(fields))
 
     def proof_blockers_for_consumer(
         self,
@@ -1673,7 +1673,7 @@ class StateStore:
             str(request.get("needed_result", "")).strip(),
             owner_chapter_id,
         )
-        fingerprint = hashlib.sha256("\0".join(fingerprint_fields).encode()).hexdigest()[:16]
+        fingerprint = digest_text("\0".join(fingerprint_fields))
         for request_id, existing in self.upstream_requests.items():
             if existing.get("fingerprint") != fingerprint:
                 continue
@@ -2271,7 +2271,7 @@ class StateStore:
             fingerprint = "\0".join(
                 (chapter.source.as_posix(), chapter.id, anchor.casefold())
             ).encode()
-            issue_id = hashlib.sha256(fingerprint).hexdigest()[:16]
+            issue_id = digest_bytes(fingerprint)
             issue_ids.append(issue_id)
             seen_at = run.finished_at or timestamp()
             if existing := self.source_issues.get(issue_id):
@@ -2756,11 +2756,11 @@ class StateStore:
             "exit_code": latest.exit_code if latest is not None else None,
             "validation": latest.validation if latest is not None else None,
         }
-        fingerprint = hashlib.sha256(json.dumpb(evidence, sort_keys=True)).hexdigest()
+        fingerprint = digest_bytes(json.dumpb(evidence, sort_keys=True))
         for case in self.repair_cases.values():
             if case.task_key == task_key and case.fingerprint == fingerprint:
                 return case
-        case_id = hashlib.sha256(f"{task_key}:{fingerprint}".encode()).hexdigest()[:16]
+        case_id = digest_text(f"{task_key}:{fingerprint}")
         case = RepairCaseRecord(
             id=case_id,
             task_key=task_key,

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import errno
-import hashlib
 import os
 import re
 import shutil
@@ -20,6 +19,7 @@ from paf import json_codec as json
 from paf.activity import EVENT_TIMESTAMP_FIELD, activity_timestamp
 from paf.backends import LeanBackend
 from paf.diagnostics import unexpected_lean_warnings
+from paf.hashing import digest_bytes, new_digest
 from paf.models import PipelineConfig, ProofTarget, Stage, WorkUnitLike
 from paf.scope import ScopeMatcher
 from paf.state import RunRecord, StateStore, TaskStatus, TokenUsage
@@ -754,7 +754,7 @@ def _upstream_source_bundle(
 
 
 def scope_digest(repo: Path, chapter: WorkUnitLike) -> str:
-    digest = hashlib.sha256()
+    digest = new_digest()
     for path in scoped_files(repo, chapter):
         digest.update(path.relative_to(repo).as_posix().encode())
         digest.update(b"\0")
@@ -844,7 +844,7 @@ def proof_targets(repo: Path, chapter: WorkUnitLike) -> tuple[ProofTarget, ...]:
                     declaration=display_name,
                     line=text.count("\n", 0, match.start()) + 1,
                     placeholder_count=placeholder_count,
-                    fingerprint=hashlib.sha256(identity).hexdigest()[:16],
+                    fingerprint=digest_bytes(identity),
                 )
             )
     return tuple(targets)

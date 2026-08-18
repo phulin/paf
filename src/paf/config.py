@@ -4,7 +4,6 @@ import re
 import shlex
 import tomllib
 from dataclasses import replace
-from hashlib import sha256
 from importlib.resources import files
 from itertools import pairwise
 from pathlib import Path
@@ -13,6 +12,7 @@ from typing import Any
 from paf.adapters import LatexAdapter, MarkdownAdapter, TextAdapter, format_for_path
 from paf.backends import LeanBackend, TargetTemplates, lean_backend_from_config
 from paf.corpus import build_corpus_schedule
+from paf.hashing import digest_text
 from paf.models import (
     BookConfig,
     Chapter,
@@ -966,7 +966,7 @@ def infer_corpus(
     )
     if output_target is not None:
         identity += f"\ntarget={backend.templates.root}"
-    corpus_id = sha256(identity.encode()).hexdigest()[:10]
+    corpus_id = digest_text(identity)[:10]
     settings = SwarmSettings(
         repo=repo,
         state_dir=repo / ".paf" / f"corpus-{corpus_id}",
