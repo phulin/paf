@@ -73,6 +73,7 @@ from paf.state import (
     UpstreamRequestStatus,
 )
 
+MAXIMUM_COORDINATOR_BUILD_TARGETS = 16
 REPAIR_EFFORT = {"small": 1.0, "medium": 3.0, "large": 8.0}
 REVIEW_REPORT_RETRY_PROMPT = """Your previous review turn did not satisfy the report contract:
 
@@ -3382,6 +3383,11 @@ class Orchestrator:
         results_by_id: dict[str, ValidationResult] = {}
         snapshots_by_id: dict[str, ValidatedBuildSnapshot] = {}
 
+        def requeue_unfinished() -> None:
+            self._pending_build_requests[0:0] = [
+                request for request in requests if not request.future.done()
+            ]
+
         def finish_ready_requests() -> None:
             for request in requests:
                 if request.future.done():
@@ -3443,7 +3449,7 @@ class Orchestrator:
                     for chapter in candidates
                     if chapter.build_command.strip().rpartition(" ")[0] == first_prefix
                 )
-                selected = compatible
+                selected = compatible[:MAXIMUM_COORDINATOR_BUILD_TARGETS]
                 active_ids = {chapter.id for chapter in selected}
                 attempt_requests = tuple(
                     request
@@ -3484,6 +3490,9 @@ class Orchestrator:
                     finish_ready_requests()
                 failed_ids = active_ids.difference(succeeded_ids)
                 if not failed_ids:
+                    if remaining:
+                        requeue_unfinished()
+                        return
                     continue
                 unattributed = {
                     chapter_id
@@ -3506,9 +3515,7 @@ class Orchestrator:
                         # Yield the coordinator lane. Unreached targets retain
                         # their caller futures and join requests that accumulated
                         # while this command was running.
-                        self._pending_build_requests[0:0] = [
-                            request for request in requests if not request.future.done()
-                        ]
+                        requeue_unfinished()
                         return
                 affected = failed_ids
                 results_by_id.update(
@@ -3516,6 +3523,9 @@ class Orchestrator:
                 )
                 remaining.difference_update(affected)
                 finish_ready_requests()
+                if remaining:
+                    requeue_unfinished()
+                    return
         except BaseException as error:
             for request in requests:
                 if request.future.done():

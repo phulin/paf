@@ -2557,6 +2557,48 @@ async def test_wholly_unattributed_batch_failure_is_not_probed_by_subsets(
     await orchestrator.shutdown()
 
 
+@pytest.mark.asyncio
+async def test_coordinator_queue_routes_one_bounded_slice_at_a_time(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = write_project(tmp_path, chapters="chapters = [1, 2, 3, 4]")
+    with (tmp_path / "books" / "book.md").open("a", encoding="utf-8") as source:
+        source.write("\n## 3. Third chapter\n\n## 4. Fourth chapter\n")
+    config = load_config(project)
+    orchestrator = Orchestrator(config, StateStore(config))
+    await orchestrator.prepare()
+    commands: list[str] = []
+
+    async def validation(
+        _config: object,
+        chapter: Chapter,
+        **_kwargs: object,
+    ) -> ValidationResult:
+        commands.append(chapter.build_command)
+        return ValidationResult(True, 0, "ok")
+
+    monkeypatch.setattr(scheduler_module, "MAXIMUM_COORDINATOR_BUILD_TARGETS", 2)
+    monkeypatch.setattr(scheduler_module, "validate", validation)
+
+    results = await asyncio.gather(
+        *(
+            orchestrator._build_chapters((chapter,), publish_if_clean=False)
+            for chapter in config.chapters
+        )
+    )
+
+    targets = [chapter.build_command.rpartition(" ")[2] for chapter in config.chapters]
+    assert commands == [
+        f"cd lean && lake build {targets[0]} {targets[1]}",
+        f"cd lean && lake build {targets[2]} {targets[3]}",
+    ]
+    assert all(
+        result[chapter.id].succeeded
+        for result, chapter in zip(results, config.chapters, strict=True)
+    )
+    await orchestrator.shutdown()
+
+
 def test_failed_batch_diagnostics_are_partitioned_by_target_closure(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
     owner, consumer = config.chapters
