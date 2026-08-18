@@ -2470,14 +2470,16 @@ async def test_later_review_build_waits_for_running_proof_certification(
 async def test_concurrent_review_builds_share_commands_and_partition_diagnostics(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    project = write_project(tmp_path, chapters="chapters = [1, 2, 3]")
+    project = write_project(tmp_path, chapters="chapters = [1, 2, 3, 4]")
     with (tmp_path / "books" / "book.md").open("a", encoding="utf-8") as source:
-        source.write("\n## 3. Third chapter\n")
+        source.write("\n## 3. Third chapter\n\n## 4. Fourth chapter\n")
     config = load_config(project)
-    first, second, third = config.chapters
+    first, second, third, fourth = config.chapters
     orchestrator = Orchestrator(config, StateStore(config))
     await orchestrator.prepare()
     commands: list[str] = []
+    first_build_started = asyncio.Event()
+    release_first_build = asyncio.Event()
 
     async def validation(
         _config: object,
@@ -2486,6 +2488,8 @@ async def test_concurrent_review_builds_share_commands_and_partition_diagnostics
     ) -> ValidationResult:
         commands.append(chapter.build_command)
         if len(commands) == 1:
+            first_build_started.set()
+            await release_first_build.wait()
             return ValidationResult(
                 False,
                 1,
@@ -2495,10 +2499,16 @@ async def test_concurrent_review_builds_share_commands_and_partition_diagnostics
 
     monkeypatch.setattr(scheduler_module, "validate", validation)
 
-    first_feedback, second_feedback, third_feedback = await asyncio.gather(
+    initial = asyncio.gather(
         orchestrator._review_build(first),
         orchestrator._review_build(second),
         orchestrator._review_build(third),
+    )
+    await first_build_started.wait()
+    fourth_build = asyncio.create_task(orchestrator._review_build(fourth))
+    release_first_build.set()
+    (first_feedback, second_feedback, third_feedback), fourth_feedback = await asyncio.gather(
+        initial, fourth_build
     )
 
     def target(chapter: Chapter) -> str:
@@ -2506,12 +2516,13 @@ async def test_concurrent_review_builds_share_commands_and_partition_diagnostics
 
     assert commands == [
         f"cd lean && lake build {target(first)} {target(second)} {target(third)}",
-        f"cd lean && lake build {target(second)} {target(third)}",
+        f"cd lean && lake build {target(second)} {target(third)} {target(fourth)}",
     ]
     assert set(first_feedback) == {first.id}
     assert "broken review output" in first_feedback[first.id]
     assert second_feedback == {}
     assert third_feedback == {}
+    assert fourth_feedback == {}
     await orchestrator.shutdown()
 
 

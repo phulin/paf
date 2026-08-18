@@ -199,6 +199,8 @@ class PendingBuildRequest:
     stage: Stage
     snapshots: dict[str, ValidatedBuildSnapshot] | None
     future: asyncio.Future[dict[str, ValidationResult]]
+    routed_results: dict[str, ValidationResult] = field(default_factory=dict)
+    routed_snapshots: dict[str, ValidatedBuildSnapshot] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -3370,7 +3372,12 @@ class Orchestrator:
     async def _run_build_batch(self, requests: tuple[PendingBuildRequest, ...]) -> None:
         """Execute and partition a coalesced batch until every caller has a precise result."""
 
-        requested_ids = {chapter.id for request in requests for chapter in request.chapters}
+        requested_ids = {
+            chapter.id
+            for request in requests
+            for chapter in request.chapters
+            if chapter.id not in request.routed_results
+        }
         remaining = set(requested_ids)
         results_by_id: dict[str, ValidationResult] = {}
         snapshots_by_id: dict[str, ValidatedBuildSnapshot] = {}
@@ -3380,18 +3387,32 @@ class Orchestrator:
                 if request.future.done():
                     continue
                 ids = tuple(chapter.id for chapter in request.chapters)
-                if not all(chapter_id in results_by_id for chapter_id in ids):
+                request.routed_results.update(
+                    {
+                        chapter_id: results_by_id[chapter_id]
+                        for chapter_id in ids
+                        if chapter_id in results_by_id
+                    }
+                )
+                request.routed_snapshots.update(
+                    {
+                        chapter_id: snapshots_by_id[chapter_id]
+                        for chapter_id in ids
+                        if chapter_id in snapshots_by_id
+                    }
+                )
+                if not all(chapter_id in request.routed_results for chapter_id in ids):
                     continue
                 if request.snapshots is not None:
                     request.snapshots.update(
                         {
-                            chapter_id: snapshots_by_id[chapter_id]
+                            chapter_id: request.routed_snapshots[chapter_id]
                             for chapter_id in ids
-                            if chapter_id in snapshots_by_id
+                            if chapter_id in request.routed_snapshots
                         }
                     )
                 request.future.set_result(
-                    {chapter_id: results_by_id[chapter_id] for chapter_id in ids}
+                    {chapter_id: request.routed_results[chapter_id] for chapter_id in ids}
                 )
 
         try:
@@ -3482,7 +3503,13 @@ class Orchestrator:
                         )
                         remaining.difference_update(attributed)
                         finish_ready_requests()
-                        continue
+                        # Yield the coordinator lane. Unreached targets retain
+                        # their caller futures and join requests that accumulated
+                        # while this command was running.
+                        self._pending_build_requests[0:0] = [
+                            request for request in requests if not request.future.done()
+                        ]
+                        return
                 affected = failed_ids
                 results_by_id.update(
                     (chapter_id, attempt_results[chapter_id]) for chapter_id in affected
