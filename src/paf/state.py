@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+from collections import deque
 from collections.abc import AsyncIterator, Iterable
 from contextlib import asynccontextmanager, suppress
 from copy import deepcopy
@@ -1105,6 +1106,7 @@ class StateStore:
         self,
         task: TaskRecord,
         context: dict[str, Any] | None = None,
+        failure_roots: dict[str, tuple[str, ...]] | None = None,
     ) -> dict[str, Any]:
         context = context or self._task_snapshot_context()
         clean = context["clean"]
@@ -1134,7 +1136,11 @@ class StateStore:
             }
             for requirement in task.waiting_on
         ]
-        failed_requirements = self.failed_requirements(task)
+        task_key = self.key(task.chapter_id, Stage(task.stage))
+        failed_requirements = self.failed_requirements(
+            task,
+            roots=failure_roots.get(task_key, ()) if failure_roots is not None else None,
+        )
         return {
             "work_unit_id": task.work_unit_id,
             "document_id": task.document_id,
@@ -1415,11 +1421,12 @@ class StateStore:
 
     def hot_snapshot(self) -> dict[str, Any]:
         task_context = self._task_snapshot_context()
+        failure_roots = self._failure_roots_index()
         return self._global_snapshot() | {
             "documents": [dict(value) for value in self._document_dicts()],
             "work_units": [dict(value) for value in self._work_unit_dicts()],
             "tasks": {
-                key: self._task_dict(task, task_context)
+                key: self._task_dict(task, task_context, failure_roots)
                 | {
                     "run_count": len(task.runs),
                     "latest_run_id": task.runs[-1].id if task.runs else None,
@@ -1584,6 +1591,7 @@ class StateStore:
 
         snapshot = self.hot_snapshot()
         task_context = self._task_snapshot_context()
+        failure_roots = self._failure_roots_index()
         payloads = self._database.run_payloads() if self.database_path.is_file() else {}
         tasks: dict[str, Any] = {}
         for key, task in sorted(self.tasks.items()):
@@ -1597,7 +1605,7 @@ class StateStore:
                 ):
                     value = self._run_dict(run)
                 runs.append(value)
-            tasks[key] = self._task_dict(task, task_context) | {"runs": runs}
+            tasks[key] = self._task_dict(task, task_context, failure_roots) | {"runs": runs}
         snapshot["source_issues"] = [
             self._issue_dict(issue) for _, issue in sorted(self.source_issues.items())
         ]
@@ -1608,8 +1616,9 @@ class StateStore:
         self,
         task: TaskRecord,
         context: dict[str, Any] | None = None,
+        failure_roots: dict[str, tuple[str, ...]] | None = None,
     ) -> dict[str, Any]:
-        return self._task_dict(task, context) | {
+        return self._task_dict(task, context, failure_roots) | {
             "run_count": len(task.runs),
             "latest_run_id": task.runs[-1].id if task.runs else None,
         }
@@ -1716,8 +1725,9 @@ class StateStore:
             self._issues_dirty = False
             self._static_dirty = False
             task_context = self._task_snapshot_context() if task_keys else None
+            failure_roots = self._failure_roots_index() if len(task_keys) > 1 else None
             task_payloads = {
-                key: json.dumpb(self._hot_task_dict(self.tasks[key], task_context))
+                key: json.dumpb(self._hot_task_dict(self.tasks[key], task_context, failure_roots))
                 for key in sorted(task_keys)
                 if key in self.tasks
             }
@@ -3370,15 +3380,60 @@ class StateStore:
         visit(task)
         return tuple(sorted(roots))
 
-    def failed_requirements(self, task: TaskRecord) -> tuple[Requirement, ...]:
-        roots = set(self.failure_roots(task))
+    def _failure_roots_index(self) -> dict[str, tuple[str, ...]]:
+        """Resolve failure roots for every task in one graph traversal.
+
+        Snapshot persistence projects every task row together. Walking from each
+        row independently repeats long prerequisite prefixes and becomes
+        quadratic on corpus-sized dependency chains. Propagating roots through
+        the reverse pending-task graph visits each requirement once and shares
+        the result among every projected row.
+        """
+
+        roots: dict[str, set[str]] = {key: set() for key in self.tasks}
+        dependents: dict[str, list[str]] = {}
+        for key, task in self.tasks.items():
+            for requirement in self.task_requirements(task):
+                owner_key = requirement.owner_task_key
+                if owner_key is None:
+                    continue
+                owner = self.tasks.get(owner_key)
+                if owner is None:
+                    continue
+                if owner.status == TaskStatus.FAILED:
+                    roots[key].add(owner_key)
+                elif owner.status == TaskStatus.PENDING:
+                    dependents.setdefault(owner_key, []).append(key)
+
+        pending = deque(key for key, values in roots.items() if values)
+        queued = set(pending)
+        while pending:
+            owner_key = pending.popleft()
+            queued.discard(owner_key)
+            owner_roots = roots[owner_key]
+            for dependent_key in dependents.get(owner_key, ()):
+                dependent_roots = roots[dependent_key]
+                previous_size = len(dependent_roots)
+                dependent_roots.update(owner_roots)
+                if len(dependent_roots) != previous_size and dependent_key not in queued:
+                    pending.append(dependent_key)
+                    queued.add(dependent_key)
+        return {key: tuple(sorted(values)) for key, values in roots.items()}
+
+    def failed_requirements(
+        self,
+        task: TaskRecord,
+        *,
+        roots: Iterable[str] | None = None,
+    ) -> tuple[Requirement, ...]:
+        resolved_roots = self.failure_roots(task) if roots is None else roots
         return tuple(
             Requirement(
                 RequirementKind.STAGE_DEPENDENCY,
                 owner_task_key=key,
                 detail="waiting on a failed prerequisite",
             )
-            for key in sorted(roots)
+            for key in sorted(set(resolved_roots))
         )
 
     def _refresh_waiting_tasks(self) -> list[TaskRecord]:

@@ -189,6 +189,38 @@ async def test_transient_wait_does_not_write_descendant_task_rows(tmp_path, monk
 
 
 @pytest.mark.asyncio
+async def test_hot_snapshot_resolves_failure_roots_in_one_graph_pass(tmp_path, monkeypatch) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    state = StateStore(config)
+    await state.load_or_create()
+    first, second = config.work_units
+    state.source_dependency_tree = {
+        "dependencies": {
+            first.id: [],
+            second.id: [first.id],
+        }
+    }
+    state.task(first.id, Stage.FORMALIZE).status = TaskStatus.FAILED
+
+    expected = {key: state.failure_roots(task) for key, task in state.tasks.items()}
+    calls = 0
+    original = state.task_requirements
+
+    def counted(task):
+        nonlocal calls
+        calls += 1
+        return original(task)
+
+    monkeypatch.setattr(state, "task_requirements", counted)
+    snapshot = state.hot_snapshot()
+
+    assert calls == len(state.tasks)
+    for key, task in snapshot["tasks"].items():
+        assert tuple(task["blocked_by"]) == expected[key]
+    await state.close()
+
+
+@pytest.mark.asyncio
 async def test_structured_wait_and_direct_failure_survive_restart(tmp_path) -> None:
     config_path = write_project(tmp_path, chapters="chapters = [1, 2]")
     config = load_config(config_path)
