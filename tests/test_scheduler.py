@@ -6,6 +6,7 @@ from collections.abc import Callable, Iterable
 from dataclasses import replace
 from pathlib import Path
 from threading import Event, get_ident
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -2174,6 +2175,50 @@ async def test_shepherd_reconciliation_accepts_matching_clean_build_without_agen
     assert await orchestrator._reconcile_stale_formalizations()
     assert state.task(chapter.id, Stage.FORMALIZE).status == TaskStatus.SUCCEEDED
     assert state.task(chapter.id, Stage.FORMALIZE).rounds == 0
+    await state.close()
+
+
+@pytest.mark.asyncio
+async def test_shepherd_reconciliation_certifies_completed_unchanged_agent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = config.chapters[0]
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await state.load_or_create()
+    digest = scope_digest(config.settings.repo, chapter)
+    run = await state.start_run(chapter.id, Stage.FORMALIZE)
+    await state.finish_run(
+        run,
+        status=TaskStatus.SUCCEEDED,
+        changed=True,
+        report={"complete": True},
+        source_digest=digest,
+    )
+    await state.set_task(
+        chapter.id,
+        Stage.FORMALIZE,
+        TaskStatus.FAILED,
+        "coordinator result was interrupted",
+    )
+    snapshot = SimpleNamespace()
+
+    async def build(*_args: object, snapshots: dict[str, object], **_kwargs: object):
+        snapshots[chapter.id] = snapshot
+        return {chapter.id: ValidationResult(True, 0, "clean")}
+
+    async def publish(_chapter: object, built: object) -> bool:
+        assert built is snapshot
+        return True
+
+    monkeypatch.setattr(orchestrator, "_build_chapters", build)
+    monkeypatch.setattr(orchestrator, "_publish_validated_build", publish)
+
+    assert await orchestrator._reconcile_stale_formalizations()
+    assert state.task(chapter.id, Stage.FORMALIZE).status == TaskStatus.SUCCEEDED
+    assert run.validation is not None
+    assert run.validation["status"] == ValidationStatus.CLEAN
     await state.close()
 
 

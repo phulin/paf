@@ -1738,9 +1738,7 @@ class Orchestrator:
                 isolation=isolated.as_dict(),
                 validation=validation.as_dict(),
                 source_digest=(
-                    await asyncio.to_thread(scope_digest, self.config.settings.repo, chapter)
-                    if isolated.accepted and agent.changed
-                    else None
+                    agent.source_digest if isolated.accepted and agent.source_digest else None
                 ),
             )
         except BaseException as error:
@@ -5297,9 +5295,7 @@ class Orchestrator:
                 continue
             self.state.load_run_details(latest)
             report = latest.report if isinstance(latest.report, dict) else {}
-            source_unchanged = latest.source_digest == current_digest or (
-                latest.source_digest is None and latest.changed is False
-            )
+            source_unchanged = latest.source_digest == current_digest
             if report.get("complete") is not True or not source_unchanged:
                 continue
             snapshots: dict[str, ValidatedBuildSnapshot] = {}
