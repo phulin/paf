@@ -2,6 +2,7 @@ import argparse
 import asyncio
 import json
 import sys
+from collections.abc import Iterable
 from io import StringIO
 from pathlib import Path
 
@@ -94,6 +95,47 @@ def test_failure_summary_prints_task_build_and_blocker_details(tmp_path: Path) -
     assert "Coordinator build" in rendered
     assert "Blocked dependents (1)" in rendered
     assert str(state.path) in rendered
+
+
+def test_failure_summary_batches_pending_failure_roots(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    state = StateStore(config)
+    chapter = config.chapters[0]
+
+    async def populate() -> None:
+        await state.load_or_create()
+        await state.set_task(
+            chapter.id,
+            Stage.REVIEW,
+            TaskStatus.FAILED,
+            "review failed",
+        )
+
+    asyncio.run(populate())
+    original = state._failure_roots_subset
+    batches: list[tuple[str, ...]] = []
+
+    def batched(task_keys: Iterable[str]) -> dict[str, tuple[str, ...]]:
+        keys = tuple(task_keys)
+        batches.append(keys)
+        return original(keys)
+
+    monkeypatch.setattr(state, "_failure_roots_subset", batched)
+    monkeypatch.setattr(
+        state,
+        "failure_roots",
+        lambda _task: pytest.fail("failure summary used a per-task graph walk"),
+    )
+    output = StringIO()
+    console = Console(file=output, force_terminal=False, color_system=None, width=160)
+
+    cli_module._print_failure_summary(state, console)
+
+    assert len(batches) == 1
+    assert "Blocked dependents (1)" in output.getvalue()
+    assert f"waiting on {state.key(chapter.id, Stage.REVIEW)}" in output.getvalue()
 
 
 def test_graph_failure_does_not_print_historical_agent_findings(tmp_path: Path) -> None:
