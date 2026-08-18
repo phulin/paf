@@ -901,7 +901,9 @@ class StateStore:
             }
         return value
 
-    def _task_dict(self, task: TaskRecord) -> dict[str, Any]:
+    def _task_snapshot_context(self) -> dict[str, Any]:
+        """Precompute build-freshness sets shared by every projected task row."""
+
         clean_value = self.formalize_graph.get("clean", {})
         clean = clean_value if isinstance(clean_value, dict) else {}
         interfaces_value = self.formalize_graph.get("interfaces", {})
@@ -911,23 +913,45 @@ class StateStore:
         stale_value = self.formalize_graph.get("interface_stale", ())
         stale = set(stale_value) if isinstance(stale_value, list) else set()
         import_graph = self.formalize_graph.get("interface_import_graph", {})
-        dependencies_value = (
-            import_graph.get("dependencies", {}) if isinstance(import_graph, dict) else {}
-        )
-        dependencies = dependencies_value if isinstance(dependencies_value, dict) else {}
-        required = {task.chapter_id}
-        pending = [task.chapter_id]
+        raw_edges = import_graph.get("edges", ()) if isinstance(import_graph, dict) else ()
+        successors: dict[str, list[str]] = {}
+        if isinstance(raw_edges, list):
+            for edge in raw_edges:
+                if (
+                    isinstance(edge, list)
+                    and len(edge) == 2
+                    and all(isinstance(item, str) for item in edge)
+                ):
+                    successors.setdefault(edge[0], []).append(edge[1])
+        stale_dependencies = set(stale)
+        pending = list(stale)
         while pending:
             chapter_id = pending.pop()
-            values = dependencies.get(chapter_id, ())
-            if not isinstance(values, list):
-                continue
-            for dependency in values:
-                if isinstance(dependency, str) and dependency not in required:
-                    required.add(dependency)
-                    pending.append(dependency)
+            for successor in successors.get(chapter_id, ()):
+                if successor not in stale_dependencies:
+                    stale_dependencies.add(successor)
+                    pending.append(successor)
+        return {
+            "clean": clean,
+            "interfaces": interfaces,
+            "dirty": dirty,
+            "stale": stale,
+            "stale_dependencies": stale_dependencies,
+        }
+
+    def _task_dict(
+        self,
+        task: TaskRecord,
+        context: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        context = context or self._task_snapshot_context()
+        clean = context["clean"]
+        interfaces = context["interfaces"]
+        dirty = context["dirty"]
+        stale = context["stale"]
+        stale_dependencies = context["stale_dependencies"]
         interface_current = task.chapter_id in interfaces and task.chapter_id not in stale
-        dependencies_current = not bool(required & stale)
+        dependencies_current = task.chapter_id not in stale_dependencies
         if task.chapter_id in stale or task.chapter_id in dirty:
             head_build_status = "pending"
         elif task.chapter_id in clean:
@@ -1122,11 +1146,12 @@ class StateStore:
         ]
 
     def hot_snapshot(self) -> dict[str, Any]:
+        task_context = self._task_snapshot_context()
         return self._global_snapshot() | {
             "documents": [dict(value) for value in self._document_dicts()],
             "work_units": [dict(value) for value in self._work_unit_dicts()],
             "tasks": {
-                key: self._task_dict(task)
+                key: self._task_dict(task, task_context)
                 | {
                     "run_count": len(task.runs),
                     "latest_run_id": task.runs[-1].id if task.runs else None,
@@ -1190,10 +1215,14 @@ class StateStore:
         """Project one in-process change notification into the dashboard wire model."""
 
         task_keys = sorted(
-            key for key, task in self.tasks.items() if task.chapter_id in change.work_units
+            key
+            for work_unit_id in change.work_units
+            for stage in Stage
+            if (key := self.key(work_unit_id, stage)) in self.tasks
         )
+        task_context = self._task_snapshot_context()
         tasks = {
-            key: self._hot_task_dict(self.tasks[key])
+            key: self._hot_task_dict(self.tasks[key], task_context)
             | {
                 "work_unit_usage": self._usage_dict(
                     self.invocation_usage(self.tasks[key].work_unit_id)
@@ -1269,6 +1298,7 @@ class StateStore:
         """Return complete state, loading immutable run payloads on demand."""
 
         snapshot = self.hot_snapshot()
+        task_context = self._task_snapshot_context()
         payloads = self._database.run_payloads() if self.database_path.is_file() else {}
         tasks: dict[str, Any] = {}
         for key, task in sorted(self.tasks.items()):
@@ -1282,15 +1312,19 @@ class StateStore:
                 ):
                     value = self._run_dict(run)
                 runs.append(value)
-            tasks[key] = self._task_dict(task) | {"runs": runs}
+            tasks[key] = self._task_dict(task, task_context) | {"runs": runs}
         snapshot["source_issues"] = [
             self._issue_dict(issue) for _, issue in sorted(self.source_issues.items())
         ]
         snapshot["tasks"] = tasks
         return snapshot
 
-    def _hot_task_dict(self, task: TaskRecord) -> dict[str, Any]:
-        return self._task_dict(task) | {
+    def _hot_task_dict(
+        self,
+        task: TaskRecord,
+        context: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return self._task_dict(task, context) | {
             "run_count": len(task.runs),
             "latest_run_id": task.runs[-1].id if task.runs else None,
         }
@@ -1366,8 +1400,9 @@ class StateStore:
             self._checkpoint_dirty = False
             self._issues_dirty = False
             self._static_dirty = False
+            task_context = self._task_snapshot_context()
             task_payloads = {
-                key: json.dumpb(self._hot_task_dict(self.tasks[key]))
+                key: json.dumpb(self._hot_task_dict(self.tasks[key], task_context))
                 for key in sorted(task_keys)
                 if key in self.tasks
             }
