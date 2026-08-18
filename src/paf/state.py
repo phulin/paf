@@ -1607,7 +1607,7 @@ class StateStore:
             next_graph_cache: dict[str, GraphSnapshot] = {}
             for section in sorted(dirty_sections.intersection(GRAPH_SECTIONS)):
                 current = graph_snapshot(section, self._section_value(section))
-                previous = self._graph_cache.get(section, GraphSnapshot({}, {}, frozenset()))
+                previous = self._graph_cache.get(section, GraphSnapshot({}, {}, {}))
                 metadata_upserts = {
                     key: json.dumpb(payload)
                     for key, payload in current.metadata.items()
@@ -1623,8 +1623,12 @@ class StateStore:
                     metadata_deletes=frozenset(previous.metadata.keys() - current.metadata.keys()),
                     node_upserts=node_upserts,
                     node_deletes=frozenset(previous.nodes.keys() - current.nodes.keys()),
-                    edge_upserts=current.edges - previous.edges,
-                    edge_deletes=previous.edges - current.edges,
+                    edge_upserts={
+                        edge: ordinal
+                        for edge, ordinal in current.edges.items()
+                        if previous.edges.get(edge) != ordinal
+                    },
+                    edge_deletes=frozenset(previous.edges.keys() - current.edges.keys()),
                 )
                 if (
                     delta.metadata_upserts

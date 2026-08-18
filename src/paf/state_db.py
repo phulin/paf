@@ -46,7 +46,7 @@ class CollectionWrite:
 class GraphSnapshot:
     metadata: dict[str, Any]
     nodes: dict[tuple[str, str], tuple[int, Any]]
-    edges: frozenset[tuple[str, str, str]]
+    edges: dict[tuple[str, str, str], int]
 
 
 @dataclass(frozen=True)
@@ -55,7 +55,7 @@ class GraphWrite:
     metadata_deletes: frozenset[str] = frozenset()
     node_upserts: dict[tuple[str, str], tuple[int, bytes]] = field(default_factory=dict)
     node_deletes: frozenset[tuple[str, str]] = frozenset()
-    edge_upserts: frozenset[tuple[str, str, str]] = frozenset()
+    edge_upserts: dict[tuple[str, str, str], int] = field(default_factory=dict)
     edge_deletes: frozenset[tuple[str, str, str]] = frozenset()
 
 
@@ -214,19 +214,20 @@ def graph_snapshot(section: str, value: Any) -> GraphSnapshot:
             )
             for node_id in node_ids
         }
-        edges = frozenset(
-            ("dependency", str(prerequisite), str(dependent))
-            for dependent, required in dependencies.items()
-            if isinstance(required, list)
-            for prerequisite in required
-            if isinstance(prerequisite, str)
-        )
-        if not edges:
-            edges = frozenset(
-                ("dependency", str(edge[0]), str(edge[1]))
-                for edge in graph.get("edges", [])
-                if isinstance(edge, list) and len(edge) == 2
-            )
+        edge_values = [
+            ("dependency", str(edge[0]), str(edge[1]))
+            for edge in graph.get("edges", [])
+            if isinstance(edge, list) and len(edge) == 2
+        ]
+        if not edge_values:
+            edge_values = [
+                ("dependency", str(prerequisite), str(dependent))
+                for dependent, required in dependencies.items()
+                if isinstance(required, list)
+                for prerequisite in required
+                if isinstance(prerequisite, str)
+            ]
+        edges = {edge: ordinal for ordinal, edge in enumerate(edge_values)}
         return GraphSnapshot(metadata, nodes, edges)
 
     excluded = {
@@ -278,13 +279,29 @@ def graph_snapshot(section: str, value: Any) -> GraphSnapshot:
         )
         for node_id in node_ids
     }
-    edges = {
-        ("dependency", str(prerequisite), str(dependent))
-        for dependent, required in dependencies.items()
-        if isinstance(required, list)
-        for prerequisite in required
-        if isinstance(prerequisite, str)
-    }
+    dependency_edges = [
+        ("dependency", str(edge[0]), str(edge[1]))
+        for edge in graph.get("edges", [])
+        if isinstance(edge, list) and len(edge) == 2
+    ]
+    if not dependency_edges:
+        dependency_edges = [
+            ("dependency", str(prerequisite), str(dependent))
+            for dependent, required in dependencies.items()
+            if isinstance(required, list)
+            for prerequisite in required
+            if isinstance(prerequisite, str)
+        ]
+    edges = {edge: ordinal for ordinal, edge in enumerate(dependency_edges)}
+    next_edge_ordinal = len(edges)
+    for dependent, required in imports.items():
+        if not isinstance(required, list):
+            continue
+        for prerequisite in required:
+            if not isinstance(prerequisite, str):
+                continue
+            edges[("interface_raw", prerequisite, str(dependent))] = next_edge_ordinal
+            next_edge_ordinal += 1
     interface_graph = graph.get("interface_import_graph", {})
     interface_graph = interface_graph if isinstance(interface_graph, dict) else {}
     interface_order = [item for item in interface_graph.get("order", []) if isinstance(item, str)]
@@ -303,18 +320,27 @@ def graph_snapshot(section: str, value: Any) -> GraphSnapshot:
             for node_id in interface_ids
         }
     )
+    interface_edges = [
+        ("interface", str(edge[0]), str(edge[1]))
+        for edge in interface_graph.get("edges", [])
+        if isinstance(edge, list) and len(edge) == 2
+    ]
+    if not interface_edges:
+        interface_edges = [
+            ("interface", str(prerequisite), str(dependent))
+            for dependent, required in interface_dependencies.items()
+            if isinstance(required, list)
+            for prerequisite in required
+            if isinstance(prerequisite, str)
+        ]
     edges.update(
-        ("interface", str(prerequisite), str(dependent))
-        for dependent, required in interface_dependencies.items()
-        if isinstance(required, list)
-        for prerequisite in required
-        if isinstance(prerequisite, str)
+        {edge: next_edge_ordinal + ordinal for ordinal, edge in enumerate(interface_edges)}
     )
     metadata["interface_graph_algorithm"] = interface_graph.get(
         "algorithm", "observed-lean-imports"
     )
     metadata["interface_graph_coverage"] = interface_graph.get("coverage", len(imports))
-    return GraphSnapshot(metadata, nodes, frozenset(edges))
+    return GraphSnapshot(metadata, nodes, edges)
 
 
 def restore_graph(snapshot: GraphSnapshot, section: str) -> dict[str, Any]:
@@ -333,14 +359,16 @@ def restore_graph(snapshot: GraphSnapshot, section: str) -> dict[str, Any]:
         )
         order = [node_id for node_id, _ in ordered]
         dependencies = {node_id: [] for node_id in order}
-        edges = sorted(
-            (source, target) for edge_kind, source, target in snapshot.edges if edge_kind == kind
-        )
+        edges = [
+            (source, target)
+            for (edge_kind, source, target), _ in sorted(
+                snapshot.edges.items(), key=lambda item: (item[1], item[0])
+            )
+            if edge_kind == kind
+        ]
         for source, target in edges:
             dependencies.setdefault(source, [])
             dependencies.setdefault(target, []).append(source)
-        for required in dependencies.values():
-            required.sort()
         return order, [[source, target] for source, target in edges], dependencies
 
     order, edges, dependencies = projection("dependency")
@@ -377,9 +405,13 @@ def restore_graph(snapshot: GraphSnapshot, section: str) -> dict[str, Any]:
         if payload.get("interface_imports"):
             imports_present.add(node_id)
     interface_order, interface_edges, interface_dependencies = projection("interface")
-    interface_imports = {
-        node_id: interface_dependencies.get(node_id, []) for node_id in sorted(imports_present)
-    }
+    raw_imports: dict[str, list[str]] = {node_id: [] for node_id in imports_present}
+    for (kind, source, target), _ in sorted(
+        snapshot.edges.items(), key=lambda item: (item[1], item[0])
+    ):
+        if kind == "interface_raw" and target in raw_imports:
+            raw_imports[target].append(source)
+    interface_imports = {node_id: raw_imports[node_id] for node_id in sorted(imports_present)}
     interface_algorithm = metadata.pop("interface_graph_algorithm", "observed-lean-imports")
     interface_coverage = metadata.pop("interface_graph_coverage", len(interface_imports))
     projections = {
@@ -529,6 +561,7 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             kind TEXT NOT NULL,
             source_id TEXT NOT NULL,
             target_id TEXT NOT NULL,
+            ordinal INTEGER NOT NULL DEFAULT 0,
             revision INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY(graph, kind, source_id, target_id)
         );
@@ -600,8 +633,14 @@ def _replace_graph(connection: sqlite3.Connection, section: str, value: Any) -> 
         ),
     )
     connection.executemany(
-        "INSERT INTO graph_edges(graph, kind, source_id, target_id) VALUES(?, ?, ?, ?)",
-        ((section, kind, source, target) for kind, source, target in snapshot.edges),
+        """
+        INSERT INTO graph_edges(graph, kind, source_id, target_id, ordinal)
+        VALUES(?, ?, ?, ?, ?)
+        """,
+        (
+            (section, kind, source, target, ordinal)
+            for (kind, source, target), ordinal in snapshot.edges.items()
+        ),
     )
 
 
@@ -824,16 +863,16 @@ def _load_graph(connection: sqlite3.Connection, section: str) -> dict[str, Any]:
             (section,),
         )
     }
-    edges = frozenset(
-        (str(kind), str(source), str(target))
-        for kind, source, target in connection.execute(
+    edges = {
+        (str(kind), str(source), str(target)): int(ordinal)
+        for kind, source, target, ordinal in connection.execute(
             """
-            SELECT kind, source_id, target_id FROM graph_edges
-            WHERE graph=? ORDER BY kind, source_id, target_id
+            SELECT kind, source_id, target_id, ordinal FROM graph_edges
+            WHERE graph=? ORDER BY kind, ordinal, source_id, target_id
             """,
             (section,),
         )
-    )
+    }
     return restore_graph(GraphSnapshot(metadata, nodes, edges), section)
 
 
@@ -1143,7 +1182,7 @@ def _coalesce_writes(writes: list[DatabaseWrite]) -> DatabaseWrite:
             metadata_deletes = set(previous.metadata_deletes)
             node_upserts = dict(previous.node_upserts)
             node_deletes = set(previous.node_deletes)
-            edge_upserts = set(previous.edge_upserts)
+            edge_upserts = dict(previous.edge_upserts)
             edge_deletes = set(previous.edge_deletes)
             for key in delta.metadata_deletes:
                 metadata_upserts.pop(key, None)
@@ -1158,17 +1197,17 @@ def _coalesce_writes(writes: list[DatabaseWrite]) -> DatabaseWrite:
                 node_deletes.discard(key)
                 node_upserts[key] = value
             for edge in delta.edge_deletes:
-                edge_upserts.discard(edge)
+                edge_upserts.pop(edge, None)
                 edge_deletes.add(edge)
-            for edge in delta.edge_upserts:
+            for edge, ordinal in delta.edge_upserts.items():
                 edge_deletes.discard(edge)
-                edge_upserts.add(edge)
+                edge_upserts[edge] = ordinal
             graphs[section] = GraphWrite(
                 metadata_upserts,
                 frozenset(metadata_deletes),
                 node_upserts,
                 frozenset(node_deletes),
-                frozenset(edge_upserts),
+                edge_upserts,
                 frozenset(edge_deletes),
             )
         tasks.update(write.tasks)
@@ -1388,13 +1427,15 @@ class StateDatabase:
                     )
                     connection.executemany(
                         """
-                        INSERT OR IGNORE INTO graph_edges(
-                            graph, kind, source_id, target_id, revision
-                        ) VALUES(?, ?, ?, ?, ?)
+                        INSERT INTO graph_edges(
+                            graph, kind, source_id, target_id, ordinal, revision
+                        ) VALUES(?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(graph, kind, source_id, target_id) DO UPDATE SET
+                            ordinal=excluded.ordinal, revision=excluded.revision
                         """,
                         (
-                            (section, kind, source, target, revision)
-                            for kind, source, target in delta.edge_upserts
+                            (section, kind, source, target, ordinal, revision)
+                            for (kind, source, target), ordinal in delta.edge_upserts.items()
                         ),
                     )
                 for key, payload in write.tasks.items():
