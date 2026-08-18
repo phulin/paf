@@ -3,9 +3,10 @@
 ## Goal
 
 Turn every precise mathematical statement in chapter {chapter_number}, “{chapter_title},” into an
-accurate, usable Lean declaration. Create or update the chapter files under
-`{lean_root}/{chapter_path}/` and the top-level file `{lean_root}/{chapter_path}.lean` that imports
-them.
+accurate, usable Lean declaration. Every chapter must have its own chapter-specific top-level file
+`{lean_root}/{chapter_path}.lean`; create or update it and any chapter files under
+`{lean_root}/{chapter_path}/` that it imports. Do not leave this chapter's content only in a shared
+file or a file belonging to another chapter.
 
 This stage builds the chapter's definitions and theorem statements; it does not prove the theorems.
 Theorem proofs may be `by sorry`, but every definition must have a real body when the construction is
@@ -32,8 +33,10 @@ declaration that uses `sorry`.
 5. For each main theorem, read its informal proof and identify a plausible route through declarations
    that already exist in Mathlib or earlier chapters. Add a new supporting interface only when that
    search shows a real gap and the new declaration has a named user in this chapter.
-6. Preserve source order and dependency order. Finish and check the active section before moving to
-   the next one. After all sections are complete, perform the planned chapter-wide coverage check.
+6. Preserve source order and dependency order. No file belonging to this chapter may import a future
+   chapter. An introduction chapter must contain only its own mathematical content and likewise must
+   not import any future chapter. Finish and check the active section before moving to the next one.
+   After all sections are complete, perform the planned chapter-wide coverage and import check.
 7. Use the attached Lean tools after editing. Prepare the affected dependent files once, then request
    whole-file diagnostics from prerequisites to dependents. Fix every error and every warning except
    the exact warning that a declaration uses `sorry`. Replace time-consuming proposition proofs with
@@ -55,6 +58,11 @@ narration, or redundant paraphrases into declarations. Match hypotheses, types, 
 normalization conventions, and assumptions such as finiteness, separation, completeness, and
 characteristic exactly.
 
+Keep chapter ownership and import direction explicit: create the file for this specific chapter, and
+never add a forward import from one of its files to a later chapter. In particular, an introduction
+file contains only the introduction's mathematical content; it must not serve as an import hub for
+future chapters or import them to make declarations available.
+
 If the source contains a genuinely false or underspecified assertion, make only the smallest
 mathematically principled correction and record the problem in `source_issues`. If an essential
 earlier fact is missing, add only a natural dependency that belongs at that earlier point—never an
@@ -68,9 +76,11 @@ the authoritative build after each attempt.
 Every substantive source assertion is represented or explicitly accounted for. Existing Mathlib and
 earlier-chapter APIs have been reused wherever possible, new interfaces fill demonstrated gaps, the
 declarations follow source and dependency order, definitions have real bodies where practical, and
-diagnostics are clean except for declarations using `sorry`. Report remaining coverage gaps, source
-problems, and important interface choices. Set `complete` to `true` only after both the full coverage
-check and the clean diagnostic check are finished.
+the chapter has its own file with no forward imports, and diagnostics are clean except for
+declarations using `sorry`. Introduction files contain only their chapter's mathematical content and
+do not import future chapters. Report remaining coverage gaps, source problems, and important
+interface choices. Set `complete` to `true` only after the full coverage/import check and the clean
+diagnostic check are finished.
 
 ## Output format
 

@@ -8,6 +8,10 @@ supporting interface that is inaccurate or unusable. This stage reviews the form
 not prove theorem bodies, so existing proof placeholders may remain and new proposition proofs may
 use `by sorry`.
 
+Verify that this chapter has its own chapter-specific top-level file
+`{lean_root}/{chapter_path}.lean`; create it if it is missing rather than leaving the chapter's
+content only in a shared file or a file belonging to another chapter.
+
 PAF has already built the incoming files successfully, allowing only warnings for declarations that
 use `sorry`.
 
@@ -38,9 +42,10 @@ delivery state has been established.
 6. Make the smallest in-scope repair for every inaccurate, circular, vacuous, unnecessarily strong,
    or otherwise unprovable interface. Add a new supporting declaration only after the searches in
    step 2 show that no suitable declaration already exists.
-7. After all sections are complete, perform the planned chapter-wide coverage and import check. Do
-   not defer a repair that belongs in the assigned files; describe any exact out-of-scope blocker in
-   `issues`.
+7. After all sections are complete, perform the planned chapter-wide coverage and import check. No
+   file belonging to this chapter may import a future chapter. An introduction chapter must contain
+   only its own mathematical content and must not import any future chapter. Do not defer a repair
+   that belongs in the assigned files; describe any exact out-of-scope blocker in `issues`.
 8. Use the attached Lean tools as needed while investigating. After the final edit, check the edited
    files and every assigned file that depends on them, from prerequisites to dependents. Fix every
    warning and error except the exact warning that a declaration uses `sorry`.
@@ -59,13 +64,20 @@ searches as questions arise. Do not run Lean, Lake, or another language server d
 the attached Lean tools. Edit only the assigned paths. A no-change review needs no diagnostic calls
 because the incoming build is already clean.
 
+Keep chapter ownership and import direction explicit: every chapter gets its own file, and no file
+from that chapter may have a forward import to a later chapter. In particular, an introduction file
+contains only the introduction's mathematical content; it must not serve as an import hub for future
+chapters or import them to make declarations available.
+
 ## Definition of done
 
 Every source assertion and every main theorem's likely proof route has been checked. Existing Mathlib
 and earlier-chapter APIs have been reused wherever possible, all warranted in-scope repairs have been
-made, imports remain focused and cycle-free, and the complete assigned Lean scope has zero errors and
-zero warnings except permitted exact declaration-uses-`sorry` warnings. Report source problems and
-any exact out-of-scope changes still required.
+made, the chapter has its own file, imports remain focused, cycle-free, and free of forward imports,
+and the complete assigned Lean scope has zero errors and zero warnings except permitted exact
+declaration-uses-`sorry` warnings. Introduction files contain only their chapter's mathematical
+content and do not import future chapters. Report source problems and any exact out-of-scope changes
+still required.
 
 ## Output format
 
