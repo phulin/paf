@@ -306,6 +306,32 @@ def test_observed_graph_is_reused_until_dependency_state_is_replaced(
     assert builds == 2
 
 
+def test_current_interface_graph_is_reused_for_freshness_checks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    first, second = config.chapters
+    orchestrator = Orchestrator(config, StateStore(config))
+    graph = orchestrator._observed_work_unit_graph()
+    orchestrator.state.formalize_graph = {
+        "interface_stale": [first.id],
+        "interface_imports": {first.id: [], second.id: [first.id]},
+    }
+    original_build = scheduler_module.build_compiled_import_graph
+    builds = 0
+
+    def counted_build(*args: Any, **kwargs: Any) -> Any:
+        nonlocal builds
+        builds += 1
+        return original_build(*args, **kwargs)
+
+    monkeypatch.setattr(scheduler_module, "build_compiled_import_graph", counted_build)
+
+    assert not orchestrator._interface_dependencies_are_current(graph, first.id)
+    assert not orchestrator._interface_dependencies_are_current(graph, second.id)
+    assert builds == 1
+
+
 @pytest.mark.asyncio
 async def test_prepare_migrates_legacy_discovery_and_build_digests(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))

@@ -392,6 +392,9 @@ class Orchestrator:
         self._diagnostic_owner_cache_lock = Lock()
         self._observed_graph_source: dict[str, Any] | None = None
         self._observed_graph_cache: WorkUnitImportGraph | None = None
+        self._interface_graph_key: tuple[int, int, int, int] | None = None
+        self._interface_graph_cache: WorkUnitImportGraph | None = None
+        self._interface_stale_cache: set[str] = set()
         self._build_diagnostic_indexes()
         self.force = force
         self.resume_agents = resume_agents
@@ -1356,6 +1359,14 @@ class Orchestrator:
         if not stale:
             return True
         raw_imports = self.state.formalize_graph.get("interface_imports", {})
+        cache_key = (
+            id(self.state.formalize_graph),
+            id(raw_imports),
+            id(stale_value),
+            id(graph),
+        )
+        if cache_key == self._interface_graph_key and self._interface_graph_cache is not None:
+            return chapter_id not in self._interface_stale_cache
         compiled = (
             {
                 str(owner): tuple(item for item in dependencies if isinstance(item, str))
@@ -1366,7 +1377,10 @@ class Orchestrator:
             else {}
         )
         interface_graph = self._interface_invalidation_graph(graph, compiled)
-        return not bool(self._dependency_closure(interface_graph, (chapter_id,)) & stale)
+        self._interface_graph_key = cache_key
+        self._interface_graph_cache = interface_graph
+        self._interface_stale_cache = self._successor_closure(interface_graph, stale)
+        return chapter_id not in self._interface_stale_cache
 
     async def _scope_exists(self, chapter: WorkUnitLike) -> bool:
         return await asyncio.to_thread(
