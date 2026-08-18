@@ -777,6 +777,13 @@ class StateDatabase:
             value = json.loads(row[0])
             if not isinstance(value, dict):
                 raise ValueError(f"invalid global state in {self.path}")
+            coordinator_row = connection.execute(
+                "SELECT payload FROM globals WHERE key='coordinator_build'"
+            ).fetchone()
+            if coordinator_row is not None:
+                coordinator = json.loads(coordinator_row[0])
+                if isinstance(coordinator, dict):
+                    value["coordinator_build"] = coordinator
             counts = {
                 str(status): int(count)
                 for status, count in connection.execute(
@@ -918,12 +925,15 @@ class StateDatabase:
                 else []
             )
             tasks = {str(key): json.loads(payload) for key, payload in task_rows}
+            global_ids = {
+                str(change["entity_id"]) for change in changes if change["entity_type"] == "global"
+            }
             globals_: dict[str, Any] = {}
-            if any(change["entity_type"] == "global" for change in changes):
+            if global_ids:
                 global_row = connection.execute(
                     "SELECT payload FROM globals WHERE key='state'"
                 ).fetchone()
-                if global_row is not None:
+                if "state" in global_ids and global_row is not None:
                     value = json.loads(global_row[0])
                     if not isinstance(value, dict):
                         raise ValueError(f"invalid global state in {self.path}")
@@ -931,6 +941,62 @@ class StateDatabase:
                     globals_["revision"] = current
                     if current_row is not None:
                         globals_["updated_at"] = str(current_row[1])
+                for key in sorted(global_ids.difference({"state"})):
+                    section_row = connection.execute(
+                        "SELECT payload FROM globals WHERE key=?", (key,)
+                    ).fetchone()
+                    if section_row is not None:
+                        globals_[key] = json.loads(section_row[0])
+                if "state" in global_ids:
+                    coordinator_row = connection.execute(
+                        "SELECT payload FROM globals WHERE key='coordinator_build'"
+                    ).fetchone()
+                    if coordinator_row is not None:
+                        globals_["coordinator_build"] = json.loads(coordinator_row[0])
+            task_or_run_changed = any(
+                change["entity_type"] in {"task", "run", "work_unit"} for change in changes
+            )
+            if task_or_run_changed and "agents" not in globals_:
+                global_row = connection.execute(
+                    "SELECT payload FROM globals WHERE key='state'"
+                ).fetchone()
+                base_agents: dict[str, Any] = {}
+                if global_row is not None:
+                    base = json.loads(global_row[0])
+                    if isinstance(base, dict) and isinstance(base.get("agents"), dict):
+                        base_agents = dict(base["agents"])
+                by_stage = {
+                    str(stage): int(count)
+                    for stage, count in connection.execute(
+                        "SELECT stage, count(*) FROM runs WHERE status='running' GROUP BY stage"
+                    )
+                }
+                by_role: dict[str, int] = {}
+                for role, stage, count in connection.execute(
+                    """
+                    SELECT json_extract(payload, '$.role'), stage, count(*)
+                    FROM runs WHERE status='running'
+                    GROUP BY json_extract(payload, '$.role'), stage
+                    """
+                ):
+                    name = str(role or stage)
+                    by_role[name] = by_role.get(name, 0) + int(count)
+                task_activity = connection.execute(
+                    """
+                    SELECT
+                        sum(CASE WHEN queued != 0 THEN 1 ELSE 0 END),
+                        sum(CASE WHEN status='running'
+                            AND json_extract(payload, '$.phase')='postprocess' THEN 1 ELSE 0 END)
+                    FROM tasks
+                    """
+                ).fetchone()
+                globals_["agents"] = base_agents | {
+                    "active": sum(by_stage.values()),
+                    "queued": int(task_activity[0] or 0),
+                    "postprocessing": int(task_activity[1] or 0),
+                    "by_stage": dict(base_agents.get("by_stage", {})) | by_stage,
+                    "by_role": by_role,
+                }
             active_run_ids = [
                 str(row[0])
                 for row in connection.execute(
@@ -959,6 +1025,13 @@ class StateDatabase:
             checkpoint = json.loads(global_row[0]) if global_row is not None else None
             if isinstance(checkpoint, dict):
                 checkpoint = dict(checkpoint)
+                coordinator_row = connection.execute(
+                    "SELECT payload FROM globals WHERE key='coordinator_build'"
+                ).fetchone()
+                if coordinator_row is not None:
+                    coordinator = json.loads(coordinator_row[0])
+                    if isinstance(coordinator, dict):
+                        checkpoint["coordinator_build"] = coordinator
                 revision_row = connection.execute(
                     "SELECT revision, updated_at FROM meta WHERE singleton=1"
                 ).fetchone()

@@ -434,6 +434,7 @@ class StateStore:
         self._telemetry_flush_task: asyncio.Task[None] | None = None
         self._batch_depth = 0
         self._checkpoint_dirty = False
+        self._coordinator_build_dirty = False
         self._static_dirty = False
         self._dirty_task_keys: set[str] = set()
         self._issues_dirty = False
@@ -794,6 +795,7 @@ class StateStore:
             self.coordinator_build.active = False
             self.coordinator_build.current_chapter_id = ""
             self.coordinator_build.updated_at = timestamp()
+            self._coordinator_build_dirty = True
         self._normalize_upstream_request_state()
         self._invalidate_aggregates()
         self._rebuild_status_indexes()
@@ -1254,8 +1256,15 @@ class StateStore:
             for task in tasks.values()
             if isinstance((run_id := task.get("latest_run_id")), str)
         )
-        globals_changed = bool(change.globals.difference({"activity"}))
-        globals_ = self._global_snapshot() | {"revision": self.revision} if globals_changed else {}
+        global_names = change.globals.difference({"activity"})
+        if "state" in global_names:
+            globals_ = self._global_snapshot() | {"revision": self.revision}
+        else:
+            globals_ = {}
+            if "coordinator_build" in global_names:
+                globals_["coordinator_build"] = self._build_dict(self.coordinator_build)
+        if change.stages or change.runs:
+            globals_["agents"] = self.agent_summary()
         shepherd = globals_.get("shepherd", {})
         if isinstance(shepherd, dict):
             run_ids.update(
@@ -1387,6 +1396,9 @@ class StateStore:
         self._issues_dirty = self._issues_dirty or issues
         self._static_dirty = self._static_dirty or static
 
+    def _mark_coordinator_build_dirty(self) -> None:
+        self._coordinator_build_dirty = True
+
     async def _persist(self) -> None:
         if self._batch_depth:
             return
@@ -1397,6 +1409,7 @@ class StateStore:
         async with self._flush_lock:
             if not (
                 self._checkpoint_dirty
+                or self._coordinator_build_dirty
                 or self._dirty_task_keys
                 or self._dirty_run_ids
                 or self._issues_dirty
@@ -1407,6 +1420,7 @@ class StateStore:
                 await asyncio.to_thread(self._database.initialize)
             self.updated_at = timestamp()
             globals_dirty = self._checkpoint_dirty
+            coordinator_build_dirty = self._coordinator_build_dirty
             task_keys = self._dirty_task_keys
             dirty_runs = self._dirty_run_ids
             issues_dirty = self._issues_dirty
@@ -1414,6 +1428,7 @@ class StateStore:
             self._dirty_task_keys = set()
             self._dirty_run_ids = set()
             self._checkpoint_dirty = False
+            self._coordinator_build_dirty = False
             self._issues_dirty = False
             self._static_dirty = False
             task_context = self._task_snapshot_context() if task_keys else None
@@ -1475,13 +1490,20 @@ class StateStore:
             }
             if globals_dirty:
                 changes.add(("global", "state"))
+            if coordinator_build_dirty:
+                changes.add(("global", "coordinator_build"))
             if issues_dirty:
                 changes.add(("source_issues", "*"))
             if static_dirty:
                 changes.add(("resync", "*"))
             write = DatabaseWrite(
                 updated_at=self.updated_at,
-                globals={"state": json.dumpb(self._global_snapshot())} if globals_dirty else {},
+                globals=({"state": json.dumpb(self._global_snapshot())} if globals_dirty else {})
+                | (
+                    {"coordinator_build": json.dumpb(self._build_dict(self.coordinator_build))}
+                    if coordinator_build_dirty
+                    else {}
+                ),
                 tasks=task_payloads,
                 runs=runs,
                 source_issues=issues,
@@ -1500,7 +1522,10 @@ class StateStore:
                     revision=revision,
                     work_units=frozenset(changed_work_units),
                     runs=frozenset(runs),
-                    globals=frozenset({"state"} if globals_dirty else ()),
+                    globals=frozenset(
+                        ({"state"} if globals_dirty else set())
+                        | ({"coordinator_build"} if coordinator_build_dirty else set())
+                    ),
                     stages=frozenset(changed_stages),
                     full_resync=static_dirty,
                 )
@@ -2565,7 +2590,7 @@ class StateStore:
         if recovered:
             changed_tasks.extend(self._release_failure_blocked_tasks())
         self._invalidate_status_summaries()
-        self._mark_dirty(tasks=changed_tasks)
+        self._mark_dirty(tasks=changed_tasks, global_state=False)
         await self._persist()
 
     async def set_tasks(
@@ -2630,7 +2655,7 @@ class StateStore:
             changed_tasks.extend(self._release_failure_blocked_tasks())
         if changed:
             self._invalidate_status_summaries()
-            self._mark_dirty(tasks=changed_tasks)
+            self._mark_dirty(tasks=changed_tasks, global_state=False)
             await self._persist()
 
     async def set_task_phase(
@@ -2648,7 +2673,7 @@ class StateStore:
         task.phase = phase
         task.detail = detail
         task.updated_at = timestamp()
-        self._mark_dirty(task=task)
+        self._mark_dirty(task=task, global_state=False)
         await self._persist()
 
     async def unblock(self) -> list[str]:
@@ -2670,7 +2695,7 @@ class StateStore:
         await self.reopen_escalated_upstream_requests(proof_chapters)
         if changed:
             self._invalidate_status_summaries()
-            self._mark_dirty(tasks=(self.tasks[key] for key in changed))
+            self._mark_dirty(tasks=(self.tasks[key] for key in changed), global_state=False)
             await self._persist()
         return changed
 
@@ -2692,7 +2717,7 @@ class StateStore:
             changed.append(key)
         if changed:
             self._invalidate_status_summaries()
-            self._mark_dirty(tasks=(self.tasks[key] for key in changed))
+            self._mark_dirty(tasks=(self.tasks[key] for key in changed), global_state=False)
             await self._persist()
         return changed
 
@@ -2778,7 +2803,7 @@ class StateStore:
             changed.append(key)
         if changed:
             self._invalidate_status_summaries()
-            self._mark_dirty(tasks=(self.tasks[key] for key in changed))
+            self._mark_dirty(tasks=(self.tasks[key] for key in changed), global_state=False)
             await self._persist()
         return changed
 
@@ -2816,7 +2841,7 @@ class StateStore:
         self._index_run(run)
         self._payload_loaded_run_ids.add(run.id)
         self._invalidate_status_summaries()
-        self._mark_dirty(task=task, run=run)
+        self._mark_dirty(task=task, run=run, global_state=False)
         await self._persist()
         return run
 
@@ -2856,7 +2881,7 @@ class StateStore:
         self._index_run(run)
         self._payload_loaded_run_ids.add(run.id)
         self._invalidate_status_summaries()
-        self._mark_dirty(task=task, run=run)
+        self._mark_dirty(task=task, run=run, global_state=False)
         await self._persist()
         return run
 
@@ -3060,7 +3085,7 @@ class StateStore:
             self._invalidate_status_summaries()
         self._mark_dirty(
             run=run,
-            global_state=bool({"usage", "model", "status"} & changes.keys()),
+            global_state=False,
         )
         if deferred:
             self._schedule_telemetry_flush()
@@ -3125,7 +3150,12 @@ class StateStore:
             task.detail = "agent interrupted with the orchestrator"
             task.updated_at = timestamp()
             changed_task = task
-        self._mark_dirty(task=changed_task, run=run, issues=bool(issue_ids))
+        self._mark_dirty(
+            task=changed_task,
+            run=run,
+            issues=bool(issue_ids),
+            global_state=False,
+        )
         await self._persist()
 
     async def start_coordinator_build(
@@ -3149,7 +3179,7 @@ class StateStore:
             total=total,
             target_chapter_ids=list(targets),
         )
-        self._mark_dirty()
+        self._mark_coordinator_build_dirty()
         await self._persist()
 
     async def advance_coordinator_build(
@@ -3168,7 +3198,7 @@ class StateStore:
         if command is not None:
             self.append_coordinator_build_output(f"$ {command}")
         self.coordinator_build.updated_at = timestamp()
-        self._mark_dirty()
+        self._mark_coordinator_build_dirty()
         await self._persist()
 
     def append_coordinator_build_output(
@@ -3213,11 +3243,11 @@ class StateStore:
             *lines,
         ][-maximum:]
         self.coordinator_build.updated_at = timestamp()
-        self._mark_dirty()
+        self._mark_coordinator_build_dirty()
 
     async def finish_coordinator_build(self) -> None:
         self.coordinator_build.active = False
         self.coordinator_build.current_chapter_id = ""
         self.coordinator_build.updated_at = timestamp()
-        self._mark_dirty()
+        self._mark_coordinator_build_dirty()
         await self._persist()

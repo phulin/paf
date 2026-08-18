@@ -1,6 +1,7 @@
 import asyncio
 import json
 import shutil
+import sqlite3
 from dataclasses import replace
 from pathlib import Path
 
@@ -11,9 +12,50 @@ from paf.cli import main
 from paf.config import infer_config, load_config
 from paf.models import PipelineConfig, Stage
 from paf.project import ProjectResolver
-from paf.state import StateStore
+from paf.state import StateStore, TaskStatus
 from paf.state_db import read_checkpoint, read_full_snapshot
 from tests.support import write_project
+
+
+@pytest.mark.asyncio
+async def test_task_and_build_deltas_do_not_rewrite_global_checkpoint(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    state = StateStore(config)
+    await state.load_or_create()
+    database = config.settings.state_dir / "state.sqlite3"
+
+    def global_row(key: str) -> tuple[int, bytes] | None:
+        with sqlite3.connect(database) as connection:
+            row = connection.execute(
+                "SELECT revision, payload FROM globals WHERE key=?", (key,)
+            ).fetchone()
+        return (int(row[0]), bytes(row[1])) if row is not None else None
+
+    checkpoint = global_row("state")
+    assert checkpoint is not None
+    chapter = config.chapters[0]
+    await state.set_task(chapter.id, Stage.FORMALIZE, TaskStatus.RUNNING, "agent running")
+    assert global_row("state") == checkpoint
+
+    await state.start_coordinator_build(
+        mode="test",
+        stage=Stage.FORMALIZE,
+        iteration=1,
+        maximum_iterations=1,
+        total=1,
+        target_work_unit_ids=(chapter.id,),
+    )
+    build = global_row("coordinator_build")
+    assert build is not None
+    assert len(build[1]) < 10_000
+    assert global_row("state") == checkpoint
+
+    state.append_coordinator_build_output("✔ [1/1] Built Book.Chapter01")
+    await state.flush()
+    assert global_row("coordinator_build") != build
+    assert global_row("state") == checkpoint
+    await state.finish_coordinator_build()
+    await state.close()
 
 
 def test_explicit_project_and_paf_toml_resolve_all_project_paths(tmp_path: Path) -> None:
