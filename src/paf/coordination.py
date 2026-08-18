@@ -59,11 +59,8 @@ class PriorityLimiter:
 
 @dataclass
 class CoordinatorBuildLease:
-    priority: float
     label: str
     stage: Stage
-    preemptible: bool
-    preempt_requested: asyncio.Event
 
 
 class CoordinatorBuildSnapshot(TypedDict):
@@ -74,20 +71,20 @@ class CoordinatorBuildSnapshot(TypedDict):
 
 
 class CoordinatorBuildQueue:
-    """Priority gate acquired only by coordinator-owned Lake builds."""
+    """FIFO gate acquired only by coordinator-owned Lake builds."""
 
     def __init__(self) -> None:
         self._sequence = 0
         self._active: CoordinatorBuildLease | None = None
         self._waiters: list[
-            tuple[float, int, asyncio.Future[CoordinatorBuildLease], CoordinatorBuildLease]
+            tuple[int, asyncio.Future[CoordinatorBuildLease], CoordinatorBuildLease]
         ] = []
 
     def _wake(self) -> None:
         if self._active is not None:
             return
         while self._waiters:
-            _, _, future, lease = heapq.heappop(self._waiters)
+            _, future, lease = heapq.heappop(self._waiters)
             if future.done():
                 continue
             self._active = lease
@@ -97,28 +94,17 @@ class CoordinatorBuildQueue:
     async def acquire(
         self,
         *,
-        priority: float,
         label: str,
         stage: Stage,
-        preemptible: bool = False,
     ) -> CoordinatorBuildLease:
         loop = asyncio.get_running_loop()
         future: asyncio.Future[CoordinatorBuildLease] = loop.create_future()
         lease = CoordinatorBuildLease(
-            priority=priority,
             label=label,
             stage=stage,
-            preemptible=preemptible,
-            preempt_requested=asyncio.Event(),
         )
         self._sequence += 1
-        heapq.heappush(self._waiters, (-priority, self._sequence, future, lease))
-        if (
-            self._active is not None
-            and self._active.preemptible
-            and priority > self._active.priority
-        ):
-            self._active.preempt_requested.set()
+        heapq.heappush(self._waiters, (self._sequence, future, lease))
         self._wake()
         try:
             return await future
@@ -136,12 +122,10 @@ class CoordinatorBuildQueue:
         self._wake()
 
     def snapshot(self) -> CoordinatorBuildSnapshot:
-        queued = [lease for _, _, future, lease in self._waiters if not future.done()]
+        queued = [lease for _, future, lease in self._waiters if not future.done()]
         return {
             "owner": self._active.label if self._active is not None else "",
             "owner_stage": self._active.stage.value if self._active is not None else "",
             "queued": len(queued),
-            "queued_jobs": [
-                lease.label for lease in sorted(queued, key=lambda item: -item.priority)
-            ],
+            "queued_jobs": [lease.label for lease in queued],
         }

@@ -73,7 +73,6 @@ from paf.state import (
     UpstreamRequestStatus,
 )
 
-MAXIMUM_IN_FLIGHT_BUILD_BATCHES = 2
 REPAIR_EFFORT = {"small": 1.0, "medium": 3.0, "large": 8.0}
 REVIEW_REPORT_RETRY_PROMPT = """Your previous review turn did not satisfy the report contract:
 
@@ -198,8 +197,6 @@ class PendingBuildRequest:
     iteration: int
     maximum_iterations: int
     stage: Stage
-    priority: float
-    preemptible: bool
     snapshots: dict[str, ValidatedBuildSnapshot] | None
     future: asyncio.Future[dict[str, ValidationResult]]
 
@@ -491,7 +488,6 @@ class Orchestrator:
         self.build_queue = CoordinatorBuildQueue()
         self._pending_build_requests: list[PendingBuildRequest] = []
         self._build_dispatch_task: asyncio.Task[None] | None = None
-        self._build_batch_tasks: set[asyncio.Task[None]] = set()
         # Snapshot creation and scoped source integration need a short
         # consistency barrier with main-worktree builds. Unlike build_queue,
         # this lock is never held for an overlay agent's editing lifetime or
@@ -655,10 +651,6 @@ class Orchestrator:
                 self._build_dispatch_task.cancel()
                 await asyncio.gather(self._build_dispatch_task, return_exceptions=True)
                 self._build_dispatch_task = None
-            batches = tuple(self._build_batch_tasks)
-            for task in batches:
-                task.cancel()
-            await asyncio.gather(*batches, return_exceptions=True)
             for request in self._pending_build_requests:
                 if not request.future.done():
                     request.future.cancel()
@@ -1738,7 +1730,7 @@ class Orchestrator:
             slots.release()
             slot_held = False
             # Agent capacity covers live Codex processes, not integration or a
-            # potentially preempted coordinator build queued after they exit.
+            # coordinator build queued after they exit.
             if not auxiliary:
                 await self.state.set_task_phase(
                     chapter.id,
@@ -1797,14 +1789,6 @@ class Orchestrator:
                                 else "proof-certification"
                             ),
                             stage=Stage.PROVE,
-                            priority=(
-                                priority_override
-                                if priority_override is not None
-                                else 250.0
-                                if auxiliary
-                                else 0.0
-                            ),
-                            preemptible=not auxiliary,
                             snapshots=snapshots,
                         )
                     )[chapter.id]
@@ -1988,7 +1972,6 @@ class Orchestrator:
                         iteration=iteration,
                         maximum_iterations=maximum,
                         stage=Stage.FORMALIZE,
-                        priority=100.0,
                         snapshots=snapshots,
                     )
                 )[chapter.id]
@@ -2049,7 +2032,6 @@ class Orchestrator:
                     iteration=maximum,
                     maximum_iterations=maximum,
                     stage=Stage.FORMALIZE,
-                    priority=100.0,
                     snapshots=snapshots,
                 )
             )[chapter.id]
@@ -3340,8 +3322,6 @@ class Orchestrator:
         iteration: int = 1,
         maximum_iterations: int = 1,
         stage: Stage = Stage.FORMALIZE,
-        priority: float = 100.0,
-        preemptible: bool = False,
         snapshots: dict[str, ValidatedBuildSnapshot] | None = None,
     ) -> dict[str, ValidationResult]:
         """Coalesce pending coordinator requests and return this caller's target results."""
@@ -3360,8 +3340,6 @@ class Orchestrator:
             iteration=iteration,
             maximum_iterations=maximum_iterations,
             stage=stage,
-            priority=priority,
-            preemptible=preemptible,
             snapshots=snapshots,
             future=future,
         )
@@ -3371,30 +3349,23 @@ class Orchestrator:
         return await future
 
     async def _dispatch_build_requests(self) -> None:
-        """Coalesce callers while bounding build batches queued behind the coordinator."""
+        """Drain all build callers through one rolling, cross-stage batch lane."""
 
-        await asyncio.sleep(0)
-        if len(self._build_batch_tasks) >= MAXIMUM_IN_FLIGHT_BUILD_BATCHES:
+        try:
+            while True:
+                # Include every caller that became runnable in the current event-loop turn.
+                await asyncio.sleep(0)
+                requests = tuple(
+                    request
+                    for request in self._pending_build_requests
+                    if not request.future.cancelled()
+                )
+                self._pending_build_requests.clear()
+                if not requests:
+                    return
+                await self._run_build_batch(requests)
+        finally:
             self._build_dispatch_task = None
-            return
-        requests = tuple(
-            request for request in self._pending_build_requests if not request.future.cancelled()
-        )
-        self._pending_build_requests.clear()
-        self._build_dispatch_task = None
-        if not requests:
-            return
-        task = asyncio.create_task(self._run_build_batch(requests))
-        self._build_batch_tasks.add(task)
-
-        def finished(completed: asyncio.Task[None]) -> None:
-            self._build_batch_tasks.discard(completed)
-            if self._pending_build_requests and (
-                self._build_dispatch_task is None or self._build_dispatch_task.done()
-            ):
-                self._build_dispatch_task = asyncio.create_task(self._dispatch_build_requests())
-
-        task.add_done_callback(finished)
 
     async def _run_build_batch(self, requests: tuple[PendingBuildRequest, ...]) -> None:
         """Execute and partition a coalesced batch until every caller has a precise result."""
@@ -3463,7 +3434,7 @@ class Orchestrator:
                 )
                 modes = {request.mode for request in attempt_requests}
                 mode = next(iter(modes)) if len(modes) == 1 else "batched"
-                owner = max(attempt_requests, key=lambda request: request.priority)
+                owner = attempt_requests[0]
                 attempt_snapshots: dict[str, ValidatedBuildSnapshot] = {}
                 capture_snapshots = any(
                     request.snapshots is not None for request in attempt_requests
@@ -3477,8 +3448,6 @@ class Orchestrator:
                         request.maximum_iterations for request in attempt_requests
                     ),
                     stage=owner.stage,
-                    priority=owner.priority,
-                    preemptible=all(request.preemptible for request in attempt_requests),
                     snapshots=attempt_snapshots if capture_snapshots else None,
                 )
                 succeeded_ids = {
@@ -3543,8 +3512,6 @@ class Orchestrator:
         iteration: int = 1,
         maximum_iterations: int = 1,
         stage: Stage = Stage.FORMALIZE,
-        priority: float = 100.0,
-        preemptible: bool = False,
         snapshots: dict[str, ValidatedBuildSnapshot] | None = None,
     ) -> dict[str, ValidationResult]:
         """Execute one deterministic Lake invocation against the coordinator cache."""
@@ -3555,16 +3522,10 @@ class Orchestrator:
         ids = tuple(chapter.id for chapter in selected)
         label = f"{stage.value} {mode}: " + ", ".join(ids)
 
-        while True:
-            await self.control.checkpoint()
-            lease = await self.build_queue.acquire(
-                priority=priority,
-                label=label,
-                stage=stage,
-                preemptible=preemptible,
-            )
+        await self.control.checkpoint()
+        lease = await self.build_queue.acquire(label=label, stage=stage)
+        try:
             results: dict[str, ValidationResult] = {}
-            preempted = False
             source_held = False
             build_workspace = None
             progress_flush: asyncio.Task[None] | None = None
@@ -3667,24 +3628,7 @@ class Orchestrator:
                             on_output=append_output,
                         )
                     )
-                    preemption = asyncio.create_task(lease.preempt_requested.wait())
-                    try:
-                        done, _ = await asyncio.wait(
-                            (validation, preemption), return_when=asyncio.FIRST_COMPLETED
-                        )
-                    except BaseException:
-                        validation.cancel()
-                        preemption.cancel()
-                        await asyncio.gather(validation, preemption, return_exceptions=True)
-                        raise
-                    if preemption in done and lease.preempt_requested.is_set():
-                        validation.cancel()
-                        await asyncio.gather(validation, return_exceptions=True)
-                        preempted = True
-                        break
-                    preemption.cancel()
-                    await asyncio.gather(preemption, return_exceptions=True)
-                    result = validation.result()
+                    result = await validation
                     results.update(
                         self._partition_build_diagnostics(result, result_ids, build_graph)
                     )
@@ -3693,10 +3637,8 @@ class Orchestrator:
                         completed=self.state.coordinator_build.total,
                     )
                 build_source_digests = reusable_digests | await build_source_digests_task
-                artifacts_built = (
-                    not preempted
-                    and bool(results)
-                    and all(result.compiler_succeeded for result in results.values())
+                artifacts_built = bool(results) and all(
+                    result.compiler_succeeded for result in results.values()
                 )
                 fingerprints: FingerprintCollection | None = None
                 fingerprint_error = ""
@@ -3772,24 +3714,25 @@ class Orchestrator:
                     publish=publish_if_clean and artifacts_built,
                 )
                 build_workspace = None
+            except BaseException:
+                raise
+        finally:
+            try:
+                if progress_flush is not None:
+                    if not progress_flush.done():
+                        progress_flush.cancel()
+                    await asyncio.gather(progress_flush, return_exceptions=True)
+                if build_source_digests_task is not None:
+                    await asyncio.gather(build_source_digests_task, return_exceptions=True)
+                if build_workspace is not None:
+                    await build_workspace.close()
+                if source_held:
+                    await self.state.finish_coordinator_build()
             finally:
-                try:
-                    if progress_flush is not None:
-                        if not progress_flush.done():
-                            progress_flush.cancel()
-                        await asyncio.gather(progress_flush, return_exceptions=True)
-                    if build_source_digests_task is not None:
-                        await asyncio.gather(build_source_digests_task, return_exceptions=True)
-                    if build_workspace is not None:
-                        await build_workspace.close()
-                    if source_held:
-                        await self.state.finish_coordinator_build()
-                finally:
-                    if source_held:
-                        self.source_lock.release()
-                    self.build_queue.release(lease)
-            if not preempted:
-                return results
+                if source_held:
+                    self.source_lock.release()
+                self.build_queue.release(lease)
+        return results
 
     async def _build_all(
         self, *, iteration: int = 1, maximum_iterations: int = 1
@@ -4201,7 +4144,6 @@ class Orchestrator:
                 publish_if_clean=True,
                 mode="review-verification",
                 stage=Stage.REVIEW,
-                priority=200.0,
                 snapshots=snapshots,
             )
         )[chapter.id]
@@ -4952,8 +4894,6 @@ class Orchestrator:
                 publish_if_clean=True,
                 mode="proof-refresh",
                 stage=Stage.PROVE,
-                priority=0.0,
-                preemptible=True,
                 snapshots=snapshots,
             )
         )[chapter.id]

@@ -2356,7 +2356,7 @@ async def test_recovery_restores_green_reviews_without_direct_findings(tmp_path:
 
 
 @pytest.mark.asyncio
-async def test_review_build_preempts_running_proof_certification(
+async def test_later_review_build_waits_for_running_proof_certification(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
@@ -2364,8 +2364,8 @@ async def test_review_build_preempts_running_proof_certification(
     orchestrator = Orchestrator(config, StateStore(config))
     await orchestrator.prepare()
     proof_started = asyncio.Event()
+    release_proof = asyncio.Event()
     events: list[str] = []
-    proof_attempts = 0
 
     async def validation(
         _config: object,
@@ -2374,20 +2374,13 @@ async def test_review_build_preempts_running_proof_certification(
         workspace_root: Path | None = None,
         on_output: Callable[[str], None] | None = None,
     ) -> ValidationResult:
-        nonlocal proof_attempts
         assert workspace_root == config.settings.repo
         assert on_output is not None
         if chapter.id == proof_chapter.id:
-            proof_attempts += 1
-            if proof_attempts == 1:
-                events.append("proof-started")
-                proof_started.set()
-                try:
-                    await asyncio.Event().wait()
-                except asyncio.CancelledError:
-                    events.append("proof-preempted")
-                    raise
-            events.append("proof-retried")
+            events.append("proof-started")
+            proof_started.set()
+            await release_proof.wait()
+            events.append("proof-built")
         else:
             events.append("review-built")
         return ValidationResult(True, 0, "ok")
@@ -2399,8 +2392,6 @@ async def test_review_build_preempts_running_proof_certification(
             publish_if_clean=False,
             mode="proof-certification",
             stage=Stage.PROVE,
-            priority=0.0,
-            preemptible=True,
         )
     )
     await proof_started.wait()
@@ -2410,13 +2401,16 @@ async def test_review_build_preempts_running_proof_certification(
             publish_if_clean=False,
             mode="review-verification",
             stage=Stage.REVIEW,
-            priority=200.0,
         )
     )
 
+    await asyncio.sleep(0)
+    assert not review.done()
+    assert events == ["proof-started"]
+    release_proof.set()
     assert (await review)[review_chapter.id].succeeded
     assert (await proof)[proof_chapter.id].succeeded
-    assert events == ["proof-started", "proof-preempted", "review-built", "proof-retried"]
+    assert events == ["proof-started", "proof-built", "review-built"]
     assert orchestrator.build_queue.snapshot() == {
         "owner": "",
         "owner_stage": "",
@@ -2695,15 +2689,12 @@ async def test_pending_review_and_proof_builds_share_a_cross_stage_command(
             publish_if_clean=False,
             mode="review-verification",
             stage=Stage.REVIEW,
-            priority=200.0,
         ),
         orchestrator._build_chapters(
             (proof_chapter,),
             publish_if_clean=False,
             mode="proof-certification",
             stage=Stage.PROVE,
-            priority=0.0,
-            preemptible=True,
         ),
     )
 
@@ -2747,8 +2738,18 @@ async def test_successful_batch_warning_fails_only_its_owned_target(
     monkeypatch.setattr(scheduler_module, "validate", validation)
 
     first_result, second_result = await asyncio.gather(
-        orchestrator._build_chapters((first,), publish_if_clean=True),
-        orchestrator._build_chapters((second,), publish_if_clean=True),
+        orchestrator._build_chapters(
+            (first,),
+            publish_if_clean=True,
+            mode="review-verification",
+            stage=Stage.REVIEW,
+        ),
+        orchestrator._build_chapters(
+            (second,),
+            publish_if_clean=True,
+            mode="proof-certification",
+            stage=Stage.PROVE,
+        ),
     )
 
     assert len(commands) == 1
@@ -3242,7 +3243,7 @@ async def test_overlay_build_releases_source_barrier_and_rejects_concurrent_edit
 
 
 @pytest.mark.asyncio
-async def test_build_dispatch_bounds_batches_waiting_behind_coordinator(
+async def test_build_dispatch_coalesces_one_batch_behind_coordinator(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     project = write_project(tmp_path, chapters="chapters = [1, 2, 3]")
@@ -3252,13 +3253,17 @@ async def test_build_dispatch_bounds_batches_waiting_behind_coordinator(
     orchestrator = Orchestrator(config, StateStore(config))
     await orchestrator.prepare()
     release = asyncio.Event()
+    first_started = asyncio.Event()
     maximum_active = 0
     active = 0
+    batch_sizes: list[int] = []
 
     async def held_batch(requests: tuple[scheduler_module.PendingBuildRequest, ...]) -> None:
         nonlocal active, maximum_active
         active += 1
         maximum_active = max(maximum_active, active)
+        batch_sizes.append(len(requests))
+        first_started.set()
         try:
             await release.wait()
             for request in requests:
@@ -3277,8 +3282,7 @@ async def test_build_dispatch_bounds_batches_waiting_behind_coordinator(
             )
         )
     ]
-    while len(orchestrator._build_batch_tasks) < 1:
-        await asyncio.sleep(0)
+    await first_started.wait()
     builds.extend(
         asyncio.create_task(
             orchestrator._build_chapters(
@@ -3288,12 +3292,6 @@ async def test_build_dispatch_bounds_batches_waiting_behind_coordinator(
         )
         for index in range(1, 6)
     )
-    for _ in range(20):
-        if len(orchestrator._build_batch_tasks) == 2:
-            break
-        await asyncio.sleep(0)
-
-    assert len(orchestrator._build_batch_tasks) == 2
     builds.extend(
         asyncio.create_task(
             orchestrator._build_chapters(
@@ -3307,10 +3305,11 @@ async def test_build_dispatch_bounds_batches_waiting_behind_coordinator(
         if orchestrator._pending_build_requests:
             break
         await asyncio.sleep(0)
-    assert orchestrator._pending_build_requests
+    assert len(orchestrator._pending_build_requests) == 11
     release.set()
     await asyncio.gather(*builds)
-    assert maximum_active == 2
+    assert maximum_active == 1
+    assert batch_sizes == [1, 11]
     await orchestrator.shutdown()
 
 

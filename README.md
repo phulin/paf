@@ -40,10 +40,11 @@ Formalization owns full source coverage, elaboration, MCP diagnostics, and coord
 convergence. It permits only the exact declaration-uses-`sorry` warning.
 All later coordinator checks use the same coalescer: formalization, review, proof refresh, and proof
 certification requests that are pending together contribute targets to one Lake command, even
-across stages. The highest-priority request supplies the batch priority, and any non-preemptible
-request makes the shared command non-preemptible. If the command fails, diagnostics are routed to
-their owning chapters and affected import descendants while independent targets are retried as one
-smaller batch and retain their successful freshness records.
+across stages. Requests drain in arrival order through one rolling build lane; requests accumulated
+while a command runs form the next shared command rather than separate stage queues. If the command
+fails, diagnostics are routed to their owning chapters and affected import descendants while
+independent targets retain their successful freshness records and uncertain targets are retried as
+one smaller batch.
 A first review starts once its own formalization is clean and all source-tree dependencies have been
 reviewed. A later targeted or forced re-review does not wait for dependency reviews. There is no
 corpus-wide barrier between formalization and review. The coordinator remembers the source
@@ -317,12 +318,11 @@ preparing every file separately is forbidden. Files are opened lazily on the fir
 and batched tactic trials use one scratch worker per MCP server. Agents never invoke a compiler
 directly. After an agent exits, the coordinator terminates its MCP/LSP process group and merges
 accepted scoped changes into the main worktree under a short source-consistency barrier. It then
-enqueues one visible targeted `lake build +Module`; only Lake builds acquire the prioritized
-coordinator build queue. Review and formalize verification outrank proof certification, and an active
-proof certification is cancelled and requeued when statement-critical build work arrives. Each
-coordinator build receives a private cache upper layer. A successful build atomically promotes that
-small delta and writes only those changed artifacts back to the main worktree's `.lake`; failed and
-preempted build deltas are discarded.
+enqueues one visible targeted `lake build +Module`; only Lake builds acquire the FIFO coordinator
+build queue. Formalization, review, and proof callers share that lane and receive their own routed
+validation and freshness results from a combined command. Each coordinator build receives a private
+cache upper layer. A successful build atomically promotes that small delta and writes only those
+changed artifacts back to the main worktree's `.lake`; failed build deltas are discarded.
 The coordinator rejects a successful compiler exit if its captured output contains any warning
 other than the exact “declaration uses `sorry`” diagnostic. This check reuses the targeted build and
 does not launch a second compiler.
@@ -442,7 +442,7 @@ After the daemon exits, `status`, `snapshot`, and `wait` fall back to the persis
   “declaration uses `sorry`”. The exact validated source digest is persisted independently of review
   status. If it is stale after restart, the coordinator rebuilds and recounts placeholders first; a
   successful placeholder-free source is accepted without launching another proof agent. Proof
-  validation uses the same visible coordinator-build record at lower priority; it never holds the
+  validation uses the same visible coordinator-build record and fair build lane; it never holds the
   build queue while the proof agent edits, takes a snapshot, or merges its scoped patch.
 - If sustained checked proof work exposes a genuinely missing earlier interface, the proof agent
   records the blocked declaration and consumer path, exact residual goal, minimal result needed,
