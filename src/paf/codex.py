@@ -1159,6 +1159,32 @@ class CodexExecutor:
         if prompt_path == PROOF_REVIEW_PROMPT_PATH:
             template = render_review_variant(template, upstream=role == UPSTREAM_REPAIR_ROLE)
         base = render_prompt(template, chapter)
+        if role == REPAIR_WORKER_ROLE:
+            instruction = feedback
+            try:
+                repair_dossier = json.loads(feedback)
+            except json.JSONDecodeError:
+                repair_dossier = None
+            if isinstance(repair_dossier, dict) and isinstance(
+                repair_dossier.get("objective"), str
+            ):
+                instruction = repair_dossier["objective"].strip()
+            instruction = instruction.strip() or (
+                f"Diagnose and repair the reported {stage.value} stage failure."
+            )
+            base = f"""# Shepherd repair agent
+
+You are a repair agent assigned to fix a failed `{stage.value}` stage. The repair instruction is
+the immediate task. The original prompt for the stage appears below it and remains the contract for
+how to perform and report the work.
+
+## Repair instruction
+
+{instruction}
+
+## Original prompt for the `{stage.value}` stage
+
+{base}"""
         common = (
             ""
             if stage is Stage.DISCOVER

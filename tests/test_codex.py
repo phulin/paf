@@ -508,14 +508,28 @@ def test_shepherd_is_strong_read_only_and_repair_workers_use_luna_max(tmp_path: 
     assert 'model_reasoning_effort="medium"' in shepherd
     assert repair[repair.index("--model") + 1] == "gpt-5.6-luna"
     assert 'model_reasoning_effort="xhigh"' in repair
+    dossier = """{
+  "repair_work_unit_id": "repair-1",
+  "objective": "Fix declaration X from diagnostic Y",
+  "covered_failures": [{"detail": "full failure evidence"}]
+}"""
     prompt = executor.build_prompt(
         config.work_units[0],
         Stage.REVIEW,
         role=REPAIR_WORKER_ROLE,
-        feedback="fix declaration X from diagnostic Y",
+        feedback=dossier,
+    )
+    assert prompt.startswith("# Shepherd repair agent")
+    assert "## Repair instruction\n\nFix declaration X from diagnostic Y" in prompt
+    assert prompt.index("## Repair instruction") < prompt.index(
+        "## Original prompt for the `review` stage"
+    )
+    assert prompt.index("## Original prompt for the `review` stage") < prompt.index(
+        "# Re-review a failed proof"
     )
     assert "bounded Shepherd repair work unit" in prompt
     assert "Shepherd repair dossier" in prompt
+    assert prompt.rstrip().endswith(f"```text\n{dossier}\n```")
 
 
 @pytest.mark.asyncio
