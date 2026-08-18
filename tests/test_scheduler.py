@@ -2515,6 +2515,37 @@ async def test_concurrent_review_builds_share_commands_and_partition_diagnostics
     await orchestrator.shutdown()
 
 
+@pytest.mark.asyncio
+async def test_wholly_unattributed_batch_failure_is_not_probed_by_subsets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    first, second = config.chapters
+    orchestrator = Orchestrator(config, StateStore(config))
+    await orchestrator.prepare()
+    commands: list[str] = []
+
+    async def validation(
+        _config: object,
+        chapter: Chapter,
+        **_kwargs: object,
+    ) -> ValidationResult:
+        commands.append(chapter.build_command)
+        return ValidationResult(False, 1, "error: coordinator process failed")
+
+    monkeypatch.setattr(scheduler_module, "validate", validation)
+
+    first_result, second_result = await asyncio.gather(
+        orchestrator._build_chapters((first,), publish_if_clean=False),
+        orchestrator._build_chapters((second,), publish_if_clean=False),
+    )
+
+    assert len(commands) == 1
+    assert first_result[first.id].status is ValidationStatus.UNATTRIBUTED_BUILD_FAILURE
+    assert second_result[second.id].status is ValidationStatus.UNATTRIBUTED_BUILD_FAILURE
+    await orchestrator.shutdown()
+
+
 def test_failed_batch_diagnostics_are_partitioned_by_target_closure(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
     owner, consumer = config.chapters

@@ -3372,7 +3372,6 @@ class Orchestrator:
 
         requested_ids = {chapter.id for request in requests for chapter in request.chapters}
         remaining = set(requested_ids)
-        maximum_batch_size: int | None = None
         results_by_id: dict[str, ValidationResult] = {}
         snapshots_by_id: dict[str, ValidatedBuildSnapshot] = {}
 
@@ -3423,9 +3422,7 @@ class Orchestrator:
                     for chapter in candidates
                     if chapter.build_command.strip().rpartition(" ")[0] == first_prefix
                 )
-                selected = (
-                    compatible if maximum_batch_size is None else compatible[:maximum_batch_size]
-                )
+                selected = compatible
                 active_ids = {chapter.id for chapter in selected}
                 attempt_requests = tuple(
                     request
@@ -3476,16 +3473,16 @@ class Orchestrator:
                 if unattributed and len(active_ids) > 1:
                     # A failed process may stop before compiling the other targets.
                     # Remove every attributed failure, then retry the uncertain
-                    # targets together. Only bisect a batch when it made no
-                    # attributable progress at all.
+                    # targets together. A wholly unattributed process failure is
+                    # shared by the batch below; probing subsets adds no evidence.
                     attributed = failed_ids.difference(unattributed)
-                    results_by_id.update(
-                        (chapter_id, attempt_results[chapter_id]) for chapter_id in attributed
-                    )
-                    remaining.difference_update(attributed)
-                    maximum_batch_size = None if attributed else max(1, len(active_ids) // 2)
-                    finish_ready_requests()
-                    continue
+                    if attributed:
+                        results_by_id.update(
+                            (chapter_id, attempt_results[chapter_id]) for chapter_id in attributed
+                        )
+                        remaining.difference_update(attributed)
+                        finish_ready_requests()
+                        continue
                 affected = failed_ids
                 results_by_id.update(
                     (chapter_id, attempt_results[chapter_id]) for chapter_id in affected
