@@ -1503,7 +1503,7 @@ class StateStore:
             if (key := self.key(work_unit_id, stage)) in self.tasks
         )
         task_context = self._task_snapshot_context()
-        failure_roots = self._failure_roots_index() if task_keys else None
+        failure_roots = self._failure_roots_subset(task_keys) if task_keys else None
         tasks = {
             key: self._hot_task_dict(self.tasks[key], task_context, failure_roots)
             | {
@@ -3407,36 +3407,55 @@ class StateStore:
         the result among every projected row.
         """
 
-        roots: dict[str, set[str]] = {key: set() for key in self.tasks}
-        dependents: dict[str, list[str]] = {}
-        for key, task in self.tasks.items():
-            owner_keys = {
-                requirement.owner_task_key
-                for requirement in task.waiting_on
-                if requirement.owner_task_key is not None
-            }
-            stage = Stage(task.stage)
-            if stage is Stage.FORMALIZE:
-                owner_keys.add(self.key(task.chapter_id, Stage.DISCOVER))
+        return self._failure_roots_subset(self.tasks)
+
+    def _failure_owner_keys(self, task: TaskRecord) -> set[str]:
+        """Return prerequisite task keys relevant to derived failure routing."""
+
+        owner_keys = {
+            requirement.owner_task_key
+            for requirement in task.waiting_on
+            if requirement.owner_task_key is not None
+        }
+        stage = Stage(task.stage)
+        if stage is Stage.FORMALIZE:
+            owner_keys.add(self.key(task.chapter_id, Stage.DISCOVER))
+            owner_keys.update(
+                self.key(dependency, Stage.FORMALIZE)
+                for dependency in self._source_dependencies(task.chapter_id)
+            )
+        elif stage is Stage.REVIEW:
+            owner_keys.add(self.key(task.chapter_id, Stage.FORMALIZE))
+            if task.rounds == 0:
                 owner_keys.update(
-                    self.key(dependency, Stage.FORMALIZE)
+                    self.key(dependency, Stage.REVIEW)
                     for dependency in self._source_dependencies(task.chapter_id)
                 )
-            elif stage is Stage.REVIEW:
-                owner_keys.add(self.key(task.chapter_id, Stage.FORMALIZE))
-                if task.rounds == 0:
-                    owner_keys.update(
-                        self.key(dependency, Stage.REVIEW)
-                        for dependency in self._source_dependencies(task.chapter_id)
-                    )
-            elif stage is Stage.PROVE:
-                owner_keys.update(
-                    (
-                        self.key(task.chapter_id, Stage.FORMALIZE),
-                        self.key(task.chapter_id, Stage.REVIEW),
-                    )
+        elif stage is Stage.PROVE:
+            owner_keys.update(
+                (
+                    self.key(task.chapter_id, Stage.FORMALIZE),
+                    self.key(task.chapter_id, Stage.REVIEW),
                 )
-            for owner_key in owner_keys:
+            )
+        return owner_keys
+
+    def _failure_roots_subset(self, task_keys: Iterable[str]) -> dict[str, tuple[str, ...]]:
+        """Resolve roots in only the prerequisite closure needed by a projection."""
+
+        requested = tuple(dict.fromkeys(task_keys))
+        roots: dict[str, set[str]] = {}
+        dependents: dict[str, list[str]] = {}
+        unresolved = list(requested)
+        while unresolved:
+            key = unresolved.pop()
+            if key in roots:
+                continue
+            roots[key] = set()
+            task = self.tasks.get(key)
+            if task is None:
+                continue
+            for owner_key in self._failure_owner_keys(task):
                 owner = self.tasks.get(owner_key)
                 if owner is None:
                     continue
@@ -3444,6 +3463,8 @@ class StateStore:
                     roots[key].add(owner_key)
                 elif owner.status == TaskStatus.PENDING:
                     dependents.setdefault(owner_key, []).append(key)
+                    if owner_key not in roots:
+                        unresolved.append(owner_key)
 
         pending = deque(key for key, values in roots.items() if values)
         queued = set(pending)
@@ -3458,7 +3479,7 @@ class StateStore:
                 if len(dependent_roots) != previous_size and dependent_key not in queued:
                     pending.append(dependent_key)
                     queued.add(dependent_key)
-        return {key: tuple(sorted(values)) for key, values in roots.items()}
+        return {key: tuple(sorted(roots.get(key, ()))) for key in requested}
 
     def failed_requirements(
         self,
