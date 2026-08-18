@@ -5380,7 +5380,7 @@ async def test_proof_validation_resumes_originating_chunk_for_local_diagnostic(
             ValidationResult(
                 False,
                 1,
-                "warning: Book/Chapter01.lean:2:1: downstream diagnostic",
+                "warning: Book/Chapter01.lean:1:1: target diagnostic",
                 process_exit_code=0,
             ),
             ValidationResult(True, 0, "ok"),
@@ -5396,7 +5396,7 @@ async def test_proof_validation_resumes_originating_chunk_for_local_diagnostic(
 
     assert await orchestrator._prove(chapter)
     assert executor.resume_thread_ids == [None, "proof-session"]
-    assert "downstream diagnostic" in executor.feedbacks[1]
+    assert "target diagnostic" in executor.feedbacks[1]
     assert state.proof_review_requests == {}
     await orchestrator.shutdown()
 

@@ -554,7 +554,7 @@ def test_shepherd_is_strong_read_only_and_repair_workers_use_luna_max(tmp_path: 
         "## Original prompt for the `review` stage"
     )
     assert prompt.index("## Original prompt for the `review` stage") < prompt.index(
-        "# Re-review a failed proof"
+        "# Review proof blockers"
     )
     assert "bounded Shepherd repair work unit" in prompt
     assert "Shepherd repair dossier" in prompt

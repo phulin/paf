@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import re
 from collections import deque
 from collections.abc import Callable, Coroutine, Iterable
@@ -5070,13 +5071,25 @@ class Orchestrator:
                 chunk_round += 1
             routed_validation_output = attempt.validation.output
             foreign_validation_feedback: dict[str, str] = {}
-            if not attempt.validation.succeeded:
+            if not coordinator_validation.succeeded:
                 routed_validation = (
-                    await self._build_feedback_async({chapter.id: attempt.validation})
+                    await self._build_feedback_async({chapter.id: coordinator_validation})
                 ).actionable
-                routed_validation_output = routed_validation.pop(chapter.id, "")
+                local_validation_output = routed_validation.pop(chapter.id, "")
                 foreign_validation_feedback = routed_validation
-                if not routed_validation_output and not foreign_validation_feedback:
+                if not attempt.validation.succeeded:
+                    routed_validation_output = local_validation_output or attempt.validation.output
+                else:
+                    # Mainline scopes chunk retries to their assigned declarations.
+                    # A same-chapter diagnostic outside those spans must not spend
+                    # this chunk's budget, though diagnostics owned by other work
+                    # units still need to be routed below.
+                    routed_validation_output = ""
+                if (
+                    not routed_validation_output
+                    and not foreign_validation_feedback
+                    and not attempt.validation.succeeded
+                ):
                     # Keep unattributed compiler failures with the originating
                     # proof assignment instead of silently dropping them.
                     routed_validation_output = attempt.validation.output
@@ -5085,7 +5098,11 @@ class Orchestrator:
                         foreign_validation_feedback,
                         origin=f"proof-validation:{attempt.run.id}",
                     )
-                if routed_validation_output and attempt.agent.thread_id:
+                if (
+                    not attempt.validation.succeeded
+                    and routed_validation_output
+                    and attempt.agent.thread_id
+                ):
                     proof_resume_thread_id = attempt.agent.thread_id
                     proof_resume_run_id = attempt.run.id
                     proof_resume_prompt = PROOF_VALIDATION_RETRY_PROMPT
@@ -5136,7 +5153,8 @@ class Orchestrator:
                     )
                     return False
             if (
-                not attempt.validation.succeeded
+                not coordinator_validation.succeeded
+                and attempt.validation.succeeded
                 and not routed_validation_output
                 and foreign_validation_feedback
             ):
