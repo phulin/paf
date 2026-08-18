@@ -9,7 +9,7 @@ from paf.codex import ValidationResult
 from paf.config import load_config
 from paf.models import Stage
 from paf.scheduler import ExecutionDisposition, Orchestrator, StageOutcome
-from paf.state import Requirement, RequirementKind, StateStore, TaskStatus
+from paf.state import ChangeSet, Requirement, RequirementKind, StateStore, TaskStatus
 from tests.support import write_project
 
 
@@ -217,6 +217,15 @@ async def test_hot_snapshot_resolves_failure_roots_in_one_graph_pass(tmp_path, m
     assert calls == len(state.tasks)
     for key, task in snapshot["tasks"].items():
         assert tuple(task["blocked_by"]) == expected[key]
+
+    calls = 0
+    delta = state.dashboard_delta(
+        ChangeSet(revision=state.revision, work_units=frozenset({second.id}))
+    )
+    assert calls == len(state.tasks)
+    assert tuple(delta["tasks"][state.key(second.id, Stage.FORMALIZE)]["blocked_by"]) == (
+        state.key(first.id, Stage.FORMALIZE),
+    )
     await state.close()
 
 

@@ -1503,8 +1503,9 @@ class StateStore:
             if (key := self.key(work_unit_id, stage)) in self.tasks
         )
         task_context = self._task_snapshot_context()
+        failure_roots = self._failure_roots_index() if task_keys else None
         tasks = {
-            key: self._hot_task_dict(self.tasks[key], task_context)
+            key: self._hot_task_dict(self.tasks[key], task_context, failure_roots)
             | {
                 "work_unit_usage": self._usage_dict(
                     self.invocation_usage(self.tasks[key].work_unit_id)
