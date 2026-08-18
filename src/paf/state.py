@@ -3106,20 +3106,15 @@ class StateStore:
         )
 
     def shepherd_repairable_tasks(self) -> list[tuple[str, TaskRecord]]:
-        """Root failures and durable proof escalations eligible for Shepherd triage."""
+        """Direct failures, including durable proof escalations, eligible for triage.
 
-        causal_details = {
-            "blocked by a failed source dependency formalization",
-            "formalization did not complete",
-            "blocked because formalization did not complete",
-            "blocked because statement review did not complete",
-            "blocked by upstream coordinator diagnostics",
-        }
+        Blocked tasks are causal impact, regardless of their human-readable detail.  Their
+        failed prerequisite is the repair target and will release them through the normal
+        scheduler once it succeeds.
+        """
+
         return [
-            (key, task)
-            for key, task in self.repairable_tasks()
-            if task.detail not in causal_details
-            and not task.detail.startswith("blocked by a failed prerequisite review")
+            (key, task) for key, task in self.repairable_tasks() if task.status == TaskStatus.FAILED
         ]
 
     def ensure_repair_case(self, task_key: str) -> RepairCaseRecord:

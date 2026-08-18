@@ -5626,10 +5626,28 @@ class Orchestrator:
             RepairWorkUnitStatus.PENDING,
             RepairWorkUnitStatus.INTERRUPTED,
         }
+        repairable_keys = {key for key, _task in self.state.shepherd_repairable_tasks()}
         candidates: list[RepairWorkUnitRecord] = []
+        pruned = False
         for unit in self.state.repair_work_units.values():
             if unit.status not in retryable:
                 continue
+            eligible_case_ids = [
+                case_id
+                for case_id in unit.case_ids
+                if (case := self.state.repair_cases.get(case_id)) is not None
+                and case.task_key in repairable_keys
+            ]
+            if not eligible_case_ids:
+                await self.state.finish_repair_work_unit(
+                    unit.id,
+                    status=RepairWorkUnitStatus.SUPERSEDED,
+                    detail="covered failures are causal blockers, not repair targets",
+                )
+                continue
+            if eligible_case_ids != unit.case_ids:
+                unit.case_ids = eligible_case_ids
+                pruned = True
             unchanged = True
             for case_id in unit.case_ids:
                 case = self.state.repair_cases.get(case_id)
@@ -5647,6 +5665,8 @@ class Orchestrator:
                     status=RepairWorkUnitStatus.SUPERSEDED,
                     detail="repair evidence fingerprint changed",
                 )
+        if pruned:
+            await self.state.save("repair_work_units")
         if not candidates:
             return False
         candidate_ids = {unit.id for unit in candidates}

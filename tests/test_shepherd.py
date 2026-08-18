@@ -94,7 +94,7 @@ async def test_shepherd_receives_root_failures_not_causal_blockers(tmp_path: Pat
         consumer.id,
         Stage.FORMALIZE,
         TaskStatus.BLOCKED,
-        "blocked by a failed source dependency formalization",
+        "a newly worded causal blocker that Shepherd does not know",
     )
     await state.set_task(
         consumer.id,
@@ -112,6 +112,75 @@ async def test_shepherd_receives_root_failures_not_causal_blockers(tmp_path: Pat
     assert [key for key, _task in state.shepherd_repairable_tasks()] == [
         state.key(root.id, Stage.FORMALIZE)
     ]
+    await state.close()
+
+
+@pytest.mark.asyncio
+async def test_interrupted_repair_dag_does_not_resume_causal_blockers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    state = StateStore(config)
+    await state.load_or_create()
+    root, consumer = config.work_units
+    await state.set_task(root.id, Stage.FORMALIZE, TaskStatus.FAILED, "local Lean error")
+    await state.set_task(
+        consumer.id,
+        Stage.FORMALIZE,
+        TaskStatus.BLOCKED,
+        "blocked by a failed source dependency formalization",
+    )
+    root_key = state.key(root.id, Stage.FORMALIZE)
+    consumer_key = state.key(consumer.id, Stage.FORMALIZE)
+    sweep = await state.start_repair_sweep(
+        trigger="test",
+        task_keys=[root_key, consumer_key],
+    )
+    root_case, consumer_case = (state.repair_cases[value] for value in sweep.case_ids)
+    root_unit = RepairWorkUnitRecord(
+        id="resume-root",
+        sweep_id=sweep.id,
+        # Legacy planners could mix a derived blocked case into an otherwise valid root unit.
+        case_ids=[root_case.id, consumer_case.id],
+        task_keys=[root_key],
+        owner_chapter_id=root.id,
+        target_stage=Stage.FORMALIZE,
+        objective="repair the root failure",
+        status=RepairWorkUnitStatus.INTERRUPTED,
+    )
+    downstream_unit = RepairWorkUnitRecord(
+        id="do-not-resume-downstream",
+        sweep_id=sweep.id,
+        case_ids=[consumer_case.id],
+        task_keys=[consumer_key],
+        owner_chapter_id=consumer.id,
+        target_stage=Stage.FORMALIZE,
+        objective="repair the downstream symptom",
+        status=RepairWorkUnitStatus.INTERRUPTED,
+    )
+    await state.install_repair_plan(
+        sweep.id,
+        [root_unit, downstream_unit],
+        summary="legacy plan",
+        run_id="planner",
+    )
+    root_unit.status = RepairWorkUnitStatus.INTERRUPTED
+    downstream_unit.status = RepairWorkUnitStatus.INTERRUPTED
+    await state.save("repair_work_units")
+    orchestrator = Orchestrator(config, state)
+    resumed: list[str] = []
+
+    async def execute(units: Any) -> bool:
+        resumed.extend(item.id for item in units)
+        return False
+
+    monkeypatch.setattr(orchestrator, "_execute_repair_plan", execute)
+
+    assert not await orchestrator._resume_repair_dags()
+    assert resumed == [root_unit.id]
+    assert root_unit.case_ids == [root_case.id]
+    assert downstream_unit.status == RepairWorkUnitStatus.SUPERSEDED
+    assert downstream_unit.detail == "covered failures are causal blockers, not repair targets"
     await state.close()
 
 
