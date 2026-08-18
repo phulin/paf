@@ -277,8 +277,7 @@ fn summary(model: &DashboardModel) -> Paragraph<'static> {
             "finalize"
         };
         format!(
-            "{} {phase} {}/{} · err {} · warn {}",
-            state.coordinator_build.mode,
+            "coordinator {phase} {}/{} · err {} · warn {}",
             state.coordinator_build.completed,
             state.coordinator_build.total,
             state.coordinator_build.error_count,
@@ -550,8 +549,7 @@ fn draw_status(frame: &mut Frame<'_>, model: &DashboardModel, area: Rect) {
             "FINALIZE"
         };
         let label = format!(
-            "{} {phase} {}/{} · iter {}/{} · err {} · warn {}{}",
-            build.mode.to_uppercase(),
+            "COORDINATOR {phase} {}/{} · iter {}/{} · err {} · warn {}{}",
             build.completed,
             build.total,
             build.iteration,
@@ -1085,10 +1083,10 @@ fn current_activity(
 ) -> String {
     let build = &model.state.coordinator_build;
     if model.is_building(row.unit.id.as_str(), build.stage.as_str()) {
-        return format!("{} coordinator build", build.mode);
+        return "coordinator build".into();
     }
     if build.active && model.is_build_target(row.unit.id.as_str()) {
-        return format!("{} coordinator finalize", build.mode);
+        return "coordinator finalize".into();
     }
     let has_running_task = row
         .tasks
@@ -1540,9 +1538,10 @@ mod tests {
         terminal.draw(|frame| draw(frame, &mut model)).unwrap();
         let rendered = terminal.backend().to_string();
 
-        assert!(rendered.contains("targeted finalize 3/3"));
+        assert!(rendered.contains("coordinator finalize 3/3"));
         assert!(rendered.contains("◇ postprocess"));
-        assert!(rendered.contains("targeted coordinator finalize"));
+        assert!(rendered.contains("coordinator finalize"));
+        assert!(!rendered.contains("targeted"));
         assert!(!rendered.contains("◆ building"));
     }
 
