@@ -3708,6 +3708,20 @@ class Orchestrator:
                 artifacts_built = bool(results) and all(
                     result.compiler_succeeded for result in results.values()
                 )
+                # Lake records successful jobs with content traces even when another target makes
+                # the combined command exit nonzero. Keep those private coordinator artifacts so
+                # an uncertain-target retry does not rebuild the same dependency closure. Timed-out
+                # or signal-terminated commands may leave incomplete writes and remain disposable.
+                cache_reusable = bool(results) and all(
+                    not result.timed_out
+                    and (
+                        result.process_exit_code
+                        if result.process_exit_code is not None
+                        else result.exit_code
+                    )
+                    >= 0
+                    for result in results.values()
+                )
                 fingerprints: FingerprintCollection | None = None
                 fingerprint_error = ""
                 if artifacts_built and snapshots is not None:
@@ -3780,6 +3794,7 @@ class Orchestrator:
                 await build_workspace.finish(
                     succeeded=artifacts_built,
                     publish=publish_if_clean and artifacts_built,
+                    retain=cache_reusable,
                 )
                 build_workspace = None
             except BaseException:

@@ -259,8 +259,14 @@ class SharedBuildWorkspace:
     def __init__(self, repo: Path) -> None:
         self.root = repo
 
-    async def finish(self, *, succeeded: bool, publish: bool) -> tuple[str, ...]:
-        del succeeded, publish
+    async def finish(
+        self,
+        *,
+        succeeded: bool,
+        publish: bool,
+        retain: bool = False,
+    ) -> tuple[str, ...]:
+        del succeeded, publish, retain
         return ()
 
     async def close(self) -> None:
@@ -382,11 +388,22 @@ class FuseBuildWorkspace:
         self.root = merged
         self.closed = False
 
-    async def finish(self, *, succeeded: bool, publish: bool) -> tuple[str, ...]:
+    async def finish(
+        self,
+        *,
+        succeeded: bool,
+        publish: bool,
+        retain: bool = False,
+    ) -> tuple[str, ...]:
         if self.closed:
             raise RuntimeError("coordinator build workspace already closed")
         self.closed = True
-        return await self.manager.finish_build(self, succeeded=succeeded, publish=publish)
+        return await self.manager.finish_build(
+            self,
+            succeeded=succeeded,
+            publish=publish,
+            retain=retain,
+        )
 
     async def close(self) -> None:
         if not self.closed:
@@ -744,26 +761,30 @@ class FuseOverlayIsolation:
         *,
         succeeded: bool,
         publish: bool,
+        retain: bool = False,
     ) -> tuple[str, ...]:
+        if publish and not succeeded:
+            raise ValueError("cannot publish an unsuccessful coordinator build")
         build_root = workspace.root.parent
         promoted: tuple[str, ...] = ()
         layer: Path | None = None
         try:
             if os.path.ismount(workspace.root):
                 await self._unmount(workspace.root)
-            if succeeded:
+            if succeeded or retain:
                 promoted = await asyncio.to_thread(self._cache_delta_paths, workspace.upper)
                 if promoted:
-                    # Preserve the ordinary worktree cache for non-swarm Lake
-                    # commands and for seeding the next orchestrator invocation.
-                    await asyncio.to_thread(self._apply_cache_whiteouts, workspace.upper)
-                    await self._run(
-                        "rsync",
-                        "-a",
-                        "--exclude=.wh.*",
-                        f"{workspace.upper}/",
-                        f"{self.settings.repo}/",
-                    )
+                    if succeeded:
+                        # Preserve the ordinary worktree cache for non-swarm Lake
+                        # commands and for seeding the next orchestrator invocation.
+                        await asyncio.to_thread(self._apply_cache_whiteouts, workspace.upper)
+                        await self._run(
+                            "rsync",
+                            "-a",
+                            "--exclude=.wh.*",
+                            f"{workspace.upper}/",
+                            f"{self.settings.repo}/",
+                        )
                     async with self._lock:
                         next_layer = self._cache_revision + 1
                         layer = self.cache_layers / f"{next_layer:08d}-delta"

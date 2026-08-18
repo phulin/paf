@@ -651,6 +651,40 @@ async def test_failed_coordinator_build_discards_its_cache_delta(tmp_path: Path)
 
 
 @pytest.mark.asyncio
+async def test_failed_coordinator_build_can_retain_private_retry_cache(tmp_path: Path) -> None:
+    manager, _ = fuse_manager(write_project(tmp_path, chapters="chapters = [1]"))
+    await manager.prepare()
+    pinned = await manager.acquire("before-failure")
+    fresh = None
+    retry = None
+    artifact = Path("lean/.lake/build/reusable.olean")
+    try:
+        build = await manager.acquire_build("failed-but-cacheable")
+        target = build.root / artifact
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"completed dependency")
+        assert await build.finish(succeeded=False, publish=False, retain=True) == (
+            artifact.as_posix(),
+        )
+
+        fresh = await manager.acquire("after-failure")
+        retry = await manager.acquire_build("retry")
+        assert not (pinned.root / artifact).exists()
+        assert not (fresh.root / artifact).exists()
+        assert not (tmp_path / artifact).exists()
+        assert (retry.root / artifact).read_bytes() == b"completed dependency"
+        assert len(manager._coordinator_layers) == 2
+        assert manager._published_cache_revision == 0
+    finally:
+        await pinned.close()
+        if fresh is not None:
+            await fresh.close()
+        if retry is not None:
+            await retry.close()
+        await manager.close()
+
+
+@pytest.mark.asyncio
 async def test_cache_layers_compact_without_invalidating_pinned_agents(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
     manager = FuseOverlayIsolation(

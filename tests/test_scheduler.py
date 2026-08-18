@@ -3225,10 +3225,20 @@ async def test_streaming_build_does_not_publish_partial_cache_snapshot(
         class TrackedBuild:
             root = workspace.root
 
-            async def finish(self, *, succeeded: bool, publish: bool) -> tuple[str, ...]:
+            async def finish(
+                self,
+                *,
+                succeeded: bool,
+                publish: bool,
+                retain: bool = False,
+            ) -> tuple[str, ...]:
                 nonlocal published
                 published += int(publish)
-                return await workspace.finish(succeeded=succeeded, publish=publish)
+                return await workspace.finish(
+                    succeeded=succeeded,
+                    publish=publish,
+                    retain=retain,
+                )
 
             async def close(self) -> None:
                 await workspace.close()
@@ -3243,6 +3253,84 @@ async def test_streaming_build_does_not_publish_partial_cache_snapshot(
 
     await orchestrator._build_all()
     assert published == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("validation_result", "expected_retain"),
+    (
+        (
+            ValidationResult(
+                False,
+                1,
+                "error: Book/Chapter01.lean:1:1: broken",
+                process_exit_code=1,
+            ),
+            True,
+        ),
+        (
+            ValidationResult(
+                False,
+                124,
+                "coordinator validation timed out",
+                timed_out=True,
+                process_exit_code=-15,
+            ),
+            False,
+        ),
+    ),
+)
+async def test_coordinator_retains_only_completed_failed_build_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    validation_result: ValidationResult,
+    expected_retain: bool,
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    orchestrator = Orchestrator(config, StateStore(config))
+    finished: list[tuple[bool, bool, bool]] = []
+
+    async def validation(*_args: object, **_kwargs: object) -> ValidationResult:
+        return validation_result
+
+    original_acquire_build = orchestrator.isolation.acquire_build
+
+    async def track_build(build_id: str) -> object:
+        workspace = await original_acquire_build(build_id)
+
+        class TrackedBuild:
+            root = workspace.root
+
+            async def finish(
+                self,
+                *,
+                succeeded: bool,
+                publish: bool,
+                retain: bool = False,
+            ) -> tuple[str, ...]:
+                finished.append((succeeded, publish, retain))
+                return await workspace.finish(
+                    succeeded=succeeded,
+                    publish=publish,
+                    retain=retain,
+                )
+
+            async def close(self) -> None:
+                await workspace.close()
+
+        return TrackedBuild()
+
+    monkeypatch.setattr(scheduler_module, "validate", validation)
+    monkeypatch.setattr(orchestrator.isolation, "acquire_build", track_build)
+
+    result = await orchestrator._build_chapters(
+        (config.chapters[0],),
+        publish_if_clean=True,
+    )
+
+    assert not result[config.chapters[0].id].succeeded
+    assert finished == [(False, False, expected_retain)]
+    await orchestrator.shutdown()
 
 
 @pytest.mark.asyncio
