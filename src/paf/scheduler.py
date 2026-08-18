@@ -873,6 +873,40 @@ class Orchestrator:
         return await asyncio.to_thread(retain)
 
     @staticmethod
+    def _copy_formalize_clean(records: dict[str, Any]) -> dict[str, dict[str, Any]]:
+        """Copy persisted clean records without re-reading the whole corpus.
+
+        Source edits integrated by the orchestrator explicitly invalidate their owners, while
+        every consumer checks its own digest before trusting a record.  Graph transactions can
+        therefore preserve unrelated records instead of globbing and hashing every clean work
+        unit after each completed build.
+        """
+
+        return {
+            str(chapter_id): dict(record)
+            for chapter_id, record in records.items()
+            if isinstance(chapter_id, str) and isinstance(record, dict)
+        }
+
+    async def _retained_formalize_record(
+        self,
+        chapter: WorkUnitLike,
+        records: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Validate only the clean record a scheduler decision is about to consume."""
+
+        record = records.get(chapter.id)
+        if not isinstance(record, dict):
+            return None
+        source = await asyncio.to_thread(scope_digest, self.config.settings.repo, chapter)
+        if record.get("source_digest") != source:
+            return None
+        return dict(record) | {
+            "source_digest": source,
+            "build_generation": int(record.get("build_generation", 0)),
+        }
+
+    @staticmethod
     def _dependency_closure(graph: WorkUnitImportGraph, chapter_ids: Iterable[str]) -> set[str]:
         required = set(chapter_ids)
         pending = list(required)
@@ -930,7 +964,7 @@ class Orchestrator:
 
             persisted = self.state.formalize_graph.get("clean", {})
             records = persisted if isinstance(persisted, dict) else {}
-            clean = await self._retain_formalize_clean(graph, records)
+            clean = self._copy_formalize_clean(records)
             raw_interfaces = self.state.formalize_graph.get("interfaces", {})
             interfaces = raw_interfaces if isinstance(raw_interfaces, dict) else {}
             raw_imports = self.state.formalize_graph.get("interface_imports", {})
@@ -1058,10 +1092,7 @@ class Orchestrator:
         graph = self._observed_work_unit_graph()
         targets = set(chapter_ids)
         persisted = self.state.formalize_graph.get("clean", {})
-        clean = await self._retain_formalize_clean(
-            graph,
-            persisted if isinstance(persisted, dict) else {},
-        )
+        clean = self._copy_formalize_clean(persisted if isinstance(persisted, dict) else {})
         raw_interfaces = self.state.formalize_graph.get("interfaces", {})
         interfaces = raw_interfaces if isinstance(raw_interfaces, dict) else {}
         known = all(
@@ -1125,9 +1156,6 @@ class Orchestrator:
                     # resurrecting records this caller explicitly invalidated.
                     if int(record.get("build_generation", 0)) >= local_generation:
                         clean[chapter_id] = dict(record)
-            retained = await self._retain_formalize_clean(graph, clean)
-            clean.clear()
-            clean.update(retained)
             edges = [list(edge) for edge in graph.edges]
             revision = int(previous.get("revision", 0)) if isinstance(previous, dict) else 0
             if previous.get("algorithm") != "source-dependency-tree" or previous_edges != edges:
@@ -1263,11 +1291,9 @@ class Orchestrator:
 
         graph = self._observed_work_unit_graph()
         persisted = self.state.formalize_graph.get("clean", {})
-        clean = await self._retain_formalize_clean(
-            graph,
-            persisted if isinstance(persisted, dict) else {},
-        )
-        return chapter.id in clean and self._interface_dependencies_are_current(graph, chapter.id)
+        records = persisted if isinstance(persisted, dict) else {}
+        record = await self._retained_formalize_record(chapter, records)
+        return record is not None and self._interface_dependencies_are_current(graph, chapter.id)
 
     async def _integrate_interrupted_workspace(
         self,
@@ -3754,7 +3780,6 @@ class Orchestrator:
         review_generation = self._review_invalidation_generation(chapter.id)
         if self.state.task(chapter.id, Stage.REVIEW).status == TaskStatus.SUCCEEDED:
             return True
-        graph = self._observed_work_unit_graph()
         request_ids = list(proof_request_ids)
         review_feedback = feedback
 
@@ -3784,7 +3809,7 @@ class Orchestrator:
 
         persisted = self.state.formalize_graph.get("clean", {})
         records = persisted if isinstance(persisted, dict) else {}
-        was_clean = chapter.id in await self._retain_formalize_clean(graph, records)
+        was_clean = await self._retained_formalize_record(chapter, records) is not None
         if not was_clean and not rerun:
             build_feedback = await self._review_build(chapter)
             if build_feedback and not await route_feedback(
@@ -4404,12 +4429,9 @@ class Orchestrator:
         if not self.force:
             graph = self._observed_work_unit_graph()
             persisted = self.state.formalize_graph.get("clean", {})
-            clean = await self._retain_formalize_clean(
-                graph,
-                persisted if isinstance(persisted, dict) else {},
-            )
+            records = persisted if isinstance(persisted, dict) else {}
             proof_task = self.state.task(chapter.id, Stage.PROVE)
-            record = clean.get(chapter.id)
+            record = await self._retained_formalize_record(chapter, records)
             dependencies_current = self._interface_dependencies_are_current(graph, chapter.id)
             if (
                 proof_task.status == TaskStatus.SUCCEEDED

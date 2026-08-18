@@ -4209,6 +4209,55 @@ async def test_compiled_interface_controls_downstream_build_invalidation(
 
 
 @pytest.mark.asyncio
+async def test_build_invalidation_does_not_rescan_untouched_clean_records(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    orchestrator = Orchestrator(config, StateStore(config))
+    await orchestrator.prepare()
+    await mark_clean_formalization(orchestrator)
+    first, second = config.chapters
+
+    def unexpected_digest(*_args: object, **_kwargs: object) -> str:
+        raise AssertionError("known changed owners must be invalidated without a corpus scan")
+
+    monkeypatch.setattr(scheduler_module, "scope_digest", unexpected_digest)
+
+    assert await orchestrator._invalidate_build_records((first.id,)) == {first.id}
+    assert set(orchestrator.state.formalize_graph["clean"]) == {second.id}
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_build_publication_hashes_only_its_dependency_closure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    orchestrator = Orchestrator(config, StateStore(config))
+    await orchestrator.prepare()
+    await mark_clean_formalization(orchestrator)
+    first, second = config.chapters
+    graph = orchestrator._observed_work_unit_graph()
+    expected = scope_digest(config.settings.repo, first)
+    digested: list[str] = []
+
+    def counted_digest(root: Path, chapter: Chapter) -> str:
+        digested.append(chapter.id)
+        return scope_digest(root, chapter)
+
+    monkeypatch.setattr(scheduler_module, "scope_digest", counted_digest)
+    snapshot = scheduler_module.ValidatedBuildSnapshot(
+        graph=graph,
+        source_digests={first.id: expected},
+    )
+
+    assert await orchestrator._publish_validated_build(first, snapshot)
+    assert digested == [first.id]
+    assert second.id in orchestrator.state.formalize_graph["clean"]
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_review_completion_cannot_resurrect_an_invalidated_generation(
     tmp_path: Path,
 ) -> None:
