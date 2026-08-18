@@ -4306,6 +4306,48 @@ async def test_build_publication_hashes_only_its_dependency_closure(
 
 
 @pytest.mark.asyncio
+async def test_build_snapshot_hashes_only_targets_without_modified_dependencies(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    first, second = config.chapters
+    for chapter in config.chapters:
+        source = tmp_path / "lean" / "Book" / f"Chapter{chapter.number:02d}.lean"
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_text(f"def value{chapter.number} := {chapter.number}\n", encoding="utf-8")
+    orchestrator = Orchestrator(config, StateStore(config))
+    await orchestrator.prepare()
+    await mark_clean_formalization(orchestrator, {second.id: (first.id,)})
+    orchestrator.git.enabled = True
+    digested: list[str] = []
+    original_digest = scheduler_module.scope_digest
+
+    def counted_digest(root: Path, chapter: Chapter) -> str:
+        digested.append(chapter.id)
+        return original_digest(root, chapter)
+
+    async def no_dirty_paths() -> tuple[str, ...]:
+        return ()
+
+    async def successful_validation(*_args: object, **_kwargs: object) -> ValidationResult:
+        return ValidationResult(True, 0, "ok")
+
+    monkeypatch.setattr(scheduler_module, "scope_digest", counted_digest)
+    monkeypatch.setattr(orchestrator.git, "working_tree_paths", no_dirty_paths)
+    monkeypatch.setattr(scheduler_module, "validate", successful_validation)
+    snapshots: dict[str, scheduler_module.ValidatedBuildSnapshot] = {}
+
+    result = await orchestrator._build_chapters(
+        (second,), publish_if_clean=False, snapshots=snapshots
+    )
+
+    assert result[second.id].succeeded
+    assert digested == [second.id]
+    assert set(snapshots[second.id].source_digests) == {first.id, second.id}
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_review_completion_cannot_resurrect_an_invalidated_generation(
     tmp_path: Path,
 ) -> None:

@@ -777,13 +777,14 @@ class StateDatabase:
             value = json.loads(row[0])
             if not isinstance(value, dict):
                 raise ValueError(f"invalid global state in {self.path}")
-            coordinator_row = connection.execute(
-                "SELECT payload FROM globals WHERE key='coordinator_build'"
-            ).fetchone()
-            if coordinator_row is not None:
-                coordinator = json.loads(coordinator_row[0])
-                if isinstance(coordinator, dict):
-                    value["coordinator_build"] = coordinator
+            for key in ("coordinator_build", "thread_cumulative_usage"):
+                section_row = connection.execute(
+                    "SELECT payload FROM globals WHERE key=?", (key,)
+                ).fetchone()
+                if section_row is not None:
+                    section = json.loads(section_row[0])
+                    if isinstance(section, dict):
+                        value[key] = section
             counts = {
                 str(status): int(count)
                 for status, count in connection.execute(
@@ -948,11 +949,12 @@ class StateDatabase:
                     if section_row is not None:
                         globals_[key] = json.loads(section_row[0])
                 if "state" in global_ids:
-                    coordinator_row = connection.execute(
-                        "SELECT payload FROM globals WHERE key='coordinator_build'"
-                    ).fetchone()
-                    if coordinator_row is not None:
-                        globals_["coordinator_build"] = json.loads(coordinator_row[0])
+                    for key in ("coordinator_build", "thread_cumulative_usage"):
+                        section_row = connection.execute(
+                            "SELECT payload FROM globals WHERE key=?", (key,)
+                        ).fetchone()
+                        if section_row is not None:
+                            globals_[key] = json.loads(section_row[0])
             task_or_run_changed = any(
                 change["entity_type"] in {"task", "run", "work_unit"} for change in changes
             )
@@ -1025,13 +1027,14 @@ class StateDatabase:
             checkpoint = json.loads(global_row[0]) if global_row is not None else None
             if isinstance(checkpoint, dict):
                 checkpoint = dict(checkpoint)
-                coordinator_row = connection.execute(
-                    "SELECT payload FROM globals WHERE key='coordinator_build'"
-                ).fetchone()
-                if coordinator_row is not None:
-                    coordinator = json.loads(coordinator_row[0])
-                    if isinstance(coordinator, dict):
-                        checkpoint["coordinator_build"] = coordinator
+                for key in ("coordinator_build", "thread_cumulative_usage"):
+                    section_row = connection.execute(
+                        "SELECT payload FROM globals WHERE key=?", (key,)
+                    ).fetchone()
+                    if section_row is not None:
+                        section = json.loads(section_row[0])
+                        if isinstance(section, dict):
+                            checkpoint[key] = section
                 revision_row = connection.execute(
                     "SELECT revision, updated_at FROM meta WHERE singleton=1"
                 ).fetchone()

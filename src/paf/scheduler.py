@@ -149,6 +149,7 @@ class BuildDiagnostics:
 class ValidatedBuildSnapshot:
     graph: WorkUnitImportGraph
     source_digests: dict[str, str]
+    source_generations: dict[str, int] = field(default_factory=dict)
     fingerprint: dict[str, Any] | None = None
     import_dependencies: tuple[str, ...] = ()
     fingerprint_error: str = ""
@@ -381,6 +382,10 @@ class Orchestrator:
         self._work_units_by_id = {chapter.id: chapter for chapter in self.work_units}
         self._work_unit_order = {chapter.id: index for index, chapter in enumerate(self.work_units)}
         self._path_owners: dict[str, list[str]] = {}
+        self._scope_matchers = {
+            chapter.id: ScopeMatcher(chapter.scope) for chapter in self.work_units
+        }
+        self._source_generations = {chapter.id: 0 for chapter in self.work_units}
         self._module_owners: dict[str, list[str]] = {}
         self._identifier_trie = _IdentifierTrieNode()
         self._diagnostic_owner_cache: dict[LeanDiagnostic, tuple[str, ...]] = {}
@@ -538,6 +543,34 @@ class Orchestrator:
             changed_paths=isolated.changed_paths,
         )
         return replace(isolated, commit=commit)
+
+    def _mark_source_changed(self, chapter_ids: Iterable[str]) -> None:
+        for chapter_id in chapter_ids:
+            self._source_generations[chapter_id] = self._source_generations.get(chapter_id, 0) + 1
+
+    async def _possibly_modified_scope_ids(
+        self,
+        chapter_ids: Iterable[str],
+        baseline: dict[str, int],
+    ) -> set[str]:
+        """Find scopes that changed internally or have uncommitted external edits."""
+
+        selected = set(chapter_ids)
+        changed = {
+            chapter_id
+            for chapter_id in selected
+            if self._source_generations.get(chapter_id, 0) != baseline.get(chapter_id, 0)
+        }
+        if not self.git.enabled:
+            return selected
+        dirty_paths = await self.git.working_tree_paths()
+        if dirty_paths:
+            changed.update(
+                chapter_id
+                for chapter_id in selected.difference(changed)
+                if any(self._scope_matchers[chapter_id].matches(path) for path in dirty_paths)
+            )
+        return changed
 
     async def shutdown(self) -> None:
         try:
@@ -986,6 +1019,7 @@ class Orchestrator:
         async with self.source_lock:
             graph = self._observed_work_unit_graph()
             captured: dict[str, str] = {}
+            captured_generations: dict[str, int] = {}
             required = self._dependency_closure(graph, snapshots)
             for snapshot in snapshots.values():
                 if snapshot.graph.edges != graph.edges:
@@ -994,15 +1028,24 @@ class Orchestrator:
                     existing = captured.setdefault(chapter_id, digest)
                     if existing != digest:
                         return False
+                for chapter_id, generation in snapshot.source_generations.items():
+                    existing_generation = captured_generations.setdefault(chapter_id, generation)
+                    if existing_generation != generation:
+                        return False
             if not required.issubset(captured):
                 return False
-
-            by_id = {item.id: item for item in self.work_units}
+            by_id = self._work_units_by_id
+            if required.issubset(captured_generations):
+                possibly_modified = await self._possibly_modified_scope_ids(
+                    required, captured_generations
+                )
+            else:
+                possibly_modified = required
             current = await asyncio.to_thread(
-                lambda: {
-                    chapter_id: scope_digest(self.config.settings.repo, by_id[chapter_id])
-                    for chapter_id in required
-                }
+                _scope_digests,
+                self.config.settings.repo,
+                by_id,
+                possibly_modified,
             )
             if any(captured[chapter_id] != digest for chapter_id, digest in current.items()):
                 return False
@@ -1358,6 +1401,8 @@ class Orchestrator:
                 acquired = True
             isolated = collected or await workspace.collect(chapter, integration_lock=None)
             isolated = await self._commit_agent_changes(chapter, stage, None, isolated)
+            if isolated.accepted and isolated.changed_paths:
+                self._mark_source_changed((chapter.id,))
         except BaseException as error:
             detail = str(error) or type(error).__name__
             return {
@@ -1577,6 +1622,8 @@ class Orchestrator:
                 assert workspace is not None
                 isolated = await workspace.collect(chapter, integration_lock=None)
                 isolated = await self._commit_agent_changes(chapter, stage, agent, isolated)
+                if isolated.accepted and isolated.changed_paths:
+                    self._mark_source_changed((chapter.id,))
                 await workspace.close()
                 workspace = None
                 if source_held:
@@ -3194,13 +3241,26 @@ class Orchestrator:
                 build_graph = self._observed_work_unit_graph()
                 by_id = {item.id: item for item in self.work_units}
                 build_required_ids = self._dependency_closure(build_graph, ids)
+                build_source_generations = {
+                    chapter_id: self._source_generations.get(chapter_id, 0)
+                    for chapter_id in build_required_ids
+                }
+                clean_value = self.state.formalize_graph.get("clean", {})
+                clean_records = clean_value if isinstance(clean_value, dict) else {}
+                reusable_digests = {
+                    chapter_id: digest
+                    for chapter_id in build_required_ids.difference(ids)
+                    if isinstance((record := clean_records.get(chapter_id)), dict)
+                    and isinstance((digest := record.get("source_digest")), str)
+                }
+                digest_ids = build_required_ids.difference(reusable_digests)
                 build_root = build_workspace.root
                 build_source_digests_task = asyncio.create_task(
                     asyncio.to_thread(
                         _scope_digests,
                         build_root,
                         by_id,
-                        build_required_ids,
+                        digest_ids,
                     )
                 )
                 # Digest capture reads the immutable build workspace. It can run
@@ -3287,7 +3347,7 @@ class Orchestrator:
                         work_unit_id=chapter.id,
                         completed=self.state.coordinator_build.total,
                     )
-                build_source_digests = await build_source_digests_task
+                build_source_digests = reusable_digests | await build_source_digests_task
                 artifacts_built = (
                     not preempted
                     and bool(results)
@@ -3312,15 +3372,19 @@ class Orchestrator:
                         await self.source_lock.acquire()
                         source_held = True
                     current_graph = self._observed_work_unit_graph()
+                    possibly_modified = await self._possibly_modified_scope_ids(
+                        build_required_ids,
+                        build_source_generations,
+                    )
                     current_source_digests = await asyncio.to_thread(
                         _scope_digests,
                         self.config.settings.repo,
                         by_id,
-                        build_required_ids,
+                        possibly_modified,
                     )
-                    source_is_current = (
-                        current_graph.edges == build_graph.edges
-                        and current_source_digests == build_source_digests
+                    source_is_current = current_graph.edges == build_graph.edges and all(
+                        build_source_digests[chapter_id] == digest
+                        for chapter_id, digest in current_source_digests.items()
                     )
                     if not source_is_current:
                         stale = ValidationResult(
@@ -3343,6 +3407,10 @@ class Orchestrator:
                                 graph=build_graph,
                                 source_digests={
                                     chapter_id: build_source_digests[chapter_id]
+                                    for chapter_id in required
+                                },
+                                source_generations={
+                                    chapter_id: build_source_generations[chapter_id]
                                     for chapter_id in required
                                 },
                                 fingerprint=fingerprint,

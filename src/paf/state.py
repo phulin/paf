@@ -435,6 +435,7 @@ class StateStore:
         self._batch_depth = 0
         self._checkpoint_dirty = False
         self._coordinator_build_dirty = False
+        self._thread_usage_dirty = False
         self._static_dirty = False
         self._dirty_task_keys: set[str] = set()
         self._issues_dirty = False
@@ -1263,6 +1264,11 @@ class StateStore:
             globals_ = {}
             if "coordinator_build" in global_names:
                 globals_["coordinator_build"] = self._build_dict(self.coordinator_build)
+            if "thread_cumulative_usage" in global_names:
+                globals_["thread_cumulative_usage"] = {
+                    thread_id: self._usage_dict(usage)
+                    for thread_id, usage in sorted(self.thread_cumulative_usage.items())
+                }
         if change.stages or change.runs:
             globals_["agents"] = self.agent_summary()
         shepherd = globals_.get("shepherd", {})
@@ -1399,6 +1405,9 @@ class StateStore:
     def _mark_coordinator_build_dirty(self) -> None:
         self._coordinator_build_dirty = True
 
+    def _mark_thread_usage_dirty(self) -> None:
+        self._thread_usage_dirty = True
+
     async def _persist(self) -> None:
         if self._batch_depth:
             return
@@ -1410,6 +1419,7 @@ class StateStore:
             if not (
                 self._checkpoint_dirty
                 or self._coordinator_build_dirty
+                or self._thread_usage_dirty
                 or self._dirty_task_keys
                 or self._dirty_run_ids
                 or self._issues_dirty
@@ -1421,6 +1431,7 @@ class StateStore:
             self.updated_at = timestamp()
             globals_dirty = self._checkpoint_dirty
             coordinator_build_dirty = self._coordinator_build_dirty
+            thread_usage_dirty = self._thread_usage_dirty
             task_keys = self._dirty_task_keys
             dirty_runs = self._dirty_run_ids
             issues_dirty = self._issues_dirty
@@ -1429,6 +1440,7 @@ class StateStore:
             self._dirty_run_ids = set()
             self._checkpoint_dirty = False
             self._coordinator_build_dirty = False
+            self._thread_usage_dirty = False
             self._issues_dirty = False
             self._static_dirty = False
             task_context = self._task_snapshot_context() if task_keys else None
@@ -1492,6 +1504,8 @@ class StateStore:
                 changes.add(("global", "state"))
             if coordinator_build_dirty:
                 changes.add(("global", "coordinator_build"))
+            if thread_usage_dirty:
+                changes.add(("global", "thread_cumulative_usage"))
             if issues_dirty:
                 changes.add(("source_issues", "*"))
             if static_dirty:
@@ -1502,6 +1516,18 @@ class StateStore:
                 | (
                     {"coordinator_build": json.dumpb(self._build_dict(self.coordinator_build))}
                     if coordinator_build_dirty
+                    else {}
+                )
+                | (
+                    {
+                        "thread_cumulative_usage": json.dumpb(
+                            {
+                                thread_id: self._usage_dict(usage)
+                                for thread_id, usage in sorted(self.thread_cumulative_usage.items())
+                            }
+                        )
+                    }
+                    if thread_usage_dirty
                     else {}
                 ),
                 tasks=task_payloads,
@@ -1525,6 +1551,7 @@ class StateStore:
                     globals=frozenset(
                         ({"state"} if globals_dirty else set())
                         | ({"coordinator_build"} if coordinator_build_dirty else set())
+                        | ({"thread_cumulative_usage"} if thread_usage_dirty else set())
                     ),
                     stages=frozenset(changed_stages),
                     full_resync=static_dirty,
@@ -3105,7 +3132,7 @@ class StateStore:
         if previous is not None and usage.total_tokens < previous.total_tokens:
             return
         self.thread_cumulative_usage[thread_id] = usage
-        self._mark_dirty(global_state=True)
+        self._mark_thread_usage_dirty()
         if deferred:
             self._schedule_telemetry_flush()
         else:

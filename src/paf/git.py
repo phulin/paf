@@ -81,17 +81,20 @@ class GitCommitter:
     async def dirty_paths(self, chapter: WorkUnitLike) -> tuple[str, ...]:
         if not self.enabled:
             return ()
+        paths = await self.working_tree_paths()
+        matcher = ScopeMatcher(chapter.scope)
+        return tuple(path for path in paths if matcher.matches(path))
+
+    async def working_tree_paths(self) -> tuple[str, ...]:
+        """Return all uncommitted paths with two repository-wide Git queries."""
+
+        if not self.enabled:
+            return ()
         tracked, untracked = await asyncio.gather(
             self._checked("diff", "--name-only", "--no-renames", "-z", "HEAD", "--"),
             self._checked("ls-files", "--others", "--exclude-standard", "-z", "--"),
         )
-        matcher = ScopeMatcher(chapter.scope)
-        paths = {
-            path
-            for output in (tracked, untracked)
-            for path in output.split("\0")
-            if path and matcher.matches(path)
-        }
+        paths = {path for output in (tracked, untracked) for path in output.split("\0") if path}
         return tuple(sorted(paths))
 
     async def ensure_clean(self, chapter: WorkUnitLike) -> None:

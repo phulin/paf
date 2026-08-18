@@ -12,7 +12,7 @@ from paf.cli import main
 from paf.config import infer_config, load_config
 from paf.models import PipelineConfig, Stage
 from paf.project import ProjectResolver
-from paf.state import StateStore, TaskStatus
+from paf.state import StateStore, TaskStatus, TokenUsage
 from paf.state_db import read_checkpoint, read_full_snapshot
 from tests.support import write_project
 
@@ -53,6 +53,15 @@ async def test_task_and_build_deltas_do_not_rewrite_global_checkpoint(tmp_path: 
     state.append_coordinator_build_output("✔ [1/1] Built Book.Chapter01")
     await state.flush()
     assert global_row("coordinator_build") != build
+    assert global_row("state") == checkpoint
+    await state.record_thread_cumulative_usage(
+        "thread-1",
+        TokenUsage(input_tokens=100, output_tokens=10, measured=True),
+        deferred=False,
+    )
+    usage = global_row("thread_cumulative_usage")
+    assert usage is not None
+    assert len(usage[1]) < 10_000
     assert global_row("state") == checkpoint
     await state.finish_coordinator_build()
     await state.close()
