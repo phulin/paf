@@ -5516,7 +5516,9 @@ class Orchestrator:
             review_queued = False
             terminal_blockers: list[str] = []
             for blocker in blockers:
-                if int(blocker.get("sightings", 0)) < 2:
+                sightings = int(blocker.get("sightings", 0))
+                retry_baseline = int(blocker.get("retry_sighting_baseline", 0))
+                if sightings - retry_baseline < 2:
                     continue
                 blocker_id = str(blocker.get("id", ""))
                 candidate = blocker.get("upstream_candidate")

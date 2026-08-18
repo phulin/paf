@@ -1722,6 +1722,63 @@ async def test_successful_failure_retry_releases_only_its_blocked_dependents(
 
 
 @pytest.mark.asyncio
+async def test_failed_proof_retry_reopens_durable_execution_gates(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = config.chapters[0]
+    state = StateStore(config)
+    await state.load_or_create()
+    await state.set_task(chapter.id, Stage.PROVE, TaskStatus.FAILED, "proof stalled")
+    first = await state.record_proof_blockers(
+        chapter.id,
+        origin_run_id="proof-one",
+        failed_attempts=(failed_attempt("missing bridge"),),
+    )
+    blockers = await state.record_proof_blockers(
+        chapter.id,
+        origin_run_id="proof-two",
+        failed_attempts=(failed_attempt("missing bridge"),),
+    )
+    blocker_id = str(first[0]["id"])
+    assert blockers[0]["sightings"] == 2
+    await state.set_proof_blocker_status((blocker_id,), ProofBlockerStatus.BLOCKED)
+    request_id, _ = await state.enqueue_upstream_request(
+        {
+            "blocked_declaration": "Book.target",
+            "consumer_path": "lean/Book/Chapter01.lean",
+            "residual_goal": "⊢ True",
+            "needed_result": "A reusable proof of True.",
+            "attempted_alternatives": ["exact True.intro"],
+        },
+        consumer_chapter_id=chapter.id,
+        origin_run_id="proof-two",
+        owner_chapter_id=chapter.id,
+        previous_attempts="two failed attempts",
+        escalation_reason="manual evaluation required",
+    )
+
+    assert await state.retry_failed() == [f"{chapter.id}:prove"]
+
+    task = state.task(chapter.id, Stage.PROVE)
+    assert task.status == TaskStatus.PENDING
+    assert task.detail == "manually retried"
+    blocker = state.proof_blockers[blocker_id]
+    assert blocker["status"] == ProofBlockerStatus.OPEN
+    assert blocker["sightings"] == 2
+    assert blocker["retry_sighting_baseline"] == 2
+    assert blocker["origin_run_ids"] == ["proof-one", "proof-two"]
+    request = state.upstream_requests[request_id]
+    assert request["status"] == UpstreamRequestStatus.REQUESTED
+    assert "escalation_reason" not in request
+    await state.close()
+
+    recovered = StateStore(config)
+    await recovered.load_or_create()
+    assert recovered.proof_blockers[blocker_id]["status"] == ProofBlockerStatus.OPEN
+    assert recovered.upstream_requests[request_id]["status"] == UpstreamRequestStatus.REQUESTED
+    await recovered.close()
+
+
+@pytest.mark.asyncio
 async def test_orchestrator_requeues_interrupted_tasks_for_fresh_retry_by_default(
     tmp_path: Path,
 ) -> None:

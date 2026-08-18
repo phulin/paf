@@ -2448,6 +2448,31 @@ class StateStore:
             await self._persist()
         return reopened
 
+    async def reopen_proof_blockers(self, chapter_ids: Iterable[str]) -> list[str]:
+        """Start a fresh retry window for unresolved proof evidence."""
+
+        selected = set(chapter_ids)
+        reopened: list[str] = []
+        reopened_statuses = {
+            ProofBlockerStatus.BLOCKED.value,
+            ProofBlockerStatus.UPSTREAM_REQUESTED.value,
+        }
+        for blocker_id, blocker in self.proof_blockers.items():
+            if blocker.get("consumer_chapter_id") not in selected:
+                continue
+            status = blocker.get("status")
+            if status == ProofBlockerStatus.RESOLVED.value:
+                continue
+            if status in reopened_statuses:
+                blocker["status"] = ProofBlockerStatus.OPEN.value
+            blocker["retry_sighting_baseline"] = int(blocker.get("sightings", 0))
+            blocker["updated_at"] = timestamp()
+            reopened.append(blocker_id)
+        if reopened:
+            self._mark_dirty(global_state=False, sections={"proof_blockers"})
+            await self._persist()
+        return reopened
+
     async def enqueue_fixup_request(
         self,
         feedback: dict[str, str],
@@ -3183,6 +3208,7 @@ class StateStore:
 
         changed: list[str] = []
         failure_changed = False
+        proof_chapters: set[str] = set()
         for key, task in self.tasks.items():
             if task.status != TaskStatus.FAILED:
                 continue
@@ -3192,11 +3218,14 @@ class StateStore:
             task.waiting_on = ()
             if task.stage == Stage.PROVE:
                 task.source_digest = None
+                proof_chapters.add(task.chapter_id)
             task.detail = "manually retried"
             task.recovering_failure = True
             task.updated_at = timestamp()
             changed.append(key)
             failure_changed = self._sync_failure_record(task) or failure_changed
+        await self.reopen_proof_blockers(proof_chapters)
+        await self.reopen_escalated_upstream_requests(proof_chapters)
         if changed:
             self._invalidate_status_summaries()
             self._mark_dirty(
