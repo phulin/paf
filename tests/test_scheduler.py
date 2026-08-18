@@ -13,6 +13,7 @@ import pytest
 import paf.scheduler as scheduler_module
 from paf.codex import (
     DIAGNOSTIC_REVIEW_ROLE,
+    WARNING_REVIEW_ROLE,
     AgentResult,
     CodexExecutor,
     ValidationResult,
@@ -25,7 +26,13 @@ from paf.corpus import WorkUnitImportGraph
 from paf.git import GitCommitError
 from paf.hashing import stable_digest_text
 from paf.models import Chapter, PipelineConfig, ProofTarget, Stage
-from paf.scheduler import FormalizeOutcome, Orchestrator, ReviewOutcome
+from paf.scheduler import (
+    BUILD_ERROR_REVIEW_KIND,
+    BUILD_WARNING_REVIEW_KIND,
+    FormalizeOutcome,
+    Orchestrator,
+    ReviewOutcome,
+)
 from paf.state import (
     RunRecord,
     StateStore,
@@ -820,6 +827,155 @@ async def test_diagnostic_requests_select_targeted_review_role(tmp_path: Path) -
 
 
 @pytest.mark.asyncio
+async def test_review_feedback_records_warning_and_error_reasons(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = config.chapters[0]
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await orchestrator.prepare()
+
+    warning_id, _ = await orchestrator._queue_review_feedback(
+        {chapter.id: "warning: Book/Chapter01.lean:3:1: unused variable"},
+        origin="warning-build",
+    )
+    assert state.proof_review_requests[warning_id]["kind"] == BUILD_WARNING_REVIEW_KIND
+    _, warning_ids = orchestrator._proof_review_feedback(chapter.id)
+    assert warning_ids == (warning_id,)
+    assert orchestrator._proof_review_role(warning_ids) == WARNING_REVIEW_ROLE
+
+    await state.finish_proof_review_requests(chapter.id, (warning_id,))
+    error_id, _ = await orchestrator._queue_review_feedback(
+        {chapter.id: "error: Book/Chapter01.lean:4:2: unknown identifier"},
+        origin="error-build",
+    )
+    assert state.proof_review_requests[error_id]["kind"] == BUILD_ERROR_REVIEW_KIND
+    _, error_ids = orchestrator._proof_review_feedback(chapter.id)
+    assert error_ids == (error_id,)
+    assert orchestrator._proof_review_role(error_ids) == DIAGNOSTIC_REVIEW_ROLE
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_diagnostics_are_selected_before_proof_findings(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = config.chapters[0]
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await orchestrator.prepare()
+    proof_id, _ = await state.enqueue_proof_review_request(
+        {chapter.id: "Failed proof `Book.target` in `lean/Book/Chapter01.lean`: blocked"},
+        origin_run_id="proof-run",
+    )
+    warning_id, _ = await state.enqueue_proof_review_request(
+        {chapter.id: "warning: Book/Chapter01.lean:3:1: unused variable"},
+        origin_run_id="warning-build",
+        kind=BUILD_WARNING_REVIEW_KIND,
+    )
+
+    _, selected_ids = orchestrator._proof_review_feedback(chapter.id)
+    assert selected_ids == (warning_id,)
+    assert orchestrator._proof_review_role(selected_ids) == WARNING_REVIEW_ROLE
+
+    await state.finish_proof_review_requests(chapter.id, selected_ids)
+    _, selected_ids = orchestrator._proof_review_feedback(chapter.id)
+    assert selected_ids == (proof_id,)
+    assert orchestrator._proof_review_role(selected_ids) == ""
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_review_tree_runs_diagnostics_before_pending_proof_review(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = config.chapters[0]
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await orchestrator.prepare()
+    await mark_clean_formalization(orchestrator)
+    proof_id, _ = await state.enqueue_proof_review_request(
+        {chapter.id: "Failed proof `Book.target` in `lean/Book/Chapter01.lean`: blocked"},
+        origin_run_id="proof-run",
+    )
+    warning_id, _ = await state.enqueue_proof_review_request(
+        {chapter.id: "warning: Book/Chapter01.lean:3:1: unused variable"},
+        origin_run_id="warning-build",
+        kind=BUILD_WARNING_REVIEW_KIND,
+    )
+    await state.set_task(
+        chapter.id,
+        Stage.REVIEW,
+        TaskStatus.PENDING,
+        "reason-specific re-review required",
+    )
+    calls: list[tuple[str, tuple[str, ...]]] = []
+
+    async def review(
+        _chapter: Chapter,
+        _rounds_used: dict[str, int],
+        **options: Any,
+    ) -> bool:
+        calls.append(
+            (
+                str(options.get("role", "")),
+                tuple(options.get("proof_request_ids", ())),
+            )
+        )
+        return True
+
+    monkeypatch.setattr(orchestrator, "_review_chapter_to_clean", review)
+
+    assert await orchestrator._review_tree()
+    assert calls == [
+        (WARNING_REVIEW_ROLE, (warning_id,)),
+        ("", (proof_id,)),
+    ]
+    assert state.proof_review_requests == {}
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_review_build_warning_switches_follow_up_to_warning_role(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = config.chapters[0]
+    source = tmp_path / "lean" / "Book" / "Chapter01.lean"
+    source.parent.mkdir(parents=True)
+    source.write_text("theorem target : True := by sorry\n", encoding="utf-8")
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await orchestrator.prepare()
+    await mark_clean_formalization(orchestrator)
+    roles: list[str] = []
+
+    async def review_once(_chapter: Chapter, **options: Any) -> ReviewOutcome:
+        roles.append(str(options.get("role", "")))
+        if len(roles) == 1:
+            source.write_text(
+                "theorem target : True := by\n  sorry\n",
+                encoding="utf-8",
+            )
+            return ReviewOutcome(True, True, complete=True, run_id="initial-review")
+        return ReviewOutcome(True, False, complete=True, run_id="warning-review")
+
+    async def review_build(_chapter: Chapter) -> dict[str, str]:
+        return {chapter.id: "warning: Book/Chapter01.lean:1:1: unused variable"}
+
+    async def build_is_fresh(_chapter: Chapter) -> bool:
+        return True
+
+    monkeypatch.setattr(orchestrator, "_review_once", review_once)
+    monkeypatch.setattr(orchestrator, "_review_build", review_build)
+    monkeypatch.setattr(orchestrator, "_proof_build_is_fresh", build_is_fresh)
+
+    assert await orchestrator._review_chapter_to_clean(chapter, {chapter.id: 0})
+    assert roles == ["", WARNING_REVIEW_ROLE]
+    assert state.proof_review_requests == {}
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_diagnostic_review_records_distinct_run_role_and_schema(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
     chapter = config.chapters[0]
@@ -1006,7 +1162,7 @@ async def test_malformed_review_report_resumes_same_session(tmp_path: Path) -> N
     state = StateStore(config)
     orchestrator = Orchestrator(config, state)
     await orchestrator.prepare()
-    await mark_formalized(orchestrator)
+    await mark_clean_formalization(orchestrator)
     executor = FakeExecutor(
         state,
         [
@@ -3186,6 +3342,10 @@ async def test_changed_review_is_rebuilt_fixed_and_reviewed_again(
             assert workspace_root is not None
             target = workspace_root / "lean" / "Book" / "Chapter01.lean"
             target.write_text("def afterReview := 1\n", encoding="utf-8")
+        elif stage is Stage.REVIEW and stages_seen.count(Stage.REVIEW) == 2:
+            assert workspace_root is not None
+            target = workspace_root / "lean" / "Book" / "Chapter01.lean"
+            target.write_text("def afterRepair := 1\n", encoding="utf-8")
         return await original_run(
             chapter,
             stage,
@@ -3210,7 +3370,7 @@ async def test_changed_review_is_rebuilt_fixed_and_reviewed_again(
 
     assert await orchestrator._review_until_clean()
     assert stages_seen == [Stage.REVIEW, Stage.REVIEW]
-    assert review_path.read_text(encoding="utf-8") == "def afterReview := 1\n"
+    assert review_path.read_text(encoding="utf-8") == "def afterRepair := 1\n"
     await orchestrator.shutdown()
 
 
@@ -3768,7 +3928,7 @@ async def test_placeholder_free_proof_does_not_run_agent_after_failed_refresh(
     assert proof.detail == "pre-existing coordinator diagnostics routed before proof work"
     assert proof.rounds == 0
     request = next(iter(orchestrator.state.proof_review_requests.values()))
-    assert request["kind"] == "diagnostic"
+    assert request["kind"] == BUILD_ERROR_REVIEW_KIND
     await orchestrator.shutdown()
 
 
@@ -3807,7 +3967,7 @@ async def test_dirty_proof_baseline_routes_diagnostics_before_placeholder_chunk(
     assert proof.rounds == 0
     assert len(orchestrator.executor.results) == 3
     request = next(iter(orchestrator.state.proof_review_requests.values()))
-    assert request["kind"] == "diagnostic"
+    assert request["kind"] == BUILD_ERROR_REVIEW_KIND
     assert chapter.id in request["feedback"]
     await orchestrator.shutdown()
 
@@ -5322,7 +5482,7 @@ async def test_proof_validation_routes_foreign_diagnostic_to_its_owner(
     assert not await orchestrator._prove(first)
     assert state.task(first.id, Stage.PROVE).rounds == 1
     request = next(iter(state.proof_review_requests.values()))
-    assert request["kind"] == "diagnostic"
+    assert request["kind"] == BUILD_ERROR_REVIEW_KIND
     assert set(request["feedback"]) == {second.id}
     await orchestrator.shutdown()
 

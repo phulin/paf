@@ -16,10 +16,12 @@ from uuid import uuid4
 from paf import json_codec as json
 from paf.codex import (
     DIAGNOSTIC_REVIEW_ROLE,
+    DIAGNOSTIC_REVIEW_ROLES,
     DOWNSTREAM_RETRY_ROLE,
     REPAIR_WORKER_ROLE,
     SHEPHERD_ROLE,
     UPSTREAM_REPAIR_ROLE,
+    WARNING_REVIEW_ROLE,
     AgentResult,
     CodexExecutor,
     ValidationResult,
@@ -224,6 +226,17 @@ PROOF_FEEDBACK_ROUNDS = 3
 DISCOVERY_BATCH_SECONDS = 0.025
 DISCOVERY_BATCH_MAXIMUM = 256
 DIAGNOSTIC_OWNER_CACHE_MAXIMUM = 16_384
+PROOF_FINDING_REVIEW_KIND = "proof_finding"
+BUILD_ERROR_REVIEW_KIND = "build_error"
+BUILD_WARNING_REVIEW_KIND = "build_warning"
+LEGACY_DIAGNOSTIC_REVIEW_KIND = "diagnostic"
+DIAGNOSTIC_REVIEW_KINDS = frozenset(
+    {
+        BUILD_ERROR_REVIEW_KIND,
+        BUILD_WARNING_REVIEW_KIND,
+        LEGACY_DIAGNOSTIC_REVIEW_KIND,
+    }
+)
 
 
 @dataclass
@@ -2721,27 +2734,42 @@ class Orchestrator:
         self,
         chapter_id: str,
     ) -> tuple[str, tuple[str, ...]]:
-        blocks: dict[str, None] = {}
-        request_ids: list[str] = []
+        entries: list[tuple[str, str, str]] = []
         for request_id, value in self.state.proof_review_requests.items():
             feedback = value.get("feedback") if isinstance(value, dict) else None
             block = feedback.get(chapter_id) if isinstance(feedback, dict) else None
             if not isinstance(block, str) or not block.strip():
                 continue
+            kind = str(value.get("kind", PROOF_FINDING_REVIEW_KIND))
+            entries.append((request_id, kind, block))
+        diagnostic_entries = [entry for entry in entries if entry[1] in DIAGNOSTIC_REVIEW_KINDS]
+        selected = diagnostic_entries or entries
+        blocks: dict[str, None] = {}
+        request_ids: list[str] = []
+        for request_id, kind, block in selected:
             request_ids.append(request_id)
-            blocks[self._tag_proof_findings(request_id, block)] = None
+            rendered = (
+                block
+                if kind in DIAGNOSTIC_REVIEW_KINDS
+                else self._tag_proof_findings(request_id, block)
+            )
+            blocks[rendered] = None
         return "\n\n".join(blocks), tuple(request_ids)
 
     def _proof_review_role(self, request_ids: Iterable[str]) -> str:
-        """Use targeted diagnostic repair only when every queued item is a diagnostic."""
+        """Select a reason-specific re-review role for one homogeneous request batch."""
 
         kinds = {
-            str(value.get("kind", "proof_finding"))
+            str(value.get("kind", PROOF_FINDING_REVIEW_KIND))
             for request_id in request_ids
             for value in (self.state.proof_review_requests.get(request_id),)
             if isinstance(value, dict)
         }
-        return DIAGNOSTIC_REVIEW_ROLE if kinds == {"diagnostic"} else ""
+        if kinds == {BUILD_WARNING_REVIEW_KIND}:
+            return WARNING_REVIEW_ROLE
+        if kinds and kinds.issubset(DIAGNOSTIC_REVIEW_KINDS):
+            return DIAGNOSTIC_REVIEW_ROLE
+        return ""
 
     @staticmethod
     def _proof_finding_ids(request_id: str, feedback: str) -> tuple[str, ...]:
@@ -2832,7 +2860,7 @@ class Orchestrator:
         _, created = await self.state.enqueue_proof_review_request(
             feedback,
             origin_run_id=origin_run_id,
-            kind="proof_finding",
+            kind=PROOF_FINDING_REVIEW_KIND,
         )
         targets = {chapter.id}
         if not created:
@@ -3894,7 +3922,9 @@ class Orchestrator:
             role=role,
             request_ids=request_ids,
             queue_detail=(
-                "targeted repair of coordinator diagnostics"
+                "targeted cleanup of coordinator warnings"
+                if role == WARNING_REVIEW_ROLE
+                else "targeted repair of coordinator diagnostics"
                 if role == DIAGNOSTIC_REVIEW_ROLE
                 else "full-scope review of failed-proof findings"
                 if feedback
@@ -4073,10 +4103,18 @@ class Orchestrator:
     ) -> tuple[str, set[str]]:
         """Persist follow-up work and reopen only its direct owners."""
 
+        diagnostics = tuple(
+            diagnostic for block in feedback.values() for diagnostic in _lean_diagnostics(block)
+        )
+        kind = (
+            BUILD_WARNING_REVIEW_KIND
+            if diagnostics and all(item.severity == "warning" for item in diagnostics)
+            else BUILD_ERROR_REVIEW_KIND
+        )
         request_id, created = await self.state.enqueue_proof_review_request(
             feedback,
             origin_run_id=origin,
-            kind="diagnostic",
+            kind=kind,
         )
         if not created:
             return request_id, set()
@@ -4106,7 +4144,7 @@ class Orchestrator:
         review_feedback = feedback
 
         async def route_feedback(items: dict[str, str], *, origin: str) -> bool:
-            nonlocal review_feedback
+            nonlocal request_ids, review_feedback, role
             if not items:
                 return True
             request_id, _ = await self._queue_review_feedback(
@@ -4115,11 +4153,21 @@ class Orchestrator:
                 exclude_from_invalidation={chapter.id},
             )
             if chapter.id in items:
-                if request_id not in request_ids:
-                    request_ids.append(request_id)
                 block = items[chapter.id]
-                if block not in review_feedback:
-                    review_feedback = f"{review_feedback}\n\n{block}" if review_feedback else block
+                if role in DIAGNOSTIC_REVIEW_ROLES:
+                    if request_id not in request_ids:
+                        request_ids.append(request_id)
+                    if block not in review_feedback:
+                        review_feedback = (
+                            f"{review_feedback}\n\n{block}" if review_feedback else block
+                        )
+                else:
+                    # A newly discovered coordinator diagnostic takes precedence
+                    # over initial review or proof-finding work. Keep those older
+                    # requests durable for their own clean follow-up pass.
+                    request_ids = [request_id]
+                    review_feedback = block
+                role = self._proof_review_role(request_ids)
             if chapter.id in items:
                 await self.state.set_task(
                     chapter.id,
@@ -4258,7 +4306,7 @@ class Orchestrator:
                 ):
                     continue
                 return False
-            if role == DIAGNOSTIC_REVIEW_ROLE and not await self._proof_build_is_fresh(chapter):
+            if role in DIAGNOSTIC_REVIEW_ROLES and not await self._proof_build_is_fresh(chapter):
                 review_feedback = attempt_feedback
                 if await queue_report_retry(
                     outcome,
@@ -4540,7 +4588,13 @@ class Orchestrator:
                             Stage.REVIEW,
                             TaskStatus.RUNNING,
                             (
-                                "targeted re-review queued"
+                                "non-sorry warning cleanup queued"
+                                if proof_review_role == WARNING_REVIEW_ROLE
+                                else "coordinator diagnostic repair queued"
+                                if proof_review_role == DIAGNOSTIC_REVIEW_ROLE
+                                else "failed-proof statement re-review queued"
+                                if proof_feedback
+                                else "targeted re-review queued"
                                 if rereview
                                 else "waiting for dependency-ordered coordinator build"
                             ),
@@ -4668,6 +4722,15 @@ class Orchestrator:
                             "editing review completed",
                             proof_request_ids=handle.proof_request_ids,
                         )
+                    remaining_feedback, _ = self._proof_review_feedback(chapter_id)
+                    if remaining_feedback:
+                        await self.state.set_task(
+                            chapter_id,
+                            Stage.REVIEW,
+                            TaskStatus.PENDING,
+                            "additional reason-specific re-review queued",
+                        )
+                        continue
                     reviewed.add(chapter_id)
 
                 completed_rebuilds = [

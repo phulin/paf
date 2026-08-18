@@ -9,7 +9,12 @@ not prove theorem bodies, so existing proof placeholders may remain and new prop
 use `by sorry`.
 
 PAF has already built the incoming files successfully, allowing only warnings for declarations that
-use `sorry`. If you make changes, leave the changed files equally clean for PAF's next build.
+use `sorry`.
+
+Deliver the complete assigned Lean scope with zero errors and zero non-`sorry` warnings. The only
+permitted warnings are exact declaration-uses-`sorry` warnings for allowed proof placeholders. This
+requirement applies whether or not you changed any files. Set `complete` to `true` only when this
+delivery state has been established.
 
 ## Workflow
 
@@ -58,8 +63,9 @@ because the incoming build is already clean.
 
 Every source assertion and every main theorem's likely proof route has been checked. Existing Mathlib
 and earlier-chapter APIs have been reused wherever possible, all warranted in-scope repairs have been
-made, imports remain focused and cycle-free, and any edited files are clean except for permitted
-`sorry` warnings. Report source problems and any exact out-of-scope changes still required.
+made, imports remain focused and cycle-free, and the complete assigned Lean scope has zero errors and
+zero warnings except permitted exact declaration-uses-`sorry` warnings. Report source problems and
+any exact out-of-scope changes still required.
 
 ## Output format
 

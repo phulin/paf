@@ -18,6 +18,7 @@ from paf.codex import (
     REPORT_SCHEMAS,
     SHEPHERD_ROLE,
     UPSTREAM_REPAIR_ROLE,
+    WARNING_REVIEW_ROLE,
     CodexExecutor,
     FatalCodexInvocationError,
     _bounded_feedback,
@@ -591,17 +592,26 @@ async def test_executor_selects_a_distinct_schema_for_each_agent(tmp_path: Path)
     assert len(set(selected.values())) == len(selected)
     for key, path in selected.items():
         assert json.loads(path.read_text(encoding="utf-8")) == REPORT_SCHEMAS[key]
+    warning_review = schema_path(
+        executor.command(
+            Stage.REVIEW,
+            feedback="warning",
+            role=WARNING_REVIEW_ROLE,
+        )
+    )
+    assert warning_review == selected["diagnostic_review"]
     assert not (config.settings.state_dir / "agent-report.schema.json").exists()
 
 
-def test_diagnostic_review_has_proof_capable_lean_tools(tmp_path: Path) -> None:
+@pytest.mark.parametrize("role", [DIAGNOSTIC_REVIEW_ROLE, WARNING_REVIEW_ROLE])
+def test_diagnostic_review_has_proof_capable_lean_tools(tmp_path: Path, role: str) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
     executor = CodexExecutor(config, StateStore(config))
 
     command = executor.command(
         Stage.REVIEW,
         feedback="diagnostic",
-        role=DIAGNOSTIC_REVIEW_ROLE,
+        role=role,
     )
     overrides = {
         command[index + 1].split("=", 1)[0]: json.loads(command[index + 1].split("=", 1)[1])

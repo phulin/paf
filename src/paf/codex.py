@@ -351,12 +351,15 @@ PROCESS_EXIT_POLL_SECONDS = 0.005
 _PROMPT_RESOURCES = files("paf.prompts")
 COMMON_PROMPT_PATH = Path(str(_PROMPT_RESOURCES.joinpath("common.md")))
 PROOF_REVIEW_PROMPT_PATH = Path(str(_PROMPT_RESOURCES.joinpath("proof_review.md")))
+DIAGNOSTIC_REVIEW_PROMPT_PATH = Path(str(_PROMPT_RESOURCES.joinpath("diagnostic_review.md")))
 SHEPHERD_PROMPT_PATH = Path(str(_PROMPT_RESOURCES.joinpath("shepherd.md")))
 UPSTREAM_REPAIR_ROLE = "upstream_repair"
 DOWNSTREAM_RETRY_ROLE = "downstream_retry"
 SHEPHERD_ROLE = "shepherd"
 REPAIR_WORKER_ROLE = "repair_worker"
 DIAGNOSTIC_REVIEW_ROLE = "diagnostic_review"
+WARNING_REVIEW_ROLE = "warning_review"
+DIAGNOSTIC_REVIEW_ROLES = frozenset({DIAGNOSTIC_REVIEW_ROLE, WARNING_REVIEW_ROLE})
 
 
 def report_schema_key(stage: Stage, *, role: str = "", feedback: str = "") -> str:
@@ -366,7 +369,7 @@ def report_schema_key(stage: Stage, *, role: str = "", feedback: str = "") -> st
         return UPSTREAM_REPAIR_ROLE
     if role == DOWNSTREAM_RETRY_ROLE:
         return DOWNSTREAM_RETRY_ROLE
-    if role == DIAGNOSTIC_REVIEW_ROLE:
+    if role in DIAGNOSTIC_REVIEW_ROLES:
         return DIAGNOSTIC_REVIEW_ROLE
     if stage is Stage.REVIEW and feedback:
         return "proof_review"
@@ -415,39 +418,6 @@ have stopped. It must describe the stable files on disk, not planned work. Use o
   concrete `usage_guidance`, and a `rejection_reason`. For `downstream`, leave `declarations` empty
   and explain why this earlier chapter is not the right owner. For the other dispositions, leave
   `rejection_reason` empty.""",
-        }
-    elif role == DIAGNOSTIC_REVIEW_ROLE:
-        values = {
-            "review_assignment": """This is a targeted diagnostic repair. The coordinator found
-exact errors or non-`sorry` warnings in source that was expected to be clean. Repair the supplied
-diagnostics and only the declarations, imports, or definitions needed to clear them.""",
-            "review_goal_details": """This is not a full-chapter re-review or open-ended proof
-search. Existing proposition placeholders may remain. When a supplied diagnostic is inside a proof
-body, repair that body as narrowly as possible; do not revisit unrelated statements or try to prove
-unassigned theorems.""",
-            "review_workflow_details": """Cover every supplied diagnostic and its source owner.
-Trace secondary diagnostics to their earliest cause, group findings with the same cause, and check
-the affected dependent files. Do not audit source sections or declarations unrelated to those
-diagnostics.""",
-            "review_guardrails": """Do not return a no-change report while a supplied diagnostic
-still applies. If a diagnostic belongs to an out-of-scope dependency, leave local source unchanged
-and identify the exact owner path in `issues`. Do not add new placeholders merely to silence an
-error.""",
-            "review_definition_of_done": """Every supplied diagnostic has been removed at its
-cause, affected files and dependents have no errors or non-`sorry` warnings, no unrelated interface
-was changed, and any genuinely out-of-scope owner is identified precisely.""",
-            "review_output_format": """Return the structured report once, after tool use and edits
-have stopped. It must describe the stable files on disk, not planned work. Use only these fields:
-
-- `complete`: `true` only when every supplied in-scope diagnostic is resolved and the definition of
-  done is met.
-- `summary`: if edits remain, concise past-tense prose naming the repaired diagnostics and their
-  causes, suitable for a commit body; otherwise, why no edit was retained.
-- `issues`: precise remaining diagnostic, tooling, or out-of-scope blockers; otherwise an empty
-  list.
-- `source_issues`: genuine defects in the informal textbook; otherwise an empty list. Each entry
-  must give `location`, an exact identifying `source_excerpt`, a mathematical `description`, and the
-  smallest `suggested_correction`.""",
         }
     else:
         values = {
@@ -1283,15 +1253,24 @@ class CodexExecutor:
         upstream_requests: Iterable[dict[str, Any]] = (),
         proof_targets: Iterable[ProofTarget | dict[str, Any]] = (),
     ) -> str:
-        if role in {UPSTREAM_REPAIR_ROLE, DIAGNOSTIC_REVIEW_ROLE} or (
-            stage is Stage.REVIEW and feedback
-        ):
+        if role in DIAGNOSTIC_REVIEW_ROLES:
+            prompt_path = DIAGNOSTIC_REVIEW_PROMPT_PATH
+        elif role == UPSTREAM_REPAIR_ROLE or (stage is Stage.REVIEW and feedback):
             prompt_path = PROOF_REVIEW_PROMPT_PATH
         else:
             prompt_path = self.config.stages[stage].prompt
         template = prompt_path.read_text(encoding="utf-8")
         if prompt_path == PROOF_REVIEW_PROMPT_PATH:
             template = render_review_variant(template, role=role)
+        elif prompt_path == DIAGNOSTIC_REVIEW_PROMPT_PATH:
+            diagnostic_trigger = (
+                "The Lean build completed, but PAF rejected one or more non-`sorry` warnings. "
+                "The build did not fail and this is not failed proof evidence."
+                if role == WARNING_REVIEW_ROLE
+                else "The coordinator build reported Lean errors, possibly together with "
+                "non-`sorry` warnings."
+            )
+            template = template.replace("{diagnostic_trigger}", diagnostic_trigger)
         base = render_prompt(template, chapter)
         if role == REPAIR_WORKER_ROLE:
             instruction = feedback
@@ -1396,10 +1375,10 @@ diagnostics supplied below say otherwise; those diagnostics describe the current
 the earlier clean-build fact. PAF will rebuild any changes.""",
             Stage.PROVE: """The assigned chapter passed review and was clean before proof work
 began. Work directly on unresolved proofs rather than auditing or rechecking untouched files. Every
-assigned declaration must finish without errors or warnings; only `sorry` warnings from placeholders
-reserved for later chunks are permitted. PAF will build the chapter after the attempt. Any validation
-diagnostics supplied below describe the newer current source and override that earlier clean-build
-fact."""
+assigned declaration must finish without errors or warnings; only `sorry` warnings from
+placeholders reserved for later chunks are permitted. PAF will build the chapter after the attempt.
+Any validation diagnostics supplied below describe the newer current source and override that
+earlier clean-build fact."""
             + proof_retry_contract,
         }[stage]
         if role == UPSTREAM_REPAIR_ROLE:
@@ -1495,7 +1474,7 @@ whole-file diagnostics from prerequisites to dependents. Do not prepare every fi
                 else "Shepherd repair dossier"
                 if role == REPAIR_WORKER_ROLE
                 else "PAF validation diagnostics to repair"
-                if role == DIAGNOSTIC_REVIEW_ROLE
+                if role in DIAGNOSTIC_REVIEW_ROLES
                 else {
                     Stage.DISCOVER: "Discovery feedback",
                     Stage.FORMALIZE: "PAF build diagnostics and reported findings",
@@ -1592,7 +1571,7 @@ whole-file diagnostics from prerequisites to dependents. Do not prepare every fi
                 project=settings.lean_project,
                 mcp_tool_timeout_seconds=settings.lean_mcp_tool_timeout_seconds,
             )
-            tool_stage = Stage.PROVE if role == DIAGNOSTIC_REVIEW_ROLE else stage
+            tool_stage = Stage.PROVE if role in DIAGNOSTIC_REVIEW_ROLES else stage
             mcp_config = backend.mcp_config(root, tool_stage)
             for key, value in mcp_config.items():
                 command.extend(["--config", f"{key}={json.dumps(value)}"])

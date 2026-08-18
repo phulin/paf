@@ -10,6 +10,11 @@ Make the smallest justified in-scope repair and preserve every sound established
 
 {review_goal_details}
 
+Deliver the complete assigned Lean scope with zero errors and zero non-`sorry` warnings. The only
+permitted warnings are exact declaration-uses-`sorry` warnings for allowed proof placeholders. This
+requirement applies whether or not you changed any files. Set `complete` to `true` only when this
+delivery state has been established.
+
 ## Inputs and authority
 
 - The supplied findings, requests, and proof attempts are evidence to reproduce and assess, not
