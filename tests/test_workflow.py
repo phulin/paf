@@ -232,6 +232,46 @@ async def test_hot_snapshot_batches_failure_roots_without_recursive_walks(
 
 
 @pytest.mark.asyncio
+async def test_subset_failure_routing_matches_full_walk_for_shared_roots_and_recovery(
+    tmp_path,
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    state = StateStore(config)
+    await state.load_or_create()
+    first, second = config.work_units
+    state.source_dependency_tree = {
+        "dependencies": {
+            first.id: [],
+            second.id: [first.id],
+        }
+    }
+    first_failure = state.key(first.id, Stage.DISCOVER)
+    second_failure = state.key(second.id, Stage.DISCOVER)
+    state.tasks[first_failure].status = TaskStatus.FAILED
+    state.tasks[second_failure].status = TaskStatus.FAILED
+    requested = (
+        state.key(second.id, Stage.FORMALIZE),
+        state.key(second.id, Stage.REVIEW),
+        state.key(second.id, Stage.PROVE),
+    )
+
+    def assert_matches_full_walk() -> None:
+        expected = {key: state.failure_roots(state.tasks[key]) for key in requested}
+        assert state._failure_roots_subset(requested) == expected
+
+    assert_matches_full_walk()
+    assert state._failure_roots_subset(requested)[requested[0]] == (
+        first_failure,
+        second_failure,
+    )
+
+    state.tasks[first_failure].status = TaskStatus.SUCCEEDED
+    assert_matches_full_walk()
+    assert state._failure_roots_subset(requested)[requested[0]] == (second_failure,)
+    await state.close()
+
+
+@pytest.mark.asyncio
 async def test_structured_wait_and_direct_failure_survive_restart(tmp_path) -> None:
     config_path = write_project(tmp_path, chapters="chapters = [1, 2]")
     config = load_config(config_path)
