@@ -174,7 +174,7 @@ async def test_failed_build_returns_before_recursive_cleanup(
 
 @pytest.mark.asyncio
 async def test_source_generations_link_unchanged_files_to_previous_snapshot(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     manager, _ = fuse_manager(write_project(tmp_path, chapters="chapters = [1]"))
     unchanged = tmp_path / "orchestrator.py"
@@ -186,14 +186,35 @@ async def test_source_generations_link_unchanged_files_to_previous_snapshot(
     first = manager._generation_paths[0]
     first_unchanged = (first / unchanged.relative_to(tmp_path)).stat().st_ino
     first_changed = (first / changed.relative_to(tmp_path)).stat().st_ino
+    first_changed_mtime = (first / changed.relative_to(tmp_path)).stat().st_mtime_ns
 
     changed.write_text("def version := 2\n", encoding="utf-8")
+    os.utime(changed, ns=(first_changed_mtime, first_changed_mtime))
     manager._revision = 1
+    manager._pending_source_changes.add(changed.relative_to(tmp_path).as_posix())
+    commands: list[tuple[str, ...]] = []
+    original_run = manager._run
+
+    async def tracked_run(*command: str) -> None:
+        commands.append(command)
+        await original_run(*command)
+
+    monkeypatch.setattr(manager, "_run", tracked_run)
     workspace = await manager.acquire("linked-generation")
     second = workspace.base
     try:
         assert (second / unchanged.relative_to(tmp_path)).stat().st_ino == first_unchanged
         assert (second / changed.relative_to(tmp_path)).stat().st_ino != first_changed
+        assert (second / changed.relative_to(tmp_path)).read_text(encoding="utf-8") == (
+            "def version := 2\n"
+        )
+        generation_rsync = next(
+            command
+            for command in commands
+            if any(item.startswith("--link-dest=") for item in command)
+        )
+        assert "--checksum" not in generation_rsync
+        assert any("--ignore-times" in command for command in commands)
     finally:
         await workspace.close()
         await manager.close()

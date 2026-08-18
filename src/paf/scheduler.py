@@ -8,6 +8,7 @@ from collections.abc import Callable, Coroutine, Iterable
 from contextlib import suppress
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from threading import Lock
 from typing import Any
 from uuid import uuid4
@@ -347,6 +348,14 @@ def _with_build_command(work_unit: WorkUnitLike, command: str) -> WorkUnitLike:
             target=replace(work_unit._target(), build_command=command),
         )
     return replace(work_unit, build_command=command)
+
+
+def _scope_digests(
+    root: Path,
+    by_id: dict[str, WorkUnitLike],
+    work_unit_ids: Iterable[str],
+) -> dict[str, str]:
+    return {work_unit_id: scope_digest(root, by_id[work_unit_id]) for work_unit_id in work_unit_ids}
 
 
 class Orchestrator:
@@ -2950,6 +2959,7 @@ class Orchestrator:
             source_held = False
             build_workspace = None
             progress_flush: asyncio.Task[None] | None = None
+            build_source_digests_task: asyncio.Task[dict[str, str]] | None = None
 
             async def flush_build_progress() -> None:
                 await asyncio.sleep(0.25)
@@ -2971,15 +2981,18 @@ class Orchestrator:
                 build_graph = self._observed_work_unit_graph()
                 by_id = {item.id: item for item in self.work_units}
                 build_required_ids = self._dependency_closure(build_graph, ids)
-                build_source_digests = await asyncio.to_thread(
-                    lambda by_id=by_id, build_required_ids=build_required_ids: {
-                        chapter_id: scope_digest(self.config.settings.repo, by_id[chapter_id])
-                        for chapter_id in build_required_ids
-                    }
+                build_root = build_workspace.root
+                build_source_digests_task = asyncio.create_task(
+                    asyncio.to_thread(
+                        _scope_digests,
+                        build_root,
+                        by_id,
+                        build_required_ids,
+                    )
                 )
-                # A FUSE build reads an immutable source generation. Source
-                # integrations therefore do not need to wait for Lake; the
-                # barrier is reacquired below before accepting the result.
+                # Digest capture reads the immutable build workspace. It can run
+                # alongside Lake instead of delaying process startup, and a FUSE
+                # build no longer needs the live-source barrier for this scan.
                 if self.isolation.name != "shared":
                     self.source_lock.release()
                     source_held = False
@@ -3061,6 +3074,7 @@ class Orchestrator:
                         work_unit_id=chapter.id,
                         completed=self.state.coordinator_build.total,
                     )
+                build_source_digests = await build_source_digests_task
                 artifacts_built = (
                     not preempted
                     and bool(results)
@@ -3086,10 +3100,10 @@ class Orchestrator:
                         source_held = True
                     current_graph = self._observed_work_unit_graph()
                     current_source_digests = await asyncio.to_thread(
-                        lambda by_id=by_id, build_required_ids=build_required_ids: {
-                            chapter_id: scope_digest(self.config.settings.repo, by_id[chapter_id])
-                            for chapter_id in build_required_ids
-                        }
+                        _scope_digests,
+                        self.config.settings.repo,
+                        by_id,
+                        build_required_ids,
                     )
                     source_is_current = (
                         current_graph.edges == build_graph.edges
@@ -3137,6 +3151,8 @@ class Orchestrator:
                         if not progress_flush.done():
                             progress_flush.cancel()
                         await asyncio.gather(progress_flush, return_exceptions=True)
+                    if build_source_digests_task is not None:
+                        await asyncio.gather(build_source_digests_task, return_exceptions=True)
                     if build_workspace is not None:
                         await build_workspace.close()
                     if source_held:

@@ -4,7 +4,7 @@ import sqlite3
 from collections.abc import Callable, Iterable
 from dataclasses import replace
 from pathlib import Path
-from threading import get_ident
+from threading import Event, get_ident
 from typing import Any
 
 import pytest
@@ -2265,6 +2265,36 @@ async def test_streaming_build_does_not_publish_partial_cache_snapshot(
 
     await orchestrator._build_all()
     assert published == 1
+
+
+@pytest.mark.asyncio
+async def test_coordinator_starts_validation_while_capturing_source_digests(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    orchestrator = Orchestrator(config, StateStore(config))
+    digest_started = Event()
+    release_digest = Event()
+
+    def held_scope_digest(_root: Path, _chapter: Chapter) -> str:
+        digest_started.set()
+        if not release_digest.wait(timeout=5):
+            raise AssertionError("validation did not start while source digest capture was running")
+        return "source-digest"
+
+    async def successful_validation(*_args: object, **_kwargs: object) -> ValidationResult:
+        assert digest_started.is_set()
+        assert not release_digest.is_set()
+        release_digest.set()
+        return ValidationResult(True, 0, "ok")
+
+    monkeypatch.setattr(scheduler_module, "scope_digest", held_scope_digest)
+    monkeypatch.setattr(scheduler_module, "validate", successful_validation)
+
+    results = await orchestrator._build_chapters((config.chapters[0],), publish_if_clean=False)
+
+    assert results[config.chapters[0].id].succeeded
+    await orchestrator.shutdown()
 
 
 @pytest.mark.asyncio

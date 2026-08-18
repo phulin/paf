@@ -426,6 +426,7 @@ class FuseOverlayIsolation:
         self._revision = 0
         self._generation_paths: dict[int, Path] = {}
         self._generation_references: dict[int, int] = {}
+        self._pending_source_changes: set[str] = set()
         self._dependency_backing = self.cache_root / "dependencies-unprepared"
         self._dependency_layer = self.cache_root / "dependency-links"
         self._coordinator_layers: tuple[Path, ...] = ()
@@ -541,9 +542,14 @@ class FuseOverlayIsolation:
             previous = self._generation_paths[previous_revision]
             # Both paths are immutable. Reusing unchanged inodes avoids
             # rewriting the complete repository for every accepted chapter.
-            # Agent integrations may preserve same-second mtimes and sizes, so
-            # checksum comparison is required before linking an old inode.
-            command.extend(("--checksum", f"--link-dest={previous}"))
+            # Imported agent deltas name every changed source, so the full-tree
+            # pass only needs metadata comparisons. Those paths are forcibly
+            # recopied below in case an edit preserved its mtime and size.
+            # Retain checksum comparison as a defensive fallback for revisions
+            # advanced by callers that did not provide a delta.
+            if not self._pending_source_changes:
+                command.append("--checksum")
+            command.append(f"--link-dest={previous}")
         command.extend(f"--exclude=/{path}" for path in self.excluded)
         # Source generations must not share inodes with the live worktree. A
         # hard-linked snapshot can change underneath an active FUSE mount when
@@ -552,8 +558,23 @@ class FuseOverlayIsolation:
         # the new contents, falsely attributing the external edit to the agent.
         command.extend((f"{self.settings.repo}/", f"{destination}/"))
         await self._run(*command)
+        if previous_revision is not None and self._pending_source_changes:
+            changed_sources = tuple(
+                f"{self.settings.repo}/./{relative}"
+                for relative in sorted(self._pending_source_changes)
+                if (self.settings.repo / relative).is_file()
+            )
+            if changed_sources:
+                await self._run(
+                    "rsync",
+                    "-aR",
+                    "--ignore-times",
+                    *changed_sources,
+                    f"{destination}/",
+                )
         self._generation_paths[generation] = destination
         self._generation_references[generation] = 0
+        self._pending_source_changes.clear()
         for revision, path in tuple(self._generation_paths.items()):
             if revision != generation and self._generation_references[revision] == 0:
                 self._generation_paths.pop(revision)
@@ -1027,6 +1048,7 @@ class FuseOverlayIsolation:
                             backup.unlink(missing_ok=True)
                 if changed:
                     self._revision += 1
+                    self._pending_source_changes.update(changed)
                 return IsolationResult(
                     accepted=True,
                     generation=generation,
