@@ -189,7 +189,9 @@ async def test_transient_wait_does_not_write_descendant_task_rows(tmp_path, monk
 
 
 @pytest.mark.asyncio
-async def test_hot_snapshot_resolves_failure_roots_in_one_graph_pass(tmp_path, monkeypatch) -> None:
+async def test_hot_snapshot_batches_failure_roots_without_recursive_walks(
+    tmp_path, monkeypatch
+) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
     state = StateStore(config)
     await state.load_or_create()
@@ -214,7 +216,7 @@ async def test_hot_snapshot_resolves_failure_roots_in_one_graph_pass(tmp_path, m
     monkeypatch.setattr(state, "task_requirements", counted)
     snapshot = state.hot_snapshot()
 
-    assert calls == len(state.tasks)
+    assert calls == 0
     for key, task in snapshot["tasks"].items():
         assert tuple(task["blocked_by"]) == expected[key]
 
@@ -222,7 +224,7 @@ async def test_hot_snapshot_resolves_failure_roots_in_one_graph_pass(tmp_path, m
     delta = state.dashboard_delta(
         ChangeSet(revision=state.revision, work_units=frozenset({second.id}))
     )
-    assert calls == len(state.tasks)
+    assert calls == 0
     assert tuple(delta["tasks"][state.key(second.id, Stage.FORMALIZE)]["blocked_by"]) == (
         state.key(first.id, Stage.FORMALIZE),
     )

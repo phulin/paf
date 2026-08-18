@@ -3410,10 +3410,33 @@ class StateStore:
         roots: dict[str, set[str]] = {key: set() for key in self.tasks}
         dependents: dict[str, list[str]] = {}
         for key, task in self.tasks.items():
-            for requirement in self.task_requirements(task):
-                owner_key = requirement.owner_task_key
-                if owner_key is None:
-                    continue
+            owner_keys = {
+                requirement.owner_task_key
+                for requirement in task.waiting_on
+                if requirement.owner_task_key is not None
+            }
+            stage = Stage(task.stage)
+            if stage is Stage.FORMALIZE:
+                owner_keys.add(self.key(task.chapter_id, Stage.DISCOVER))
+                owner_keys.update(
+                    self.key(dependency, Stage.FORMALIZE)
+                    for dependency in self._source_dependencies(task.chapter_id)
+                )
+            elif stage is Stage.REVIEW:
+                owner_keys.add(self.key(task.chapter_id, Stage.FORMALIZE))
+                if task.rounds == 0:
+                    owner_keys.update(
+                        self.key(dependency, Stage.REVIEW)
+                        for dependency in self._source_dependencies(task.chapter_id)
+                    )
+            elif stage is Stage.PROVE:
+                owner_keys.update(
+                    (
+                        self.key(task.chapter_id, Stage.FORMALIZE),
+                        self.key(task.chapter_id, Stage.REVIEW),
+                    )
+                )
+            for owner_key in owner_keys:
                 owner = self.tasks.get(owner_key)
                 if owner is None:
                     continue
