@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 import paf.cli as cli_module
+import paf.state as state_module
 from paf.cli import main
 from paf.config import infer_config, load_config
 from paf.models import PipelineConfig, Stage
@@ -83,6 +84,91 @@ async def test_task_and_build_deltas_do_not_rewrite_global_checkpoint(tmp_path: 
     assert usage_payload["input_tokens"] + usage_payload["output_tokens"] == 110
     assert global_row("state") == checkpoint
     await state.finish_coordinator_build()
+    await state.close()
+
+
+@pytest.mark.asyncio
+async def test_thread_usage_updates_do_not_snapshot_all_threads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    state = StateStore(config)
+    await state.load_or_create()
+    for index in range(100):
+        await state.record_thread_cumulative_usage(
+            f"thread-{index}",
+            TokenUsage(input_tokens=index, measured=True),
+            deferred=False,
+        )
+
+    original_snapshot = state_module.collection_snapshot
+
+    def reject_full_usage_snapshot(section: str, value: object) -> object:
+        assert section != "thread_cumulative_usage"
+        return original_snapshot(section, value)
+
+    monkeypatch.setattr(state_module, "collection_snapshot", reject_full_usage_snapshot)
+    await state.record_thread_cumulative_usage(
+        "thread-50",
+        TokenUsage(input_tokens=500, measured=True),
+        deferred=False,
+    )
+
+    with sqlite3.connect(state.database_path) as connection:
+        count = connection.execute(
+            "SELECT count(*) FROM state_items WHERE section='thread_cumulative_usage'"
+        ).fetchone()
+        payload = connection.execute(
+            """
+            SELECT payload FROM state_items
+            WHERE section='thread_cumulative_usage' AND item_key='thread-50'
+            """
+        ).fetchone()
+    assert count == (100,)
+    assert payload is not None
+    assert json.loads(payload[0])["input_tokens"] == 500
+    await state.close()
+
+
+@pytest.mark.asyncio
+async def test_graph_edge_insert_does_not_rewrite_unchanged_edge(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    state = StateStore(config)
+    await state.load_or_create()
+    state.formalize_graph = {
+        "order": ["a", "b", "c"],
+        "edges": [["b", "c"]],
+        "dependencies": {"a": [], "b": [], "c": ["b"]},
+    }
+    await state.save("formalize_graph")
+    with sqlite3.connect(state.database_path) as connection:
+        original_revision = connection.execute(
+            """
+            SELECT revision FROM graph_edges
+            WHERE graph='formalize_graph' AND kind='dependency'
+                AND source_id='b' AND target_id='c'
+            """
+        ).fetchone()
+
+    state.formalize_graph = {
+        "order": ["a", "b", "c"],
+        "edges": [["a", "c"], ["b", "c"]],
+        "dependencies": {"a": [], "b": [], "c": ["a", "b"]},
+    }
+    await state.save("formalize_graph")
+    with sqlite3.connect(state.database_path) as connection:
+        unchanged_revision = connection.execute(
+            """
+            SELECT revision FROM graph_edges
+            WHERE graph='formalize_graph' AND kind='dependency'
+                AND source_id='b' AND target_id='c'
+            """
+        ).fetchone()
+        edge_count = connection.execute(
+            "SELECT count(*) FROM graph_edges WHERE graph='formalize_graph'"
+        ).fetchone()
+    assert unchanged_revision == original_revision
+    assert edge_count == (2,)
     await state.close()
 
 

@@ -457,6 +457,7 @@ class StateStore:
         self._graph_cache: dict[str, GraphSnapshot] = {}
         self._coordinator_build_dirty = False
         self._thread_usage_dirty = False
+        self._dirty_thread_usage_ids: set[str] = set()
         self._static_dirty = False
         self._dirty_task_keys: set[str] = set()
         self._issues_dirty = False
@@ -1170,11 +1171,23 @@ class StateStore:
             for section in COLLECTION_SECTIONS
         }
         self._graph_cache = {
-            section: deepcopy(graph_snapshot(section, self._section_value(section)))
+            section: self._cache_graph_snapshot(
+                graph_snapshot(section, self._section_value(section))
+            )
             for section in GRAPH_SECTIONS
         }
         self._persisted_section_object_ids = self._section_object_ids()
         self._persisted_header_object_ids = self._header_object_ids()
+
+    @staticmethod
+    def _cache_graph_snapshot(snapshot: GraphSnapshot) -> GraphSnapshot:
+        """Detach mutable payloads without copying immutable edge keys."""
+
+        return GraphSnapshot(
+            deepcopy(snapshot.metadata),
+            deepcopy(snapshot.nodes),
+            dict(snapshot.edges),
+        )
 
     def _header_object_ids(self) -> dict[str, int]:
         return {"isolation": id(self.isolation)}
@@ -1501,9 +1514,9 @@ class StateStore:
         self._coordinator_build_dirty = True
         self._dirty_sections.add("coordinator_targets")
 
-    def _mark_thread_usage_dirty(self) -> None:
+    def _mark_thread_usage_dirty(self, thread_id: str) -> None:
         self._thread_usage_dirty = True
-        self._dirty_sections.add("thread_cumulative_usage")
+        self._dirty_thread_usage_ids.add(thread_id)
 
     async def _persist(self) -> None:
         if self._batch_depth:
@@ -1526,6 +1539,7 @@ class StateStore:
                 self._checkpoint_dirty
                 or self._coordinator_build_dirty
                 or self._thread_usage_dirty
+                or self._dirty_thread_usage_ids
                 or self._dirty_sections
                 or self._dirty_task_keys
                 or self._dirty_run_ids
@@ -1538,6 +1552,7 @@ class StateStore:
             self.updated_at = timestamp()
             globals_dirty = self._checkpoint_dirty
             coordinator_build_dirty = self._coordinator_build_dirty
+            dirty_thread_usage_ids = self._dirty_thread_usage_ids
             dirty_sections = self._dirty_sections
             task_keys = self._dirty_task_keys
             dirty_runs = self._dirty_run_ids
@@ -1548,6 +1563,7 @@ class StateStore:
             self._checkpoint_dirty = False
             self._coordinator_build_dirty = False
             self._thread_usage_dirty = False
+            self._dirty_thread_usage_ids = set()
             self._dirty_sections = set()
             self._issues_dirty = False
             self._static_dirty = False
@@ -1611,6 +1627,26 @@ class StateStore:
                 if upserts or deletes:
                     collection_writes[section] = CollectionWrite(upserts, deletes)
                 next_collection_cache[section] = deepcopy(current)
+            incremental_collection_cache_updates: dict[str, dict[str, tuple[int, Any]]] = {}
+            if dirty_thread_usage_ids and "thread_cumulative_usage" not in dirty_sections:
+                section = "thread_cumulative_usage"
+                previous = self._collection_cache.get(section, {})
+                current = {
+                    thread_id: (
+                        previous.get(thread_id, (len(previous), None))[0],
+                        self._usage_dict(self.thread_cumulative_usage[thread_id]),
+                    )
+                    for thread_id in dirty_thread_usage_ids
+                    if thread_id in self.thread_cumulative_usage
+                }
+                upserts = {
+                    key: (ordinal, json.dumpb(payload))
+                    for key, (ordinal, payload) in current.items()
+                    if previous.get(key) != (ordinal, payload)
+                }
+                if upserts:
+                    collection_writes[section] = CollectionWrite(upserts, frozenset())
+                incremental_collection_cache_updates[section] = deepcopy(current)
             graph_writes: dict[str, GraphWrite] = {}
             next_graph_cache: dict[str, GraphSnapshot] = {}
             for section in sorted(dirty_sections.intersection(GRAPH_SECTIONS)):
@@ -1634,7 +1670,7 @@ class StateStore:
                     edge_upserts={
                         edge: ordinal
                         for edge, ordinal in current.edges.items()
-                        if previous.edges.get(edge) != ordinal
+                        if edge not in previous.edges
                     },
                     edge_deletes=frozenset(previous.edges.keys() - current.edges.keys()),
                 )
@@ -1647,7 +1683,7 @@ class StateStore:
                     or delta.edge_deletes
                 ):
                     graph_writes[section] = delta
-                next_graph_cache[section] = deepcopy(current)
+                next_graph_cache[section] = self._cache_graph_snapshot(current)
             changed_sections = set(collection_writes) | set(graph_writes)
             changed_work_units = {self.tasks[key].chapter_id for key in task_payloads} | {
                 run.chapter_id for run_id in runs if (run := self._runs_by_id.get(run_id))
@@ -1711,6 +1747,8 @@ class StateStore:
             revision = await asyncio.wrap_future(self._writer.submit(write))
             assert revision is not None
             self._collection_cache.update(next_collection_cache)
+            for section, updates in incremental_collection_cache_updates.items():
+                self._collection_cache.setdefault(section, {}).update(updates)
             self._graph_cache.update(next_graph_cache)
             self._persisted_section_object_ids.update(section_object_ids)
             if globals_dirty:
@@ -3341,7 +3379,7 @@ class StateStore:
         if previous is not None and usage.total_tokens < previous.total_tokens:
             return
         self.thread_cumulative_usage[thread_id] = usage
-        self._mark_thread_usage_dirty()
+        self._mark_thread_usage_dirty(thread_id)
         if deferred:
             self._schedule_telemetry_flush()
         else:
