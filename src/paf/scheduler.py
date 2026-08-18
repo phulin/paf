@@ -139,44 +139,40 @@ class Attempt:
         return "\n\n".join(parts)
 
 
-class FormalizeDisposition(StrEnum):
+class ExecutionDisposition(StrEnum):
     SUCCEEDED = "succeeded"
     WAITING = "waiting"
     FAILED = "failed"
 
 
 @dataclass(frozen=True)
-class FormalizeOutcome:
-    disposition: FormalizeDisposition
-    waiting_on: tuple[str, ...] = ()
+class StageOutcome:
+    disposition: ExecutionDisposition
+    waiting_on: tuple[Requirement, ...] = ()
 
     def __post_init__(self) -> None:
-        if not isinstance(self.disposition, FormalizeDisposition):
-            raise TypeError("FormalizeOutcome requires an explicit FormalizeDisposition")
+        if not isinstance(self.disposition, ExecutionDisposition):
+            raise TypeError("StageOutcome requires an explicit ExecutionDisposition")
 
     @property
     def succeeded(self) -> bool:
-        return self.disposition is FormalizeDisposition.SUCCEEDED
+        return self.disposition is ExecutionDisposition.SUCCEEDED
 
     @property
     def failed(self) -> bool:
-        return self.disposition is FormalizeDisposition.FAILED
+        return self.disposition is ExecutionDisposition.FAILED
 
     @property
     def waiting(self) -> bool:
-        return self.disposition is FormalizeDisposition.WAITING
+        return self.disposition is ExecutionDisposition.WAITING
 
-    @property
-    def blocked_by(self) -> tuple[str, ...]:
-        """Compatibility name for coordinator diagnostic owners."""
-
-        return self.waiting_on
+    def __bool__(self) -> bool:
+        return self.succeeded
 
 
 @dataclass(frozen=True)
-class ReviewOutcome:
-    succeeded: bool
-    changed: bool
+class ReviewOutcome(StageOutcome):
+    changed: bool = False
     complete: bool = True
     run_id: str = ""
     report_error: str = ""
@@ -230,7 +226,7 @@ class RunningFormalizeStage:
 
 @dataclass(frozen=True)
 class RunningReview:
-    task: asyncio.Task[bool]
+    task: asyncio.Task[StageOutcome]
     dependencies: frozenset[str]
     proof_request_ids: tuple[str, ...] = ()
 
@@ -1923,9 +1919,9 @@ class Orchestrator:
         assert run is not None
         return Attempt(agent=agent, validation=validation, run=run)
 
-    async def _discover(self, chapter: WorkUnitLike, *, rerun: bool = False) -> FormalizeOutcome:
+    async def _discover(self, chapter: WorkUnitLike, *, rerun: bool = False) -> StageOutcome:
         if not rerun and not self.force and self._discovery_is_current(chapter):
-            return FormalizeOutcome(FormalizeDisposition.SUCCEEDED)
+            return StageOutcome(ExecutionDisposition.SUCCEEDED)
         attempt = await self._attempt(
             chapter,
             Stage.DISCOVER,
@@ -1951,7 +1947,7 @@ class Orchestrator:
                 TaskStatus.FAILED,
                 "discovery must be read-only",
             )
-            return FormalizeOutcome(FormalizeDisposition.FAILED)
+            return StageOutcome(ExecutionDisposition.FAILED)
         if attempt.agent.succeeded and attempt.validation.succeeded and complete and not invalid:
             try:
                 await self._persist_source_dependencies(chapter, dependencies, attempt.agent.report)
@@ -1962,8 +1958,8 @@ class Orchestrator:
                     TaskStatus.FAILED,
                     str(error),
                 )
-                return FormalizeOutcome(FormalizeDisposition.FAILED)
-            return FormalizeOutcome(FormalizeDisposition.SUCCEEDED)
+                return StageOutcome(ExecutionDisposition.FAILED)
+            return StageOutcome(ExecutionDisposition.SUCCEEDED)
         await self.state.set_task(
             chapter.id,
             Stage.DISCOVER,
@@ -1974,11 +1970,11 @@ class Orchestrator:
                 else "source dependency discovery was incomplete"
             ),
         )
-        return FormalizeOutcome(FormalizeDisposition.FAILED)
+        return StageOutcome(ExecutionDisposition.FAILED)
 
-    async def _formalize(self, chapter: WorkUnitLike, *, rerun: bool = False) -> FormalizeOutcome:
+    async def _formalize(self, chapter: WorkUnitLike, *, rerun: bool = False) -> StageOutcome:
         if self._already_done(chapter, Stage.FORMALIZE):
-            return FormalizeOutcome(FormalizeDisposition.SUCCEEDED)
+            return StageOutcome(ExecutionDisposition.SUCCEEDED)
         maximum = self.config.stages[Stage.FORMALIZE].max_rounds
         feedback = ""
         last_attempt: Attempt | None = None
@@ -2011,7 +2007,7 @@ class Orchestrator:
                         TaskStatus.SUCCEEDED,
                         "clean diagnostics and coordinator build in source dependency order",
                     )
-                    return FormalizeOutcome(FormalizeDisposition.SUCCEEDED)
+                    return StageOutcome(ExecutionDisposition.SUCCEEDED)
                 if validation.status is ValidationStatus.UPSTREAM_FAILED:
                     return await self._block_on_upstream_diagnostics(chapter, validation)
                 if validation.blocked_by:
@@ -2036,7 +2032,7 @@ class Orchestrator:
                     TaskStatus.FAILED,
                     "model capacity remained unavailable after the configured retries",
                 )
-                return FormalizeOutcome(FormalizeDisposition.FAILED)
+                return StageOutcome(ExecutionDisposition.FAILED)
             if not attempt.agent.succeeded or not attempt.validation.succeeded:
                 feedback = attempt.feedback()
                 continue
@@ -2072,7 +2068,7 @@ class Orchestrator:
                     TaskStatus.SUCCEEDED,
                     "clean diagnostics and coordinator build in source dependency order",
                 )
-                return FormalizeOutcome(FormalizeDisposition.SUCCEEDED)
+                return StageOutcome(ExecutionDisposition.SUCCEEDED)
             if validation.status is ValidationStatus.UPSTREAM_FAILED:
                 return await self._block_on_upstream_diagnostics(chapter, validation)
             if validation.blocked_by:
@@ -2084,7 +2080,7 @@ class Orchestrator:
             TaskStatus.FAILED,
             f"formalization did not reach clean diagnostics in {maximum} attempts",
         )
-        return FormalizeOutcome(FormalizeDisposition.FAILED)
+        return StageOutcome(ExecutionDisposition.FAILED)
 
     async def _block_on_upstream_diagnostics(
         self,
@@ -2092,7 +2088,7 @@ class Orchestrator:
         validation: ValidationResult,
         *,
         block_consumer: bool = True,
-    ) -> FormalizeOutcome:
+    ) -> StageOutcome:
         """Route a coordinator failure to its owners without spending a consumer round."""
 
         owners = tuple(
@@ -2101,7 +2097,7 @@ class Orchestrator:
             if owner_id in self._work_units_by_id and owner_id != consumer.id
         )
         if not owners:
-            return FormalizeOutcome(FormalizeDisposition.FAILED)
+            return StageOutcome(ExecutionDisposition.FAILED)
         await self._invalidate_build_records(owners)
         async with self.state.batch():
             for owner_id in owners:
@@ -2129,7 +2125,17 @@ class Orchestrator:
                     ),
                     "waiting for upstream coordinator diagnostic owners",
                 )
-        return FormalizeOutcome(FormalizeDisposition.WAITING, owners)
+        return StageOutcome(
+            ExecutionDisposition.WAITING,
+            tuple(
+                Requirement(
+                    RequirementKind.COORDINATOR_OWNER,
+                    owner_task_key=self.state.key(owner_id, Stage.FORMALIZE),
+                    detail=f"coordinator diagnostic owned by {owner_id}",
+                )
+                for owner_id in owners
+            ),
+        )
 
     def _chapter_identifiers(self, chapter: WorkUnitLike) -> tuple[str, ...]:
         root = (chapter.lean_root / chapter.chapter_path).as_posix()
@@ -3803,7 +3809,7 @@ class Orchestrator:
         """Discover inputs with bounded scheduling and batched promotion."""
 
         pending = deque(self.work_units)
-        results: list[FormalizeOutcome] = []
+        results: list[StageOutcome] = []
         maximum = self.config.stages[Stage.DISCOVER].max_agents
         assert maximum is not None
 
@@ -3826,7 +3832,7 @@ class Orchestrator:
 
         by_id = {chapter.id: chapter for chapter in self.work_units}
         pending_discoveries: deque[WorkUnitLike] = deque()
-        discovery_tasks: dict[str, asyncio.Task[FormalizeOutcome]] = {}
+        discovery_tasks: dict[str, asyncio.Task[StageOutcome]] = {}
         if discover:
             discovery_digests = (
                 {}
@@ -3852,7 +3858,7 @@ class Orchestrator:
                 )
 
         fill_discovery_window()
-        formalize_tasks: dict[str, asyncio.Task[FormalizeOutcome]] = {}
+        formalize_tasks: dict[str, asyncio.Task[StageOutcome]] = {}
 
         async def cancel_all() -> None:
             tasks = [*discovery_tasks.values(), *formalize_tasks.values()]
@@ -3951,7 +3957,7 @@ class Orchestrator:
         resume_prompt: str = "",
     ) -> ReviewOutcome:
         if not rerun and self._already_done(chapter, Stage.REVIEW):
-            return ReviewOutcome(True, False, complete=True)
+            return ReviewOutcome(ExecutionDisposition.SUCCEEDED, changed=False, complete=True)
         attempt = await self._attempt(
             chapter,
             Stage.REVIEW,
@@ -3979,8 +3985,8 @@ class Orchestrator:
                 "model capacity remained unavailable after the configured retries",
             )
             return ReviewOutcome(
-                False,
-                attempt.agent.changed,
+                ExecutionDisposition.FAILED,
+                changed=attempt.agent.changed,
                 complete=False,
                 run_id=attempt.run.id,
             )
@@ -3998,8 +4004,8 @@ class Orchestrator:
                     "review changes merged; coordinator verification queued",
                 )
             return ReviewOutcome(
-                True,
-                attempt.agent.changed,
+                ExecutionDisposition.SUCCEEDED,
+                changed=attempt.agent.changed,
                 complete=True,
                 run_id=attempt.run.id,
             )
@@ -4011,8 +4017,8 @@ class Orchestrator:
                 "invalid review report; session retry queued",
             )
             return ReviewOutcome(
-                False,
-                attempt.agent.changed,
+                ExecutionDisposition.WAITING,
+                changed=attempt.agent.changed,
                 complete=False,
                 run_id=attempt.run.id,
                 report_error=report_error,
@@ -4025,8 +4031,8 @@ class Orchestrator:
                 "incomplete review report; session retry queued",
             )
             return ReviewOutcome(
-                True,
-                attempt.agent.changed,
+                ExecutionDisposition.WAITING,
+                changed=attempt.agent.changed,
                 complete=False,
                 run_id=attempt.run.id,
             )
@@ -4037,8 +4043,8 @@ class Orchestrator:
             "editing review failed",
         )
         return ReviewOutcome(
-            succeeded,
-            attempt.agent.changed,
+            ExecutionDisposition.SUCCEEDED if succeeded else ExecutionDisposition.FAILED,
+            changed=attempt.agent.changed,
             complete=complete,
             run_id=attempt.run.id,
         )
@@ -4177,12 +4183,12 @@ class Orchestrator:
         feedback: str = "",
         role: str = "",
         proof_request_ids: tuple[str, ...] = (),
-    ) -> bool:
+    ) -> StageOutcome:
         """Run at most five edit/rebuild cycles for one reviewable chapter."""
 
         review_generation = self._review_invalidation_generation(chapter.id)
         if self.state.task(chapter.id, Stage.REVIEW).status == TaskStatus.SUCCEEDED:
-            return True
+            return StageOutcome(ExecutionDisposition.SUCCEEDED)
         request_ids = list(proof_request_ids)
         review_feedback = feedback
 
@@ -4229,7 +4235,7 @@ class Orchestrator:
                 build_feedback,
                 origin=f"review-build:{chapter.id}:{uuid4().hex[:12]}",
             ):
-                return False
+                return StageOutcome(ExecutionDisposition.FAILED)
 
         maximum = min(self.config.stages[Stage.REVIEW].max_rounds, 5)
         resume_thread_id: str | None = None
@@ -4301,19 +4307,19 @@ class Orchestrator:
             resume_run_id = ""
             resume_prompt = ""
             review_feedback = ""
-            if not outcome.succeeded:
-                if outcome.report_error:
-                    review_feedback = attempt_feedback
-                    if source_changed:
-                        malformed_build_feedback = await self._review_build(chapter)
-                        if malformed_build_feedback and not await route_feedback(
-                            malformed_build_feedback,
-                            origin=f"review-build:{outcome.run_id or uuid4().hex[:12]}",
-                        ):
-                            return False
-                    if await queue_report_retry(outcome, outcome.report_error):
-                        continue
-                return False
+            if outcome.report_error:
+                review_feedback = attempt_feedback
+                if source_changed:
+                    malformed_build_feedback = await self._review_build(chapter)
+                    if malformed_build_feedback and not await route_feedback(
+                        malformed_build_feedback,
+                        origin=f"review-build:{outcome.run_id or uuid4().hex[:12]}",
+                    ):
+                        return StageOutcome(ExecutionDisposition.FAILED)
+                if await queue_report_retry(outcome, outcome.report_error):
+                    continue
+            if outcome.failed:
+                return StageOutcome(ExecutionDisposition.FAILED)
             expected_finding_ids = self._expected_proof_finding_ids(chapter.id, request_ids)
             if assessment_error := self._proof_review_assessment_error(
                 chapter.id,
@@ -4323,7 +4329,7 @@ class Orchestrator:
                 review_feedback = attempt_feedback
                 if await queue_report_retry(outcome, assessment_error):
                     continue
-                return False
+                return StageOutcome(ExecutionDisposition.FAILED)
             build_feedback: dict[str, str] = {}
             if source_changed:
                 build_feedback = await self._review_build(chapter)
@@ -4331,7 +4337,7 @@ class Orchestrator:
                     build_feedback,
                     origin=f"review-build:{outcome.run_id or uuid4().hex[:12]}",
                 ):
-                    return False
+                    return StageOutcome(ExecutionDisposition.FAILED)
             if review_feedback:
                 if rounds_used[chapter.id] >= maximum:
                     await self.state.set_task(
@@ -4340,7 +4346,7 @@ class Orchestrator:
                         TaskStatus.FAILED,
                         f"review follow-up remained unresolved after {maximum} cycles",
                     )
-                    return False
+                    return StageOutcome(ExecutionDisposition.FAILED)
                 continue
             if not outcome.complete:
                 review_feedback = attempt_feedback
@@ -4348,7 +4354,7 @@ class Orchestrator:
                     outcome, "review report marked the assignment incomplete"
                 ):
                     continue
-                return False
+                return StageOutcome(ExecutionDisposition.FAILED)
             if role in DIAGNOSTIC_REVIEW_ROLES and not await self._proof_build_is_fresh(chapter):
                 review_feedback = attempt_feedback
                 if await queue_report_retry(
@@ -4356,26 +4362,35 @@ class Orchestrator:
                     "current source digest is not certified by a clean coordinator build",
                 ):
                     continue
-                return False
+                return StageOutcome(ExecutionDisposition.FAILED)
             if finding_guided:
-                return await self._complete_review(
+                completed = await self._complete_review(
                     chapter,
                     "targeted review completed with no pending findings",
                     expected_generation=review_generation,
                     proof_request_ids=request_ids,
                 )
+                return StageOutcome(
+                    ExecutionDisposition.SUCCEEDED if completed else ExecutionDisposition.WAITING
+                )
             if not source_changed:
-                return await self._complete_review(
+                completed = await self._complete_review(
                     chapter,
                     "editing review found no actionable issues",
                     expected_generation=review_generation,
                     proof_request_ids=request_ids,
                 )
-        return await self._complete_review(
+                return StageOutcome(
+                    ExecutionDisposition.SUCCEEDED if completed else ExecutionDisposition.WAITING
+                )
+        completed = await self._complete_review(
             chapter,
             f"review/rebuild cap reached after {maximum} cycles",
             expected_generation=review_generation,
             proof_request_ids=request_ids,
+        )
+        return StageOutcome(
+            ExecutionDisposition.SUCCEEDED if completed else ExecutionDisposition.WAITING
         )
 
     async def _review_tree(
@@ -4419,7 +4434,7 @@ class Orchestrator:
         rounds_used = {chapter_id: 0 for chapter_id in by_id}
         review_tasks: dict[str, RunningReview] = {}
         rebuild_tasks: dict[str, asyncio.Task[bool]] = {}
-        proof_tasks: dict[str, asyncio.Task[bool]] = {}
+        proof_tasks: dict[str, asyncio.Task[StageOutcome]] = {}
         failed_rebuilds: set[str] = set()
         persisted_clean = self.state.formalize_graph.get("clean", {})
         clean = await self._retain_formalize_clean(
@@ -4443,7 +4458,7 @@ class Orchestrator:
             return self.state.task(chapter_id, Stage.FORMALIZE).status == TaskStatus.SUCCEEDED
 
         async def cancel_all() -> None:
-            tasks = [handle.task for handle in review_tasks.values()]
+            tasks: list[asyncio.Task[Any]] = [handle.task for handle in review_tasks.values()]
             tasks.extend(rebuild_tasks.values())
             tasks.extend(proof_tasks.values())
             for task in tasks:
@@ -4530,7 +4545,7 @@ class Orchestrator:
                     if self.state.task(chapter_id, Stage.REVIEW).status
                     not in {TaskStatus.RUNNING, TaskStatus.SUCCEEDED}
                 ]
-                cancelled_reviews: list[asyncio.Task[bool]] = []
+                cancelled_reviews: list[asyncio.Task[Any]] = []
                 for chapter_id in stale_reviews:
                     handle = review_tasks.pop(chapter_id)
                     handle.task.cancel()
@@ -4636,12 +4651,15 @@ class Orchestrator:
                             and chapter_id not in review_tasks
                             and chapter_id not in rebuild_tasks
                             and formalize_ready(chapter_id)
+                            and self.state.readiness(self.state.task(chapter_id, Stage.PROVE)).ready
                         ):
                             proof_tasks[chapter_id] = asyncio.create_task(
                                 self._prove(by_id[chapter_id], defer_review=True)
                             )
 
-                live_tasks = [handle.task for handle in review_tasks.values()]
+                live_tasks: list[asyncio.Task[Any]] = [
+                    handle.task for handle in review_tasks.values()
+                ]
                 live_tasks.extend(rebuild_tasks.values())
                 live_tasks.extend(proof_tasks.values())
                 progress_waiter: asyncio.Task[bool] | None = None
@@ -4672,8 +4690,11 @@ class Orchestrator:
                 ]
                 for chapter_id in completed_reviews:
                     handle = review_tasks.pop(chapter_id)
-                    succeeded = handle.task.result()
-                    if not succeeded:
+                    outcome = handle.task.result()
+                    if outcome.waiting:
+                        rounds_used[chapter_id] = 0
+                        continue
+                    if outcome.failed:
                         task_record = self.state.task(chapter_id, Stage.REVIEW)
                         if task_record.status == TaskStatus.PENDING:
                             rounds_used[chapter_id] = 0
@@ -4722,9 +4743,12 @@ class Orchestrator:
                 for chapter_id in completed_proofs:
                     if chapter_id not in proof_tasks:
                         continue
-                    proof_succeeded = proof_tasks.pop(chapter_id).result()
-                    if proof_succeeded:
+                    proof_outcome = proof_tasks.pop(chapter_id).result()
+                    if proof_outcome.succeeded:
                         proof_results[chapter_id] = True
+                        continue
+                    if proof_outcome.waiting:
+                        proof_results.pop(chapter_id, None)
                         continue
 
                     proof_task = self.state.task(chapter_id, Stage.PROVE)
@@ -4751,8 +4775,24 @@ class Orchestrator:
                         report,
                         origin_run_id=proof_run.id,
                     )
+                    proof_request_ids = self._proof_review_feedback(chapter_id)[1]
+                    if proof_request_ids:
+                        await self.state.set_task_waiting(
+                            chapter_id,
+                            Stage.PROVE,
+                            (
+                                Requirement(
+                                    RequirementKind.PROOF_REVIEW_REQUEST,
+                                    owner_task_key=self.state.key(chapter_id, Stage.REVIEW),
+                                    request_id=request_id,
+                                    detail="waiting for proof-review findings",
+                                )
+                                for request_id in proof_request_ids
+                            ),
+                            "waiting for proof-review findings to be resolved",
+                        )
 
-                    cancelled: list[asyncio.Task[bool]] = []
+                    cancelled: list[asyncio.Task[Any]] = []
                     for invalidated_id in invalidated:
                         if handle := review_tasks.pop(invalidated_id, None):
                             handle.task.cancel()
@@ -4807,7 +4847,7 @@ class Orchestrator:
         validation = await self._refresh_stale_proof_build(chapter)
         return validation.succeeded
 
-    async def _prove(self, chapter: WorkUnitLike, *, defer_review: bool = False) -> bool:
+    async def _prove(self, chapter: WorkUnitLike, *, defer_review: bool = False) -> StageOutcome:
         build_fresh = False
         if not self.force:
             graph = self._observed_work_unit_graph()
@@ -4826,7 +4866,7 @@ class Orchestrator:
                     chapter,
                     build_fresh=True,
                 )
-                return True
+                return StageOutcome(ExecutionDisposition.SUCCEEDED)
             files = scoped_files(self.config.settings.repo, chapter)
             if files:
                 placeholders = await asyncio.to_thread(
@@ -4859,7 +4899,15 @@ class Orchestrator:
                             TaskStatus.PENDING,
                             "pre-existing coordinator diagnostics routed before proof work",
                         )
-                        return False
+                        return StageOutcome(
+                            ExecutionDisposition.WAITING,
+                            (
+                                Requirement(
+                                    RequirementKind.PROOF_REVIEW_REQUEST,
+                                    detail="coordinator diagnostics require review",
+                                ),
+                            ),
+                        )
                     else:
                         build_fresh = True
                         if placeholders > 0:
@@ -4884,7 +4932,7 @@ class Orchestrator:
                         "placeholder-free sources validated without an agent",
                         source_digest=source_digest,
                     )
-                    return True
+                    return StageOutcome(ExecutionDisposition.SUCCEEDED)
         proof_maximum = self.config.stages[Stage.PROVE].max_rounds
         proof_chunk_size = self.config.stages[Stage.PROVE].chunk_size or 4
         discovered_targets = await asyncio.to_thread(
@@ -4963,7 +5011,7 @@ class Orchestrator:
                 TaskStatus.FAILED,
                 "upstream request requires manual escalation: " + ", ".join(escalated),
             )
-            return False
+            return StageOutcome(ExecutionDisposition.FAILED)
         targeted_request_ids = answered_ids
         proof_resume_thread_id: str | None = None
         proof_resume_run_id = ""
@@ -5006,7 +5054,7 @@ class Orchestrator:
                             "all proof chunks completed and chapter elaborates",
                             source_digest=source_digest,
                         )
-                        return True
+                        return StageOutcome(ExecutionDisposition.SUCCEEDED)
                     # Keep unusual declaration syntax safe: after all recognized chunks, hand any
                     # remaining raw placeholders to the established whole-chapter fallback.
                     chunked_proofs = False
@@ -5066,7 +5114,15 @@ class Orchestrator:
                     TaskStatus.PENDING,
                     f"proof retry deferred until dirty exclusive scope is reconciled: {error}",
                 )
-                return False
+                return StageOutcome(
+                    ExecutionDisposition.WAITING,
+                    (
+                        Requirement(
+                            RequirementKind.BUILD_FRESHNESS,
+                            detail="dirty exclusive scope must be reconciled",
+                        ),
+                    ),
+                )
             if attempt.agent.capacity_exhausted:
                 if targeted_retry:
                     await self.state.finish_upstream_requests(
@@ -5085,7 +5141,7 @@ class Orchestrator:
                         else "model capacity remained unavailable after the configured retries"
                     ),
                 )
-                return False
+                return StageOutcome(ExecutionDisposition.FAILED)
             coordinator_validation = attempt.validation
             if chunked_proofs and assigned_targets:
                 validation_targets = await asyncio.to_thread(
@@ -5189,7 +5245,7 @@ class Orchestrator:
                         TaskStatus.FAILED,
                         "targeted downstream retry did not prove: " + ", ".join(sorted(unresolved)),
                     )
-                    return False
+                    return StageOutcome(ExecutionDisposition.FAILED)
             if (
                 not coordinator_validation.succeeded
                 and attempt.validation.succeeded
@@ -5202,7 +5258,15 @@ class Orchestrator:
                     TaskStatus.PENDING,
                     "proof validation diagnostics routed to their source owners",
                 )
-                return False
+                return StageOutcome(
+                    ExecutionDisposition.WAITING,
+                    (
+                        Requirement(
+                            RequirementKind.PROOF_REVIEW_REQUEST,
+                            detail="validation diagnostics were routed to source owners",
+                        ),
+                    ),
+                )
             remaining_targets = (
                 await asyncio.to_thread(proof_targets, self.config.settings.repo, chapter)
                 if chunked_proofs
@@ -5235,7 +5299,7 @@ class Orchestrator:
                     "no placeholders and chapter elaborates",
                     source_digest=source_digest,
                 )
-                return True
+                return StageOutcome(ExecutionDisposition.SUCCEEDED)
             if (
                 chunked_proofs
                 and assigned_targets
@@ -5252,7 +5316,15 @@ class Orchestrator:
                     "all proof chunks completed; coordinator diagnostics remain outside the "
                     "assigned declarations",
                 )
-                return False
+                return StageOutcome(
+                    ExecutionDisposition.WAITING,
+                    (
+                        Requirement(
+                            RequirementKind.BUILD_FRESHNESS,
+                            detail="coordinator diagnostics remain outside the proof chunk",
+                        ),
+                    ),
+                )
             if (
                 chunked_proofs
                 and assigned_targets
@@ -5352,7 +5424,17 @@ class Orchestrator:
                     TaskStatus.PENDING,
                     "unchanged statement/interface blocker queued for focused review",
                 )
-                return False
+                return StageOutcome(
+                    ExecutionDisposition.WAITING,
+                    tuple(
+                        Requirement(
+                            RequirementKind.PROOF_REVIEW_REQUEST,
+                            request_id=request_id,
+                            detail="proof blocker queued for focused review",
+                        )
+                        for request_id in self._proof_review_feedback(chapter.id)[1]
+                    ),
+                )
             if upstream_request_ids:
                 answered_ids = await self._ensure_upstream_answers(upstream_request_ids)
                 escalated = tuple(
@@ -5368,7 +5450,7 @@ class Orchestrator:
                         TaskStatus.FAILED,
                         "upstream request requires manual escalation: " + ", ".join(escalated),
                     )
-                    return False
+                    return StageOutcome(ExecutionDisposition.FAILED)
                 targeted_request_ids = answered_ids
                 feedback = self._upstream_retry_feedback(
                     targeted_request_ids,
@@ -5393,7 +5475,7 @@ class Orchestrator:
                     TaskStatus.FAILED,
                     "unchanged proof blocker(s): " + ", ".join(terminal_blockers),
                 )
-                return False
+                return StageOutcome(ExecutionDisposition.FAILED)
             placeholders = attempt.agent.placeholders
             validation_retry_exhausted = (
                 not attempt.validation.succeeded
@@ -5413,7 +5495,15 @@ class Orchestrator:
                     TaskStatus.PENDING,
                     "proof-local validation retries exhausted; diagnostic repair queued",
                 )
-                return False
+                return StageOutcome(
+                    ExecutionDisposition.WAITING,
+                    (
+                        Requirement(
+                            RequirementKind.PROOF_REVIEW_REQUEST,
+                            detail="proof-local diagnostic repair queued",
+                        ),
+                    ),
+                )
             if chunked_proofs:
                 if chunk_round >= proof_maximum:
                     skipped_target_ids.update(target.fingerprint for target in assigned_targets)
@@ -5438,7 +5528,7 @@ class Orchestrator:
                     TaskStatus.FAILED,
                     f"proof pass stalled with {placeholders} placeholders",
                 )
-                return False
+                return StageOutcome(ExecutionDisposition.FAILED)
 
         unresolved_placeholders = await asyncio.to_thread(
             count_placeholders, self.config.settings.repo, chapter
@@ -5458,7 +5548,7 @@ class Orchestrator:
                 )
             ),
         )
-        return False
+        return StageOutcome(ExecutionDisposition.FAILED)
 
     def _repair_cases(self, *, periodic: bool) -> list[RepairCaseRecord]:
         selected = {chapter.id for chapter in self.work_units}
@@ -5701,7 +5791,7 @@ class Orchestrator:
             )
         return units
 
-    async def _run_repair_work_unit(self, unit: RepairWorkUnitRecord) -> bool:
+    async def _run_repair_work_unit(self, unit: RepairWorkUnitRecord) -> StageOutcome:
         active_cases = [
             self.state.repair_cases[case_id]
             for case_id in unit.case_ids
@@ -5714,7 +5804,7 @@ class Orchestrator:
                 status=RepairWorkUnitStatus.SUPERSEDED,
                 detail="all covered failures were resolved before this repair ran",
             )
-            return False
+            return StageOutcome(ExecutionDisposition.WAITING)
         async with self._repair_slots:
             await self.state.start_repair_work_unit(unit.id)
             chapter = self.config.work_unit(unit.owner_chapter_id)
@@ -5779,9 +5869,9 @@ class Orchestrator:
                         detail=detail,
                         run_id=attempt.run.id,
                     )
-                    return False
+                    return StageOutcome(ExecutionDisposition.FAILED)
                 await self._accept_repair_work_unit(unit, active_cases, run_id=attempt.run.id)
-                return True
+                return StageOutcome(ExecutionDisposition.SUCCEEDED)
             except asyncio.CancelledError:
                 await self.state.finish_repair_work_unit(
                     unit.id,
@@ -5795,7 +5885,7 @@ class Orchestrator:
                     status=RepairWorkUnitStatus.FAILED,
                     detail=str(error) or type(error).__name__,
                 )
-                return False
+                return StageOutcome(ExecutionDisposition.FAILED)
 
     async def _accept_repair_work_unit(
         self,

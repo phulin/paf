@@ -29,10 +29,10 @@ from paf.models import Chapter, PipelineConfig, ProofTarget, Stage
 from paf.scheduler import (
     BUILD_ERROR_REVIEW_KIND,
     BUILD_WARNING_REVIEW_KIND,
-    FormalizeDisposition,
-    FormalizeOutcome,
+    ExecutionDisposition,
     Orchestrator,
     ReviewOutcome,
+    StageOutcome,
 )
 from paf.state import (
     RunRecord,
@@ -510,13 +510,13 @@ async def test_discovery_scheduler_bounds_created_coroutines(
     window_full = asyncio.Event()
     started: list[str] = []
 
-    async def discover(chapter: Chapter, *, rerun: bool = False) -> FormalizeOutcome:
+    async def discover(chapter: Chapter, *, rerun: bool = False) -> StageOutcome:
         del rerun
         started.append(chapter.id)
         if len(started) == 2:
             window_full.set()
         await release.wait()
-        return FormalizeOutcome(FormalizeDisposition.SUCCEEDED)
+        return StageOutcome(ExecutionDisposition.SUCCEEDED)
 
     monkeypatch.setattr(orchestrator, "_discover", discover)
     operation = asyncio.create_task(orchestrator._discover_all())
@@ -739,7 +739,7 @@ async def test_state_persists_fixup_graph(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_review_progress_reconciles_pending_initial_fixup(tmp_path: Path) -> None:
+async def test_review_progress_does_not_imply_formalization_success(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
     chapter = config.chapters[0]
     state = StateStore(config)
@@ -748,17 +748,15 @@ async def test_review_progress_reconciles_pending_initial_fixup(tmp_path: Path) 
     await state.set_task(chapter.id, Stage.REVIEW, TaskStatus.RUNNING, "reviewing")
 
     fixup = state.task(chapter.id, Stage.FORMALIZE)
-    assert fixup.status == TaskStatus.SUCCEEDED
-    assert fixup.detail == "formalization completed before review"
+    assert fixup.status == TaskStatus.PENDING
 
-    await state.set_task(
-        chapter.id,
-        Stage.FORMALIZE,
-        TaskStatus.RUNNING,
-        "late coordinator rebuild",
-    )
-    assert fixup.status == TaskStatus.SUCCEEDED
-    assert fixup.detail == "formalization completed before review"
+    with pytest.raises(RuntimeError, match="after review or proof has begun"):
+        await state.set_task(
+            chapter.id,
+            Stage.FORMALIZE,
+            TaskStatus.RUNNING,
+            "late coordinator rebuild",
+        )
     with pytest.raises(RuntimeError, match="after review or proof has begun"):
         await state.start_run(chapter.id, Stage.FORMALIZE)
 
@@ -1643,18 +1641,17 @@ async def test_successful_failure_retry_releases_only_its_blocked_dependents(
 
     second_review = recovered.task(second.id, Stage.REVIEW)
     assert second_review.status == TaskStatus.PENDING
-    assert second_review.recovering_failure
-    assert recovered.task(second.id, Stage.PROVE).status == TaskStatus.BLOCKED
-    assert recovered.task(first.id, Stage.PROVE).status == TaskStatus.BLOCKED
+    assert recovered.readiness(second_review).ready
+    assert recovered.task(second.id, Stage.PROVE).status == TaskStatus.PENDING
+    assert recovered.task(first.id, Stage.PROVE).waiting_on
 
     await recovered.set_task(second.id, Stage.REVIEW, TaskStatus.RUNNING, "reviewing")
     await recovered.set_task(second.id, Stage.REVIEW, TaskStatus.SUCCEEDED, "reviewed")
 
     second_proof = recovered.task(second.id, Stage.PROVE)
     assert second_proof.status == TaskStatus.PENDING
-    assert second_proof.recovering_failure
-    assert "automatically unblocked" in second_proof.detail
-    assert recovered.task(first.id, Stage.PROVE).status == TaskStatus.BLOCKED
+    assert recovered.readiness(second_proof).ready
+    assert recovered.task(first.id, Stage.PROVE).waiting_on
     await recovered.close()
 
 
@@ -2416,8 +2413,10 @@ async def test_formalizer_blocks_on_upstream_diagnostics_without_running_consume
 
     outcome = await orchestrator._formalize(consumer)
 
-    assert outcome.blocked_by == (owner.id,)
-    assert outcome.disposition is FormalizeDisposition.WAITING
+    assert [requirement.owner_task_key for requirement in outcome.waiting_on] == [
+        state.key(owner.id, Stage.FORMALIZE)
+    ]
+    assert outcome.disposition is ExecutionDisposition.WAITING
     assert state.task(owner.id, Stage.FORMALIZE).status == TaskStatus.PENDING
     consumer_task = state.task(consumer.id, Stage.FORMALIZE)
     assert consumer_task.status == TaskStatus.PENDING
@@ -2772,15 +2771,15 @@ async def test_capacity_exhaustion_is_a_bounded_formalizer_failure(
     attempts: dict[int, int] = {1: 0, 2: 0}
     order: list[tuple[int, bool]] = []
 
-    async def formalize(chapter: Chapter, *, rerun: bool = False) -> FormalizeOutcome:
+    async def formalize(chapter: Chapter, *, rerun: bool = False) -> StageOutcome:
         attempts[chapter.number] += 1
         order.append((chapter.number, rerun))
         if chapter.number == 1:
-            return FormalizeOutcome(FormalizeDisposition.FAILED)
+            return StageOutcome(ExecutionDisposition.FAILED)
         await orchestrator.state.set_task(
             chapter.id, Stage.FORMALIZE, TaskStatus.SUCCEEDED, "formalized"
         )
-        return FormalizeOutcome(FormalizeDisposition.SUCCEEDED)
+        return StageOutcome(ExecutionDisposition.SUCCEEDED)
 
     monkeypatch.setattr(orchestrator, "_formalize", formalize)
 
@@ -2800,17 +2799,17 @@ async def test_formalizer_failure_does_not_cancel_healthy_workers(
     await mark_discovered(orchestrator)
     healthy_finished = False
 
-    async def formalize(chapter: Chapter, *, rerun: bool = False) -> FormalizeOutcome:
+    async def formalize(chapter: Chapter, *, rerun: bool = False) -> StageOutcome:
         nonlocal healthy_finished
         assert not rerun
         if chapter.number == 1:
-            return FormalizeOutcome(FormalizeDisposition.FAILED)
+            return StageOutcome(ExecutionDisposition.FAILED)
         await asyncio.sleep(0.01)
         healthy_finished = True
         await orchestrator.state.set_task(
             chapter.id, Stage.FORMALIZE, TaskStatus.SUCCEEDED, "formalized"
         )
-        return FormalizeOutcome(FormalizeDisposition.SUCCEEDED)
+        return StageOutcome(ExecutionDisposition.SUCCEEDED)
 
     monkeypatch.setattr(orchestrator, "_formalize", formalize)
 
@@ -3488,26 +3487,26 @@ async def test_review_failure_quarantines_branch_without_cancelling_unrelated_wo
         _rounds_used: dict[str, int],
         *,
         rerun: bool = False,
-    ) -> bool:
+    ) -> StageOutcome:
         nonlocal healthy_finished
         assert not rerun
         reviewed.append(chapter.id)
         if chapter.id == first.id:
             await third_started.wait()
-            return False
+            return StageOutcome(ExecutionDisposition.FAILED)
         if chapter.id == third.id:
             third_started.set()
             await asyncio.sleep(0.01)
             healthy_finished = True
-            return True
+            return StageOutcome(ExecutionDisposition.SUCCEEDED)
         raise AssertionError("a dependent of the failed review must not start")
 
-    async def prove(chapter: Chapter, *, defer_review: bool = False) -> bool:
+    async def prove(chapter: Chapter, *, defer_review: bool = False) -> StageOutcome:
         assert defer_review
         nonlocal healthy_proved
         assert chapter.id == third.id
         healthy_proved = True
-        return True
+        return StageOutcome(ExecutionDisposition.SUCCEEDED)
 
     monkeypatch.setattr(orchestrator, "_review_chapter_to_clean", review)
     monkeypatch.setattr(orchestrator, "_prove", prove)
@@ -3517,7 +3516,9 @@ async def test_review_failure_quarantines_branch_without_cancelling_unrelated_wo
     assert healthy_proved
     assert set(reviewed) == {first.id, third.id}
     assert state.task(first.id, Stage.REVIEW).status == TaskStatus.FAILED
-    assert state.task(second.id, Stage.REVIEW).status == TaskStatus.BLOCKED
+    dependent_review = state.task(second.id, Stage.REVIEW)
+    assert dependent_review.status == TaskStatus.PENDING
+    assert state.failure_roots(dependent_review) == (state.key(first.id, Stage.REVIEW),)
     await orchestrator.shutdown()
 
 
@@ -3572,7 +3573,7 @@ async def test_review_is_capped_at_three_edit_rebuild_cycles(
             + f"\n-- review pass {reviews}\n",
             encoding="utf-8",
         )
-        return ReviewOutcome(True, True)
+        return ReviewOutcome(ExecutionDisposition.SUCCEEDED, changed=True)
 
     async def review_build(_chapter: Chapter) -> dict[str, str]:
         nonlocal rebuilds
@@ -3596,7 +3597,7 @@ async def test_capacity_failure_consumes_a_review_round(
     chapter = config.chapters[0]
     orchestrator = Orchestrator(config, StateStore(config))
     await orchestrator.prepare()
-    outcomes = iter((ReviewOutcome(False, False, complete=False),))
+    outcomes = iter((ReviewOutcome(ExecutionDisposition.FAILED, changed=False, complete=False),))
 
     async def clean(*_args: object, **_kwargs: object) -> dict[str, str]:
         return {}
@@ -4526,7 +4527,7 @@ async def test_pending_review_is_not_recovered_from_historical_runs(
     await restarted.prepare()
 
     async def review_again(*_args: object, **_kwargs: object) -> ReviewOutcome:
-        return ReviewOutcome(True, False)
+        return ReviewOutcome(ExecutionDisposition.SUCCEEDED, changed=False)
 
     async def forbidden_agent(*_args: object, **_kwargs: object) -> AgentResult:
         raise AssertionError("current placeholder-free proof must not rerun an agent")
@@ -4558,6 +4559,7 @@ async def test_statement_finding_invalidates_only_its_review(tmp_path: Path) -> 
     )
     orchestrator = Orchestrator(config, StateStore(config))
     await orchestrator.prepare()
+    await mark_formalized(orchestrator)
     for chapter in config.chapters:
         await orchestrator.state.set_task(
             chapter.id, Stage.REVIEW, TaskStatus.SUCCEEDED, "reviewed"
@@ -4899,7 +4901,7 @@ async def test_upstream_proof_starts_before_downstream_review_finishes(
         _rounds_used: dict[str, int],
         *,
         rerun: bool = False,
-    ) -> bool:
+    ) -> StageOutcome:
         assert not rerun
         if chapter.id == second.id:
             assert orchestrator.state.task(second.id, Stage.REVIEW).status == TaskStatus.RUNNING
@@ -4908,15 +4910,15 @@ async def test_upstream_proof_starts_before_downstream_review_finishes(
             finish_upstream_proof.set()
         else:
             events.append(f"review:{chapter.id}")
-        return True
+        return StageOutcome(ExecutionDisposition.SUCCEEDED)
 
-    async def prove(chapter: Chapter, *, defer_review: bool = False) -> bool:
+    async def prove(chapter: Chapter, *, defer_review: bool = False) -> StageOutcome:
         assert defer_review
         events.append(f"prove:{chapter.id}")
         if chapter.id == first.id:
             upstream_proof_started.set()
             await finish_upstream_proof.wait()
-        return True
+        return StageOutcome(ExecutionDisposition.SUCCEEDED)
 
     monkeypatch.setattr(orchestrator, "_review_chapter_to_clean", review)
     monkeypatch.setattr(orchestrator, "_prove", prove)
@@ -4952,6 +4954,7 @@ async def test_invalidated_review_allows_descendant_proofs_to_run_optimistically
     )
     orchestrator = Orchestrator(config, StateStore(config))
     await orchestrator.prepare()
+    await mark_formalized(orchestrator)
     for chapter in config.chapters:
         await orchestrator.state.set_task(
             chapter.id,
@@ -4973,18 +4976,18 @@ async def test_invalidated_review_allows_descendant_proofs_to_run_optimistically
         chapter: Chapter,
         _rounds_used: dict[str, int],
         **_kwargs: object,
-    ) -> bool:
+    ) -> StageOutcome:
         assert chapter.id == first.id
         upstream_review_started.set()
         await release_upstream_review.wait()
-        return True
+        return StageOutcome(ExecutionDisposition.SUCCEEDED)
 
-    async def prove(chapter: Chapter, *, defer_review: bool = False) -> bool:
+    async def prove(chapter: Chapter, *, defer_review: bool = False) -> StageOutcome:
         assert defer_review
         proofs_started.append(chapter.id)
         if {second.id, third.id}.issubset(proofs_started):
             descendant_proofs_started.set()
-        return True
+        return StageOutcome(ExecutionDisposition.SUCCEEDED)
 
     monkeypatch.setattr(orchestrator, "_review_chapter_to_clean", review)
     monkeypatch.setattr(orchestrator, "_prove", prove)
@@ -5017,6 +5020,7 @@ async def test_dirty_rebuilds_wait_only_for_an_agent_on_the_same_chapter(
     )
     orchestrator = Orchestrator(config, StateStore(config))
     await orchestrator.prepare()
+    await mark_formalized(orchestrator)
     for chapter in config.chapters:
         await orchestrator.state.set_task(
             chapter.id,
@@ -5043,11 +5047,11 @@ async def test_dirty_rebuilds_wait_only_for_an_agent_on_the_same_chapter(
         chapter: Chapter,
         _rounds_used: dict[str, int],
         **_kwargs: object,
-    ) -> bool:
+    ) -> StageOutcome:
         assert chapter.id == first.id
         rereview_started.set()
         await release_rereview.wait()
-        return True
+        return StageOutcome(ExecutionDisposition.SUCCEEDED)
 
     async def rebuild(chapter: Chapter) -> bool:
         rebuilt.append(chapter.id)
@@ -5113,20 +5117,20 @@ async def test_proof_finding_requeues_only_its_review_branch(
         rerun: bool = False,
         feedback: str = "",
         proof_request_ids: tuple[str, ...] = (),
-    ) -> bool:
+    ) -> StageOutcome:
         nonlocal reviews
         assert rerun == (reviews > 0)
         review_feedback.append(feedback)
         assert bool(proof_request_ids) == bool(feedback)
         reviews += 1
-        return True
+        return StageOutcome(ExecutionDisposition.SUCCEEDED)
 
-    async def prove(_chapter: Chapter, *, defer_review: bool = False) -> bool:
+    async def prove(_chapter: Chapter, *, defer_review: bool = False) -> StageOutcome:
         assert defer_review
         nonlocal proofs
         proofs += 1
         if proofs > 1:
-            return True
+            return StageOutcome(ExecutionDisposition.SUCCEEDED)
         run = await state.start_run(chapter.id, Stage.PROVE)
         await state.finish_run(
             run,
@@ -5136,7 +5140,7 @@ async def test_proof_finding_requeues_only_its_review_branch(
                 "failed_attempts": [failed_attempt("statement needs a hypothesis")],
             },
         )
-        return False
+        return StageOutcome(ExecutionDisposition.FAILED)
 
     monkeypatch.setattr(orchestrator, "_review_chapter_to_clean", review)
     monkeypatch.setattr(orchestrator, "_prove", prove)
@@ -5359,7 +5363,7 @@ async def test_proof_task_failure_does_not_fail_or_block_the_review_tree(
     await mark_formalized(orchestrator)
     await state.set_task(chapter.id, Stage.REVIEW, TaskStatus.SUCCEEDED, "reviewed")
 
-    async def failed_proof(attempted: Chapter, *, defer_review: bool = False) -> bool:
+    async def failed_proof(attempted: Chapter, *, defer_review: bool = False) -> StageOutcome:
         assert attempted.id == chapter.id
         assert defer_review
         await state.set_task(
@@ -5368,7 +5372,7 @@ async def test_proof_task_failure_does_not_fail_or_block_the_review_tree(
             TaskStatus.FAILED,
             "proof chunks exhausted retries",
         )
-        return False
+        return StageOutcome(ExecutionDisposition.FAILED)
 
     monkeypatch.setattr(orchestrator, "_prove", failed_proof)
 
@@ -5778,13 +5782,13 @@ chapters = [1]
     await mark_discovered(orchestrator, {second.id: (first.id,)})
     events: list[str] = []
 
-    async def formalize(chapter: Chapter, *, rerun: bool = False) -> FormalizeOutcome:
+    async def formalize(chapter: Chapter, *, rerun: bool = False) -> StageOutcome:
         assert not rerun
         events.append(f"start:{chapter.book_id}")
         await asyncio.sleep(0)
         events.append(f"end:{chapter.book_id}")
         await state.set_task(chapter.id, Stage.FORMALIZE, TaskStatus.SUCCEEDED, "formalized")
-        return FormalizeOutcome(FormalizeDisposition.SUCCEEDED)
+        return StageOutcome(ExecutionDisposition.SUCCEEDED)
 
     monkeypatch.setattr(orchestrator, "_formalize", formalize)
 
@@ -5804,7 +5808,7 @@ async def test_chapter_failure_cancels_and_drains_siblings(
     sibling_started = asyncio.Event()
     sibling_cleaned = asyncio.Event()
 
-    async def formalize(chapter: Chapter, *, rerun: bool = False) -> FormalizeOutcome:
+    async def formalize(chapter: Chapter, *, rerun: bool = False) -> StageOutcome:
         assert not rerun
         if chapter.number == 1:
             await sibling_started.wait()

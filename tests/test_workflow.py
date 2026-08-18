@@ -8,7 +8,7 @@ import pytest
 from paf.codex import ValidationResult
 from paf.config import load_config
 from paf.models import Stage
-from paf.scheduler import FormalizeDisposition, FormalizeOutcome, Orchestrator
+from paf.scheduler import ExecutionDisposition, Orchestrator, StageOutcome
 from paf.state import StateStore, TaskStatus
 from tests.support import write_project
 
@@ -39,7 +39,7 @@ async def test_discovery_streams_into_dependency_ready_formalization(tmp_path, m
             TaskStatus.SUCCEEDED,
             "source dependency tree persisted",
         )
-        return FormalizeOutcome(FormalizeDisposition.SUCCEEDED)
+        return StageOutcome(ExecutionDisposition.SUCCEEDED)
 
     async def formalize(chapter, *, rerun=False):
         del rerun
@@ -53,7 +53,7 @@ async def test_discovery_streams_into_dependency_ready_formalization(tmp_path, m
             TaskStatus.SUCCEEDED,
             "clean",
         )
-        return FormalizeOutcome(FormalizeDisposition.SUCCEEDED)
+        return StageOutcome(ExecutionDisposition.SUCCEEDED)
 
     monkeypatch.setattr(orchestrator, "_discover", discover)
     monkeypatch.setattr(orchestrator, "_formalize", formalize)
@@ -167,7 +167,7 @@ async def test_rereview_does_not_wait_for_dependency_review(tmp_path, monkeypatc
         else:
             second_started.set()
         await state.set_task(chapter.id, Stage.REVIEW, TaskStatus.SUCCEEDED, "reviewed")
-        return True
+        return StageOutcome(ExecutionDisposition.SUCCEEDED)
 
     monkeypatch.setattr(orchestrator, "_review_chapter_to_clean", review)
     run = asyncio.create_task(orchestrator._review_tree())
@@ -198,7 +198,7 @@ async def test_first_review_waits_for_dependency_review(tmp_path, monkeypatch) -
         else:
             second_started.set()
         await state.set_task(chapter.id, Stage.REVIEW, TaskStatus.SUCCEEDED, "reviewed")
-        return True
+        return StageOutcome(ExecutionDisposition.SUCCEEDED)
 
     monkeypatch.setattr(orchestrator, "_review_chapter_to_clean", review)
     # Even a forced pipeline invocation must preserve ordering for a node's
@@ -234,7 +234,7 @@ async def test_proof_release_does_not_wait_for_dependency_proof(tmp_path, monkey
         else:
             second_started.set()
         await state.set_task(chapter.id, Stage.PROVE, TaskStatus.SUCCEEDED, "proved")
-        return True
+        return StageOutcome(ExecutionDisposition.SUCCEEDED)
 
     monkeypatch.setattr(orchestrator, "_prove", prove)
     run = asyncio.create_task(orchestrator._review_tree(prove=True))
@@ -259,26 +259,26 @@ async def test_pipeline_has_no_full_stage_barriers(tmp_path, monkeypatch) -> Non
             chapter, (), {"summary": "independent", "issues": []}
         )
         await state.set_task(chapter.id, Stage.DISCOVER, TaskStatus.SUCCEEDED, "discovered")
-        return FormalizeOutcome(FormalizeDisposition.SUCCEEDED)
+        return StageOutcome(ExecutionDisposition.SUCCEEDED)
 
     async def formalize(chapter, *, rerun=False):
         del rerun
         if chapter.id == second.id:
             await release_second_formalize.wait()
         await state.set_task(chapter.id, Stage.FORMALIZE, TaskStatus.SUCCEEDED, "clean")
-        return FormalizeOutcome(FormalizeDisposition.SUCCEEDED)
+        return StageOutcome(ExecutionDisposition.SUCCEEDED)
 
     async def review(chapter, rounds_used, **kwargs):
         del rounds_used, kwargs
         if chapter.id == first.id:
             first_review_started.set()
         await state.set_task(chapter.id, Stage.REVIEW, TaskStatus.SUCCEEDED, "reviewed")
-        return True
+        return StageOutcome(ExecutionDisposition.SUCCEEDED)
 
     async def prove(chapter, *, defer_review=False):
         del defer_review
         await state.set_task(chapter.id, Stage.PROVE, TaskStatus.SUCCEEDED, "proved")
-        return True
+        return StageOutcome(ExecutionDisposition.SUCCEEDED)
 
     monkeypatch.setattr(orchestrator, "_discover", discover)
     monkeypatch.setattr(orchestrator, "_formalize", formalize)

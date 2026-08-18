@@ -814,6 +814,8 @@ class StateStore:
                 formalize.phase = TaskPhase.IDLE
                 formalize.detail = "formalization completed before review"
                 formalize.updated_at = timestamp()
+        for task in self.tasks.values():
+            self._migrate_legacy_task_wait(task)
         for value in persisted_runs:
             if not isinstance(value, dict):
                 continue
@@ -2893,6 +2895,14 @@ class StateStore:
             TaskStatus.SUCCEEDED,
         ):
             return
+        if (
+            stage is Stage.FORMALIZE
+            and status == TaskStatus.RUNNING
+            and self.later_stage_started(chapter_id)
+        ):
+            raise RuntimeError(
+                f"cannot start formalize for {chapter_id} after review or proof has begun"
+            )
         changed_tasks = [task]
         recovered = task.recovering_failure and status == TaskStatus.SUCCEEDED
         task.status = status
@@ -2936,6 +2946,14 @@ class StateStore:
                 TaskStatus.SUCCEEDED,
             ):
                 continue
+            if (
+                stage is Stage.FORMALIZE
+                and status == TaskStatus.RUNNING
+                and self.later_stage_started(chapter_id)
+            ):
+                raise RuntimeError(
+                    f"cannot start formalize for {chapter_id} after review or proof has begun"
+                )
             task_status = status
             task_detail = detail
             recovered = recovered or (
@@ -3070,6 +3088,74 @@ class StateStore:
         raw = node.get("dependencies", ()) if isinstance(node, dict) else ()
         return {item for item in raw if isinstance(item, str)} if isinstance(raw, list) else set()
 
+    def _migrate_legacy_task_wait(self, task: TaskRecord) -> None:
+        if not any(
+            requirement.kind is RequirementKind.LEGACY_BLOCK for requirement in task.waiting_on
+        ):
+            return
+        stage = Stage(task.stage)
+        requirements: tuple[Requirement, ...] = ()
+        if stage is Stage.FORMALIZE and task.detail == (
+            "blocked by a failed source dependency formalization"
+        ):
+            requirements = tuple(
+                self._task_key_requirement(
+                    RequirementKind.SOURCE_DEPENDENCY,
+                    dependency,
+                    Stage.FORMALIZE,
+                    f"waiting for source dependency {dependency}",
+                )
+                for dependency in sorted(self._source_dependencies(task.chapter_id))
+            )
+        elif stage is Stage.REVIEW and task.detail == (
+            "blocked by a failed prerequisite review; unrelated branches completed"
+        ):
+            requirements = tuple(
+                self._task_key_requirement(
+                    RequirementKind.STAGE_DEPENDENCY,
+                    dependency,
+                    Stage.REVIEW,
+                    f"waiting for dependency review {dependency}",
+                )
+                for dependency in sorted(self._source_dependencies(task.chapter_id))
+            )
+        elif (
+            stage is Stage.REVIEW
+            and task.detail
+            in {
+                "formalization did not complete",
+                "formalization failed; quarantined from review",
+            }
+        ) or (
+            stage is Stage.PROVE
+            and task.detail
+            in {
+                "blocked because formalization did not complete",
+                "formalization failed; quarantined from proof",
+            }
+        ):
+            requirements = (
+                self._task_key_requirement(
+                    RequirementKind.STAGE_DEPENDENCY,
+                    task.chapter_id,
+                    Stage.FORMALIZE,
+                    "waiting for clean formalization",
+                ),
+            )
+        elif stage is Stage.PROVE and task.detail == (
+            "blocked because statement review did not complete"
+        ):
+            requirements = (
+                self._task_key_requirement(
+                    RequirementKind.STAGE_DEPENDENCY,
+                    task.chapter_id,
+                    Stage.REVIEW,
+                    "waiting for successful review",
+                ),
+            )
+        if requirements:
+            task.waiting_on = requirements
+
     def _task_key_requirement(
         self,
         kind: RequirementKind,
@@ -3139,6 +3225,18 @@ class StateStore:
                     ),
                 )
             )
+            requirements.extend(
+                Requirement(
+                    RequirementKind.PROOF_REVIEW_REQUEST,
+                    owner_task_key=self.key(task.chapter_id, Stage.REVIEW),
+                    request_id=request_id,
+                    detail="waiting for proof-review request",
+                )
+                for request_id, request in sorted(self.proof_review_requests.items())
+                if isinstance(request, dict)
+                and isinstance(request.get("feedback"), dict)
+                and task.chapter_id in request["feedback"]
+            )
         return tuple(
             dict.fromkeys(
                 requirement
@@ -3159,8 +3257,14 @@ class StateStore:
                     UpstreamRequestStatus.CLOSED,
                 }
             if requirement.kind is RequirementKind.PROOF_REVIEW_REQUEST:
-                request = self.proof_review_requests.get(requirement.request_id, {})
-                return request.get("status") == "closed"
+                request = self.proof_review_requests.get(requirement.request_id)
+                if not isinstance(request, dict):
+                    return True
+                feedback = request.get("feedback")
+                if requirement.owner_task_key is None or not isinstance(feedback, dict):
+                    return False
+                chapter_id = requirement.owner_task_key.rpartition(":")[0]
+                return chapter_id not in feedback
         return False
 
     def readiness(self, task: TaskRecord) -> Readiness:

@@ -171,12 +171,12 @@ async def test_persisted_repair_plan_reopens_only_root_failures(tmp_path: Path) 
     assert state.repair_work_units == {}
     assert state.repair_sweeps == {}
     assert root_case.status == RepairCaseStatus.OPEN
-    assert consumer_case.status == RepairCaseStatus.EXHAUSTED
+    assert consumer_case.status == RepairCaseStatus.RESOLVED
     await state.close()
 
 
 @pytest.mark.asyncio
-async def test_legacy_derived_review_failure_migrates_to_blocked(tmp_path: Path) -> None:
+async def test_legacy_derived_review_failure_migrates_to_structured_wait(tmp_path: Path) -> None:
     config_path = write_project(tmp_path, chapters="chapters = [1]")
     config = load_config(config_path)
     state = StateStore(config)
@@ -193,7 +193,9 @@ async def test_legacy_derived_review_failure_migrates_to_blocked(tmp_path: Path)
     recovered = StateStore(load_config(config_path))
     await recovered.load_or_create()
 
-    assert recovered.task(chapter.id, Stage.REVIEW).status == TaskStatus.BLOCKED
+    review = recovered.task(chapter.id, Stage.REVIEW)
+    assert review.status == TaskStatus.PENDING
+    assert review.waiting_on
     assert recovered.shepherd_repairable_tasks() == []
     await recovered.close()
 
