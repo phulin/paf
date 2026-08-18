@@ -155,7 +155,11 @@ async def test_interrupted_repair_dag_resumes_without_replanning(
     await state.install_repair_plan(sweep.id, [unit], summary="existing plan", run_id="planner")
     unit.status = RepairWorkUnitStatus.INTERRUPTED
     await state.save("repair_work_units")
-    orchestrator = Orchestrator(config, state)
+    await state.close()
+
+    recovered = StateStore(config)
+    await recovered.load_or_create()
+    orchestrator = Orchestrator(config, recovered)
     resumed: list[str] = []
 
     async def execute(units: Any) -> bool:
@@ -166,8 +170,8 @@ async def test_interrupted_repair_dag_resumes_without_replanning(
 
     assert not await orchestrator._resume_repair_dags(include_certification=True)
     assert resumed == [unit.id]
-    assert len(state.repair_sweeps) == 1
-    await state.close()
+    assert len(recovered.repair_sweeps) == 1
+    await recovered.close()
 
 
 @pytest.mark.asyncio
