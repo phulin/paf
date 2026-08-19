@@ -151,7 +151,7 @@ async def test_failed_build_returns_before_recursive_cleanup(
     artifact = build.root / "lean" / ".lake" / "build" / "large.olean"
     artifact.parent.mkdir(parents=True)
     artifact.write_bytes(b"artifact")
-    build_root = build.root.parent
+    build_root = build.transaction_root
     cleanup_started = threading.Event()
     release_cleanup = threading.Event()
     original_rmtree = shutil.rmtree
@@ -169,6 +169,26 @@ async def test_failed_build_returns_before_recursive_cleanup(
         assert build_root.exists()
     finally:
         release_cleanup.set()
+        await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_coordinator_build_mount_path_is_stable_across_transactions(
+    tmp_path: Path,
+) -> None:
+    manager, _ = fuse_manager(write_project(tmp_path, chapters="chapters = [1]"))
+    await manager.prepare()
+    try:
+        first = await manager.acquire_build("first")
+        first_root = first.root
+        first_transaction = first.transaction_root
+        await first.finish(succeeded=True, publish=True)
+
+        second = await manager.acquire_build("second")
+        assert second.root == first_root == manager.coordinator_merged
+        assert second.transaction_root != first_transaction
+        await second.close()
+    finally:
         await manager.close()
 
 
