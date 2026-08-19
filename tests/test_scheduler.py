@@ -14,6 +14,7 @@ import paf.scheduler as scheduler_module
 import paf.state as state_module
 from paf.codex import (
     DIAGNOSTIC_REVIEW_ROLE,
+    PROOF_REVIEW_ROLE,
     WARNING_REVIEW_ROLE,
     AgentResult,
     CodexExecutor,
@@ -987,7 +988,7 @@ async def test_warning_cleanup_is_separate_from_proof_findings(tmp_path: Path) -
     await state.finish_proof_review_requests(chapter.id, warning_ids)
     _, selected_ids = orchestrator._proof_review_feedback(chapter.id)
     assert selected_ids == (proof_id,)
-    assert orchestrator._proof_review_role(selected_ids) == ""
+    assert orchestrator._proof_review_role(selected_ids) == PROOF_REVIEW_ROLE
     await orchestrator.shutdown()
 
 
@@ -1034,7 +1035,7 @@ async def test_review_tree_ignores_auxiliary_warning_cleanup_obligations(
     monkeypatch.setattr(orchestrator, "_review_chapter_to_clean", review)
 
     assert await orchestrator._review_tree()
-    assert calls == [("", (proof_id,))]
+    assert calls == [(PROOF_REVIEW_ROLE, (proof_id,))]
     assert set(state.proof_review_requests) == {warning_id}
     await orchestrator.shutdown()
 
@@ -2522,7 +2523,9 @@ async def test_recovery_restores_green_reviews_without_direct_findings(tmp_path:
     await orchestrator.prepare()
     await orchestrator._recover_proof_review_requests()
 
-    assert recovered.task(owner.id, Stage.REVIEW).status == TaskStatus.PENDING
+    owner_review = recovered.task(owner.id, Stage.REVIEW)
+    assert owner_review.status == TaskStatus.SUCCEEDED
+    assert owner_review.detail == "reviewed"
     restored = recovered.task(downstream.id, Stage.REVIEW)
     assert restored.status == TaskStatus.SUCCEEDED
     assert restored.detail == "durable review remains green; no pending findings for this chapter"
@@ -5176,7 +5179,7 @@ async def test_standalone_failed_proof_attempt_queues_durable_review(
     assert not await orchestrator._prove(chapter)
     review = orchestrator.state.task(chapter.id, Stage.REVIEW)
     proof = orchestrator.state.task(chapter.id, Stage.PROVE)
-    assert review.status == TaskStatus.PENDING
+    assert review.status == TaskStatus.SUCCEEDED
     assert proof.status == TaskStatus.PENDING
     assert proof.source_digest is None
     feedback, request_ids = orchestrator._proof_review_feedback(chapter.id)
@@ -5188,18 +5191,17 @@ async def test_standalone_failed_proof_attempt_queues_durable_review(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("assessment", "review_changed", "expected"),
+    ("assessment", "review_changed"),
     [
-        ("confirmed", False, ProofBlockerStatus.BLOCKED),
-        ("rejected", False, ProofBlockerStatus.OPEN),
-        ("confirmed", True, ProofBlockerStatus.OPEN),
+        ("confirmed", False),
+        ("rejected", False),
+        ("reframed", True),
     ],
 )
-async def test_completed_review_controls_blocker_reopening(
+async def test_completed_review_deterministically_reopens_blocker(
     tmp_path: Path,
     assessment: str,
     review_changed: bool,
-    expected: ProofBlockerStatus,
 ) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
     chapter = config.chapters[0]
@@ -5242,10 +5244,174 @@ async def test_completed_review_controls_blocker_reopening(
     )
 
     assert await orchestrator._complete_review(chapter, "reviewed", proof_request_ids=(request_id,))
-    assert state.proof_blockers[blocker_id]["status"] == expected.value
-    if expected is ProofBlockerStatus.OPEN:
-        assert state.proof_blockers[blocker_id]["retry_sighting_baseline"] == 1
+    assert state.proof_blockers[blocker_id]["status"] == ProofBlockerStatus.OPEN.value
+    assert state.proof_blockers[blocker_id]["retry_sighting_baseline"] == 1
+    assert state.proof_blockers[blocker_id]["review_exchange_count"] == 1
     assert request_id not in state.proof_review_requests
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_proof_review_request_is_auxiliary_to_green_review(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = config.chapters[0]
+    source = tmp_path / "lean" / "Book" / "Chapter01.lean"
+    source.parent.mkdir(parents=True)
+    source.write_text("theorem target : True := by sorry\n", encoding="utf-8")
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await orchestrator.prepare()
+    await mark_clean_formalization(orchestrator)
+    await state.set_task(chapter.id, Stage.REVIEW, TaskStatus.SUCCEEDED, "canonical review")
+    blockers = await state.record_proof_blockers(
+        chapter.id,
+        origin_run_id="proof-run",
+        failed_attempts=[failed_attempt("proof strategy stalled")],
+    )
+    blocker_id = str(blockers[0]["id"])
+    request_id, _ = await state.enqueue_proof_review_request(
+        {chapter.id: "Failed proof `Book.target` in `lean/Book/Chapter01.lean`"},
+        origin_run_id="proof-run",
+        blocker_ids=(blocker_id,),
+    )
+    await state.set_proof_blocker_status((blocker_id,), ProofBlockerStatus.REVIEW_REQUESTED)
+    feedback, request_ids = orchestrator._proof_review_feedback(chapter.id)
+    orchestrator.executor = FakeExecutor(
+        state,
+        [
+            result(
+                changed=False,
+                finding_assessments=[
+                    {
+                        "finding_id": f"{request_id}:1",
+                        "finding": "Book.target remains unproved",
+                        "assessment": "reframed",
+                        "explanation": "Try induction on the finite presentation next.",
+                    }
+                ],
+            )
+        ],
+    )
+
+    outcome = await orchestrator._review_chapter_to_clean(
+        chapter,
+        {chapter.id: 0},
+        rerun=True,
+        feedback=feedback,
+        role=PROOF_REVIEW_ROLE,
+        proof_request_ids=request_ids,
+    )
+
+    assert outcome.succeeded
+    review = state.task(chapter.id, Stage.REVIEW)
+    assert review.status == TaskStatus.SUCCEEDED
+    assert review.detail == "canonical review"
+    assert review.runs[-1].auxiliary
+    assert review.runs[-1].role == PROOF_REVIEW_ROLE
+    assert request_id not in state.proof_review_requests
+    blocker = state.proof_blockers[blocker_id]
+    assert blocker["status"] == ProofBlockerStatus.OPEN.value
+    assert blocker["review_exchange_count"] == 1
+    assert blocker["review_responses"] == ["Try induction on the finite presentation next."]
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_green_review_does_not_satisfy_pending_proof_review_request(
+    tmp_path: Path,
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = config.chapters[0]
+    state = StateStore(config)
+    await state.load_or_create()
+    await state.set_task(chapter.id, Stage.FORMALIZE, TaskStatus.SUCCEEDED, "formalized")
+    await state.set_task(chapter.id, Stage.REVIEW, TaskStatus.SUCCEEDED, "reviewed")
+    request_id, _ = await state.enqueue_proof_review_request(
+        {chapter.id: "review this failed proof"},
+        origin_run_id="proof-run",
+    )
+
+    proof = state.task(chapter.id, Stage.PROVE)
+    readiness = state.readiness(proof)
+    assert not readiness.ready
+    assert [requirement.request_id for requirement in readiness.waiting] == [request_id]
+
+    await state.finish_proof_review_requests(chapter.id, (request_id,))
+    assert state.readiness(proof).ready
+    await state.close()
+
+
+@pytest.mark.asyncio
+async def test_proof_review_exchange_cap_blocks_proof_not_review(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = config.chapters[0]
+    source = tmp_path / "lean" / "Book" / "Chapter01.lean"
+    source.parent.mkdir(parents=True)
+    source.write_text("theorem target : True := by sorry\n", encoding="utf-8")
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await orchestrator.prepare()
+    await mark_clean_formalization(orchestrator)
+    await state.set_task(chapter.id, Stage.REVIEW, TaskStatus.SUCCEEDED, "canonical review")
+    blockers = await state.record_proof_blockers(
+        chapter.id,
+        origin_run_id="proof-run-0",
+        failed_attempts=[failed_attempt("statement/interface strategy stalled")],
+    )
+    blocker_id = str(blockers[0]["id"])
+    maximum = config.stages[Stage.PROVE].unchanged_retry_limit
+
+    for exchange in range(1, maximum + 1):
+        request_id, _ = await state.enqueue_proof_review_request(
+            {chapter.id: "Failed proof `Book.target` in `lean/Book/Chapter01.lean`"},
+            origin_run_id=f"proof-run-{exchange}",
+            blocker_ids=(blocker_id,),
+        )
+        await state.set_proof_blocker_status((blocker_id,), ProofBlockerStatus.REVIEW_REQUESTED)
+        run = await state.start_auxiliary_run(
+            chapter.id,
+            Stage.REVIEW,
+            role=PROOF_REVIEW_ROLE,
+            request_ids=(request_id,),
+        )
+        await state.finish_run(
+            run,
+            status=TaskStatus.SUCCEEDED,
+            report={
+                "complete": True,
+                "finding_assessments": [
+                    {
+                        "finding_id": f"{request_id}:1",
+                        "finding": "Book.target remains unproved",
+                        "assessment": "reframed",
+                        "explanation": f"review response {exchange}",
+                    }
+                ],
+            },
+        )
+        await orchestrator._apply_proof_review_outcomes(chapter, (request_id,))
+        await state.finish_proof_review_requests(chapter.id, (request_id,))
+        assert state.proof_blockers[blocker_id]["status"] == ProofBlockerStatus.OPEN.value
+        assert state.task(chapter.id, Stage.REVIEW).status == TaskStatus.SUCCEEDED
+
+    blocker = state.proof_blockers[blocker_id]
+    assert blocker["review_exchange_count"] == maximum
+    assert len(blocker["review_responses"]) == maximum
+    orchestrator.executor = FakeExecutor(
+        state,
+        [
+            result(
+                changed=False,
+                placeholders=1,
+                failed_attempts=[failed_attempt("statement/interface strategy stalled")],
+            )
+        ],
+    )
+    assert not await orchestrator._prove(chapter)
+    proof = state.task(chapter.id, Stage.PROVE)
+    assert proof.status == TaskStatus.FAILED
+    assert "durable blockers retained" in proof.detail
+    assert state.task(chapter.id, Stage.REVIEW).status == TaskStatus.SUCCEEDED
     await orchestrator.shutdown()
 
 
@@ -6506,12 +6672,17 @@ async def test_proof_finding_requeues_only_its_review_branch(
         *,
         rerun: bool = False,
         feedback: str = "",
+        role: str = "",
         proof_request_ids: tuple[str, ...] = (),
     ) -> StageOutcome:
         nonlocal reviews
         assert rerun == (reviews > 0)
+        if feedback:
+            assert role == PROOF_REVIEW_ROLE
         review_feedback.append(feedback)
         assert bool(proof_request_ids) == bool(feedback)
+        if proof_request_ids:
+            await state.finish_proof_review_requests(chapter.id, proof_request_ids)
         reviews += 1
         return StageOutcome(ExecutionDisposition.SUCCEEDED)
 

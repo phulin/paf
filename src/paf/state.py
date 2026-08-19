@@ -2756,7 +2756,7 @@ class StateStore:
         request_id: str | None = None,
         blocker_ids: Iterable[str] = (),
     ) -> tuple[str, bool]:
-        """Persist proof findings or diagnostics before invalidating their review closure."""
+        """Persist proof findings or diagnostics before scheduling their request service."""
 
         for existing_id, value in self.proof_review_requests.items():
             if value.get("origin_run_id") == origin_run_id:
@@ -3653,9 +3653,6 @@ class StateStore:
         )
 
     def requirement_satisfied(self, requirement: Requirement) -> bool:
-        if requirement.owner_task_key is not None:
-            owner = self.tasks.get(requirement.owner_task_key)
-            return owner is not None and owner.status == TaskStatus.SUCCEEDED
         if requirement.request_id is not None:
             if requirement.kind is RequirementKind.UPSTREAM_REQUEST:
                 request = self.upstream_requests.get(requirement.request_id, {})
@@ -3672,6 +3669,9 @@ class StateStore:
                     return False
                 chapter_id = requirement.owner_task_key.rpartition(":")[0]
                 return chapter_id not in feedback
+        if requirement.owner_task_key is not None:
+            owner = self.tasks.get(requirement.owner_task_key)
+            return owner is not None and owner.status == TaskStatus.SUCCEEDED
         return False
 
     def readiness(self, task: TaskRecord) -> Readiness:

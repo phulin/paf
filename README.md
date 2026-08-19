@@ -423,10 +423,11 @@ After the daemon exits, `status`, `snapshot`, and `wait` fall back to the persis
   edit only for the edited files and their assigned transitive dependents, rechecking just the files
   invalidated by any subsequent repair. A changed chapter receives a prioritized coordinator build.
   Failed builds are routed to diagnostic repair. Structured statement/interface proof findings are
-  fed to a focused re-review of the named declarations, immediate supporting interfaces, and source
-  passages; they return to review rather than formalization. A confirmed finding that produces no
-  source repair remains terminal instead of silently reopening the same proof. A rejected or
-  reframed finding opens one fresh blocker retry window with the review's guidance.
+  sent as durable requests to an auxiliary proof-review service covering the named declarations,
+  immediate supporting interfaces, and source passages. This correspondence never reopens or fails
+  the canonical review task: a valid response is stored as proof feedback, and the orchestrator
+  deterministically retries or terminates the proof from the stable blocker ledger. Reviewer
+  classifications are evidence, not scheduler commands.
   An initial review that edits source receives another full pass until one pass is clean, capped at
   five review/verification cycles. A review launched with specific persisted findings instead makes
   one repair pass and completes as soon as its coordinator rebuild is clean; it does not require a
@@ -446,8 +447,9 @@ After the daemon exits, `status`, `snapshot`, and `wait` fall back to the persis
   explicitly in the generated prompt; placeholders outside it are reserved for later agents.
   `max_rounds` is the local retry budget for one chunk, not a cap on the number of chunks in the
   chapter. `unchanged_retry_limit` is the global budget for one semantic blocker across later
-  proof/review cycles; differently worded reports with the same declaration and residual goal do
-  not reset it.
+  proof-review exchanges; differently worded reports with the same declaration and residual goal do
+  not reset it. At the limit the proof task fails while canonical review remains successful and
+  downstream interface consumers remain eligible.
   A completed chunk starts with a fresh budget, while an exhausted or durably obstructed chunk does
   not prevent independent chunks from running or block downstream tasks. After every runnable
   branch drains, such a chunk remains a visible failed leaf task without failing the enclosing

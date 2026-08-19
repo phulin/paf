@@ -19,6 +19,7 @@ from paf.codex import (
     DIAGNOSTIC_REVIEW_ROLE,
     DIAGNOSTIC_REVIEW_ROLES,
     DOWNSTREAM_RETRY_ROLE,
+    PROOF_REVIEW_ROLE,
     REPAIR_WORKER_ROLE,
     SHEPHERD_ROLE,
     UPSTREAM_REPAIR_ROLE,
@@ -256,6 +257,7 @@ class RunningReview:
     task: asyncio.Task[StageOutcome]
     dependencies: frozenset[str]
     proof_request_ids: tuple[str, ...] = ()
+    auxiliary: bool = False
 
 
 @dataclass(frozen=True)
@@ -1670,7 +1672,12 @@ class Orchestrator:
         resume_run_id: str = "",
         resume_prompt: str = "",
     ) -> Attempt:
-        auxiliary = role in {UPSTREAM_REPAIR_ROLE, REPAIR_WORKER_ROLE, WARNING_REVIEW_ROLE}
+        auxiliary = role in {
+            UPSTREAM_REPAIR_ROLE,
+            REPAIR_WORKER_ROLE,
+            WARNING_REVIEW_ROLE,
+            PROOF_REVIEW_ROLE,
+        }
         upstream_repair = role == UPSTREAM_REPAIR_ROLE
         selected_request_ids = tuple(dict.fromkeys(request_ids))
         selected_upstream_requests = tuple(upstream_requests)
@@ -2904,11 +2911,18 @@ class Orchestrator:
 
         blocks = []
         for blocker in sorted(deduplicated.values(), key=lambda value: str(value.get("id", ""))):
+            responses = blocker.get("review_responses")
+            review_advice = (
+                "\nLatest reviewer response: " + str(responses[-1])[:2000]
+                if isinstance(responses, list) and responses
+                else ""
+            )
             blocks.append(
                 f"{blocker['id']} — `{blocker.get('declaration', '')}` in "
                 f"`{blocker.get('path', '')}` (seen {blocker.get('sightings', 1)} time(s))\n"
                 f"Residual goal: {str(blocker.get('remaining_goal', ''))[:2000]}\n"
                 f"Obstruction: {str(blocker.get('obstruction', ''))[:1200]}"
+                f"{review_advice}"
             )
         if not blocks:
             return ""
@@ -3031,7 +3045,7 @@ class Orchestrator:
             return WARNING_REVIEW_ROLE
         if kinds and kinds.issubset(DIAGNOSTIC_REVIEW_KINDS):
             return DIAGNOSTIC_REVIEW_ROLE
-        return ""
+        return PROOF_REVIEW_ROLE if kinds else ""
 
     @staticmethod
     def _proof_finding_ids(request_id: str, feedback: str) -> tuple[str, ...]:
@@ -3107,12 +3121,12 @@ class Orchestrator:
         report: dict[str, Any],
         *,
         origin_run_id: str,
-    ) -> set[str]:
-        """Durably hand failed proof evidence to a full-scope chapter review."""
+    ) -> tuple[str, ...]:
+        """Durably hand failed proof evidence to the auxiliary review service."""
 
         attempt_feedback = self._failed_attempt_feedback(report)
         if not attempt_feedback:
-            return set()
+            return ()
         feedback = {
             chapter.id: (
                 f"Proof work in `{chapter.id}` left checked failures. Evaluate this evidence while "
@@ -3133,20 +3147,13 @@ class Orchestrator:
                 ):
                     blocker_ids.append(str(blocker["id"]))
                     break
-        _, created = await self.state.enqueue_proof_review_request(
+        request_id, _ = await self.state.enqueue_proof_review_request(
             feedback,
             origin_run_id=origin_run_id,
             kind=PROOF_FINDING_REVIEW_KIND,
             blocker_ids=blocker_ids,
         )
-        targets = {chapter.id}
-        if not created:
-            return targets
-        invalidated_reviews = await self._invalidate_reviews(
-            targets,
-            detail="review invalidated by failed-proof findings",
-        )
-        return invalidated_reviews
+        return (request_id,)
 
     def _has_completed_green_review(self, chapter_id: str) -> bool:
         """Whether history contains a completed no-change review pass."""
@@ -3161,29 +3168,38 @@ class Orchestrator:
                 return True
         return False
 
-    async def _restore_unaffected_review_successes(
+    async def _restore_review_successes_for_auxiliary_requests(
         self,
         pending_owners: set[str],
     ) -> None:
-        """Repair review greens erased by the former closure-wide policy."""
+        """Keep canonical review green while auxiliary proof mail is pending."""
 
-        restored: set[str] = set()
+        restored_auxiliary: set[str] = set()
+        restored_legacy: set[str] = set()
         synthetic_failures = {
             "formalization failed; quarantined from review",
             "formalization failed; quarantined from proof",
         }
         for chapter in self.work_units:
-            if chapter.id in pending_owners:
-                continue
             task = self.state.task(chapter.id, Stage.REVIEW)
-            recoverable = task.status in (TaskStatus.PENDING, TaskStatus.BLOCKED) or (
-                task.status == TaskStatus.FAILED and task.detail in synthetic_failures
+            recoverable = (
+                task.status in (TaskStatus.PENDING, TaskStatus.BLOCKED)
+                or (chapter.id in pending_owners and task.status == TaskStatus.FAILED)
+                or (task.status == TaskStatus.FAILED and task.detail in synthetic_failures)
             )
             if recoverable and self._has_completed_green_review(chapter.id):
-                restored.add(chapter.id)
-        if restored:
+                target = restored_auxiliary if chapter.id in pending_owners else restored_legacy
+                target.add(chapter.id)
+        if restored_auxiliary:
             await self.state.set_tasks(
-                restored,
+                restored_auxiliary,
+                Stage.REVIEW,
+                TaskStatus.SUCCEEDED,
+                "canonical review remains green; proof-review request is auxiliary",
+            )
+        if restored_legacy:
+            await self.state.set_tasks(
+                restored_legacy,
                 Stage.REVIEW,
                 TaskStatus.SUCCEEDED,
                 "durable review remains green; no pending findings for this chapter",
@@ -3266,17 +3282,7 @@ class Orchestrator:
             for chapter_id in feedback
             if chapter_id in by_id
         }
-        stale_reviews = {
-            chapter_id
-            for chapter_id in pending_owners
-            if self.state.task(chapter_id, Stage.REVIEW).status == TaskStatus.SUCCEEDED
-        }
-        if stale_reviews:
-            await self._invalidate_reviews(
-                stale_reviews,
-                detail="recovering pending failed-proof review findings",
-            )
-        await self._restore_unaffected_review_successes(pending_owners)
+        await self._restore_review_successes_for_auxiliary_requests(pending_owners)
 
     def _module_owner_ids(self, module: str) -> tuple[str, ...]:
         owners: list[str] = []
@@ -4336,7 +4342,8 @@ class Orchestrator:
         resume_run_id: str = "",
         resume_prompt: str = "",
     ) -> StageOutcome:
-        if not rerun and self._already_done(chapter, Stage.REVIEW):
+        auxiliary_request = role == PROOF_REVIEW_ROLE
+        if not auxiliary_request and not rerun and self._already_done(chapter, Stage.REVIEW):
             return StageOutcome(ExecutionDisposition.SUCCEEDED, changed=False, complete=True)
         attempt = await self._attempt(
             chapter,
@@ -4358,12 +4365,13 @@ class Orchestrator:
             resume_prompt=resume_prompt,
         )
         if attempt.agent.capacity_exhausted:
-            await self.state.set_task(
-                chapter.id,
-                Stage.REVIEW,
-                TaskStatus.FAILED,
-                "model capacity remained unavailable after the configured retries",
-            )
+            if not auxiliary_request:
+                await self.state.set_task(
+                    chapter.id,
+                    Stage.REVIEW,
+                    TaskStatus.FAILED,
+                    "model capacity remained unavailable after the configured retries",
+                )
             return StageOutcome(
                 ExecutionDisposition.FAILED,
                 changed=attempt.agent.changed,
@@ -4376,7 +4384,7 @@ class Orchestrator:
         succeeded = attempt.agent.succeeded and attempt.validation.succeeded
         complete = bool(attempt.agent.report.get("complete"))
         if succeeded and complete:
-            if attempt.agent.changed:
+            if attempt.agent.changed and not auxiliary_request:
                 await self.state.set_task(
                     chapter.id,
                     Stage.REVIEW,
@@ -4390,12 +4398,13 @@ class Orchestrator:
                 run_id=attempt.run.id,
             )
         if report_error:
-            await self.state.set_task(
-                chapter.id,
-                Stage.REVIEW,
-                TaskStatus.RUNNING,
-                "invalid review report; session retry queued",
-            )
+            if not auxiliary_request:
+                await self.state.set_task(
+                    chapter.id,
+                    Stage.REVIEW,
+                    TaskStatus.RUNNING,
+                    "invalid review report; session retry queued",
+                )
             return StageOutcome(
                 ExecutionDisposition.WAITING,
                 changed=attempt.agent.changed,
@@ -4404,24 +4413,26 @@ class Orchestrator:
                 report_error=report_error,
             )
         if succeeded:
-            await self.state.set_task(
-                chapter.id,
-                Stage.REVIEW,
-                TaskStatus.RUNNING,
-                "incomplete review report; session retry queued",
-            )
+            if not auxiliary_request:
+                await self.state.set_task(
+                    chapter.id,
+                    Stage.REVIEW,
+                    TaskStatus.RUNNING,
+                    "incomplete review report; session retry queued",
+                )
             return StageOutcome(
                 ExecutionDisposition.WAITING,
                 changed=attempt.agent.changed,
                 complete=False,
                 run_id=attempt.run.id,
             )
-        await self.state.set_task(
-            chapter.id,
-            Stage.REVIEW,
-            TaskStatus.FAILED,
-            "editing review failed",
-        )
+        if not auxiliary_request:
+            await self.state.set_task(
+                chapter.id,
+                Stage.REVIEW,
+                TaskStatus.FAILED,
+                "editing review failed",
+            )
         return StageOutcome(
             ExecutionDisposition.SUCCEEDED if succeeded else ExecutionDisposition.FAILED,
             changed=attempt.agent.changed,
@@ -4479,7 +4490,7 @@ class Orchestrator:
         raw_assessments = report.get("finding_assessments")
         assessments = (
             {
-                str(item.get("finding_id", "")): str(item.get("assessment", ""))
+                str(item.get("finding_id", "")): item
                 for item in raw_assessments
                 if isinstance(item, dict)
             }
@@ -4504,12 +4515,16 @@ class Orchestrator:
                 if placeholder is False:
                     status = ProofBlockerStatus.RESOLVED
                 else:
-                    assessment = assessments.get(f"{request_id}:{index}", "")
-                    if run.changed or assessment in {"rejected", "reframed"}:
-                        status = ProofBlockerStatus.OPEN
-                        blocker["retry_sighting_baseline"] = int(blocker.get("sightings", 0))
-                    else:
-                        status = ProofBlockerStatus.BLOCKED
+                    assessment = assessments.get(f"{request_id}:{index}", {})
+                    response = str(assessment.get("explanation", "")).strip()
+                    if response:
+                        responses = blocker.setdefault("review_responses", [])
+                        if isinstance(responses, list) and response not in responses:
+                            responses.append(response)
+                    exchanges = int(blocker.get("review_exchange_count", 0)) + 1
+                    blocker["review_exchange_count"] = exchanges
+                    status = ProofBlockerStatus.OPEN
+                    blocker["retry_sighting_baseline"] = int(blocker.get("sightings", 0))
                 await self.state.set_proof_blocker_status((blocker_id,), status)
 
     async def _invalidate_reviews(
@@ -4959,23 +4974,57 @@ class Orchestrator:
     ) -> StageOutcome:
         """Run at most five edit/rebuild cycles for one reviewable chapter."""
 
+        auxiliary_request = role == PROOF_REVIEW_ROLE
         review_generation = self._review_invalidation_generation(chapter.id)
-        if self.state.task(chapter.id, Stage.REVIEW).status == TaskStatus.SUCCEEDED:
+        if (
+            not auxiliary_request
+            and self.state.task(chapter.id, Stage.REVIEW).status == TaskStatus.SUCCEEDED
+        ):
             return StageOutcome(ExecutionDisposition.SUCCEEDED)
         request_ids = list(proof_request_ids)
         review_feedback = feedback
+
+        async def set_review_task(status: TaskStatus, detail: str) -> None:
+            if not auxiliary_request:
+                await self.state.set_task(chapter.id, Stage.REVIEW, status, detail)
+
+        async def complete_review(detail: str) -> bool:
+            if not auxiliary_request:
+                return await self._complete_review(
+                    chapter,
+                    detail,
+                    expected_generation=review_generation,
+                    proof_request_ids=request_ids,
+                )
+            async with self.state.batch():
+                await self._apply_proof_review_outcomes(chapter, request_ids)
+                await self.state.finish_proof_review_requests(chapter.id, request_ids)
+            return True
 
         async def route_feedback(items: dict[str, str], *, origin: str) -> bool:
             nonlocal request_ids, review_feedback, role
             if not items:
                 return True
-            request_id, _ = await self._queue_review_feedback(
-                items,
-                origin=origin,
-                exclude_from_invalidation={chapter.id},
+            routed_items = (
+                {owner_id: block for owner_id, block in items.items() if owner_id != chapter.id}
+                if auxiliary_request
+                else items
             )
+            request_id = ""
+            if routed_items:
+                request_id, _ = await self._queue_review_feedback(
+                    routed_items,
+                    origin=origin,
+                    exclude_from_invalidation={chapter.id},
+                )
             if chapter.id in items:
                 block = items[chapter.id]
+                if auxiliary_request:
+                    if block not in review_feedback:
+                        review_feedback = (
+                            f"{review_feedback}\n\n{block}" if review_feedback else block
+                        )
+                    return True
                 if role in DIAGNOSTIC_REVIEW_ROLES:
                     if request_id not in request_ids:
                         request_ids.append(request_id)
@@ -4991,12 +5040,7 @@ class Orchestrator:
                     review_feedback = block
                 role = self._proof_review_role(request_ids)
             if chapter.id in items:
-                await self.state.set_task(
-                    chapter.id,
-                    Stage.REVIEW,
-                    TaskStatus.RUNNING,
-                    "review follow-up queued",
-                )
+                await set_review_task(TaskStatus.RUNNING, "review follow-up queued")
             return True
 
         if verification_retry:
@@ -5008,11 +5052,8 @@ class Orchestrator:
                 ):
                     return StageOutcome(ExecutionDisposition.FAILED)
             else:
-                completed = await self._complete_review(
-                    chapter,
-                    "coordinator verification completed after stale snapshot",
-                    expected_generation=review_generation,
-                    proof_request_ids=request_ids,
+                completed = await complete_review(
+                    "coordinator verification completed after stale snapshot"
                 )
                 return StageOutcome(
                     ExecutionDisposition.SUCCEEDED if completed else ExecutionDisposition.WAITING
@@ -5042,9 +5083,7 @@ class Orchestrator:
         async def queue_report_retry(outcome: StageOutcome, error: str) -> bool:
             nonlocal resume_thread_id, resume_run_id, resume_prompt
             if rounds_used[chapter.id] >= maximum:
-                await self.state.set_task(
-                    chapter.id,
-                    Stage.REVIEW,
+                await set_review_task(
                     TaskStatus.FAILED,
                     f"{error}; review report retry cap reached after {maximum} cycles",
                 )
@@ -5061,9 +5100,7 @@ class Orchestrator:
                 resume_thread_id = run.thread_id
                 resume_run_id = run.id
                 resume_prompt = REVIEW_REPORT_RETRY_PROMPT.format(error=error)
-            await self.state.set_task(
-                chapter.id,
-                Stage.REVIEW,
+            await set_review_task(
                 TaskStatus.RUNNING,
                 (
                     "resuming review session after invalid report "
@@ -5141,9 +5178,7 @@ class Orchestrator:
                 coordinator_verified = not build_feedback
             if review_feedback:
                 if rounds_used[chapter.id] >= maximum:
-                    await self.state.set_task(
-                        chapter.id,
-                        Stage.REVIEW,
+                    await set_review_task(
                         TaskStatus.FAILED,
                         f"review follow-up remained unresolved after {maximum} cycles",
                     )
@@ -5167,9 +5202,7 @@ class Orchestrator:
                     if review_feedback:
                         if rounds_used[chapter.id] < maximum:
                             continue
-                        await self.state.set_task(
-                            chapter.id,
-                            Stage.REVIEW,
+                        await set_review_task(
                             TaskStatus.FAILED,
                             f"review follow-up remained unresolved after {maximum} cycles",
                         )
@@ -5193,40 +5226,25 @@ class Orchestrator:
                             "waiting for upstream coordinator diagnostic owners",
                         )
                         return StageOutcome(ExecutionDisposition.WAITING, requirements)
-                    await self.state.set_task(
-                        chapter.id,
-                        Stage.REVIEW,
+                    await set_review_task(
                         TaskStatus.FAILED,
                         "coordinator verification failed without actionable feedback",
                     )
                     return StageOutcome(ExecutionDisposition.FAILED)
                 coordinator_verified = True
             if finding_guided:
-                completed = await self._complete_review(
-                    chapter,
-                    "targeted review completed with no pending findings",
-                    expected_generation=review_generation,
-                    proof_request_ids=request_ids,
+                completed = await complete_review(
+                    "targeted review completed with no pending findings"
                 )
                 return StageOutcome(
                     ExecutionDisposition.SUCCEEDED if completed else ExecutionDisposition.WAITING
                 )
             if not source_changed:
-                completed = await self._complete_review(
-                    chapter,
-                    "editing review found no actionable issues",
-                    expected_generation=review_generation,
-                    proof_request_ids=request_ids,
-                )
+                completed = await complete_review("editing review found no actionable issues")
                 return StageOutcome(
                     ExecutionDisposition.SUCCEEDED if completed else ExecutionDisposition.WAITING
                 )
-        completed = await self._complete_review(
-            chapter,
-            f"review/rebuild cap reached after {maximum} cycles",
-            expected_generation=review_generation,
-            proof_request_ids=request_ids,
-        )
+        completed = await complete_review(f"review/rebuild cap reached after {maximum} cycles")
         return StageOutcome(
             ExecutionDisposition.SUCCEEDED if completed else ExecutionDisposition.WAITING
         )
@@ -5290,6 +5308,7 @@ class Orchestrator:
             )
         }
         proof_reviews = {chapter_id: 0 for chapter_id in by_id}
+        proof_review_rounds = {chapter_id: 0 for chapter_id in by_id}
         formalize_failures_applied = False
         formalize_failure_ids: set[str] = set()
 
@@ -5417,6 +5436,33 @@ class Orchestrator:
                                 )
 
                 review_frontiers_ready = self._dependency_frontiers_ready(graph, reviewed)
+                for chapter_id in graph.order:
+                    proof_feedback, proof_request_ids = self._proof_review_feedback(chapter_id)
+                    proof_review_role = self._proof_review_role(proof_request_ids)
+                    if (
+                        proof_review_role == PROOF_REVIEW_ROLE
+                        and chapter_id in reviewed
+                        and chapter_id not in review_tasks
+                        and chapter_id not in proof_tasks
+                        and chapter_id not in rebuild_tasks
+                        and formalize_ready(chapter_id)
+                    ):
+                        review_tasks[chapter_id] = RunningReview(
+                            task=asyncio.create_task(
+                                self._review_chapter_to_clean(
+                                    by_id[chapter_id],
+                                    proof_review_rounds,
+                                    rerun=True,
+                                    feedback=proof_feedback,
+                                    role=PROOF_REVIEW_ROLE,
+                                    proof_request_ids=proof_request_ids,
+                                )
+                            ),
+                            dependencies=graph.dependencies[chapter_id],
+                            proof_request_ids=proof_request_ids,
+                            auxiliary=True,
+                        )
+
                 for chapter_id in graph.order:
                     review_task = self.state.task(chapter_id, Stage.REVIEW)
                     # A forced pipeline run is not itself evidence that this node has
@@ -5557,6 +5603,33 @@ class Orchestrator:
                 for chapter_id in completed_reviews:
                     handle = review_tasks.pop(chapter_id)
                     outcome = handle.task.result()
+                    if handle.auxiliary:
+                        if outcome.waiting:
+                            proof_review_rounds[chapter_id] = 0
+                            continue
+                        proof_review_rounds[chapter_id] = 0
+                        if outcome.failed:
+                            blocker_ids = {
+                                str(blocker_id)
+                                for request_id in handle.proof_request_ids
+                                for request in (self.state.proof_review_requests.get(request_id),)
+                                if isinstance(request, dict)
+                                for blocker_id in request.get("blocker_ids", ())
+                            }
+                            await self.state.set_proof_blocker_status(
+                                blocker_ids, ProofBlockerStatus.BLOCKED
+                            )
+                            await self.state.finish_proof_review_requests(
+                                chapter_id, handle.proof_request_ids
+                            )
+                            await self.state.set_task(
+                                chapter_id,
+                                Stage.PROVE,
+                                TaskStatus.FAILED,
+                                "proof-review correspondence exhausted without a usable response",
+                            )
+                            proof_results[chapter_id] = False
+                        continue
                     if outcome.waiting:
                         rounds_used[chapter_id] = 0
                         continue
@@ -5623,7 +5696,10 @@ class Orchestrator:
                     if not isinstance(report, dict) or not report.get("failed_attempts"):
                         proof_results[chapter_id] = False
                         continue
-                    if proof_reviews[chapter_id] >= self.config.stages[Stage.REVIEW].max_rounds:
+                    if (
+                        proof_reviews[chapter_id]
+                        >= self.config.stages[Stage.PROVE].unchanged_retry_limit
+                    ):
                         proof_results[chapter_id] = False
                         await self.state.set_task(
                             chapter_id,
@@ -5636,7 +5712,7 @@ class Orchestrator:
 
                     chapter = by_id[chapter_id]
                     proof_run = primary_runs[-1]
-                    invalidated = await self._queue_proof_review(
+                    await self._queue_proof_review(
                         chapter,
                         report,
                         origin_run_id=proof_run.id,
@@ -5658,14 +5734,6 @@ class Orchestrator:
                             "waiting for proof-review findings to be resolved",
                         )
 
-                    cancelled: list[asyncio.Task[Any]] = []
-                    for invalidated_id in invalidated:
-                        if handle := review_tasks.pop(invalidated_id, None):
-                            handle.task.cancel()
-                            cancelled.append(handle.task)
-                        reviewed.discard(invalidated_id)
-                        rounds_used[invalidated_id] = 0
-                    await asyncio.gather(*cancelled, return_exceptions=True)
         finally:
             await cancel_all()
 
@@ -6367,6 +6435,15 @@ class Orchestrator:
                         request_id=ids[0] if ids else "",
                     )
                 elif self._blocker_needs_review(blocker):
+                    if (
+                        int(blocker.get("review_exchange_count", 0))
+                        >= self.config.stages[Stage.PROVE].unchanged_retry_limit
+                    ):
+                        await self.state.set_proof_blocker_status(
+                            (blocker_id,), ProofBlockerStatus.BLOCKED
+                        )
+                        terminal_blockers.append(blocker_id)
+                        continue
                     report = self._blocker_report(blocker)
                     await self._queue_proof_review(
                         chapter,

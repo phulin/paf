@@ -376,6 +376,7 @@ DOWNSTREAM_RETRY_ROLE = "downstream_retry"
 SHEPHERD_ROLE = "shepherd"
 REPAIR_WORKER_ROLE = "repair_worker"
 DIAGNOSTIC_REVIEW_ROLE = "diagnostic_review"
+PROOF_REVIEW_ROLE = "proof_review"
 WARNING_CLEANUP_ROLE = "warning_cleanup"
 # Compatibility name for callers written before warning cleanup became an
 # independent auxiliary workflow.
@@ -394,6 +395,8 @@ def report_schema_key(stage: Stage, *, role: str = "", feedback: str = "") -> st
         return WARNING_CLEANUP_ROLE
     if role == DIAGNOSTIC_REVIEW_ROLE:
         return DIAGNOSTIC_REVIEW_ROLE
+    if role == PROOF_REVIEW_ROLE:
+        return PROOF_REVIEW_ROLE
     if stage is Stage.REVIEW and feedback:
         return "proof_review"
     return stage.value
@@ -1400,7 +1403,9 @@ class CodexExecutor:
             prompt_path = WARNING_CLEANUP_PROMPT_PATH
         elif role == DIAGNOSTIC_REVIEW_ROLE:
             prompt_path = DIAGNOSTIC_REVIEW_PROMPT_PATH
-        elif role == UPSTREAM_REPAIR_ROLE or (stage is Stage.REVIEW and feedback):
+        elif role in {UPSTREAM_REPAIR_ROLE, PROOF_REVIEW_ROLE} or (
+            stage is Stage.REVIEW and feedback
+        ):
             prompt_path = PROOF_REVIEW_PROMPT_PATH
         else:
             prompt_path = self.config.stages[stage].prompt
