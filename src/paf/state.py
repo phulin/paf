@@ -523,6 +523,7 @@ class StateStore:
         self._payload_loaded_run_ids: set[str] = set()
         self._chapter_runs: dict[str, list[RunRecord]] = {}
         self._latest_runs_by_chapter: dict[str, RunRecord] = {}
+        self._latest_sorry_counts: dict[str, tuple[tuple[str, str], int]] = {}
         self._usage_cache: dict[tuple[bool, str | None], TokenUsage] = {}
         self._cost_cache: dict[tuple[bool, str | None], CostEstimate] = {}
         self._task_snapshot_context_key: tuple[int, ...] | None = None
@@ -1185,6 +1186,11 @@ class StateStore:
             "interface_current": interface_current,
             "dependencies_current": dependencies_current,
             "head_build_status": head_build_status,
+            "sorry_count": (
+                latest[1]
+                if (latest := self._latest_sorry_counts.get(task.chapter_id)) is not None
+                else None
+            ),
             "fully_certified": (
                 proof_complete
                 and interface_current
@@ -2765,6 +2771,17 @@ class StateStore:
         latest = self._latest_runs_by_chapter.get(run.chapter_id)
         if latest is None or (run.started_at, run.id) >= (latest.started_at, latest.id):
             self._latest_runs_by_chapter[run.chapter_id] = run
+        self._index_sorry_count(run)
+
+    def _index_sorry_count(self, run: RunRecord) -> None:
+        """Retain the newest source-wide placeholder count reported by an agent run."""
+
+        if run.placeholders is None:
+            return
+        key = (run.started_at, run.id)
+        latest = self._latest_sorry_counts.get(run.chapter_id)
+        if latest is None or key >= latest[0]:
+            self._latest_sorry_counts[run.chapter_id] = (key, run.placeholders)
 
     def chapter_runs(self, chapter_id: str) -> tuple[RunRecord, ...]:
         return tuple(self._chapter_runs.get(chapter_id, ()))
@@ -4144,6 +4161,8 @@ class StateStore:
         old_model = run.model
         for name, value in changes.items():
             setattr(run, name, value)
+        if "placeholders" in changes:
+            self._index_sorry_count(run)
         if "usage" in changes or "model" in changes:
             self._adjust_aggregate_caches(run, old_usage=old_usage, old_model=old_model)
         if "status" in changes:
@@ -4196,6 +4215,7 @@ class StateStore:
         run.finished_at = timestamp()
         for name, value in changes.items():
             setattr(run, name, value)
+        self._index_sorry_count(run)
         issue_ids = self._record_source_issues(run)
         if isinstance(run.report, dict) and "source_issues" in run.report:
             report = {key: value for key, value in run.report.items() if key != "source_issues"}

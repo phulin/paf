@@ -49,6 +49,8 @@ chapters.forEach(([book, chapter, title], chapterIndex) => {
             ? `queued for ${stage} agent`
             : "",
       rounds: status === "succeeded" ? 1 : 0,
+      head_build_status: chapterIndex < 2 ? "clean" : "pending",
+      sorry_count: Math.max(0, 4 - chapterIndex),
       updated_at: now,
       latest_run_id: status === "running" ? `demo-${chapterIndex}` : null,
     };

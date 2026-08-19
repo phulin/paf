@@ -470,7 +470,12 @@ fn draw_task_table(frame: &mut Frame<'_>, model: &DashboardModel, area: Rect) {
             .tasks
             .values()
             .any(|task| task.head_build_status == "clean");
-        cells.push(Cell::from(if fresh { "✓ fresh" } else { "○ stale" }));
+        let sorry_count = row.tasks.values().find_map(|task| task.sorry_count);
+        cells.push(Cell::from(format!(
+            "{} · {} sorry",
+            if fresh { "✓ fresh" } else { "○ stale" },
+            sorry_count.map_or_else(|| "?".into(), |count| count.to_string())
+        )));
         cells.push(Cell::from(current_activity(model, row, activity)));
         cells.push(Cell::from(row_spend(row)));
         Row::new(cells).height(1)
@@ -484,7 +489,7 @@ fn draw_task_table(frame: &mut Frame<'_>, model: &DashboardModel, area: Rect) {
         Constraint::Length(14),
         Constraint::Length(14),
         Constraint::Length(14),
-        Constraint::Length(9),
+        Constraint::Length(20),
         Constraint::Min(24),
         Constraint::Length(14),
     ];
@@ -1756,6 +1761,35 @@ mod tests {
         assert!(rendered.contains("coordinator finalize"));
         assert!(!rendered.contains("targeted"));
         assert!(!rendered.contains("◆ building"));
+    }
+
+    #[test]
+    fn build_freshness_renders_the_sorry_count() {
+        let mut model = DashboardModel::loading("proof stage".into(), String::new());
+        model.preparation = None;
+        model.state.work_units.push(WorkUnit {
+            id: "book/chapter-01".into(),
+            document_id: "book".into(),
+            title: "Opening".into(),
+            ordinal: 1,
+            ..WorkUnit::default()
+        });
+        model.state.tasks.insert(
+            "book/chapter-01:prove".into(),
+            Task {
+                work_unit_id: "book/chapter-01".into(),
+                stage: "prove".into(),
+                head_build_status: "clean".into(),
+                sorry_count: Some(3),
+                ..Task::default()
+            },
+        );
+
+        let backend = TestBackend::new(180, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut model)).unwrap();
+
+        assert!(terminal.backend().to_string().contains("✓ fresh · 3 sorry"));
     }
 
     #[test]

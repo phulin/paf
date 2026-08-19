@@ -81,46 +81,55 @@ export function TaskTable({
               {STAGES.map((stage) => (
                 <th key={stage}>{stage}</th>
               ))}
+              <th>Build</th>
               <th>Current agent activity</th>
               <th aria-label="Inspect" />
             </tr>
           </thead>
           <tbody>
-            {visible.slice(0, 22).map((row) => (
-              <tr
-                key={row.id}
-                className={selected?.id === row.id ? "selected" : ""}
-                onClick={() => setSelected(row)}
-              >
-                <td>
-                  <div className="chapter-cell">
-                    <span className="chapter-index">{chapterLabel(row)}</span>
-                    <div>
-                      <strong>{row.title}</strong>
+            {visible.slice(0, 22).map((row) => {
+              const tasks = Object.values(row.stages);
+              const fresh = tasks.some((task) => task?.head_build_status === "clean");
+              const sorryCount = tasks.find((task) => task?.sorry_count != null)?.sorry_count;
+              return (
+                <tr
+                  key={row.id}
+                  className={selected?.id === row.id ? "selected" : ""}
+                  onClick={() => setSelected(row)}
+                >
+                  <td>
+                    <div className="chapter-cell">
+                      <span className="chapter-index">{chapterLabel(row)}</span>
+                      <div>
+                        <strong>{row.title}</strong>
+                      </div>
                     </div>
-                  </div>
-                </td>
-                {STAGES.map((stage) => (
-                  <td key={stage}>
-                    <StatusPill
-                      status={row.stages[stage]?.status}
-                      rounds={row.stages[stage]?.rounds}
-                      queued={row.stages[stage]?.queued}
-                      schedulingStatus={row.stages[stage]?.scheduling_status}
-                      phase={row.stages[stage]?.phase}
-                      repairing={row.stages[stage]?.repairing}
-                      building={build.active && build.stage === stage && buildTargets.has(row.id)}
-                    />
                   </td>
-                ))}
-                <td>
-                  <ActivityCell activity={row.activity} task={row.latestTask} />
-                </td>
-                <td>
-                  <ChevronRight className="row-chevron" size={16} />
-                </td>
-              </tr>
-            ))}
+                  {STAGES.map((stage) => (
+                    <td key={stage}>
+                      <StatusPill
+                        status={row.stages[stage]?.status}
+                        rounds={row.stages[stage]?.rounds}
+                        queued={row.stages[stage]?.queued}
+                        schedulingStatus={row.stages[stage]?.scheduling_status}
+                        phase={row.stages[stage]?.phase}
+                        repairing={row.stages[stage]?.repairing}
+                        building={build.active && build.stage === stage && buildTargets.has(row.id)}
+                      />
+                    </td>
+                  ))}
+                  <td className="build-freshness">
+                    {fresh ? "✓ fresh" : "○ stale"} · {sorryCount ?? "?"} sorry
+                  </td>
+                  <td>
+                    <ActivityCell activity={row.activity} task={row.latestTask} />
+                  </td>
+                  <td>
+                    <ChevronRight className="row-chevron" size={16} />
+                  </td>
+                </tr>
+              );
+            })}
           </tbody>
         </table>
         {!visible.length && (

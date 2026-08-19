@@ -294,10 +294,13 @@ async def test_dashboard_projects_build_freshness_without_shipping_formalize_gra
         "edges": [],
         "dependencies": {chapter.id: []},
     }
+    run = await state.start_run(chapter.id, Stage.REVIEW)
+    await state.finish_run(run, status=TaskStatus.SUCCEEDED, placeholders=3)
 
     snapshot = state.dashboard_snapshot()
     assert "formalize_graph" not in snapshot
     assert snapshot["tasks"][state.key(chapter.id, Stage.REVIEW)]["head_build_status"] == "clean"
+    assert snapshot["tasks"][state.key(chapter.id, Stage.REVIEW)]["sorry_count"] == 3
 
     delta = state.dashboard_delta(
         ChangeSet(
@@ -308,6 +311,7 @@ async def test_dashboard_projects_build_freshness_without_shipping_formalize_gra
     )
     assert "formalize_graph" not in delta["globals"]
     assert delta["tasks"][state.key(chapter.id, Stage.REVIEW)]["head_build_status"] == "clean"
+    assert delta["tasks"][state.key(chapter.id, Stage.REVIEW)]["sorry_count"] == 3
     await state.close()
 
 

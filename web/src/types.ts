@@ -37,6 +37,7 @@ export interface Task {
   interface_current?: boolean;
   dependencies_current?: boolean;
   head_build_status?: "clean" | "pending" | "failed" | "unknown";
+  sorry_count?: number | null;
   fully_certified?: boolean;
 }
 
