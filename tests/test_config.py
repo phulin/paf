@@ -50,8 +50,8 @@ def test_discovers_chapters_and_renders_paths(tmp_path: Path) -> None:
     assert config.shepherd.model == "gpt-5.6-sol"
     assert config.shepherd.enabled is True
     assert config.shepherd.reasoning_effort == "medium"
-    assert config.shepherd.worker_model == "gpt-5.6-luna"
-    assert config.shepherd.worker_reasoning_effort == "xhigh"
+    assert config.shepherd.worker_model == "gpt-5.6-sol"
+    assert config.shepherd.worker_reasoning_effort == "medium"
 
 
 def test_loads_and_validates_discovery_concurrency(tmp_path: Path) -> None:

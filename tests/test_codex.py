@@ -604,7 +604,7 @@ def test_executor_uses_stage_specific_model_and_reasoning_effort(tmp_path: Path)
     assert 'model_reasoning_effort="high"' in command
 
 
-def test_shepherd_is_strong_read_only_and_repair_workers_use_luna_max(tmp_path: Path) -> None:
+def test_shepherd_planner_is_read_only_and_repair_workers_use_their_model(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
     executor = CodexExecutor(config, StateStore(config))
 
@@ -615,8 +615,28 @@ def test_shepherd_is_strong_read_only_and_repair_workers_use_luna_max(tmp_path: 
     assert shepherd[shepherd.index("--sandbox") + 1] == "read-only"
     assert shepherd[shepherd.index("--model") + 1] == "gpt-5.6-sol"
     assert 'model_reasoning_effort="medium"' in shepherd
-    assert repair[repair.index("--model") + 1] == "gpt-5.6-luna"
-    assert 'model_reasoning_effort="xhigh"' in repair
+    assert repair[repair.index("--model") + 1] == "gpt-5.6-sol"
+    assert 'model_reasoning_effort="medium"' in repair
+
+    customized = replace(
+        config,
+        shepherd=replace(
+            config.shepherd,
+            worker_model="repair-specialist",
+            worker_reasoning_effort="high",
+        ),
+    )
+    customized_executor = CodexExecutor(customized, StateStore(customized))
+    customized_shepherd = customized_executor.command(Stage.DISCOVER, role=SHEPHERD_ROLE)
+    customized_repair = customized_executor.command(
+        Stage.REVIEW,
+        role=REPAIR_WORKER_ROLE,
+        feedback="repair case",
+    )
+    assert customized_shepherd[customized_shepherd.index("--model") + 1] == "gpt-5.6-sol"
+    assert customized_repair[customized_repair.index("--model") + 1] == "repair-specialist"
+    assert 'model_reasoning_effort="high"' in customized_repair
+
     dossier = """{
   "repair_work_unit_id": "repair-1",
   "objective": "Fix declaration X from diagnostic Y",

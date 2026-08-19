@@ -101,16 +101,15 @@ class SwarmSettings:
 class ShepherdSettings:
     """Configuration for failure triage and repair work.
 
-    The Shepherd is enabled by default and uses a stronger planning model.
-    Projects may opt out explicitly; repair workers keep using the inexpensive
-    editing model and a high reasoning effort.
+    The Shepherd is enabled by default. Its read-only planner and scoped repair
+    workers have independently configurable model and reasoning settings.
     """
 
     enabled: bool = True
     model: str = "gpt-5.6-sol"
     reasoning_effort: str = "medium"
-    worker_model: str = "gpt-5.6-luna"
-    worker_reasoning_effort: str = "xhigh"
+    worker_model: str = "gpt-5.6-sol"
+    worker_reasoning_effort: str = "medium"
     interval_seconds: float = 1200.0
     failure_threshold: int = 10
     maximum_failures_per_sweep: int = 50

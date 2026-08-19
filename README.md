@@ -719,16 +719,17 @@ lean_mcp_tool_timeout_seconds = 300
 
 Failure repair is enabled by default. The Shepherd uses a strong read-only model to plan bounded,
 independent repair work units every 20 minutes or whenever 10 new terminal failures accumulate.
-Scoped editing remains on Luna/max workers; repairs receive an effort-based priority boost and
-compete directly for the ordinary global agent capacity:
+Scoped repair workers have their own model and reasoning settings, defaulting to Sol/medium.
+Repairs receive an effort-based priority boost and compete directly for the ordinary global agent
+capacity:
 
 ```toml
 [shepherd]
 enabled = true
 model = "gpt-5.6-sol"
 reasoning_effort = "medium"
-worker_model = "gpt-5.6-luna"
-worker_reasoning_effort = "max"
+worker_model = "gpt-5.6-sol"
+worker_reasoning_effort = "medium"
 interval_seconds = 1200
 failure_threshold = 10
 maximum_failures_per_sweep = 50
@@ -739,9 +740,9 @@ maximum_consecutive_no_progress_sweeps = 3
 Set `enabled = false` to opt out for a project.
 
 Repair is an auxiliary overlay, not a fifth stage. The Shepherd may target any existing
-discover/formalize/review/prove cell. While the Luna worker runs, the TUI and web matrix label that
-cell `repairing`; after its edits integrate, the underlying task returns to the normal stage queue
-for building and validation.
+discover/formalize/review/prove cell. While the repair worker runs, the TUI and web matrix label
+that cell `repairing`; after its edits integrate, the underlying task returns to the normal stage
+queue for building and validation.
 
 When Lean MCP is enabled, orchestrator startup bootstraps `lean_project` if it does not already
 contain both `lean-toolchain` and a Lake file. PAF pins the active Lean version, creates a matching
