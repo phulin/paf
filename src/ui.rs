@@ -619,12 +619,18 @@ fn draw_detail(frame: &mut Frame<'_>, model: &mut DashboardModel) {
         return;
     };
     let activity = model.selected_activity();
+    let update_height = if activity.is_some_and(|value| !value.latest_summary.is_empty()) {
+        (frame.area().height / 5).clamp(4, 10)
+    } else {
+        3
+    };
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
             Constraint::Length(3),
             Constraint::Length(5),
+            Constraint::Length(update_height),
             Constraint::Length(3),
             Constraint::Min(4),
             Constraint::Length(1),
@@ -706,6 +712,7 @@ fn draw_detail(frame: &mut Frame<'_>, model: &mut DashboardModel) {
             .block(Block::default().borders(Borders::ALL)),
         layout[2],
     );
+    draw_latest_update(frame, activity, layout[3]);
     let tab_titles = DetailTab::ALL.map(|tab| Line::from(tab.label()));
     let selected_tab = DetailTab::ALL
         .iter()
@@ -717,10 +724,10 @@ fn draw_detail(frame: &mut Frame<'_>, model: &mut DashboardModel) {
             .highlight_style(Style::default().fg(CYAN).add_modifier(Modifier::BOLD))
             .divider(" │ ")
             .block(Block::default().borders(Borders::BOTTOM)),
-        layout[3],
+        layout[4],
     );
     if model.detail_tab == DetailTab::Timeline {
-        draw_timeline_content(frame, model, layout[4]);
+        draw_timeline_content(frame, model, layout[5]);
     } else {
         let text = detail_text(
             model.detail_tab,
@@ -728,7 +735,7 @@ fn draw_detail(frame: &mut Frame<'_>, model: &mut DashboardModel) {
             model.selected_prompt(),
             model.selected_timeline_status(),
         );
-        draw_detail_content(frame, model, text, layout[4]);
+        draw_detail_content(frame, model, text, layout[5]);
     }
     frame.render_widget(
         Paragraph::new(
@@ -736,7 +743,29 @@ fn draw_detail(frame: &mut Frame<'_>, model: &mut DashboardModel) {
         )
         .style(Style::default().fg(MUTED))
         .alignment(Alignment::Center),
-        layout[5],
+        layout[6],
+    );
+}
+
+fn draw_latest_update(frame: &mut Frame<'_>, activity: Option<&Activity>, area: Rect) {
+    let lines = activity
+        .filter(|value| !value.latest_summary.is_empty())
+        .map_or_else(
+            || {
+                vec![Line::styled(
+                    "No agent update yet.",
+                    Style::default().fg(MUTED),
+                )]
+            },
+            |value| format_agent_update(&value.latest_summary),
+        );
+    frame.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Latest agent update "),
+        ),
+        area,
     );
 }
 
@@ -998,12 +1027,7 @@ fn detail_text(
                 "LATEST AGENT UPDATE",
                 Style::default().fg(CYAN).add_modifier(Modifier::BOLD),
             )];
-            lines.extend(
-                activity
-                    .latest_summary
-                    .lines()
-                    .map(|line| Line::from(line.to_owned())),
-            );
+            lines.extend(format_agent_update(&activity.latest_summary));
             if !activity.latest_error.is_empty() {
                 lines.push(Line::from(""));
                 lines.push(Line::styled("LATEST ERROR", Style::default().fg(RED)));
@@ -1061,15 +1085,171 @@ fn timeline_entry_lines(entries: &[crate::model::ActivityEntry]) -> Vec<Line<'st
                 ),
                 Span::raw(format!(" {}", entry.title)),
             ])];
-            lines.extend(
+            let detail_lines = if entry.kind == "message" {
+                format_agent_update(&entry.detail)
+            } else {
                 entry
                     .detail
                     .lines()
-                    .map(|detail| Line::from(format!("    {detail}"))),
-            );
+                    .map(|detail| Line::from(detail.to_owned()))
+                    .collect()
+            };
+            lines.extend(detail_lines.into_iter().map(|mut line| {
+                line.spans.insert(0, Span::raw("    "));
+                line
+            }));
             lines
         })
         .collect()
+}
+
+fn format_agent_update(raw: &str) -> Vec<Line<'static>> {
+    let Ok(serde_json::Value::Object(object)) = serde_json::from_str(raw) else {
+        return raw
+            .lines()
+            .map(|line| Line::from(line.to_owned()))
+            .collect();
+    };
+    let mut lines = Vec::new();
+
+    if let Some(summary) = object.get("summary").and_then(serde_json::Value::as_str) {
+        push_labeled_text(&mut lines, "Summary", summary, CYAN);
+    }
+    if let Some(complete) = object.get("complete").and_then(serde_json::Value::as_bool) {
+        lines.push(Line::from(vec![
+            Span::styled("Status: ", Style::default().fg(MUTED)),
+            Span::styled(
+                if complete { "complete" } else { "in progress" },
+                Style::default()
+                    .fg(if complete { GREEN } else { YELLOW })
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
+    }
+    if let Some(changed) = object.get("changed").and_then(serde_json::Value::as_bool) {
+        lines.push(Line::from(vec![
+            Span::styled("Changes: ", Style::default().fg(MUTED)),
+            Span::raw(if changed { "made" } else { "none" }),
+        ]));
+    }
+    if let Some(issues) = object.get("issues") {
+        push_json_collection(&mut lines, "Issues", issues);
+    }
+    if let Some(source_issues) = object.get("source_issues") {
+        push_json_collection(&mut lines, "Source issues", source_issues);
+    }
+
+    for (key, value) in &object {
+        if matches!(
+            key.as_str(),
+            "summary" | "complete" | "changed" | "issues" | "source_issues"
+        ) {
+            continue;
+        }
+        push_json_value(&mut lines, &json_label(key), value, 0);
+    }
+
+    if lines.is_empty() {
+        vec![Line::from("No details reported.")]
+    } else {
+        lines
+    }
+}
+
+fn push_json_collection(lines: &mut Vec<Line<'static>>, label: &str, value: &serde_json::Value) {
+    match value {
+        serde_json::Value::Array(items) if items.is_empty() => {}
+        serde_json::Value::Array(items) => {
+            lines.push(Line::styled(
+                format!("{label}:"),
+                Style::default().fg(PURPLE).add_modifier(Modifier::BOLD),
+            ));
+            for item in items {
+                match item {
+                    serde_json::Value::String(text) => {
+                        lines.push(Line::from(format!("• {text}")));
+                    }
+                    serde_json::Value::Object(fields) => {
+                        let heading = fields
+                            .get("location")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("detail");
+                        lines.push(Line::styled(
+                            format!("• {heading}"),
+                            Style::default().fg(YELLOW).add_modifier(Modifier::BOLD),
+                        ));
+                        for (key, child) in fields {
+                            if key != "location" {
+                                push_json_value(lines, &json_label(key), child, 2);
+                            }
+                        }
+                    }
+                    other => push_json_value(lines, "•", other, 0),
+                }
+            }
+        }
+        other => push_json_value(lines, label, other, 0),
+    }
+}
+
+fn push_json_value(
+    lines: &mut Vec<Line<'static>>,
+    label: &str,
+    value: &serde_json::Value,
+    indent: usize,
+) {
+    let prefix = " ".repeat(indent);
+    match value {
+        serde_json::Value::String(text) => {
+            push_labeled_text(lines, &format!("{prefix}{label}"), text, MUTED);
+        }
+        serde_json::Value::Bool(value) => lines.push(Line::from(vec![
+            Span::styled(format!("{prefix}{label}: "), Style::default().fg(MUTED)),
+            Span::raw(if *value { "yes" } else { "no" }),
+        ])),
+        serde_json::Value::Number(value) => lines.push(Line::from(vec![
+            Span::styled(format!("{prefix}{label}: "), Style::default().fg(MUTED)),
+            Span::raw(value.to_string()),
+        ])),
+        serde_json::Value::Null => lines.push(Line::from(vec![
+            Span::styled(format!("{prefix}{label}: "), Style::default().fg(MUTED)),
+            Span::raw("—"),
+        ])),
+        serde_json::Value::Array(_) => {
+            push_json_collection(lines, &format!("{prefix}{label}"), value)
+        }
+        serde_json::Value::Object(fields) => {
+            lines.push(Line::styled(
+                format!("{prefix}{label}:"),
+                Style::default().fg(MUTED),
+            ));
+            for (key, child) in fields {
+                push_json_value(lines, &json_label(key), child, indent + 2);
+            }
+        }
+    }
+}
+
+fn push_labeled_text(lines: &mut Vec<Line<'static>>, label: &str, text: &str, color: Color) {
+    let mut parts = text.lines();
+    let first = parts.next().unwrap_or_default();
+    lines.push(Line::from(vec![
+        Span::styled(
+            format!("{label}: "),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(first.to_owned()),
+    ]));
+    lines.extend(parts.map(|part| Line::from(format!("  {part}"))));
+}
+
+fn json_label(key: &str) -> String {
+    let label = key.replace(['_', '-'], " ");
+    let mut characters = label.chars();
+    match characters.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + characters.as_str(),
+        None => label,
+    }
 }
 
 fn latest_task<'a>(tasks: &'a HashMap<&str, &'a Task>) -> Option<&'a Task> {
@@ -1339,7 +1519,11 @@ mod tests {
                     }},
                     "activities": {"run-1": {
                         "run_id": "run-1", "current": "editing theorem", "updated_at": "2026-08-16T00:00:00+00:00",
-                        "recent": [{"sequence": 1, "at": "2026-08-16T00:00:00+00:00", "kind": "file_change", "status": "completed", "title": "success"}]
+                        "latest_summary": "{\"complete\":false,\"changed\":true,\"summary\":\"The theorem now has a proof.\",\"issues\":[\"One follow-up remains.\"],\"source_issues\":[]}",
+                        "recent": [
+                            {"sequence": 1, "at": "2026-08-16T00:00:00+00:00", "kind": "file_change", "status": "completed", "title": "success"},
+                            {"sequence": 2, "at": "2026-08-16T00:00:01+00:00", "kind": "message", "status": "completed", "title": "agent update", "detail": "{\"complete\":false,\"changed\":true,\"summary\":\"The theorem now has a proof.\",\"issues\":[\"One follow-up remains.\"],\"source_issues\":[]}"}
+                        ]
                     }}
                 })),
                 delta: None,
@@ -1360,8 +1544,37 @@ mod tests {
         terminal.draw(|frame| draw(frame, &mut model)).unwrap();
         let detail = terminal.backend().to_string();
         assert!(detail.contains("Agent detail"));
+        assert!(detail.contains("Latest agent update"));
+        assert!(detail.contains("Summary: The theorem now has a proof."));
+        assert!(detail.contains("Status: in progress"));
+        assert!(detail.contains("Issues:"));
+        assert!(detail.contains("One follow-up remains."));
+        assert!(!detail.contains("{\"complete\""));
         assert!(detail.contains("[edit] success"));
+        assert!(detail.contains("[msg] agent update"));
         assert!(detail.contains("reload TUI"));
+    }
+
+    #[test]
+    fn formats_structured_agent_updates_and_preserves_plain_text() {
+        let structured = format_agent_update(
+            r#"{"complete":true,"summary":"Finished the proof.","source_issues":[{"location":"book.tex:12","description":"Direction is reversed.","suggested_correction":"Reverse the arrow."}],"extra_context":{"attempt":2}}"#,
+        );
+        let rendered = plain_tabs(&structured).join("\n");
+
+        assert!(rendered.contains("Summary: Finished the proof."));
+        assert!(rendered.contains("Status: complete"));
+        assert!(rendered.contains("Source issues:"));
+        assert!(rendered.contains("• book.tex:12"));
+        assert!(rendered.contains("Description: Direction is reversed."));
+        assert!(rendered.contains("Suggested correction: Reverse the arrow."));
+        assert!(rendered.contains("Extra context:"));
+        assert!(rendered.contains("Attempt: 2"));
+
+        assert_eq!(
+            plain_tabs(&format_agent_update("First line\nSecond line")),
+            ["First line", "Second line"]
+        );
     }
 
     #[test]
@@ -1582,6 +1795,7 @@ mod tests {
             "run-1".into(),
             Activity {
                 run_id: "run-1".into(),
+                latest_summary: r#"{"complete":false,"summary":"Still working."}"#.into(),
                 recent: (0..20)
                     .map(|sequence| ActivityEntry {
                         sequence,
