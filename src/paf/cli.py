@@ -624,26 +624,6 @@ def _print_failure_summary(
     graph_failed = [task for task in failed if task.detail == graph_failure]
     if graph_failed:
         failed = [task for task in failed if task.detail != graph_failure]
-    waiting = [
-        task
-        for task in state.tasks.values()
-        if selected(task) and task.status in {TaskStatus.PENDING, TaskStatus.BLOCKED}
-    ]
-    failure_roots = state._failure_roots_subset(
-        state.key(task.chapter_id, Stage(task.stage)) for task in waiting
-    )
-    blocked = sorted(
-        (
-            task
-            for task in state.tasks.values()
-            if selected(task)
-            and (
-                task.status == TaskStatus.BLOCKED
-                or failure_roots.get(state.key(task.chapter_id, Stage(task.stage)), ())
-            )
-        ),
-        key=lambda task: (task.book_id, task.chapter_number, task.stage),
-    )
     interrupted = sorted(
         (
             task
@@ -680,15 +660,6 @@ def _print_failure_summary(
         for line in build.output_tail[-12:]:
             console.print(f"    {line}", markup=False)
 
-    if blocked:
-        console.print(f"Blocked dependents ({len(blocked)})", style="bold yellow")
-        for task in blocked:
-            roots = failure_roots.get(state.key(task.chapter_id, Stage(task.stage)), ())
-            console.print(
-                f"- {task.chapter_id} [{task.stage}]: "
-                + (f"waiting on {', '.join(roots)}" if roots else task.detail),
-                markup=False,
-            )
     if interrupted:
         console.print(f"Interrupted tasks ({len(interrupted)})", style="bold yellow")
         for task in interrupted:
