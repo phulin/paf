@@ -2935,6 +2935,31 @@ def test_failed_batch_diagnostics_are_partitioned_by_target_closure(tmp_path: Pa
     assert partitioned[consumer.id].blocked_by == (owner.id,)
 
 
+def test_upstream_warning_does_not_fail_dependent_build(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    owner, consumer = config.chapters
+    orchestrator = Orchestrator(config, StateStore(config))
+    graph = WorkUnitImportGraph(
+        dependencies={owner.id: frozenset(), consumer.id: frozenset({owner.id})},
+        successors={owner.id: frozenset({consumer.id}), consumer.id: frozenset()},
+        order=(owner.id, consumer.id),
+        edges=((owner.id, consumer.id),),
+    )
+    result = ValidationResult(
+        False,
+        1,
+        "warning: Book/Chapter01/Section.lean:3:2: unused variable `h`",
+        process_exit_code=0,
+    )
+
+    partitioned = orchestrator._partition_build_diagnostics(result, (owner.id, consumer.id), graph)
+
+    assert partitioned[owner.id].status is ValidationStatus.TARGET_WARNINGS
+    assert partitioned[owner.id].warnings_only
+    assert partitioned[consumer.id].status is ValidationStatus.CLEAN
+    assert partitioned[consumer.id].succeeded
+
+
 @pytest.mark.asyncio
 async def test_formalizer_blocks_on_upstream_diagnostics_without_running_consumer_agent(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch

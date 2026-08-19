@@ -3238,13 +3238,31 @@ class Orchestrator:
             ]
             if relevant:
                 output = "\n\n".join(diagnostic.text for diagnostic, _owners in relevant)
-                relevant_owners = set().union(*(owners for _diagnostic, owners in relevant))
-                blocked_by = tuple(sorted(relevant_owners - {target_id}))
-                status = (
-                    ValidationStatus.TARGET_FAILED
-                    if target_id in relevant_owners
-                    else ValidationStatus.UPSTREAM_FAILED
-                )
+                errors = [item for item in relevant if item[0].severity == "error"]
+                warnings = [item for item in relevant if item[0].severity == "warning"]
+                error_owners = set().union(*(owners for _diagnostic, owners in errors), set())
+                warning_owners = set().union(*(owners for _diagnostic, owners in warnings), set())
+                blocked_by = tuple(sorted(error_owners - {target_id}))
+                if target_id in error_owners:
+                    status = ValidationStatus.TARGET_FAILED
+                elif blocked_by:
+                    status = ValidationStatus.UPSTREAM_FAILED
+                elif target_id in warning_owners:
+                    status = ValidationStatus.TARGET_WARNINGS
+                elif result.compiler_succeeded:
+                    # Warnings are cleanup obligations of the source that emitted
+                    # them. A consumer can use the successfully compiled artifact.
+                    partitioned[target_id] = ValidationResult(
+                        True,
+                        0,
+                        "Lake build succeeded; warnings belong to upstream dependencies.",
+                        process_exit_code=0,
+                        status=ValidationStatus.CLEAN,
+                    )
+                    continue
+                else:
+                    status = ValidationStatus.UPSTREAM_FAILED
+                    blocked_by = tuple(sorted(warning_owners - {target_id}))
                 output += (
                     f"\n\nCoordinator found {len(relevant)} Lean diagnostic(s) relevant "
                     f"to {target_id}."

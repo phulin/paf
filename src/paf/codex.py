@@ -493,6 +493,7 @@ def lean_mcp_path() -> str:
 
 class ValidationStatus(StrEnum):
     CLEAN = "clean"
+    TARGET_WARNINGS = "target_warnings"
     DEFERRED = "deferred"
     TARGET_FAILED = "target_failed"
     UPSTREAM_FAILED = "upstream_failed"
@@ -525,6 +526,12 @@ class ValidationResult:
     def compiler_succeeded(self) -> bool:
         code = self.exit_code if self.process_exit_code is None else self.process_exit_code
         return code == 0 and not self.timed_out
+
+    @property
+    def warnings_only(self) -> bool:
+        """Whether Lean produced usable artifacts rejected only by warning policy."""
+
+        return self.status is ValidationStatus.TARGET_WARNINGS and self.compiler_succeeded
 
     def as_dict(self) -> dict[str, Any]:
         return {
