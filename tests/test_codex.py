@@ -612,15 +612,15 @@ def test_shepherd_is_strong_read_only_and_repair_workers_use_luna_max(tmp_path: 
         role=REPAIR_WORKER_ROLE,
         feedback=dossier,
     )
-    assert prompt.startswith("# Shepherd repair agent")
+    assert prompt.startswith("# Shepherd repair worker")
     assert "## Repair instruction\n\nFix declaration X from diagnostic Y" in prompt
-    assert prompt.index("## Repair instruction") < prompt.index(
-        "## Original prompt for the `review` stage"
-    )
-    assert prompt.index("## Original prompt for the `review` stage") < prompt.index(
-        "# Review proof blockers"
-    )
+    assert "Original prompt" not in prompt
+    assert "# Review proof blockers" not in prompt
+    assert "## Rules shared by all Lean stages" in prompt
+    assert "That instruction is the complete assignment" in prompt
     assert "bounded Shepherd repair work unit" in prompt
+    assert "replaces the ordinary review stage mission" in prompt
+    assert "Follow the review workflow above" not in prompt
     assert "Shepherd repair dossier" in prompt
     assert prompt.rstrip().endswith(f"```text\n{dossier}\n```")
 

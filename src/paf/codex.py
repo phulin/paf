@@ -353,6 +353,7 @@ COMMON_PROMPT_PATH = Path(str(_PROMPT_RESOURCES.joinpath("common.md")))
 PROOF_REVIEW_PROMPT_PATH = Path(str(_PROMPT_RESOURCES.joinpath("proof_review.md")))
 DIAGNOSTIC_REVIEW_PROMPT_PATH = Path(str(_PROMPT_RESOURCES.joinpath("diagnostic_review.md")))
 SHEPHERD_PROMPT_PATH = Path(str(_PROMPT_RESOURCES.joinpath("shepherd.md")))
+REPAIR_WORKER_PROMPT_PATH = Path(str(_PROMPT_RESOURCES.joinpath("repair_worker.md")))
 UPSTREAM_REPAIR_ROLE = "upstream_repair"
 DOWNSTREAM_RETRY_ROLE = "downstream_retry"
 SHEPHERD_ROLE = "shepherd"
@@ -1363,7 +1364,9 @@ class CodexExecutor:
         upstream_requests: Iterable[dict[str, Any]] = (),
         proof_targets: Iterable[ProofTarget | dict[str, Any]] = (),
     ) -> str:
-        if role in DIAGNOSTIC_REVIEW_ROLES:
+        if role == REPAIR_WORKER_ROLE:
+            prompt_path = REPAIR_WORKER_PROMPT_PATH
+        elif role in DIAGNOSTIC_REVIEW_ROLES:
             prompt_path = DIAGNOSTIC_REVIEW_PROMPT_PATH
         elif role == UPSTREAM_REPAIR_ROLE or (stage is Stage.REVIEW and feedback):
             prompt_path = PROOF_REVIEW_PROMPT_PATH
@@ -1381,7 +1384,6 @@ class CodexExecutor:
                 "non-`sorry` warnings."
             )
             template = template.replace("{diagnostic_trigger}", diagnostic_trigger)
-        base = render_prompt(template, chapter)
         if role == REPAIR_WORKER_ROLE:
             instruction = feedback
             try:
@@ -1395,22 +1397,12 @@ class CodexExecutor:
             instruction = instruction.strip() or (
                 f"Diagnose and repair the reported {stage.value} stage failure."
             )
-            base = f"""# Shepherd repair agent
-
-You are a repair agent assigned to fix a failed `{stage.value}` stage. The repair instruction is
-the immediate task. The original prompt for the stage appears below it and remains the contract for
-how to perform and report the work.
-
-## Repair instruction
-
-{instruction}
-
-## Original prompt for the `{stage.value}` stage
-
-{base}"""
+            base = render_prompt(template.replace("{repair_instruction}", instruction), chapter)
+        else:
+            base = render_prompt(template, chapter)
         common = (
             ""
-            if stage in (Stage.DISCOVER, Stage.PROVE)
+            if role != REPAIR_WORKER_ROLE and stage in (Stage.DISCOVER, Stage.PROVE)
             else render_prompt(COMMON_PROMPT_PATH.read_text(encoding="utf-8"), chapter)
         )
         scope = "\n".join(f"- `{item}`" for item in chapter.scope)
@@ -1437,7 +1429,11 @@ meaningfully different one. Resolve supplied current diagnostics and do not rest
 blocker evidence."""
         selected_proof_targets = tuple(proof_targets)
         proof_assignment = ""
-        if stage is Stage.PROVE and selected_proof_targets and role != UPSTREAM_REPAIR_ROLE:
+        if (
+            stage is Stage.PROVE
+            and selected_proof_targets
+            and role not in {UPSTREAM_REPAIR_ROLE, REPAIR_WORKER_ROLE}
+        ):
             rendered_targets: list[str] = []
             assigned_placeholders = 0
             for target in selected_proof_targets:
@@ -1556,8 +1552,10 @@ fully prove every new declaration. PAF will merge and build the changes before r
         elif role == REPAIR_WORKER_ROLE:
             stage_contract = f"""This is a bounded Shepherd repair work unit targeting the existing
 {stage.value} stage. Diagnose and fix the concrete blocker in the attached repair dossier. Keep the
-change as small as possible, do not broaden into unrelated cleanup, and satisfy the ordinary
-{stage.value} stage contract. PAF will independently validate and integrate the result."""
+change as small as possible and do not broaden into unrelated cleanup. The custom repair instruction
+replaces the ordinary {stage.value} stage mission; the target stage still determines filesystem,
+tool, report-schema, and validation constraints. PAF will independently validate and integrate the
+result."""
         validation_contract = {
             Stage.DISCOVER: "PAF validates and saves the reported source dependencies.",
             Stage.FORMALIZE: "PAF independently checks the allowed file changes, placeholders, "
@@ -1600,15 +1598,20 @@ isolation trees. Keep command output below roughly 12 KiB. {stage_contract}
                 else "dependency preparation, whole-file diagnostics, goals, hover, declaration "
                 "lookup, code actions, completions, tactic trials, and local search"
             )
-            mcp_workflow = {
-                Stage.FORMALIZE: """Using a Lean tool opens and synchronizes the file it targets.
-Follow the formalization workflow above for when and where to request diagnostics.""",
-                Stage.REVIEW: """Using a Lean tool opens and synchronizes the file it targets.
+            mcp_workflow = (
+                """Using a Lean tool opens and synchronizes the file it targets. Use focused
+diagnostics and other attached tools as needed to validate the custom repair instruction."""
+                if role == REPAIR_WORKER_ROLE
+                else {
+                    Stage.FORMALIZE: """Using a Lean tool opens and synchronizes the file it
+targets. Follow the formalization workflow above for when and where to request diagnostics.""",
+                    Stage.REVIEW: """Using a Lean tool opens and synchronizes the file it targets.
 Follow the review workflow above for when and where to request diagnostics.""",
-                Stage.PROVE: """Using a Lean tool opens and synchronizes the file it targets. Do not
-request diagnostics merely because you switched files. After editing, use goals and fresh
+                    Stage.PROVE: """Using a Lean tool opens and synchronizes the file it targets.
+Do not request diagnostics merely because you switched files. After editing, use goals and fresh
 diagnostics as needed to show that the assigned span has no errors or warnings.""",
-            }[stage]
+                }[stage]
+            )
             contract += f"""
 
 ### Attached Lean tools (MCP)
