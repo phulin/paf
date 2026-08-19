@@ -2990,6 +2990,71 @@ def test_upstream_warning_does_not_fail_dependent_build(tmp_path: Path) -> None:
     assert partitioned[consumer.id].succeeded
 
 
+def test_warning_does_not_become_upstream_failure_when_batch_process_fails(
+    tmp_path: Path,
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    owner, consumer = config.chapters
+    orchestrator = Orchestrator(config, StateStore(config))
+    graph = WorkUnitImportGraph(
+        dependencies={owner.id: frozenset(), consumer.id: frozenset({owner.id})},
+        successors={owner.id: frozenset({consumer.id}), consumer.id: frozenset()},
+        order=(owner.id, consumer.id),
+        edges=((owner.id, consumer.id),),
+    )
+    result = ValidationResult(
+        False,
+        1,
+        "warning: Book/Chapter01/Section.lean:3:2: unused variable `h`",
+        process_exit_code=1,
+    )
+
+    partitioned = orchestrator._partition_build_diagnostics(result, (owner.id, consumer.id), graph)
+
+    assert partitioned[owner.id].status is ValidationStatus.TARGET_WARNINGS
+    assert not partitioned[owner.id].warnings_only
+    assert partitioned[consumer.id].status is ValidationStatus.UNATTRIBUTED_BUILD_FAILURE
+    assert partitioned[consumer.id].blocked_by == ()
+
+
+def test_cached_broken_result_is_relabelled_for_each_consumer(tmp_path: Path) -> None:
+    project = write_project(tmp_path, chapters="chapters = [1, 2, 3]")
+    with (tmp_path / "books" / "book.md").open("a", encoding="utf-8") as source:
+        source.write("\n## 3. Third chapter\n")
+    config = load_config(project)
+    owner, first_consumer, second_consumer = config.chapters
+    orchestrator = Orchestrator(config, StateStore(config))
+    graph = WorkUnitImportGraph(
+        dependencies={
+            owner.id: frozenset(),
+            first_consumer.id: frozenset({owner.id}),
+            second_consumer.id: frozenset({first_consumer.id}),
+        },
+        successors={
+            owner.id: frozenset({first_consumer.id}),
+            first_consumer.id: frozenset({second_consumer.id}),
+            second_consumer.id: frozenset(),
+        },
+        order=(owner.id, first_consumer.id, second_consumer.id),
+        edges=((owner.id, first_consumer.id), (first_consumer.id, second_consumer.id)),
+    )
+    diagnostic = "error: Book/Chapter01/Section.lean:3:2: rejected declaration"
+    first_result = ValidationResult(
+        False,
+        1,
+        f"{diagnostic}\n\nCoordinator found 1 Lean diagnostic(s) relevant to {first_consumer.id}.",
+        process_exit_code=1,
+        status=ValidationStatus.UPSTREAM_FAILED,
+        blocked_by=(owner.id,),
+    )
+
+    orchestrator._remember_broken_builds({first_consumer.id: first_result}, graph)
+    cached = orchestrator._cached_broken_results((second_consumer.id,), graph)[second_consumer.id]
+
+    assert f"relevant to {second_consumer.id}." in cached.output
+    assert f"relevant to {first_consumer.id}." not in cached.output
+
+
 @pytest.mark.asyncio
 async def test_formalize_warning_publishes_artifact_and_queues_auxiliary_cleanup(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch

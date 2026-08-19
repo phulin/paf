@@ -269,6 +269,9 @@ class LeanDiagnostic:
 
 LEAN_DIAGNOSTIC_RE = re.compile(r"^(?P<severity>error|warning):[ \t]*(?P<message>.*)$")
 LEAN_LOCATION_RE = re.compile(r"^(?P<path>.+?\.lean):(?P<line>\d+):(?P<column>\d+):(?:[ \t]|$)")
+COORDINATOR_DIAGNOSTIC_SUMMARY_RE = re.compile(
+    r"(?:\n\nCoordinator found \d+ Lean diagnostic\(s\) relevant to [^\n]+\.)+\s*$"
+)
 LAKE_CONTROL_PREFIXES = (
     "⚠ ",
     "✖ ",
@@ -357,6 +360,18 @@ def _lean_diagnostics(output: str) -> tuple[LeanDiagnostic, ...]:
     for diagnostic in diagnostics:
         unique.setdefault(diagnostic.header, diagnostic)
     return tuple(unique.values())
+
+
+def _diagnostic_output_for_target(diagnostics: Iterable[LeanDiagnostic], target_id: str) -> str:
+    """Render diagnostics with provenance for the target receiving the result."""
+
+    selected = tuple(diagnostics)
+    output = "\n\n".join(
+        COORDINATOR_DIAGNOSTIC_SUMMARY_RE.sub("", diagnostic.text).rstrip()
+        for diagnostic in selected
+    )
+    output += f"\n\nCoordinator found {len(selected)} Lean diagnostic(s) relevant to {target_id}."
+    return output[-20_000:]
 
 
 def _deterministic_warning_diagnostics(
@@ -3343,7 +3358,6 @@ class Orchestrator:
                 (diagnostic, owners & closure) for diagnostic, owners in owned if closure & owners
             ]
             if relevant:
-                output = "\n\n".join(diagnostic.text for diagnostic, _owners in relevant)
                 errors = [item for item in relevant if item[0].severity == "error"]
                 warnings = [item for item in relevant if item[0].severity == "warning"]
                 error_owners = set().union(*(owners for _diagnostic, owners in errors), set())
@@ -3367,11 +3381,22 @@ class Orchestrator:
                     )
                     continue
                 else:
-                    status = ValidationStatus.UPSTREAM_FAILED
-                    blocked_by = tuple(sorted(warning_owners - {target_id}))
-                output += (
-                    f"\n\nCoordinator found {len(relevant)} Lean diagnostic(s) relevant "
-                    f"to {target_id}."
+                    # The combined process failed, but this target's closure contains
+                    # warnings only.  The actual error belongs to another batch target,
+                    # and the process may have stopped before reaching this one.  Retry
+                    # it separately instead of promoting an upstream warning to a build
+                    # failure and reopening an already successful owner.
+                    partitioned[target_id] = ValidationResult(
+                        False,
+                        result.exit_code,
+                        result.output[-20_000:],
+                        timed_out=result.timed_out,
+                        process_exit_code=result.process_exit_code,
+                        status=ValidationStatus.UNATTRIBUTED_BUILD_FAILURE,
+                    )
+                    continue
+                output = _diagnostic_output_for_target(
+                    (diagnostic for diagnostic, _owners in relevant), target_id
                 )
                 partitioned[target_id] = ValidationResult(
                     False,
@@ -3422,10 +3447,15 @@ class Orchestrator:
                 if owner_id not in self._work_units_by_id:
                     continue
                 required = self._dependency_closure(graph, (owner_id,))
+                diagnostics = _lean_diagnostics(result.output)
                 owner_result = ValidationResult(
                     False,
                     result.exit_code,
-                    result.output,
+                    (
+                        _diagnostic_output_for_target(diagnostics, owner_id)
+                        if diagnostics
+                        else result.output
+                    ),
                     timed_out=result.timed_out,
                     process_exit_code=result.process_exit_code,
                     status=ValidationStatus.TARGET_FAILED,
@@ -3452,8 +3482,14 @@ class Orchestrator:
             blocked = self._successor_closure(graph, (owner_id,)).intersection(candidates)
             blocked.discard(owner_id)
             for target_id in blocked.difference(results):
+                diagnostics = _lean_diagnostics(broken.result.output)
                 results[target_id] = replace(
                     broken.result,
+                    output=(
+                        _diagnostic_output_for_target(diagnostics, target_id)
+                        if diagnostics
+                        else broken.result.output
+                    ),
                     status=ValidationStatus.UPSTREAM_FAILED,
                     blocked_by=(owner_id,),
                 )
