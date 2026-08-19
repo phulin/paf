@@ -1360,7 +1360,7 @@ class CodexExecutor:
             for key in REPORT_SCHEMAS
         }
 
-    def _resumable_run(
+    def interrupted_predecessor(
         self,
         run: RunRecord,
         stage: Stage,
@@ -1371,13 +1371,23 @@ class CodexExecutor:
             prior
             if prior is not None
             and prior.status == TaskStatus.INTERRUPTED
-            and prior.thread_id
             and (prior.role or prior.stage) == (run.role or run.stage)
             and prior.request_ids == run.request_ids
             and prior.proof_targets == run.proof_targets
             and (not prior.prompt_kind or prior.prompt_kind == run.prompt_kind)
             else None
         )
+
+    def resumable_run(
+        self,
+        run: RunRecord,
+        stage: Stage,
+    ) -> RunRecord | None:
+        prior = self.interrupted_predecessor(run, stage)
+        return prior if prior is not None and prior.thread_id else None
+
+    # Compatibility for integrations which used the former private helper.
+    _resumable_run = resumable_run
 
     async def prepare(self) -> None:
         self.config.settings.state_dir.mkdir(parents=True, exist_ok=True)

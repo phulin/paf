@@ -335,6 +335,62 @@ async def test_fuse_overlay_reclaims_dead_orchestrator_roots(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
+async def test_fuse_overlay_resume_reuses_the_exact_preserved_workspace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = write_project(tmp_path, chapters="chapters = [1]")
+    monkeypatch.setattr(os, "getpid", lambda: 999_999_991)
+    first, chapter = fuse_manager(config_path)
+    await first.prepare()
+    workspace = await first.acquire("interrupted-run")
+    target = workspace.root / "lean" / "Book" / "Chapter01.lean"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("theorem resumed_edit : True := by trivial\n", encoding="utf-8")
+    workspace.preserve("interrupted-run")
+    await first.close(preserve=True)
+
+    monkeypatch.setattr(os, "getpid", lambda: 999_999_992)
+    resumed, _ = fuse_manager(config_path)
+    resumed.resume = True
+    await resumed.prepare()
+    restored = await resumed.acquire("new-run", resume_run_id="interrupted-run")
+    try:
+        assert restored.resumed_from == "interrupted-run"
+        assert restored.root == workspace.root
+        assert target.read_text(encoding="utf-8").startswith("theorem resumed_edit")
+        result = await restored.collect(chapter)
+        assert result.accepted
+        assert result.changed_paths == ("lean/Book/Chapter01.lean",)
+    finally:
+        await restored.close()
+        await resumed.close()
+
+    assert (
+        (tmp_path / "lean" / "Book" / "Chapter01.lean")
+        .read_text(encoding="utf-8")
+        .startswith("theorem resumed_edit")
+    )
+    assert not workspace.root.parents[2].exists()
+
+
+@pytest.mark.asyncio
+async def test_fuse_overlay_fresh_restart_discards_preserved_workspace(tmp_path: Path) -> None:
+    manager, _ = fuse_manager(write_project(tmp_path, chapters="chapters = [1]"))
+    stale = manager.parent / "999999990"
+    slot = stale / "slots" / "0000-interrupted"
+    (slot / "merged").mkdir(parents=True)
+    (slot / "resume.json").write_text(
+        '{"version":1,"run_id":"interrupted-run"}\n', encoding="utf-8"
+    )
+
+    await manager.prepare()
+    try:
+        assert not stale.exists()
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
 async def test_fuse_overlay_lazily_detaches_busy_stale_mount(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
 
+from paf import json_codec as json
 from paf.hashing import digest_bytes, new_digest
 from paf.models import SwarmSettings, WorkUnitLike
 from paf.scope import ScopeMatcher
@@ -282,13 +283,15 @@ class SharedIsolation:
     async def prepare(self) -> None:
         return
 
-    async def acquire(self, _run_id: str) -> SharedWorkspace:
+    async def acquire(self, _run_id: str, *, resume_run_id: str = "") -> SharedWorkspace:
+        del resume_run_id
         return SharedWorkspace(self.settings.repo)
 
     async def acquire_build(self, _build_id: str) -> SharedBuildWorkspace:
         return SharedBuildWorkspace(self.settings.repo)
 
-    async def close(self) -> None:
+    async def close(self, *, preserve: bool = False) -> None:
+        del preserve
         return
 
 
@@ -305,6 +308,8 @@ class FuseWorkspace:
         upper: Path,
         work: Path,
         merged: Path,
+        resumed_from: str = "",
+        lowerdirs: tuple[Path, ...] = (),
     ) -> None:
         self.manager = manager
         self.slot = slot
@@ -315,7 +320,10 @@ class FuseWorkspace:
         self.upper = upper
         self.work = work
         self.root = merged
+        self.resumed_from = resumed_from
+        self.lowerdirs = lowerdirs
         self.closed = False
+        self.preserved = False
 
     async def collect(
         self,
@@ -361,6 +369,23 @@ class FuseWorkspace:
         if not self.closed:
             self.closed = True
             await self.manager.release(self)
+
+    def preserve(self, run_id: str) -> None:
+        """Leave this exact overlay available to a later ``--resume`` run."""
+
+        metadata = {
+            "version": 1,
+            "run_id": run_id,
+            "generation": self.generation,
+            "cache_generation": self.cache_generation,
+            "base": str(self.base),
+            "lowerdirs": [str(path) for path in self.lowerdirs],
+        }
+        (self.root.parent / "resume.json").write_bytes(
+            json.dumpb(metadata, indent=True, sort_keys=True)
+        )
+        (self.root.parents[2] / ".preserved").touch()
+        self.preserved = True
 
 
 class FuseBuildWorkspace:
@@ -414,8 +439,9 @@ class FuseBuildWorkspace:
 class FuseOverlayIsolation:
     name = "fuse-overlay"
 
-    def __init__(self, settings: SwarmSettings) -> None:
+    def __init__(self, settings: SwarmSettings, *, resume: bool = False) -> None:
         self.settings = settings
+        self.resume = resume
         self.parent = settings.state_dir / "isolation"
         self.root = self.parent / str(os.getpid())
         self.generations = self.root / "source-generations"
@@ -479,7 +505,7 @@ class FuseOverlayIsolation:
             raise ValueError(
                 "fuse-overlay isolation requires fuse-overlayfs, fusermount3, rsync, and /dev/fuse"
             )
-        await self._clean_stale_roots()
+        await self._clean_stale_roots(preserve_resumable=self.resume)
         self.generations.mkdir(parents=True, exist_ok=True)
         self.cache_layers.mkdir(parents=True, exist_ok=True)
         self.cache_builds.mkdir(parents=True, exist_ok=True)
@@ -491,7 +517,7 @@ class FuseOverlayIsolation:
             await self._generation()
             await self._seed_cache_layers()
 
-    async def _clean_stale_roots(self) -> None:
+    async def _clean_stale_roots(self, *, preserve_resumable: bool = False) -> None:
         """Reclaim mounts left by dead orchestrators for this state directory."""
 
         if not self.parent.exists():
@@ -508,6 +534,8 @@ class FuseOverlayIsolation:
             except (PermissionError, ValueError):
                 continue
             else:
+                continue
+            if preserve_resumable and any(stale.glob("slots/*/resume.json")):
                 continue
             for merged in stale.glob("**/merged"):
                 # os.path.ismount() returns False when lstat() reports ENOTCONN, which is exactly
@@ -915,8 +943,12 @@ class FuseOverlayIsolation:
                 self._active_compaction_layers.difference_update(layers)
                 self._drop_unused_cache_generations_locked()
 
-    async def acquire(self, run_id: str) -> FuseWorkspace:
+    async def acquire(self, run_id: str, *, resume_run_id: str = "") -> FuseWorkspace:
         slot = await self._available.get()
+        if resume_run_id:
+            resumed = await self._resume_workspace(slot, resume_run_id)
+            if resumed is not None:
+                return resumed
         generation: int | None = None
         cache_generation: int | None = None
         slot_root = self.slots / f"{slot:04d}-{run_id}"
@@ -951,6 +983,7 @@ class FuseOverlayIsolation:
                 upper=upper,
                 work=work,
                 merged=merged,
+                lowerdirs=(base, *cache.layers, self._dependency_layer),
             )
         except Exception:
             if os.path.ismount(merged):
@@ -964,6 +997,56 @@ class FuseOverlayIsolation:
                         self._cache_generations[cache_generation].references -= 1
             self._available.put_nowait(slot)
             raise
+
+    async def _resume_workspace(self, slot: int, run_id: str) -> FuseWorkspace | None:
+        """Reattach the overlay belonging to the immediately interrupted run."""
+
+        if not self.parent.exists():
+            return None
+        for metadata_path in sorted(
+            self.parent.glob("*/slots/*/resume.json"),
+            key=lambda path: path.stat().st_mtime_ns,
+            reverse=True,
+        ):
+            try:
+                metadata = json.loads(metadata_path.read_bytes())
+            except (OSError, ValueError, TypeError):
+                continue
+            if not isinstance(metadata, dict) or metadata.get("run_id") != run_id:
+                continue
+            slot_root = metadata_path.parent
+            merged = slot_root / "merged"
+            upper = slot_root / "upper"
+            work = slot_root / "work"
+            base = Path(str(metadata.get("base", "")))
+            lowerdirs = tuple(Path(str(path)) for path in metadata.get("lowerdirs", ()))
+            if not upper.is_dir() or not work.is_dir() or not base.is_dir() or not lowerdirs:
+                continue
+            mounted = merged in _mount_points() or os.path.ismount(merged)
+            if not mounted:
+                await self._run(
+                    "fuse-overlayfs",
+                    "-o",
+                    f"lowerdir={':'.join(str(path) for path in lowerdirs)},"
+                    f"upperdir={upper},workdir={work}",
+                    str(merged),
+                )
+                if not os.path.ismount(merged):
+                    raise RuntimeError(f"fuse-overlayfs did not remount {merged}")
+            return FuseWorkspace(
+                self,
+                slot=slot,
+                generation=int(metadata.get("generation", 0)),
+                cache_generation=int(metadata.get("cache_generation", 0)),
+                base=base,
+                cache=lowerdirs[-1],
+                upper=upper,
+                work=work,
+                merged=merged,
+                resumed_from=run_id,
+                lowerdirs=lowerdirs,
+            )
+        return None
 
     async def import_changes(
         self,
@@ -1081,6 +1164,19 @@ class FuseOverlayIsolation:
                 integration_lock.release()
 
     async def release(self, workspace: FuseWorkspace) -> None:
+        if workspace.resumed_from:
+            try:
+                if workspace.root in _mount_points() or os.path.ismount(workspace.root):
+                    await self._unmount(workspace.root)
+                slot_root = workspace.root.parent
+                (slot_root / "resume.json").unlink(missing_ok=True)
+                await asyncio.to_thread(shutil.rmtree, slot_root)
+                stale_root = workspace.root.parents[2]
+                if not any(stale_root.glob("slots/*/resume.json")):
+                    self._schedule_remove_tree(stale_root)
+            finally:
+                self._available.put_nowait(workspace.slot)
+            return
         try:
             if os.path.ismount(workspace.root):
                 await self._unmount(workspace.root)
@@ -1104,7 +1200,9 @@ class FuseOverlayIsolation:
                 self._drop_unused_cache_generations_locked()
             self._available.put_nowait(workspace.slot)
 
-    async def close(self) -> None:
+    async def close(self, *, preserve: bool = False) -> None:
+        if preserve:
+            return
         if self._available.qsize() != self.settings.max_agents:
             raise RuntimeError("cannot close isolation while workspaces are active")
         if self._active_build_layers:
@@ -1131,12 +1229,12 @@ Workspace = SharedWorkspace | FuseWorkspace
 BuildWorkspace = SharedBuildWorkspace | FuseBuildWorkspace
 
 
-def create_isolation(settings: SwarmSettings) -> IsolationManager:
+def create_isolation(settings: SwarmSettings, *, resume: bool = False) -> IsolationManager:
     backend = settings.isolation
     if backend == "auto":
         backend = "fuse-overlay" if fuse_overlay_available() else "shared"
     if backend == "fuse-overlay":
-        return FuseOverlayIsolation(settings)
+        return FuseOverlayIsolation(settings, resume=resume)
     if backend == "shared":
         return SharedIsolation(settings)
     raise ValueError(f"unknown isolation backend: {backend}")

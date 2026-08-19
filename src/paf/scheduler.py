@@ -61,7 +61,7 @@ from paf.interface_fingerprint import (
     InterfaceFingerprintError,
     collect_interface_fingerprints,
 )
-from paf.isolation import IsolationResult, create_isolation
+from paf.isolation import FuseWorkspace, IsolationResult, create_isolation
 from paf.models import PipelineConfig, ProofTarget, Stage, WorkUnit, WorkUnitLike
 from paf.scope import ScopeMatcher
 from paf.state import (
@@ -412,7 +412,6 @@ class RunControl:
         self._gate.set()
         self.paused = False
         self.stopping = False
-        self.integrate_interrupted_workspaces = False
 
     async def checkpoint(self) -> None:
         await self._gate.wait()
@@ -429,9 +428,8 @@ class RunControl:
             self.paused = False
             self._gate.set()
 
-    def stop(self, *, integrate_interrupted_workspaces: bool = False) -> None:
+    def stop(self) -> None:
         self.stopping = True
-        self.integrate_interrupted_workspaces |= integrate_interrupted_workspaces
         self.paused = False
         self._gate.set()
 
@@ -520,7 +518,7 @@ class Orchestrator:
         self.resume_agents = resume_agents
         self.control = control or RunControl()
         self.executor = CodexExecutor(config, state, resume_agents=resume_agents)
-        self.isolation = create_isolation(config.settings)
+        self.isolation = create_isolation(config.settings, resume=resume_agents)
         self.git = GitCommitter(config.settings.repo)
         self.state.isolation = {
             "configured": config.settings.isolation,
@@ -746,7 +744,7 @@ class Orchestrator:
                 if not request.future.done():
                     request.future.cancel()
             self._pending_build_requests.clear()
-            await self.isolation.close()
+            await self.isolation.close(preserve=self.control.stopping)
         finally:
             await self.state.close()
 
@@ -1613,49 +1611,6 @@ class Orchestrator:
         record = await self._retained_formalize_record(chapter, records)
         return record is not None and self._interface_dependencies_are_current(graph, chapter.id)
 
-    async def _integrate_interrupted_workspace(
-        self,
-        chapter: WorkUnitLike,
-        stage: Stage,
-        workspace: Any,
-        *,
-        source_lock_held: bool,
-        collected: IsolationResult | None = None,
-    ) -> dict[str, object]:
-        """Best-effort import of a stable workspace after a requested stop."""
-
-        acquired = False
-        try:
-            if not source_lock_held:
-                await self.source_lock.acquire()
-                acquired = True
-            isolated = collected or await workspace.collect(chapter, integration_lock=None)
-            isolated = await self._commit_agent_changes(chapter, stage, None, isolated)
-            if isolated.accepted and isolated.changed_paths:
-                self._mark_source_changed((chapter.id,))
-        except BaseException as error:
-            detail = str(error) or type(error).__name__
-            return {
-                "accepted": False,
-                "interrupted": True,
-                "error": f"best-effort stop integration failed: {detail}",
-            }
-        finally:
-            if acquired:
-                self.source_lock.release()
-
-        payload = isolated.as_dict()
-        payload["interrupted"] = True
-        if isolated.accepted and isolated.changed_paths and stage is not Stage.DISCOVER:
-            try:
-                invalidated_builds = await self._invalidate_build_records((chapter.id,))
-                if stage in (Stage.FORMALIZE, Stage.REVIEW):
-                    self._proof_rechecks.update(invalidated_builds)
-            except BaseException as error:
-                detail = str(error) or type(error).__name__
-                payload["warning"] = f"changes integrated but invalidation failed: {detail}"
-        return payload
-
     async def _attempt(
         self,
         chapter: WorkUnitLike,
@@ -1775,7 +1730,15 @@ class Orchestrator:
             else:
                 async with self.source_lock:
                     await self.git.ensure_clean(chapter)
-                workspace = await self.isolation.acquire(run.id)
+                interrupted_run = (
+                    self.executor.interrupted_predecessor(run, stage)
+                    if self.resume_agents
+                    else None
+                )
+                workspace = await self.isolation.acquire(
+                    run.id,
+                    resume_run_id=interrupted_run.id if interrupted_run is not None else "",
+                )
                 workspace_root = workspace.root
             while True:
                 if resume_thread_id is not None:
@@ -1990,21 +1953,18 @@ class Orchestrator:
             interrupted_isolation: dict[str, object] | None = None
             if (
                 isinstance(error, asyncio.CancelledError)
-                and self.control.integrate_interrupted_workspaces
+                and self.control.stopping
                 and workspace is not None
+                and self.isolation.name == "fuse-overlay"
             ):
-                interrupted_isolation = await self._integrate_interrupted_workspace(
-                    chapter,
-                    stage,
-                    workspace,
-                    source_lock_held=source_held,
-                    collected=isolated,
-                )
-                await workspace.close()
-                workspace = None
-                if source_held:
-                    self.source_lock.release()
-                    source_held = False
+                assert isinstance(workspace, FuseWorkspace)
+                workspace.preserve(run.id if run is not None else "")
+                interrupted_isolation = {
+                    "accepted": False,
+                    "interrupted": True,
+                    "preserved": True,
+                    "workspace": str(workspace.root),
+                }
             if run is not None:
                 detail = str(error) or type(error).__name__
                 failure_isolation = interrupted_isolation
@@ -2030,7 +1990,7 @@ class Orchestrator:
         finally:
             if slot_held:
                 slots.release()
-            if workspace is not None:
+            if workspace is not None and not getattr(workspace, "preserved", False):
                 await workspace.close()
             if source_held:
                 self.source_lock.release()

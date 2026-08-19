@@ -217,7 +217,7 @@ versioned Unix-socket protocol. The server sends one initial snapshot, then push
 agent-activity, and global-state deltas directly from the in-process change bus; the TUI does not
 poll SQLite or repeatedly request full snapshots. Press `Enter` or `i` to inspect the selected
 agent, `s` to open the Shepherd trace and jump directly to its planner or repair workers, `p` to
-pause or resume scheduling, and `q` to stop workers, integrate interrupted workspace changes, and
+pause or resume scheduling, and `q` to stop workers, preserve their private overlay changes, and
 return to the shell. Press `d` to detach the TUI while leaving a managed orchestrator running. The
 web dashboard exposes the same trace and agent links through its Shepherd metric card (or the `s`
 shortcut).
@@ -635,11 +635,11 @@ runs and their tasks become `interrupted`, never `failed` or dependency-propagat
 retain the Codex session id observed before shutdown. The next invocation resets those tasks to
 `pending` and starts fresh agents by default. With `--resume`, it instead tries the saved sessions and
 falls back to fresh agents when a session is no longer available. Successful records remain skipped
-unless `--force` is given. The TUI drains its
-workers and unmounts their overlays
-before exiting. Shutdown waits briefly for the complete Codex process group and force-terminates
-surviving MCP/LSP descendants before unmounting; the next invocation also reclaims any mounts left
-by a hard-killed orchestrator.
+unless `--force` is given. The TUI drains its workers but leaves interrupted agent overlays intact.
+A subsequent `--resume` reattaches each saved Codex session to its exact prior overlay; a restart
+without `--resume` unmounts and removes those abandoned trees before launching fresh agents.
+Shutdown waits briefly for the complete Codex process group and force-terminates surviving MCP/LSP
+descendants.
 
 Agents never commit. With the default `auto` backend, supported Linux systems run each mutating
 attempt in a private `fuse-overlayfs` view. Discovery is read-only and runs against the canonical

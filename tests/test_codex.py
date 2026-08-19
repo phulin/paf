@@ -1594,6 +1594,22 @@ async def test_executor_only_resumes_the_matching_immediate_predecessor(
 
 
 @pytest.mark.asyncio
+async def test_interrupted_predecessor_restores_overlay_even_without_a_thread_id(
+    tmp_path: Path,
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    state = StateStore(config)
+    await state.load_or_create()
+    interrupted = await state.start_run(config.chapters[0].id, Stage.FORMALIZE)
+    await state.finish_run(interrupted, status=TaskStatus.INTERRUPTED)
+    resumed = await state.start_run(config.chapters[0].id, Stage.FORMALIZE)
+    executor = CodexExecutor(config, state, resume_agents=True)
+
+    assert executor.interrupted_predecessor(resumed, Stage.FORMALIZE) is interrupted
+    assert executor.resumable_run(resumed, Stage.FORMALIZE) is None
+
+
+@pytest.mark.asyncio
 async def test_executor_starts_new_agent_when_session_cannot_resume(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
     invocations_path = tmp_path / "fallback-invocations.jsonl"
