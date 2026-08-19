@@ -8,7 +8,12 @@ import pytest
 
 from paf.codex import AgentResult, CodexExecutor
 from paf.config import load_config
-from paf.git import GitCommitError, GitCommitter, agent_commit_subject
+from paf.git import (
+    GitCommitError,
+    GitCommitter,
+    agent_commit_subject,
+    deterministic_warning_commit_subject,
+)
 from paf.models import Chapter, Stage
 from paf.scheduler import Orchestrator
 from paf.state import RunRecord, StateStore, TaskStatus, TokenUsage
@@ -106,6 +111,14 @@ def test_agent_commit_subject_has_custom_book_fallback(tmp_path: Path) -> None:
 
     assert agent_commit_subject(config.chapters[0], Stage.PROVE) == (
         "chore(book): changes from prove agent on book book chapter 1"
+    )
+
+
+def test_deterministic_warning_commit_subject_has_custom_book_fallback(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+
+    assert deterministic_warning_commit_subject(config.chapters[0]) == (
+        "chore(book): resolve deterministic warnings on book book chapter 1"
     )
 
 

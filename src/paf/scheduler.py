@@ -48,7 +48,7 @@ from paf.corpus import (
     scheduling_snapshot,
 )
 from paf.diagnostics import unexpected_lean_warnings
-from paf.git import GitCommitError, GitCommitter
+from paf.git import GitCommitError, GitCommitter, deterministic_warning_commit_subject
 from paf.hashing import is_legacy_digest, migrate_digest_text, tagged_digest_text
 from paf.interface_fingerprint import (
     FingerprintCollection,
@@ -72,6 +72,7 @@ from paf.state import (
     TaskStatus,
     UpstreamRequestStatus,
 )
+from paf.warning_cleanup import WarningDiagnostic, apply_deterministic_warning_cleanup
 
 MAXIMUM_COORDINATOR_BUILD_TARGETS = 500
 REPAIR_EFFORT = {"small": 1.0, "medium": 3.0, "large": 8.0}
@@ -181,6 +182,14 @@ class WarningCleanupOutcome:
 
 
 @dataclass(frozen=True)
+class DeterministicWarningCleanupOutcome:
+    attempted: bool = False
+    clean: bool = False
+    changed: bool = False
+    feedback: str = ""
+
+
+@dataclass(frozen=True)
 class BuildDiagnostics:
     actionable: dict[str, str]
     deferred_owner_ids: tuple[str, ...]
@@ -265,6 +274,7 @@ DIAGNOSTIC_OWNER_CACHE_MAXIMUM = 16_384
 PROOF_FINDING_REVIEW_KIND = "proof_finding"
 BUILD_ERROR_REVIEW_KIND = "build_error"
 BUILD_WARNING_REVIEW_KIND = "build_warning"
+DETERMINISTIC_WARNING_CLEANUP_ROLE = "deterministic_warning_cleanup"
 LEGACY_DIAGNOSTIC_REVIEW_KIND = "diagnostic"
 COORDINATOR_VERIFICATION_RETRY_DETAIL = "coordinator verification retry queued"
 DIAGNOSTIC_REVIEW_KINDS = frozenset(
@@ -336,6 +346,37 @@ def _lean_diagnostics(output: str) -> tuple[LeanDiagnostic, ...]:
     for diagnostic in diagnostics:
         unique.setdefault(diagnostic.header, diagnostic)
     return tuple(unique.values())
+
+
+def _deterministic_warning_diagnostics(
+    output: str,
+    *,
+    lean_project: Path,
+) -> tuple[WarningDiagnostic, ...]:
+    """Convert complete, located warning blocks into deterministic cleanup inputs."""
+
+    converted: list[WarningDiagnostic] = []
+    project_prefix = lean_project.as_posix().strip("/") + "/"
+    for diagnostic in _lean_diagnostics(output):
+        if diagnostic.severity != "warning":
+            return ()
+        header = LEAN_DIAGNOSTIC_RE.match(diagnostic.header)
+        if header is None:
+            return ()
+        location = LEAN_LOCATION_RE.match(header.group("message"))
+        if location is None:
+            return ()
+        path = location.group("path").removeprefix(project_prefix)
+        converted.append(
+            WarningDiagnostic(
+                path=path,
+                line=int(location.group("line")),
+                column=int(location.group("column")),
+                message=header.group("message")[location.end() :].strip(),
+                text=diagnostic.text,
+            )
+        )
+    return tuple(converted)
 
 
 def _failed_modules(output: str) -> tuple[str, ...]:
@@ -4548,12 +4589,193 @@ class Orchestrator:
             blocks[block] = None
         return "\n\n".join(blocks), tuple(request_ids)
 
+    async def _try_deterministic_warning_cleanup(
+        self,
+        chapter: WorkUnitLike,
+        feedback: str,
+        request_ids: tuple[str, ...],
+    ) -> DeterministicWarningCleanupOutcome:
+        diagnostics = _deterministic_warning_diagnostics(
+            feedback,
+            lean_project=self.config.settings.lean_project,
+        )
+        if not diagnostics:
+            return DeterministicWarningCleanupOutcome()
+
+        await self.control.checkpoint()
+        chapter_lock = self._chapter_agent_locks[chapter.id]
+        await chapter_lock.acquire()
+        workspace = None
+        source_held = False
+        run: RunRecord | None = None
+        isolated: IsolationResult | None = None
+        cleanup_result = None
+        try:
+            if self.isolation.name == "shared":
+                await self.source_lock.acquire()
+                source_held = True
+                await self.git.ensure_clean(chapter)
+                workspace = await self.isolation.acquire(f"regex-{uuid4().hex[:12]}")
+                snapshot = getattr(workspace, "snapshot", None)
+                if snapshot is not None:
+                    await snapshot(chapter)
+            else:
+                async with self.source_lock:
+                    await self.git.ensure_clean(chapter)
+                workspace = await self.isolation.acquire(f"regex-{uuid4().hex[:12]}")
+
+            cleanup_result = await asyncio.to_thread(
+                apply_deterministic_warning_cleanup,
+                repo_root=workspace.root,
+                lean_root=workspace.root / self.config.settings.lean_project,
+                scope=chapter.scope,
+                diagnostics=diagnostics,
+            )
+            if not cleanup_result.applied:
+                return DeterministicWarningCleanupOutcome()
+
+            run = await self.state.start_auxiliary_run(
+                chapter.id,
+                Stage.REVIEW,
+                role=DETERMINISTIC_WARNING_CLEANUP_ROLE,
+                request_ids=request_ids,
+                model="deterministic-regex",
+            )
+            if not source_held:
+                await self.source_lock.acquire()
+                source_held = True
+            isolated = await workspace.collect(chapter, integration_lock=None)
+            if isolated.accepted and isolated.changed_paths:
+                summary = (
+                    f"Resolved {cleanup_result.warning_count} allowlisted Lean warning(s) "
+                    "with location-bound edits."
+                )
+                commit = await self.git.commit(
+                    chapter,
+                    Stage.REVIEW,
+                    summary=summary,
+                    changed_paths=isolated.changed_paths,
+                    subject=deterministic_warning_commit_subject(chapter),
+                )
+                isolated = replace(isolated, commit=commit)
+                self._mark_source_changed((chapter.id,))
+            await workspace.close()
+            workspace = None
+            self.source_lock.release()
+            source_held = False
+
+            if not isolated.accepted or not isolated.changed_paths:
+                detail = isolated.error or "deterministic cleanup produced no scoped source change"
+                validation = ValidationResult(
+                    False,
+                    1,
+                    f"Deterministic warning cleanup was not integrated: {detail}",
+                )
+                await self.state.finish_run(
+                    run,
+                    status=TaskStatus.FAILED,
+                    changed=False,
+                    report={"complete": False, "summary": "", "issues": [detail]},
+                    isolation=isolated.as_dict(),
+                    validation=validation.as_dict(),
+                )
+                return DeterministicWarningCleanupOutcome(
+                    attempted=True,
+                    feedback=validation.output,
+                )
+
+            invalidated_builds = await self._invalidate_build_records((chapter.id,))
+            self._proof_rechecks.update(invalidated_builds)
+            snapshots: dict[str, ValidatedBuildSnapshot] = {}
+            validation = (
+                await self._build_chapters(
+                    (chapter,),
+                    publish_if_clean=True,
+                    mode="deterministic-warning-cleanup-certification",
+                    stage=Stage.REVIEW,
+                    snapshots=snapshots,
+                )
+            )[chapter.id]
+            if validation.succeeded and not await self._publish_validated_build(
+                chapter, snapshots[chapter.id]
+            ):
+                validation = ValidationResult(
+                    False,
+                    1,
+                    "Source scope changed after deterministic warning cleanup; retry required.",
+                    status=ValidationStatus.STALE_SNAPSHOT,
+                )
+
+            complete = validation.succeeded
+            issues = [] if complete else [validation.output[-4000:]]
+            await self.state.finish_run(
+                run,
+                status=TaskStatus.SUCCEEDED if complete else TaskStatus.FAILED,
+                changed=True,
+                report={
+                    "complete": complete,
+                    "summary": (
+                        f"Resolved {cleanup_result.warning_count} warning(s) deterministically."
+                        if complete
+                        else "Deterministic warning edits require agent follow-up."
+                    ),
+                    "issues": issues,
+                },
+                isolation=isolated.as_dict(),
+                validation=validation.as_dict(),
+            )
+            if complete:
+                await self.state.finish_proof_review_requests(chapter.id, request_ids)
+            return DeterministicWarningCleanupOutcome(
+                attempted=True,
+                clean=complete,
+                changed=True,
+                feedback="" if complete else validation.output,
+            )
+        except BaseException as error:
+            if run is not None and run.status == TaskStatus.RUNNING:
+                detail = str(error) or type(error).__name__
+                await self.state.finish_run(
+                    run,
+                    status=(
+                        TaskStatus.INTERRUPTED
+                        if isinstance(error, asyncio.CancelledError)
+                        else TaskStatus.FAILED
+                    ),
+                    changed=bool(isolated and isolated.changed_paths),
+                    report={"complete": False, "summary": "", "issues": [detail]},
+                    isolation=(
+                        isolated.as_dict()
+                        if isolated is not None
+                        else {"accepted": False, "error": detail}
+                    ),
+                )
+            raise
+        finally:
+            if workspace is not None:
+                await workspace.close()
+            if source_held:
+                self.source_lock.release()
+            chapter_lock.release()
+
     async def _clean_warnings_for_chapter(
         self,
         chapter: WorkUnitLike,
         feedback: str,
         request_ids: tuple[str, ...],
     ) -> WarningCleanupOutcome:
+        deterministic = await self._try_deterministic_warning_cleanup(
+            chapter,
+            feedback,
+            request_ids,
+        )
+        if deterministic.clean:
+            return WarningCleanupOutcome(True, deterministic.changed)
+        if deterministic.attempted and deterministic.feedback:
+            feedback = (
+                f"{feedback}\n\nDeterministic cleanup certification failed; continue from the "
+                f"retained edits and resolve these diagnostics:\n{deterministic.feedback}"
+            )
         attempt = await self._attempt(
             chapter,
             Stage.REVIEW,
@@ -4562,6 +4784,7 @@ class Orchestrator:
             request_ids=request_ids,
             queue_detail="auxiliary warning cleanup queued",
         )
+        changed = deterministic.changed or attempt.agent.changed
         complete = bool(attempt.agent.report.get("complete"))
         snapshots: dict[str, ValidatedBuildSnapshot] = {}
         validation = (
@@ -4576,11 +4799,11 @@ class Orchestrator:
         await self.state.update_run(attempt.run, validation=validation.as_dict())
         if validation.succeeded:
             if not await self._publish_validated_build(chapter, snapshots[chapter.id]):
-                return WarningCleanupOutcome(False, attempt.agent.changed)
+                return WarningCleanupOutcome(False, changed)
             if attempt.agent.succeeded and complete:
                 await self.state.finish_proof_review_requests(chapter.id, request_ids)
-                return WarningCleanupOutcome(True, attempt.agent.changed)
-            return WarningCleanupOutcome(False, attempt.agent.changed)
+                return WarningCleanupOutcome(True, changed)
+            return WarningCleanupOutcome(False, changed)
         if not validation.warnings_only:
             routed = (await self._build_feedback_async({chapter.id: validation})).actionable
             await self._queue_review_feedback(
@@ -4588,7 +4811,7 @@ class Orchestrator:
                 origin=f"warning-cleanup-error:{attempt.run.id}",
                 stage=Stage.REVIEW,
             )
-        return WarningCleanupOutcome(False, attempt.agent.changed)
+        return WarningCleanupOutcome(False, changed)
 
     async def _drain_warning_cleanups(self) -> WarningCleanupOutcome:
         work: list[Coroutine[Any, Any, WarningCleanupOutcome]] = []

@@ -28,9 +28,9 @@ from paf.git import GitCommitError
 from paf.hashing import stable_digest_text
 from paf.models import Chapter, PipelineConfig, ProofTarget, Stage
 from paf.scheduler import (
-    Attempt,
     BUILD_ERROR_REVIEW_KIND,
     BUILD_WARNING_REVIEW_KIND,
+    Attempt,
     ExecutionDisposition,
     Orchestrator,
     StageOutcome,
@@ -3081,6 +3081,146 @@ async def test_auxiliary_warning_cleanup_preserves_stage_success(
     assert state.task(chapter.id, Stage.REVIEW).runs[-1].auxiliary
     assert state.task(chapter.id, Stage.REVIEW).runs[-1].role == WARNING_REVIEW_ROLE
     await state.close()
+
+
+@pytest.mark.asyncio
+async def test_deterministic_warning_cleanup_skips_agent_after_clean_build(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = config.chapters[0]
+    target = tmp_path / "lean" / "Book" / "Chapter01.lean"
+    target.parent.mkdir(parents=True)
+    target.write_text("  simpa using h\n", encoding="utf-8")
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await orchestrator.prepare()
+    request_id, _ = await state.enqueue_proof_review_request(
+        {chapter.id: ("warning: Book/Chapter01.lean:1:2: try 'simp' instead of 'simpa'")},
+        origin_run_id="warning-build",
+        kind=BUILD_WARNING_REVIEW_KIND,
+        stage=Stage.PROVE,
+    )
+
+    async def clean_build(
+        _chapters: Iterable[Chapter],
+        *,
+        snapshots: dict[str, object],
+        **_kwargs: object,
+    ) -> dict[str, ValidationResult]:
+        snapshots[chapter.id] = object()
+        return {chapter.id: ValidationResult(True, 0, "clean", process_exit_code=0)}
+
+    monkeypatch.setattr(orchestrator, "_build_chapters", clean_build)
+    monkeypatch.setattr(
+        orchestrator,
+        "_publish_validated_build",
+        lambda *_args: asyncio.sleep(0, result=True),
+    )
+
+    async def unexpected_agent(*_args: object, **_kwargs: object) -> Attempt:
+        raise AssertionError("deterministic warning cleanup should not assign an agent")
+
+    monkeypatch.setattr(orchestrator, "_attempt", unexpected_agent)
+    feedback, request_ids = orchestrator._warning_cleanup_feedback(chapter.id)
+
+    outcome = await orchestrator._clean_warnings_for_chapter(chapter, feedback, request_ids)
+
+    assert outcome.clean
+    assert outcome.changed
+    assert target.read_text(encoding="utf-8") == "  simp using h\n"
+    assert request_id not in state.proof_review_requests
+    run = state.task(chapter.id, Stage.REVIEW).runs[-1]
+    assert run.auxiliary
+    assert run.role == scheduler_module.DETERMINISTIC_WARNING_CLEANUP_ROLE
+    assert run.report is not None
+    assert run.report["complete"] is True
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_failed_deterministic_build_falls_back_to_warning_agent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = config.chapters[0]
+    target = tmp_path / "lean" / "Book" / "Chapter01.lean"
+    target.parent.mkdir(parents=True)
+    target.write_text("  simpa using h\n", encoding="utf-8")
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await orchestrator.prepare()
+    request_id, _ = await state.enqueue_proof_review_request(
+        {chapter.id: ("warning: Book/Chapter01.lean:1:2: try 'simp' instead of 'simpa'")},
+        origin_run_id="warning-build",
+        kind=BUILD_WARNING_REVIEW_KIND,
+        stage=Stage.PROVE,
+    )
+    build_count = 0
+
+    async def builds(
+        _chapters: Iterable[Chapter],
+        *,
+        snapshots: dict[str, object],
+        **_kwargs: object,
+    ) -> dict[str, ValidationResult]:
+        nonlocal build_count
+        build_count += 1
+        if build_count == 1:
+            return {
+                chapter.id: ValidationResult(
+                    False,
+                    1,
+                    "error: Book/Chapter01.lean:1:2: deterministic edit failed",
+                    process_exit_code=1,
+                )
+            }
+        snapshots[chapter.id] = object()
+        return {chapter.id: ValidationResult(True, 0, "clean", process_exit_code=0)}
+
+    agent_feedback: list[str] = []
+
+    async def cleanup_attempt(
+        _chapter: Chapter,
+        _stage: Stage,
+        *,
+        feedback: str,
+        **_kwargs: object,
+    ) -> Attempt:
+        agent_feedback.append(feedback)
+        run = await state.start_auxiliary_run(
+            chapter.id,
+            Stage.REVIEW,
+            role=WARNING_REVIEW_ROLE,
+            request_ids=(request_id,),
+        )
+        await state.finish_run(
+            run,
+            status=TaskStatus.SUCCEEDED,
+            report={"complete": True, "summary": "checked fallback", "issues": []},
+        )
+        return Attempt(result(changed=False, placeholders=0), ValidationResult(True, 0, "ok"), run)
+
+    monkeypatch.setattr(orchestrator, "_build_chapters", builds)
+    monkeypatch.setattr(orchestrator, "_attempt", cleanup_attempt)
+    monkeypatch.setattr(
+        orchestrator,
+        "_publish_validated_build",
+        lambda *_args: asyncio.sleep(0, result=True),
+    )
+    feedback, request_ids = orchestrator._warning_cleanup_feedback(chapter.id)
+
+    outcome = await orchestrator._clean_warnings_for_chapter(chapter, feedback, request_ids)
+
+    assert outcome.clean
+    assert outcome.changed
+    assert build_count == 2
+    assert len(agent_feedback) == 1
+    assert "Deterministic cleanup certification failed" in agent_feedback[0]
+    assert "deterministic edit failed" in agent_feedback[0]
+    assert request_id not in state.proof_review_requests
+    assert target.read_text(encoding="utf-8") == "  simp using h\n"
+    await orchestrator.shutdown()
 
 
 @pytest.mark.asyncio

@@ -34,6 +34,16 @@ def agent_commit_subject(chapter: WorkUnitLike, stage: Stage) -> str:
     )
 
 
+def deterministic_warning_commit_subject(chapter: WorkUnitLike) -> str:
+    """Build the stable subject for a coordinator-owned warning cleanup."""
+
+    book = _book_label(chapter.book_id)
+    return (
+        f"chore({chapter.book_id}): resolve deterministic warnings "
+        f"on book {book} chapter {chapter.number}"
+    )
+
+
 class GitCommitter:
     """Create exact, coordinator-owned commits without absorbing unrelated work."""
 
@@ -112,6 +122,7 @@ class GitCommitter:
         *,
         summary: str,
         changed_paths: tuple[str, ...],
+        subject: str | None = None,
     ) -> str:
         if not self.enabled or not changed_paths:
             return ""
@@ -141,7 +152,7 @@ class GitCommitter:
             "--no-verify",
             "--no-gpg-sign",
             "-m",
-            agent_commit_subject(chapter, stage),
+            subject or agent_commit_subject(chapter, stage),
             "-m",
             body,
             "--",
