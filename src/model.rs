@@ -74,6 +74,7 @@ pub struct Shepherd {
     pub running_units: usize,
     pub succeeded_units: usize,
     pub failed_units: usize,
+    pub cost: Cost,
     pub agents: Vec<ShepherdAgent>,
 }
 

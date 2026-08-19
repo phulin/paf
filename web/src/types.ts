@@ -85,6 +85,7 @@ export interface Shepherd {
   running_units: number;
   succeeded_units: number;
   failed_units: number;
+  cost?: { estimated_usd: number };
   agents?: ShepherdAgent[];
 }
 

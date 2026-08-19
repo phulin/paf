@@ -18,6 +18,7 @@ from paf.config import load_config
 from paf.models import Stage
 from paf.scheduler import Orchestrator
 from paf.state import (
+    ChangeSet,
     RepairCaseStatus,
     RepairWorkUnitRecord,
     RepairWorkUnitStatus,
@@ -412,6 +413,65 @@ async def test_dashboard_exposes_live_shepherd_and_repair_worker_runs(tmp_path: 
         == SHEPHERD_ROLE
     )
     await state.close()
+
+
+@pytest.mark.asyncio
+async def test_dashboard_tracks_lifetime_shepherd_cost_and_live_updates(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = config.work_units[0]
+    state = StateStore(config)
+    await state.load_or_create()
+
+    planner = await state.start_auxiliary_run(
+        chapter.id,
+        Stage.DISCOVER,
+        role=SHEPHERD_ROLE,
+        request_ids=["case-1"],
+        model="gpt-5.6-sol",
+    )
+    assert state.shepherd_cost().estimated_usd == 0
+    await state.update_run(
+        planner,
+        usage=TokenUsage(input_tokens=100, output_tokens=20, measured=True),
+    )
+    planner_cost = state.run_cost(planner).estimated_usd
+    assert state.shepherd_cost().estimated_usd == pytest.approx(planner_cost)
+
+    live_delta = state.dashboard_delta(
+        ChangeSet(revision=state.revision, runs=frozenset({planner.id}))
+    )
+    assert live_delta["globals"]["shepherd"]["cost"]["estimated_usd"] == pytest.approx(planner_cost)
+    await state.finish_run(planner, status=TaskStatus.SUCCEEDED)
+
+    repair = await state.start_auxiliary_run(
+        chapter.id,
+        Stage.REVIEW,
+        role=REPAIR_WORKER_ROLE,
+        request_ids=["repair-1"],
+        model="gpt-5.6-sol",
+    )
+    await state.finish_run(
+        repair,
+        status=TaskStatus.SUCCEEDED,
+        usage=TokenUsage(input_tokens=200, output_tokens=40, measured=True),
+    )
+    ordinary = await state.start_run(chapter.id, Stage.FORMALIZE)
+    await state.finish_run(
+        ordinary,
+        status=TaskStatus.SUCCEEDED,
+        usage=TokenUsage(input_tokens=500, output_tokens=100, measured=True),
+    )
+
+    expected = planner_cost + state.run_cost(repair).estimated_usd
+    snapshot = state.dashboard_snapshot()
+    assert state.total_cost().estimated_usd > expected
+    assert snapshot["shepherd"]["cost"]["estimated_usd"] == pytest.approx(expected)
+    await state.close()
+
+    recovered = StateStore(config)
+    await recovered.load_or_create()
+    assert recovered.shepherd_cost().estimated_usd == pytest.approx(expected)
+    await recovered.close()
 
 
 @pytest.mark.asyncio

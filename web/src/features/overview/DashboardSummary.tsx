@@ -172,6 +172,7 @@ export function DashboardSummary({
               <span>{shepherd?.pending_failures ?? failed} failures</span>
               <i />
               {shepherd?.running_units ?? 0} repairing
+              <i />${(shepherd?.cost?.estimated_usd ?? 0).toFixed(2)}
               {!connected && " · demo"}
             </>
           }

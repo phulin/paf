@@ -166,12 +166,13 @@ fn draw_shepherd_detail(frame: &mut Frame<'_>, model: &mut DashboardModel) {
                 Style::default().fg(YELLOW).add_modifier(Modifier::BOLD),
             ),
             Line::from(format!(
-                "failures {} · repairs {}/{} · succeeded {} · failed {}    {}",
+                "failures {} · repairs {}/{} · succeeded {} · failed {} · cost ${:.2}    {}",
                 shepherd.pending_failures,
                 shepherd.running_units,
                 shepherd.planned_units,
                 shepherd.succeeded_units,
                 shepherd.failed_units,
+                shepherd.cost.estimated_usd,
                 summary,
             )),
         ])
@@ -311,7 +312,7 @@ fn summary(model: &DashboardModel) -> Paragraph<'static> {
             )),
         ]),
         Line::from(format!(
-            "Agents {}/{} · {} · queued {}    {}    Shepherd {} · failures {} · repair {}/{}",
+            "Agents {}/{} · {} · queued {}    {}    Shepherd {} · ${:.2} · failures {} · repair {}/{}",
             state.agents.active,
             state.agents.maximum,
             agent_detail,
@@ -322,6 +323,7 @@ fn summary(model: &DashboardModel) -> Paragraph<'static> {
             } else {
                 "off"
             },
+            state.shepherd.cost.estimated_usd,
             state.shepherd.pending_failures,
             state.shepherd.running_units,
             state.shepherd.planned_units,
@@ -1653,6 +1655,7 @@ mod tests {
                         "pending_failures": 2,
                         "planned_units": 1,
                         "running_units": 1,
+                        "cost": {"estimated_usd": 3.25},
                         "last_summary": "repair the shared blocker",
                         "agents": [{
                             "run_id": "plan-run",
@@ -1692,6 +1695,7 @@ mod tests {
                 message: String::new(),
             })
             .unwrap();
+        assert_eq!(model.state.shepherd.cost.estimated_usd, 3.25);
         model.enter_shepherd_detail();
 
         let backend = TestBackend::new(140, 32);
@@ -1701,6 +1705,7 @@ mod tests {
         assert!(rendered.contains("Shepherd trace"));
         assert!(rendered.contains("Shepherd planner"));
         assert!(rendered.contains("Repair review"));
+        assert!(rendered.contains("cost $3.25"));
         assert!(rendered.contains("Inspect failures"));
         assert!(rendered.contains("Enter open full agent view"));
     }

@@ -527,7 +527,8 @@ The dashboard shows:
   concurrency pool;
 - the active coordinator build's mode, stage, iteration, target progress, current chapter, owner, and
   queued build count;
-- Shepherd status, pending failure count, and planned/running repair units;
+- Shepherd status, lifetime planner/repair-worker cost, pending failure count, and planned/running
+  repair units;
 - aggregate `pending`, `queued`, `running`, `succeeded`, `failed`, `blocked`, and `interrupted`
   chapter counts for discover, formalize, review, and prove;
 - each chapter's status and attempt count in every stage, plus independent exact-build freshness;

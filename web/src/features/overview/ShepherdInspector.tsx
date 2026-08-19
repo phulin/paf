@@ -67,6 +67,9 @@ export function ShepherdInspector({
             <span>
               <strong>{shepherd?.failed_units ?? 0}</strong> failed
             </span>
+            <span>
+              <strong>${(shepherd?.cost?.estimated_usd ?? 0).toFixed(2)}</strong> total cost
+            </span>
           </div>
           {(shepherd?.last_error || shepherd?.last_summary) && (
             <div className="drawer-section shepherd-summary">

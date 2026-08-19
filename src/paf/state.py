@@ -41,6 +41,7 @@ from paf.state_db import (
 
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 LAKE_PROGRESS_RE = re.compile(r"\[(?P<completed>\d+)/(?P<total>\d+)\]\s+\S+\s+(?P<target>\S+)")
+SHEPHERD_RUN_ROLES = frozenset({"shepherd", "repair_worker"})
 
 
 def timestamp() -> str:
@@ -523,7 +524,7 @@ class StateStore:
         self._latest_runs_by_chapter: dict[str, RunRecord] = {}
         self._latest_sorry_counts: dict[str, tuple[tuple[str, str], int]] = {}
         self._usage_cache: dict[tuple[bool, str | None], TokenUsage] = {}
-        self._cost_cache: dict[tuple[bool, str | None], CostEstimate] = {}
+        self._cost_cache: dict[tuple[bool, str | None, frozenset[str] | None], CostEstimate] = {}
         self._task_snapshot_context_key: tuple[int, ...] | None = None
         self._task_snapshot_context_cache: dict[str, Any] | None = None
         self._indexed_task_states: dict[str, tuple[str, str, bool, str, bool]] = {}
@@ -1227,16 +1228,21 @@ class StateStore:
             "current_work_unit_id": build.current_work_unit_id,
         }
 
+    def _shepherd_dict(self, *, include_agents: bool) -> dict[str, Any]:
+        shepherd = {
+            name: getattr(self.shepherd, name) for name in ShepherdRecord.__dataclass_fields__
+        }
+        shepherd["cost"] = self.shepherd_cost().as_dict()
+        if include_agents:
+            shepherd["agents"] = self._shepherd_agent_views()
+        return shepherd
+
     def _bounded_global_snapshot(self, *, include_shepherd_agents: bool) -> dict[str, Any]:
         usage = self.total_usage()
         invocation_usage = self.invocation_usage()
         cost = self.total_cost()
         invocation_cost = self.invocation_cost()
-        shepherd = {
-            name: getattr(self.shepherd, name) for name in ShepherdRecord.__dataclass_fields__
-        }
-        if include_shepherd_agents:
-            shepherd["agents"] = self._shepherd_agent_views()
+        shepherd = self._shepherd_dict(include_agents=include_shepherd_agents)
         return {
             "version": 18,
             "history_database": DATABASE_NAME,
@@ -1580,6 +1586,11 @@ class StateStore:
             globals_["upstream_request_batches"] = self.upstream_request_batches()
         if change.stages or change.runs:
             globals_["agents"] = self.agent_summary()
+        if any(
+            (run := self._runs_by_id.get(run_id)) is not None and run.role in SHEPHERD_RUN_ROLES
+            for run_id in change.runs
+        ):
+            globals_["shepherd"] = self._shepherd_dict(include_agents=True)
         shepherd = globals_.get("shepherd", {})
         if isinstance(shepherd, dict):
             run_ids.update(
@@ -2947,12 +2958,15 @@ class StateStore:
                 inferred_runs=new_cost.inferred_runs - old_cost.inferred_runs,
                 unknown_models=new_cost.unknown_models,
             )
-            for invocation_only in (False, True):
+            for key, cached in tuple(self._cost_cache.items()):
+                invocation_only, chapter_id, roles = key
                 if invocation_only and run.id in self._prior_run_ids:
                     continue
-                for key in ((invocation_only, None), (invocation_only, run.chapter_id)):
-                    if key in self._cost_cache:
-                        self._cost_cache[key] = self._cost_cache[key] + delta_cost
+                if chapter_id is not None and chapter_id != run.chapter_id:
+                    continue
+                if roles is not None and run.role not in roles:
+                    continue
+                self._cost_cache[key] = cached + delta_cost
 
     def _invalidate_status_summaries(self) -> None:
         """Compatibility hook; indexes synchronize when dirty entities are marked."""
@@ -3143,8 +3157,14 @@ class StateStore:
         )
         return self._usage_cache.get(key, TokenUsage())
 
-    def _cost(self, *, invocation_only: bool, chapter_id: str | None = None) -> CostEstimate:
-        key = (invocation_only, chapter_id)
+    def _cost(
+        self,
+        *,
+        invocation_only: bool,
+        chapter_id: str | None = None,
+        roles: frozenset[str] | None = None,
+    ) -> CostEstimate:
+        key = (invocation_only, chapter_id, roles)
         if key in self._cost_cache:
             return self._cost_cache[key]
 
@@ -3152,15 +3172,17 @@ class StateStore:
         for run in self._runs_by_id.values():
             if invocation_only and run.id in self._prior_run_ids:
                 continue
+            if roles is not None and run.role not in roles:
+                continue
             cost = self.run_cost(run)
             by_chapter[run.chapter_id] += cost
         total = CostEstimate()
         for cost in by_chapter.values():
             total += cost
 
-        self._cost_cache[(invocation_only, None)] = total
+        self._cost_cache[(invocation_only, None, roles)] = total
         self._cost_cache.update(
-            ((invocation_only, item), cost) for item, cost in by_chapter.items()
+            ((invocation_only, item, roles), cost) for item, cost in by_chapter.items()
         )
         return self._cost_cache.get(key, CostEstimate())
 
@@ -3185,6 +3207,11 @@ class StateStore:
 
     def invocation_cost(self, chapter_id: str | None = None) -> CostEstimate:
         return self._cost(invocation_only=True, chapter_id=chapter_id)
+
+    def shepherd_cost(self) -> CostEstimate:
+        """Lifetime API-equivalent cost of Shepherd planners and repair workers."""
+
+        return self._cost(invocation_only=False, roles=SHEPHERD_RUN_ROLES)
 
     def task(self, chapter_id: str, stage: Stage) -> TaskRecord:
         return self.tasks[self.key(chapter_id, stage)]
