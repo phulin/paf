@@ -4205,8 +4205,13 @@ class StateStore:
         self._invalidate_aggregates()
         self._invalidate_status_summaries()
         changed_task = None
-        if status == TaskStatus.INTERRUPTED and not run.auxiliary:
-            task = self.task(run.chapter_id, Stage(run.stage))
+        if (
+            status == TaskStatus.INTERRUPTED
+            and not run.auxiliary
+            and (task := self.task(run.chapter_id, Stage(run.stage))).status == TaskStatus.RUNNING
+            and task.runs
+            and task.runs[-1].id == run.id
+        ):
             task.status = TaskStatus.INTERRUPTED
             task.phase = TaskPhase.IDLE
             task.queued = False

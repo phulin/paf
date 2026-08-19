@@ -1780,6 +1780,29 @@ async def test_interrupted_review_persists_until_startup_requeues_it(tmp_path: P
 
 
 @pytest.mark.asyncio
+async def test_interrupted_run_does_not_overwrite_newer_pending_task_state(
+    tmp_path: Path,
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = config.chapters[0]
+    state = StateStore(config)
+    await state.load_or_create()
+    run = await state.start_run(chapter.id, Stage.REVIEW)
+    task = state.task(chapter.id, Stage.REVIEW)
+
+    # Review invalidation can make the task schedulable again before cancellation
+    # cleanup for the superseded agent has finished.
+    task.status = TaskStatus.PENDING
+    task.detail = "review invalidated while its agent was stopping"
+    await state.finish_run(run, status=TaskStatus.INTERRUPTED)
+
+    assert run.status == TaskStatus.INTERRUPTED
+    assert task.status == TaskStatus.PENDING
+    assert task.detail == "review invalidated while its agent was stopping"
+    await state.close()
+
+
+@pytest.mark.asyncio
 async def test_successful_failure_retry_releases_only_its_blocked_dependents(
     tmp_path: Path,
 ) -> None:
