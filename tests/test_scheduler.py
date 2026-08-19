@@ -2628,6 +2628,98 @@ async def test_concurrent_review_builds_share_commands_and_partition_diagnostics
 
 
 @pytest.mark.asyncio
+async def test_known_broken_prerequisite_short_circuits_dependent_builds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = write_project(tmp_path, chapters="chapters = [1, 2, 3]")
+    with (tmp_path / "books" / "book.md").open("a", encoding="utf-8") as source:
+        source.write("\n## 3. Third chapter\n")
+    config = load_config(project)
+    owner, consumer, independent = config.chapters
+    orchestrator = Orchestrator(config, StateStore(config))
+    await orchestrator.prepare()
+    graph = WorkUnitImportGraph(
+        dependencies={
+            owner.id: frozenset(),
+            consumer.id: frozenset({owner.id}),
+            independent.id: frozenset(),
+        },
+        successors={
+            owner.id: frozenset({consumer.id}),
+            consumer.id: frozenset(),
+            independent.id: frozenset(),
+        },
+        order=(owner.id, consumer.id, independent.id),
+        edges=((owner.id, consumer.id),),
+    )
+    attempts: list[tuple[str, ...]] = []
+
+    async def build(
+        chapters: Iterable[Chapter],
+        **_kwargs: object,
+    ) -> dict[str, ValidationResult]:
+        selected = tuple(chapters)
+        attempts.append(tuple(chapter.id for chapter in selected))
+        if len(attempts) == 1:
+            return {
+                consumer.id: ValidationResult(
+                    False,
+                    1,
+                    "error: Book/Chapter01/Section.lean:1:1: broken prerequisite",
+                    process_exit_code=1,
+                    status=ValidationStatus.UPSTREAM_FAILED,
+                    blocked_by=(owner.id,),
+                ),
+                independent.id: ValidationResult(
+                    False,
+                    1,
+                    "combined build stopped before this target",
+                    process_exit_code=1,
+                    status=ValidationStatus.UNATTRIBUTED_BUILD_FAILURE,
+                ),
+            }
+        return {
+            chapter.id: ValidationResult(True, 0, "ok", process_exit_code=0) for chapter in selected
+        }
+
+    monkeypatch.setattr(orchestrator, "_observed_work_unit_graph", lambda: graph)
+    monkeypatch.setattr(orchestrator, "_execute_build_chapters", build)
+
+    consumer_result, independent_result = await asyncio.gather(
+        orchestrator._build_chapters((consumer,), publish_if_clean=False),
+        orchestrator._build_chapters((independent,), publish_if_clean=False),
+    )
+    cached_result = await orchestrator._build_chapters((consumer,), publish_if_clean=False)
+
+    assert consumer_result[consumer.id].status is ValidationStatus.UPSTREAM_FAILED
+    assert independent_result[independent.id].succeeded
+    assert cached_result[consumer.id].status is ValidationStatus.UPSTREAM_FAILED
+    assert attempts == [
+        (consumer.id, independent.id),
+        (independent.id,),
+    ]
+
+    orchestrator._mark_source_changed((owner.id,))
+    rebuilt = await orchestrator._build_chapters((consumer,), publish_if_clean=False)
+    assert rebuilt[consumer.id].succeeded
+    assert attempts[-1] == (consumer.id,)
+
+    feedback = {owner.id: "error: Book/Chapter01/Section.lean:1:1: broken prerequisite"}
+    first_request, first_created = await orchestrator._queue_review_feedback(
+        feedback,
+        origin="consumer-one",
+    )
+    second_request, second_created = await orchestrator._queue_review_feedback(
+        feedback,
+        origin="consumer-two",
+    )
+    assert first_created
+    assert not second_created
+    assert second_request == first_request
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_stale_build_batch_retries_without_returning_feedback(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

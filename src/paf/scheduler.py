@@ -205,6 +205,12 @@ class PendingBuildRequest:
 
 
 @dataclass(frozen=True)
+class BrokenBuild:
+    source_generations: dict[str, int]
+    result: ValidationResult
+
+
+@dataclass(frozen=True)
 class PendingDiscovery:
     chapter: WorkUnitLike
     dependencies: tuple[str, ...]
@@ -434,6 +440,7 @@ class Orchestrator:
             chapter.id: ScopeMatcher(chapter.scope) for chapter in self.work_units
         }
         self._source_generations = {chapter.id: 0 for chapter in self.work_units}
+        self._broken_builds: dict[str, BrokenBuild] = {}
         self._module_owners: dict[str, list[str]] = {}
         self._identifier_trie = _IdentifierTrieNode()
         self._diagnostic_owner_cache: dict[LeanDiagnostic, tuple[str, ...]] = {}
@@ -609,6 +616,23 @@ class Orchestrator:
     def _mark_source_changed(self, chapter_ids: Iterable[str]) -> None:
         for chapter_id in chapter_ids:
             self._source_generations[chapter_id] = self._source_generations.get(chapter_id, 0) + 1
+
+    def _current_broken_build(
+        self,
+        owner_id: str,
+        graph: WorkUnitImportGraph,
+    ) -> BrokenBuild | None:
+        broken = self._broken_builds.get(owner_id)
+        if broken is None:
+            return None
+        required = self._dependency_closure(graph, (owner_id,))
+        if required != set(broken.source_generations) or any(
+            self._source_generations.get(chapter_id, 0) != broken.source_generations[chapter_id]
+            for chapter_id in required
+        ):
+            self._broken_builds.pop(owner_id, None)
+            return None
+        return broken
 
     async def _possibly_modified_scope_ids(
         self,
@@ -3285,6 +3309,64 @@ class Orchestrator:
                 )
         return partitioned
 
+    def _remember_broken_builds(
+        self,
+        results: dict[str, ValidationResult],
+        graph: WorkUnitImportGraph,
+    ) -> None:
+        """Cache attributable source failures until their input closure changes."""
+
+        for target_id, result in results.items():
+            if result.succeeded:
+                self._broken_builds.pop(target_id, None)
+                continue
+            if result.status is ValidationStatus.TARGET_FAILED:
+                owners = (target_id,)
+            elif result.status is ValidationStatus.UPSTREAM_FAILED:
+                owners = result.blocked_by
+            else:
+                continue
+            for owner_id in owners:
+                if owner_id not in self._work_units_by_id:
+                    continue
+                required = self._dependency_closure(graph, (owner_id,))
+                owner_result = ValidationResult(
+                    False,
+                    result.exit_code,
+                    result.output,
+                    timed_out=result.timed_out,
+                    process_exit_code=result.process_exit_code,
+                    status=ValidationStatus.TARGET_FAILED,
+                )
+                self._broken_builds[owner_id] = BrokenBuild(
+                    source_generations={
+                        chapter_id: self._source_generations.get(chapter_id, 0)
+                        for chapter_id in required
+                    },
+                    result=owner_result,
+                )
+
+    def _cached_broken_results(
+        self,
+        target_ids: Iterable[str],
+        graph: WorkUnitImportGraph,
+    ) -> dict[str, ValidationResult]:
+        candidates = set(target_ids)
+        results: dict[str, ValidationResult] = {}
+        for owner_id in self._ordered_owner_ids(self._broken_builds):
+            broken = self._current_broken_build(owner_id, graph)
+            if broken is None:
+                continue
+            blocked = self._successor_closure(graph, (owner_id,)).intersection(candidates)
+            blocked.discard(owner_id)
+            for target_id in blocked.difference(results):
+                results[target_id] = replace(
+                    broken.result,
+                    status=ValidationStatus.UPSTREAM_FAILED,
+                    blocked_by=(owner_id,),
+                )
+        return results
+
     @staticmethod
     def _proof_chunk_validation(
         result: ValidationResult,
@@ -3473,6 +3555,15 @@ class Orchestrator:
                 }
                 if not candidate_ids:
                     break
+                graph = self._observed_work_unit_graph()
+                cached_failures = self._cached_broken_results(candidate_ids, graph)
+                if cached_failures:
+                    results_by_id.update(cached_failures)
+                    remaining.difference_update(cached_failures)
+                    finish_ready_requests()
+                    candidate_ids.difference_update(cached_failures)
+                    if not candidate_ids:
+                        continue
                 selected_by_id: dict[str, WorkUnitLike] = {}
                 for request in active:
                     for chapter in request.chapters:
@@ -3510,6 +3601,7 @@ class Orchestrator:
                     stage=owner.stage,
                     snapshots=attempt_snapshots if capture_snapshots else None,
                 )
+                self._remember_broken_builds(attempt_results, graph)
                 succeeded_ids = {
                     chapter_id for chapter_id, result in attempt_results.items() if result.succeeded
                 }
@@ -4326,6 +4418,11 @@ class Orchestrator:
             if diagnostics and all(item.severity == "warning" for item in diagnostics)
             else BUILD_ERROR_REVIEW_KIND
         )
+        if diagnostics:
+            fingerprint_input = "\0".join(
+                (*sorted(feedback), *(sorted(item.text for item in diagnostics)))
+            )
+            origin = f"{kind}:{hashlib.sha256(fingerprint_input.encode()).hexdigest()}"
         request_id, created = await self.state.enqueue_proof_review_request(
             feedback,
             origin_run_id=origin,
