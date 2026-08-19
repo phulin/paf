@@ -625,6 +625,24 @@ def test_shepherd_is_strong_read_only_and_repair_workers_use_luna_max(tmp_path: 
     assert prompt.rstrip().endswith(f"```text\n{dossier}\n```")
 
 
+def test_warning_cleanup_uses_dedicated_minimal_disturbance_prompt(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    executor = CodexExecutor(config, StateStore(config))
+
+    prompt = executor.build_prompt(
+        config.work_units[0],
+        Stage.REVIEW,
+        role=WARNING_REVIEW_ROLE,
+        feedback="warning: Book/Chapter01.lean:4:2: unused tactic",
+    )
+
+    assert prompt.startswith("# Clean Lean warnings")
+    assert "Preserve all existing declarations" in prompt
+    assert "do not replace, simplify, reorganize, or re-prove an existing proof" in prompt
+    assert "Resolve every supplied warning" in prompt
+    assert "PAF validation diagnostics to repair" in prompt
+
+
 @pytest.mark.asyncio
 async def test_executor_selects_a_distinct_schema_for_each_agent(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
@@ -646,6 +664,13 @@ async def test_executor_selects_a_distinct_schema_for_each_agent(tmp_path: Path)
                 role=DIAGNOSTIC_REVIEW_ROLE,
             )
         ),
+        "warning_cleanup": schema_path(
+            executor.command(
+                Stage.REVIEW,
+                feedback="warning",
+                role=WARNING_REVIEW_ROLE,
+            )
+        ),
         "prove": schema_path(executor.command(Stage.PROVE)),
         "downstream_retry": schema_path(executor.command(Stage.PROVE, role=DOWNSTREAM_RETRY_ROLE)),
         "upstream_repair": schema_path(executor.command(Stage.PROVE, role=UPSTREAM_REPAIR_ROLE)),
@@ -655,14 +680,6 @@ async def test_executor_selects_a_distinct_schema_for_each_agent(tmp_path: Path)
     assert len(set(selected.values())) == len(selected)
     for key, path in selected.items():
         assert json.loads(path.read_text(encoding="utf-8")) == REPORT_SCHEMAS[key]
-    warning_review = schema_path(
-        executor.command(
-            Stage.REVIEW,
-            feedback="warning",
-            role=WARNING_REVIEW_ROLE,
-        )
-    )
-    assert warning_review == selected["diagnostic_review"]
     assert not (config.settings.state_dir / "agent-report.schema.json").exists()
 
 

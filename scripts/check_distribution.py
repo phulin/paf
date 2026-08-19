@@ -11,11 +11,13 @@ from pathlib import Path
 
 PROMPTS = {
     "common.md",
+    "diagnostic_review.md",
     "discover.md",
     "formalize.md",
     "proof_review.md",
     "prove.md",
     "review.md",
+    "warning_cleanup.md",
 }
 
 

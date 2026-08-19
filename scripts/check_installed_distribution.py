@@ -34,7 +34,12 @@ from pathlib import Path
 
 import paf
 from paf import _rust_tui
-from paf.codex import COMMON_PROMPT_PATH, PROOF_REVIEW_PROMPT_PATH
+from paf.codex import (
+    COMMON_PROMPT_PATH,
+    DIAGNOSTIC_REVIEW_PROMPT_PATH,
+    PROOF_REVIEW_PROMPT_PATH,
+    WARNING_CLEANUP_PROMPT_PATH,
+)
 from paf.config import load_config, standard_prompt_path
 from paf.models import Stage
 from paf.state import StateStore
@@ -54,7 +59,9 @@ for stage in Stage:
     assert actual == Path(str(expected)) and actual.is_file(), (stage, actual, expected)
 for actual, name in (
     (COMMON_PROMPT_PATH, "common.md"),
+    (DIAGNOSTIC_REVIEW_PROMPT_PATH, "diagnostic_review.md"),
     (PROOF_REVIEW_PROMPT_PATH, "proof_review.md"),
+    (WARNING_CLEANUP_PROMPT_PATH, "warning_cleanup.md"),
 ):
     assert actual == Path(str(prompts.joinpath(name))) and actual.is_file(), actual
 index = Path(str(web.joinpath("index.html")))

@@ -277,6 +277,10 @@ REPORT_SCHEMAS: dict[str, dict[str, Any]] = {
         "PAF diagnostic repair report",
         _REPORT_BASE_PROPERTIES | {"source_issues": _SOURCE_ISSUES_PROPERTY},
     ),
+    "warning_cleanup": _report_schema(
+        "PAF warning cleanup report",
+        _REPORT_BASE_PROPERTIES | {"source_issues": _SOURCE_ISSUES_PROPERTY},
+    ),
     "proof_review": _report_schema(
         "PAF failed-proof review report",
         _REPORT_BASE_PROPERTIES
@@ -347,6 +351,7 @@ _PROMPT_RESOURCES = files("paf.prompts")
 COMMON_PROMPT_PATH = Path(str(_PROMPT_RESOURCES.joinpath("common.md")))
 PROOF_REVIEW_PROMPT_PATH = Path(str(_PROMPT_RESOURCES.joinpath("proof_review.md")))
 DIAGNOSTIC_REVIEW_PROMPT_PATH = Path(str(_PROMPT_RESOURCES.joinpath("diagnostic_review.md")))
+WARNING_CLEANUP_PROMPT_PATH = Path(str(_PROMPT_RESOURCES.joinpath("warning_cleanup.md")))
 SHEPHERD_PROMPT_PATH = Path(str(_PROMPT_RESOURCES.joinpath("shepherd.md")))
 REPAIR_WORKER_PROMPT_PATH = Path(str(_PROMPT_RESOURCES.joinpath("repair_worker.md")))
 UPSTREAM_REPAIR_ROLE = "upstream_repair"
@@ -354,7 +359,10 @@ DOWNSTREAM_RETRY_ROLE = "downstream_retry"
 SHEPHERD_ROLE = "shepherd"
 REPAIR_WORKER_ROLE = "repair_worker"
 DIAGNOSTIC_REVIEW_ROLE = "diagnostic_review"
-WARNING_REVIEW_ROLE = "warning_review"
+WARNING_CLEANUP_ROLE = "warning_cleanup"
+# Compatibility name for callers written before warning cleanup became an
+# independent auxiliary workflow.
+WARNING_REVIEW_ROLE = WARNING_CLEANUP_ROLE
 DIAGNOSTIC_REVIEW_ROLES = frozenset({DIAGNOSTIC_REVIEW_ROLE, WARNING_REVIEW_ROLE})
 
 
@@ -365,7 +373,9 @@ def report_schema_key(stage: Stage, *, role: str = "", feedback: str = "") -> st
         return UPSTREAM_REPAIR_ROLE
     if role == DOWNSTREAM_RETRY_ROLE:
         return DOWNSTREAM_RETRY_ROLE
-    if role in DIAGNOSTIC_REVIEW_ROLES:
+    if role == WARNING_CLEANUP_ROLE:
+        return WARNING_CLEANUP_ROLE
+    if role == DIAGNOSTIC_REVIEW_ROLE:
         return DIAGNOSTIC_REVIEW_ROLE
     if stage is Stage.REVIEW and feedback:
         return "proof_review"
@@ -1368,7 +1378,9 @@ class CodexExecutor:
     ) -> str:
         if role == REPAIR_WORKER_ROLE:
             prompt_path = REPAIR_WORKER_PROMPT_PATH
-        elif role in DIAGNOSTIC_REVIEW_ROLES:
+        elif role == WARNING_CLEANUP_ROLE:
+            prompt_path = WARNING_CLEANUP_PROMPT_PATH
+        elif role == DIAGNOSTIC_REVIEW_ROLE:
             prompt_path = DIAGNOSTIC_REVIEW_PROMPT_PATH
         elif role == UPSTREAM_REPAIR_ROLE or (stage is Stage.REVIEW and feedback):
             prompt_path = PROOF_REVIEW_PROMPT_PATH
@@ -1379,10 +1391,7 @@ class CodexExecutor:
             template = render_review_variant(template, role=role)
         elif prompt_path == DIAGNOSTIC_REVIEW_PROMPT_PATH:
             diagnostic_trigger = (
-                "The Lean build completed, but PAF rejected one or more non-`sorry` warnings. "
-                "The build did not fail and this is not failed proof evidence."
-                if role == WARNING_REVIEW_ROLE
-                else "The coordinator build reported Lean errors, possibly together with "
+                "The coordinator build reported Lean errors, possibly together with "
                 "non-`sorry` warnings."
             )
             template = template.replace("{diagnostic_trigger}", diagnostic_trigger)
