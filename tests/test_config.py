@@ -45,7 +45,7 @@ def test_discovers_chapters_and_renders_paths(tmp_path: Path) -> None:
     assert config.settings.codex_fd_recycle_attempts == 20
     assert config.settings.sandbox == "danger-full-access"
     assert config.settings.cache_compaction_layers == 32
-    assert config.settings.interface_invalidation == "conservative"
+    assert not hasattr(config.settings, "interface_invalidation")
     assert config.shepherd.model == "gpt-5.6-sol"
     assert config.shepherd.enabled is True
     assert config.shepherd.reasoning_effort == "medium"
@@ -198,7 +198,7 @@ def test_loads_and_validates_cache_compaction_threshold(tmp_path: Path) -> None:
         load_config(path)
 
 
-def test_loads_and_validates_interface_invalidation_mode(tmp_path: Path) -> None:
+def test_rejects_removed_interface_invalidation_mode(tmp_path: Path) -> None:
     path = write_project(tmp_path)
     path.write_text(
         path.read_text(encoding="utf-8").replace(
@@ -207,16 +207,7 @@ def test_loads_and_validates_interface_invalidation_mode(tmp_path: Path) -> None
         ),
         encoding="utf-8",
     )
-    assert load_config(path).settings.interface_invalidation == "observe"
-
-    path.write_text(
-        path.read_text(encoding="utf-8").replace(
-            'interface_invalidation = "observe"',
-            'interface_invalidation = "unsafe"',
-        ),
-        encoding="utf-8",
-    )
-    with pytest.raises(ValueError, match=r"swarm\.interface_invalidation"):
+    with pytest.raises(ValueError, match=r"swarm\.interface_invalidation was removed"):
         load_config(path)
 
 

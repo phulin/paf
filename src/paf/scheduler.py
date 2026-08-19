@@ -1164,64 +1164,61 @@ class Orchestrator:
                 compiled_imports.get(chapter_id) != dependencies
                 for chapter_id, dependencies in import_updates.items()
             )
-            compiled_invalidation_graph = (
+            invalidation_graph = (
                 self._interface_invalidation_graph(graph, compiled_imports | import_updates)
                 if imports_changed
                 else self._persisted_interface_invalidation_graph(graph, compiled_imports)
             )
-            invalidation_graph = compiled_invalidation_graph
-            if self.config.settings.interface_invalidation != "interface":
-                invalidation_graph = graph
             invalidated: set[str] = set()
             previous_dirty = set(self.state.formalize_graph.get("dirty", ()))
             previous_stale = set(self.state.formalize_graph.get("interface_stale", ()))
             metric_updates: dict[str, int] = {}
             invalidation_events: list[tuple[str, str, str | None, str | None, tuple[str, ...]]] = []
-            if self.config.settings.interface_invalidation != "observe":
-                for chapter_id, snapshot in snapshots.items():
-                    old = interfaces.get(chapter_id)
-                    new = snapshot.fingerprint
-                    old_files = self._file_interface_digests(old)
-                    new_files = self._file_interface_digests(new)
-                    if new_files is not None:
-                        previous = old_files or {}
-                        changed_files = [
-                            (chapter_id, source, previous.get(source), new_files.get(source))
-                            for source in sorted(set(previous) | set(new_files))
-                            if previous.get(source) != new_files.get(source)
-                        ]
-                        if changed_files:
-                            changed_successors = self._successor_closure(
-                                invalidation_graph, (chapter_id,)
-                            ) - set(snapshots)
-                            invalidation_events.extend(
-                                (*changed_file, tuple(sorted(changed_successors)))
-                                for changed_file in changed_files
-                            )
-                            invalidated.update(changed_successors)
-                            metric_updates["interface_changing_edits"] = (
-                                metric_updates.get("interface_changing_edits", 0) + 1
-                            )
-                            metric_updates["descendants_queued"] = metric_updates.get(
-                                "descendants_queued", 0
-                            ) + len(changed_successors)
-                            if old_files is None:
-                                metric_updates["unknown_interface_fallbacks"] = (
-                                    metric_updates.get("unknown_interface_fallbacks", 0) + 1
-                                )
-                        elif chapter_id in previous_dirty and chapter_id not in previous_stale:
-                            metric_updates["interface_preserving_edits"] = (
-                                metric_updates.get("interface_preserving_edits", 0) + 1
-                            )
-                    elif old_files is not None:
-                        # Fingerprinting failed after the source had taken the
-                        # selective path. Fall back to legacy invalidation.
-                        invalidated.update(
-                            self._successor_closure(graph, (chapter_id,)) - set(snapshots)
-                        )
-                        metric_updates["fingerprint_failures"] = (
-                            metric_updates.get("fingerprint_failures", 0) + 1
-                        )
+            for chapter_id, snapshot in snapshots.items():
+                old_files = self._file_interface_digests(interfaces.get(chapter_id))
+                new_files = self._file_interface_digests(snapshot.fingerprint)
+                if new_files is None:
+                    metric_updates["fingerprint_failures"] = (
+                        metric_updates.get("fingerprint_failures", 0) + 1
+                    )
+                    continue
+                if old_files is None:
+                    metric_updates["interface_baselines_initialized"] = metric_updates.get(
+                        "interface_baselines_initialized", 0
+                    ) + len(new_files)
+                    continue
+                # A file enters invalidation only after PAF has observed a successful
+                # fingerprint for it. Newly observed files establish their golden
+                # baseline; changed and deleted observed files invalidate successors.
+                added_files = set(new_files).difference(old_files)
+                if added_files:
+                    metric_updates["interface_baselines_initialized"] = metric_updates.get(
+                        "interface_baselines_initialized", 0
+                    ) + len(added_files)
+                changed_files = [
+                    (chapter_id, source, old_files[source], new_files.get(source))
+                    for source in sorted(old_files)
+                    if old_files[source] != new_files.get(source)
+                ]
+                if changed_files:
+                    changed_successors = self._successor_closure(
+                        invalidation_graph, (chapter_id,)
+                    ) - set(snapshots)
+                    invalidation_events.extend(
+                        (*changed_file, tuple(sorted(changed_successors)))
+                        for changed_file in changed_files
+                    )
+                    invalidated.update(changed_successors)
+                    metric_updates["interface_changing_edits"] = (
+                        metric_updates.get("interface_changing_edits", 0) + 1
+                    )
+                    metric_updates["descendants_queued"] = metric_updates.get(
+                        "descendants_queued", 0
+                    ) + len(changed_successors)
+                elif chapter_id in previous_dirty and chapter_id not in previous_stale:
+                    metric_updates["interface_preserving_edits"] = (
+                        metric_updates.get("interface_preserving_edits", 0) + 1
+                    )
             for chapter_id in invalidated:
                 clean.pop(chapter_id, None)
             build_generation = int(self.state.formalize_graph.get("build_generation", 0))
@@ -1301,17 +1298,6 @@ class Orchestrator:
             pairs[source] = digest
         return pairs or None
 
-    @staticmethod
-    def _invalidate_formalize_descendants(
-        graph: WorkUnitImportGraph,
-        clean: dict[str, dict[str, Any]],
-        chapter_ids: Iterable[str],
-    ) -> set[str]:
-        invalidated = Orchestrator._successor_closure(graph, chapter_ids)
-        for chapter_id in invalidated:
-            clean.pop(chapter_id, None)
-        return invalidated
-
     async def _invalidate_build_records(self, chapter_ids: Iterable[str]) -> set[str]:
         """Mark edited sources stale while retaining known downstream interfaces."""
 
@@ -1319,19 +1305,15 @@ class Orchestrator:
         targets = set(chapter_ids)
         persisted = self.state.formalize_graph.get("clean", {})
         clean = self._copy_formalize_clean(persisted if isinstance(persisted, dict) else {})
-        if self.config.settings.interface_invalidation == "observe":
-            invalidated = self._invalidate_formalize_descendants(graph, clean, targets)
-        else:
-            invalidated = targets
-            for chapter_id in targets:
-                clean.pop(chapter_id, None)
+        for chapter_id in targets:
+            clean.pop(chapter_id, None)
         await self._save_formalize_graph(
             graph,
             clean,
             build_generation=int(self.state.formalize_graph.get("build_generation", 0)),
-            invalidated=invalidated,
+            invalidated=targets,
         )
-        return invalidated
+        return targets
 
     async def _save_formalize_graph(
         self,
@@ -1476,7 +1458,6 @@ class Orchestrator:
                 },
                 "interface_import_graph": interface_graph_snapshot,
                 "fingerprint_schema": "olean-proof-erased-v1",
-                "fingerprint_mode": self.config.settings.interface_invalidation,
                 "last_fingerprint_error": fingerprint_error,
                 "interface_stale": sorted(interface_stale),
                 "fingerprint_metrics": fingerprint_metrics,

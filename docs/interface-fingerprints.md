@@ -22,25 +22,22 @@ environment extensions. Source ranges, module-use telemetry, and compiler IR ext
 Unreferenced private declarations are excluded; private declarations reachable from exported types or
 definition bodies remain part of the fingerprint.
 
-## Invalidation modes
+## Invalidation policy
 
-Set `swarm.interface_invalidation` to one of:
+PAF has one baseline-first invalidation policy. The first successful fingerprint observed for a file
+becomes its golden baseline and does not invalidate downstream work. Later changes to or deletion of
+that observed interface mark the relevant compiled-import successor closure `interface_stale`.
+Fingerprint failures leave the owner stale without manufacturing a downstream change. The compiled
+import graph falls back to the discovered source graph only for work units whose imports have not yet
+been recovered.
 
-- `observe`: collect fingerprints but retain the legacy source-graph invalidation policy.
-- `conservative` (default): skip downstream invalidation only when both old and new interface digests
-  are known and equal. Changed, missing, or failed fingerprints use the legacy closure.
-- `interface`: use the compiled import graph wherever records exist, with the discovered source graph
-  as a migration fallback for work units not yet fingerprinted.
-
-An edit initially makes only its owner stale, even when the old file signature is unavailable. After
-the owner rebuilds, equal file signatures stop invalidation. Changed signatures mark the relevant
-compiled-import successor closure `interface_stale`; a missing baseline falls back conservatively at
-that point. Local proof-completion history remains intact. Each changed pair and its affected work
+Local proof-completion history remains intact. Each observed old/new change and its affected work
 units is appended to SQLite as analysis-only provenance; the scheduler never reads that history.
 
 State exposes `proof_complete`, `interface_current`, `dependencies_current`, `head_build_status`, and
 `fully_certified` projections for each task. The dashboard reports locally completed proofs separately
 from proofs fully certified against HEAD.
 
-`formalize_graph.fingerprint_metrics` records interface-preserving edits, interface-changing edits,
-queued descendants, automatic successful rechecks, fingerprint failures, and conservative fallbacks.
+`formalize_graph.fingerprint_metrics` records initialized baselines, interface-preserving edits,
+interface-changing edits, queued descendants, automatic successful rechecks, and fingerprint
+failures.

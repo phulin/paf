@@ -5385,10 +5385,6 @@ async def test_compiled_interface_controls_downstream_build_invalidation(
     with (tmp_path / "books" / "book.md").open("a", encoding="utf-8") as source:
         source.write("\n## 3. Third chapter\n")
     config = load_config(project)
-    config = replace(
-        config,
-        settings=replace(config.settings, interface_invalidation="interface"),
-    )
     first, imported_successor, textbook_only = config.chapters
     source_root = tmp_path / "lean" / "Book"
     source_root.mkdir(parents=True)
@@ -5537,7 +5533,9 @@ async def test_proof_only_file_signature_change_does_not_invalidate_descendants(
 
 
 @pytest.mark.asyncio
-async def test_missing_file_signature_falls_back_only_after_owner_build(tmp_path: Path) -> None:
+async def test_first_file_signature_establishes_baseline_without_invalidation(
+    tmp_path: Path,
+) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
     first, second = config.chapters
     orchestrator = Orchestrator(config, StateStore(config))
@@ -5555,8 +5553,65 @@ async def test_missing_file_signature_falls_back_only_after_owner_build(tmp_path
         import_dependencies=(),
     )
     assert await orchestrator._publish_validated_build(first, snapshot)
-    assert second.id not in orchestrator.state.formalize_graph["clean"]
-    assert orchestrator.state.formalize_graph["interface_stale"] == [second.id]
+    assert set(orchestrator.state.formalize_graph["clean"]) == {first.id, second.id}
+    assert orchestrator.state.formalize_graph["interface_stale"] == []
+    assert orchestrator.state.formalize_graph["fingerprint_metrics"] == {
+        "interface_baselines_initialized": 1
+    }
+    with sqlite3.connect(orchestrator.state.database_path) as connection:
+        count = connection.execute("SELECT count(*) FROM interface_invalidation_events").fetchone()[
+            0
+        ]
+    assert count == 0
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_new_file_signature_extends_baseline_without_invalidation(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    first, second = config.chapters
+    orchestrator = Orchestrator(config, StateStore(config))
+    await orchestrator.prepare()
+    await mark_clean_formalization(orchestrator, {second.id: (first.id,)})
+    old = interface_record("existing-interface")
+    orchestrator.state.formalize_graph["interfaces"] = {first.id: old}
+    await orchestrator._invalidate_build_records((first.id,))
+
+    old_modules = old["modules"]
+    assert isinstance(old_modules, list)
+    assert isinstance(old_modules[0], dict)
+    added_module = dict(old_modules[0])
+    added_module.update(
+        {
+            "module": "Book.Chapter.Extra",
+            "source": "lean/Book/Chapter/Extra.lean",
+            "artifact": "lean/.lake/build/lib/lean/Book/Chapter/Extra.olean",
+            "artifact_digest": "artifact-extra",
+            "interface_digest": "extra-interface",
+        }
+    )
+    new = dict(old)
+    new["modules"] = [*old_modules, added_module]
+    graph = orchestrator._observed_work_unit_graph()
+    snapshot = scheduler_module.ValidatedBuildSnapshot(
+        graph=graph,
+        source_digests={first.id: scope_digest(config.settings.repo, first)},
+        fingerprint=new,
+        import_dependencies=(),
+    )
+
+    assert await orchestrator._publish_validated_build(first, snapshot)
+    assert set(orchestrator.state.formalize_graph["clean"]) == {first.id, second.id}
+    assert orchestrator.state.formalize_graph["interface_stale"] == []
+    assert orchestrator.state.formalize_graph["fingerprint_metrics"] == {
+        "interface_baselines_initialized": 1,
+        "interface_preserving_edits": 1,
+    }
+    with sqlite3.connect(orchestrator.state.database_path) as connection:
+        count = connection.execute("SELECT count(*) FROM interface_invalidation_events").fetchone()[
+            0
+        ]
+    assert count == 0
     await orchestrator.shutdown()
 
 
