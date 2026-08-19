@@ -345,7 +345,6 @@ class LeanBackend:
             "mcp_servers.paf_lean.enabled_tools": list(tools),
             "mcp_servers.paf_lean.env.PATH": self._mcp_path(),
             "mcp_servers.paf_lean.env.LEAN_PROJECT_PATH": str(project),
-            "mcp_servers.paf_lean.env.LEAN_MCP_SCRATCH_SLOTS": "1",
             "mcp_servers.paf_lean.env.LEAN_LOG_LEVEL": "NONE",
             "mcp_servers.paf_lean.env.PYTHONWARNINGS": "ignore",
         }

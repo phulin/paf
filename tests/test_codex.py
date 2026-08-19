@@ -478,7 +478,7 @@ def test_executor_uses_machine_readable_codex_mode(tmp_path: Path) -> None:
     ]
     assert overrides["mcp_servers.paf_lean.cwd"] == f'"{isolated / "lean"}"'
     assert json.loads(overrides["mcp_servers.paf_lean.env.PATH"]) == lean_mcp_path()
-    assert json.loads(overrides["mcp_servers.paf_lean.env.LEAN_MCP_SCRATCH_SLOTS"]) == "1"
+    assert "mcp_servers.paf_lean.env.LEAN_MCP_SCRATCH_SLOTS" not in overrides
     assert "mcp_servers.paf_lean.env.LEAN_MCP_PREWARM_FILES" not in overrides
     assert "lean_diagnostic_messages" in overrides["mcp_servers.paf_lean.enabled_tools"]
     assert "lean_prepare_dependencies" in overrides["mcp_servers.paf_lean.enabled_tools"]
@@ -692,7 +692,7 @@ def test_lean_mcp_does_not_prewarm_files(tmp_path: Path) -> None:
         if item == "--config"
     }
     assert "mcp_servers.paf_lean.env.LEAN_MCP_PREWARM_FILES" not in overrides
-    assert json.loads(overrides["mcp_servers.paf_lean.env.LEAN_MCP_SCRATCH_SLOTS"]) == "1"
+    assert "mcp_servers.paf_lean.env.LEAN_MCP_SCRATCH_SLOTS" not in overrides
 
 
 @pytest.mark.parametrize(
