@@ -108,6 +108,12 @@ def test_report_schemas_contain_only_fields_used_by_each_agent() -> None:
             "issues",
             "source_issues",
         },
+        "warning_cleanup": {
+            "complete",
+            "summary",
+            "issues",
+            "source_issues",
+        },
         "proof_review": {
             "complete",
             "summary",

@@ -175,6 +175,12 @@ class StageOutcome:
 
 
 @dataclass(frozen=True)
+class WarningCleanupOutcome:
+    clean: bool
+    changed: bool = False
+
+
+@dataclass(frozen=True)
 class BuildDiagnostics:
     actionable: dict[str, str]
     deferred_owner_ids: tuple[str, ...]
@@ -1614,7 +1620,7 @@ class Orchestrator:
         resume_run_id: str = "",
         resume_prompt: str = "",
     ) -> Attempt:
-        auxiliary = role in {UPSTREAM_REPAIR_ROLE, REPAIR_WORKER_ROLE}
+        auxiliary = role in {UPSTREAM_REPAIR_ROLE, REPAIR_WORKER_ROLE, WARNING_REVIEW_ROLE}
         upstream_repair = role == UPSTREAM_REPAIR_ROLE
         selected_request_ids = tuple(dict.fromkeys(request_ids))
         selected_upstream_requests = tuple(upstream_requests)
@@ -1848,6 +1854,29 @@ class Orchestrator:
                             "Source scope changed after the coordinator build; retry required.",
                             status=ValidationStatus.STALE_SNAPSHOT,
                         )
+                    elif validation.warnings_only:
+                        if await self._publish_validated_build(chapter, snapshots[chapter.id]):
+                            warning_output = validation.output
+                            await self._queue_warning_cleanup(
+                                chapter,
+                                validation,
+                                stage=Stage.PROVE,
+                            )
+                            validation = ValidationResult(
+                                True,
+                                0,
+                                "Lean build succeeded; warning cleanup queued.\n\n"
+                                + warning_output,
+                                process_exit_code=0,
+                                status=ValidationStatus.CLEAN,
+                            )
+                        else:
+                            validation = ValidationResult(
+                                False,
+                                1,
+                                "Source scope changed after the coordinator build; retry required.",
+                                status=ValidationStatus.STALE_SNAPSHOT,
+                            )
                 elif stage is Stage.PROVE:
                     build_fresh = await self._proof_build_is_fresh(chapter)
                     validation = ValidationResult(
@@ -2037,6 +2066,21 @@ class Orchestrator:
                         "clean diagnostics and coordinator build in source dependency order",
                     )
                     return StageOutcome(ExecutionDisposition.SUCCEEDED)
+                if validation.warnings_only and await self._publish_validated_build(
+                    chapter, snapshots[chapter.id]
+                ):
+                    await self._queue_warning_cleanup(
+                        chapter,
+                        validation,
+                        stage=Stage.FORMALIZE,
+                    )
+                    await self.state.set_task(
+                        chapter.id,
+                        Stage.FORMALIZE,
+                        TaskStatus.SUCCEEDED,
+                        "coordinator build succeeded; warning cleanup queued",
+                    )
+                    return StageOutcome(ExecutionDisposition.SUCCEEDED)
                 if validation.status is ValidationStatus.UPSTREAM_FAILED:
                     return await self._block_on_upstream_diagnostics(chapter, validation)
                 if validation.blocked_by:
@@ -2095,6 +2139,21 @@ class Orchestrator:
                     Stage.FORMALIZE,
                     TaskStatus.SUCCEEDED,
                     "clean diagnostics and coordinator build in source dependency order",
+                )
+                return StageOutcome(ExecutionDisposition.SUCCEEDED)
+            if validation.warnings_only and await self._publish_validated_build(
+                chapter, snapshots[chapter.id]
+            ):
+                await self._queue_warning_cleanup(
+                    chapter,
+                    validation,
+                    stage=Stage.FORMALIZE,
+                )
+                await self.state.set_task(
+                    chapter.id,
+                    Stage.FORMALIZE,
+                    TaskStatus.SUCCEEDED,
+                    "coordinator build succeeded; warning cleanup queued",
                 )
                 return StageOutcome(ExecutionDisposition.SUCCEEDED)
             if validation.status is ValidationStatus.UPSTREAM_FAILED:
@@ -2878,6 +2937,10 @@ class Orchestrator:
             if not isinstance(block, str) or not block.strip():
                 continue
             kind = str(value.get("kind", PROOF_FINDING_REVIEW_KIND))
+            if kind == BUILD_WARNING_REVIEW_KIND:
+                # Warning cleanup is an auxiliary obligation. It must not reopen
+                # or delay the semantic review dependency frontier.
+                continue
             entries.append((request_id, kind, block))
         diagnostic_entries = [entry for entry in entries if entry[1] in DIAGNOSTIC_REVIEW_KINDS]
         selected = diagnostic_entries or entries
@@ -3591,6 +3654,16 @@ class Orchestrator:
                 succeeded_ids = {
                     chapter_id for chapter_id, result in attempt_results.items() if result.succeeded
                 }
+                artifact_ids = {
+                    chapter_id
+                    for chapter_id, result in attempt_results.items()
+                    if result.compiler_succeeded
+                }
+                snapshots_by_id.update(
+                    (chapter_id, attempt_snapshots[chapter_id])
+                    for chapter_id in artifact_ids
+                    if chapter_id in attempt_snapshots
+                )
                 stale_ids = {
                     chapter_id
                     for chapter_id, result in attempt_results.items()
@@ -3599,11 +3672,6 @@ class Orchestrator:
                 if succeeded_ids:
                     results_by_id.update(
                         (chapter_id, attempt_results[chapter_id]) for chapter_id in succeeded_ids
-                    )
-                    snapshots_by_id.update(
-                        (chapter_id, attempt_snapshots[chapter_id])
-                        for chapter_id in succeeded_ids
-                        if chapter_id in attempt_snapshots
                     )
                     remaining.difference_update(succeeded_ids)
                     finish_ready_requests()
@@ -4384,6 +4452,27 @@ class Orchestrator:
                     COORDINATOR_VERIFICATION_RETRY_DETAIL,
                 )
                 continue
+            if result.warnings_only:
+                if await self._publish_validated_build(chapter, snapshots[chapter.id]):
+                    await self._queue_warning_cleanup(
+                        chapter,
+                        result,
+                        stage=Stage.REVIEW,
+                    )
+                    await self.state.set_task(
+                        chapter.id,
+                        Stage.REVIEW,
+                        TaskStatus.RUNNING,
+                        "coordinator build succeeded; warning cleanup queued",
+                    )
+                    return {}
+                await self.state.set_task(
+                    chapter.id,
+                    Stage.REVIEW,
+                    TaskStatus.RUNNING,
+                    COORDINATOR_VERIFICATION_RETRY_DETAIL,
+                )
+                continue
             feedback = (await self._build_feedback_async({chapter.id: result})).actionable
             return feedback or {chapter.id: result.output}
 
@@ -4392,6 +4481,7 @@ class Orchestrator:
         feedback: dict[str, str],
         *,
         origin: str,
+        stage: Stage = Stage.REVIEW,
         exclude_from_invalidation: Iterable[str] = (),
     ) -> tuple[str, set[str]]:
         """Persist follow-up work and reopen only its direct owners."""
@@ -4413,8 +4503,13 @@ class Orchestrator:
             feedback,
             origin_run_id=origin,
             kind=kind,
+            stage=stage,
         )
         if not created:
+            return request_id, set()
+        if kind == BUILD_WARNING_REVIEW_KIND:
+            # Warning-only builds produced usable artifacts. Preserve the stage
+            # certificate and clean the diagnostics through an auxiliary worker.
             return request_id, set()
         invalidated = await self._invalidate_reviews(
             feedback,
@@ -4422,6 +4517,96 @@ class Orchestrator:
             detail="review invalidated by follow-up findings",
         )
         return request_id, invalidated
+
+    async def _queue_warning_cleanup(
+        self,
+        chapter: WorkUnitLike,
+        validation: ValidationResult,
+        *,
+        stage: Stage,
+    ) -> str:
+        feedback = (await self._build_feedback_async({chapter.id: validation})).actionable
+        owned = feedback or {chapter.id: validation.output}
+        request_id, _ = await self._queue_review_feedback(
+            owned,
+            origin=f"warning:{stage.value}:{chapter.id}",
+            stage=stage,
+        )
+        return request_id
+
+    def _warning_cleanup_feedback(self, chapter_id: str) -> tuple[str, tuple[str, ...]]:
+        blocks: dict[str, None] = {}
+        request_ids: list[str] = []
+        for request_id, value in self.state.proof_review_requests.items():
+            if not isinstance(value, dict) or value.get("kind") != BUILD_WARNING_REVIEW_KIND:
+                continue
+            feedback = value.get("feedback")
+            block = feedback.get(chapter_id) if isinstance(feedback, dict) else None
+            if not isinstance(block, str) or not block.strip():
+                continue
+            request_ids.append(request_id)
+            blocks[block] = None
+        return "\n\n".join(blocks), tuple(request_ids)
+
+    async def _clean_warnings_for_chapter(
+        self,
+        chapter: WorkUnitLike,
+        feedback: str,
+        request_ids: tuple[str, ...],
+    ) -> WarningCleanupOutcome:
+        attempt = await self._attempt(
+            chapter,
+            Stage.REVIEW,
+            feedback=feedback,
+            role=WARNING_REVIEW_ROLE,
+            request_ids=request_ids,
+            queue_detail="auxiliary warning cleanup queued",
+        )
+        complete = bool(attempt.agent.report.get("complete"))
+        snapshots: dict[str, ValidatedBuildSnapshot] = {}
+        validation = (
+            await self._build_chapters(
+                (chapter,),
+                publish_if_clean=True,
+                mode="warning-cleanup-certification",
+                stage=Stage.REVIEW,
+                snapshots=snapshots,
+            )
+        )[chapter.id]
+        await self.state.update_run(attempt.run, validation=validation.as_dict())
+        if validation.succeeded:
+            if not await self._publish_validated_build(chapter, snapshots[chapter.id]):
+                return WarningCleanupOutcome(False, attempt.agent.changed)
+            if attempt.agent.succeeded and complete:
+                await self.state.finish_proof_review_requests(chapter.id, request_ids)
+                return WarningCleanupOutcome(True, attempt.agent.changed)
+            return WarningCleanupOutcome(False, attempt.agent.changed)
+        if not validation.warnings_only:
+            routed = (await self._build_feedback_async({chapter.id: validation})).actionable
+            await self._queue_review_feedback(
+                routed or {chapter.id: validation.output},
+                origin=f"warning-cleanup-error:{attempt.run.id}",
+                stage=Stage.REVIEW,
+            )
+        return WarningCleanupOutcome(False, attempt.agent.changed)
+
+    async def _drain_warning_cleanups(self) -> WarningCleanupOutcome:
+        work: list[Coroutine[Any, Any, WarningCleanupOutcome]] = []
+        for chapter in self.work_units:
+            feedback, request_ids = self._warning_cleanup_feedback(chapter.id)
+            if request_ids:
+                work.append(self._clean_warnings_for_chapter(chapter, feedback, request_ids))
+        if not work:
+            return WarningCleanupOutcome(True)
+        outcomes = await _gather_cancel_on_error(work)
+        return WarningCleanupOutcome(
+            clean=all(outcome.clean for outcome in outcomes)
+            and not any(
+                isinstance(value, dict) and value.get("kind") == BUILD_WARNING_REVIEW_KIND
+                for value in self.state.proof_review_requests.values()
+            ),
+            changed=any(outcome.changed for outcome in outcomes),
+        )
 
     async def _review_chapter_to_clean(
         self,
@@ -5179,6 +5364,23 @@ class Orchestrator:
                 1,
                 "Source scope changed after the coordinator build; retry required.",
                 status=ValidationStatus.STALE_SNAPSHOT,
+            )
+        if validation.warnings_only:
+            if not await self._publish_validated_build(chapter, snapshots[chapter.id]):
+                return ValidationResult(
+                    False,
+                    1,
+                    "Source scope changed after the coordinator build; retry required.",
+                    status=ValidationStatus.STALE_SNAPSHOT,
+                )
+            warning_output = validation.output
+            await self._queue_warning_cleanup(chapter, validation, stage=Stage.PROVE)
+            return ValidationResult(
+                True,
+                0,
+                "Lean build succeeded; warning cleanup queued.\n\n" + warning_output,
+                process_exit_code=0,
+                status=ValidationStatus.CLEAN,
             )
         return validation
 
@@ -6460,7 +6662,13 @@ class Orchestrator:
         await self._drain_active_shepherd()
         if self._repair_progress_generation != generation:
             result = await self._run_stage_once(stage)
-        return result
+        cleanup = await self._drain_warning_cleanups()
+        if cleanup.clean and cleanup.changed:
+            # Re-evaluate stage certificates after the cleanup edit. Interface
+            # fingerprints decide which completed dependents actually reopen.
+            result = await self._run_stage_once(stage)
+            cleanup = await self._drain_warning_cleanups()
+        return result and cleanup.clean
 
     async def _run_pipeline_once(self) -> bool:
         progress = asyncio.Event()
@@ -6497,4 +6705,8 @@ class Orchestrator:
         await self._drain_active_shepherd()
         if self._repair_progress_generation != generation:
             result = await self._run_pipeline_once()
-        return result
+        cleanup = await self._drain_warning_cleanups()
+        if cleanup.clean and cleanup.changed:
+            result = await self._run_pipeline_once()
+            cleanup = await self._drain_warning_cleanups()
+        return result and cleanup.clean

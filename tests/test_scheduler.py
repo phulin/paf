@@ -28,6 +28,7 @@ from paf.git import GitCommitError
 from paf.hashing import stable_digest_text
 from paf.models import Chapter, PipelineConfig, ProofTarget, Stage
 from paf.scheduler import (
+    Attempt,
     BUILD_ERROR_REVIEW_KIND,
     BUILD_WARNING_REVIEW_KIND,
     ExecutionDisposition,
@@ -918,8 +919,10 @@ async def test_review_feedback_records_warning_and_error_reasons(tmp_path: Path)
     )
     assert state.proof_review_requests[warning_id]["kind"] == BUILD_WARNING_REVIEW_KIND
     _, warning_ids = orchestrator._proof_review_feedback(chapter.id)
+    assert warning_ids == ()
+    warning_feedback, warning_ids = orchestrator._warning_cleanup_feedback(chapter.id)
     assert warning_ids == (warning_id,)
-    assert orchestrator._proof_review_role(warning_ids) == WARNING_REVIEW_ROLE
+    assert "unused variable" in warning_feedback
 
     await state.finish_proof_review_requests(chapter.id, (warning_id,))
     error_id, _ = await orchestrator._queue_review_feedback(
@@ -934,7 +937,7 @@ async def test_review_feedback_records_warning_and_error_reasons(tmp_path: Path)
 
 
 @pytest.mark.asyncio
-async def test_diagnostics_are_selected_before_proof_findings(tmp_path: Path) -> None:
+async def test_warning_cleanup_is_separate_from_proof_findings(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
     chapter = config.chapters[0]
     state = StateStore(config)
@@ -951,10 +954,11 @@ async def test_diagnostics_are_selected_before_proof_findings(tmp_path: Path) ->
     )
 
     _, selected_ids = orchestrator._proof_review_feedback(chapter.id)
-    assert selected_ids == (warning_id,)
-    assert orchestrator._proof_review_role(selected_ids) == WARNING_REVIEW_ROLE
+    assert selected_ids == (proof_id,)
+    _, warning_ids = orchestrator._warning_cleanup_feedback(chapter.id)
+    assert warning_ids == (warning_id,)
 
-    await state.finish_proof_review_requests(chapter.id, selected_ids)
+    await state.finish_proof_review_requests(chapter.id, warning_ids)
     _, selected_ids = orchestrator._proof_review_feedback(chapter.id)
     assert selected_ids == (proof_id,)
     assert orchestrator._proof_review_role(selected_ids) == ""
@@ -962,7 +966,7 @@ async def test_diagnostics_are_selected_before_proof_findings(tmp_path: Path) ->
 
 
 @pytest.mark.asyncio
-async def test_review_tree_runs_diagnostics_before_pending_proof_review(
+async def test_review_tree_ignores_auxiliary_warning_cleanup_obligations(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
@@ -1004,11 +1008,8 @@ async def test_review_tree_runs_diagnostics_before_pending_proof_review(
     monkeypatch.setattr(orchestrator, "_review_chapter_to_clean", review)
 
     assert await orchestrator._review_tree()
-    assert calls == [
-        (WARNING_REVIEW_ROLE, (warning_id,)),
-        ("", (proof_id,)),
-    ]
-    assert state.proof_review_requests == {}
+    assert calls == [("", (proof_id,))]
+    assert set(state.proof_review_requests) == {warning_id}
     await orchestrator.shutdown()
 
 
@@ -2958,6 +2959,158 @@ def test_upstream_warning_does_not_fail_dependent_build(tmp_path: Path) -> None:
     assert partitioned[owner.id].warnings_only
     assert partitioned[consumer.id].status is ValidationStatus.CLEAN
     assert partitioned[consumer.id].succeeded
+
+
+@pytest.mark.asyncio
+async def test_formalize_warning_publishes_artifact_and_queues_auxiliary_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = config.chapters[0]
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await state.load_or_create()
+    await state.set_task(chapter.id, Stage.DISCOVER, TaskStatus.SUCCEEDED, "discovered")
+    monkeypatch.setattr(orchestrator, "_scope_exists", lambda _chapter: asyncio.sleep(0, True))
+
+    async def warning_build(
+        _chapters: Iterable[Chapter],
+        *,
+        snapshots: dict[str, object],
+        **_kwargs: object,
+    ) -> dict[str, ValidationResult]:
+        snapshots[chapter.id] = object()
+        return {
+            chapter.id: ValidationResult(
+                False,
+                1,
+                "warning: Book/Chapter01.lean:3:1: unused variable `h`",
+                process_exit_code=0,
+                status=ValidationStatus.TARGET_WARNINGS,
+            )
+        }
+
+    async def publish(_chapter: Chapter, _snapshot: object) -> bool:
+        return True
+
+    monkeypatch.setattr(orchestrator, "_build_chapters", warning_build)
+    monkeypatch.setattr(orchestrator, "_publish_validated_build", publish)
+
+    outcome = await orchestrator._formalize(chapter)
+
+    assert outcome.succeeded
+    formalize = state.task(chapter.id, Stage.FORMALIZE)
+    assert formalize.status == TaskStatus.SUCCEEDED
+    assert "warning cleanup queued" in formalize.detail
+    feedback, request_ids = orchestrator._warning_cleanup_feedback(chapter.id)
+    assert len(request_ids) == 1
+    assert "unused variable" in feedback
+    assert state.task(chapter.id, Stage.REVIEW).status == TaskStatus.PENDING
+    await state.close()
+
+
+@pytest.mark.asyncio
+async def test_auxiliary_warning_cleanup_preserves_stage_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = config.chapters[0]
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await state.load_or_create()
+    for stage in (Stage.FORMALIZE, Stage.REVIEW, Stage.PROVE):
+        await state.set_task(chapter.id, stage, TaskStatus.SUCCEEDED, "complete")
+    request_id, _ = await state.enqueue_proof_review_request(
+        {chapter.id: "warning: Book/Chapter01.lean:3:1: unused variable `h`"},
+        origin_run_id="warning-build",
+        kind=BUILD_WARNING_REVIEW_KIND,
+        stage=Stage.PROVE,
+    )
+
+    async def cleanup_attempt(*_args: object, **_kwargs: object) -> Attempt:
+        run = await state.start_auxiliary_run(
+            chapter.id,
+            Stage.REVIEW,
+            role=WARNING_REVIEW_ROLE,
+            request_ids=(request_id,),
+        )
+        await state.finish_run(
+            run,
+            status=TaskStatus.SUCCEEDED,
+            report={"complete": True, "summary": "removed warning", "issues": []},
+        )
+        return Attempt(
+            AgentResult(
+                succeeded=True,
+                exit_code=0,
+                changed=True,
+                placeholders=0,
+                usage=TokenUsage(),
+                report={"complete": True, "summary": "removed warning", "issues": []},
+            ),
+            ValidationResult(True, 0, "deferred"),
+            run,
+        )
+
+    async def clean_build(
+        _chapters: Iterable[Chapter],
+        *,
+        snapshots: dict[str, object],
+        **_kwargs: object,
+    ) -> dict[str, ValidationResult]:
+        snapshots[chapter.id] = object()
+        return {chapter.id: ValidationResult(True, 0, "clean", process_exit_code=0)}
+
+    monkeypatch.setattr(orchestrator, "_attempt", cleanup_attempt)
+    monkeypatch.setattr(orchestrator, "_build_chapters", clean_build)
+    monkeypatch.setattr(
+        orchestrator,
+        "_publish_validated_build",
+        lambda *_args: asyncio.sleep(0, result=True),
+    )
+
+    outcome = await orchestrator._drain_warning_cleanups()
+
+    assert outcome.clean
+    assert outcome.changed
+    assert request_id not in state.proof_review_requests
+    assert all(
+        state.task(chapter.id, stage).status == TaskStatus.SUCCEEDED
+        for stage in (Stage.FORMALIZE, Stage.REVIEW, Stage.PROVE)
+    )
+    assert state.task(chapter.id, Stage.REVIEW).runs[-1].auxiliary
+    assert state.task(chapter.id, Stage.REVIEW).runs[-1].role == WARNING_REVIEW_ROLE
+    await state.close()
+
+
+@pytest.mark.asyncio
+async def test_warning_obligation_does_not_invalidate_review_dependency(
+    tmp_path: Path,
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    owner, consumer = config.chapters
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await state.load_or_create()
+    state.source_dependency_tree = {
+        "dependencies": {owner.id: [], consumer.id: [owner.id]},
+    }
+    for chapter in config.chapters:
+        await state.set_task(chapter.id, Stage.FORMALIZE, TaskStatus.SUCCEEDED, "built")
+    await state.set_task(owner.id, Stage.REVIEW, TaskStatus.SUCCEEDED, "reviewed")
+
+    await orchestrator._queue_review_feedback(
+        {owner.id: "warning: Book/Chapter01.lean:3:1: unused variable `h`"},
+        origin="warning-build",
+        stage=Stage.REVIEW,
+    )
+
+    assert state.task(owner.id, Stage.REVIEW).status == TaskStatus.SUCCEEDED
+    waiting = state.task_requirements(state.task(consumer.id, Stage.REVIEW))
+    assert all(
+        requirement.owner_task_key != state.key(owner.id, Stage.REVIEW) for requirement in waiting
+    )
+    await state.close()
 
 
 @pytest.mark.asyncio
@@ -6462,7 +6615,7 @@ async def test_proof_validation_routes_foreign_diagnostic_to_its_owner(
 
 
 @pytest.mark.asyncio
-async def test_proof_validation_resumes_originating_chunk_for_local_diagnostic(
+async def test_proof_warning_queues_cleanup_without_resuming_completed_chunk(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
@@ -6529,9 +6682,11 @@ async def test_proof_validation_resumes_originating_chunk_for_local_diagnostic(
     orchestrator.executor = executor
 
     assert await orchestrator._prove(chapter)
-    assert executor.resume_thread_ids == [None, "proof-session"]
-    assert "target diagnostic" in executor.feedbacks[1]
-    assert state.proof_review_requests == {}
+    assert executor.resume_thread_ids == [None]
+    feedback, request_ids = orchestrator._warning_cleanup_feedback(chapter.id)
+    assert len(request_ids) == 1
+    assert "target diagnostic" in feedback
+    assert state.task(chapter.id, Stage.PROVE).status == TaskStatus.SUCCEEDED
     await orchestrator.shutdown()
 
 

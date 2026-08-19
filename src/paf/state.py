@@ -2712,6 +2712,7 @@ class StateStore:
         *,
         origin_run_id: str,
         kind: str = "proof_finding",
+        stage: Stage | None = None,
         request_id: str | None = None,
     ) -> tuple[str, bool]:
         """Persist proof findings or diagnostics before invalidating their review closure."""
@@ -2724,6 +2725,7 @@ class StateStore:
             "feedback": dict(feedback),
             "origin_run_id": origin_run_id,
             "kind": kind,
+            "stage": stage.value if stage is not None else Stage.REVIEW.value,
             "created_at": timestamp(),
         }
         self._mark_dirty(global_state=False, sections={"proof_review_requests"})

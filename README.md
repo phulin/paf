@@ -37,7 +37,8 @@ parallel, identifies its direct source prerequisites, and persists the resulting
 tree with source digests. A chapter can formalize as soon as its discovery is complete and its
 dependencies have formalized; it does not wait for unrelated discovery or formalization work.
 Formalization owns full source coverage, elaboration, MCP diagnostics, and coordinator build
-convergence. It permits only the exact declaration-uses-`sorry` warning.
+convergence. A successful Lean build releases dependents even when it emits a non-`sorry` warning;
+the warning becomes a durable, local cleanup obligation and does not weaken final convergence.
 All later coordinator checks use the same coalescer: formalization, review, proof refresh, and proof
 certification requests that are pending together contribute targets to one Lake command, even
 across stages. Requests drain in arrival order through one rolling build lane; requests accumulated
@@ -324,8 +325,10 @@ validation and freshness results from a combined command. Each coordinator build
 cache upper layer. A successful build atomically promotes that small delta and writes only those
 changed artifacts back to the main worktree's `.lake`; failed build deltas are discarded.
 The coordinator rejects a successful compiler exit if its captured output contains any warning
-other than the exact “declaration uses `sorry`” diagnostic. This check reuses the targeted build and
-does not launch a second compiler.
+other than the exact “declaration uses `sorry`” diagnostic. It still publishes the usable artifact,
+keeps the warning local to its source owner, and schedules a dedicated auxiliary cleanup worker.
+Cleanup preserves existing declarations and proof terms as far as possible. The pipeline reports
+success only after every warning obligation receives a warning-free coordinator certification.
 
 An MCP/LSP process exists per active proof attempt, not per queued agent. Its imported `.olean` files come
 from a read-only snapshot of the coordinator cache taken when the attempt starts, while its document
@@ -409,8 +412,9 @@ After the daemon exits, `status`, `snapshot`, and `wait` fall back to the persis
   tree and input digests. Independent discoveries run concurrently without allocating overlays.
 - **Formalize** starts after its own discovery and the formalization of its direct dependencies.
   It covers the complete source chapter, uses Lean MCP for elaboration and diagnostics, and cycles
-  through coordinator builds up to `max_rounds`. Completion requires a clean build with no warning
-  other than `declaration uses sorry`.
+  through coordinator builds up to `max_rounds`. A compiler-successful build completes the stage and
+  releases its artifact; non-`sorry` warnings become auxiliary cleanup obligations rather than
+  dependency failures.
 - **Review** visits dependency-ready chapters against a clean source and `.olean` generation. Only
   the first review waits for source-tree dependency reviews; subsequent re-reviews do not. Agents
   make warranted in-scope statement and API changes directly; exact out-of-scope blockers remain in
@@ -444,9 +448,9 @@ After the daemon exits, `status`, `snapshot`, and `wait` fall back to the persis
   pipeline invocation. A cumulative attempt ledger is prior inventory: retry
   agents must refine an earlier proof using new evidence or try a materially different route instead
   of rereading the chapter, reconfirming clean diagnostics, or echoing a missing-API claim. The proof
-  task succeeds only when the scoped Lean code has no
-  `sorry` or `admit` tokens and final Lake validation succeeds without any warning other than
-  “declaration uses `sorry`”. The exact validated source digest is persisted independently of review
+  task succeeds when the scoped Lean code has no `sorry` or `admit` tokens and final Lake validation
+  compiles; any non-`sorry` warning is assigned to auxiliary cleanup and remains a final pipeline
+  convergence requirement. The exact validated source digest is persisted independently of review
   status. If it is stale after restart, the coordinator rebuilds and recounts placeholders first; a
   successful placeholder-free source is accepted without launching another proof agent. Proof
   validation uses the same visible coordinator-build record and fair build lane; it never holds the
