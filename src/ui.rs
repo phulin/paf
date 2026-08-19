@@ -1354,6 +1354,7 @@ fn task_mark_style(task: &Task, building: bool) -> Style {
         "running" => Style::default().fg(BLUE),
         "succeeded" => Style::default().fg(GREEN),
         "failed" => Style::default().fg(RED),
+        "blocked" => Style::default().fg(YELLOW),
         _ => Style::default(),
     }
 }
@@ -1822,7 +1823,7 @@ mod tests {
     }
 
     #[test]
-    fn task_marks_color_running_done_failed_and_building() {
+    fn task_marks_color_running_done_failed_blocked_and_building() {
         let task = |status: &str| Task {
             status: status.into(),
             ..Task::default()
@@ -1831,6 +1832,7 @@ mod tests {
         assert_eq!(task_mark_style(&task("running"), false).fg, Some(BLUE));
         assert_eq!(task_mark_style(&task("succeeded"), false).fg, Some(GREEN));
         assert_eq!(task_mark_style(&task("failed"), false).fg, Some(RED));
+        assert_eq!(task_mark_style(&task("blocked"), false).fg, Some(YELLOW));
         assert_eq!(task_mark_style(&task("pending"), false).fg, None);
         assert_eq!(task_mark_style(&task("pending"), true).fg, Some(PURPLE));
     }
