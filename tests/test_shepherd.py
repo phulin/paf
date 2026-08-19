@@ -380,6 +380,10 @@ async def test_dashboard_exposes_live_shepherd_and_repair_worker_runs(tmp_path: 
             "label": "Shepherd planner",
             "repair_work_unit_id": "",
             "objective": "one repair",
+            "document_id": "book",
+            "document_title": "A Book",
+            "ordinal": 1,
+            "unit_title": "First chapter",
         },
         {
             "run_id": worker.id,
@@ -390,6 +394,10 @@ async def test_dashboard_exposes_live_shepherd_and_repair_worker_runs(tmp_path: 
             "label": "Repair review",
             "repair_work_unit_id": unit.id,
             "objective": unit.objective,
+            "document_id": "book",
+            "document_title": "A Book",
+            "ordinal": 1,
+            "unit_title": "First chapter",
         },
     ]
     assert snapshot["activities"][planner.id]["current"] == "ranking repair candidates"

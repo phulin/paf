@@ -1367,6 +1367,19 @@ class StateStore:
             return []
 
         agents: list[dict[str, Any]] = []
+
+        def work_unit_context(work_unit_id: str) -> dict[str, Any]:
+            try:
+                work_unit = self.config.work_unit(work_unit_id)
+            except KeyError:
+                return {}
+            return {
+                "document_id": work_unit.document_id,
+                "document_title": work_unit.document.title,
+                "ordinal": work_unit.ordinal,
+                "unit_title": work_unit.title,
+            }
+
         planner_run_id = sweep.run_id or (
             self.shepherd.current_run_id if self.shepherd.current_sweep_id == sweep.id else ""
         )
@@ -1382,6 +1395,7 @@ class StateStore:
                     "label": "Shepherd planner",
                     "repair_work_unit_id": "",
                     "objective": sweep.summary,
+                    **work_unit_context(run.chapter_id if run is not None else ""),
                 }
             )
         for unit_id in sweep.work_unit_ids:
@@ -1398,6 +1412,7 @@ class StateStore:
                     "label": f"Repair {unit.target_stage}",
                     "repair_work_unit_id": unit.id,
                     "objective": unit.objective,
+                    **work_unit_context(unit.owner_chapter_id),
                 }
             )
         return agents
