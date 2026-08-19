@@ -460,11 +460,12 @@ fn draw_task_table(frame: &mut Frame<'_>, model: &DashboardModel, area: Rect) {
             Cell::from(format!("{:02} {}", row.unit.ordinal, row.unit.title)),
         ];
         for stage in STAGES {
-            let value = row.tasks.get(stage).map_or_else(
-                || "· pending".into(),
-                |task| task_mark(task, model.is_building(row.unit.id.as_str(), stage)),
+            let building = model.is_building(row.unit.id.as_str(), stage);
+            let cell = row.tasks.get(stage).map_or_else(
+                || Cell::from("· pending"),
+                |task| Cell::from(task_mark(task, building)).style(task_mark_style(task, building)),
             );
-            cells.push(Cell::from(value));
+            cells.push(cell);
         }
         let fresh = row
             .tasks
@@ -1342,6 +1343,21 @@ fn task_mark(task: &Task, building: bool) -> String {
     }
 }
 
+fn task_mark_style(task: &Task, building: bool) -> Style {
+    if building
+        || task.repairing
+        || task.queued
+        || (task.status == "running" && task.phase == "postprocess")
+    {
+        return Style::default();
+    }
+    match task_display_status(task) {
+        "succeeded" => Style::default().fg(GREEN),
+        "failed" => Style::default().fg(RED),
+        _ => Style::default(),
+    }
+}
+
 fn task_display_status(task: &Task) -> &str {
     if task.status == "pending" && task.scheduling_status == "blocked" {
         "blocked"
@@ -1803,6 +1819,18 @@ mod tests {
 
         assert_eq!(task_mark(&task, false), "↻ repairing (2)");
         assert_eq!(task_mark(&task, true), "◆ building (2)");
+    }
+
+    #[test]
+    fn terminal_task_marks_color_done_and_failed_only() {
+        let task = |status: &str| Task {
+            status: status.into(),
+            ..Task::default()
+        };
+
+        assert_eq!(task_mark_style(&task("succeeded"), false).fg, Some(GREEN));
+        assert_eq!(task_mark_style(&task("failed"), false).fg, Some(RED));
+        assert_eq!(task_mark_style(&task("pending"), false).fg, None);
     }
 
     #[test]
