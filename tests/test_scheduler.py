@@ -807,6 +807,84 @@ async def test_proof_review_requests_persist_and_acknowledge_exact_findings(
 
 
 @pytest.mark.asyncio
+async def test_stale_snapshot_review_requests_are_migrated_to_verification(
+    tmp_path: Path,
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    retry, genuine = config.chapters
+    state = StateStore(config)
+    await state.load_or_create()
+    for chapter in config.chapters:
+        await state.set_task(chapter.id, Stage.REVIEW, TaskStatus.PENDING, "needs review")
+    stale_id, _ = await state.enqueue_proof_review_request(
+        {
+            retry.id: (
+                "Coordinator build failed without a source-located diagnostic:\n"
+                "Source dependency scope changed during the coordinator build; retry required."
+            ),
+            genuine.id: (
+                "Coordinator build failed without a source-located diagnostic:\n"
+                "Source dependency scope changed during the coordinator build; retry required."
+            ),
+        },
+        origin_run_id="stale-build",
+        kind=BUILD_ERROR_REVIEW_KIND,
+    )
+    warning_id, _ = await state.enqueue_proof_review_request(
+        {genuine.id: "warning: Book/Chapter02.lean:3:1: unused variable"},
+        origin_run_id="warning-build",
+        kind=BUILD_WARNING_REVIEW_KIND,
+    )
+
+    affected = await state.migrate_stale_snapshot_review_requests()
+
+    assert affected == {retry.id, genuine.id}
+    assert stale_id not in state.proof_review_requests
+    assert warning_id in state.proof_review_requests
+    assert state.task(retry.id, Stage.REVIEW).detail == "coordinator verification retry queued"
+    assert state.task(genuine.id, Stage.REVIEW).detail == "needs review"
+    await state.close()
+
+
+@pytest.mark.asyncio
+async def test_migrated_stale_review_verifies_without_rerunning_agent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = config.chapters[0]
+    orchestrator = Orchestrator(config, StateStore(config))
+    await orchestrator.prepare()
+    await mark_clean_formalization(orchestrator)
+    await orchestrator.state.set_task(
+        chapter.id,
+        Stage.REVIEW,
+        TaskStatus.PENDING,
+        "coordinator verification retry queued",
+    )
+
+    async def clean_build(_chapter: Chapter) -> dict[str, str]:
+        return {}
+
+    async def unexpected_review(*_args: object, **_kwargs: object) -> StageOutcome:
+        raise AssertionError("stale coordinator retry must not launch a review agent")
+
+    monkeypatch.setattr(orchestrator, "_review_build", clean_build)
+    monkeypatch.setattr(orchestrator, "_review_once", unexpected_review)
+
+    outcome = await orchestrator._review_chapter_to_clean(
+        chapter,
+        {chapter.id: 0},
+        verification_retry=True,
+    )
+
+    assert outcome.succeeded
+    review = orchestrator.state.task(chapter.id, Stage.REVIEW)
+    assert review.status == TaskStatus.SUCCEEDED
+    assert review.detail == "coordinator verification completed after stale snapshot"
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_diagnostic_requests_select_targeted_review_role(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
     chapter = config.chapters[0]
@@ -2527,6 +2605,44 @@ async def test_concurrent_review_builds_share_commands_and_partition_diagnostics
 
 
 @pytest.mark.asyncio
+async def test_stale_build_batch_retries_without_returning_feedback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = config.chapters[0]
+    orchestrator = Orchestrator(config, StateStore(config))
+    await orchestrator.prepare()
+    attempts = 0
+
+    async def build(
+        chapters: Iterable[Chapter],
+        **_kwargs: object,
+    ) -> dict[str, ValidationResult]:
+        nonlocal attempts
+        attempts += 1
+        selected = tuple(chapters)
+        status = ValidationStatus.STALE_SNAPSHOT if attempts == 1 else ValidationStatus.CLEAN
+        return {
+            item.id: ValidationResult(
+                status is ValidationStatus.CLEAN,
+                0 if status is ValidationStatus.CLEAN else 1,
+                "ok" if status is ValidationStatus.CLEAN else "source changed",
+                status=status,
+            )
+            for item in selected
+        }
+
+    monkeypatch.setattr(orchestrator, "_execute_build_chapters", build)
+
+    result = await orchestrator._build_chapters((chapter,), publish_if_clean=False)
+
+    assert attempts == 2
+    assert result[chapter.id].succeeded
+    assert orchestrator.state.proof_review_requests == {}
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_wholly_unattributed_batch_failure_is_not_probed_by_subsets(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -3506,7 +3622,7 @@ async def test_validated_build_refuses_to_certify_a_newer_source_generation(
 
 
 @pytest.mark.asyncio
-async def test_overlay_build_releases_source_barrier_and_rejects_concurrent_edit(
+async def test_overlay_build_releases_source_barrier_and_retries_concurrent_edit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
@@ -3519,8 +3635,11 @@ async def test_overlay_build_releases_source_barrier_and_rejects_concurrent_edit
     monkeypatch.setattr(orchestrator.isolation, "name", "fuse-overlay")
     validation_started = asyncio.Event()
     release_validation = asyncio.Event()
+    validations = 0
 
     async def validation(*_args: object, **_kwargs: object) -> ValidationResult:
+        nonlocal validations
+        validations += 1
         validation_started.set()
         await release_validation.wait()
         return ValidationResult(True, 0, "ok")
@@ -3535,8 +3654,9 @@ async def test_overlay_build_releases_source_barrier_and_rejects_concurrent_edit
     release_validation.set()
 
     result = (await build)[chapter.id]
-    assert not result.succeeded
-    assert "changed during the coordinator build" in result.output
+    assert result.succeeded
+    assert validations == 2
+    assert orchestrator.state.proof_review_requests == {}
     await orchestrator.shutdown()
 
 

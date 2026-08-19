@@ -253,6 +253,7 @@ PROOF_FINDING_REVIEW_KIND = "proof_finding"
 BUILD_ERROR_REVIEW_KIND = "build_error"
 BUILD_WARNING_REVIEW_KIND = "build_warning"
 LEGACY_DIAGNOSTIC_REVIEW_KIND = "diagnostic"
+COORDINATOR_VERIFICATION_RETRY_DETAIL = "coordinator verification retry queued"
 DIAGNOSTIC_REVIEW_KINDS = frozenset(
     {
         BUILD_ERROR_REVIEW_KIND,
@@ -561,6 +562,7 @@ class Orchestrator:
                     migrated,
                     detail="recovered post-review findings",
                 )
+        await self.state.migrate_stale_snapshot_review_requests()
         report("Preparing agent execution", 6)
         await self.executor.prepare()
         report("Preparing isolated workspaces and Lean caches", 7)
@@ -3510,6 +3512,11 @@ class Orchestrator:
                 succeeded_ids = {
                     chapter_id for chapter_id, result in attempt_results.items() if result.succeeded
                 }
+                stale_ids = {
+                    chapter_id
+                    for chapter_id, result in attempt_results.items()
+                    if result.status is ValidationStatus.STALE_SNAPSHOT
+                }
                 if succeeded_ids:
                     results_by_id.update(
                         (chapter_id, attempt_results[chapter_id]) for chapter_id in succeeded_ids
@@ -3521,7 +3528,10 @@ class Orchestrator:
                     )
                     remaining.difference_update(succeeded_ids)
                     finish_ready_requests()
-                failed_ids = active_ids.difference(succeeded_ids)
+                # A stale immutable build is an orchestration retry, not a source finding.
+                # Leave its callers unfinished so they re-enter the coordinator lane instead
+                # of leaking a synthetic build error into review or proof work.
+                failed_ids = active_ids.difference(succeeded_ids, stale_ids)
                 if not failed_ids:
                     if remaining:
                         requeue_unfinished()
@@ -4218,35 +4228,45 @@ class Orchestrator:
         return targets
 
     async def _review_build(self, chapter: WorkUnitLike) -> dict[str, str]:
-        """Build review output once, returning diagnostics to review rather than formalization."""
+        """Build review output, retrying stale snapshots before returning diagnostics."""
 
-        snapshots: dict[str, ValidatedBuildSnapshot] = {}
-        result = (
-            await self._build_chapters(
-                (chapter,),
-                publish_if_clean=True,
-                mode="review-verification",
-                stage=Stage.REVIEW,
-                snapshots=snapshots,
-            )
-        )[chapter.id]
-        if result.succeeded:
-            if await self._publish_validated_build(chapter, snapshots[chapter.id]):
+        while True:
+            snapshots: dict[str, ValidatedBuildSnapshot] = {}
+            result = (
+                await self._build_chapters(
+                    (chapter,),
+                    publish_if_clean=True,
+                    mode="review-verification",
+                    stage=Stage.REVIEW,
+                    snapshots=snapshots,
+                )
+            )[chapter.id]
+            if result.status is ValidationStatus.STALE_SNAPSHOT:
                 await self.state.set_task(
                     chapter.id,
                     Stage.REVIEW,
                     TaskStatus.RUNNING,
-                    "coordinator verification clean; continuing editing review",
+                    COORDINATOR_VERIFICATION_RETRY_DETAIL,
                 )
-                return {}
-            return {
-                chapter.id: (
-                    "The source changed after coordinator verification. Re-read the current "
-                    "scope and complete the review against the fresh source."
+                continue
+            if result.succeeded:
+                if await self._publish_validated_build(chapter, snapshots[chapter.id]):
+                    await self.state.set_task(
+                        chapter.id,
+                        Stage.REVIEW,
+                        TaskStatus.RUNNING,
+                        "coordinator verification clean; continuing editing review",
+                    )
+                    return {}
+                await self.state.set_task(
+                    chapter.id,
+                    Stage.REVIEW,
+                    TaskStatus.RUNNING,
+                    COORDINATOR_VERIFICATION_RETRY_DETAIL,
                 )
-            }
-        feedback = (await self._build_feedback_async({chapter.id: result})).actionable
-        return feedback or {chapter.id: result.output}
+                continue
+            feedback = (await self._build_feedback_async({chapter.id: result})).actionable
+            return feedback or {chapter.id: result.output}
 
     async def _queue_review_feedback(
         self,
@@ -4288,6 +4308,7 @@ class Orchestrator:
         feedback: str = "",
         role: str = "",
         proof_request_ids: tuple[str, ...] = (),
+        verification_retry: bool = False,
     ) -> StageOutcome:
         """Run at most five edit/rebuild cycles for one reviewable chapter."""
 
@@ -4330,6 +4351,25 @@ class Orchestrator:
                     "review follow-up queued",
                 )
             return True
+
+        if verification_retry:
+            build_feedback = await self._review_build(chapter)
+            if build_feedback:
+                if not await route_feedback(
+                    build_feedback,
+                    origin=f"review-build:{chapter.id}:{uuid4().hex[:12]}",
+                ):
+                    return StageOutcome(ExecutionDisposition.FAILED)
+            else:
+                completed = await self._complete_review(
+                    chapter,
+                    "coordinator verification completed after stale snapshot",
+                    expected_generation=review_generation,
+                    proof_request_ids=request_ids,
+                )
+                return StageOutcome(
+                    ExecutionDisposition.SUCCEEDED if completed else ExecutionDisposition.WAITING
+                )
 
         persisted = self.state.formalize_graph.get("clean", {})
         records = persisted if isinstance(persisted, dict) else {}
@@ -4737,7 +4777,12 @@ class Orchestrator:
                         dependencies = graph.dependencies[chapter_id]
                         proof_feedback, proof_request_ids = self._proof_review_feedback(chapter_id)
                         proof_review_role = self._proof_review_role(proof_request_ids)
-                        review_rerun = rerun or chapter_id in attempted or review_task.rounds > 0
+                        verification_retry = (
+                            review_task.detail == COORDINATOR_VERIFICATION_RETRY_DETAIL
+                        )
+                        review_rerun = (
+                            rerun or chapter_id in attempted or review_task.rounds > 0
+                        ) and not verification_retry
                         await self.state.set_task(
                             chapter_id,
                             Stage.REVIEW,
@@ -4749,6 +4794,8 @@ class Orchestrator:
                                 if proof_review_role == DIAGNOSTIC_REVIEW_ROLE
                                 else "failed-proof statement re-review queued"
                                 if proof_feedback
+                                else COORDINATOR_VERIFICATION_RETRY_DETAIL
+                                if verification_retry
                                 else "targeted re-review queued"
                                 if rereview
                                 else "waiting for dependency-ordered coordinator build"
@@ -4761,6 +4808,8 @@ class Orchestrator:
                         }
                         if proof_review_role:
                             review_feedback_options["role"] = proof_review_role
+                        if verification_retry:
+                            review_feedback_options["verification_retry"] = True
                         review_operation = (
                             self._review_chapter_to_clean(
                                 by_id[chapter_id],
@@ -4772,6 +4821,7 @@ class Orchestrator:
                                 by_id[chapter_id],
                                 rounds_used,
                                 rerun=review_rerun,
+                                **({"verification_retry": True} if verification_retry else {}),
                             )
                         )
                         review_tasks[chapter_id] = RunningReview(

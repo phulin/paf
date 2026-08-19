@@ -2610,6 +2610,53 @@ class StateStore:
             await self._persist()
         return migrated
 
+    async def migrate_stale_snapshot_review_requests(self) -> set[str]:
+        """Discard orchestration-only stale builds that were persisted as review findings."""
+
+        markers = (
+            "Source dependency scope changed during the coordinator build; retry required.",
+            "The source changed after coordinator verification.",
+        )
+        affected: set[str] = set()
+        changed = False
+        async with self.batch():
+            for request_id, value in tuple(self.proof_review_requests.items()):
+                if not isinstance(value, dict):
+                    continue
+                if value.get("kind") != "build_error":
+                    continue
+                feedback = value.get("feedback")
+                if not isinstance(feedback, dict):
+                    continue
+                for chapter_id, block in tuple(feedback.items()):
+                    if isinstance(block, str) and any(marker in block for marker in markers):
+                        feedback.pop(chapter_id, None)
+                        affected.add(chapter_id)
+                        changed = True
+                if not feedback:
+                    self.proof_review_requests.pop(request_id, None)
+            if changed:
+                for chapter_id in affected:
+                    has_real_feedback = any(
+                        isinstance((feedback := request.get("feedback")), dict)
+                        and chapter_id in feedback
+                        for request in self.proof_review_requests.values()
+                        if isinstance(request, dict)
+                    )
+                    if not has_real_feedback and self.key(chapter_id, Stage.REVIEW) in self.tasks:
+                        await self.set_task(
+                            chapter_id,
+                            Stage.REVIEW,
+                            TaskStatus.PENDING,
+                            "coordinator verification retry queued",
+                        )
+                self._mark_dirty(
+                    global_state=False,
+                    sections={"proof_review_requests"},
+                )
+                await self._persist()
+        return affected
+
     async def enqueue_proof_review_request(
         self,
         feedback: dict[str, str],
