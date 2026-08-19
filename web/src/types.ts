@@ -92,6 +92,10 @@ export interface ShepherdAgent {
   run_id: string;
   role: "shepherd" | "repair_worker" | string;
   work_unit_id: string;
+  document_id?: string;
+  document_title?: string;
+  ordinal?: number;
+  unit_title?: string;
   stage: Stage | string;
   status: string;
   label: string;

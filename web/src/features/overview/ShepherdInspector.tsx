@@ -9,6 +9,14 @@ function agentKey(agent: ShepherdAgent): string {
   return agent.repair_work_unit_id || agent.run_id || `${agent.role}:${agent.work_unit_id}`;
 }
 
+function taskLocation(agent: ShepherdAgent): string {
+  const document = agent.document_title || agent.document_id;
+  const chapter = agent.ordinal == null ? "" : `Chapter ${agent.ordinal}`;
+  const location = [document, chapter].filter(Boolean).join(" · ");
+  if (location && agent.unit_title) return `${location} — ${agent.unit_title}`;
+  return location || agent.unit_title || agent.work_unit_id;
+}
+
 export function ShepherdInspector({
   state,
   close,
@@ -72,6 +80,7 @@ export function ShepherdInspector({
               {agents.length ? (
                 agents.map((agent) => {
                   const active = agent === selected;
+                  const location = taskLocation(agent);
                   return (
                     <button
                       className={`shepherd-agent-row${active ? " selected" : ""}`}
@@ -82,8 +91,11 @@ export function ShepherdInspector({
                         {agent.role === "shepherd" ? <ShieldCheck size={16} /> : <Bot size={16} />}
                       </span>
                       <span>
-                        <strong>{agent.label}</strong>
-                        <small>
+                        <strong title={location || agent.label}>
+                          {agent.role === "repair_worker" && location ? location : agent.label}
+                        </strong>
+                        <small>{agent.role === "repair_worker" ? agent.label : location}</small>
+                        <small title={agent.objective}>
                           {agent.objective || agent.work_unit_id || "Planning repair DAG"}
                         </small>
                       </span>
@@ -104,7 +116,11 @@ export function ShepherdInspector({
             <div className="drawer-section shepherd-selection">
               <span className="eyebrow">Selected agent</span>
               <strong>{activity?.current || selected.objective || selected.label}</strong>
+              {taskLocation(selected) && (
+                <span className="shepherd-selection-location">{taskLocation(selected)}</span>
+              )}
               <span>
+                {selected.stage} · {selected.status} ·{" "}
                 {selected.run_id ? `run ${selected.run_id.slice(0, 12)}` : "not started"}
                 {activity?.updated_at ? ` · ${timeAgo(activity.updated_at)}` : ""}
               </span>
