@@ -6662,6 +6662,8 @@ class Orchestrator:
         await self._drain_active_shepherd()
         if self._repair_progress_generation != generation:
             result = await self._run_stage_once(stage)
+        if stage is Stage.DISCOVER:
+            return result
         cleanup = await self._drain_warning_cleanups()
         if cleanup.clean and cleanup.changed:
             # Re-evaluate stage certificates after the cleanup edit. Interface
