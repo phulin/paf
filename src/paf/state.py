@@ -849,11 +849,15 @@ class StateStore:
             formalize = self.task(chapter.id, Stage.FORMALIZE)
             review = self.task(chapter.id, Stage.REVIEW)
             prove = self.task(chapter.id, Stage.PROVE)
-            if formalize.status != TaskStatus.SUCCEEDED and (
-                review.rounds > 0
-                or prove.rounds > 0
-                or review.status in (TaskStatus.RUNNING, TaskStatus.SUCCEEDED)
-                or prove.status in (TaskStatus.RUNNING, TaskStatus.SUCCEEDED)
+            if (
+                formalize.status != TaskStatus.SUCCEEDED
+                and not formalize.recovering_failure
+                and (
+                    review.rounds > 0
+                    or prove.rounds > 0
+                    or review.status in (TaskStatus.RUNNING, TaskStatus.SUCCEEDED)
+                    or prove.status in (TaskStatus.RUNNING, TaskStatus.SUCCEEDED)
+                )
             ):
                 formalize.status = TaskStatus.SUCCEEDED
                 formalize.phase = TaskPhase.IDLE
@@ -3189,6 +3193,7 @@ class StateStore:
             and stage is Stage.FORMALIZE
             and status == TaskStatus.RUNNING
             and self.later_stage_started(chapter_id)
+            and not task.recovering_failure
         ):
             raise RuntimeError(
                 f"cannot start formalize for {chapter_id} after review or proof has begun"
@@ -3245,6 +3250,7 @@ class StateStore:
                 stage is Stage.FORMALIZE
                 and status == TaskStatus.RUNNING
                 and self.later_stage_started(chapter_id)
+                and not task.recovering_failure
             ):
                 raise RuntimeError(
                     f"cannot start formalize for {chapter_id} after review or proof has begun"
@@ -3294,6 +3300,18 @@ class StateStore:
         waiting = tuple(dict.fromkeys(requirements))
         if not waiting:
             raise ValueError("a waiting task requires at least one unmet requirement")
+        if stage is Stage.FORMALIZE:
+            invalid = tuple(
+                requirement.owner_task_key
+                for requirement in waiting
+                if requirement.owner_task_key is not None
+                and requirement.owner_task_key.rpartition(":")[2]
+                in {Stage.REVIEW.value, Stage.PROVE.value}
+            )
+            if invalid:
+                raise ValueError(
+                    "formalize tasks cannot wait on later-stage owners: " + ", ".join(invalid)
+                )
         await self.set_task(
             chapter_id,
             stage,
@@ -3401,6 +3419,23 @@ class StateStore:
         return {item for item in raw if isinstance(item, str)} if isinstance(raw, list) else set()
 
     def _migrate_legacy_task_wait(self, task: TaskRecord) -> None:
+        if Stage(task.stage) is Stage.FORMALIZE:
+            task.waiting_on = tuple(
+                Requirement(
+                    requirement.kind,
+                    owner_task_key=(
+                        requirement.owner_task_key.rpartition(":")[0] + f":{Stage.FORMALIZE.value}"
+                        if requirement.kind is RequirementKind.COORDINATOR_OWNER
+                        and requirement.owner_task_key is not None
+                        and requirement.owner_task_key.rpartition(":")[2]
+                        in {Stage.REVIEW.value, Stage.PROVE.value}
+                        else requirement.owner_task_key
+                    ),
+                    request_id=requirement.request_id,
+                    detail=requirement.detail,
+                )
+                for requirement in task.waiting_on
+            )
         if not any(
             requirement.kind is RequirementKind.LEGACY_BLOCK for requirement in task.waiting_on
         ):
@@ -3789,11 +3824,15 @@ class StateStore:
         return changed
 
     async def start_run(self, chapter_id: str, stage: Stage) -> RunRecord:
-        if stage is Stage.FORMALIZE and self.later_stage_started(chapter_id):
+        task = self.task(chapter_id, stage)
+        if (
+            stage is Stage.FORMALIZE
+            and self.later_stage_started(chapter_id)
+            and not task.recovering_failure
+        ):
             raise RuntimeError(
                 f"cannot start formalize for {chapter_id} after review or proof has begun"
             )
-        task = self.task(chapter_id, stage)
         chapter = self.config.work_unit(chapter_id)
         task.status = TaskStatus.RUNNING
         task.phase = TaskPhase.AGENT

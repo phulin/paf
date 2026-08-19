@@ -2986,7 +2986,7 @@ async def test_formalizer_blocks_on_upstream_diagnostics_without_running_consume
 
 
 @pytest.mark.asyncio
-async def test_formalizer_routes_late_upstream_diagnostics_to_review(
+async def test_formalizer_reopens_late_upstream_diagnostic_owner(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
@@ -2995,7 +2995,9 @@ async def test_formalizer_routes_late_upstream_diagnostics_to_review(
     orchestrator = Orchestrator(config, state)
     await state.load_or_create()
     await state.set_task(owner.id, Stage.FORMALIZE, TaskStatus.SUCCEEDED, "clean")
-    await state.set_task(owner.id, Stage.REVIEW, TaskStatus.RUNNING, "reviewing")
+    review_run = await state.start_run(owner.id, Stage.REVIEW)
+    await state.finish_run(review_run, status=TaskStatus.SUCCEEDED)
+    await state.set_task(owner.id, Stage.PROVE, TaskStatus.SUCCEEDED, "proved")
     monkeypatch.setattr(orchestrator, "_scope_exists", lambda _chapter: asyncio.sleep(0, True))
 
     async def build(*_args: object, **_kwargs: object) -> dict[str, ValidationResult]:
@@ -3023,16 +3025,20 @@ async def test_formalizer_routes_late_upstream_diagnostics_to_review(
     outcome = await orchestrator._formalize(consumer)
 
     owner_formalize = state.task(owner.id, Stage.FORMALIZE)
-    assert owner_formalize.status == TaskStatus.SUCCEEDED
+    assert owner_formalize.status == TaskStatus.PENDING
+    assert owner_formalize.recovering_failure
     owner_review = state.task(owner.id, Stage.REVIEW)
     assert owner_review.status == TaskStatus.PENDING
-    assert (
-        "upstream diagnostic without a source location"
-        in orchestrator._proof_review_feedback(owner.id)[0]
-    )
+    assert owner_review.detail == "review invalidated by reopened formalization"
+    owner_prove = state.task(owner.id, Stage.PROVE)
+    assert owner_prove.status == TaskStatus.PENDING
+    assert owner_prove.detail == "proof invalidated by reopened formalization"
+    assert orchestrator._proof_review_feedback(owner.id) == ("", ())
     requirement = outcome.waiting_on[0]
-    assert requirement.owner_task_key == state.key(owner.id, Stage.REVIEW)
+    assert requirement.owner_task_key == state.key(owner.id, Stage.FORMALIZE)
     assert state.task(consumer.id, Stage.FORMALIZE).waiting_on == (requirement,)
+    recovery_run = await state.start_run(owner.id, Stage.FORMALIZE)
+    assert recovery_run.round == 1
     await state.close()
 
 

@@ -456,6 +456,72 @@ async def test_structured_wait_and_direct_failure_survive_restart(tmp_path) -> N
 
 
 @pytest.mark.asyncio
+async def test_formalize_wait_rejects_later_stage_owner(tmp_path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    state = StateStore(config)
+    await state.load_or_create()
+    owner, consumer = config.work_units
+
+    for owner_stage in (Stage.REVIEW, Stage.PROVE):
+        requirement = Requirement(
+            RequirementKind.COORDINATOR_OWNER,
+            owner_task_key=state.key(owner.id, owner_stage),
+            detail="invalid backward stage dependency",
+        )
+        with pytest.raises(ValueError, match="cannot wait on later-stage owners"):
+            await state.set_task_waiting(
+                consumer.id,
+                Stage.FORMALIZE,
+                (requirement,),
+                "invalid wait",
+            )
+
+    await state.close()
+
+
+@pytest.mark.asyncio
+async def test_restart_preserves_reopened_formalize_and_migrates_backward_wait(
+    tmp_path,
+) -> None:
+    config_path = write_project(tmp_path, chapters="chapters = [1, 2]")
+    config = load_config(config_path)
+    state = StateStore(config)
+    await state.load_or_create()
+    owner, consumer = config.work_units
+    await state.set_task(owner.id, Stage.FORMALIZE, TaskStatus.SUCCEEDED, "clean")
+    review_run = await state.start_run(owner.id, Stage.REVIEW)
+    await state.finish_run(review_run, status=TaskStatus.SUCCEEDED)
+    owner_formalize = state.task(owner.id, Stage.FORMALIZE)
+    owner_formalize.recovering_failure = True
+    await state.set_task(
+        owner.id,
+        Stage.FORMALIZE,
+        TaskStatus.PENDING,
+        "reopened after an upstream diagnostic",
+    )
+    consumer_formalize = state.task(consumer.id, Stage.FORMALIZE)
+    consumer_formalize.waiting_on = (
+        Requirement(
+            RequirementKind.COORDINATOR_OWNER,
+            owner_task_key=state.key(owner.id, Stage.REVIEW),
+            detail="persisted backward wait",
+        ),
+    )
+    state._mark_dirty(task=consumer_formalize, global_state=False)
+    await state.flush()
+    await state.close()
+
+    recovered = StateStore(load_config(config_path))
+    await recovered.load_or_create()
+    assert recovered.task(owner.id, Stage.FORMALIZE).status == TaskStatus.PENDING
+    assert recovered.task(owner.id, Stage.FORMALIZE).recovering_failure
+    assert recovered.task(consumer.id, Stage.FORMALIZE).waiting_on[0].owner_task_key == (
+        recovered.key(owner.id, Stage.FORMALIZE)
+    )
+    await recovered.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("reverse_tasks", [False, True])
 async def test_wait_recovery_is_independent_of_task_insertion_order(
     tmp_path, reverse_tasks
