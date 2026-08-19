@@ -472,11 +472,11 @@ fn draw_task_table(frame: &mut Frame<'_>, model: &DashboardModel, area: Rect) {
             .values()
             .any(|task| task.head_build_status == "clean");
         let sorry_count = row.tasks.values().find_map(|task| task.sorry_count);
-        cells.push(Cell::from(format!(
-            "{} · {} sorry",
-            if fresh { "✓ fresh" } else { "○ stale" },
-            sorry_count.map_or_else(|| "?".into(), |count| count.to_string())
-        )));
+        let formalized = row.tasks.get("formalize").is_some_and(|task| {
+            task_mark_style(task, model.is_building(row.unit.id.as_str(), "formalize")).fg
+                == Some(GREEN)
+        });
+        cells.push(Cell::from(build_mark(fresh, sorry_count, formalized)));
         cells.push(Cell::from(current_activity(model, row, activity)));
         cells.push(Cell::from(row_spend(row)));
         Row::new(cells).height(1)
@@ -1343,6 +1343,18 @@ fn task_mark(task: &Task, building: bool) -> String {
     }
 }
 
+fn build_mark(fresh: bool, sorry_count: Option<usize>, formalized: bool) -> String {
+    let freshness = if fresh { "✓ fresh" } else { "○ stale" };
+    if formalized {
+        format!(
+            "{freshness} · {} sorry",
+            sorry_count.map_or_else(|| "?".into(), |count| count.to_string())
+        )
+    } else {
+        freshness.into()
+    }
+}
+
 fn task_mark_style(task: &Task, building: bool) -> Style {
     if building {
         return Style::default().fg(PURPLE);
@@ -1792,6 +1804,15 @@ mod tests {
             ..WorkUnit::default()
         });
         model.state.tasks.insert(
+            "book/chapter-01:formalize".into(),
+            Task {
+                work_unit_id: "book/chapter-01".into(),
+                stage: "formalize".into(),
+                status: "succeeded".into(),
+                ..Task::default()
+            },
+        );
+        model.state.tasks.insert(
             "book/chapter-01:prove".into(),
             Task {
                 work_unit_id: "book/chapter-01".into(),
@@ -1807,6 +1828,12 @@ mod tests {
         terminal.draw(|frame| draw(frame, &mut model)).unwrap();
 
         assert!(terminal.backend().to_string().contains("✓ fresh · 3 sorry"));
+    }
+
+    #[test]
+    fn build_freshness_omits_sorry_count_before_formalization_succeeds() {
+        assert_eq!(build_mark(true, Some(3), false), "✓ fresh");
+        assert_eq!(build_mark(false, Some(3), false), "○ stale");
     }
 
     #[test]
