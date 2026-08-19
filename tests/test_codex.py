@@ -648,17 +648,25 @@ def test_shepherd_planner_is_read_only_and_repair_workers_use_their_model(tmp_pa
         role=REPAIR_WORKER_ROLE,
         feedback=dossier,
     )
-    assert prompt.startswith("# Shepherd repair worker")
+    assert prompt.startswith("# Shepherd roadmap worker")
     assert "## Repair instruction\n\nFix declaration X from diagnostic Y" in prompt
     assert "Original prompt" not in prompt
     assert "# Review proof blockers" not in prompt
     assert "## Rules shared by all Lean stages" in prompt
-    assert "That instruction is the complete assignment" in prompt
+    assert "This instruction replaces the ordinary pipeline-stage mission" in prompt
+    assert "Prepare the assigned failed proof for a normal Luna proof agent" in prompt
+    assert "The roadmap is the main deliverable" in prompt
+    assert "Keep its proof hole for the normal Luna agent" in prompt
     assert "bounded Shepherd repair work unit" in prompt
     assert "replaces the ordinary review stage mission" in prompt
     assert "Follow the review workflow above" not in prompt
     assert "Shepherd repair dossier" in prompt
     assert prompt.rstrip().endswith(f"```text\n{dossier}\n```")
+
+    planner_prompt = executor.build_shepherd_prompt([], scheduling={})
+    assert "The shepherd worker, not this planner, develops the proof roadmap" in planner_prompt
+    assert "Give it the concrete failure" in planner_prompt
+    assert "do not pre-solve the roadmap in the work-unit objective" in planner_prompt
 
 
 def test_warning_cleanup_uses_dedicated_minimal_disturbance_prompt(tmp_path: Path) -> None:
