@@ -377,7 +377,6 @@ class FuseBuildWorkspace:
         upper: Path,
         work: Path,
         merged: Path,
-        transaction_root: Path,
     ) -> None:
         self.manager = manager
         self.build_id = build_id
@@ -387,7 +386,6 @@ class FuseBuildWorkspace:
         self.upper = upper
         self.work = work
         self.root = merged
-        self.transaction_root = transaction_root
         self.closed = False
 
     async def finish(
@@ -424,8 +422,6 @@ class FuseOverlayIsolation:
         self.cache_root = self.root / "cache"
         self.cache_layers = self.cache_root / "layers"
         self.cache_builds = self.cache_root / "builds"
-        self.coordinator_root = self.cache_root / "coordinator"
-        self.coordinator_merged = self.coordinator_root / "merged"
         self.cache_compactions = self.cache_root / "compactions"
         self.slots = self.root / "slots"
         lean_cache = (settings.lean_project / ".lake").as_posix()
@@ -455,7 +451,6 @@ class FuseOverlayIsolation:
         self._published_cache_revision = 0
         self._cache_generations: dict[int, CacheGeneration] = {}
         self._active_build_layers: set[Path] = set()
-        self._coordinator_build_active = False
         self._active_compaction_layers: set[Path] = set()
         self._compaction_task: asyncio.Task[None] | None = None
         self._cleanup_tasks: set[asyncio.Task[None]] = set()
@@ -488,7 +483,6 @@ class FuseOverlayIsolation:
         self.generations.mkdir(parents=True, exist_ok=True)
         self.cache_layers.mkdir(parents=True, exist_ok=True)
         self.cache_builds.mkdir(parents=True, exist_ok=True)
-        self.coordinator_merged.mkdir(parents=True, exist_ok=True)
         self.cache_compactions.mkdir(parents=True, exist_ok=True)
         self.slots.mkdir(parents=True, exist_ok=True)
         # Seed immutable source and split cache bases once. Every later build
@@ -720,26 +714,17 @@ class FuseOverlayIsolation:
 
     async def acquire_build(self, build_id: str) -> FuseBuildWorkspace:
         generation: int | None = None
-        coordinator_claimed = False
         build_root = self._create_cache_workspace(self.cache_builds, "build")
         upper = build_root / "upper"
         work = build_root / "work"
-        # Lake setup artifacts contain absolute paths. Mount every serialized
-        # coordinator transaction at one stable location so those artifacts stay
-        # reusable across builds; the writable upper and work directories remain
-        # private to this transaction.
-        merged = self.coordinator_merged
+        merged = build_root / "merged"
         try:
             async with self._lock:
-                if self._coordinator_build_active:
-                    raise RuntimeError("a coordinator build workspace is already active")
-                self._coordinator_build_active = True
-                coordinator_claimed = True
                 generation, base = await self._generation()
                 layers = self._coordinator_layers
                 self._generation_references[generation] += 1
                 self._active_build_layers.update(layers)
-            for path in (upper, work):
+            for path in (upper, work, merged):
                 path.mkdir(parents=True, exist_ok=False)
             await self._run(
                 "fuse-overlayfs",
@@ -758,7 +743,6 @@ class FuseOverlayIsolation:
                 upper=upper,
                 work=work,
                 merged=merged,
-                transaction_root=build_root,
             )
         except Exception:
             if os.path.ismount(merged):
@@ -769,10 +753,6 @@ class FuseOverlayIsolation:
                 async with self._lock:
                     self._generation_references[generation] -= 1
                     self._active_build_layers.difference_update(layers)
-                    self._coordinator_build_active = False
-            elif coordinator_claimed:
-                async with self._lock:
-                    self._coordinator_build_active = False
             raise
 
     async def finish_build(
@@ -785,7 +765,7 @@ class FuseOverlayIsolation:
     ) -> tuple[str, ...]:
         if publish and not succeeded:
             raise ValueError("cannot publish an unsuccessful coordinator build")
-        build_root = workspace.transaction_root
+        build_root = workspace.root.parent
         promoted: tuple[str, ...] = ()
         layer: Path | None = None
         try:
@@ -830,7 +810,6 @@ class FuseOverlayIsolation:
             async with self._lock:
                 self._generation_references[workspace.generation] -= 1
                 self._active_build_layers.difference_update(workspace.layers)
-                self._coordinator_build_active = False
                 self._drop_unused_cache_generations_locked()
 
     def _drop_unused_cache_generations_locked(self) -> None:
