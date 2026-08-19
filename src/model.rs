@@ -76,6 +76,21 @@ pub struct Shepherd {
     pub failed_units: usize,
     pub cost: Cost,
     pub agents: Vec<ShepherdAgent>,
+    pub runs: Vec<ShepherdRun>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct ShepherdRun {
+    pub id: String,
+    pub status: String,
+    pub trigger: String,
+    pub failure_count: usize,
+    pub started_at: String,
+    pub finished_at: Option<String>,
+    pub summary: String,
+    pub error: String,
+    pub agents: Vec<ShepherdAgent>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -89,6 +104,11 @@ pub struct ShepherdAgent {
     pub label: String,
     pub repair_work_unit_id: String,
     pub objective: String,
+    pub document_id: String,
+    pub document_title: String,
+    pub ordinal: Option<usize>,
+    pub unit_title: String,
+    pub location: String,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -348,6 +368,7 @@ pub struct DashboardModel {
     pub selected: usize,
     pub detail: bool,
     pub shepherd_detail: bool,
+    pub shepherd_run_selected: usize,
     pub shepherd_selected: usize,
     pub detail_tab: DetailTab,
     pub scroll: u16,
@@ -390,6 +411,7 @@ impl DashboardModel {
             selected: 0,
             detail: false,
             shepherd_detail: false,
+            shepherd_run_selected: 0,
             shepherd_selected: 0,
             detail_tab: detail_tab.map(DetailTab::from_name).unwrap_or_default(),
             scroll: 0,
@@ -611,10 +633,15 @@ impl DashboardModel {
     pub fn enter_shepherd_detail(&mut self) {
         self.shepherd_detail = true;
         self.detail = false;
-        self.shepherd_selected = self
+        self.shepherd_run_selected = self
             .state
             .shepherd
-            .agents
+            .runs
+            .iter()
+            .position(|run| run.id == self.state.shepherd.current_sweep_id)
+            .unwrap_or_else(|| self.state.shepherd.runs.len().saturating_sub(1));
+        self.shepherd_selected = self
+            .selected_shepherd_agents()
             .iter()
             .position(|agent| !agent.run_id.is_empty() && agent.status == "running")
             .unwrap_or(0);
@@ -631,7 +658,18 @@ impl DashboardModel {
     }
 
     pub fn selected_shepherd_agent(&self) -> Option<&ShepherdAgent> {
-        self.state.shepherd.agents.get(self.shepherd_selected)
+        self.selected_shepherd_agents().get(self.shepherd_selected)
+    }
+
+    pub fn selected_shepherd_run(&self) -> Option<&ShepherdRun> {
+        self.state.shepherd.runs.get(self.shepherd_run_selected)
+    }
+
+    pub fn selected_shepherd_agents(&self) -> &[ShepherdAgent] {
+        self.selected_shepherd_run()
+            .map_or(self.state.shepherd.agents.as_slice(), |run| {
+                run.agents.as_slice()
+            })
     }
 
     pub fn selected_shepherd_activity(&self) -> Option<&Activity> {
@@ -640,7 +678,7 @@ impl DashboardModel {
     }
 
     pub fn move_shepherd_selection(&mut self, delta: isize) {
-        let length = self.state.shepherd.agents.len();
+        let length = self.selected_shepherd_agents().len();
         if length == 0 {
             self.shepherd_selected = 0;
             return;
@@ -649,6 +687,26 @@ impl DashboardModel {
             .shepherd_selected
             .saturating_add_signed(delta)
             .min(length - 1);
+        self.scroll = 0;
+        self.detail_max_scroll = 0;
+        self.detail_follow_tail = true;
+    }
+
+    pub fn move_shepherd_run_selection(&mut self, delta: isize) {
+        let length = self.state.shepherd.runs.len();
+        if length == 0 {
+            self.shepherd_run_selected = 0;
+            return;
+        }
+        self.shepherd_run_selected = self
+            .shepherd_run_selected
+            .saturating_add_signed(delta)
+            .min(length - 1);
+        self.shepherd_selected = self
+            .selected_shepherd_agents()
+            .iter()
+            .position(|agent| !agent.run_id.is_empty() && agent.status == "running")
+            .unwrap_or(0);
         self.scroll = 0;
         self.detail_max_scroll = 0;
         self.detail_follow_tail = true;

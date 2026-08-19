@@ -145,20 +145,34 @@ fn draw_dashboard(frame: &mut Frame<'_>, model: &DashboardModel) {
 
 fn draw_shepherd_detail(frame: &mut Frame<'_>, model: &mut DashboardModel) {
     let shepherd = &model.state.shepherd;
+    let agents = model.selected_shepherd_agents();
+    let selected_run = model.selected_shepherd_run();
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(4),
-            Constraint::Length((shepherd.agents.len().clamp(1, 8) + 3) as u16),
+            Constraint::Length(3),
+            Constraint::Length((agents.len().clamp(1, 8) + 3) as u16),
             Constraint::Min(6),
             Constraint::Length(1),
         ])
         .split(frame.area());
-    let summary = if shepherd.last_error.is_empty() {
-        shepherd.last_summary.as_str()
-    } else {
-        shepherd.last_error.as_str()
-    };
+    let summary = selected_run.map_or_else(
+        || {
+            if shepherd.last_error.is_empty() {
+                shepherd.last_summary.as_str()
+            } else {
+                shepherd.last_error.as_str()
+            }
+        },
+        |run| {
+            if run.error.is_empty() {
+                run.summary.as_str()
+            } else {
+                run.error.as_str()
+            }
+        },
+    );
     frame.render_widget(
         Paragraph::new(vec![
             Line::styled(
@@ -184,26 +198,61 @@ fn draw_shepherd_detail(frame: &mut Frame<'_>, model: &mut DashboardModel) {
         layout[0],
     );
 
-    let rows = if shepherd.agents.is_empty() {
-        vec![Row::new(["—", "No Shepherd sweep has run yet", "", ""])]
+    let tab_titles = if shepherd.runs.is_empty() {
+        vec![Line::from("Latest")]
     } else {
         shepherd
-            .agents
+            .runs
+            .iter()
+            .enumerate()
+            .map(|(index, run)| Line::from(format!("Run {} · {}", index + 1, title(&run.status))))
+            .collect()
+    };
+    frame.render_widget(
+        Tabs::new(tab_titles)
+            .select(model.shepherd_run_selected)
+            .highlight_style(Style::default().fg(YELLOW).add_modifier(Modifier::BOLD))
+            .divider(" │ ")
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Shepherd runs "),
+            ),
+        layout[1],
+    );
+
+    let rows = if agents.is_empty() {
+        vec![Row::new(["—", "No Shepherd sweep has run yet", "", "", ""])]
+    } else {
+        agents
             .iter()
             .map(|agent| {
-                Row::new([
+                let book = if !agent.document_title.is_empty() {
+                    agent.document_title.clone()
+                } else if !agent.document_id.is_empty() {
+                    agent.document_id.clone()
+                } else {
+                    "Sweep".into()
+                };
+                let chapter = if !agent.location.is_empty() {
+                    agent.location.clone()
+                } else if let Some(ordinal) = agent.ordinal {
+                    format!("Chapter {ordinal} · {}", agent.unit_title)
+                } else if !agent.unit_title.is_empty() {
+                    agent.unit_title.clone()
+                } else {
+                    agent.work_unit_id.clone()
+                };
+                Row::new(vec![
                     if agent.role == "shepherd" {
-                        "planner"
+                        Cell::from("planner")
                     } else {
-                        "worker"
+                        Cell::from("worker")
                     },
-                    agent.label.as_str(),
-                    agent.status.as_str(),
-                    if agent.run_id.is_empty() {
-                        "not started"
-                    } else {
-                        agent.run_id.as_str()
-                    },
+                    Cell::from(book),
+                    Cell::from(chapter),
+                    Cell::from(agent.objective.clone()),
+                    Cell::from(agent.status.clone()),
                 ])
             })
             .collect()
@@ -212,13 +261,14 @@ fn draw_shepherd_detail(frame: &mut Frame<'_>, model: &mut DashboardModel) {
         rows,
         [
             Constraint::Length(9),
+            Constraint::Length(20),
             Constraint::Min(24),
+            Constraint::Min(28),
             Constraint::Length(13),
-            Constraint::Length(14),
         ],
     )
     .header(
-        Row::new(["Role", "Agent / objective", "Status", "Run"])
+        Row::new(["Role", "Book", "Chapter", "Objective", "Status"])
             .style(Style::default().fg(CYAN).add_modifier(Modifier::BOLD)),
     )
     .row_highlight_style(Style::default().bg(SURFACE).add_modifier(Modifier::BOLD))
@@ -229,8 +279,8 @@ fn draw_shepherd_detail(frame: &mut Frame<'_>, model: &mut DashboardModel) {
             .title(" Relevant agents "),
     );
     let mut table_state = TableState::default()
-        .with_selected((!shepherd.agents.is_empty()).then_some(model.shepherd_selected));
-    frame.render_stateful_widget(table, layout[1], &mut table_state);
+        .with_selected((!agents.is_empty()).then_some(model.shepherd_selected));
+    frame.render_stateful_widget(table, layout[2], &mut table_state);
 
     let text = detail_text(
         DetailTab::Timeline,
@@ -238,14 +288,12 @@ fn draw_shepherd_detail(frame: &mut Frame<'_>, model: &mut DashboardModel) {
         None,
         None,
     );
-    draw_detail_content(frame, model, text, layout[2]);
+    draw_detail_content(frame, model, text, layout[3]);
     frame.render_widget(
-        Paragraph::new(
-            "↑↓ select agent  Enter open full agent view  s/Esc/q back  r reload TUI  d detach",
-        )
-        .style(Style::default().fg(MUTED))
-        .alignment(Alignment::Center),
-        layout[3],
+        Paragraph::new("←→ switch run  ↑↓ select agent  Enter open full agent view  s/Esc/q back")
+            .style(Style::default().fg(MUTED))
+            .alignment(Alignment::Center),
+        layout[4],
     );
 }
 
@@ -1655,16 +1703,28 @@ mod tests {
                         "pending_failures": 2,
                         "planned_units": 1,
                         "running_units": 1,
+                        "current_sweep_id": "sweep-2",
                         "cost": {"estimated_usd": 3.25},
                         "last_summary": "repair the shared blocker",
-                        "agents": [{
+                        "runs": [{
+                            "id": "sweep-1",
+                            "status": "completed",
+                            "summary": "older repair",
+                            "agents": []
+                        }, {
+                            "id": "sweep-2",
+                            "status": "repairing",
+                            "failure_count": 2,
+                            "summary": "repair the shared blocker",
+                            "agents": [{
                             "run_id": "plan-run",
                             "role": "shepherd",
                             "work_unit_id": "book/chapter-01",
                             "stage": "discover",
                             "status": "running",
                             "label": "Shepherd planner",
-                            "objective": "rank repair candidates"
+                            "objective": "rank repair candidates",
+                            "location": "2 chapters in 1 book"
                         }, {
                             "run_id": "worker-run",
                             "role": "repair_worker",
@@ -1673,7 +1733,11 @@ mod tests {
                             "status": "running",
                             "label": "Repair review",
                             "repair_work_unit_id": "repair-1",
-                            "objective": "repair the failed declaration"
+                            "objective": "repair the failed declaration",
+                            "document_title": "Algebra",
+                            "ordinal": 3,
+                            "unit_title": "Ideals"
+                        }]
                         }]
                     },
                     "activities": {
@@ -1697,17 +1761,25 @@ mod tests {
             .unwrap();
         assert_eq!(model.state.shepherd.cost.estimated_usd, 3.25);
         model.enter_shepherd_detail();
+        assert_eq!(model.shepherd_run_selected, 1);
 
         let backend = TestBackend::new(140, 32);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| draw(frame, &mut model)).unwrap();
         let rendered = terminal.backend().to_string();
         assert!(rendered.contains("Shepherd trace"));
-        assert!(rendered.contains("Shepherd planner"));
-        assert!(rendered.contains("Repair review"));
+        assert!(rendered.contains("Run 1 · Completed"));
+        assert!(rendered.contains("Run 2 · Repairing"));
+        assert!(rendered.contains("2 chapters in 1 book"));
+        assert!(rendered.contains("Algebra"));
+        assert!(rendered.contains("Chapter 3 · Ideals"));
         assert!(rendered.contains("cost $3.25"));
         assert!(rendered.contains("Inspect failures"));
         assert!(rendered.contains("Enter open full agent view"));
+
+        model.move_shepherd_run_selection(-1);
+        assert_eq!(model.shepherd_run_selected, 0);
+        assert!(model.selected_shepherd_agent().is_none());
     }
 
     #[test]

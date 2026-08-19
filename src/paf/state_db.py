@@ -78,8 +78,10 @@ def bounded_global_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
         }
     }
     shepherd = header.get("shepherd")
-    if isinstance(shepherd, dict) and "agents" in shepherd:
-        header["shepherd"] = {key: value for key, value in shepherd.items() if key != "agents"}
+    if isinstance(shepherd, dict) and ({"agents", "runs"} & shepherd.keys()):
+        header["shepherd"] = {
+            key: value for key, value in shepherd.items() if key not in {"agents", "runs"}
+        }
     return header
 
 

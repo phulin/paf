@@ -775,6 +775,35 @@ p {
   font-size: 12px;
   line-height: 1.55;
 }
+.shepherd-run-tabs {
+  display: flex;
+  gap: 6px;
+  padding: 10px 18px;
+  overflow-x: auto;
+  border-bottom: 1px solid var(--border);
+}
+.shepherd-run-tabs button {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: baseline;
+  gap: 7px;
+  padding: 7px 9px;
+  color: var(--muted);
+  border: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.015);
+  cursor: pointer;
+  font:
+    500 9px / 1 ui-monospace,
+    monospace;
+}
+.shepherd-run-tabs button.selected {
+  color: var(--text-strong);
+  border-color: rgba(224, 175, 104, 0.55);
+  background: rgba(224, 175, 104, 0.07);
+}
+.shepherd-run-tabs strong {
+  font-size: 10px;
+}
 .shepherd-agent-section {
   min-height: 0;
 }

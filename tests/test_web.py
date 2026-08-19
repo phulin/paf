@@ -8,6 +8,7 @@ from starlette.testclient import TestClient
 
 import paf.web as web_module
 from paf.cli import main
+from paf.codex import SHEPHERD_ROLE
 from paf.config import load_config
 from paf.models import PipelineConfig, Stage
 from paf.state import StateStore, TaskPhase, TaskStatus
@@ -124,6 +125,42 @@ def test_snapshot_keeps_shepherd_agent_activity_without_a_latest_task(tmp_path: 
     snapshot = web_module._snapshot(candidate, tmp_path)
 
     assert snapshot["activities"]["planner-run"]["current"] == "planning repairs"
+
+
+def test_snapshot_reconstructs_shepherd_run_tabs_from_persisted_state(
+    tmp_path: Path, static_dir: Path
+) -> None:
+    config = _project(tmp_path)
+    state = StateStore(config)
+
+    async def populate() -> tuple[str, str]:
+        await state.load_or_create()
+        chapter = config.work_units[0]
+        await state.set_task(chapter.id, Stage.REVIEW, TaskStatus.FAILED, "review failed")
+        sweep = await state.start_repair_sweep(
+            trigger="threshold", task_keys=[state.key(chapter.id, Stage.REVIEW)]
+        )
+        planner = await state.start_auxiliary_run(
+            chapter.id,
+            Stage.DISCOVER,
+            role=SHEPHERD_ROLE,
+            request_ids=sweep.case_ids,
+        )
+        await state.install_repair_plan(sweep.id, [], summary="triaged", run_id=planner.id)
+        await state.close()
+        return sweep.id, planner.id
+
+    sweep_id, planner_id = asyncio.run(populate())
+    with TestClient(web_module.create_app(config, static_dir=static_dir)) as client:
+        snapshot = client.get("/api/swarm").json()
+
+    run = snapshot["shepherd"]["runs"][0]
+    assert run["id"] == sweep_id
+    assert run["agents"][0]["run_id"] == planner_id
+    assert run["agents"][0]["location"] == "A Book · Chapter 1 — First chapter"
+    discover = snapshot["tasks"][f"{config.work_units[0].id}:discover"]
+    assert discover["active_auxiliary_role"] == ""
+    assert discover["latest_run_id"] is None
 
 
 def test_dashboard_changes_return_only_changed_rows_and_live_activity(

@@ -198,8 +198,130 @@ def _activity(candidate: StateCandidate, run_id: str) -> dict[str, Any] | None:
     return value if isinstance(value, dict) else None
 
 
+def _shepherd_with_runs(candidate: StateCandidate, state: dict[str, Any]) -> dict[str, Any]:
+    shepherd = state.get("shepherd", {})
+    result = dict(shepherd) if isinstance(shepherd, dict) else {}
+    if isinstance(result.get("runs"), list):
+        return result
+    sweeps = state.get("repair_sweeps", {})
+    units = state.get("repair_work_units", {})
+    cases = state.get("repair_cases", {})
+    if not isinstance(sweeps, dict) or not sweeps:
+        return result
+    units = units if isinstance(units, dict) else {}
+    cases = cases if isinstance(cases, dict) else {}
+    documents = {
+        str(document.get("id", "")): document
+        for document in state.get("documents", [])
+        if isinstance(document, dict)
+    }
+    work_units = {
+        str(unit.get("id", "")): unit
+        for unit in state.get("work_units", [])
+        if isinstance(unit, dict)
+    }
+    database = StateDatabase(candidate.directory)
+    run_payloads = database.run_payloads() if database.path.is_file() else {}
+
+    def context(work_unit_id: str) -> dict[str, Any]:
+        work_unit = work_units.get(work_unit_id, {})
+        document_id = str(work_unit.get("document_id", ""))
+        document = documents.get(document_id, {})
+        return {
+            "document_id": document_id,
+            "document_title": str(document.get("title", document_id)),
+            "ordinal": work_unit.get("ordinal"),
+            "unit_title": str(work_unit.get("title", "")),
+        }
+
+    def sweep_location(sweep: dict[str, Any]) -> str:
+        chapter_ids = {
+            str(case.get("chapter_id", ""))
+            for case_id in sweep.get("case_ids", [])
+            if isinstance((case := cases.get(str(case_id))), dict)
+        }
+        selected = [work_units[item] for item in sorted(chapter_ids) if item in work_units]
+        if len(selected) == 1:
+            item = selected[0]
+            ctx = context(str(item.get("id", "")))
+            return f"{ctx['document_title']} · Chapter {ctx['ordinal']} — {ctx['unit_title']}"
+        document_count = len({item.get("document_id") for item in selected})
+        if selected:
+            books = "book" if document_count == 1 else "books"
+            return f"{len(selected)} chapters in {document_count} {books}"
+        return f"{sweep.get('failure_count', 0)} failures"
+
+    run_views = []
+    for sweep in sorted(
+        sweeps.values(), key=lambda item: (str(item.get("started_at", "")), str(item.get("id", "")))
+    ):
+        if not isinstance(sweep, dict):
+            continue
+        planner_id = str(sweep.get("run_id", ""))
+        if not planner_id and sweep.get("id") == result.get("current_sweep_id"):
+            planner_id = str(result.get("current_run_id", ""))
+        agents = []
+        if planner_id:
+            planner = run_payloads.get(planner_id, {})
+            agents.append(
+                {
+                    "run_id": planner_id,
+                    "role": "shepherd",
+                    "work_unit_id": str(planner.get("work_unit_id", planner.get("chapter_id", ""))),
+                    "stage": str(planner.get("stage", "discover")),
+                    "status": str(planner.get("status", sweep.get("status", ""))),
+                    "label": "Shepherd planner",
+                    "repair_work_unit_id": "",
+                    "objective": str(sweep.get("summary", "")),
+                    "location": sweep_location(sweep),
+                }
+            )
+        for unit_id in sweep.get("work_unit_ids", []):
+            unit = units.get(str(unit_id))
+            if not isinstance(unit, dict):
+                continue
+            owner = str(unit.get("owner_chapter_id", ""))
+            agents.append(
+                {
+                    "run_id": str(unit.get("run_id", "")),
+                    "role": "repair_worker",
+                    "work_unit_id": owner,
+                    "stage": str(unit.get("target_stage", "")),
+                    "status": str(unit.get("status", "")),
+                    "label": f"Repair {unit.get('target_stage', '')}",
+                    "repair_work_unit_id": str(unit.get("id", unit_id)),
+                    "objective": str(unit.get("objective", "")),
+                    **context(owner),
+                }
+            )
+        run_views.append(
+            {
+                key: sweep.get(key)
+                for key in (
+                    "id",
+                    "status",
+                    "trigger",
+                    "failure_count",
+                    "started_at",
+                    "finished_at",
+                    "summary",
+                    "error",
+                )
+            }
+            | {"agents": agents}
+        )
+    result["runs"] = run_views
+    selected = next(
+        (run for run in run_views if run["id"] == result.get("current_sweep_id")),
+        run_views[-1],
+    )
+    result["agents"] = selected["agents"]
+    return result
+
+
 def _snapshot(candidate: StateCandidate, project_root: Path) -> dict[str, Any]:
     state = dict(candidate.state)
+    state["shepherd"] = _shepherd_with_runs(candidate, state)
     tasks = state.get("tasks", {})
     recent: list[str] = []
     if isinstance(tasks, dict):
@@ -213,7 +335,14 @@ def _snapshot(candidate: StateCandidate, project_root: Path) -> dict[str, Any]:
                 break
     shepherd = state.get("shepherd", {})
     if isinstance(shepherd, dict):
-        for agent in shepherd.get("agents", []):
+        shepherd_agents = list(shepherd.get("agents", []))
+        shepherd_agents.extend(
+            agent
+            for run in shepherd.get("runs", [])
+            if isinstance(run, dict)
+            for agent in run.get("agents", [])
+        )
+        for agent in shepherd_agents:
             run_id = agent.get("run_id") if isinstance(agent, dict) else None
             if isinstance(run_id, str) and run_id and run_id not in recent:
                 recent.append(run_id)
@@ -490,7 +619,7 @@ def create_app(
         )
 
     async def changes(request: Request) -> Response:
-        candidates = _state_candidates(state_root)
+        candidates = _state_candidates(state_root, dashboard=True)
         requested = request.query_params.get("swarm")
         candidate = next((item for item in candidates if item.id == requested), None)
         candidate = candidate or (candidates[0] if not requested and candidates else None)
@@ -511,6 +640,17 @@ def create_app(
             }
         elif request.query_params.get("view") == "dashboard":
             result = database.dashboard_delta(after)
+            changed_globals = {
+                str(change.get("entity_id", ""))
+                for change in result.get("changes", [])
+                if isinstance(change, dict) and change.get("entity_type") == "global"
+            }
+            if changed_globals.intersection(
+                {"state", "shepherd", "repair_sweeps", "repair_work_units", "repair_cases"}
+            ):
+                globals_ = result.setdefault("globals", {})
+                if isinstance(globals_, dict):
+                    globals_["shepherd"] = _shepherd_with_runs(candidate, candidate.state)
             run_ids = {
                 *result.get("run_ids", []),
                 *result.get("active_run_ids", []),
@@ -526,9 +666,16 @@ def create_app(
             globals_ = result.get("globals", {})
             shepherd = globals_.get("shepherd", {}) if isinstance(globals_, dict) else {}
             if isinstance(shepherd, dict):
+                shepherd_agents = list(shepherd.get("agents", []))
+                shepherd_agents.extend(
+                    agent
+                    for run in shepherd.get("runs", [])
+                    if isinstance(run, dict)
+                    for agent in run.get("agents", [])
+                )
                 run_ids.update(
                     run_id
-                    for agent in shepherd.get("agents", [])
+                    for agent in shepherd_agents
                     if isinstance(agent, dict)
                     and isinstance((run_id := agent.get("run_id")), str)
                     and run_id

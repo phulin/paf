@@ -381,10 +381,7 @@ async def test_dashboard_exposes_live_shepherd_and_repair_worker_runs(tmp_path: 
             "label": "Shepherd planner",
             "repair_work_unit_id": "",
             "objective": "one repair",
-            "document_id": "book",
-            "document_title": "A Book",
-            "ordinal": 1,
-            "unit_title": "First chapter",
+            "location": "A Book · Chapter 1 — First chapter",
         },
         {
             "run_id": worker.id,
@@ -403,15 +400,52 @@ async def test_dashboard_exposes_live_shepherd_and_repair_worker_runs(tmp_path: 
     ]
     assert snapshot["activities"][planner.id]["current"] == "ranking repair candidates"
     assert snapshot["activities"][worker.id]["current"] == "editing the failed declaration"
+    assert snapshot["shepherd"]["runs"][0]["id"] == sweep.id
+    assert snapshot["shepherd"]["runs"][0]["agents"] == snapshot["shepherd"]["agents"]
     assert snapshot["tasks"][task_key]["active_auxiliary_role"] == REPAIR_WORKER_ROLE
 
     await state.finish_run(worker, status=TaskStatus.SUCCEEDED)
     snapshot = state.dashboard_snapshot()
     assert snapshot["tasks"][task_key]["active_auxiliary_role"] == ""
-    assert (
-        snapshot["tasks"][state.key(chapter.id, Stage.DISCOVER)]["active_auxiliary_role"]
-        == SHEPHERD_ROLE
+    discover_task = snapshot["tasks"][state.key(chapter.id, Stage.DISCOVER)]
+    assert discover_task["active_auxiliary_role"] == ""
+    assert discover_task["latest_run_id"] is None
+    await state.close()
+
+
+@pytest.mark.asyncio
+async def test_dashboard_groups_agents_under_chronological_shepherd_runs(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = config.work_units[0]
+    state = StateStore(config)
+    await state.load_or_create()
+    await state.set_task(chapter.id, Stage.REVIEW, TaskStatus.FAILED, "review build failed")
+    task_key = state.key(chapter.id, Stage.REVIEW)
+
+    first = await state.start_repair_sweep(trigger="threshold", task_keys=[task_key])
+    first_planner = await state.start_auxiliary_run(
+        chapter.id,
+        Stage.DISCOVER,
+        role=SHEPHERD_ROLE,
+        request_ids=first.case_ids,
     )
+    await state.install_repair_plan(first.id, [], summary="first plan", run_id=first_planner.id)
+    await state.finish_repair_sweep(first.id)
+
+    second = await state.start_repair_sweep(trigger="interval", task_keys=[task_key])
+    second_planner = await state.start_auxiliary_run(
+        chapter.id,
+        Stage.DISCOVER,
+        role=SHEPHERD_ROLE,
+        request_ids=second.case_ids,
+    )
+    state.shepherd.current_run_id = second_planner.id
+
+    runs = state.dashboard_snapshot()["shepherd"]["runs"]
+    assert [run["id"] for run in runs] == [first.id, second.id]
+    assert runs[0]["agents"][0]["run_id"] == first_planner.id
+    assert runs[1]["agents"][0]["run_id"] == second_planner.id
+    assert runs[1]["trigger"] == "interval"
     await state.close()
 
 

@@ -1149,6 +1149,7 @@ class StateStore:
             active_run.role
             if active_run is not None
             and active_run.auxiliary
+            and active_run.role != "shepherd"
             and active_run.stage == str(task.stage)
             else ""
         )
@@ -1235,6 +1236,7 @@ class StateStore:
         shepherd["cost"] = self.shepherd_cost().as_dict()
         if include_agents:
             shepherd["agents"] = self._shepherd_agent_views()
+            shepherd["runs"] = self._shepherd_run_views()
         return shepherd
 
     def _bounded_global_snapshot(self, *, include_shepherd_agents: bool) -> dict[str, Any]:
@@ -1376,14 +1378,8 @@ class StateStore:
     def _header_object_ids(self) -> dict[str, int]:
         return {"isolation": id(self.isolation)}
 
-    def _shepherd_agent_views(self) -> list[dict[str, Any]]:
-        """Return the planner and repair workers belonging to the current or latest sweep."""
-
-        sweep = self.repair_sweeps.get(self.shepherd.current_sweep_id)
-        if sweep is None and self.repair_sweeps:
-            sweep = max(self.repair_sweeps.values(), key=lambda item: (item.started_at, item.id))
-        if sweep is None:
-            return []
+    def _shepherd_agents_for_sweep(self, sweep: RepairSweepRecord) -> list[dict[str, Any]]:
+        """Return the planner and repair workers belonging to one sweep."""
 
         agents: list[dict[str, Any]] = []
 
@@ -1414,7 +1410,7 @@ class StateStore:
                     "label": "Shepherd planner",
                     "repair_work_unit_id": "",
                     "objective": sweep.summary,
-                    **work_unit_context(run.chapter_id if run is not None else ""),
+                    "location": self._shepherd_sweep_location(sweep),
                 }
             )
         for unit_id in sweep.work_unit_ids:
@@ -1435,6 +1431,58 @@ class StateStore:
                 }
             )
         return agents
+
+    def _shepherd_sweep_location(self, sweep: RepairSweepRecord) -> str:
+        chapter_ids = {
+            case.chapter_id
+            for case_id in sweep.case_ids
+            if (case := self.repair_cases.get(case_id)) is not None
+        }
+        contexts = []
+        for chapter_id in sorted(chapter_ids):
+            try:
+                contexts.append(self.config.work_unit(chapter_id))
+            except KeyError:
+                continue
+        if len(contexts) == 1:
+            unit = contexts[0]
+            return f"{unit.document.title} · Chapter {unit.ordinal} — {unit.title}"
+        document_count = len({unit.document_id for unit in contexts})
+        if contexts:
+            books = "book" if document_count == 1 else "books"
+            return f"{len(contexts)} chapters in {document_count} {books}"
+        return f"{sweep.failure_count} failures"
+
+    def _shepherd_run_views(self) -> list[dict[str, Any]]:
+        """Return chronological sweep tabs with their own planner and workers."""
+
+        return [
+            {
+                "id": sweep.id,
+                "status": sweep.status,
+                "trigger": sweep.trigger,
+                "failure_count": sweep.failure_count,
+                "started_at": sweep.started_at,
+                "finished_at": sweep.finished_at,
+                "summary": sweep.summary,
+                "error": sweep.error,
+                "agents": self._shepherd_agents_for_sweep(sweep),
+            }
+            for sweep in sorted(
+                self.repair_sweeps.values(), key=lambda item: (item.started_at, item.id)
+            )
+        ]
+
+    def _shepherd_agent_views(self) -> list[dict[str, Any]]:
+        """Return agents for the current or latest sweep for older dashboard clients."""
+
+        runs = self._shepherd_run_views()
+        if not runs:
+            return []
+        current = next(
+            (run for run in runs if run["id"] == self.shepherd.current_sweep_id), runs[-1]
+        )
+        return current["agents"]
 
     def _document_dicts(self) -> list[dict[str, Any]]:
         return [
@@ -1471,11 +1519,7 @@ class StateStore:
             "documents": [dict(value) for value in self._document_dicts()],
             "work_units": [dict(value) for value in self._work_unit_dicts()],
             "tasks": {
-                key: self._task_dict(task, task_context, failure_roots)
-                | {
-                    "run_count": len(task.runs),
-                    "latest_run_id": task.runs[-1].id if task.runs else None,
-                }
+                key: self._hot_task_dict(task, task_context, failure_roots)
                 for key, task in sorted(self.tasks.items())
             },
         }
@@ -1516,7 +1560,14 @@ class StateStore:
                 recent_run_ids.append(run_id)
         shepherd_snapshot = snapshot.get("shepherd")
         if isinstance(shepherd_snapshot, dict):
-            for agent in shepherd_snapshot.get("agents", []):
+            shepherd_agents = list(shepherd_snapshot.get("agents", []))
+            shepherd_agents.extend(
+                agent
+                for run in shepherd_snapshot.get("runs", [])
+                if isinstance(run, dict)
+                for agent in run.get("agents", [])
+            )
+            for agent in shepherd_agents:
                 run_id = agent.get("run_id") if isinstance(agent, dict) else None
                 if isinstance(run_id, str) and run_id and run_id not in recent_run_ids:
                     recent_run_ids.append(run_id)
@@ -1593,9 +1644,16 @@ class StateStore:
             globals_["shepherd"] = self._shepherd_dict(include_agents=True)
         shepherd = globals_.get("shepherd", {})
         if isinstance(shepherd, dict):
+            shepherd_agents = list(shepherd.get("agents", []))
+            shepherd_agents.extend(
+                agent
+                for run in shepherd.get("runs", [])
+                if isinstance(run, dict)
+                for agent in run.get("agents", [])
+            )
             run_ids.update(
                 run_id
-                for agent in shepherd.get("agents", [])
+                for agent in shepherd_agents
                 if isinstance(agent, dict)
                 and isinstance((run_id := agent.get("run_id")), str)
                 and run_id
@@ -1677,9 +1735,13 @@ class StateStore:
         context: dict[str, Any] | None = None,
         failure_roots: dict[str, tuple[str, ...]] | None = None,
     ) -> dict[str, Any]:
+        dashboard_run = next(
+            (run for run in reversed(task.runs) if not (run.auxiliary and run.role == "shepherd")),
+            None,
+        )
         return self._task_dict(task, context, failure_roots) | {
             "run_count": len(task.runs),
-            "latest_run_id": task.runs[-1].id if task.runs else None,
+            "latest_run_id": dashboard_run.id if dashboard_run is not None else None,
         }
 
     def _persisted_task_dict(

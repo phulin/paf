@@ -87,6 +87,19 @@ export interface Shepherd {
   failed_units: number;
   cost?: { estimated_usd: number };
   agents?: ShepherdAgent[];
+  runs?: ShepherdRun[];
+}
+
+export interface ShepherdRun {
+  id: string;
+  status: string;
+  trigger: string;
+  failure_count: number;
+  started_at: string;
+  finished_at?: string | null;
+  summary: string;
+  error: string;
+  agents: ShepherdAgent[];
 }
 
 export interface ShepherdAgent {
@@ -97,6 +110,7 @@ export interface ShepherdAgent {
   document_title?: string;
   ordinal?: number;
   unit_title?: string;
+  location?: string;
   stage: Stage | string;
   status: string;
   label: string;

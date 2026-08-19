@@ -514,6 +514,9 @@ fn handle_shepherd_key(
         }
         KeyCode::Up | KeyCode::Char('k') => model.move_shepherd_selection(-1),
         KeyCode::Down | KeyCode::Char('j') => model.move_shepherd_selection(1),
+        KeyCode::Left | KeyCode::Char('h') => model.move_shepherd_run_selection(-1),
+        KeyCode::Right | KeyCode::Char('l') | KeyCode::Tab => model.move_shepherd_run_selection(1),
+        KeyCode::BackTab => model.move_shepherd_run_selection(-1),
         KeyCode::PageUp => model.move_shepherd_selection(-10),
         KeyCode::PageDown => model.move_shepherd_selection(10),
         KeyCode::Home => model.move_shepherd_selection(-(model.shepherd_selected as isize)),

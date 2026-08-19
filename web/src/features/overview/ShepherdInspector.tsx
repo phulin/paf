@@ -2,7 +2,7 @@ import { Activity, ArrowRight, Bot, ShieldCheck, X } from "lucide-react";
 import { useMemo, useState } from "react";
 import { IconButton } from "../../components/Controls";
 import { timeAgo } from "../../lib/format";
-import type { ShepherdAgent, SwarmState } from "../../types";
+import type { ShepherdAgent, ShepherdRun, SwarmState } from "../../types";
 import { AgentTimelinePane } from "./ChapterInspector";
 
 function agentKey(agent: ShepherdAgent): string {
@@ -10,6 +10,7 @@ function agentKey(agent: ShepherdAgent): string {
 }
 
 function taskLocation(agent: ShepherdAgent): string {
+  if (agent.location) return agent.location;
   const document = agent.document_title || agent.document_id;
   const chapter = agent.ordinal == null ? "" : `Chapter ${agent.ordinal}`;
   const location = [document, chapter].filter(Boolean).join(" · ");
@@ -26,7 +27,29 @@ export function ShepherdInspector({
   close: () => void;
   openAgent: (agent: ShepherdAgent) => void;
 }) {
-  const agents = state.shepherd?.agents ?? [];
+  const shepherd = state.shepherd;
+  const runs: ShepherdRun[] = shepherd?.runs?.length
+    ? shepherd.runs
+    : [
+        {
+          id: shepherd?.current_sweep_id || "latest",
+          status: shepherd?.status || "idle",
+          trigger: "",
+          failure_count: shepherd?.pending_failures ?? 0,
+          started_at: shepherd?.last_started_at || "",
+          finished_at: shepherd?.last_finished_at,
+          summary: shepherd?.last_summary || "",
+          error: shepherd?.last_error || "",
+          agents: shepherd?.agents ?? [],
+        },
+      ];
+  const currentRunIndex = runs.findIndex((run) => run.id === shepherd?.current_sweep_id);
+  const initialRun = currentRunIndex >= 0 ? currentRunIndex : runs.length - 1;
+  const [selectedRunId, setSelectedRunId] = useState(
+    () => runs[initialRun]?.id ?? runs[runs.length - 1]?.id ?? "",
+  );
+  const selectedRun = runs.find((run) => run.id === selectedRunId) ?? runs[runs.length - 1];
+  const agents = selectedRun?.agents ?? [];
   const initial = useMemo(
     () => agents.findIndex((agent) => agent.run_id && agent.status === "running"),
     [agents],
@@ -36,7 +59,12 @@ export function ShepherdInspector({
   );
   const selected = agents.find((agent) => agentKey(agent) === selectedKey) ?? agents[0] ?? null;
   const activity = selected?.run_id ? state.activities?.[selected.run_id] : undefined;
-  const shepherd = state.shepherd;
+
+  const selectRun = (run: ShepherdRun) => {
+    setSelectedRunId(run.id);
+    const running = run.agents.find((agent) => agent.run_id && agent.status === "running");
+    setSelectedKey(running ? agentKey(running) : run.agents[0] ? agentKey(run.agents[0]) : "");
+  };
 
   return (
     <div
@@ -71,14 +99,28 @@ export function ShepherdInspector({
               <strong>${(shepherd?.cost?.estimated_usd ?? 0).toFixed(2)}</strong> total cost
             </span>
           </div>
-          {(shepherd?.last_error || shepherd?.last_summary) && (
+          {(selectedRun?.error || selectedRun?.summary) && (
             <div className="drawer-section shepherd-summary">
-              <span className="eyebrow">Latest sweep</span>
-              <p>{shepherd.last_error || shepherd.last_summary}</p>
+              <span className="eyebrow">Selected run</span>
+              <p>{selectedRun.error || selectedRun.summary}</p>
             </div>
           )}
+          <div className="shepherd-run-tabs" role="tablist" aria-label="Shepherd runs">
+            {runs.map((run, index) => (
+              <button
+                aria-selected={run.id === selectedRun?.id}
+                className={run.id === selectedRun?.id ? "selected" : ""}
+                key={run.id}
+                onClick={() => selectRun(run)}
+                role="tab"
+              >
+                <strong>Run {index + 1}</strong>
+                <span>{run.status}</span>
+              </button>
+            ))}
+          </div>
           <div className="drawer-section shepherd-agent-section">
-            <span className="eyebrow">Relevant agents</span>
+            <span className="eyebrow">Agents · {selectedRun?.failure_count ?? 0} failures</span>
             <div className="shepherd-agent-list">
               {agents.length ? (
                 agents.map((agent) => {
@@ -94,10 +136,8 @@ export function ShepherdInspector({
                         {agent.role === "shepherd" ? <ShieldCheck size={16} /> : <Bot size={16} />}
                       </span>
                       <span>
-                        <strong title={location || agent.label}>
-                          {agent.role === "repair_worker" && location ? location : agent.label}
-                        </strong>
-                        <small>{agent.role === "repair_worker" ? agent.label : location}</small>
+                        <strong title={location || agent.label}>{location || agent.label}</strong>
+                        <small>{agent.label}</small>
                         <small title={agent.objective}>
                           {agent.objective || agent.work_unit_id || "Planning repair DAG"}
                         </small>
