@@ -23,6 +23,14 @@ class WarningCleanupResult:
     changed_paths: tuple[str, ...] = ()
     warning_count: int = 0
     reason: str = ""
+    rewrites: tuple[WarningSourceRewrite, ...] = ()
+
+
+@dataclass(frozen=True)
+class WarningSourceRewrite:
+    relative_path: str
+    original: str
+    updated: str
 
 
 @dataclass(frozen=True)
@@ -224,4 +232,29 @@ def apply_deterministic_warning_cleanup(
         True,
         changed_paths=tuple(sorted(relative_paths.values())),
         warning_count=len(diagnostics),
+        rewrites=tuple(
+            WarningSourceRewrite(relative_paths[path], sources[path], updated[path])
+            for path in sorted(updated, key=relative_paths.__getitem__)
+        ),
     )
+
+
+def revert_deterministic_warning_cleanup(
+    *,
+    repo_root: Path,
+    rewrites: tuple[WarningSourceRewrite, ...],
+) -> tuple[str, ...]:
+    """Restore a cleanup only when every source still equals its deterministic result."""
+
+    current: dict[Path, str] = {}
+    for rewrite in rewrites:
+        path = repo_root / rewrite.relative_path
+        value = path.read_text(encoding="utf-8")
+        if value != rewrite.updated:
+            raise RuntimeError(
+                f"cannot revert deterministic warning cleanup after {rewrite.relative_path} changed"
+            )
+        current[path] = rewrite.original
+    for path, source in current.items():
+        path.write_text(source, encoding="utf-8")
+    return tuple(rewrite.relative_path for rewrite in rewrites)

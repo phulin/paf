@@ -13,6 +13,7 @@ from paf.git import (
     GitCommitter,
     agent_commit_subject,
     deterministic_warning_commit_subject,
+    deterministic_warning_revert_subject,
 )
 from paf.models import Chapter, Stage
 from paf.scheduler import Orchestrator
@@ -119,6 +120,10 @@ def test_deterministic_warning_commit_subject_has_custom_book_fallback(tmp_path:
 
     assert deterministic_warning_commit_subject(config.chapters[0]) == (
         "chore(book): resolve deterministic warnings on book book chapter 1"
+    )
+
+    assert deterministic_warning_revert_subject(config.chapters[0]) == (
+        "revert(book): restore warnings on book book chapter 1"
     )
 
 

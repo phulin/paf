@@ -2,7 +2,11 @@ from pathlib import Path
 
 import pytest
 
-from paf.warning_cleanup import WarningDiagnostic, apply_deterministic_warning_cleanup
+from paf.warning_cleanup import (
+    WarningDiagnostic,
+    apply_deterministic_warning_cleanup,
+    revert_deterministic_warning_cleanup,
+)
 
 
 def warning(
@@ -170,3 +174,33 @@ def test_accepts_utf8_byte_column_when_it_identifies_one_token(tmp_path: Path) -
 
     assert result.applied
     assert updated == "α   simp\n"  # noqa: RUF001
+
+
+def test_reverts_an_applied_cleanup(tmp_path: Path) -> None:
+    result, updated = apply(
+        tmp_path,
+        "  simpa using h\n",
+        warning(message="try 'simp' instead of 'simpa'"),
+    )
+    assert result.applied
+    assert updated == "  simp using h\n"
+
+    changed = revert_deterministic_warning_cleanup(repo_root=tmp_path, rewrites=result.rewrites)
+
+    assert changed == ("lean/Book/Chapter.lean",)
+    assert (tmp_path / changed[0]).read_text(encoding="utf-8") == "  simpa using h\n"
+
+
+def test_revert_refuses_to_overwrite_a_later_change(tmp_path: Path) -> None:
+    result, _updated = apply(
+        tmp_path,
+        "  simpa using h\n",
+        warning(message="try 'simp' instead of 'simpa'"),
+    )
+    target = tmp_path / "lean" / "Book" / "Chapter.lean"
+    target.write_text("  exact h\n", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="changed"):
+        revert_deterministic_warning_cleanup(repo_root=tmp_path, rewrites=result.rewrites)
+
+    assert target.read_text(encoding="utf-8") == "  exact h\n"

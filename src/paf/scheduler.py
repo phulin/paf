@@ -48,7 +48,12 @@ from paf.corpus import (
     scheduling_snapshot,
 )
 from paf.diagnostics import unexpected_lean_warnings
-from paf.git import GitCommitError, GitCommitter, deterministic_warning_commit_subject
+from paf.git import (
+    GitCommitError,
+    GitCommitter,
+    deterministic_warning_commit_subject,
+    deterministic_warning_revert_subject,
+)
 from paf.hashing import is_legacy_digest, migrate_digest_text, tagged_digest_text
 from paf.interface_fingerprint import (
     FingerprintCollection,
@@ -72,7 +77,12 @@ from paf.state import (
     TaskStatus,
     UpstreamRequestStatus,
 )
-from paf.warning_cleanup import WarningDiagnostic, apply_deterministic_warning_cleanup
+from paf.warning_cleanup import (
+    WarningCleanupResult,
+    WarningDiagnostic,
+    apply_deterministic_warning_cleanup,
+    revert_deterministic_warning_cleanup,
+)
 
 MAXIMUM_COORDINATOR_BUILD_TARGETS = 500
 REPAIR_EFFORT = {"small": 1.0, "medium": 3.0, "large": 8.0}
@@ -186,7 +196,6 @@ class DeterministicWarningCleanupOutcome:
     attempted: bool = False
     clean: bool = False
     changed: bool = False
-    feedback: str = ""
 
 
 @dataclass(frozen=True)
@@ -4589,6 +4598,30 @@ class Orchestrator:
             blocks[block] = None
         return "\n\n".join(blocks), tuple(request_ids)
 
+    async def _revert_deterministic_warning_cleanup(
+        self,
+        chapter: WorkUnitLike,
+        cleanup: WarningCleanupResult,
+    ) -> str:
+        async with self.source_lock:
+            await self.git.ensure_clean(chapter)
+            changed_paths = await asyncio.to_thread(
+                revert_deterministic_warning_cleanup,
+                repo_root=self.config.settings.repo,
+                rewrites=cleanup.rewrites,
+            )
+            commit = await self.git.commit(
+                chapter,
+                Stage.REVIEW,
+                summary="Restored the source after deterministic warning certification failed.",
+                changed_paths=changed_paths,
+                subject=deterministic_warning_revert_subject(chapter),
+            )
+            self._mark_source_changed((chapter.id,))
+        invalidated_builds = await self._invalidate_build_records((chapter.id,))
+        self._proof_rechecks.update(invalidated_builds)
+        return commit
+
     async def _try_deterministic_warning_cleanup(
         self,
         chapter: WorkUnitLike,
@@ -4681,7 +4714,6 @@ class Orchestrator:
                 )
                 return DeterministicWarningCleanupOutcome(
                     attempted=True,
-                    feedback=validation.output,
                 )
 
             invalidated_builds = await self._invalidate_build_records((chapter.id,))
@@ -4707,11 +4739,20 @@ class Orchestrator:
                 )
 
             complete = validation.succeeded
+            revert_commit = ""
+            if not complete:
+                revert_commit = await self._revert_deterministic_warning_cleanup(
+                    chapter,
+                    cleanup_result,
+                )
             issues = [] if complete else [validation.output[-4000:]]
+            isolation_payload = isolated.as_dict()
+            if revert_commit:
+                isolation_payload["revert_commit"] = revert_commit
             await self.state.finish_run(
                 run,
                 status=TaskStatus.SUCCEEDED if complete else TaskStatus.FAILED,
-                changed=True,
+                changed=complete,
                 report={
                     "complete": complete,
                     "summary": (
@@ -4721,7 +4762,7 @@ class Orchestrator:
                     ),
                     "issues": issues,
                 },
-                isolation=isolated.as_dict(),
+                isolation=isolation_payload,
                 validation=validation.as_dict(),
             )
             if complete:
@@ -4729,8 +4770,7 @@ class Orchestrator:
             return DeterministicWarningCleanupOutcome(
                 attempted=True,
                 clean=complete,
-                changed=True,
-                feedback="" if complete else validation.output,
+                changed=complete,
             )
         except BaseException as error:
             if run is not None and run.status == TaskStatus.RUNNING:
@@ -4771,11 +4811,6 @@ class Orchestrator:
         )
         if deterministic.clean:
             return WarningCleanupOutcome(True, deterministic.changed)
-        if deterministic.attempted and deterministic.feedback:
-            feedback = (
-                f"{feedback}\n\nDeterministic cleanup certification failed; continue from the "
-                f"retained edits and resolve these diagnostics:\n{deterministic.feedback}"
-            )
         attempt = await self._attempt(
             chapter,
             Stage.REVIEW,

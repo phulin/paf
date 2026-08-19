@@ -44,6 +44,13 @@ def deterministic_warning_commit_subject(chapter: WorkUnitLike) -> str:
     )
 
 
+def deterministic_warning_revert_subject(chapter: WorkUnitLike) -> str:
+    """Build the stable subject for rolling back a failed deterministic cleanup."""
+
+    book = _book_label(chapter.book_id)
+    return f"revert({chapter.book_id}): restore warnings on book {book} chapter {chapter.number}"
+
+
 class GitCommitter:
     """Create exact, coordinator-owned commits without absorbing unrelated work."""
 

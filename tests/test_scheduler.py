@@ -3213,13 +3213,12 @@ async def test_failed_deterministic_build_falls_back_to_warning_agent(
     outcome = await orchestrator._clean_warnings_for_chapter(chapter, feedback, request_ids)
 
     assert outcome.clean
-    assert outcome.changed
+    assert not outcome.changed
     assert build_count == 2
     assert len(agent_feedback) == 1
-    assert "Deterministic cleanup certification failed" in agent_feedback[0]
-    assert "deterministic edit failed" in agent_feedback[0]
+    assert agent_feedback == [feedback]
     assert request_id not in state.proof_review_requests
-    assert target.read_text(encoding="utf-8") == "  simp using h\n"
+    assert target.read_text(encoding="utf-8") == "  simpa using h\n"
     await orchestrator.shutdown()
 
 
