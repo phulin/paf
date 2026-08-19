@@ -370,12 +370,10 @@ class RepairWorkUnitRecord:
     owner_chapter_id: str
     target_stage: str
     objective: str
-    depends_on: list[str] = field(default_factory=list)
     effort: str = "medium"
     priority: float = 0.0
     status: str = RepairWorkUnitStatus.PENDING
     queued: bool = False
-    waiting_on: tuple[str, ...] = ()
     detail: str = ""
     run_id: str = ""
     created_at: str = field(default_factory=timestamp)
@@ -729,7 +727,6 @@ class StateStore:
                         if name in RepairWorkUnitRecord.__dataclass_fields__
                     }
                     fields.setdefault("id", record_id)
-                    fields["waiting_on"] = tuple(fields.get("waiting_on", ()))
                     try:
                         self.repair_work_units[record_id] = RepairWorkUnitRecord(**fields)
                     except (TypeError, ValueError):
@@ -4027,7 +4024,6 @@ class StateStore:
             if unit.sweep_id != sweep_id:
                 raise ValueError(f"repair unit {unit.id} belongs to another sweep")
             unit.queued = False
-            unit.waiting_on = tuple(unit.depends_on)
             self.repair_work_units[unit.id] = unit
             for case_id in unit.case_ids:
                 case = self.repair_cases[case_id]
@@ -4056,8 +4052,7 @@ class StateStore:
             return
         unit.status = RepairWorkUnitStatus.PENDING
         unit.queued = True
-        unit.waiting_on = ()
-        unit.detail = "repair ready; waiting for worker capacity"
+        unit.detail = "repair queued in the global agent pool"
         self._mark_dirty(global_state=False, sections={"repair_work_units"})
         await self._persist()
 
@@ -4065,7 +4060,6 @@ class StateStore:
         unit = self.repair_work_units[unit_id]
         unit.status = RepairWorkUnitStatus.RUNNING
         unit.queued = False
-        unit.waiting_on = ()
         unit.started_at = timestamp()
         unit.finished_at = None
         unit.detail = "repair worker running"
@@ -4108,7 +4102,6 @@ class StateStore:
         unit = self.repair_work_units[unit_id]
         unit.status = status
         unit.queued = False
-        unit.waiting_on = ()
         unit.detail = detail
         unit.run_id = run_id
         unit.finished_at = timestamp()

@@ -555,7 +555,6 @@ def load_config(path: str | Path, *, project: Project | None = None) -> Pipeline
                 raw_shepherd.get("maximum_sweeps_per_invocation", 3),
             )
         ),
-        max_agents=int(raw_shepherd.get("max_agents", 2)),
     )
     if shepherd.interval_seconds <= 0:
         raise ValueError("shepherd.interval_seconds must be positive")
@@ -567,8 +566,6 @@ def load_config(path: str | Path, *, project: Project | None = None) -> Pipeline
         raise ValueError("shepherd.maximum_work_units_per_sweep must be positive")
     if shepherd.maximum_consecutive_no_progress_sweeps < 1:
         raise ValueError("shepherd.maximum_consecutive_no_progress_sweeps must be positive")
-    if shepherd.max_agents < 1:
-        raise ValueError("shepherd.max_agents must be positive")
 
     source_defaults, source_rules, source_discovery = _read_source_settings(data)
     if "backend" in data and "target" in data:

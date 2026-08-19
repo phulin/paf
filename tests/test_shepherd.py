@@ -1,3 +1,4 @@
+import asyncio
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,7 +16,7 @@ from paf.codex import (
 )
 from paf.config import load_config
 from paf.models import Stage
-from paf.scheduler import Orchestrator, ShepherdPlanError
+from paf.scheduler import Orchestrator
 from paf.state import (
     RepairCaseStatus,
     RepairWorkUnitRecord,
@@ -298,6 +299,7 @@ async def test_repair_worker_returns_integrated_edit_to_normal_stage_scheduler(
 
     async def attempt(*_args: object, **kwargs: object) -> object:
         assert kwargs["role"] == REPAIR_WORKER_ROLE
+        await state.start_repair_work_unit(unit.id)
         return SimpleNamespace(
             agent=SimpleNamespace(
                 succeeded=True,
@@ -396,7 +398,7 @@ async def test_dashboard_exposes_live_shepherd_and_repair_worker_runs(tmp_path: 
 
 
 @pytest.mark.asyncio
-async def test_shepherd_plan_is_validated_and_ranked_in_the_four_stage_dag(
+async def test_shepherd_plan_is_validated_and_ranked_as_independent_work(
     tmp_path: Path,
 ) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
@@ -411,7 +413,7 @@ async def test_shepherd_plan_is_validated_and_ranked_in_the_four_stage_dag(
     orchestrator = Orchestrator(config, state)
     report: dict[str, Any] = {
         "complete": True,
-        "summary": "repair the shared interface before retrying the proof",
+        "summary": "repair two independent failures",
         "issues": [],
         "dispositions": [
             {"case_id": case.id, "disposition": "repair", "reason": "actionable"} for case in cases
@@ -423,7 +425,6 @@ async def test_shepherd_plan_is_validated_and_ranked_in_the_four_stage_dag(
                 "owner_chapter_id": first.id,
                 "target_stage": "review",
                 "objective": "repair the malformed declaration",
-                "depends_on": [],
                 "effort": "small",
             },
             {
@@ -431,8 +432,7 @@ async def test_shepherd_plan_is_validated_and_ranked_in_the_four_stage_dag(
                 "case_ids": [cases[1].id],
                 "owner_chapter_id": second.id,
                 "target_stage": "prove",
-                "objective": "retry the proof against the repaired declaration",
-                "depends_on": ["interface"],
+                "objective": "repair the stalled proof",
                 "effort": "large",
             },
         ],
@@ -440,16 +440,26 @@ async def test_shepherd_plan_is_validated_and_ranked_in_the_four_stage_dag(
 
     units = orchestrator._validate_shepherd_plan(sweep.id, cases, report)
 
-    by_id = {unit.id: unit for unit in units}
     interface, proof = units
-    assert proof.depends_on == [interface.id]
-    assert interface.priority > orchestrator.statement_schedule.priority(first.document_id)
+    ordinary_ceiling = max(
+        [
+            *orchestrator.statement_schedule.rank.values(),
+            *orchestrator.proof_schedule.rank.values(),
+        ]
+    )
+    assert interface.priority == (
+        orchestrator._repair_priority_offset
+        + orchestrator.statement_schedule.priority(first.document_id)
+        + 1.0
+    )
+    assert interface.priority > ordinary_ceiling
     assert interface.task_keys == [state.key(first.id, Stage.REVIEW)]
-    assert by_id[proof.id].target_stage == Stage.PROVE
-
-    report["work_units"][0]["depends_on"] = ["proof"]
-    with pytest.raises(ShepherdPlanError, match="cycle"):
-        orchestrator._validate_shepherd_plan(sweep.id, cases, report)
+    assert proof.target_stage == Stage.PROVE
+    assert proof.priority == (
+        orchestrator._repair_priority_offset
+        + orchestrator.proof_schedule.priority(second.document_id)
+        + 8.0
+    )
     await state.close()
 
 
@@ -500,7 +510,6 @@ async def test_failure_threshold_launches_strong_shepherd_plan(
                         "owner_chapter_id": first.id,
                         "target_stage": "review",
                         "objective": "repair the shared review blocker",
-                        "depends_on": [],
                         "effort": "medium",
                     }
                 ],
@@ -520,7 +529,7 @@ async def test_failure_threshold_launches_strong_shepherd_plan(
         return True
 
     orchestrator.executor = FakeShepherd(config, state)
-    monkeypatch.setattr(orchestrator, "_execute_repair_plan", capture_plan)
+    monkeypatch.setattr(orchestrator, "_run_repair_units", capture_plan)
 
     assert await orchestrator._trigger_threshold_shepherd() is True
     assert len(planned) == 1
@@ -532,7 +541,7 @@ async def test_failure_threshold_launches_strong_shepherd_plan(
 
 
 @pytest.mark.asyncio
-async def test_discovery_repair_uses_the_discovery_pool(tmp_path: Path) -> None:
+async def test_discovery_repair_uses_the_global_agent_pool(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
     state = StateStore(config)
     await state.load_or_create()
@@ -563,5 +572,66 @@ async def test_discovery_repair_uses_the_discovery_pool(tmp_path: Path) -> None:
             Stage.DISCOVER,
             role=REPAIR_WORKER_ROLE,
         )
-    assert selected == ["discover"]
+    assert selected == ["mutating"]
+    await state.close()
+
+
+@pytest.mark.asyncio
+async def test_all_repair_units_enter_the_global_priority_pool(tmp_path: Path) -> None:
+    config_path = write_project(tmp_path, chapters="chapters = [1, 2, 3]")
+    source_path = tmp_path / "books" / "book.md"
+    source_path.write_text(
+        source_path.read_text(encoding="utf-8") + "\n\n## 3. Third chapter\n",
+        encoding="utf-8",
+    )
+    config = load_config(config_path)
+    state = StateStore(config)
+    await state.load_or_create()
+    task_keys: list[str] = []
+    for chapter in config.work_units:
+        await state.set_task(chapter.id, Stage.REVIEW, TaskStatus.FAILED, "review failed")
+        task_keys.append(state.key(chapter.id, Stage.REVIEW))
+    sweep = await state.start_repair_sweep(trigger="test", task_keys=task_keys)
+    units = [
+        RepairWorkUnitRecord(
+            id=f"repair-{index}",
+            sweep_id=sweep.id,
+            case_ids=[case_id],
+            task_keys=[task_key],
+            owner_chapter_id=chapter.id,
+            target_stage=Stage.REVIEW,
+            objective=f"repair chapter {index}",
+            priority=float(index),
+        )
+        for index, (chapter, task_key, case_id) in enumerate(
+            zip(config.work_units, task_keys, sweep.case_ids, strict=True), start=1
+        )
+    ]
+    await state.install_repair_plan(sweep.id, units, summary="repairs", run_id="planner")
+    orchestrator = Orchestrator(config, state)
+    acquired: list[float] = []
+    all_waiting = asyncio.Event()
+    never = asyncio.Event()
+
+    class RecordingLimiter:
+        async def acquire(self, priority: float) -> None:
+            acquired.append(priority)
+            if len(acquired) == len(units):
+                all_waiting.set()
+            await never.wait()
+
+        def release(self) -> None:
+            raise AssertionError("no global slot was granted")
+
+    orchestrator.agent_slots = cast(Any, RecordingLimiter())
+    running = asyncio.create_task(orchestrator._run_repair_units(units))
+    await asyncio.wait_for(all_waiting.wait(), timeout=1)
+
+    assert sorted(acquired) == [1.0, 2.0, 3.0]
+    assert all(unit.queued for unit in units)
+    assert state.shepherd.running_units == 0
+
+    running.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await running
     await state.close()

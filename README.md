@@ -699,10 +699,10 @@ lean_project = "lean" # relative to swarm.repo; contains lakefile and lean-toolc
 lean_mcp_tool_timeout_seconds = 300
 ```
 
-Failure repair is enabled by default. The Shepherd uses a strong read-only model to plan a bounded
-repair DAG
-every 20 minutes or whenever 10 new terminal failures accumulate; scoped editing remains on
-Luna/max workers and shares the ordinary stage locks and capacity:
+Failure repair is enabled by default. The Shepherd uses a strong read-only model to plan bounded,
+independent repair work units every 20 minutes or whenever 10 new terminal failures accumulate.
+Scoped editing remains on Luna/max workers; repairs receive an effort-based priority boost and
+compete directly for the ordinary global agent capacity:
 
 ```toml
 [shepherd]
@@ -716,7 +716,6 @@ failure_threshold = 10
 maximum_failures_per_sweep = 50
 maximum_work_units_per_sweep = 32
 maximum_consecutive_no_progress_sweeps = 3
-max_agents = 2
 ```
 
 Set `enabled = false` to opt out for a project.

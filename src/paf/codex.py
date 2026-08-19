@@ -225,10 +225,6 @@ _SHEPHERD_WORK_UNITS_PROPERTY: dict[str, Any] = {
                 "enum": [stage.value for stage in Stage],
             },
             "objective": {"type": "string", "minLength": 1},
-            "depends_on": {
-                "type": "array",
-                "items": {"type": "string", "minLength": 1},
-            },
             "effort": {"type": "string", "enum": ["small", "medium", "large"]},
         },
         "required": [
@@ -237,7 +233,6 @@ _SHEPHERD_WORK_UNITS_PROPERTY: dict[str, Any] = {
             "owner_chapter_id",
             "target_stage",
             "objective",
-            "depends_on",
             "effort",
         ],
     },
@@ -1833,7 +1828,7 @@ diagnostics from prerequisites to dependents.
         *,
         scheduling: dict[str, Any],
     ) -> AgentResult:
-        """Ask the strong, read-only Shepherd model for a bounded repair DAG."""
+        """Ask the strong, read-only Shepherd model for bounded repair work units."""
 
         prompt = self.build_shepherd_prompt(failures, scheduling=scheduling)
         return await self._run_prompt(

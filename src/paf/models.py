@@ -116,7 +116,6 @@ class ShepherdSettings:
     maximum_failures_per_sweep: int = 50
     maximum_work_units_per_sweep: int = 32
     maximum_consecutive_no_progress_sweeps: int = 3
-    max_agents: int = 2
 
 
 @dataclass(frozen=True)

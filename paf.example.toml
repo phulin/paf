@@ -34,7 +34,6 @@ failure_threshold = 10
 maximum_failures_per_sweep = 50
 maximum_work_units_per_sweep = 32
 maximum_consecutive_no_progress_sweeps = 3
-max_agents = 2
 
 # The backend owns all Lean target layout and toolchain settings. Target templates
 # apply to [sources]-discovered corpora and can migrate legacy [[books]] entries;

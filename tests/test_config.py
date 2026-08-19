@@ -110,7 +110,6 @@ failure_threshold = 10
 maximum_failures_per_sweep = 40
 maximum_work_units_per_sweep = 24
 maximum_sweeps_per_invocation = 2
-max_agents = 3
 """,
         encoding="utf-8",
     )
@@ -126,7 +125,7 @@ max_agents = 3
     assert shepherd.maximum_failures_per_sweep == 40
     assert shepherd.maximum_work_units_per_sweep == 24
     assert shepherd.maximum_consecutive_no_progress_sweeps == 2
-    assert shepherd.max_agents == 3
+    assert not hasattr(shepherd, "max_agents")
 
     path.write_text(
         path.read_text(encoding="utf-8").replace("failure_threshold = 10", "failure_threshold = 0"),

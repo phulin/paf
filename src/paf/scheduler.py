@@ -492,6 +492,10 @@ class Orchestrator:
             phase="proofs",
             selected_documents=selected_documents,
         )
+        self._repair_priority_offset = 1.0 + max(
+            [*self.statement_schedule.rank.values(), *self.proof_schedule.rank.values()],
+            default=0.0,
+        )
         self.state.scheduling = self.scheduling_snapshot()
         self.agent_slots = PriorityLimiter(config.settings.max_agents)
         discovery_max_agents = config.stages[Stage.DISCOVER].max_agents
@@ -520,7 +524,6 @@ class Orchestrator:
         self._consecutive_no_progress_sweeps = 0
         self._last_shepherd_case_fingerprints: tuple[str, ...] = ()
         self._repair_progress_generation = 0
-        self._repair_slots = asyncio.Semaphore(config.shepherd.max_agents)
         self._live_agent_tasks: dict[
             tuple[str, Stage], tuple[RunRecord, asyncio.Task[AgentResult]]
         ] = {}
@@ -1646,9 +1649,7 @@ class Orchestrator:
         chapter_lock_held = True
         slot_held = False
         slots = (
-            self.discovery_slots
-            if stage is Stage.DISCOVER and role != UPSTREAM_REPAIR_ROLE
-            else self.agent_slots
+            self.discovery_slots if stage is Stage.DISCOVER and not auxiliary else self.agent_slots
         )
         try:
             await self.control.checkpoint()
@@ -1711,6 +1712,8 @@ class Orchestrator:
             return started
 
         try:
+            if role == REPAIR_WORKER_ROLE and selected_request_ids:
+                await self.state.start_repair_work_unit(selected_request_ids[0])
             run = await start_agent_run()
             if role == REPAIR_WORKER_ROLE and selected_request_ids:
                 await self.state.link_repair_work_unit_run(selected_request_ids[0], run.id)
@@ -6083,11 +6086,6 @@ class Orchestrator:
             objective = value.get("objective")
             if not isinstance(objective, str) or not objective.strip():
                 raise ShepherdPlanError(f"Shepherd work unit {key} has no objective")
-            dependencies = value.get("depends_on")
-            if not isinstance(dependencies, list) or not all(
-                isinstance(item, str) for item in dependencies
-            ):
-                raise ShepherdPlanError(f"Shepherd work unit {key} has invalid dependencies")
             by_key[key] = value
             covered_cases.update(case_ids)
 
@@ -6102,36 +6100,6 @@ class Orchestrator:
                 + (f"; missing: {', '.join(missing)}" if missing else "")
                 + (f"; extra: {', '.join(extra)}" if extra else "")
             )
-        for key, value in by_key.items():
-            dependencies = list(dict.fromkeys(value["depends_on"]))
-            if key in dependencies or any(item not in by_key for item in dependencies):
-                raise ShepherdPlanError(f"Shepherd work unit {key} has an invalid dependency")
-            value["depends_on"] = dependencies
-
-        successors: dict[str, list[str]] = {key: [] for key in by_key}
-        for key, value in by_key.items():
-            for dependency in value["depends_on"]:
-                successors[dependency].append(key)
-        visiting: set[str] = set()
-        dynamic_ranks: dict[str, float] = {}
-
-        def dynamic_rank(key: str) -> float:
-            if key in dynamic_ranks:
-                return dynamic_ranks[key]
-            if key in visiting:
-                raise ShepherdPlanError("Shepherd work-unit dependencies contain a cycle")
-            visiting.add(key)
-            successor_rank = max(
-                (dynamic_rank(successor) for successor in successors[key]), default=0.0
-            )
-            visiting.remove(key)
-            rank = REPAIR_EFFORT[str(by_key[key]["effort"])] + successor_rank
-            dynamic_ranks[key] = rank
-            return rank
-
-        for key in by_key:
-            dynamic_rank(key)
-
         id_by_key = {key: f"{sweep_id}-{key}" for key in by_key}
         units: list[RepairWorkUnitRecord] = []
         for key, value in by_key.items():
@@ -6147,9 +6115,10 @@ class Orchestrator:
                     owner_chapter_id=owner.id,
                     target_stage=stage.value,
                     objective=str(value["objective"]),
-                    depends_on=[id_by_key[item] for item in value["depends_on"]],
                     effort=str(value["effort"]),
-                    priority=schedule.priority(owner.document_id) + dynamic_ranks[key],
+                    priority=self._repair_priority_offset
+                    + schedule.priority(owner.document_id)
+                    + REPAIR_EFFORT[str(value["effort"])],
                 )
             )
         return units
@@ -6168,87 +6137,85 @@ class Orchestrator:
                 detail="all covered failures were resolved before this repair ran",
             )
             return StageOutcome(ExecutionDisposition.WAITING)
-        async with self._repair_slots:
-            await self.state.start_repair_work_unit(unit.id)
-            chapter = self.config.work_unit(unit.owner_chapter_id)
-            stage = Stage(unit.target_stage)
-            before_placeholders = (
-                await asyncio.to_thread(count_placeholders, self.config.settings.repo, chapter)
-                if stage is Stage.PROVE
-                else None
+        chapter = self.config.work_unit(unit.owner_chapter_id)
+        stage = Stage(unit.target_stage)
+        before_placeholders = (
+            await asyncio.to_thread(count_placeholders, self.config.settings.repo, chapter)
+            if stage is Stage.PROVE
+            else None
+        )
+        dossier = {
+            "repair_work_unit_id": unit.id,
+            "objective": unit.objective,
+            "target_stage": unit.target_stage,
+            "effort": unit.effort,
+            "covered_failures": [self._repair_failure_evidence(case) for case in active_cases],
+        }
+        try:
+            attempt = await self._attempt(
+                chapter,
+                stage,
+                feedback=json.dumps(dossier, indent=2),
+                queue_detail=f"Shepherd repair {unit.id}",
+                role=REPAIR_WORKER_ROLE,
+                request_ids=[unit.id, *(case.id for case in active_cases)],
+                priority_override=unit.priority,
             )
-            dossier = {
-                "repair_work_unit_id": unit.id,
-                "objective": unit.objective,
-                "target_stage": unit.target_stage,
-                "effort": unit.effort,
-                "covered_failures": [self._repair_failure_evidence(case) for case in active_cases],
-            }
-            try:
-                attempt = await self._attempt(
-                    chapter,
-                    stage,
-                    feedback=json.dumps(dossier, indent=2),
-                    queue_detail=f"Shepherd repair {unit.id}",
-                    role=REPAIR_WORKER_ROLE,
-                    request_ids=[unit.id, *(case.id for case in active_cases)],
-                    priority_override=unit.priority,
+            complete = bool(attempt.agent.report.get("complete"))
+            validation = attempt.validation
+            accepted = attempt.agent.succeeded and validation.succeeded and complete
+            if stage is Stage.DISCOVER:
+                raw_dependencies = attempt.agent.report.get("source_dependencies")
+                dependencies = (
+                    tuple(item for item in raw_dependencies if isinstance(item, str))
+                    if isinstance(raw_dependencies, list)
+                    else ()
                 )
-                complete = bool(attempt.agent.report.get("complete"))
-                validation = attempt.validation
-                accepted = attempt.agent.succeeded and validation.succeeded and complete
-                if stage is Stage.DISCOVER:
-                    raw_dependencies = attempt.agent.report.get("source_dependencies")
-                    dependencies = (
-                        tuple(item for item in raw_dependencies if isinstance(item, str))
-                        if isinstance(raw_dependencies, list)
-                        else ()
-                    )
-                    known = {chapter.id for chapter in self.work_units}
-                    accepted = (
-                        accepted
-                        and not attempt.agent.changed
-                        and isinstance(raw_dependencies, list)
-                        and len(dependencies) == len(raw_dependencies)
-                        and all(item in known for item in dependencies)
-                        and chapter.id not in dependencies
-                    )
-                    if accepted:
-                        await self._persist_source_dependencies(
-                            chapter,
-                            dependencies,
-                            attempt.agent.report,
-                        )
-                elif stage is Stage.PROVE and before_placeholders is not None:
-                    accepted = accepted and (
-                        attempt.agent.placeholders == 0
-                        or attempt.agent.placeholders < before_placeholders
-                    )
-                if not accepted:
-                    detail = attempt.feedback()
-                    await self.state.finish_repair_work_unit(
-                        unit.id,
-                        status=RepairWorkUnitStatus.FAILED,
-                        detail=detail,
-                        run_id=attempt.run.id,
-                    )
-                    return StageOutcome(ExecutionDisposition.FAILED)
-                await self._accept_repair_work_unit(unit, active_cases, run_id=attempt.run.id)
-                return StageOutcome(ExecutionDisposition.SUCCEEDED)
-            except asyncio.CancelledError:
-                await self.state.finish_repair_work_unit(
-                    unit.id,
-                    status=RepairWorkUnitStatus.INTERRUPTED,
-                    detail="repair interrupted with the orchestrator",
+                known = {chapter.id for chapter in self.work_units}
+                accepted = (
+                    accepted
+                    and not attempt.agent.changed
+                    and isinstance(raw_dependencies, list)
+                    and len(dependencies) == len(raw_dependencies)
+                    and all(item in known for item in dependencies)
+                    and chapter.id not in dependencies
                 )
-                raise
-            except BaseException as error:
+                if accepted:
+                    await self._persist_source_dependencies(
+                        chapter,
+                        dependencies,
+                        attempt.agent.report,
+                    )
+            elif stage is Stage.PROVE and before_placeholders is not None:
+                accepted = accepted and (
+                    attempt.agent.placeholders == 0
+                    or attempt.agent.placeholders < before_placeholders
+                )
+            if not accepted:
+                detail = attempt.feedback()
                 await self.state.finish_repair_work_unit(
                     unit.id,
                     status=RepairWorkUnitStatus.FAILED,
-                    detail=str(error) or type(error).__name__,
+                    detail=detail,
+                    run_id=attempt.run.id,
                 )
                 return StageOutcome(ExecutionDisposition.FAILED)
+            await self._accept_repair_work_unit(unit, active_cases, run_id=attempt.run.id)
+            return StageOutcome(ExecutionDisposition.SUCCEEDED)
+        except asyncio.CancelledError:
+            await self.state.finish_repair_work_unit(
+                unit.id,
+                status=RepairWorkUnitStatus.INTERRUPTED,
+                detail="repair interrupted with the orchestrator",
+            )
+            raise
+        except BaseException as error:
+            await self.state.finish_repair_work_unit(
+                unit.id,
+                status=RepairWorkUnitStatus.FAILED,
+                detail=str(error) or type(error).__name__,
+            )
+            return StageOutcome(ExecutionDisposition.FAILED)
 
     async def _accept_repair_work_unit(
         self,
@@ -6275,128 +6242,13 @@ class Orchestrator:
             )
         self._repair_progress_generation += 1
 
-    async def _execute_repair_plan(self, units: Iterable[RepairWorkUnitRecord]) -> bool:
-        pending = {unit.id: unit for unit in units}
-        progressed = False
-        while pending:
-            terminal_failures = {
-                unit_id
-                for unit_id, unit in self.state.repair_work_units.items()
-                if unit.status
-                in {
-                    RepairWorkUnitStatus.FAILED,
-                    RepairWorkUnitStatus.SUPERSEDED,
-                }
-            }
-            blocked = [
-                unit
-                for unit in pending.values()
-                if set(unit.depends_on).intersection(terminal_failures)
-            ]
-            for unit in blocked:
-                await self.state.finish_repair_work_unit(
-                    unit.id,
-                    status=RepairWorkUnitStatus.SUPERSEDED,
-                    detail="repair dependency did not succeed",
-                )
-                pending.pop(unit.id)
-            succeeded = {
-                unit_id
-                for unit_id, unit in self.state.repair_work_units.items()
-                if self._repair_unit_validated(unit)
-            }
-            ready = [unit for unit in pending.values() if set(unit.depends_on).issubset(succeeded)]
-            if not ready:
-                break
-            async with self.state.batch():
-                for unit in ready:
-                    await self.state.queue_repair_work_unit(unit.id)
-            results = await _gather_cancel_on_error(
-                self._run_repair_work_unit(unit) for unit in ready
-            )
-            progressed = progressed or any(results)
-            for unit in ready:
-                pending.pop(unit.id)
-        return progressed
-
-    def _repair_unit_validated(self, unit: RepairWorkUnitRecord) -> bool:
-        """A repaired dependency is ready only after the normal stage scheduler accepts it."""
-
-        return unit.status == RepairWorkUnitStatus.SUCCEEDED and all(
-            task_key in self.state.tasks
-            and self.state.tasks[task_key].status == TaskStatus.SUCCEEDED
-            for task_key in unit.task_keys
-        )
-
-    async def _continue_repair_dags(self) -> bool:
-        """Continue a plan created by this orchestrator while its dependencies settle."""
-
-        retryable = {
-            RepairWorkUnitStatus.PENDING,
-            RepairWorkUnitStatus.INTERRUPTED,
-        }
-        repairable_keys = {key for key, _task in self.state.shepherd_repairable_tasks()}
-        candidates: list[RepairWorkUnitRecord] = []
-        pruned = False
-        for unit in self.state.repair_work_units.values():
-            if unit.status not in retryable:
-                continue
-            eligible_case_ids = [
-                case_id
-                for case_id in unit.case_ids
-                if (case := self.state.repair_cases.get(case_id)) is not None
-                and case.task_key in repairable_keys
-            ]
-            if not eligible_case_ids:
-                await self.state.finish_repair_work_unit(
-                    unit.id,
-                    status=RepairWorkUnitStatus.SUPERSEDED,
-                    detail="covered failures are causal blockers, not repair targets",
-                )
-                continue
-            if eligible_case_ids != unit.case_ids:
-                unit.case_ids = eligible_case_ids
-                pruned = True
-            unchanged = True
-            for case_id in unit.case_ids:
-                case = self.state.repair_cases.get(case_id)
-                if case is None or case.task_key not in self.state.tasks:
-                    unchanged = False
-                    break
-                if self.state.ensure_repair_case(case.task_key).id != case_id:
-                    unchanged = False
-                    break
-            if unchanged:
-                candidates.append(unit)
-            else:
-                await self.state.finish_repair_work_unit(
-                    unit.id,
-                    status=RepairWorkUnitStatus.SUPERSEDED,
-                    detail="repair evidence fingerprint changed",
-                )
-        if pruned:
-            await self.state.save("repair_work_units")
-        if not candidates:
-            return False
-        candidate_ids = {unit.id for unit in candidates}
-        succeeded_ids = {
-            unit.id
-            for unit in self.state.repair_work_units.values()
-            if self._repair_unit_validated(unit)
-        }
-        candidates = [
-            unit
-            for unit in candidates
-            if set(unit.depends_on).issubset(candidate_ids | succeeded_ids)
-        ]
-        if not candidates:
-            return False
-        async with self._shepherd_lock:
-            progressed = await self._execute_repair_plan(candidates)
-            for sweep_id in {unit.sweep_id for unit in candidates}:
-                if sweep_id in self.state.repair_sweeps:
-                    await self.state.finish_repair_sweep(sweep_id)
-            return progressed
+    async def _run_repair_units(self, units: Iterable[RepairWorkUnitRecord]) -> bool:
+        queued = list(units)
+        async with self.state.batch():
+            for unit in queued:
+                await self.state.queue_repair_work_unit(unit.id)
+        results = await _gather_cancel_on_error(self._run_repair_work_unit(unit) for unit in queued)
+        return any(results)
 
     async def _discard_persisted_repair_plans(self) -> list[RepairCaseRecord]:
         """Discard unfinished plans from an earlier orchestrator and reopen current cases."""
@@ -6542,7 +6394,7 @@ class Orchestrator:
                     summary=str(result.report.get("summary", "")),
                     run_id=run.id,
                 )
-                progressed = await self._execute_repair_plan(units)
+                progressed = await self._run_repair_units(units)
                 await self.state.finish_repair_sweep(sweep.id)
                 if progressed:
                     self._consecutive_no_progress_sweeps = 0
@@ -6584,13 +6436,10 @@ class Orchestrator:
             while True:
                 remaining = max(0.0, (due - datetime.now(UTC)).total_seconds())
                 timed_out = False
-                change = None
                 try:
-                    change = await asyncio.wait_for(changes.get(), timeout=remaining)
+                    await asyncio.wait_for(changes.get(), timeout=remaining)
                 except TimeoutError:
                     timed_out = True
-                if change is not None and change.stages:
-                    await self._continue_repair_dags()
                 cases = self._repair_cases(periodic=timed_out)
                 pending = len(self.state.shepherd_repairable_tasks())
                 if self.state.shepherd.pending_failures != pending:
