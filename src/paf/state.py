@@ -1143,6 +1143,14 @@ class StateStore:
             task,
             roots=failure_roots.get(task_key, ()) if failure_roots is not None else None,
         )
+        active_run = self._active_runs_by_chapter.get(task.chapter_id)
+        active_auxiliary_role = (
+            active_run.role
+            if active_run is not None
+            and active_run.auxiliary
+            and active_run.stage == str(task.stage)
+            else ""
+        )
         return {
             "work_unit_id": task.work_unit_id,
             "document_id": task.document_id,
@@ -1154,6 +1162,7 @@ class StateStore:
             "chapter_title": task.chapter_title,
             "stage": str(task.stage),
             "status": str(task.status),
+            "active_auxiliary_role": active_auxiliary_role,
             "phase": str(task.phase),
             "detail": task.detail,
             "queued": task.queued,
@@ -4280,7 +4289,7 @@ class StateStore:
             run.report = report
         self._invalidate_aggregates()
         self._invalidate_status_summaries()
-        changed_task = None
+        changed_task = self.task(run.chapter_id, Stage(run.stage)) if run.auxiliary else None
         if (
             status == TaskStatus.INTERRUPTED
             and not run.auxiliary

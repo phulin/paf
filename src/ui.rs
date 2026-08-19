@@ -650,7 +650,7 @@ fn draw_detail(frame: &mut Frame<'_>, model: &mut DashboardModel) {
             row.unit.ordinal,
             row.unit.title,
             active_task
-                .map(|task| format!("{} {}", title(&task.stage), task_display_status(task)))
+                .map(|task| format!("{} {}", title(&task.stage), task_status_label(task)))
                 .unwrap_or_else(|| "no run".into())
         ))
         .style(Style::default().fg(CYAN).add_modifier(Modifier::BOLD))
@@ -689,7 +689,7 @@ fn draw_detail(frame: &mut Frame<'_>, model: &mut DashboardModel) {
     let has_running_task = row
         .tasks
         .values()
-        .any(|task| task.status == "running" || task.repairing);
+        .any(|task| task_is_running(task) || task.repairing);
     let metrics = activity.filter(|_| has_running_task).map_or_else(
         || {
             pending_reason
@@ -1277,7 +1277,7 @@ fn current_activity(
     let has_running_task = row
         .tasks
         .values()
-        .any(|task| task.status == "running" || task.repairing);
+        .any(|task| task_is_running(task) || task.repairing);
     if let Some(activity) = activity.filter(|_| has_running_task) {
         let idle = elapsed_seconds(&activity.updated_at);
         return if idle >= 60 {
@@ -1319,21 +1319,23 @@ fn row_spend(row: &RowModel<'_>) -> String {
 
 fn task_mark(task: &Task, building: bool) -> String {
     let mark = if building {
-        "◆ building"
+        "◆ building".into()
     } else if task.repairing {
-        "↻ repairing"
+        "↻ repairing".into()
+    } else if let Some(letter) = auxiliary_role_letter(&task.active_auxiliary_role) {
+        format!("▶ running ({letter})")
     } else if task.queued {
-        "· queued"
+        "· queued".into()
     } else if task.status == "running" && task.phase == "postprocess" {
-        "◇ postprocess"
+        "◇ postprocess".into()
     } else {
         match task_display_status(task) {
-            "running" => "▶ running",
-            "succeeded" => "✓ done",
-            "failed" => "✗ failed",
-            "blocked" => "! blocked",
-            "interrupted" => "Ⅱ interrupted",
-            _ => "· pending",
+            "running" => "▶ running".into(),
+            "succeeded" => "✓ done".into(),
+            "failed" => "✗ failed".into(),
+            "blocked" => "! blocked".into(),
+            "interrupted" => "Ⅱ interrupted".into(),
+            _ => "· pending".into(),
         }
     };
     if task.rounds > 0 {
@@ -1372,10 +1374,34 @@ fn task_mark_style(task: &Task, building: bool) -> Style {
 }
 
 fn task_display_status(task: &Task) -> &str {
-    if task.status == "pending" && task.scheduling_status == "blocked" {
+    if !task.active_auxiliary_role.is_empty() {
+        "running"
+    } else if task.status == "pending" && task.scheduling_status == "blocked" {
         "blocked"
     } else {
         task.status.as_str()
+    }
+}
+
+fn task_status_label(task: &Task) -> String {
+    auxiliary_role_letter(&task.active_auxiliary_role).map_or_else(
+        || task_display_status(task).into(),
+        |letter| format!("running ({letter})"),
+    )
+}
+
+fn task_is_running(task: &Task) -> bool {
+    task.status == "running" || !task.active_auxiliary_role.is_empty()
+}
+
+fn auxiliary_role_letter(role: &str) -> Option<&'static str> {
+    match role {
+        "upstream_repair" => Some("u"),
+        "warning_cleanup" => Some("w"),
+        "repair_worker" => Some("r"),
+        "shepherd" => Some("s"),
+        "" => None,
+        _ => Some("a"),
     }
 }
 
@@ -1862,6 +1888,27 @@ mod tests {
         assert_eq!(task_mark_style(&task("blocked"), false).fg, Some(YELLOW));
         assert_eq!(task_mark_style(&task("pending"), false).fg, None);
         assert_eq!(task_mark_style(&task("pending"), true).fg, Some(PURPLE));
+    }
+
+    #[test]
+    fn task_marks_distinguish_auxiliary_run_roles() {
+        for (role, letter) in [
+            ("upstream_repair", "u"),
+            ("warning_cleanup", "w"),
+            ("repair_worker", "r"),
+            ("shepherd", "s"),
+            ("future_auxiliary_role", "a"),
+        ] {
+            let task = Task {
+                status: "pending".into(),
+                active_auxiliary_role: role.into(),
+                ..Task::default()
+            };
+
+            assert_eq!(task_mark(&task, false), format!("▶ running ({letter})"));
+            assert_eq!(task_status_label(&task), format!("running ({letter})"));
+            assert_eq!(task_mark_style(&task, false).fg, Some(BLUE));
+        }
     }
 
     #[test]

@@ -402,6 +402,15 @@ async def test_dashboard_exposes_live_shepherd_and_repair_worker_runs(tmp_path: 
     ]
     assert snapshot["activities"][planner.id]["current"] == "ranking repair candidates"
     assert snapshot["activities"][worker.id]["current"] == "editing the failed declaration"
+    assert snapshot["tasks"][task_key]["active_auxiliary_role"] == REPAIR_WORKER_ROLE
+
+    await state.finish_run(worker, status=TaskStatus.SUCCEEDED)
+    snapshot = state.dashboard_snapshot()
+    assert snapshot["tasks"][task_key]["active_auxiliary_role"] == ""
+    assert (
+        snapshot["tasks"][state.key(chapter.id, Stage.DISCOVER)]["active_auxiliary_role"]
+        == SHEPHERD_ROLE
+    )
     await state.close()
 
 

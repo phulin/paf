@@ -99,6 +99,7 @@ pub struct Task {
     pub unit_title: String,
     pub stage: String,
     pub status: String,
+    pub active_auxiliary_role: String,
     pub phase: String,
     pub detail: String,
     pub queued: bool,
@@ -544,7 +545,11 @@ impl DashboardModel {
             .filter_map(|task| {
                 let run_id = task.latest_run_id.as_ref()?;
                 let activity = self.state.activities.get(run_id)?;
-                Some((task.status == "running", &activity.updated_at, activity))
+                Some((
+                    task.status == "running" || !task.active_auxiliary_role.is_empty(),
+                    &activity.updated_at,
+                    activity,
+                ))
             })
             .max_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(right.1)))
             .map(|value| value.2)
@@ -854,7 +859,7 @@ impl DashboardModel {
             let Some(task) = row.tasks.get(stage) else {
                 continue;
             };
-            if task.status != "pending" || task.queued {
+            if task.status != "pending" || task.queued || !task.active_auxiliary_role.is_empty() {
                 continue;
             }
             if row
@@ -904,7 +909,11 @@ impl DashboardModel {
         let pending = STAGES
             .iter()
             .filter_map(|stage| row.tasks.get(stage))
-            .find(|task| task.status == "pending" && (task.queued || !task.detail.is_empty()))?;
+            .find(|task| {
+                task.status == "pending"
+                    && task.active_auxiliary_role.is_empty()
+                    && (task.queued || !task.detail.is_empty())
+            })?;
         if pending.queued && pending.detail.is_empty() {
             Some("waiting: agent capacity".into())
         } else {
