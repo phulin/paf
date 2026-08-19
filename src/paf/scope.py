@@ -55,3 +55,12 @@ class ScopeMatcher:
             )
             for pattern in self.patterns
         )
+
+    def has_match_for_primary_pattern(self, root: Path) -> bool:
+        """Whether the primary target exists; later patterns only extend its scope."""
+
+        pattern = self.patterns[0]
+        return any(
+            path.is_file() and ScopeMatcher((pattern,)).matches(path.relative_to(root))
+            for path in root.glob(pattern)
+        )

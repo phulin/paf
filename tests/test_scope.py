@@ -29,3 +29,13 @@ def test_globstar_matches_zero_or_more_directories_consistently(tmp_path: Path) 
     assert matcher.files(tmp_path) == [direct, nested]
     assert matcher.matches("X/Direct.lean")
     assert matcher.matches("X/nested/Nested.lean")
+
+
+def test_primary_scope_exists_without_optional_subfiles(tmp_path: Path) -> None:
+    primary = tmp_path / "X" / "Unit01.lean"
+    primary.parent.mkdir(parents=True)
+    primary.write_text("def primary := 1\n", encoding="utf-8")
+    matcher = ScopeMatcher(("X/Unit01.lean", "X/Unit01/**/*.lean"))
+
+    assert matcher.has_match_for_primary_pattern(tmp_path)
+    assert not matcher.has_match_for_each_pattern(tmp_path)

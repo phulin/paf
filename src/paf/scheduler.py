@@ -1534,7 +1534,7 @@ class Orchestrator:
 
     async def _scope_exists(self, chapter: WorkUnitLike) -> bool:
         return await asyncio.to_thread(
-            ScopeMatcher(chapter.scope).has_match_for_each_pattern,
+            ScopeMatcher(chapter.scope).has_match_for_primary_pattern,
             self.config.settings.repo,
         )
 
