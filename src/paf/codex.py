@@ -929,14 +929,28 @@ def _placeholder_offsets(text: str) -> tuple[int, ...]:
 
 
 def _placeholder_context(text: str, offset: int) -> str:
-    """Return a compact nearby source label for one proof hole."""
+    """Return a compact source excerpt containing one proof hole.
 
-    prefix = text[:offset].splitlines()
-    for line in reversed(prefix[-6:]):
-        stripped = line.strip()
-        if stripped and not stripped.startswith(("/-", "--", "*")):
-            return stripped[:160]
-    return "proof obligation"
+    The excerpt must be anchored to the placeholder itself.  Looking backwards for a
+    nonempty line is tempting for standalone ``sorry`` terms, but it can attach a hole
+    to an unrelated declaration line or even to doc-comment punctuation.
+    """
+
+    line_start = text.rfind("\n", 0, offset) + 1
+    line_end = text.find("\n", offset)
+    if line_end < 0:
+        line_end = len(text)
+    raw_line = text[line_start:line_end]
+    leading_whitespace = len(raw_line) - len(raw_line.lstrip())
+    line = raw_line.strip()
+    if len(line) <= 160:
+        return line or text[offset : offset + 160].strip() or "proof obligation"
+
+    # Keep the placeholder visible when it occurs on an unusually long source line.
+    column = max(0, offset - line_start - leading_whitespace)
+    window_start = max(0, min(column - 70, len(line) - 157))
+    excerpt = line[window_start : window_start + 157]
+    return ("…" if window_start else "") + excerpt + ("…" if window_start + 157 < len(line) else "")
 
 
 def _placeholder_signature(text: str, offset: int) -> str:

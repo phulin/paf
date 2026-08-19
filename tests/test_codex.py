@@ -348,6 +348,31 @@ def test_proof_chunk_does_not_split_one_declaration(tmp_path: Path) -> None:
     assert [target.placeholder_count for target in proof_target_chunk(targets, 1)] == [2]
 
 
+def test_proof_hole_context_is_anchored_to_the_placeholder_line(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = config.chapters[0]
+    path = tmp_path / "lean" / "Book" / "Chapter01.lean"
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        "/-- A doc comment whose final line must not label the proof hole.\n"
+        "· misleading doc text\n"
+        "-/\n"
+        "theorem standalone : True := by\n"
+        "  sorry\n"
+        "theorem inline : True := by\n"
+        "  have result : True := by sorry\n"
+        "  exact result\n",
+        encoding="utf-8",
+    )
+
+    targets = proof_targets(tmp_path, chapter)
+
+    assert [target.obligations[0].context for target in targets] == [
+        "sorry",
+        "have result : True := by sorry",
+    ]
+
+
 def test_proof_target_spans_refresh_after_an_assigned_proof_expands(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
     chapter = config.chapters[0]
