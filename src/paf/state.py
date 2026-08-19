@@ -3159,15 +3159,22 @@ class StateStore:
         source_digest: str | None = None,
         queued: bool = False,
         waiting_on: Iterable[Requirement] | None = None,
+        force: bool = False,
     ) -> None:
         task = self.task(chapter_id, stage)
-        if task.status == TaskStatus.INTERRUPTED and status not in (
-            TaskStatus.RUNNING,
-            TaskStatus.SUCCEEDED,
+        if (
+            not force
+            and task.status == TaskStatus.INTERRUPTED
+            and status
+            not in (
+                TaskStatus.RUNNING,
+                TaskStatus.SUCCEEDED,
+            )
         ):
             return
         if (
-            stage is Stage.FORMALIZE
+            not force
+            and stage is Stage.FORMALIZE
             and status == TaskStatus.RUNNING
             and self.later_stage_started(chapter_id)
         ):

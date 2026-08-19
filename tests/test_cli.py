@@ -549,6 +549,56 @@ def test_agent_retry_sends_targeted_chapter_and_stage(
     }
 
 
+def test_agent_state_sends_arbitrary_task_state(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = write_project(tmp_path, chapters="chapters = [1]")
+    captured: dict[str, object] = {}
+
+    def control_response(
+        command: str,
+        _config: PipelineConfig,
+        *,
+        parameters: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        captured.update(command=command, parameters=parameters)
+        return {"changed": True}
+
+    monkeypatch.setattr(cli_module, "_control_response", control_response)
+
+    assert (
+        main(
+            [
+                "agent",
+                "state",
+                "--config",
+                str(config_path),
+                "--chapter",
+                "book/chapter-01",
+                "--stage",
+                "review",
+                "--state",
+                "succeeded",
+                "--detail",
+                "accepted manually",
+            ]
+        )
+        == 0
+    )
+    assert json.loads(capsys.readouterr().out) == {"changed": True}
+    assert captured == {
+        "command": "state",
+        "parameters": {
+            "chapter": "book/chapter-01",
+            "stage": "review",
+            "state": "succeeded",
+            "detail": "accepted manually",
+        },
+    }
+
+
 def test_agent_snapshot_writes_json_only_with_output(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

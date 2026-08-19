@@ -347,6 +347,7 @@ uv run paf agent pause "$TARGET"
 uv run paf agent resume "$TARGET"
 uv run paf agent retry "$TARGET" --chapter book02/chapter-08
 uv run paf agent retry "$TARGET"
+uv run paf agent state "$TARGET" --chapter book02/chapter-08 --stage prove --state pending
 uv run paf agent unblock "$TARGET"
 uv run paf agent clear-upstream-requests "$TARGET"
 uv run paf agent snapshot "$TARGET"
@@ -362,7 +363,8 @@ auto-discovered dependency graph deterministically select a corpus-specific stat
 Every command prints one JSON object. `wait` blocks until completion and exits with the pipeline's
 success/failure code. `snapshot` includes the complete persisted task/run state; `status` is compact.
 `snapshot --output PATH` additionally writes that complete state to JSON atomically. No JSON file is
-written unless an output path is explicitly supplied.
+written unless an output path is explicitly supplied. `state` changes any one task to any valid
+task state in the live managed run; add `--detail TEXT` to replace the default audit detail.
 Use `agent stop` to cancel the scheduler and terminate active Codex/build subprocess groups.
 
 Pause is cooperative: already-running chapter attempts finish, while new agent/build attempts wait at

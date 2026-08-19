@@ -12,6 +12,7 @@ from typing import Any
 
 from paf import json_codec as json
 from paf.corpus import scheduling_summary
+from paf.models import Stage
 from paf.scheduler import Orchestrator
 from paf.state import TaskStatus, timestamp
 from paf.state_db import DATABASE_NAME, read_status_view
@@ -251,6 +252,62 @@ class ControlServer:
                     response = self._status() | retried
                 else:
                     raise ValueError("retry chapter must be a non-empty string")
+            elif command == "state":
+                chapter = request.get("chapter")
+                stage_value = request.get("stage")
+                status_value = request.get("state")
+                detail = request.get("detail")
+                if not isinstance(chapter, str) or not chapter:
+                    raise ValueError("state chapter must be a non-empty string")
+                if not isinstance(stage_value, str):
+                    raise ValueError("state stage must be a string")
+                if not isinstance(status_value, str):
+                    raise ValueError("state must be a string")
+                if detail is not None and not isinstance(detail, str):
+                    raise ValueError("state detail must be a string")
+                try:
+                    stage = Stage(stage_value)
+                except ValueError:
+                    raise ValueError(f"unknown task stage: {stage_value}") from None
+                try:
+                    status = TaskStatus(status_value)
+                except ValueError:
+                    raise ValueError(f"unknown task state: {status_value}") from None
+                matches = [
+                    unit for unit in self.orchestrator.config.work_units if unit.id == chapter
+                ]
+                if not matches and chapter.isdigit():
+                    matches = [
+                        unit
+                        for unit in self.orchestrator.config.work_units
+                        if unit.ordinal == int(chapter)
+                    ]
+                if not matches:
+                    raise ValueError(f"work-unit selector matched nothing: {chapter}")
+                if len(matches) > 1:
+                    raise ValueError(
+                        f"work-unit selector {chapter!r} is ambiguous; pass a complete id"
+                    )
+                chapter_id = matches[0].id
+                task = self.orchestrator.state.task(chapter_id, stage)
+                previous_state = str(task.status)
+                task_detail = detail if detail is not None else f"manually set to {status.value}"
+                await self.orchestrator.state.set_task(
+                    chapter_id,
+                    stage,
+                    status,
+                    task_detail,
+                    force=True,
+                )
+                response = self._status() | {
+                    "changed": True,
+                    "task": self.orchestrator.state.key(chapter_id, stage),
+                    "chapter_id": chapter_id,
+                    "stage": stage.value,
+                    "previous_state": previous_state,
+                    "state": status.value,
+                    "detail": task_detail,
+                }
             elif command == "stop":
                 self.request_stop()
                 response = self._status() | {"accepted": True}

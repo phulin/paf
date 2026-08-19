@@ -126,6 +126,30 @@ async def test_control_server_accepts_bash_friendly_commands(
     assert retried["accepted"] is True
     assert retried["interrupted_run_id"] == "live-run"
     assert retried_targets == [("book/chapter-01", Stage.REVIEW)]
+    await state.set_task(
+        config.chapters[0].id,
+        Stage.REVIEW,
+        TaskStatus.INTERRUPTED,
+        "agent was interrupted",
+    )
+    changed = await asyncio.to_thread(
+        send_command,
+        config.settings.state_dir,
+        "state",
+        parameters={
+            "chapter": "book/chapter-01",
+            "stage": "review",
+            "state": "pending",
+            "detail": "operator override",
+        },
+    )
+    assert changed["changed"] is True
+    assert changed["task"] == "book/chapter-01:review"
+    assert changed["previous_state"] == "interrupted"
+    assert changed["state"] == "pending"
+    changed_task = state.task(config.chapters[0].id, Stage.REVIEW)
+    assert changed_task.status == TaskStatus.PENDING
+    assert changed_task.detail == "operator override"
     stopped = await asyncio.to_thread(send_command, config.settings.state_dir, "stop")
     assert stopped["accepted"]
 

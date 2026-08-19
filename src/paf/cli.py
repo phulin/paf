@@ -268,6 +268,28 @@ def parser() -> argparse.ArgumentParser:
             "without it, reset every failed task"
         ),
     )
+    state = agent_commands.add_parser(
+        "state", help="arbitrarily change one task's state in the live run"
+    )
+    _add_source(state)
+    state.add_argument(
+        "--chapter",
+        required=True,
+        help="chapter id or unambiguous number",
+    )
+    state.add_argument(
+        "--stage",
+        required=True,
+        choices=[stage.value for stage in Stage],
+        help="task stage",
+    )
+    state.add_argument(
+        "--state",
+        required=True,
+        choices=[status.value for status in TaskStatus],
+        help="new task state",
+    )
+    state.add_argument("--detail", help="replacement task detail")
     rpc = agent_commands.add_parser("rpc", help="read control commands as JSONL from stdin")
     _add_source(rpc)
     inspect = agent_commands.add_parser("inspect", help="show one agent's live activity")
@@ -1254,6 +1276,7 @@ def _agent_rpc(config: PipelineConfig) -> int:
         "stop",
         "wait",
         "inspect",
+        "state",
     }
     failed = False
     for line in sys.stdin:
@@ -1273,6 +1296,12 @@ def _agent_rpc(config: PipelineConfig) -> int:
                 parameters = None
                 if request["command"] == "retry" and "chapter" in request:
                     parameters = {"chapter": request["chapter"]}
+                elif request["command"] == "state":
+                    parameters = {
+                        key: request[key]
+                        for key in ("chapter", "stage", "state", "detail")
+                        if key in request
+                    }
                 response = _control_response(str(request["command"]), config, parameters=parameters)
         except (json.JSONDecodeError, ValueError) as error:
             response = {"error": str(error)}
@@ -1291,9 +1320,18 @@ def _agent_command(args: argparse.Namespace, config: PipelineConfig) -> int:
         return _agent_rpc(config)
     if command == "inspect":
         return _inspect_agent(args, config)
-    parameters = (
-        {"chapter": args.chapter} if command == "retry" and args.chapter is not None else None
-    )
+    if command == "retry" and args.chapter is not None:
+        parameters = {"chapter": args.chapter}
+    elif command == "state":
+        parameters = {
+            "chapter": args.chapter,
+            "stage": args.stage,
+            "state": args.state,
+        }
+        if args.detail is not None:
+            parameters["detail"] = args.detail
+    else:
+        parameters = None
     response = _control_response(command, config, parameters=parameters)
     if command == "snapshot" and args.output is not None:
         snapshot = response.get("snapshot")
