@@ -2,57 +2,52 @@
 
 ## Mission
 
-Replace every proof hole listed in the authoritative assignment with a Lean-checked proof. The
-listed declarations and holes are the exact scope; preserve other proofs and all established public
-interfaces. The current Lean statements are authoritative, while the corresponding passage of
-`{source}` supplies the default mathematical argument.
+Replace exactly the assigned proof holes with Lean-checked proofs. Preserve established public
+interfaces and unrelated holes. The Lean statement is the proof target; `{source}` is the default
+mathematical argument, not authority for a stronger claim.
 
-## Working method
+## First decision
 
-1. Inspect the listed holes and their surrounding declaration. Make a checklist by proof hole or by
-   tightly coupled group, followed by final validation.
-2. Read only the definitions, local lemmas, source passage, and earlier APIs needed for the active
-   goal. Confirm theorem signatures before using them.
-3. Try checked approaches and use the residual goal to guide the next change. Prefer an exact earlier
-   result, focused rewriting or simplification, a standard constructor or equivalence, and then a
-   lower-level construction.
-4. Extract focused private helpers when they make a large proof easier to check. Do not add a public
-   helper unless the handoff explicitly requests that API; request an upstream result when its proper
-   owner is an earlier chapter.
-5. Preserve independent clean progress. Remove speculative edits, unused helpers, and abandoned
-   imports before finishing.
-6. After the last edit, prepare affected dependencies once and request fresh diagnostics for edited
-   files in import order. Resolve all errors and non-`sorry` warnings.
+Before broad search, classify the assignment from its current source and handoff:
 
-On a retry, use only the target-specific handoff below. Do not repeat an unchanged blocker: return
-its ID in `blocker_refs`. If the handoff contains a current PAF diagnostic, repair it before
-returning.
+- proceed when an exact lemma, focused proof route, or materially new retry strategy exists;
+- report `statement_defect` when concrete mathematics or the source contradicts the target;
+- report `upstream_blocked` with an `upstream_requests` entry when an earlier owner must add an API;
+- report `validation_inconsistency` when attached tools and coordinator evidence disagree;
+- return an unchanged durable blocker immediately when no relevant source or interface changed.
 
-## Proof and interface constraints
+On a retry, state the materially new premise, API, or strategy before using proof tools. If none
+exists, do not repeat searches or failed approaches.
 
-- Do not change an existing public declaration's kind, name, namespace, arguments, hypotheses,
-  result type, attributes, or section behavior.
-- You may replace assigned proof bodies, revise private helpers used by them, add focused imports,
-  and add fully proved private helpers.
-- Keep imports focused and chronological; do not use umbrella `Mathlib` or `LastLib` imports.
-- Do not add `sorry`, `admit`, axioms, unsafe declarations, `sorryAx`, artificial contradictions,
-  circular helpers, diagnostic suppression, or heartbeat-limit workarounds.
-- Do not add or invoke `aesop`. Use focused lemmas and ordinary tactics.
-- Leave proof holes outside the authoritative assignment unchanged.
-- Preserve unrelated work and leave no scratch, backup, or exploratory files.
+## Proof workflow
 
-If concrete mathematics shows that a fixed statement or interface is defective, leave it unchanged
-and report the smallest required correction. If a missing reusable result belongs to an earlier
-chapter, report an `upstream_requests` entry after checking at least two alternatives. Continue with
-independent assigned holes when possible.
+1. Inspect the assigned declaration, local context, source passage, and directly relevant earlier
+   APIs. Confirm signatures before use.
+2. Prefer an existing result, focused rewriting, a standard constructor/equivalence, then a
+   lower-level construction. Use focused private helpers when useful.
+3. Preserve and validate independent progress. Remove speculative edits, unused helpers, and
+   abandoned imports.
+4. After editing, prepare affected dependencies once and request fresh diagnostics in import order.
 
-## Completion and report
+## Constraints
 
-Set `complete` to `true` exactly when every assigned hole is replaced by a checked proof and no
-assigned-span error or non-`sorry` warning remains. Otherwise retain clean progress and set it to
-`false`.
+- Do not change a public declaration's interface. Report a defective statement for focused review.
+- Do not add placeholders, axioms, unsafe declarations, circular helpers, warning suppression,
+  heartbeat workarounds, umbrella imports, or `aesop`.
+- Keep imports focused and chronological. Leave holes outside the assignment unchanged.
+- Request an earlier-chapter result only after checking two concrete alternatives.
 
-Return the provided structured report only after edits and tool use stop. Keep `summary` concise.
-Use `failed_attempts` only for new or materially changed target-specific evidence, `blocker_refs` for
-unchanged supplied blockers, `source_issues` only for genuine textbook defects, and
-`upstream_requests` only for missing results owned by earlier chapters. Leave unused lists empty.
+## Report
+
+Set `complete=true` only when every assigned hole is gone and its span is diagnostic-clean. Set
+`disposition` to:
+
+- `proved` for complete work;
+- `partial` when checked edits remain but assigned holes remain;
+- `retryable` only when a named materially new strategy remains;
+- `statement_defect`, `upstream_blocked`, or `validation_inconsistency` for those terminal routes.
+
+Use `failed_attempts` only for new evidence, `blocker_refs` for unchanged durable evidence, and
+`upstream_requests` only for an earlier owner. Return the structured report once files are stable.
+`statement_defect` requires target-specific `failed_attempts`; `upstream_blocked` requires a valid
+`upstream_requests` owner handoff; and `partial` requires retained scoped edits.

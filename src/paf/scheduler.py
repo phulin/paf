@@ -1870,6 +1870,15 @@ class Orchestrator:
                 invalidated_builds = await self._invalidate_build_records((chapter.id,))
                 if stage is Stage.REVIEW or auxiliary:
                     self._proof_rechecks.update(invalidated_builds)
+            assigned_targets_satisfied = bool(selected_proof_targets) and all(
+                declaration_uses_placeholder(
+                    self.config.settings.repo,
+                    target.path,
+                    target.declaration,
+                )
+                is False
+                for target in selected_proof_targets
+            )
             if isolated.accepted:
                 if role == REPAIR_WORKER_ROLE:
                     validation = ValidationResult(
@@ -1878,7 +1887,9 @@ class Orchestrator:
                         "validation deferred to the normal stage scheduler",
                         status=ValidationStatus.DEFERRED,
                     )
-                elif stage is Stage.PROVE and (agent.changed or self.force):
+                elif stage is Stage.PROVE and (
+                    agent.changed or self.force or assigned_targets_satisfied
+                ):
                     snapshots: dict[str, ValidatedBuildSnapshot] = {}
                     validation = (
                         await self._build_chapters(
@@ -1929,14 +1940,15 @@ class Orchestrator:
                             )
                 elif stage is Stage.PROVE:
                     build_fresh = await self._proof_build_is_fresh(chapter)
-                    validation = ValidationResult(
-                        build_fresh,
-                        0 if build_fresh else 1,
-                        (
-                            "unchanged proof source reused the incoming clean build"
-                            if build_fresh
-                            else "unchanged proof source has no clean coordinator build"
-                        ),
+                    validation = (
+                        ValidationResult(
+                            True,
+                            0,
+                            "unchanged proof source reused the incoming clean build",
+                            status=ValidationStatus.CLEAN,
+                        )
+                        if build_fresh
+                        else await self._refresh_stale_proof_build(chapter)
                     )
                 else:
                     validation = ValidationResult(
@@ -3107,10 +3119,25 @@ class Orchestrator:
                 "re-reviewing the complete assigned scope:\n\n" + attempt_feedback
             )
         }
+        attempts = report.get("failed_attempts")
+        blocker_ids: list[str] = []
+        for raw in attempts if isinstance(attempts, list) else ():
+            if not isinstance(raw, dict):
+                continue
+            for blocker in self.state.proof_blockers_for_consumer(chapter.id, active_only=False):
+                if (
+                    str(blocker.get("path", "")) == str(raw.get("path", ""))
+                    and str(blocker.get("declaration", "")).rsplit(".", 1)[-1]
+                    == str(raw.get("declaration", "")).rsplit(".", 1)[-1]
+                    and self._normalized_blocker_goal(blocker) == self._normalized_blocker_goal(raw)
+                ):
+                    blocker_ids.append(str(blocker["id"]))
+                    break
         _, created = await self.state.enqueue_proof_review_request(
             feedback,
             origin_run_id=origin_run_id,
             kind=PROOF_FINDING_REVIEW_KIND,
+            blocker_ids=blocker_ids,
         )
         targets = {chapter.id}
         if not created:
@@ -4420,6 +4447,10 @@ class Orchestrator:
             ):
                 return False
             async with self.state.batch():
+                await self._apply_proof_review_outcomes(
+                    chapter,
+                    proof_request_ids,
+                )
                 await self.state.finish_proof_review_requests(
                     chapter.id,
                     proof_request_ids,
@@ -4431,6 +4462,55 @@ class Orchestrator:
                     detail,
                 )
             return True
+
+    async def _apply_proof_review_outcomes(
+        self,
+        chapter: WorkUnitLike,
+        request_ids: Iterable[str],
+    ) -> None:
+        """Resolve reviewed blockers without blindly scheduling the same proof again."""
+
+        review_runs = self.state.task(chapter.id, Stage.REVIEW).runs
+        if not review_runs:
+            return
+        run = review_runs[-1]
+        self.state.load_run_details(run)
+        report = run.report if isinstance(run.report, dict) else {}
+        raw_assessments = report.get("finding_assessments")
+        assessments = (
+            {
+                str(item.get("finding_id", "")): str(item.get("assessment", ""))
+                for item in raw_assessments
+                if isinstance(item, dict)
+            }
+            if isinstance(raw_assessments, list)
+            else {}
+        )
+        for request_id in request_ids:
+            request = self.state.proof_review_requests.get(request_id)
+            if not isinstance(request, dict) or request.get("kind") != PROOF_FINDING_REVIEW_KIND:
+                continue
+            raw_ids = request.get("blocker_ids")
+            blocker_ids = [str(value) for value in raw_ids] if isinstance(raw_ids, list) else []
+            for index, blocker_id in enumerate(blocker_ids, start=1):
+                blocker = self.state.proof_blockers.get(blocker_id)
+                if not isinstance(blocker, dict):
+                    continue
+                placeholder = declaration_uses_placeholder(
+                    self.config.settings.repo,
+                    str(blocker.get("path", "")),
+                    str(blocker.get("declaration", "")),
+                )
+                if placeholder is False:
+                    status = ProofBlockerStatus.RESOLVED
+                else:
+                    assessment = assessments.get(f"{request_id}:{index}", "")
+                    if run.changed or assessment in {"rejected", "reframed"}:
+                        status = ProofBlockerStatus.OPEN
+                        blocker["retry_sighting_baseline"] = int(blocker.get("sightings", 0))
+                    else:
+                        status = ProofBlockerStatus.BLOCKED
+                await self.state.set_proof_blocker_status((blocker_id,), status)
 
     async def _invalidate_reviews(
         self,
@@ -5766,19 +5846,8 @@ class Orchestrator:
                 )
             }
 
-        pending_review = any(
-            isinstance(value, dict)
-            and isinstance(value.get("feedback"), dict)
-            and chapter.id in value["feedback"]
-            for value in self.state.proof_review_requests.values()
-        )
-        if not pending_review:
-            reviewed_blockers = (
-                str(blocker["id"])
-                for blocker in self.state.proof_blockers_for_consumer(chapter.id, active_only=False)
-                if blocker.get("status") == ProofBlockerStatus.REVIEW_REQUESTED.value
-            )
-            await self.state.set_proof_blocker_status(reviewed_blockers, ProofBlockerStatus.OPEN)
+        # A completed review must explicitly reopen or resolve its blockers. Merely consuming the
+        # request is not evidence that another proof attempt has become possible.
         feedback = ""
         feedback_ledger: deque[str] = deque(maxlen=PROOF_FEEDBACK_ROUNDS)
         stalled_rounds = 0
@@ -5882,7 +5951,21 @@ class Orchestrator:
                         )
                         if requested:
                             candidates = requested
-                    assigned_targets = proof_target_chunk(candidates, proof_chunk_size)
+                    blocked_candidates = tuple(
+                        target
+                        for target in candidates
+                        if any(
+                            matches_target(blocker, target)
+                            for blocker in self.state.proof_blockers_for_consumer(chapter.id)
+                        )
+                    )
+                    # Once a declaration has durable failure evidence, isolate it from otherwise
+                    # productive holes so a hard residual cannot consume the whole chunk budget.
+                    assigned_targets = (
+                        blocked_candidates[:1]
+                        if blocked_candidates
+                        else proof_target_chunk(candidates, proof_chunk_size)
+                    )
                     chunk_round = 0
                     if not feedback and (
                         durable_feedback := self._durable_blocker_feedback(
@@ -6152,6 +6235,46 @@ class Orchestrator:
                 feedback = ""
                 continue
 
+            report_disposition = str(attempt.agent.report.get("disposition", ""))
+            if report_disposition == "validation_inconsistency" and not attempt.agent.changed:
+                exact_validation = await self._refresh_stale_proof_build(chapter)
+                if not exact_validation.succeeded:
+                    routed = (
+                        await self._build_feedback_async({chapter.id: exact_validation})
+                    ).actionable
+                    await self._queue_review_feedback(
+                        routed
+                        or {
+                            chapter.id: (
+                                "Exact coordinator revalidation after an agent-reported validation "
+                                "inconsistency failed:\n" + exact_validation.output
+                            )
+                        },
+                        origin=f"proof-validation-inconsistency:{attempt.run.id}",
+                    )
+                    await self.state.set_task(
+                        chapter.id,
+                        Stage.PROVE,
+                        TaskStatus.PENDING,
+                        "exact coordinator diagnostics routed after validation inconsistency",
+                    )
+                    return StageOutcome(
+                        ExecutionDisposition.WAITING,
+                        (
+                            Requirement(
+                                RequirementKind.PROOF_REVIEW_REQUEST,
+                                detail="exact coordinator diagnostics require repair",
+                            ),
+                        ),
+                    )
+                await self.state.set_task(
+                    chapter.id,
+                    Stage.PROVE,
+                    TaskStatus.FAILED,
+                    "agent-reported validation inconsistency was not reproduced by an exact build",
+                )
+                return StageOutcome(ExecutionDisposition.FAILED)
+
             feedback_ledger.clear()
             feedback_ledger.append(
                 f"Proof attempt {proof_round}:\n"
@@ -6187,12 +6310,46 @@ class Orchestrator:
                 if unmatched_upstream
                 else ()
             )
+            if report_disposition == "statement_defect" and not blockers:
+                await self.state.set_task(
+                    chapter.id,
+                    Stage.PROVE,
+                    TaskStatus.FAILED,
+                    "statement defect report lacked target-specific failed-attempt evidence",
+                )
+                return StageOutcome(ExecutionDisposition.FAILED)
+            if report_disposition == "upstream_blocked" and not upstream_request_ids:
+                await self.state.set_task(
+                    chapter.id,
+                    Stage.PROVE,
+                    TaskStatus.FAILED,
+                    "upstream-blocked report lacked a valid owner request",
+                )
+                return StageOutcome(ExecutionDisposition.FAILED)
+            if report_disposition == "partial" and not attempt.agent.changed:
+                await self.state.set_task(
+                    chapter.id,
+                    Stage.PROVE,
+                    TaskStatus.FAILED,
+                    "partial proof report retained no scoped source change",
+                )
+                return StageOutcome(ExecutionDisposition.FAILED)
             review_queued = False
             terminal_blockers: list[str] = []
             for blocker in blockers:
                 sightings = int(blocker.get("sightings", 0))
                 retry_baseline = int(blocker.get("retry_sighting_baseline", 0))
-                if sightings - retry_baseline < 2:
+                immediate_handoff = (
+                    report_disposition in {"statement_defect", "upstream_blocked"}
+                    or isinstance(blocker.get("upstream_candidate"), dict)
+                    or self._blocker_needs_review(blocker)
+                )
+                retry_limit = (
+                    1
+                    if immediate_handoff
+                    else self.config.stages[Stage.PROVE].unchanged_retry_limit
+                )
+                if sightings - retry_baseline < retry_limit:
                     continue
                 blocker_id = str(blocker.get("id", ""))
                 candidate = blocker.get("upstream_candidate")

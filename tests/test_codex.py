@@ -123,6 +123,7 @@ def test_report_schemas_contain_only_fields_used_by_each_agent() -> None:
         },
         "prove": {
             "complete",
+            "disposition",
             "summary",
             "issues",
             "source_issues",
@@ -132,6 +133,7 @@ def test_report_schemas_contain_only_fields_used_by_each_agent() -> None:
         },
         "downstream_retry": {
             "complete",
+            "disposition",
             "summary",
             "issues",
             "source_issues",
@@ -155,6 +157,14 @@ def test_report_schemas_contain_only_fields_used_by_each_agent() -> None:
 
 
 def test_report_schema_records_complete_upstream_handoffs() -> None:
+    assert REPORT_SCHEMAS["prove"]["properties"]["disposition"]["enum"] == [
+        "proved",
+        "partial",
+        "retryable",
+        "statement_defect",
+        "upstream_blocked",
+        "validation_inconsistency",
+    ]
     request = REPORT_SCHEMAS["prove"]["properties"]["upstream_requests"]["items"]
     assert set(request["required"]) == {
         "blocked_declaration",
@@ -468,14 +478,14 @@ def test_proof_prompt_contains_only_the_assigned_chunk(tmp_path: Path) -> None:
 
     prompt = executor.build_prompt(chapter, Stage.PROVE, proof_targets=[assigned])
 
-    assert "Authoritative assignment" in prompt
+    assert "Current merged-source target" in prompt
     assert "exactly 1 declaration containing\n2 proof holes" in prompt
     assert "`Book.target`" in prompt
     assert "H1 at line 20: `left := by`" in prompt
     assert "H2 at line 23: `right := by`" in prompt
     assert "There are no unassigned placeholders" in prompt
-    assert prompt.index("## Mission") < prompt.index("## Authoritative assignment")
-    assert prompt.index("## Authoritative assignment") < prompt.index("## Working method")
+    assert prompt.index("## Mission") < prompt.index("## Current merged-source target")
+    assert prompt.index("## Current merged-source target") < prompt.index("## Working method")
     assert "Resolve every\nlisted hole" in prompt
 
 

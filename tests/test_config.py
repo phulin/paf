@@ -35,6 +35,7 @@ def test_discovers_chapters_and_renders_paths(tmp_path: Path) -> None:
     assert config.settings.state_dir == tmp_path / ".paf"
     assert config.stages[Stage.DISCOVER].max_agents == 40
     assert config.stages[Stage.PROVE].chunk_size == 4
+    assert config.stages[Stage.PROVE].unchanged_retry_limit == 2
     assert config.stages[Stage.REVIEW].chunk_size is None
     assert config.settings.lean_project == Path("lean")
     assert config.settings.lean_mcp_tool_timeout_seconds == 300
@@ -90,6 +91,28 @@ def test_loads_and_validates_proof_chunk_size(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     with pytest.raises(ValueError, match=r"stages\.prove\.chunk_size"):
+        load_config(path)
+
+
+def test_loads_and_validates_global_unchanged_proof_retry_limit(tmp_path: Path) -> None:
+    path = write_project(tmp_path)
+    path.write_text(
+        path.read_text(encoding="utf-8").replace(
+            'prompt = "prompts/prove.md"',
+            'prompt = "prompts/prove.md"\nunchanged_retry_limit = 4',
+        ),
+        encoding="utf-8",
+    )
+
+    assert load_config(path).stages[Stage.PROVE].unchanged_retry_limit == 4
+
+    path.write_text(
+        path.read_text(encoding="utf-8").replace(
+            "unchanged_retry_limit = 4", "unchanged_retry_limit = 0"
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match=r"stages\.prove\.unchanged_retry_limit"):
         load_config(path)
 
 

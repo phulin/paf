@@ -28,6 +28,7 @@ class StageConfig:
     chunk_size: int | None = None
     model: str | None = None
     reasoning_effort: str | None = None
+    unchanged_retry_limit: int = 2
 
 
 @dataclass(frozen=True)

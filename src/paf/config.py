@@ -134,6 +134,11 @@ def _stage_configs(raw_stages: dict[str, Any], base: Path) -> dict[Stage, StageC
         reasoning_value = raw.get("reasoning_effort", STAGE_REASONING_EFFORTS.get(stage))
         if reasoning_value is not None and not isinstance(reasoning_value, str):
             raise ValueError(f"stages.{stage.value}.reasoning_effort must be a string")
+        unchanged_retry_limit = int(raw.get("unchanged_retry_limit", 2))
+        if stage is not Stage.PROVE and "unchanged_retry_limit" in raw:
+            raise ValueError("retry settings are only supported for stages.prove")
+        if unchanged_retry_limit < 1:
+            raise ValueError("stages.prove.unchanged_retry_limit must be positive")
         stages[stage] = StageConfig(
             prompt=prompt,
             max_rounds=max_rounds,
@@ -141,6 +146,7 @@ def _stage_configs(raw_stages: dict[str, Any], base: Path) -> dict[Stage, StageC
             chunk_size=chunk_size,
             model=model_value,
             reasoning_effort=reasoning_value,
+            unchanged_retry_limit=unchanged_retry_limit,
         )
     return stages
 

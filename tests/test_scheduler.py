@@ -636,6 +636,32 @@ async def test_proof_blockers_merge_delta_reports_and_persist_ids(tmp_path: Path
 
 
 @pytest.mark.asyncio
+async def test_proof_blockers_deduplicate_obstruction_wording_by_residual_goal(
+    tmp_path: Path,
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    state = StateStore(config)
+    await state.load_or_create()
+    chapter_id = config.chapters[0].id
+
+    first = await state.record_proof_blockers(
+        chapter_id,
+        origin_run_id="run-1",
+        failed_attempts=[failed_attempt("no bridge was found")],
+    )
+    second = await state.record_proof_blockers(
+        chapter_id,
+        origin_run_id="run-2",
+        failed_attempts=[failed_attempt("the imported API does not expose a bridge")],
+    )
+
+    assert second[0]["id"] == first[0]["id"]
+    assert len(state.proof_blockers) == 1
+    assert second[0]["sightings"] == 2
+    await state.close()
+
+
+@pytest.mark.asyncio
 async def test_usage_and_cost_aggregates_cache_all_chapters_in_one_pass(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
     state = StateStore(config)
@@ -4711,6 +4737,51 @@ async def test_proof_releases_agent_slot_before_coordinator_build(
 
 
 @pytest.mark.asyncio
+async def test_stale_assigned_target_is_rescanned_and_certified_without_agent_edits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = config.chapters[0]
+    source = tmp_path / "lean" / "Book" / "Chapter01.lean"
+    source.parent.mkdir(parents=True)
+    source.write_text("theorem target : True := by trivial\n", encoding="utf-8")
+    orchestrator = Orchestrator(config, StateStore(config))
+    await orchestrator.prepare()
+    orchestrator.executor = FakeExecutor(
+        orchestrator.state, [result(changed=False, placeholders=1)]
+    )
+    builds = 0
+
+    async def build(
+        _chapters: object, *, snapshots: dict[str, object], **_kwargs: object
+    ) -> dict[str, ValidationResult]:
+        nonlocal builds
+        builds += 1
+        snapshots[chapter.id] = object()
+        return {chapter.id: ValidationResult(True, 0, "ok")}
+
+    async def publish(_chapter: Chapter, _snapshot: object) -> bool:
+        return True
+
+    monkeypatch.setattr(orchestrator, "_build_chapters", build)
+    monkeypatch.setattr(orchestrator, "_publish_validated_build", publish)
+    stale = ProofTarget(
+        path="lean/Book/Chapter01.lean",
+        declaration="target",
+        line=1,
+        end_line=1,
+        placeholder_count=1,
+        fingerprint="stale-target",
+    )
+
+    attempt = await orchestrator._attempt(chapter, Stage.PROVE, proof_targets=(stale,))
+
+    assert attempt.validation.succeeded
+    assert builds == 1
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_targeted_live_retry_resumes_only_selected_agent(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -5112,6 +5183,69 @@ async def test_standalone_failed_proof_attempt_queues_durable_review(
     assert "the statement needs another hypothesis" in feedback
     assert len(request_ids) == 1
     assert orchestrator.state.fixup_requests == {}
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("assessment", "review_changed", "expected"),
+    [
+        ("confirmed", False, ProofBlockerStatus.BLOCKED),
+        ("rejected", False, ProofBlockerStatus.OPEN),
+        ("confirmed", True, ProofBlockerStatus.OPEN),
+    ],
+)
+async def test_completed_review_controls_blocker_reopening(
+    tmp_path: Path,
+    assessment: str,
+    review_changed: bool,
+    expected: ProofBlockerStatus,
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = config.chapters[0]
+    source = tmp_path / "lean" / "Book" / "Chapter01.lean"
+    source.parent.mkdir(parents=True)
+    source.write_text("theorem target : True := by sorry\n", encoding="utf-8")
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await orchestrator.prepare()
+    blockers = await state.record_proof_blockers(
+        chapter.id,
+        origin_run_id="proof-run",
+        failed_attempts=[
+            failed_attempt("the statement may be too strong") | {"disposition": "statement_review"}
+        ],
+    )
+    blocker_id = str(blockers[0]["id"])
+    await state.set_proof_blocker_status((blocker_id,), ProofBlockerStatus.REVIEW_REQUESTED)
+    request_id, _ = await state.enqueue_proof_review_request(
+        {chapter.id: "Failed proof `Book.target` in `lean/Book/Chapter01.lean`"},
+        origin_run_id="proof-run",
+        blocker_ids=(blocker_id,),
+    )
+    run = await state.start_run(chapter.id, Stage.REVIEW)
+    await state.finish_run(
+        run,
+        status=TaskStatus.SUCCEEDED,
+        changed=review_changed,
+        report={
+            "complete": True,
+            "finding_assessments": [
+                {
+                    "finding_id": f"{request_id}:1",
+                    "finding": "Book.target is blocked",
+                    "assessment": assessment,
+                    "explanation": "checked against the source",
+                }
+            ],
+        },
+    )
+
+    assert await orchestrator._complete_review(chapter, "reviewed", proof_request_ids=(request_id,))
+    assert state.proof_blockers[blocker_id]["status"] == expected.value
+    if expected is ProofBlockerStatus.OPEN:
+        assert state.proof_blockers[blocker_id]["retry_sighting_baseline"] == 1
+    assert request_id not in state.proof_review_requests
     await orchestrator.shutdown()
 
 

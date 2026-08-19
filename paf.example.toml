@@ -73,6 +73,8 @@ max_rounds = 3
 [stages.prove]
 chunk_size = 4
 max_rounds = 3
+# Counted globally per semantic blocker, including later proof/review cycles.
+unchanged_retry_limit = 2
 
 # Adapter defaults apply to every configured source. Ordered path rules can
 # override the format or splitting mode for a mixed corpus.

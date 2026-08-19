@@ -106,6 +106,21 @@ _BLOCKER_REFS_PROPERTY: dict[str, Any] = {
     "description": "Durable blocker IDs whose fingerprint and evidence are unchanged.",
 }
 
+_PROOF_DISPOSITION_PROPERTY: dict[str, Any] = {
+    "type": "string",
+    "enum": [
+        "proved",
+        "partial",
+        "retryable",
+        "statement_defect",
+        "upstream_blocked",
+        "validation_inconsistency",
+    ],
+    "description": (
+        "Machine-actionable next state. Use retryable only when a materially new strategy remains."
+    ),
+}
+
 _UPSTREAM_REQUESTS_PROPERTY: dict[str, Any] = {
     "type": "array",
     "items": {
@@ -293,6 +308,7 @@ REPORT_SCHEMAS: dict[str, dict[str, Any]] = {
         "PAF proof report",
         _REPORT_BASE_PROPERTIES
         | {
+            "disposition": _PROOF_DISPOSITION_PROPERTY,
             "source_issues": _SOURCE_ISSUES_PROPERTY,
             "failed_attempts": _FAILED_ATTEMPTS_PROPERTY,
             "blocker_refs": _BLOCKER_REFS_PROPERTY,
@@ -303,6 +319,7 @@ REPORT_SCHEMAS: dict[str, dict[str, Any]] = {
         "PAF downstream proof retry report",
         _REPORT_BASE_PROPERTIES
         | {
+            "disposition": _PROOF_DISPOSITION_PROPERTY,
             "source_issues": _SOURCE_ISSUES_PROPERTY,
             "failed_attempts": _FAILED_ATTEMPTS_PROPERTY,
             "blocker_refs": _BLOCKER_REFS_PROPERTY,
@@ -427,24 +444,25 @@ have stopped. It must describe the stable files on disk, not planned work. Use o
         }
     else:
         values = {
-            "review_assignment": """This is a full-chapter statement and interface re-review
-triggered by failed proof evidence. Review the complete assigned chapter, not only the declarations
-named in the supplied findings.""",
+            "review_assignment": """This is a focused statement and interface review triggered by
+failed proof evidence. Review the named declarations, their immediate supporting interfaces, and
+the corresponding source passages. Do not spend time re-auditing unrelated chapter declarations.""",
             "review_goal_details": """This remains review work, not a second proof attempt. Repair
-every genuine statement or supporting-interface problem, but preserve a sound interface when only
-the proof strategy failed.""",
-            "review_workflow_details": """Cover every numbered source section and every assigned
-Lean declaration, followed by a chapter-wide coverage, import, and diagnostic check. For each main
-theorem, verify the statement's mathematical meaning and a plausible route through earlier results.
-Account for every supplied finding ID as confirmed, rejected, or reframed.""",
+every genuine statement or supporting-interface problem in the focused scope. You are authorized to
+make the smallest source-faithful public correction when the evidence confirms a defect. Preserve a
+sound interface when only the proof strategy failed.""",
+            "review_workflow_details": """Account for every supplied finding ID as confirmed,
+rejected, or reframed. Check the exact statement against the source, test obvious counterexamples,
+and inspect only the focused earlier APIs needed to decide it. A confirmed defect must be repaired
+when it is in scope; a rejected finding must name a concrete viable proof route.""",
             "review_guardrails": """Do not spend the assignment proving existing proposition
-placeholders or restrict review to the failed declarations. A no-change review needs no diagnostic
-calls only when the handoff contains no PAF build or validation diagnostics. Supplied diagnostics
-must all be resolved except for explicitly permitted exact `sorry` warnings.""",
-            "review_definition_of_done": """The complete assigned chapter has been re-reviewed,
-every supplied finding has an evidence-backed assessment, all warranted in-scope repairs have been
-made, established APIs have been reused wherever possible, imports remain chronological, and edited
-files have no diagnostics except permitted exact `sorry` warnings.""",
+placeholders. Do not broaden from the named findings into unrelated chapter cleanup. A no-change
+review must explain the concrete viable proof route or why the blocker is terminal. Supplied build
+diagnostics remain required work.""",
+            "review_definition_of_done": """Every supplied finding has an evidence-backed
+assessment, every confirmed in-scope defect has the smallest source-faithful repair, rejected or
+reframed findings have actionable proof guidance, and edited files have no diagnostics except
+permitted exact `sorry` warnings.""",
             "review_output_format": """Return the structured report once, after tool use and edits
 have stopped. It must describe the stable files on disk, not planned work. Use only these fields:
 
@@ -1435,9 +1453,9 @@ class CodexExecutor:
         proof_retry_contract = ""
         if stage is Stage.PROVE and feedback and role != UPSTREAM_REPAIR_ROLE:
             proof_retry_contract = """
-This is a retry. Use the target-specific handoff below to improve a prior approach or try a
-meaningfully different one. Resolve supplied current diagnostics and do not restate unchanged
-blocker evidence."""
+This is a retry. The handoff below is the complete delta from the previous attempt. Before using
+tools, identify a materially new premise, API, or strategy. If there is none, return the unchanged
+blocker immediately. Do not repeat prior searches or evidence."""
         selected_proof_targets = tuple(proof_targets)
         proof_assignment = ""
         if (
@@ -1514,7 +1532,12 @@ blocker evidence."""
                 if declaration_count == 1 and assigned_placeholders > chunk_size
                 else ""
             )
-            proof_assignment = f"""## Authoritative assignment
+            merged_scope_digest = scope_digest(root, chapter)
+            attempt_mode = "retry with a target-specific handoff" if feedback else "initial attempt"
+            proof_assignment = f"""## Current merged-source target
+
+Attempt mode: {attempt_mode}
+Merged scope digest: `{merged_scope_digest}`
 
 This attempt owns exactly {declaration_count} {declaration_label} containing
 {assigned_placeholders} {hole_label}.{overflow}
@@ -1527,10 +1550,16 @@ Work only on the assigned declaration bodies and focused private helpers they re
 listed hole and every diagnostic in the assigned span. Set `complete` to `true` only when all listed
 holes are gone and no non-`sorry` diagnostic remains.
 """
-            workflow_heading = "\n## Working method\n"
-            if workflow_heading in base:
+            insertion_heading = "\n## First decision\n"
+            if insertion_heading in base:
                 base = base.replace(
-                    workflow_heading,
+                    insertion_heading,
+                    f"\n{proof_assignment}\n## First decision\n",
+                    1,
+                )
+            elif "\n## Working method\n" in base:
+                base = base.replace(
+                    "\n## Working method\n",
                     f"\n{proof_assignment}\n## Working method\n",
                     1,
                 )
@@ -2200,9 +2229,17 @@ diagnostics from prerequisites to dependents.
         succeeded = exit_code == 0 and bool(report)
         activity.finish("succeeded" if succeeded else "failed", error)
         await self.state.activities.save_async(activity)
+        if succeeded and report.get("complete") is True:
+            run_status = TaskStatus.SUCCEEDED
+        elif succeeded:
+            # The process completed, but the proof assignment did not. The structured
+            # disposition distinguishes productive partial work from terminal blockers.
+            run_status = TaskStatus.BLOCKED
+        else:
+            run_status = TaskStatus.FAILED
         await self.state.finish_run(
             run,
-            status=TaskStatus.SUCCEEDED if succeeded else TaskStatus.FAILED,
+            status=run_status,
             exit_code=exit_code,
             changed=changed,
             placeholders=placeholders,

@@ -2146,6 +2146,15 @@ class StateStore:
         )
         return digest_text("\0".join(fields))
 
+    @staticmethod
+    def _proof_blocker_semantic_key(attempt: dict[str, Any]) -> tuple[str, str, str]:
+        """Stable identity for wording variants of the same residual declaration goal."""
+
+        path = str(attempt.get("path", "")).strip()
+        declaration = str(attempt.get("declaration", "")).strip().rsplit(".", 1)[-1]
+        goal = re.sub(r"\s+", " ", str(attempt.get("remaining_goal", ""))).strip()
+        return path, declaration, goal.removeprefix("⊢ ")
+
     def proof_blockers_for_consumer(
         self,
         chapter_id: str,
@@ -2176,6 +2185,11 @@ class StateStore:
             for value in self.proof_blockers.values()
             if value.get("consumer_chapter_id") == chapter_id
         }
+        by_semantic_key = {
+            self._proof_blocker_semantic_key(value): value
+            for value in self.proof_blockers.values()
+            if value.get("consumer_chapter_id") == chapter_id
+        }
         candidates = tuple(value for value in upstream_candidates if isinstance(value, dict))
         for raw in failed_attempts:
             if not isinstance(raw, dict):
@@ -2184,6 +2198,11 @@ class StateStore:
             blocker: dict[str, Any] | None = by_fingerprint.get(fingerprint)
             if blocker is None:
                 blocker = by_fingerprint.get(self._transitional_proof_blocker_fingerprint(raw))
+                if blocker is not None:
+                    blocker["fingerprint"] = fingerprint
+                    by_fingerprint[fingerprint] = blocker
+            if blocker is None:
+                blocker = by_semantic_key.get(self._proof_blocker_semantic_key(raw))
                 if blocker is not None:
                     blocker["fingerprint"] = fingerprint
                     by_fingerprint[fingerprint] = blocker
@@ -2209,6 +2228,7 @@ class StateStore:
                 }
                 self.proof_blockers[blocker_id] = blocker
                 by_fingerprint[fingerprint] = blocker
+                by_semantic_key[self._proof_blocker_semantic_key(raw)] = blocker
             attempts = blocker.setdefault("attempts", [])
             raw_attempts = raw.get("attempts")
             if isinstance(attempts, list) and isinstance(raw_attempts, list):
@@ -2723,6 +2743,7 @@ class StateStore:
         kind: str = "proof_finding",
         stage: Stage | None = None,
         request_id: str | None = None,
+        blocker_ids: Iterable[str] = (),
     ) -> tuple[str, bool]:
         """Persist proof findings or diagnostics before invalidating their review closure."""
 
@@ -2736,6 +2757,7 @@ class StateStore:
             "kind": kind,
             "stage": stage.value if stage is not None else Stage.REVIEW.value,
             "created_at": timestamp(),
+            "blocker_ids": list(dict.fromkeys(blocker_ids)),
         }
         self._mark_dirty(global_state=False, sections={"proof_review_requests"})
         await self._persist()

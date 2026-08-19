@@ -422,8 +422,11 @@ After the daemon exits, `status`, `snapshot`, and `wait` fall back to the persis
   files a reviewer does not edit. Reviewers request whole-file LSP diagnostics after the last relevant
   edit only for the edited files and their assigned transitive dependents, rechecking just the files
   invalidated by any subsequent repair. A changed chapter receives a prioritized coordinator build.
-  Failed builds and structured proof `failed_attempts` are fed to a full-scope re-review of the
-  affected chapter; they return to review rather than formalization.
+  Failed builds are routed to diagnostic repair. Structured statement/interface proof findings are
+  fed to a focused re-review of the named declarations, immediate supporting interfaces, and source
+  passages; they return to review rather than formalization. A confirmed finding that produces no
+  source repair remains terminal instead of silently reopening the same proof. A rejected or
+  reframed finding opens one fresh blocker retry window with the review's guidance.
   An initial review that edits source receives another full pass until one pass is clean, capped at
   five review/verification cycles. A review launched with specific persisted findings instead makes
   one repair pass and completes as soon as its coordinator rebuild is clean; it does not require a
@@ -441,18 +444,26 @@ After the daemon exits, `status`, `snapshot`, and `wait` fall back to the persis
 - **Prove** scans one chapter into declaration-level targets and sends each agent a source-ordered
   chunk bounded by `stages.prove.chunk_size`. The assignment is persisted with the run and repeated
   explicitly in the generated prompt; placeholders outside it are reserved for later agents.
-  `max_rounds` is the retry budget for one chunk, not a cap on the number of chunks in the chapter.
+  `max_rounds` is the local retry budget for one chunk, not a cap on the number of chunks in the
+  chapter. `unchanged_retry_limit` is the global budget for one semantic blocker across later
+  proof/review cycles; differently worded reports with the same declaration and residual goal do
+  not reset it.
   A completed chunk starts with a fresh budget, while an exhausted or durably obstructed chunk does
   not prevent independent chunks from running or block downstream tasks. After every runnable
   branch drains, such a chunk remains a visible failed leaf task without failing the enclosing
-  pipeline invocation. A cumulative attempt ledger is prior inventory: retry
-  agents must refine an earlier proof using new evidence or try a materially different route instead
+  pipeline invocation. A cumulative attempt ledger is prior inventory. Known blocked declarations
+  are isolated from otherwise productive chunks, and unchanged terminal blockers are not launched
+  again. Retry agents must refine an earlier proof using new evidence or try a materially different route instead
   of rereading the chapter, reconfirming clean diagnostics, or echoing a missing-API claim. The proof
   task succeeds when the scoped Lean code has no `sorry` or `admit` tokens and final Lake validation
   compiles; any non-`sorry` warning is assigned to auxiliary cleanup and remains a final pipeline
   convergence requirement. The exact validated source digest is persisted independently of review
   status. If it is stale after restart, the coordinator rebuilds and recounts placeholders first; a
-  successful placeholder-free source is accepted without launching another proof agent. Proof
+  successful placeholder-free source is accepted without launching another proof agent. Every
+  assignment is rescanned after integration, so a declaration proved concurrently in the merged
+  source is certified even when the reporting agent made no changes. An unchanged result without a
+  reusable clean build triggers an exact coordinator rebuild rather than an unsourced validation
+  failure. Proof
   validation uses the same visible coordinator-build record and fair build lane; it never holds the
   build queue while the proof agent edits, takes a snapshot, or merges its scoped patch.
 - If sustained checked proof work exposes a genuinely missing earlier interface, the proof agent
@@ -480,7 +491,10 @@ After the daemon exits, `status`, `snapshot`, and `wait` fall back to the persis
   authorizes another targeted attempt without erasing run history.
 - A proof agent may change proof bodies but not declaration interfaces. It reports each unresolved
   proof through structured `failed_attempts`, including checked approaches and the exact remaining
-  goal; the pipeline sends that evidence to an independent editing re-review before proving resumes.
+  goal, plus a machine-actionable disposition. Statement defects and valid upstream requests route
+  immediately; ordinary unchanged blockers receive at most `unchanged_retry_limit` sightings. A
+  clean agent exit with an incomplete report is recorded as a blocked run rather than a successful
+  proof run.
 
 The orchestrator independently hashes every configured chapter scope. Agent claims about changes do
 not control review convergence. Lean placeholder scanning ignores comments and strings.
@@ -756,6 +770,7 @@ max_rounds = 6
 [stages.prove]
 chunk_size = 4 # maximum placeholders per agent; declarations are never split
 max_rounds = 3 # retries for each chunk
+unchanged_retry_limit = 2 # global sightings per semantic blocker
 ```
 
 Books are repeatable. Chapters omitted from `chapters` are discovered from every matching Markdown
