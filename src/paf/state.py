@@ -515,6 +515,7 @@ class StateStore:
         self._dirty_thread_usage_ids: set[str] = set()
         self._static_dirty = False
         self._dirty_task_keys: set[str] = set()
+        self._dirty_projection_work_units: set[str] = set()
         self._issues_dirty = False
         self._dirty_run_ids: set[str] = set()
         self._prior_run_ids: set[str] = set()
@@ -1639,6 +1640,15 @@ class StateStore:
             "latest_run_id": task.runs[-1].id if task.runs else None,
         }
 
+    def _persisted_task_dict(
+        self,
+        task: TaskRecord,
+        context: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Serialize canonical task state without derived failure presentation."""
+
+        return self._hot_task_dict(task, context, {})
+
     def _mark_dirty(
         self,
         *,
@@ -1655,6 +1665,24 @@ class StateStore:
         changed_tasks = [*tasks]
         if task is not None:
             changed_tasks.append(task)
+        failure_transitions = {
+            self.key(item.chapter_id, Stage(item.stage))
+            for item in changed_tasks
+            if (
+                previous := self._indexed_task_states.get(
+                    self.key(item.chapter_id, Stage(item.stage))
+                )
+            )
+            is not None
+            and (previous[1] == TaskStatus.FAILED) != (item.status == TaskStatus.FAILED)
+        }
+        if failure_transitions:
+            self._dirty_projection_work_units.update(
+                item.chapter_id for item in self._failure_dependents(failure_transitions)
+            )
+        changed_tasks = list(
+            {self.key(item.chapter_id, Stage(item.stage)): item for item in changed_tasks}.values()
+        )
         for item in changed_tasks:
             self._sync_task_index(item)
         self._dirty_task_keys.update(
@@ -1728,10 +1756,12 @@ class StateStore:
             dirty_thread_usage_ids = self._dirty_thread_usage_ids
             dirty_sections = self._dirty_sections
             task_keys = self._dirty_task_keys
+            projection_work_units = self._dirty_projection_work_units
             dirty_runs = self._dirty_run_ids
             issues_dirty = self._issues_dirty
             static_dirty = self._static_dirty
             self._dirty_task_keys = set()
+            self._dirty_projection_work_units = set()
             self._dirty_run_ids = set()
             self._checkpoint_dirty = False
             self._coordinator_build_dirty = False
@@ -1741,13 +1771,8 @@ class StateStore:
             self._issues_dirty = False
             self._static_dirty = False
             task_context = self._task_snapshot_context() if task_keys else None
-            failure_roots = (
-                self._failure_roots_index()
-                if len(task_keys) >= max(32, len(self.tasks) // 8)
-                else None
-            )
             task_payloads = {
-                key: json.dumpb(self._hot_task_dict(self.tasks[key], task_context, failure_roots))
+                key: json.dumpb(self._persisted_task_dict(self.tasks[key], task_context))
                 for key in sorted(task_keys)
                 if key in self.tasks
             }
@@ -1880,13 +1905,15 @@ class StateStore:
                     )
                     if kind == "dependency"
                 )
+            persisted_changed_work_units = set(changed_work_units)
+            changed_work_units.update(projection_work_units)
             changed_stages = {self.tasks[key].stage for key in task_payloads} | {
                 run.stage for run_id in runs if (run := self._runs_by_id.get(run_id))
             }
             changes = {
                 *(("task", key) for key in task_payloads),
                 *(("run", run_id) for run_id in runs),
-                *(("work_unit", unit_id) for unit_id in changed_work_units),
+                *(("work_unit", unit_id) for unit_id in persisted_changed_work_units),
             }
             if globals_dirty:
                 changes.add(("global", "state"))
@@ -3587,6 +3614,29 @@ class StateStore:
                 )
             )
         return owner_keys
+
+    def _failure_dependents(self, owner_keys: Iterable[str]) -> list[TaskRecord]:
+        """Return pending tasks whose derived blocked state can change with an owner."""
+
+        dependents: dict[str, list[str]] = {}
+        for key, task in self.tasks.items():
+            if task.status != TaskStatus.PENDING:
+                continue
+            for owner_key in self._failure_owner_keys(task):
+                dependents.setdefault(owner_key, []).append(key)
+
+        changed: list[TaskRecord] = []
+        pending = deque(dict.fromkeys(owner_keys))
+        visited = set(pending)
+        while pending:
+            owner_key = pending.popleft()
+            for dependent_key in dependents.get(owner_key, ()):
+                if dependent_key in visited:
+                    continue
+                visited.add(dependent_key)
+                changed.append(self.tasks[dependent_key])
+                pending.append(dependent_key)
+        return changed
 
     def _failure_roots_subset(self, task_keys: Iterable[str]) -> dict[str, tuple[str, ...]]:
         """Resolve roots in only the prerequisite closure needed by a projection."""

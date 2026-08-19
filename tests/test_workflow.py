@@ -232,6 +232,55 @@ async def test_hot_snapshot_batches_failure_roots_without_recursive_walks(
 
 
 @pytest.mark.asyncio
+async def test_failure_recovery_publishes_derived_waiting_state(tmp_path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    state = StateStore(config)
+    await state.load_or_create()
+    first, second = config.work_units
+    state.source_dependency_tree = {
+        "dependencies": {
+            first.id: [],
+            second.id: [first.id],
+        }
+    }
+    baseline_revision = state.revision
+    changes = state.change_bus.subscribe()
+
+    await state.set_task(first.id, Stage.FORMALIZE, TaskStatus.FAILED, "failed")
+    failed_change = await changes.get()
+    assert second.id in failed_change.work_units
+    failed_delta = state.dashboard_delta(failed_change)
+    assert (
+        failed_delta["tasks"][state.key(second.id, Stage.FORMALIZE)]["scheduling_status"]
+        == "blocked"
+    )
+    with sqlite3.connect(state.database_path) as connection:
+        status, payload = connection.execute(
+            "SELECT status, payload FROM tasks WHERE task_key = ?",
+            (state.key(second.id, Stage.FORMALIZE),),
+        ).fetchone()
+        persisted_projection_changes = connection.execute(
+            """SELECT count(*) FROM changes
+            WHERE revision > ? AND entity_type = 'work_unit' AND entity_id = ?""",
+            (baseline_revision, second.id),
+        ).fetchone()[0]
+    assert status == "pending"
+    assert json.loads(payload)["scheduling_status"] == "waiting"
+    assert json.loads(payload)["blocked_by"] == []
+    assert persisted_projection_changes == 0
+
+    await state.set_task(first.id, Stage.FORMALIZE, TaskStatus.PENDING, "manual retry")
+    retry_change = await changes.get()
+    assert second.id in retry_change.work_units
+    retry_delta = state.dashboard_delta(retry_change)
+    assert (
+        retry_delta["tasks"][state.key(second.id, Stage.FORMALIZE)]["scheduling_status"]
+        == "waiting"
+    )
+    await state.close()
+
+
+@pytest.mark.asyncio
 async def test_dashboard_projects_build_freshness_without_shipping_formalize_graph(
     tmp_path,
 ) -> None:
