@@ -117,6 +117,48 @@ async def test_waiting_owner_recovery_retries_consumer_in_same_run(tmp_path, mon
 
 
 @pytest.mark.asyncio
+async def test_pipeline_formalize_scheduler_wakes_after_idle_retry(tmp_path, monkeypatch) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await orchestrator.prepare()
+    chapter = config.work_units[0]
+    await orchestrator._persist_source_dependencies(chapter, (), {"summary": "root", "issues": []})
+    await state.set_task(chapter.id, Stage.DISCOVER, TaskStatus.SUCCEEDED, "discovered")
+    await state.set_task(chapter.id, Stage.FORMALIZE, TaskStatus.FAILED, "failed once")
+    formalized = asyncio.Event()
+
+    async def formalize(selected, *, rerun=False):
+        del rerun
+        assert selected.id == chapter.id
+        await state.set_task(selected.id, Stage.FORMALIZE, TaskStatus.SUCCEEDED, "clean")
+        formalized.set()
+        return StageOutcome(ExecutionDisposition.SUCCEEDED)
+
+    monkeypatch.setattr(orchestrator, "_formalize", formalize)
+    progress = asyncio.Event()
+    idle = asyncio.Event()
+    stop = asyncio.Event()
+    scheduler = asyncio.create_task(
+        orchestrator._discover_and_formalize(
+            progress_event=progress,
+            idle_event=idle,
+            stop_event=stop,
+            discover=False,
+        )
+    )
+
+    await asyncio.wait_for(idle.wait(), timeout=1)
+    assert not scheduler.done()
+    assert await state.retry_failed() == [state.key(chapter.id, Stage.FORMALIZE)]
+    await asyncio.wait_for(formalized.wait(), timeout=1)
+    stop.set()
+
+    assert await asyncio.wait_for(scheduler, timeout=1)
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_transient_wait_does_not_write_descendant_task_rows(tmp_path, monkeypatch) -> None:
     config_path = write_project(tmp_path, chapters="chapters = [1, 2, 3]")
     with (tmp_path / "books" / "book.md").open("a", encoding="utf-8") as source:
@@ -673,6 +715,70 @@ async def test_pipeline_has_no_full_stage_barriers(tmp_path, monkeypatch) -> Non
     assert not release_second_formalize.is_set()
     release_second_formalize.set()
     assert await pipeline
+
+
+@pytest.mark.asyncio
+async def test_pipeline_retries_formalization_after_scheduler_becomes_idle(
+    tmp_path, monkeypatch
+) -> None:
+    config = load_config(write_project(tmp_path))
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await orchestrator.prepare()
+    first, second = config.work_units
+    attempts: list[str] = []
+    first_failed = asyncio.Event()
+    first_retried = asyncio.Event()
+    second_proof_started = asyncio.Event()
+    release_second_proof = asyncio.Event()
+
+    async def discover(chapter, *, rerun=False):
+        del rerun
+        await orchestrator._persist_source_dependencies(
+            chapter, (), {"summary": "independent", "issues": []}
+        )
+        await state.set_task(chapter.id, Stage.DISCOVER, TaskStatus.SUCCEEDED, "discovered")
+        return StageOutcome(ExecutionDisposition.SUCCEEDED)
+
+    async def formalize(chapter, *, rerun=False):
+        del rerun
+        attempts.append(chapter.id)
+        if chapter.id == first.id and attempts.count(first.id) == 1:
+            await state.set_task(first.id, Stage.FORMALIZE, TaskStatus.FAILED, "failed once")
+            first_failed.set()
+            return StageOutcome(ExecutionDisposition.FAILED)
+        await state.set_task(chapter.id, Stage.FORMALIZE, TaskStatus.SUCCEEDED, "clean")
+        if chapter.id == first.id:
+            first_retried.set()
+        return StageOutcome(ExecutionDisposition.SUCCEEDED)
+
+    async def review(chapter, rounds_used, **kwargs):
+        del rounds_used, kwargs
+        await state.set_task(chapter.id, Stage.REVIEW, TaskStatus.SUCCEEDED, "reviewed")
+        return StageOutcome(ExecutionDisposition.SUCCEEDED)
+
+    async def prove(chapter, *, defer_review=False):
+        del defer_review
+        if chapter.id == second.id:
+            second_proof_started.set()
+            await release_second_proof.wait()
+        await state.set_task(chapter.id, Stage.PROVE, TaskStatus.SUCCEEDED, "proved")
+        return StageOutcome(ExecutionDisposition.SUCCEEDED)
+
+    monkeypatch.setattr(orchestrator, "_discover", discover)
+    monkeypatch.setattr(orchestrator, "_formalize", formalize)
+    monkeypatch.setattr(orchestrator, "_review_chapter_to_clean", review)
+    monkeypatch.setattr(orchestrator, "_prove", prove)
+
+    pipeline = asyncio.create_task(orchestrator.run_pipeline())
+    await asyncio.wait_for(first_failed.wait(), timeout=1)
+    await asyncio.wait_for(second_proof_started.wait(), timeout=1)
+    assert await state.retry_failed() == [state.key(first.id, Stage.FORMALIZE)]
+    await asyncio.wait_for(first_retried.wait(), timeout=1)
+    release_second_proof.set()
+
+    assert await asyncio.wait_for(pipeline, timeout=1)
+    assert attempts.count(first.id) == 2
 
 
 @pytest.mark.asyncio

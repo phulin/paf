@@ -217,6 +217,7 @@ class PendingDiscovery:
 class RunningFormalizeStage:
     task: asyncio.Task[bool]
     progress: asyncio.Event
+    idle: asyncio.Event
     target_ids: frozenset[str]
 
 
@@ -3942,11 +3943,17 @@ class Orchestrator:
         self,
         *,
         progress_event: asyncio.Event | None = None,
+        idle_event: asyncio.Event | None = None,
+        stop_event: asyncio.Event | None = None,
         discover: bool = True,
     ) -> bool:
         """Pipeline discovery into dependency-ready formalization without a stage gate."""
 
+        if (idle_event is None) != (stop_event is None):
+            raise ValueError("idle_event and stop_event must be provided together")
+
         by_id = {chapter.id: chapter for chapter in self.work_units}
+        changes = self.state.change_bus.subscribe() if stop_event is not None else None
         pending_discoveries: deque[WorkUnitLike] = deque()
         discovery_tasks: dict[str, asyncio.Task[StageOutcome]] = {}
         if discover:
@@ -3984,6 +3991,8 @@ class Orchestrator:
 
         try:
             while True:
+                if idle_event is not None:
+                    idle_event.clear()
                 fill_discovery_window()
                 graph = self._observed_work_unit_graph()
                 succeeded = {
@@ -4013,7 +4022,36 @@ class Orchestrator:
 
                 live = [*discovery_tasks.values(), *formalize_tasks.values()]
                 if not live:
-                    break
+                    if stop_event is None:
+                        break
+                    assert idle_event is not None
+                    assert changes is not None
+                    idle_event.set()
+                    if progress_event is not None:
+                        progress_event.set()
+
+                    async def relevant_change() -> None:
+                        while True:
+                            change = await changes.get()
+                            if (
+                                change.full_resync
+                                or Stage.DISCOVER.value in change.stages
+                                or Stage.FORMALIZE.value in change.stages
+                            ):
+                                return
+
+                    changed = asyncio.create_task(relevant_change())
+                    stopped = asyncio.create_task(stop_event.wait())
+                    done, pending = await asyncio.wait(
+                        (changed, stopped), return_when=asyncio.FIRST_COMPLETED
+                    )
+                    for task in pending:
+                        task.cancel()
+                    if pending:
+                        await asyncio.gather(*pending, return_exceptions=True)
+                    if stopped in done:
+                        break
+                    continue
 
                 done, _ = await asyncio.wait(live, return_when=asyncio.FIRST_COMPLETED)
                 for chapter_id, task in tuple(discovery_tasks.items()):
@@ -4051,6 +4089,9 @@ class Orchestrator:
         except BaseException:
             await cancel_all()
             raise
+        finally:
+            if changes is not None:
+                self.state.change_bus.unsubscribe(changes)
 
         return all(
             self.state.task(chapter_id, Stage.FORMALIZE).status == TaskStatus.SUCCEEDED
@@ -4644,6 +4685,7 @@ class Orchestrator:
         }
         proof_reviews = {chapter_id: 0 for chapter_id in by_id}
         formalize_failures_applied = False
+        formalize_failure_ids: set[str] = set()
 
         def formalize_ready(chapter_id: str) -> bool:
             return self.state.task(chapter_id, Stage.FORMALIZE).status == TaskStatus.SUCCEEDED
@@ -4662,6 +4704,16 @@ class Orchestrator:
                     # Clear before inspecting state so a subsequent formalize
                     # transition cannot be lost between the scan and wait.
                     formalize.progress.clear()
+                    recovered = {
+                        chapter_id
+                        for chapter_id in formalize_failure_ids
+                        if self.state.task(chapter_id, Stage.FORMALIZE).status
+                        not in {TaskStatus.FAILED, TaskStatus.INTERRUPTED}
+                    }
+                    formalize_failure_ids.difference_update(recovered)
+                    review_failures.difference_update(recovered)
+                    if recovered or not formalize.idle.is_set():
+                        formalize_failures_applied = False
                 try:
                     graph = self._observed_work_unit_graph()
                 except ValueError as error:
@@ -4676,13 +4728,14 @@ class Orchestrator:
 
                 if (
                     formalize is not None
-                    and formalize.task.done()
+                    and (formalize.task.done() or formalize.idle.is_set())
                     and not formalize_failures_applied
                 ):
                     # Propagate orchestration failures, then quarantine only
                     # chapters whose own formalization did not succeed. Independent
                     # clean branches remain eligible for review and proof.
-                    formalize.task.result()
+                    if formalize.task.done():
+                        formalize.task.result()
                     failed_formalizations = {
                         chapter_id
                         for chapter_id in formalize.target_ids
@@ -4706,6 +4759,7 @@ class Orchestrator:
                             failed_formalizations,
                             detail="review blocked by failed formalization",
                         )
+                    formalize_failure_ids = failed_formalizations
                     formalize_failures_applied = True
 
                 # Pull durable successes into readiness and remove reviews with
@@ -4865,7 +4919,11 @@ class Orchestrator:
                 live_tasks.extend(rebuild_tasks.values())
                 live_tasks.extend(proof_tasks.values())
                 progress_waiter: asyncio.Task[bool] | None = None
-                if formalize is not None and not formalize.task.done():
+                if (
+                    formalize is not None
+                    and not formalize.task.done()
+                    and not formalize.idle.is_set()
+                ):
                     progress_waiter = asyncio.create_task(formalize.progress.wait())
                     live_tasks.extend((formalize.task, progress_waiter))
                 if not live_tasks:
@@ -6477,17 +6535,26 @@ class Orchestrator:
 
     async def _run_pipeline_once(self) -> bool:
         progress = asyncio.Event()
+        idle = asyncio.Event()
+        stop = asyncio.Event()
         formalize_task = asyncio.create_task(
-            self._discover_and_formalize(progress_event=progress, discover=True)
+            self._discover_and_formalize(
+                progress_event=progress,
+                idle_event=idle,
+                stop_event=stop,
+                discover=True,
+            )
         )
         handle = RunningFormalizeStage(
             task=formalize_task,
             progress=progress,
+            idle=idle,
             target_ids=frozenset(chapter.id for chapter in self.work_units),
         )
         try:
             reviewed = await self._review_tree(prove=True, formalize=handle)
-            formalized = formalize_task.result() if formalize_task.done() else await formalize_task
+            stop.set()
+            formalized = await formalize_task
             return formalized and reviewed
         except BaseException:
             formalize_task.cancel()
