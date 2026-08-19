@@ -1344,14 +1344,14 @@ fn task_mark(task: &Task, building: bool) -> String {
 }
 
 fn task_mark_style(task: &Task, building: bool) -> Style {
-    if building
-        || task.repairing
-        || task.queued
-        || (task.status == "running" && task.phase == "postprocess")
-    {
+    if building {
+        return Style::default().fg(PURPLE);
+    }
+    if task.repairing || task.queued || (task.status == "running" && task.phase == "postprocess") {
         return Style::default();
     }
     match task_display_status(task) {
+        "running" => Style::default().fg(BLUE),
         "succeeded" => Style::default().fg(GREEN),
         "failed" => Style::default().fg(RED),
         _ => Style::default(),
@@ -1822,15 +1822,17 @@ mod tests {
     }
 
     #[test]
-    fn terminal_task_marks_color_done_and_failed_only() {
+    fn task_marks_color_running_done_failed_and_building() {
         let task = |status: &str| Task {
             status: status.into(),
             ..Task::default()
         };
 
+        assert_eq!(task_mark_style(&task("running"), false).fg, Some(BLUE));
         assert_eq!(task_mark_style(&task("succeeded"), false).fg, Some(GREEN));
         assert_eq!(task_mark_style(&task("failed"), false).fg, Some(RED));
         assert_eq!(task_mark_style(&task("pending"), false).fg, None);
+        assert_eq!(task_mark_style(&task("pending"), true).fg, Some(PURPLE));
     }
 
     #[test]
