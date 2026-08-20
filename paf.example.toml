@@ -72,7 +72,7 @@ max_rounds = 3
 max_rounds = 3
 
 [stages.prove]
-chunk_size = 4
+chunk_size = 6
 max_rounds = 3
 # Counted globally per semantic blocker, including later proof/review cycles.
 unchanged_retry_limit = 2

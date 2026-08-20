@@ -7044,7 +7044,7 @@ async def test_prove_builds_run_after_agents_and_are_serialized_in_main_worktree
 
 
 @pytest.mark.asyncio
-async def test_prove_assigns_source_ordered_chunks_of_four_and_persists_them(
+async def test_prove_assigns_source_ordered_chunks_of_six_and_persists_them(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
@@ -7062,8 +7062,7 @@ async def test_prove_assigns_source_ordered_chunks_of_four_and_persists_them(
     fake = FakeExecutor(
         state,
         [
-            result(changed=True, placeholders=5),
-            result(changed=True, placeholders=1),
+            result(changed=True, placeholders=3),
             result(changed=True, placeholders=0),
         ],
     )
@@ -7106,14 +7105,12 @@ async def test_prove_assigns_source_ordered_chunks_of_four_and_persists_them(
     assert await orchestrator._prove(chapter)
     runs = state.task(chapter.id, Stage.PROVE).runs
     assert [sum(target["placeholder_count"] for target in run.proof_targets) for run in runs] == [
-        4,
-        4,
-        1,
+        6,
+        3,
     ]
     assert [[target["declaration"] for target in run.proof_targets] for run in runs] == [
-        ["target1", "target2", "target3", "target4"],
-        ["target5", "target6", "target7", "target8"],
-        ["target9"],
+        ["target1", "target2", "target3", "target4", "target5", "target6"],
+        ["target7", "target8", "target9"],
     ]
     await orchestrator.shutdown()
 
@@ -7164,7 +7161,7 @@ async def test_prove_retries_the_same_chunk_before_advancing(
         config,
         stages={
             **config.stages,
-            Stage.PROVE: replace(config.stages[Stage.PROVE], max_rounds=2),
+            Stage.PROVE: replace(config.stages[Stage.PROVE], max_rounds=2, chunk_size=4),
         },
     )
     chapter = config.chapters[0]

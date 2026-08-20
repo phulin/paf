@@ -1552,7 +1552,7 @@ blocker immediately. Do not repeat prior searches or evidence."""
             declaration_count = len(selected_proof_targets)
             declaration_label = "declaration" if declaration_count == 1 else "declarations"
             hole_label = "proof hole" if assigned_placeholders == 1 else "proof holes"
-            chunk_size = self.config.stages[Stage.PROVE].chunk_size or 4
+            chunk_size = self.config.stages[Stage.PROVE].chunk_size or 6
             overflow = (
                 f" The configured chunk size is {chunk_size}, but PAF keeps all holes in one "
                 "declaration with the same agent because they can share local terms."

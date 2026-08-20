@@ -34,7 +34,7 @@ def test_discovers_chapters_and_renders_paths(tmp_path: Path) -> None:
     assert config.reasoning_effort_for(Stage.FORMALIZE) == config.settings.reasoning_effort
     assert config.settings.state_dir == tmp_path / ".paf"
     assert config.stages[Stage.DISCOVER].max_agents == 40
-    assert config.stages[Stage.PROVE].chunk_size == 4
+    assert config.stages[Stage.PROVE].chunk_size == 6
     assert config.stages[Stage.PROVE].unchanged_retry_limit == 2
     assert config.stages[Stage.REVIEW].chunk_size is None
     assert config.settings.lean_project == Path("lean")

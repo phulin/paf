@@ -5916,7 +5916,7 @@ class Orchestrator:
                     )
                     return StageOutcome(ExecutionDisposition.SUCCEEDED)
         proof_maximum = self.config.stages[Stage.PROVE].max_rounds
-        proof_chunk_size = self.config.stages[Stage.PROVE].chunk_size or 4
+        proof_chunk_size = self.config.stages[Stage.PROVE].chunk_size or 6
         discovered_targets = await asyncio.to_thread(
             proof_targets, self.config.settings.repo, chapter
         )

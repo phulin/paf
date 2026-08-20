@@ -75,7 +75,7 @@ STAGE_MAX_AGENTS = {
 }
 
 STAGE_CHUNK_SIZES = {
-    Stage.PROVE: 4,
+    Stage.PROVE: 6,
 }
 
 

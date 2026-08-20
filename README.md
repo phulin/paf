@@ -773,7 +773,7 @@ prompt = "my-prompts/strict-review.md"
 max_rounds = 6
 
 [stages.prove]
-chunk_size = 4 # maximum placeholders per agent; declarations are never split
+chunk_size = 6 # maximum placeholders per agent; declarations are never split
 max_rounds = 3 # retries for each chunk
 unchanged_retry_limit = 2 # global sightings per semantic blocker
 ```
