@@ -2817,11 +2817,20 @@ class StateStore:
         stage: Stage | None = None,
         request_id: str | None = None,
         blocker_ids: Iterable[str] = (),
+        source_digests: dict[str, str] | None = None,
     ) -> tuple[str, bool]:
         """Persist proof findings or diagnostics before scheduling their request service."""
 
+        owned_source_digests = {
+            chapter_id: digest
+            for chapter_id, digest in (source_digests or {}).items()
+            if chapter_id in feedback and isinstance(digest, str) and digest
+        }
         for existing_id, value in self.proof_review_requests.items():
-            if value.get("origin_run_id") == origin_run_id:
+            if (
+                value.get("origin_run_id") == origin_run_id
+                and value.get("source_digests", {}) == owned_source_digests
+            ):
                 return existing_id, False
         request_id = request_id or uuid4().hex[:12]
         self.proof_review_requests[request_id] = {
@@ -2831,10 +2840,41 @@ class StateStore:
             "stage": stage.value if stage is not None else Stage.REVIEW.value,
             "created_at": timestamp(),
             "blocker_ids": list(dict.fromkeys(blocker_ids)),
+            "source_digests": owned_source_digests,
         }
         self._mark_dirty(global_state=False, sections={"proof_review_requests"})
         await self._persist()
         return request_id, True
+
+    async def discard_stale_proof_review_requests(
+        self,
+        source_digests: dict[str, str],
+    ) -> set[str]:
+        """Drop owner feedback captured from a different source-scope snapshot."""
+
+        affected: set[str] = set()
+        changed = False
+        for request_id, value in tuple(self.proof_review_requests.items()):
+            if not isinstance(value, dict):
+                continue
+            feedback = value.get("feedback")
+            recorded = value.get("source_digests")
+            if not isinstance(feedback, dict) or not isinstance(recorded, dict):
+                continue
+            for chapter_id in tuple(feedback):
+                expected = recorded.get(chapter_id)
+                current = source_digests.get(chapter_id)
+                if isinstance(expected, str) and isinstance(current, str) and expected != current:
+                    feedback.pop(chapter_id, None)
+                    recorded.pop(chapter_id, None)
+                    affected.add(chapter_id)
+                    changed = True
+            if not feedback:
+                self.proof_review_requests.pop(request_id, None)
+        if changed:
+            self._mark_dirty(global_state=False, sections={"proof_review_requests"})
+            await self._persist()
+        return affected
 
     async def finish_proof_review_requests(
         self,
@@ -2852,6 +2892,9 @@ class StateStore:
             if not isinstance(feedback, dict) or chapter_id not in feedback:
                 continue
             feedback.pop(chapter_id, None)
+            source_digests = value.get("source_digests")
+            if isinstance(source_digests, dict):
+                source_digests.pop(chapter_id, None)
             changed = True
             if not feedback:
                 self.proof_review_requests.pop(request_id, None)

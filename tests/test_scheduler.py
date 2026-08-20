@@ -31,6 +31,7 @@ from paf.models import Chapter, PipelineConfig, ProofTarget, Stage
 from paf.scheduler import (
     BUILD_ERROR_REVIEW_KIND,
     BUILD_WARNING_REVIEW_KIND,
+    COORDINATOR_VERIFICATION_RETRY_DETAIL,
     Attempt,
     ExecutionDisposition,
     Orchestrator,
@@ -835,6 +836,57 @@ async def test_proof_review_requests_persist_and_acknowledge_exact_findings(
 
 
 @pytest.mark.asyncio
+async def test_proof_review_requests_discard_only_stale_source_owners(
+    tmp_path: Path,
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    first, second = config.chapters
+    state = StateStore(config)
+    await state.load_or_create()
+    request_id, created = await state.enqueue_proof_review_request(
+        {first.id: "first diagnostic", second.id: "second diagnostic"},
+        origin_run_id="shared-build",
+        source_digests={first.id: "first-old", second.id: "second-current"},
+    )
+
+    affected = await state.discard_stale_proof_review_requests(
+        {first.id: "first-new", second.id: "second-current"}
+    )
+
+    assert created
+    assert affected == {first.id}
+    assert state.proof_review_requests[request_id]["feedback"] == {second.id: "second diagnostic"}
+    assert state.proof_review_requests[request_id]["source_digests"] == {
+        second.id: "second-current"
+    }
+    await state.close()
+
+
+@pytest.mark.asyncio
+async def test_proof_review_request_origin_is_reusable_after_source_changes(
+    tmp_path: Path,
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = config.chapters[0]
+    state = StateStore(config)
+    await state.load_or_create()
+    first_id, first_created = await state.enqueue_proof_review_request(
+        {chapter.id: "same diagnostic"},
+        origin_run_id="same-build-fingerprint",
+        source_digests={chapter.id: "old-source"},
+    )
+    second_id, second_created = await state.enqueue_proof_review_request(
+        {chapter.id: "same diagnostic"},
+        origin_run_id="same-build-fingerprint",
+        source_digests={chapter.id: "new-source"},
+    )
+
+    assert first_created and second_created
+    assert first_id != second_id
+    await state.close()
+
+
+@pytest.mark.asyncio
 async def test_stale_snapshot_review_requests_are_migrated_to_verification(
     tmp_path: Path,
 ) -> None:
@@ -872,6 +924,65 @@ async def test_stale_snapshot_review_requests_are_migrated_to_verification(
     assert state.task(retry.id, Stage.REVIEW).detail == "coordinator verification retry queued"
     assert state.task(genuine.id, Stage.REVIEW).detail == "needs review"
     await state.close()
+
+
+@pytest.mark.asyncio
+async def test_changed_owner_scope_discards_queued_diagnostics_before_review(
+    tmp_path: Path,
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = config.chapters[0]
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await orchestrator.prepare()
+    source = tmp_path / "lean" / "Book" / "Chapter01.lean"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_text("theorem target : True := by trivial\n", encoding="utf-8")
+    old_digest = scope_digest(config.settings.repo, chapter)
+    request_id, _ = await state.enqueue_proof_review_request(
+        {chapter.id: "error: Book/Chapter01.lean:3:1: unknown identifier"},
+        origin_run_id="old-coordinator-build",
+        kind=BUILD_ERROR_REVIEW_KIND,
+        source_digests={chapter.id: old_digest},
+    )
+    source.write_text(source.read_text(encoding="utf-8") + "\n-- replacement snapshot\n")
+    await state.set_task(
+        chapter.id,
+        Stage.REVIEW,
+        TaskStatus.FAILED,
+        "stale diagnostic review failed",
+    )
+
+    affected = await orchestrator._discard_stale_proof_review_requests()
+
+    assert affected == {chapter.id}
+    assert request_id not in state.proof_review_requests
+    review = state.task(chapter.id, Stage.REVIEW)
+    assert review.status == TaskStatus.PENDING
+    assert review.detail == COORDINATOR_VERIFICATION_RETRY_DETAIL
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_queued_build_diagnostics_capture_each_owner_source_digest(
+    tmp_path: Path,
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    first, second = config.chapters
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await orchestrator.prepare()
+
+    request_id, _ = await orchestrator._queue_review_feedback(
+        {first.id: "first diagnostic", second.id: "second diagnostic"},
+        origin="coordinator-build",
+    )
+
+    assert state.proof_review_requests[request_id]["source_digests"] == {
+        first.id: scope_digest(config.settings.repo, first),
+        second.id: scope_digest(config.settings.repo, second),
+    }
+    await orchestrator.shutdown()
 
 
 @pytest.mark.asyncio

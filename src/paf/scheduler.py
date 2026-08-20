@@ -3127,8 +3127,60 @@ class Orchestrator:
             origin_run_id=origin_run_id,
             kind=PROOF_FINDING_REVIEW_KIND,
             blocker_ids=blocker_ids,
+            source_digests={
+                chapter.id: await asyncio.to_thread(
+                    scope_digest,
+                    self.config.settings.repo,
+                    chapter,
+                )
+            },
         )
         return (request_id,)
+
+    async def _discard_stale_proof_review_requests(self) -> set[str]:
+        """Discard feedback whose owner scope changed after it was captured."""
+
+        by_id = {chapter.id: chapter for chapter in self.work_units}
+        owner_ids = {
+            chapter_id
+            for request in self.state.proof_review_requests.values()
+            if isinstance(request, dict)
+            for recorded in (request.get("source_digests"),)
+            if isinstance(recorded, dict)
+            for chapter_id, digest in recorded.items()
+            if chapter_id in by_id and isinstance(digest, str) and digest
+        }
+        if not owner_ids:
+            return set()
+        current = await asyncio.to_thread(
+            _scope_digests,
+            self.config.settings.repo,
+            by_id,
+            owner_ids,
+        )
+        affected = await self.state.discard_stale_proof_review_requests(current)
+        if not affected:
+            return affected
+        pending_owners = {
+            chapter_id
+            for request in self.state.proof_review_requests.values()
+            if isinstance(request, dict)
+            for feedback in (request.get("feedback"),)
+            if isinstance(feedback, dict)
+            for chapter_id in feedback
+        }
+        async with self.state.batch():
+            for chapter_id in affected.difference(pending_owners):
+                task_key = self.state.key(chapter_id, Stage.REVIEW)
+                task = self.state.tasks.get(task_key)
+                if task is not None and task.status in {TaskStatus.PENDING, TaskStatus.FAILED}:
+                    await self.state.set_task(
+                        chapter_id,
+                        Stage.REVIEW,
+                        TaskStatus.PENDING,
+                        COORDINATOR_VERIFICATION_RETRY_DETAIL,
+                    )
+        return affected
 
     def _has_completed_green_review(self, chapter_id: str) -> bool:
         """Whether history contains a completed no-change review pass."""
@@ -3213,6 +3265,8 @@ class Orchestrator:
 
     async def _recover_proof_review_requests(self) -> None:
         """Recover durable blockers and only escalate repeated review evidence."""
+
+        await self._discard_stale_proof_review_requests()
 
         persisted_origins = {
             origin
@@ -4640,11 +4694,20 @@ class Orchestrator:
                 (*sorted(feedback), *(sorted(item.text for item in diagnostics)))
             )
             origin = f"{kind}:{hashlib.sha256(fingerprint_input.encode()).hexdigest()}"
+        by_id = {chapter.id: chapter for chapter in self.work_units}
+        digest_owner_ids = set(feedback).intersection(by_id)
+        source_digests = await asyncio.to_thread(
+            _scope_digests,
+            self.config.settings.repo,
+            by_id,
+            digest_owner_ids,
+        )
         request_id, created = await self.state.enqueue_proof_review_request(
             feedback,
             origin_run_id=origin,
             kind=kind,
             stage=stage,
+            source_digests=source_digests,
         )
         if not created:
             return request_id, set()
@@ -4940,6 +5003,7 @@ class Orchestrator:
         return WarningCleanupOutcome(False, changed)
 
     async def _drain_warning_cleanups(self) -> WarningCleanupOutcome:
+        await self._discard_stale_proof_review_requests()
         work: list[Coroutine[Any, Any, WarningCleanupOutcome]] = []
         for chapter in self.work_units:
             feedback, request_ids = self._warning_cleanup_feedback(chapter.id)
@@ -5321,6 +5385,7 @@ class Orchestrator:
 
         try:
             while True:
+                await self._discard_stale_proof_review_requests()
                 if formalize is not None:
                     # Clear before inspecting state so a subsequent formalize
                     # transition cannot be lost between the scan and wait.
