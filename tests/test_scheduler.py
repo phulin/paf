@@ -5325,6 +5325,42 @@ async def test_placeholder_free_proof_does_not_run_agent_after_failed_refresh(
 
 
 @pytest.mark.asyncio
+async def test_coordinator_proof_scan_replaces_stale_agent_sorry_count(
+    tmp_path: Path,
+) -> None:
+    config = with_example_modules(load_config(write_project(tmp_path, chapters="chapters = [1]")))
+    chapter = config.chapters[0]
+    source = tmp_path / "lean" / "Book" / "Chapter01.lean"
+    source.parent.mkdir(parents=True)
+    source.write_text("theorem target : True := by trivial\n", encoding="utf-8")
+    orchestrator = Orchestrator(config, StateStore(config))
+    await orchestrator.prepare()
+    old_run = await orchestrator.state.start_run(chapter.id, Stage.REVIEW)
+    await orchestrator.state.finish_run(
+        old_run,
+        status=TaskStatus.SUCCEEDED,
+        placeholders=106,
+    )
+    await mark_clean_formalization(orchestrator)
+
+    assert await orchestrator._prove(chapter)
+    proof = orchestrator.state.task(chapter.id, Stage.PROVE)
+    assert proof.status == TaskStatus.SUCCEEDED
+    assert (
+        orchestrator.state.snapshot()["tasks"][orchestrator.state.key(chapter.id, Stage.PROVE)][
+            "sorry_count"
+        ]
+        == 0
+    )
+    await orchestrator.shutdown()
+
+    reloaded = StateStore(config)
+    await reloaded.load_or_create()
+    assert reloaded.snapshot()["tasks"][reloaded.key(chapter.id, Stage.PROVE)]["sorry_count"] == 0
+    await reloaded.close()
+
+
+@pytest.mark.asyncio
 async def test_dirty_proof_baseline_routes_diagnostics_before_placeholder_chunk(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

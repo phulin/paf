@@ -290,6 +290,11 @@ class TaskRecord:
     # Proof completion is tied to the exact validated chapter sources. This is
     # populated only on the prove task.
     source_digest: str | None = None
+    # Coordinator scans can observe placeholders without creating an agent run.
+    # Persist that observation on the prove task so the dashboard does not fall
+    # back to a stale count from an older run after a restart.
+    sorry_count: int | None = None
+    sorry_count_updated_at: str | None = None
     rounds: int = 0
     updated_at: str = field(default_factory=timestamp)
     runs: list[RunRecord] = field(default_factory=list)
@@ -804,6 +809,12 @@ class StateStore:
                                 ),
                             )
                     self.tasks[key] = TaskRecord(**task_value)
+                for task in self.tasks.values():
+                    if task.sorry_count is not None and task.sorry_count_updated_at is not None:
+                        self._latest_sorry_counts[task.chapter_id] = (
+                            (task.sorry_count_updated_at, "coordinator"),
+                            task.sorry_count,
+                        )
         self._seed_normalized_caches()
         for value in persisted_source_issues:
             if isinstance(value, dict):
@@ -1203,6 +1214,7 @@ class StateStore:
                 if (latest := self._latest_sorry_counts.get(task.chapter_id)) is not None
                 else None
             ),
+            "sorry_count_updated_at": task.sorry_count_updated_at,
             "fully_certified": (
                 proof_complete
                 and interface_current
@@ -3391,6 +3403,17 @@ class StateStore:
             global_state=False,
             sections={"failure_records"} if failure_changed else (),
         )
+        await self._persist()
+
+    async def record_sorry_count(self, chapter_id: str, count: int) -> None:
+        """Persist a source-wide placeholder count observed by the coordinator."""
+
+        observed_at = timestamp()
+        task = self.task(chapter_id, Stage.PROVE)
+        task.sorry_count = count
+        task.sorry_count_updated_at = observed_at
+        self._latest_sorry_counts[chapter_id] = ((observed_at, "coordinator"), count)
+        self._mark_dirty(task=task, global_state=False)
         await self._persist()
 
     async def set_tasks(

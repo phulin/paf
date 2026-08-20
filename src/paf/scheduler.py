@@ -5880,6 +5880,10 @@ class Orchestrator:
                 and proof_task.source_digest == record.get("source_digest")
                 and dependencies_current
             ):
+                placeholders = await asyncio.to_thread(
+                    count_placeholders, self.config.settings.repo, chapter
+                )
+                await self.state.record_sorry_count(chapter.id, placeholders)
                 await self._close_previously_satisfied_upstream_requests(
                     chapter,
                     build_fresh=True,
@@ -5890,6 +5894,7 @@ class Orchestrator:
                 placeholders = await asyncio.to_thread(
                     count_placeholders, self.config.settings.repo, chapter
                 )
+                await self.state.record_sorry_count(chapter.id, placeholders)
                 build_fresh = isinstance(record, dict) and dependencies_current
                 if not build_fresh:
                     revalidation = await self._refresh_stale_proof_build(chapter)
