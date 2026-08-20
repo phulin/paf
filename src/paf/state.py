@@ -2599,18 +2599,21 @@ class StateStore:
             await self._persist()
         return reopened
 
-    async def clear_upstream_requests(self) -> list[str]:
-        """Manually close every outstanding upstream request.
+    async def clear_upstream_requests(self, chapter_ids: Iterable[str] | None = None) -> list[str]:
+        """Manually close outstanding upstream requests, optionally by consumer.
 
         Closed records retain their origin run ids so restart recovery does not recreate the
         requests. Any affected proof becomes eligible for a later retry, which may enqueue a new
         request when the upstream dependency is still missing.
         """
 
+        selected = set(chapter_ids) if chapter_ids is not None else None
         cleared: list[str] = []
         blockers_changed = False
         now = timestamp()
         for request_id, request in self.upstream_requests.items():
+            if selected is not None and request.get("consumer_chapter_id") not in selected:
+                continue
             if request.get("status") == UpstreamRequestStatus.CLOSED.value:
                 continue
             request["status"] = UpstreamRequestStatus.CLOSED.value

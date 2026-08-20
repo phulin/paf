@@ -40,7 +40,7 @@ async def test_run_control_pauses_and_stops_checkpoints() -> None:
 async def test_control_server_accepts_bash_friendly_commands(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
     state = StateStore(config)
     control = RunControl()
     orchestrator = Orchestrator(config, state, control=control)
@@ -85,12 +85,28 @@ async def test_control_server_accepts_bash_friendly_commands(
         owner_chapter_id=config.chapters[0].id,
         previous_attempts="attempt one",
     )
+    other_request_id, _ = await state.enqueue_upstream_request(
+        {
+            "blocked_declaration": "other-target",
+            "consumer_path": "lean/Book/Chapter02.lean",
+            "needed_result": "another helper lemma",
+        },
+        consumer_chapter_id=config.chapters[1].id,
+        origin_run_id="other-proof-run",
+        owner_chapter_id=config.chapters[0].id,
+        previous_attempts="other attempt",
+    )
     cleared = await asyncio.to_thread(
-        send_command, config.settings.state_dir, "clear-upstream-requests"
+        send_command,
+        config.settings.state_dir,
+        "clear-upstream-requests",
+        parameters={"chapter": config.chapters[0].id},
     )
     assert cleared["cleared"] == 1
     assert cleared["cleared_upstream_requests"] == [request_id]
+    assert cleared["chapter_id"] == config.chapters[0].id
     assert state.upstream_requests[request_id]["status"] == "closed"
+    assert state.upstream_requests[other_request_id]["status"] == "requested"
     paused = await asyncio.to_thread(send_command, config.settings.state_dir, "pause")
     assert paused["status"] == "paused"
     resumed = await asyncio.to_thread(send_command, config.settings.state_dir, "resume")

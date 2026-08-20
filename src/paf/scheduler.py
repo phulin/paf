@@ -726,19 +726,22 @@ class Orchestrator:
 
         scaffold_directories(self.config, self.work_units)
 
+    def resolve_work_unit_id(self, selector: str) -> str:
+        """Resolve one complete id or unambiguous ordinal in this invocation."""
+
+        matches = [unit for unit in self.work_units if unit.id == selector]
+        if not matches and selector.isdigit():
+            matches = [unit for unit in self.work_units if unit.ordinal == int(selector)]
+        if not matches:
+            raise ValueError(f"work-unit selector matched nothing: {selector}")
+        if len(matches) > 1:
+            raise ValueError(f"work-unit selector {selector!r} is ambiguous; pass a complete id")
+        return matches[0].id
+
     def retry_live_agent(self, chapter_selector: str) -> dict[str, object]:
         """Interrupt and continue the single agent currently executing for one chapter."""
 
-        matches = [unit for unit in self.work_units if unit.id == chapter_selector]
-        if not matches and chapter_selector.isdigit():
-            matches = [unit for unit in self.work_units if unit.ordinal == int(chapter_selector)]
-        if not matches:
-            raise ValueError(f"work-unit selector matched nothing: {chapter_selector}")
-        if len(matches) > 1:
-            raise ValueError(
-                f"work-unit selector {chapter_selector!r} is ambiguous; pass a complete id"
-            )
-        chapter_id = matches[0].id
+        chapter_id = self.resolve_work_unit_id(chapter_selector)
         live = [
             (stage, active)
             for (active_chapter_id, stage), active in self._live_agent_tasks.items()

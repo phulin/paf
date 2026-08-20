@@ -257,6 +257,11 @@ def parser() -> argparse.ArgumentParser:
                 type=Path,
                 help="explicitly export the complete snapshot to this JSON file",
             )
+        if name == "clear-upstream-requests":
+            command.add_argument(
+                "--chapter",
+                help="close requests only for this chapter id or unambiguous number",
+            )
     retry = agent_commands.add_parser(
         "retry", help="retry one live chapter agent or reset all failed tasks"
     )
@@ -1186,9 +1191,22 @@ def _control_response(
             else:
                 state = StateStore(config)
 
+                chapter_ids = (
+                    tuple(
+                        unit.id
+                        for unit in select_work_units(
+                            config,
+                            document_ids=(),
+                            unit_selectors=(str(parameters["chapter"]),),
+                        )
+                    )
+                    if parameters and parameters.get("chapter") is not None
+                    else None
+                )
+
                 async def clear_upstream_requests() -> list[str]:
                     await state.load_or_create()
-                    return await state.clear_upstream_requests()
+                    return await state.clear_upstream_requests(chapter_ids)
 
                 requests = asyncio.run(clear_upstream_requests())
                 response = offline_status(config.settings.state_dir) | {
@@ -1196,6 +1214,8 @@ def _control_response(
                     "cleared_upstream_requests": requests,
                     "updated_at": state.updated_at,
                 }
+                if chapter_ids is not None:
+                    response["chapter_id"] = chapter_ids[0]
         elif command == "retry" and not parameters:
             if read_checkpoint(config.settings.state_dir) is None:
                 response = offline_status(config.settings.state_dir) | {
@@ -1265,7 +1285,14 @@ def _agent_rpc(config: PipelineConfig) -> int:
                 )
             else:
                 parameters = None
-                if request["command"] == "retry" and "chapter" in request:
+                if (
+                    request["command"]
+                    in {
+                        "retry",
+                        "clear-upstream-requests",
+                    }
+                    and "chapter" in request
+                ):
                     parameters = {"chapter": request["chapter"]}
                 elif request["command"] == "state":
                     parameters = {
@@ -1291,7 +1318,7 @@ def _agent_command(args: argparse.Namespace, config: PipelineConfig) -> int:
         return _agent_rpc(config)
     if command == "inspect":
         return _inspect_agent(args, config)
-    if command == "retry" and args.chapter is not None:
+    if command in {"retry", "clear-upstream-requests"} and args.chapter is not None:
         parameters = {"chapter": args.chapter}
     elif command == "state":
         parameters = {

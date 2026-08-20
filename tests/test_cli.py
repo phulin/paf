@@ -686,11 +686,11 @@ def test_agent_unblock_updates_offline_state(
 def test_agent_clear_upstream_requests_updates_offline_state(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    config_path = write_project(tmp_path, chapters="chapters = [1]")
+    config_path = write_project(tmp_path, chapters="chapters = [1, 2]")
     config = load_config(config_path)
     state = StateStore(config)
 
-    async def populate() -> str:
+    async def populate() -> tuple[str, str]:
         await state.load_or_create()
         request_id, _ = await state.enqueue_upstream_request(
             {
@@ -703,22 +703,47 @@ def test_agent_clear_upstream_requests_updates_offline_state(
             owner_chapter_id=config.chapters[0].id,
             previous_attempts="attempt one",
         )
+        other_request_id, _ = await state.enqueue_upstream_request(
+            {
+                "blocked_declaration": "otherTarget",
+                "consumer_path": "lean/Book/Chapter02.lean",
+                "needed_result": "another helper lemma",
+            },
+            consumer_chapter_id=config.chapters[1].id,
+            origin_run_id="other-proof-run",
+            owner_chapter_id=config.chapters[0].id,
+            previous_attempts="other attempt",
+        )
         await state.close()
-        return request_id
+        return request_id, other_request_id
 
-    request_id = asyncio.run(populate())
+    request_id, other_request_id = asyncio.run(populate())
 
-    assert main(["agent", "clear-upstream-requests", "--config", str(config_path)]) == 0
+    assert (
+        main(
+            [
+                "agent",
+                "clear-upstream-requests",
+                "--config",
+                str(config_path),
+                "--chapter",
+                config.chapters[0].id,
+            ]
+        )
+        == 0
+    )
     response = json.loads(capsys.readouterr().out)
     assert response["status"] == "offline"
     assert response["cleared"] == 1
     assert response["cleared_upstream_requests"] == [request_id]
+    assert response["chapter_id"] == config.chapters[0].id
 
     snapshot = read_full_snapshot(config.settings.state_dir)
     assert snapshot is not None
     request = snapshot["upstream_requests"][request_id]
     assert request["status"] == "closed"
     assert request["closed_reason"] == "manually cleared"
+    assert snapshot["upstream_requests"][other_request_id]["status"] == "requested"
 
 
 def test_agent_retry_without_chapter_requeues_failed_but_not_blocked_tasks(

@@ -234,11 +234,20 @@ class ControlServer:
                     "unblocked_tasks": tasks,
                 }
             elif command == "clear-upstream-requests":
-                requests = await self.orchestrator.state.clear_upstream_requests()
+                chapter = request.get("chapter")
+                if chapter is None:
+                    chapter_ids = None
+                elif isinstance(chapter, str) and chapter:
+                    chapter_ids = (self.orchestrator.resolve_work_unit_id(chapter),)
+                else:
+                    raise ValueError("clear-upstream-requests chapter must be a non-empty string")
+                requests = await self.orchestrator.state.clear_upstream_requests(chapter_ids)
                 response = self._status() | {
                     "cleared": len(requests),
                     "cleared_upstream_requests": requests,
                 }
+                if chapter_ids is not None:
+                    response["chapter_id"] = chapter_ids[0]
             elif command == "retry":
                 chapter = request.get("chapter")
                 if chapter is None:

@@ -1640,14 +1640,27 @@ async def test_clear_upstream_requests_closes_requests_and_reopens_linked_blocke
         "consumer_chapter_id": consumer.id,
         "request_id": request_id,
     }
+    other_request_id, _ = await state.enqueue_upstream_request(
+        {
+            "blocked_declaration": "otherTarget",
+            "consumer_path": "lean/Book/Chapter01.lean",
+            "needed_result": "another helper lemma",
+        },
+        consumer_chapter_id=owner.id,
+        origin_run_id="other-proof-run",
+        owner_chapter_id=owner.id,
+        previous_attempts="other attempt",
+    )
 
-    assert await state.clear_upstream_requests() == [request_id]
-    assert state.upstream_request_batches() == {}
+    assert await state.clear_upstream_requests((consumer.id,)) == [request_id]
     assert state.upstream_requests[request_id]["status"] == UpstreamRequestStatus.CLOSED
     assert state.upstream_requests[request_id]["closed_reason"] == "manually cleared"
+    assert state.upstream_requests[other_request_id]["status"] == UpstreamRequestStatus.REQUESTED
     assert state.proof_blockers["B1"]["status"] == ProofBlockerStatus.OPEN
     assert "request_id" not in state.proof_blockers["B1"]
-    assert await state.clear_upstream_requests() == []
+    assert await state.clear_upstream_requests((consumer.id,)) == []
+    assert await state.clear_upstream_requests() == [other_request_id]
+    assert state.upstream_request_batches() == {}
     await state.close()
 
     recovered = StateStore(config)
