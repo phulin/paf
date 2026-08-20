@@ -3060,7 +3060,9 @@ class Orchestrator:
         feedback = {
             chapter.id: (
                 f"Proof work in `{chapter.id}` left checked failures. Evaluate this evidence while "
-                "re-reviewing the complete assigned scope:\n\n" + attempt_feedback
+                "re-reviewing the complete assigned scope. If it makes logical sense to provide "
+                "additional results in this module to satisfy the reported defect in the downstream "
+                "module, do so:\n\n" + attempt_feedback
             )
         }
         attempts = report.get("failed_attempts")
