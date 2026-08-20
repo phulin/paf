@@ -1055,6 +1055,36 @@ async def test_validation_streams_build_output(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_validation_retains_structured_evidence_before_bounded_output(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = replace(
+        config.chapters[0],
+        build_command=(
+            "printf '%s\\n' 'error: Book/Chapter.lean:7:3: early failure'; "
+            "yes 'warning: Book/Other.lean:1:1: unused variable' | head -n 1000; "
+            "printf '%s\\n' 'Some required targets logged failures:' '- Book.Chapter'; "
+            "exit 1"
+        ),
+    )
+
+    validation = await validate(config, chapter)
+
+    assert validation.process_exit_code == 1
+    assert len(validation.output) == 20_000
+    assert "coordinator build output omitted" in validation.output
+    assert next(diagnostic.header for diagnostic in validation.diagnostics) == (
+        "error: Book/Chapter.lean:7:3: early failure"
+    )
+    assert validation.failed_modules == ("Book.Chapter",)
+    assert validation.raw_log_path is not None
+    assert validation.as_dict()["diagnostics"][0]["severity"] == "error"
+    assert validation.as_dict()["failed_modules"] == ["Book.Chapter"]
+    raw_log = Path(validation.raw_log_path)
+    assert raw_log.is_file()
+    assert "early failure" in raw_log.read_text(encoding="utf-8")
+
+
+@pytest.mark.asyncio
 async def test_executor_consumes_jsonl_report_and_usage(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

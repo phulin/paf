@@ -48,7 +48,12 @@ from paf.corpus import (
     build_source_dependency_graph,
     scheduling_snapshot,
 )
-from paf.diagnostics import unexpected_lean_warnings
+from paf.diagnostics import (
+    LEAN_DIAGNOSTIC_RE,
+    LeanDiagnostic,
+    failed_lean_modules,
+    lean_diagnostics,
+)
 from paf.git import (
     GitCommitError,
     GitCommitter,
@@ -260,25 +265,9 @@ class RunningReview:
     auxiliary: bool = False
 
 
-@dataclass(frozen=True)
-class LeanDiagnostic:
-    severity: str
-    header: str
-    text: str
-
-
-LEAN_DIAGNOSTIC_RE = re.compile(r"^(?P<severity>error|warning):[ \t]*(?P<message>.*)$")
 LEAN_LOCATION_RE = re.compile(r"^(?P<path>.+?\.lean):(?P<line>\d+):(?P<column>\d+):(?:[ \t]|$)")
 COORDINATOR_DIAGNOSTIC_SUMMARY_RE = re.compile(
     r"(?:\n\nCoordinator found \d+ Lean diagnostic\(s\) relevant to [^\n]+\.)+\s*$"
-)
-LAKE_CONTROL_PREFIXES = (
-    "⚠ ",
-    "✖ ",
-    "✔ ",
-    "trace:",
-    "Some required targets logged failures:",
-    "Coordinator rejected ",
 )
 PROOF_FEEDBACK_MAX_CHARS = 12_000
 PROOF_FEEDBACK_ROUNDS = 3
@@ -321,45 +310,21 @@ def _bounded_proof_feedback(blocks: Iterable[str]) -> str:
 
 
 def _lean_diagnostics(output: str) -> tuple[LeanDiagnostic, ...]:
-    """Extract actionable Lean diagnostics without Lake replay/progress chatter."""
+    """Compatibility wrapper around the shared full-transcript parser."""
 
-    diagnostics: list[LeanDiagnostic] = []
-    severity = ""
-    header = ""
-    lines: list[str] = []
+    return lean_diagnostics(output)
 
-    def finish() -> None:
-        nonlocal severity, header, lines
-        if not header:
-            return
-        text = "\n".join(lines).rstrip()
-        if severity == "error" or unexpected_lean_warnings(header):
-            diagnostics.append(LeanDiagnostic(severity, header, text))
-        severity = ""
-        header = ""
-        lines = []
 
-    for line in output.splitlines():
-        match = LEAN_DIAGNOSTIC_RE.match(line)
-        if match:
-            finish()
-            severity = match.group("severity")
-            header = line.strip()
-            lines = [line.rstrip()]
-            continue
-        if header and line.startswith(LAKE_CONTROL_PREFIXES):
-            finish()
-            continue
-        if header:
-            lines.append(line.rstrip())
-    finish()
+def _result_diagnostics(result: ValidationResult) -> tuple[LeanDiagnostic, ...]:
+    """Use authoritative full-stream evidence with legacy text fallback."""
 
-    # Validation appends a compact list of rejected warnings after the complete
-    # output. Prefer the first copy because it retains the diagnostic body.
-    unique: dict[str, LeanDiagnostic] = {}
-    for diagnostic in diagnostics:
-        unique.setdefault(diagnostic.header, diagnostic)
-    return tuple(unique.values())
+    return result.diagnostics or _lean_diagnostics(result.output)
+
+
+def _result_failed_modules(result: ValidationResult) -> tuple[str, ...]:
+    """Use authoritative full-stream failed targets with legacy text fallback."""
+
+    return result.failed_modules or _failed_modules(result.output)
 
 
 def _diagnostic_output_for_target(diagnostics: Iterable[LeanDiagnostic], target_id: str) -> str:
@@ -406,17 +371,7 @@ def _deterministic_warning_diagnostics(
 
 
 def _failed_modules(output: str) -> tuple[str, ...]:
-    marker = "Some required targets logged failures:"
-    _, found, suffix = output.rpartition(marker)
-    if not found:
-        return ()
-    modules: list[str] = []
-    for line in suffix.splitlines()[1:]:
-        if match := re.fullmatch(r"-\s+([A-Za-z0-9_'.]+)", line.strip()):
-            modules.append(match.group(1))
-        elif modules:
-            break
-    return tuple(dict.fromkeys(modules))
+    return failed_lean_modules(output)
 
 
 class RunControl:
@@ -3399,7 +3354,7 @@ class Orchestrator:
                 )
                 for target_id in ids
             }
-        diagnostics = _lean_diagnostics(result.output)
+        diagnostics = _result_diagnostics(result)
         owned = tuple(
             (diagnostic, set(self._diagnostic_owner_ids(diagnostic))) for diagnostic in diagnostics
         )
@@ -3432,6 +3387,7 @@ class Orchestrator:
                         "Lake build succeeded; warnings belong to upstream dependencies.",
                         process_exit_code=0,
                         status=ValidationStatus.CLEAN,
+                        raw_log_path=result.raw_log_path,
                     )
                     continue
                 else:
@@ -3447,6 +3403,9 @@ class Orchestrator:
                         timed_out=result.timed_out,
                         process_exit_code=result.process_exit_code,
                         status=ValidationStatus.UNATTRIBUTED_BUILD_FAILURE,
+                        diagnostics=result.diagnostics,
+                        failed_modules=result.failed_modules,
+                        raw_log_path=result.raw_log_path,
                     )
                     continue
                 output = _diagnostic_output_for_target(
@@ -3460,6 +3419,9 @@ class Orchestrator:
                     process_exit_code=result.process_exit_code,
                     status=status,
                     blocked_by=blocked_by,
+                    diagnostics=tuple(diagnostic for diagnostic, _owners in relevant),
+                    failed_modules=result.failed_modules,
+                    raw_log_path=result.raw_log_path,
                 )
             elif result.compiler_succeeded and not unattributed:
                 partitioned[target_id] = ValidationResult(
@@ -3468,6 +3430,7 @@ class Orchestrator:
                     "Lake build succeeded; diagnostics belonged to other batch targets.",
                     process_exit_code=0,
                     status=ValidationStatus.CLEAN,
+                    raw_log_path=result.raw_log_path,
                 )
             else:
                 partitioned[target_id] = ValidationResult(
@@ -3477,6 +3440,9 @@ class Orchestrator:
                     timed_out=result.timed_out,
                     process_exit_code=result.process_exit_code,
                     status=ValidationStatus.UNATTRIBUTED_BUILD_FAILURE,
+                    diagnostics=result.diagnostics,
+                    failed_modules=result.failed_modules,
+                    raw_log_path=result.raw_log_path,
                 )
         return partitioned
 
@@ -3501,7 +3467,7 @@ class Orchestrator:
                 if owner_id not in self._work_units_by_id:
                     continue
                 required = self._dependency_closure(graph, (owner_id,))
-                diagnostics = _lean_diagnostics(result.output)
+                diagnostics = _result_diagnostics(result)
                 owner_result = ValidationResult(
                     False,
                     result.exit_code,
@@ -3513,6 +3479,9 @@ class Orchestrator:
                     timed_out=result.timed_out,
                     process_exit_code=result.process_exit_code,
                     status=ValidationStatus.TARGET_FAILED,
+                    diagnostics=diagnostics,
+                    failed_modules=result.failed_modules,
+                    raw_log_path=result.raw_log_path,
                 )
                 self._broken_builds[owner_id] = BrokenBuild(
                     source_generations={
@@ -3536,7 +3505,7 @@ class Orchestrator:
             blocked = self._successor_closure(graph, (owner_id,)).intersection(candidates)
             blocked.discard(owner_id)
             for target_id in blocked.difference(results):
-                diagnostics = _lean_diagnostics(broken.result.output)
+                diagnostics = _result_diagnostics(broken.result)
                 results[target_id] = replace(
                     broken.result,
                     output=(
@@ -3565,7 +3534,7 @@ class Orchestrator:
         selected = tuple(targets)
         if result.succeeded or not selected:
             return result
-        diagnostics = _lean_diagnostics(result.output)
+        diagnostics = _result_diagnostics(result)
         if not diagnostics:
             # Timeouts and process failures without a parsed Lean diagnostic do not
             # establish that the assigned declarations are clean.
@@ -3606,6 +3575,9 @@ class Orchestrator:
                 output[-20_000:],
                 timed_out=result.timed_out,
                 process_exit_code=result.process_exit_code,
+                diagnostics=tuple(relevant),
+                failed_modules=result.failed_modules,
+                raw_log_path=result.raw_log_path,
             )
 
         return ValidationResult(
@@ -3614,6 +3586,7 @@ class Orchestrator:
             "Whole-chapter build failed, but no located Lean errors or rejected warnings "
             "belonged to the assigned proof chunk.",
             process_exit_code=result.process_exit_code,
+            raw_log_path=result.raw_log_path,
         )
 
     async def _build_chapters(
@@ -4141,7 +4114,7 @@ class Orchestrator:
 
         for result, target_ids in targets_by_result.items():
             routed = False
-            for diagnostic in _lean_diagnostics(result.output):
+            for diagnostic in _result_diagnostics(result):
                 owners = self._diagnostic_owner_ids(diagnostic)
                 if not owners:
                     continue
@@ -4153,10 +4126,9 @@ class Orchestrator:
                     )
                     feedback.setdefault(owner, {})[block] = None
 
-            # A truncated Lake log can retain its failed-module summary while
-            # still retaining an unrelated warning. Always route the precise
-            # failed module as well as any source-located diagnostics.
-            for module in _failed_modules(result.output):
+            # Always route Lake's precise failed modules in addition to
+            # source-located diagnostics.
+            for module in _result_failed_modules(result):
                 owners = self._module_owner_ids(module)
                 if not owners:
                     continue

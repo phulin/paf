@@ -16,11 +16,17 @@ from enum import StrEnum
 from importlib.resources import files
 from pathlib import Path
 from typing import Any, BinaryIO
+from uuid import uuid4
 
 from paf import json_codec as json
 from paf.activity import EVENT_TIMESTAMP_FIELD, activity_timestamp
 from paf.backends import LeanBackend
-from paf.diagnostics import unexpected_lean_warnings
+from paf.diagnostics import (
+    LeanDiagnostic,
+    failed_lean_modules,
+    lean_diagnostics,
+    unexpected_lean_warnings,
+)
 from paf.hashing import (
     ALGORITHM,
     STABLE_ALGORITHM,
@@ -544,6 +550,9 @@ class ValidationResult:
     process_exit_code: int | None = None
     status: ValidationStatus | None = None
     blocked_by: tuple[str, ...] = ()
+    diagnostics: tuple[LeanDiagnostic, ...] = ()
+    failed_modules: tuple[str, ...] = ()
+    raw_log_path: str | None = None
 
     def __post_init__(self) -> None:
         if self.status is None:
@@ -573,6 +582,9 @@ class ValidationResult:
             "process_exit_code": self.process_exit_code,
             "status": self.status,
             "blocked_by": list(self.blocked_by),
+            "diagnostics": [diagnostic.as_dict() for diagnostic in self.diagnostics],
+            "failed_modules": list(self.failed_modules),
+            "raw_log_path": self.raw_log_path,
         }
 
 
@@ -2279,6 +2291,17 @@ diagnostics from prerequisites to dependents.
         return result
 
 
+def _bounded_validation_output(output: str, maximum: int = 20_000) -> str:
+    """Bound human-facing build output while preserving both endpoints."""
+
+    if len(output) <= maximum:
+        return output
+    marker = "\n\n... coordinator build output omitted; see raw_log_path ...\n\n"
+    available = maximum - len(marker)
+    head = available // 3
+    return output[:head] + marker + output[-(available - head) :]
+
+
 async def validate(
     config: PipelineConfig,
     chapter: WorkUnitLike,
@@ -2287,6 +2310,9 @@ async def validate(
     on_output: Callable[[str], None] | None = None,
 ) -> ValidationResult:
     root = workspace_root or config.settings.repo
+    logs_dir = config.settings.state_dir / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    raw_log_path = logs_dir / f"coordinator-build-{uuid4().hex[:12]}.log"
     process = await asyncio.create_subprocess_exec(
         "bash",
         "-lc",
@@ -2299,45 +2325,53 @@ async def validate(
     if process.stdout is None:
         raise RuntimeError("failed to open validation subprocess output")
     output_parts: list[bytes] = []
-    try:
-        async with asyncio.timeout(config.settings.validation_timeout_seconds):
-            while line := await process.stdout.readline():
-                output_parts.append(line)
-                if on_output is not None:
-                    on_output(line.decode(errors="replace"))
-            await process.wait()
-        process_exit_code = process.returncode or 0
-        timed_out = False
-    except TimeoutError:
-        await _terminate(process)
-        timeout_message = b"validation timed out"
-        output_parts.append(timeout_message)
-        if on_output is not None:
-            on_output(timeout_message.decode())
-        process_exit_code = 124
-        timed_out = True
-    except asyncio.CancelledError:
-        await _terminate(process)
-        raise
+    with raw_log_path.open("wb") as raw_log:
+        try:
+            async with asyncio.timeout(config.settings.validation_timeout_seconds):
+                while line := await process.stdout.readline():
+                    output_parts.append(line)
+                    raw_log.write(line)
+                    if on_output is not None:
+                        on_output(line.decode(errors="replace"))
+                await process.wait()
+            process_exit_code = process.returncode or 0
+            timed_out = False
+        except TimeoutError:
+            await _terminate(process)
+            timeout_message = b"validation timed out"
+            output_parts.append(timeout_message)
+            raw_log.write(timeout_message)
+            if on_output is not None:
+                on_output(timeout_message.decode())
+            process_exit_code = 124
+            timed_out = True
+        except asyncio.CancelledError:
+            await _terminate(process)
+            raise
     output_bytes = b"".join(output_parts)
     complete_output = output_bytes.decode(errors="replace")
     warnings = unexpected_lean_warnings(complete_output)
+    diagnostics = lean_diagnostics(complete_output)
+    failed_modules = failed_lean_modules(complete_output)
     exit_code = process_exit_code
-    output = complete_output[-20000:]
+    display_output = complete_output
     if warnings:
         warning_summary = "\n".join(warnings[-50:])
-        output = (
-            f"{output}\n\nCoordinator rejected {len(warnings)} non-sorry Lean warning(s):\n"
+        display_output = (
+            f"{display_output}\n\nCoordinator rejected {len(warnings)} non-sorry Lean warning(s):\n"
             f"{warning_summary}"
-        )[-20000:]
+        )
         if exit_code == 0:
             exit_code = 1
     return ValidationResult(
         exit_code == 0 and not warnings,
         exit_code,
-        output,
+        _bounded_validation_output(display_output),
         timed_out,
         process_exit_code,
+        diagnostics=diagnostics,
+        failed_modules=failed_modules,
+        raw_log_path=str(raw_log_path),
     )
 
 

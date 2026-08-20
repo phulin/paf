@@ -3076,6 +3076,42 @@ def test_failed_batch_diagnostics_are_partitioned_by_target_closure(tmp_path: Pa
     assert partitioned[consumer.id].blocked_by == (owner.id,)
 
 
+def test_failed_batch_uses_structured_diagnostics_hidden_from_display_output(
+    tmp_path: Path,
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    owner, consumer = config.chapters
+    orchestrator = Orchestrator(config, StateStore(config))
+    graph = WorkUnitImportGraph(
+        dependencies={owner.id: frozenset(), consumer.id: frozenset({owner.id})},
+        successors={owner.id: frozenset({consumer.id}), consumer.id: frozenset()},
+        order=(owner.id, consumer.id),
+        edges=((owner.id, consumer.id),),
+    )
+    hidden = scheduler_module.LeanDiagnostic(
+        "error",
+        "error: Book/Chapter01/Section.lean:3:2: hidden failure",
+        "error: Book/Chapter01/Section.lean:3:2: hidden failure",
+    )
+    result = ValidationResult(
+        False,
+        1,
+        "warning: Book/Unrelated.lean:9:1: trailing warning",
+        process_exit_code=1,
+        diagnostics=(hidden,),
+        failed_modules=("Book.Chapter01",),
+        raw_log_path="/tmp/coordinator-build.log",
+    )
+
+    partitioned = orchestrator._partition_build_diagnostics(result, (owner.id, consumer.id), graph)
+
+    assert partitioned[owner.id].status is ValidationStatus.TARGET_FAILED
+    assert partitioned[consumer.id].status is ValidationStatus.UPSTREAM_FAILED
+    assert partitioned[consumer.id].blocked_by == (owner.id,)
+    assert partitioned[owner.id].diagnostics == (hidden,)
+    assert partitioned[owner.id].raw_log_path == "/tmp/coordinator-build.log"
+
+
 def test_upstream_warning_does_not_fail_dependent_build(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
     owner, consumer = config.chapters
