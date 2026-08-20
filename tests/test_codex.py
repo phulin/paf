@@ -258,6 +258,9 @@ async def test_rollout_tail_skips_large_non_usage_records_before_json_decode(
 ) -> None:
     from paf import codex as codex_module
 
+    async def run_inline(function: Callable[..., object], *args: object) -> object:
+        return function(*args)
+
     rollout = tmp_path / "rollout.jsonl"
     irrelevant = b'{"type":"response_item","payload":"' + b"x" * (2 * 1024 * 1024) + b'"}\n'
     token_count = json.dumps(
@@ -284,6 +287,7 @@ async def test_rollout_tail_skips_large_non_usage_records_before_json_decode(
         return original_loads(value)
 
     monkeypatch.setattr(codex_module, "_codex_rollout", lambda _thread_id: rollout)
+    monkeypatch.setattr(codex_module.asyncio, "to_thread", run_inline)
     monkeypatch.setattr(codex_module.json, "loads", recording_loads)
     monkeypatch.setattr(codex_module, "USAGE_POLL_SECONDS", 0)
     stop = asyncio.Event()
