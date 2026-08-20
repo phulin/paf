@@ -389,6 +389,9 @@ pub struct DashboardModel {
     pub preparation: Option<Preparation>,
     pub reload_requested: bool,
     pub detach_requested: bool,
+    pub search_query: Option<String>,
+    pub search_error: String,
+    search_origin: Option<usize>,
     restore_agent_view: Option<String>,
 }
 
@@ -436,6 +439,9 @@ impl DashboardModel {
             }),
             reload_requested: false,
             detach_requested: false,
+            search_query: None,
+            search_error: String::new(),
+            search_origin: None,
             restore_agent_view: agent_view,
         }
     }
@@ -586,6 +592,101 @@ impl DashboardModel {
         }
         self.selected = self.selected.saturating_add_signed(delta).min(length - 1);
         self.scroll = 0;
+    }
+
+    pub fn begin_search(&mut self) {
+        self.search_query = Some(String::new());
+        self.search_error.clear();
+        self.search_origin = Some(self.selected);
+    }
+
+    pub fn cancel_search(&mut self) {
+        if let Some(origin) = self.search_origin {
+            self.selected = origin.min(self.rows().len().saturating_sub(1));
+            self.scroll = 0;
+        }
+        self.search_query = None;
+        self.search_error.clear();
+        self.search_origin = None;
+    }
+
+    pub fn accept_search(&mut self) {
+        self.search_query = None;
+        self.search_error.clear();
+        self.search_origin = None;
+        if self.detail {
+            self.leave_detail();
+        }
+        self.shepherd_detail = false;
+    }
+
+    pub fn push_search_character(&mut self, character: char) {
+        if let Some(query) = &mut self.search_query {
+            query.push(character);
+        }
+        self.update_search_selection();
+    }
+
+    pub fn pop_search_character(&mut self) {
+        if let Some(query) = &mut self.search_query {
+            query.pop();
+        }
+        self.update_search_selection();
+    }
+
+    pub fn clear_search_query(&mut self) {
+        if let Some(query) = &mut self.search_query {
+            query.clear();
+        }
+        self.update_search_selection();
+    }
+
+    /// Select the first work unit matching the current book search.
+    ///
+    /// A numeric suffix after the final dot is an exact `document_id.ordinal` target. All other
+    /// queries are case-insensitive substrings of `document_id` and select the first displayed row
+    /// in the matching document.
+    fn update_search_selection(&mut self) -> bool {
+        let query = self.search_query.as_deref().unwrap_or_default().trim();
+        if query.is_empty() {
+            if let Some(origin) = self.search_origin {
+                self.selected = origin.min(self.rows().len().saturating_sub(1));
+                self.scroll = 0;
+            }
+            self.search_error.clear();
+            return true;
+        }
+
+        let rows = self.rows();
+        let exact_target = query.rsplit_once('.').and_then(|(document_id, ordinal)| {
+            (!document_id.is_empty())
+                .then(|| {
+                    ordinal
+                        .parse::<usize>()
+                        .ok()
+                        .map(|ordinal| (document_id, ordinal))
+                })
+                .flatten()
+        });
+        let selected = if let Some((document_id, ordinal)) = exact_target {
+            rows.iter().position(|row| {
+                exact_document_id_matches(&row.unit.document_id, document_id)
+                    && row.unit.ordinal == ordinal
+            })
+        } else {
+            let query = query.to_lowercase();
+            rows.iter()
+                .position(|row| row.unit.document_id.to_lowercase().contains(&query))
+        };
+        let Some(selected) = selected else {
+            self.search_error = format!("No book or unit found for {query:?}");
+            return false;
+        };
+        drop(rows);
+        self.selected = selected;
+        self.scroll = 0;
+        self.search_error.clear();
+        true
     }
 
     fn clamp_selection(&mut self) {
@@ -992,6 +1093,21 @@ impl DashboardModel {
     }
 }
 
+fn exact_document_id_matches(actual: &str, query: &str) -> bool {
+    strip_books_prefix(actual).eq_ignore_ascii_case(strip_books_prefix(query))
+}
+
+fn strip_books_prefix(document_id: &str) -> &str {
+    if document_id
+        .get(.."books/".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("books/"))
+    {
+        &document_id["books/".len()..]
+    } else {
+        document_id
+    }
+}
+
 pub fn compact_task_detail(detail: &str) -> String {
     const LEGACY_PREFIX: &str = "waiting for prerequisite reviews:";
     if detail
@@ -1126,6 +1242,119 @@ mod tests {
         assert!(model.detail);
         assert_eq!(model.detail_tab, DetailTab::Plan);
         assert_eq!(model.selected_row().unwrap().unit.id, "book/chapter-01");
+    }
+
+    #[test]
+    fn search_selects_the_first_unit_in_a_matching_book() {
+        let mut model = DashboardModel::loading("test".into(), String::new());
+        for (id, document_id, ordinal) in [
+            ("intro/unit-1", "intro", 1),
+            ("more-algebra/unit-7", "more-algebra", 7),
+            ("more-algebra/unit-8", "more-algebra", 8),
+        ] {
+            model.state.work_units.push(WorkUnit {
+                id: id.into(),
+                document_id: document_id.into(),
+                ordinal,
+                ..WorkUnit::default()
+            });
+            model.state.tasks.insert(
+                format!("{id}:review"),
+                Task {
+                    work_unit_id: id.into(),
+                    stage: "review".into(),
+                    ..Task::default()
+                },
+            );
+        }
+
+        model.begin_search();
+        model.push_search_character('A');
+        assert_eq!(model.selected_row().unwrap().unit.id, "more-algebra/unit-7");
+        for character in "LGEBRA".chars() {
+            model.push_search_character(character);
+        }
+        assert_eq!(model.selected_row().unwrap().unit.id, "more-algebra/unit-7");
+        model.accept_search();
+        assert!(model.search_query.is_none());
+    }
+
+    #[test]
+    fn search_selects_an_exact_book_and_unit_number() {
+        let mut model = DashboardModel::loading("test".into(), String::new());
+        for ordinal in [7, 8] {
+            let id = format!("more-algebra/unit-{ordinal}");
+            model.state.work_units.push(WorkUnit {
+                id: id.clone(),
+                document_id: "books/more-algebra".into(),
+                ordinal,
+                ..WorkUnit::default()
+            });
+            model.state.tasks.insert(
+                format!("{id}:review"),
+                Task {
+                    work_unit_id: id,
+                    stage: "review".into(),
+                    ..Task::default()
+                },
+            );
+        }
+
+        model.begin_search();
+        for character in "more-algebra.8".chars() {
+            model.push_search_character(character);
+        }
+        assert_eq!(model.selected_row().unwrap().unit.ordinal, 8);
+        model.accept_search();
+
+        model.begin_search();
+        for character in "books/more-algebra.7".chars() {
+            model.push_search_character(character);
+        }
+        assert_eq!(model.selected_row().unwrap().unit.ordinal, 7);
+        model.accept_search();
+    }
+
+    #[test]
+    fn unsuccessful_search_stays_at_the_last_match_for_correction() {
+        let mut model = DashboardModel::loading("test".into(), String::new());
+        model.begin_search();
+        for character in "missing.3".chars() {
+            model.push_search_character(character);
+        }
+
+        assert_eq!(model.search_query.as_deref(), Some("missing.3"));
+        assert!(model.search_error.contains("missing.3"));
+    }
+
+    #[test]
+    fn cancelling_search_restores_the_original_selection() {
+        let mut model = DashboardModel::loading("test".into(), String::new());
+        for document_id in ["intro", "algebra"] {
+            let id = format!("{document_id}/unit-1");
+            model.state.work_units.push(WorkUnit {
+                id: id.clone(),
+                document_id: document_id.into(),
+                ordinal: 1,
+                ..WorkUnit::default()
+            });
+            model.state.tasks.insert(
+                format!("{id}:review"),
+                Task {
+                    work_unit_id: id,
+                    stage: "review".into(),
+                    ..Task::default()
+                },
+            );
+        }
+
+        model.begin_search();
+        for character in "algebra".chars() {
+            model.push_search_character(character);
+        }
+        assert_eq!(model.selected, 1);
+        model.cancel_search();
+        assert_eq!(model.selected, 0);
     }
 
     #[test]

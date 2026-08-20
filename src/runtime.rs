@@ -299,6 +299,9 @@ fn handle_terminal_event_with_sender(
     if !key.is_press() {
         return Ok(false);
     }
+    if model.search_query.is_some() {
+        return Ok(handle_search_key(key, model));
+    }
     let stop_key = key.code == KeyCode::Char('q')
         || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL));
     if key.code == KeyCode::Char('d') {
@@ -307,6 +310,10 @@ fn handle_terminal_event_with_sender(
     }
     if model.preparation.is_some() && !stop_key {
         return Ok(false);
+    }
+    if key.code == KeyCode::Char('/') {
+        model.begin_search();
+        return Ok(true);
     }
     if key.code == KeyCode::Char('r') {
         model.reload_requested = true;
@@ -397,6 +404,28 @@ fn handle_terminal_event_with_sender(
         }
         _ => Ok(false),
     }
+}
+
+fn handle_search_key(key: KeyEvent, model: &mut DashboardModel) -> bool {
+    match key.code {
+        KeyCode::Esc => model.cancel_search(),
+        KeyCode::Enter => {
+            model.accept_search();
+        }
+        KeyCode::Backspace => model.pop_search_character(),
+        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            model.clear_search_query();
+        }
+        KeyCode::Char(character)
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+        {
+            model.push_search_character(character);
+        }
+        _ => return false,
+    }
+    true
 }
 
 #[cfg(test)]
@@ -754,6 +783,32 @@ mod tests {
         handle_terminal_event(wheel(MouseEventKind::ScrollDown), &mut model, "/unused").unwrap();
         assert_eq!(model.scroll, model.detail_max_scroll);
         assert!(model.detail_follow_tail);
+    }
+
+    #[test]
+    fn slash_opens_search_and_typing_captures_dashboard_shortcuts() {
+        let mut model = DashboardModel::loading("test".into(), String::new());
+        model.preparation = None;
+
+        assert!(
+            handle_terminal_event(
+                Event::Key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE)),
+                &mut model,
+                "/unused",
+            )
+            .unwrap()
+        );
+        for character in ['d', 'o', 'c'] {
+            handle_terminal_event(
+                Event::Key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE)),
+                &mut model,
+                "/unused",
+            )
+            .unwrap();
+        }
+
+        assert_eq!(model.search_query.as_deref(), Some("doc"));
+        assert!(!model.detach_requested);
     }
 
     #[test]

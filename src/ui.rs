@@ -35,6 +35,54 @@ pub fn draw(frame: &mut Frame<'_>, model: &mut DashboardModel) {
     if model.preparation.is_some() {
         draw_preparation_modal(frame, model);
     }
+    if model.search_query.is_some() {
+        draw_search_modal(frame, model);
+    }
+}
+
+fn draw_search_modal(frame: &mut Frame<'_>, model: &DashboardModel) {
+    let Some(query) = &model.search_query else {
+        return;
+    };
+    let area = centered(frame.area(), 72, 7);
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .title(" Search books ")
+        .title_alignment(Alignment::Center)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(CYAN))
+        .style(Style::default().bg(SURFACE));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(1),
+        ])
+        .split(inner);
+    frame.render_widget(
+        Paragraph::new(format!("> {query}")).style(Style::default().fg(Color::White).bg(SURFACE)),
+        layout[0],
+    );
+    frame.render_widget(
+        Paragraph::new("Enter keeps selection · Esc restores · exact: [books/]book-name.8")
+            .style(Style::default().fg(MUTED).bg(SURFACE)),
+        layout[1],
+    );
+    if !model.search_error.is_empty() {
+        frame.render_widget(
+            Paragraph::new(model.search_error.as_str())
+                .style(Style::default().fg(YELLOW).bg(SURFACE)),
+            layout[2],
+        );
+    }
+    let cursor_offset = u16::try_from(query.chars().count())
+        .unwrap_or(u16::MAX)
+        .min(layout[0].width.saturating_sub(3));
+    frame.set_cursor_position((layout[0].x + 2 + cursor_offset, layout[0].y));
 }
 
 fn draw_preparation_modal(frame: &mut Frame<'_>, model: &DashboardModel) {
@@ -135,7 +183,7 @@ fn draw_dashboard(frame: &mut Frame<'_>, model: &DashboardModel) {
     draw_status(frame, model, layout[4]);
     frame.render_widget(
         Paragraph::new(
-            "↑↓ select  Enter/i inspect  s shepherd  p pause/resume  r reload TUI  d detach  q stop",
+            "↑↓ select  Enter/i inspect  / search  s shepherd  p pause/resume  r reload TUI  d detach  q stop",
         )
         .style(Style::default().fg(MUTED))
         .alignment(Alignment::Center),
@@ -1606,6 +1654,23 @@ mod tests {
         assert!(rendered.contains("Preparing isolated workspaces and Lean caches"));
         assert!(rendered.contains("7 / 9"));
         assert!(rendered.contains("d detaches  q stops before workers are launched"));
+    }
+
+    #[test]
+    fn renders_book_search_as_a_modal() {
+        let mut model = DashboardModel::loading("review stage".into(), String::new());
+        model.preparation = None;
+        model.begin_search();
+        model.search_query = Some("more-algebra.8".into());
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal.draw(|frame| draw(frame, &mut model)).unwrap();
+
+        let rendered = terminal.backend().to_string();
+        assert!(rendered.contains("Search books"));
+        assert!(rendered.contains("> more-algebra.8"));
+        assert!(rendered.contains("Enter keeps selection · Esc restores"));
     }
 
     #[test]
