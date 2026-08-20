@@ -3,15 +3,17 @@
 ## Goal
 
 Determine which earlier chapters this chapter directly needs. Read chapter {chapter_number},
-“{chapter_title},” in `{source}` from the start of its assigned span to the end. Return the ids of its
-direct prerequisites so PAF can process the chapters in the right order.
+“{chapter_title},” in `{source}`, restricted exactly to lines {source_start_line}-{source_end_line}
+(inclusive). Do not read past line {source_end_line} when deciding dependencies. Return the ids of
+its direct prerequisites so PAF can process the chapters in the right order.
 
 This stage only studies the book source. It does not write Lean code, inspect generated Lean imports,
 or edit any files.
 
 ## Workflow
 
-1. Read the complete assigned source span.
+1. Read the complete assigned source span, `{source}:{source_start_line}-{source_end_line}`, and no
+   later chapter text.
 2. List the definitions, constructions, assumptions, and named results introduced in this chapter.
 3. For each item, identify the earlier chapters whose mathematical content it directly uses.
 4. Match those chapters to ids in the input catalog supplied below.
