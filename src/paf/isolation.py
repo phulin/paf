@@ -772,7 +772,7 @@ class FuseOverlayIsolation:
                 work=work,
                 merged=merged,
             )
-        except Exception:
+        except BaseException:
             if os.path.ismount(merged):
                 await self._unmount(merged)
             if build_root.exists():
@@ -945,15 +945,15 @@ class FuseOverlayIsolation:
 
     async def acquire(self, run_id: str, *, resume_run_id: str = "") -> FuseWorkspace:
         slot = await self._available.get()
-        if resume_run_id:
-            resumed = await self._resume_workspace(slot, resume_run_id)
-            if resumed is not None:
-                return resumed
         generation: int | None = None
         cache_generation: int | None = None
         slot_root = self.slots / f"{slot:04d}-{run_id}"
         merged = slot_root / "merged"
         try:
+            if resume_run_id:
+                resumed = await self._resume_workspace(slot, resume_run_id)
+                if resumed is not None:
+                    return resumed
             async with self._lock:
                 generation, base = await self._generation()
                 cache_generation = self._published_cache_revision
@@ -985,7 +985,7 @@ class FuseOverlayIsolation:
                 merged=merged,
                 lowerdirs=(base, *cache.layers, self._dependency_layer),
             )
-        except Exception:
+        except BaseException:
             if os.path.ismount(merged):
                 await self._unmount(merged)
             if slot_root.exists():

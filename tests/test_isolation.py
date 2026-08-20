@@ -106,6 +106,57 @@ async def test_fuse_overlay_recursive_cleanup_does_not_block_event_loop(
 
 
 @pytest.mark.asyncio
+async def test_cancelled_workspace_acquisition_returns_its_slot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager, _ = fuse_manager(write_project(tmp_path, chapters="chapters = [1]"))
+    await manager.prepare()
+    mounting = asyncio.Event()
+
+    async def interrupted_mount(*command: str) -> None:
+        assert command[0] == "fuse-overlayfs"
+        mounting.set()
+        await asyncio.Future()
+
+    monkeypatch.setattr(manager, "_run", interrupted_mount)
+    acquisition = asyncio.create_task(manager.acquire("cancelled-acquisition"))
+    await mounting.wait()
+    acquisition.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await acquisition
+
+    assert manager._available.qsize() == manager.settings.max_agents
+    await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_build_acquisition_releases_its_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager, _ = fuse_manager(write_project(tmp_path, chapters="chapters = [1]"))
+    await manager.prepare()
+    mounting = asyncio.Event()
+
+    async def interrupted_mount(*command: str) -> None:
+        assert command[0] == "fuse-overlayfs"
+        mounting.set()
+        await asyncio.Future()
+
+    monkeypatch.setattr(manager, "_run", interrupted_mount)
+    acquisition = asyncio.create_task(manager.acquire_build("cancelled-build"))
+    await mounting.wait()
+    acquisition.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await acquisition
+
+    assert not manager._active_build_layers
+    assert all(references == 0 for references in manager._generation_references.values())
+    await manager.close()
+
+
+@pytest.mark.asyncio
 async def test_cache_layer_cleanup_is_serialized_and_releases_finished_tasks(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
