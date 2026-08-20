@@ -1126,7 +1126,7 @@ class Orchestrator:
         self,
         snapshots: dict[str, ValidatedBuildSnapshot],
     ) -> bool:
-        """Publish only if the exact source graph built is still current."""
+        """Publish only if the exact source snapshot built is still current."""
 
         if not snapshots:
             return False
@@ -1134,10 +1134,12 @@ class Orchestrator:
             graph = self._observed_work_unit_graph()
             captured: dict[str, str] = {}
             captured_generations: dict[str, int] = {}
-            required = self._dependency_closure(graph, snapshots)
-            for snapshot in snapshots.values():
-                if snapshot.graph.edges != graph.edges:
-                    return False
+            required: set[str] = set()
+            for chapter_id, snapshot in snapshots.items():
+                # Discovery is scheduling guidance, not part of the Lean build
+                # certificate.  A concurrently refined discovery graph must not
+                # invalidate a build of an unchanged source snapshot.
+                required.update(self._dependency_closure(snapshot.graph, (chapter_id,)))
                 for chapter_id, digest in snapshot.source_digests.items():
                     existing = captured.setdefault(chapter_id, digest)
                     if existing != digest:
@@ -2058,31 +2060,10 @@ class Orchestrator:
                     and (previous_run := getattr(last_attempt, "run", None)) is not None
                 ):
                     await self.state.update_run(previous_run, validation=validation.as_dict())
-                if validation.succeeded and await self._publish_validated_build(
-                    chapter, snapshots[chapter.id]
-                ):
-                    await self.state.set_task(
-                        chapter.id,
-                        Stage.FORMALIZE,
-                        TaskStatus.SUCCEEDED,
-                        "clean diagnostics and coordinator build in source dependency order",
+                if validation.succeeded or validation.warnings_only:
+                    return await self._complete_formalize_build(
+                        chapter, validation, snapshots[chapter.id]
                     )
-                    return StageOutcome(ExecutionDisposition.SUCCEEDED)
-                if validation.warnings_only and await self._publish_validated_build(
-                    chapter, snapshots[chapter.id]
-                ):
-                    await self._queue_warning_cleanup(
-                        chapter,
-                        validation,
-                        stage=Stage.FORMALIZE,
-                    )
-                    await self.state.set_task(
-                        chapter.id,
-                        Stage.FORMALIZE,
-                        TaskStatus.SUCCEEDED,
-                        "coordinator build succeeded; warning cleanup queued",
-                    )
-                    return StageOutcome(ExecutionDisposition.SUCCEEDED)
                 if validation.status is ValidationStatus.UPSTREAM_FAILED:
                     return await self._block_on_upstream_diagnostics(chapter, validation)
                 if validation.blocked_by:
@@ -2133,31 +2114,10 @@ class Orchestrator:
                 and (previous_run := getattr(last_attempt, "run", None)) is not None
             ):
                 await self.state.update_run(previous_run, validation=validation.as_dict())
-            if validation.succeeded and await self._publish_validated_build(
-                chapter, snapshots[chapter.id]
-            ):
-                await self.state.set_task(
-                    chapter.id,
-                    Stage.FORMALIZE,
-                    TaskStatus.SUCCEEDED,
-                    "clean diagnostics and coordinator build in source dependency order",
+            if validation.succeeded or validation.warnings_only:
+                return await self._complete_formalize_build(
+                    chapter, validation, snapshots[chapter.id]
                 )
-                return StageOutcome(ExecutionDisposition.SUCCEEDED)
-            if validation.warnings_only and await self._publish_validated_build(
-                chapter, snapshots[chapter.id]
-            ):
-                await self._queue_warning_cleanup(
-                    chapter,
-                    validation,
-                    stage=Stage.FORMALIZE,
-                )
-                await self.state.set_task(
-                    chapter.id,
-                    Stage.FORMALIZE,
-                    TaskStatus.SUCCEEDED,
-                    "coordinator build succeeded; warning cleanup queued",
-                )
-                return StageOutcome(ExecutionDisposition.SUCCEEDED)
             if validation.status is ValidationStatus.UPSTREAM_FAILED:
                 return await self._block_on_upstream_diagnostics(chapter, validation)
             if validation.blocked_by:
@@ -2170,6 +2130,40 @@ class Orchestrator:
             f"formalization did not reach clean diagnostics in {maximum} attempts",
         )
         return StageOutcome(ExecutionDisposition.FAILED)
+
+    async def _complete_formalize_build(
+        self,
+        chapter: WorkUnitLike,
+        validation: ValidationResult,
+        snapshot: ValidatedBuildSnapshot,
+    ) -> StageOutcome:
+        """Publish a clean formalize build, independently of discovery refinements."""
+
+        if not await self._publish_validated_build(chapter, snapshot):
+            return await self._defer_formalize_publication(chapter)
+        if validation.warnings_only:
+            await self._queue_warning_cleanup(chapter, validation, stage=Stage.FORMALIZE)
+            detail = "coordinator build succeeded; warning cleanup queued"
+        else:
+            detail = "clean diagnostics and coordinator build in source dependency order"
+        await self.state.set_task(
+            chapter.id,
+            Stage.FORMALIZE,
+            TaskStatus.SUCCEEDED,
+            detail,
+        )
+        return StageOutcome(ExecutionDisposition.SUCCEEDED)
+
+    async def _defer_formalize_publication(self, chapter: WorkUnitLike) -> StageOutcome:
+        """Requeue a clean build whose source snapshot changed before publication."""
+
+        await self.state.set_task(
+            chapter.id,
+            Stage.FORMALIZE,
+            TaskStatus.PENDING,
+            "source changed after the clean coordinator build; revalidation queued",
+        )
+        return StageOutcome(ExecutionDisposition.WAITING)
 
     async def _block_on_upstream_diagnostics(
         self,
@@ -4008,7 +4002,6 @@ class Orchestrator:
                     if not source_held:
                         await self.source_lock.acquire()
                         source_held = True
-                    current_graph = self._observed_work_unit_graph()
                     possibly_modified = await self._possibly_modified_scope_ids(
                         build_required_ids,
                         build_source_generations,
@@ -4019,7 +4012,7 @@ class Orchestrator:
                         by_id,
                         possibly_modified,
                     )
-                    source_is_current = current_graph.edges == build_graph.edges and all(
+                    source_is_current = all(
                         build_source_digests[chapter_id] == digest
                         for chapter_id, digest in current_source_digests.items()
                     )

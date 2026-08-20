@@ -3264,6 +3264,47 @@ async def test_formalize_warning_publishes_artifact_and_queues_auxiliary_cleanup
 
 
 @pytest.mark.asyncio
+async def test_formalize_requeues_clean_build_if_source_changes_before_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = config.chapters[0]
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await state.load_or_create()
+    await state.set_task(chapter.id, Stage.DISCOVER, TaskStatus.SUCCEEDED, "discovered")
+    monkeypatch.setattr(orchestrator, "_scope_exists", lambda _chapter: asyncio.sleep(0, True))
+
+    async def clean_build(
+        _chapters: Iterable[Chapter],
+        *,
+        snapshots: dict[str, object],
+        **_kwargs: object,
+    ) -> dict[str, ValidationResult]:
+        snapshots[chapter.id] = object()
+        return {chapter.id: ValidationResult(True, 0, "ok")}
+
+    async def stale_publication(_chapter: Chapter, _snapshot: object) -> bool:
+        return False
+
+    async def no_agent(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("a publication race must not spend a formalize agent round")
+
+    monkeypatch.setattr(orchestrator, "_build_chapters", clean_build)
+    monkeypatch.setattr(orchestrator, "_publish_validated_build", stale_publication)
+    monkeypatch.setattr(orchestrator, "_attempt", no_agent)
+
+    outcome = await orchestrator._formalize(chapter)
+
+    assert outcome.disposition is ExecutionDisposition.WAITING
+    formalize = state.task(chapter.id, Stage.FORMALIZE)
+    assert formalize.status == TaskStatus.PENDING
+    assert formalize.rounds == 0
+    assert "revalidation queued" in formalize.detail
+    await state.close()
+
+
+@pytest.mark.asyncio
 async def test_auxiliary_warning_cleanup_preserves_stage_success(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -4310,6 +4351,53 @@ async def test_validated_build_refuses_to_certify_a_newer_source_generation(
 
     assert not await orchestrator._publish_validated_build(chapter, snapshots[chapter.id])
     assert chapter.id not in orchestrator.state.fixup_graph.get("clean", {})
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_discovery_graph_change_does_not_invalidate_validated_build(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    first, second = config.chapters
+    for chapter in config.chapters:
+        source = tmp_path / "lean" / "Book" / f"Chapter{chapter.number:02d}.lean"
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_text(f"def value{chapter.number} := {chapter.number}\n", encoding="utf-8")
+    orchestrator = Orchestrator(config, StateStore(config))
+    await orchestrator.prepare()
+    initial_graph = WorkUnitImportGraph(
+        dependencies={first.id: frozenset(), second.id: frozenset()},
+        successors={first.id: frozenset(), second.id: frozenset()},
+        order=(first.id, second.id),
+        edges=(),
+    )
+    refined_graph = WorkUnitImportGraph(
+        dependencies={first.id: frozenset(), second.id: frozenset({first.id})},
+        successors={first.id: frozenset({second.id}), second.id: frozenset()},
+        order=(first.id, second.id),
+        edges=((first.id, second.id),),
+    )
+    observed_graph = initial_graph
+
+    async def validation(*_args: object, **_kwargs: object) -> ValidationResult:
+        nonlocal observed_graph
+        observed_graph = refined_graph
+        return ValidationResult(True, 0, "ok")
+
+    monkeypatch.setattr(orchestrator, "_observed_work_unit_graph", lambda: observed_graph)
+    monkeypatch.setattr(scheduler_module, "validate", validation)
+    snapshots: dict[str, scheduler_module.ValidatedBuildSnapshot] = {}
+
+    results = await orchestrator._build_chapters(
+        (second,), publish_if_clean=True, snapshots=snapshots
+    )
+
+    assert results[second.id].succeeded
+    assert snapshots[second.id].graph is initial_graph
+    assert await orchestrator._publish_validated_build(second, snapshots[second.id])
+    assert second.id in orchestrator.state.formalize_graph["clean"]
+    assert orchestrator.state.formalize_graph["edges"] == [list(refined_graph.edges[0])]
     await orchestrator.shutdown()
 
 
