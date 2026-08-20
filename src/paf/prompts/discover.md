@@ -2,7 +2,7 @@
 
 ## Goal
 
-Determine which earlier chapters this chapter directly needs. Read chapter {chapter_number},
+Determine which earlier chapters the eventual Lean formalization should import directly. Read chapter {chapter_number},
 “{chapter_title},” in `{source}`, restricted exactly to lines {source_start_line}-{source_end_line}
 (inclusive). Do not read past line {source_end_line} when deciding dependencies. Return the ids of
 its direct prerequisites so PAF can process the chapters in the right order.
@@ -15,7 +15,8 @@ or edit any files.
 1. Read the complete assigned source span, `{source}:{source_start_line}-{source_end_line}`, and no
    later chapter text.
 2. List the definitions, constructions, assumptions, and named results introduced in this chapter.
-3. For each item, identify the earlier chapters whose mathematical content it directly uses.
+3. For each item, identify the earlier chapters whose definitions, constructions, or results the
+   formalization should reuse directly.
 4. Match those chapters to ids in the input catalog supplied below.
 5. Return those ids in `source_dependencies`, and briefly explain the dependency relationships and
    any ambiguous references in the report.
@@ -25,6 +26,11 @@ or edit any files.
 A direct prerequisite is one this chapter actually uses, not merely one that an earlier prerequisite
 uses. Do not include those indirect ancestors or incidental citations. Keep dependencies explicitly
 provided by the project even when the book leaves them implicit.
+
+When this chapter repeats or restates a definition or construction already introduced by an earlier
+chapter, include that earlier chapter. The Lean formalization should import and reuse the canonical
+definition rather than create a parallel one merely because the textbook restates it here. Predict
+the intended direct import graph, including such reuse edges, while excluding transitive imports.
 
 Never create a dependency edge from this chapter to itself. The assigned chapter's own id must not
 appear in `source_dependencies`.
