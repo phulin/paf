@@ -151,6 +151,46 @@ def test_activity_replay_preserves_recorded_event_timestamps(tmp_path: Path) -> 
     assert replayed.updated_at == recorded_at[-1]
 
 
+def test_activity_records_codex_reconnects_without_promoting_them_to_failures(
+    tmp_path: Path,
+) -> None:
+    activity = AgentActivity(run_id="run", chapter_id="chapter", stage="prove")
+    message = (
+        "Reconnecting... 2/5 (stream disconnected before completion: "
+        "Incomplete response returned, reason: max_output_tokens)"
+    )
+
+    activity.consume(
+        {
+            "type": "error",
+            "message": message,
+            EVENT_TIMESTAMP_FIELD: "2026-08-20T20:38:13+00:00",
+        },
+        workspace_root=tmp_path,
+    )
+
+    assert activity.current == message
+    assert activity.latest_error == ""
+    assert activity.failures == 0
+    assert activity.recent[-1].at == "2026-08-20T20:38:13+00:00"
+    assert activity.recent[-1].status == "retrying"
+    assert activity.recent[-1].title == message
+
+
+def test_activity_records_top_level_codex_errors(tmp_path: Path) -> None:
+    activity = AgentActivity(run_id="run", chapter_id="chapter", stage="prove")
+
+    activity.consume(
+        {"type": "error", "message": "stream failed permanently"},
+        workspace_root=tmp_path,
+    )
+
+    assert activity.latest_error == "stream failed permanently"
+    assert activity.recent[-1].status == "failed"
+    assert activity.recent[-1].title == "Codex error"
+    assert activity.recent[-1].detail == "stream failed permanently"
+
+
 def test_activity_replay_recovers_legacy_timestamps_from_sidecar(tmp_path: Path) -> None:
     store = ActivityStore(tmp_path / "logs")
     activity = store.start("run", "chapter", "formalize")

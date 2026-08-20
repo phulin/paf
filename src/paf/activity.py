@@ -546,6 +546,20 @@ class AgentActivity:
             self._append("usage", "completed", "turn completed", detail, at=at)
             self._set_current()
             return
+        if event_type == "error":
+            message = str(event.get("message", "")).strip()
+            if not message:
+                return
+            if message.startswith("Reconnecting..."):
+                self.current = message
+                self.current_kind = "agent"
+                self._append("agent", "retrying", message, at=at)
+            else:
+                if candidate := reportable_error(message):
+                    self.latest_error = _compact(candidate)
+                self._append("agent", "failed", "Codex error", message, at=at)
+                self._set_current()
+            return
 
         item = event.get("item")
         if not isinstance(item, dict) or not isinstance(item.get("type"), str):
