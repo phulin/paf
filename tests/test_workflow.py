@@ -274,6 +274,49 @@ async def test_hot_snapshot_batches_failure_roots_without_recursive_walks(
 
 
 @pytest.mark.asyncio
+async def test_dashboard_projects_computed_readiness_without_persisting_it(tmp_path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    state = StateStore(config)
+    await state.load_or_create()
+    chapter = config.work_units[0]
+    proof_key = state.key(chapter.id, Stage.PROVE)
+
+    initial = state.dashboard_snapshot()["tasks"][proof_key]
+    assert [requirement["owner_task_key"] for requirement in initial["waiting_on"]] == [
+        state.key(chapter.id, Stage.FORMALIZE),
+        state.key(chapter.id, Stage.REVIEW),
+    ]
+    assert state.task(chapter.id, Stage.PROVE).waiting_on == ()
+
+    await state.set_task(chapter.id, Stage.FORMALIZE, TaskStatus.SUCCEEDED, "formalized")
+    await state.set_task(chapter.id, Stage.REVIEW, TaskStatus.SUCCEEDED, "reviewed")
+    changes = state.change_bus.subscribe()
+    request_id, _ = await state.enqueue_proof_review_request(
+        {chapter.id: "full feedback that must not be copied into the compact waiting list " * 20},
+        origin_run_id="proof-run",
+    )
+
+    change = await changes.get()
+    assert chapter.id in change.work_units
+    projected = state.dashboard_delta(change)["tasks"][proof_key]
+    assert projected["waiting_on"] == [
+        {
+            "kind": RequirementKind.PROOF_REVIEW_REQUEST.value,
+            "detail": "waiting for proof-review request",
+            "owner_task_key": state.key(chapter.id, Stage.REVIEW),
+            "request_id": request_id,
+        }
+    ]
+    assert state.task(chapter.id, Stage.PROVE).waiting_on == ()
+    with sqlite3.connect(state.database_path) as connection:
+        payload = connection.execute(
+            "SELECT payload FROM tasks WHERE task_key = ?", (proof_key,)
+        ).fetchone()[0]
+    assert json.loads(payload)["waiting_on"] == []
+    await state.close()
+
+
+@pytest.mark.asyncio
 async def test_failure_recovery_publishes_derived_waiting_state(tmp_path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
     state = StateStore(config)

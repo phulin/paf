@@ -70,6 +70,7 @@ from paf.isolation import FuseWorkspace, IsolationResult, create_isolation
 from paf.models import PipelineConfig, ProofTarget, Stage, WorkUnit, WorkUnitLike
 from paf.scope import ScopeMatcher
 from paf.state import (
+    BUILD_WARNING_REVIEW_KIND,
     ProofBlockerStatus,
     RepairCaseRecord,
     RepairCaseStatus,
@@ -276,7 +277,6 @@ DISCOVERY_BATCH_MAXIMUM = 256
 DIAGNOSTIC_OWNER_CACHE_MAXIMUM = 16_384
 PROOF_FINDING_REVIEW_KIND = "proof_finding"
 BUILD_ERROR_REVIEW_KIND = "build_error"
-BUILD_WARNING_REVIEW_KIND = "build_warning"
 DETERMINISTIC_WARNING_CLEANUP_ROLE = "deterministic_warning_cleanup"
 LEGACY_DIAGNOSTIC_REVIEW_KIND = "diagnostic"
 COORDINATOR_VERIFICATION_RETRY_DETAIL = "coordinator verification retry queued"

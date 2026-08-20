@@ -5603,6 +5603,28 @@ async def test_green_review_does_not_satisfy_pending_proof_review_request(
 
 
 @pytest.mark.asyncio
+async def test_build_warning_review_request_does_not_block_proof_readiness(
+    tmp_path: Path,
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = config.chapters[0]
+    state = StateStore(config)
+    await state.load_or_create()
+    await state.set_task(chapter.id, Stage.FORMALIZE, TaskStatus.SUCCEEDED, "formalized")
+    await state.set_task(chapter.id, Stage.REVIEW, TaskStatus.SUCCEEDED, "reviewed")
+    warning_id, _ = await state.enqueue_proof_review_request(
+        {chapter.id: "clean up this warning"},
+        origin_run_id="warning-build",
+        kind=BUILD_WARNING_REVIEW_KIND,
+    )
+
+    proof = state.task(chapter.id, Stage.PROVE)
+    assert state.readiness(proof).ready
+    assert warning_id in state.proof_review_requests
+    await state.close()
+
+
+@pytest.mark.asyncio
 async def test_proof_review_exchange_cap_blocks_proof_not_review(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
     chapter = config.chapters[0]

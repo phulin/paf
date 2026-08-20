@@ -42,6 +42,8 @@ from paf.state_db import (
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 LAKE_PROGRESS_RE = re.compile(r"\[(?P<completed>\d+)/(?P<total>\d+)\]\s+\S+\s+(?P<target>\S+)")
 SHEPHERD_RUN_ROLES = frozenset({"shepherd", "repair_worker"})
+BUILD_WARNING_REVIEW_KIND = "build_warning"
+WAITING_DETAIL_MAXIMUM = 160
 
 
 def timestamp() -> str:
@@ -1121,6 +1123,7 @@ class StateStore:
         task: TaskRecord,
         context: dict[str, Any] | None = None,
         failure_roots: dict[str, tuple[str, ...]] | None = None,
+        readiness_requirements: tuple[Requirement, ...] | None = None,
     ) -> dict[str, Any]:
         context = context or self._task_snapshot_context()
         clean = context["clean"]
@@ -1141,15 +1144,19 @@ class StateStore:
             and task.status == TaskStatus.SUCCEEDED
             and task.source_digest is not None
         )
-        waiting_on = [
-            {
+        waiting_on = []
+        for requirement in (
+            task.waiting_on if readiness_requirements is None else readiness_requirements
+        ):
+            summary: dict[str, Any] = {
                 "kind": str(requirement.kind),
-                "owner_task_key": requirement.owner_task_key,
-                "request_id": requirement.request_id,
-                "detail": requirement.detail,
+                "detail": requirement.detail[:WAITING_DETAIL_MAXIMUM],
             }
-            for requirement in task.waiting_on
-        ]
+            if requirement.owner_task_key is not None:
+                summary["owner_task_key"] = requirement.owner_task_key
+            if requirement.request_id is not None:
+                summary["request_id"] = requirement.request_id
+            waiting_on.append(summary)
         task_key = self.key(task.chapter_id, Stage(task.stage))
         failed_requirements = self.failed_requirements(
             task,
@@ -1527,11 +1534,17 @@ class StateStore:
     def hot_snapshot(self) -> dict[str, Any]:
         task_context = self._task_snapshot_context()
         failure_roots = self._failure_roots_index()
+        readiness_requirements = self._readiness_requirements_subset(self.tasks)
         return self._global_snapshot() | {
             "documents": [dict(value) for value in self._document_dicts()],
             "work_units": [dict(value) for value in self._work_unit_dicts()],
             "tasks": {
-                key: self._hot_task_dict(task, task_context, failure_roots)
+                key: self._hot_task_dict(
+                    task,
+                    task_context,
+                    failure_roots,
+                    readiness_requirements.get(key, ()),
+                )
                 for key, task in sorted(self.tasks.items())
             },
         }
@@ -1609,8 +1622,14 @@ class StateStore:
         )
         task_context = self._task_snapshot_context()
         failure_roots = self._failure_roots_subset(task_keys) if task_keys else None
+        readiness_requirements = self._readiness_requirements_subset(task_keys)
         tasks = {
-            key: self._hot_task_dict(self.tasks[key], task_context, failure_roots)
+            key: self._hot_task_dict(
+                self.tasks[key],
+                task_context,
+                failure_roots,
+                readiness_requirements.get(key, ()),
+            )
             | {
                 "work_unit_usage": self._usage_dict(
                     self.invocation_usage(self.tasks[key].work_unit_id)
@@ -1721,6 +1740,7 @@ class StateStore:
         snapshot = self.hot_snapshot()
         task_context = self._task_snapshot_context()
         failure_roots = self._failure_roots_index()
+        readiness_requirements = self._readiness_requirements_subset(self.tasks)
         payloads = self._database.run_payloads() if self.database_path.is_file() else {}
         tasks: dict[str, Any] = {}
         for key, task in sorted(self.tasks.items()):
@@ -1734,7 +1754,12 @@ class StateStore:
                 ):
                     value = self._run_dict(run)
                 runs.append(value)
-            tasks[key] = self._task_dict(task, task_context, failure_roots) | {"runs": runs}
+            tasks[key] = self._task_dict(
+                task,
+                task_context,
+                failure_roots,
+                readiness_requirements.get(key, ()),
+            ) | {"runs": runs}
         snapshot["source_issues"] = [
             self._issue_dict(issue) for _, issue in sorted(self.source_issues.items())
         ]
@@ -1746,12 +1771,13 @@ class StateStore:
         task: TaskRecord,
         context: dict[str, Any] | None = None,
         failure_roots: dict[str, tuple[str, ...]] | None = None,
+        readiness_requirements: tuple[Requirement, ...] | None = None,
     ) -> dict[str, Any]:
         dashboard_run = next(
             (run for run in reversed(task.runs) if not (run.auxiliary and run.role == "shepherd")),
             None,
         )
-        return self._task_dict(task, context, failure_roots) | {
+        return self._task_dict(task, context, failure_roots, readiness_requirements) | {
             "run_count": len(task.runs),
             "latest_run_id": dashboard_run.id if dashboard_run is not None else None,
         }
@@ -2857,6 +2883,7 @@ class StateStore:
             "blocker_ids": list(dict.fromkeys(blocker_ids)),
             "source_digests": owned_source_digests,
         }
+        self._dirty_projection_work_units.update(feedback)
         self._mark_dirty(global_state=False, sections={"proof_review_requests"})
         await self._persist()
         return request_id, True
@@ -2887,6 +2914,7 @@ class StateStore:
             if not feedback:
                 self.proof_review_requests.pop(request_id, None)
         if changed:
+            self._dirty_projection_work_units.update(affected)
             self._mark_dirty(global_state=False, sections={"proof_review_requests"})
             await self._persist()
         return affected
@@ -2914,6 +2942,7 @@ class StateStore:
             if not feedback:
                 self.proof_review_requests.pop(request_id, None)
         if changed:
+            self._dirty_projection_work_units.add(chapter_id)
             self._mark_dirty(global_state=False, sections={"proof_review_requests"})
             await self._persist()
 
@@ -3703,9 +3732,25 @@ class StateStore:
     ) -> Requirement:
         return Requirement(kind, owner_task_key=self.key(chapter_id, stage), detail=detail)
 
-    def task_requirements(self, task: TaskRecord) -> tuple[Requirement, ...]:
-        """Return current requirements without mutating descendant task rows."""
+    def _blocking_proof_review_requests(self) -> dict[str, tuple[str, ...]]:
+        """Index semantic proof-review requests without auxiliary warning cleanup."""
 
+        by_chapter: dict[str, list[str]] = {}
+        for request_id, request in sorted(self.proof_review_requests.items()):
+            if not isinstance(request, dict) or request.get("kind") == BUILD_WARNING_REVIEW_KIND:
+                continue
+            feedback = request.get("feedback")
+            if not isinstance(feedback, dict):
+                continue
+            for chapter_id in feedback:
+                by_chapter.setdefault(chapter_id, []).append(request_id)
+        return {chapter_id: tuple(request_ids) for chapter_id, request_ids in by_chapter.items()}
+
+    def _task_requirements(
+        self,
+        task: TaskRecord,
+        proof_review_requests: dict[str, tuple[str, ...]],
+    ) -> tuple[Requirement, ...]:
         requirements = list(task.waiting_on)
         stage = Stage(task.stage)
         if stage is Stage.FORMALIZE:
@@ -3770,10 +3815,7 @@ class StateStore:
                     request_id=request_id,
                     detail="waiting for proof-review request",
                 )
-                for request_id, request in sorted(self.proof_review_requests.items())
-                if isinstance(request, dict)
-                and isinstance(request.get("feedback"), dict)
-                and task.chapter_id in request["feedback"]
+                for request_id in proof_review_requests.get(task.chapter_id, ())
             )
         return tuple(
             dict.fromkeys(
@@ -3782,6 +3824,24 @@ class StateStore:
                 if not self.requirement_satisfied(requirement)
             )
         )
+
+    def task_requirements(self, task: TaskRecord) -> tuple[Requirement, ...]:
+        """Return current requirements without mutating descendant task rows."""
+
+        return self._task_requirements(task, self._blocking_proof_review_requests())
+
+    def _readiness_requirements_subset(
+        self,
+        task_keys: Iterable[str],
+    ) -> dict[str, tuple[Requirement, ...]]:
+        """Project current readiness blockers with one request-ledger index pass."""
+
+        proof_review_requests = self._blocking_proof_review_requests()
+        return {
+            key: self._task_requirements(task, proof_review_requests)
+            for key in dict.fromkeys(task_keys)
+            if (task := self.tasks.get(key)) is not None
+        }
 
     def requirement_satisfied(self, requirement: Requirement) -> bool:
         if requirement.request_id is not None:
