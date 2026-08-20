@@ -10,9 +10,10 @@ misunderstands an import boundary, or reports completion without fixing the diag
 the retry. PAF should be able to spend a small, explicit budget on a stronger model to understand
 and schedule those exceptional cases without paying strong-model prices for every edit.
 
-The implemented design is a **Shepherd repair sweep** with two model tiers. Every 20 minutes, or when
-the configured failure threshold is reached, a recovery controller identifies locally repairable
-failures. One read-only strong-model Shepherd receives the failure dossier and emits a small,
+The implemented design is a **Shepherd repair sweep** with two model tiers. At most once every two
+hours by default, a recovery controller identifies locally repairable failures. Once that cooldown
+has elapsed, either the interval or the configured failure threshold can trigger a sweep. One
+read-only strong-model Shepherd receives the failure dossier and emits a small,
 structured DAG of repair work units. Ordinary Luna/max workers execute those units in their
 individual scopes. PAF accepts a repair only when its own checks show that the candidate validates.
 
@@ -280,9 +281,9 @@ The remaining cases are eligible only when:
 - the case, repair-unit, task, lineage, sweep, and optional cost budgets all permit more work;
 - the isolation backend can provide the required safety guarantees.
 
-The first version batches eligible roots every configured interval or when enough new fingerprints
-reach the failure threshold. The Shepherd is invoked only if at least one eligible fingerprint is
-available.
+The first version batches eligible roots every configured interval or, after the same cooldown has
+elapsed, when enough new fingerprints reach the failure threshold. The Shepherd is invoked only if
+at least one eligible fingerprint is available.
 A bounded replan may run after a worker supplies genuinely new evidence or a valid plan becomes stale;
 an ordinary worker failure alone does not recursively create a new case.
 
@@ -570,7 +571,7 @@ model = "gpt-5.6-sol"
 reasoning_effort = "medium"
 worker_model = "gpt-5.6-luna"
 worker_reasoning_effort = "max"
-interval_seconds = 1200
+interval_seconds = 7200
 failure_threshold = 10
 maximum_failures_per_sweep = 50
 maximum_work_units_per_sweep = 32

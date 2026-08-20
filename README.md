@@ -721,7 +721,8 @@ lean_mcp_tool_timeout_seconds = 300
 ```
 
 Failure repair is enabled by default. The Shepherd uses a strong read-only model to plan bounded,
-independent repair work units every 20 minutes or whenever 10 new terminal failures accumulate.
+independent repair work units at most once every two hours. A sweep runs when the interval expires
+or, once that cooldown has elapsed, whenever 10 new terminal failures have accumulated.
 Scoped repair workers have their own model and reasoning settings, defaulting to Sol/medium.
 Repairs receive an effort-based priority boost and compete directly for the ordinary global agent
 capacity:
@@ -733,7 +734,7 @@ model = "gpt-5.6-sol"
 reasoning_effort = "medium"
 worker_model = "gpt-5.6-sol"
 worker_reasoning_effort = "medium"
-interval_seconds = 1200
+interval_seconds = 7200
 failure_threshold = 10
 maximum_failures_per_sweep = 50
 maximum_work_units_per_sweep = 32

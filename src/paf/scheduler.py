@@ -7015,6 +7015,8 @@ class Orchestrator:
         trigger: str,
         cases: Iterable[RepairCaseRecord],
     ) -> bool:
+        if not self._shepherd_cooldown_elapsed():
+            return False
         candidate_cases = list(cases)[: self.config.shepherd.maximum_failures_per_sweep]
         await self._reconcile_stale_formalizations(case.task_key for case in candidate_cases)
         repairable_keys = {key for key, _task in self.state.shepherd_repairable_tasks()}
@@ -7026,11 +7028,16 @@ class Orchestrator:
             self._consecutive_no_progress_sweeps = 0
             self._last_shepherd_case_fingerprints = fingerprints
         async with self._shepherd_lock:
+            if not self._shepherd_cooldown_elapsed():
+                return False
             if (
                 self._consecutive_no_progress_sweeps
                 >= self.config.shepherd.maximum_consecutive_no_progress_sweeps
             ):
                 return False
+            self.state.shepherd.next_run_at = (
+                datetime.now(UTC) + timedelta(seconds=self.config.shepherd.interval_seconds)
+            ).isoformat()
             sweep = await self.state.start_repair_sweep(
                 trigger=trigger,
                 task_keys=[case.task_key for case in selected_cases],
@@ -7090,6 +7097,28 @@ class Orchestrator:
                 if planning_slot:
                     self.agent_slots.release()
 
+    def _shepherd_cooldown_elapsed(self) -> bool:
+        next_run_at = self.state.shepherd.next_run_at
+        if next_run_at is None:
+            return True
+        try:
+            due = datetime.fromisoformat(next_run_at)
+        except ValueError:
+            return True
+        if due.tzinfo is None:
+            due = due.replace(tzinfo=UTC)
+        return datetime.now(UTC) >= due
+
+    def _shepherd_due_at(self, fallback: datetime) -> datetime:
+        next_run_at = self.state.shepherd.next_run_at
+        if next_run_at is None:
+            return fallback
+        try:
+            due = datetime.fromisoformat(next_run_at)
+        except ValueError:
+            return fallback
+        return due.replace(tzinfo=UTC) if due.tzinfo is None else due
+
     async def _trigger_threshold_shepherd(self) -> bool:
         if not self.config.shepherd.enabled:
             return False
@@ -7101,7 +7130,7 @@ class Orchestrator:
     async def _shepherd_loop(self, restart_cases: Iterable[RepairCaseRecord] = ()) -> None:
         changes = self.state.change_bus.subscribe()
         interval = self.config.shepherd.interval_seconds
-        due = datetime.now(UTC) + timedelta(seconds=interval)
+        due = self._shepherd_due_at(datetime.now(UTC) + timedelta(seconds=interval))
         try:
             restart_cases = tuple(restart_cases)
             if restart_cases:
@@ -7123,9 +7152,12 @@ class Orchestrator:
                 elif timed_out:
                     if cases:
                         await self._run_shepherd_sweep(trigger="interval", cases=cases)
-                    due = datetime.now(UTC) + timedelta(seconds=interval)
-                    self.state.shepherd.next_run_at = due.isoformat()
+                    if self._shepherd_cooldown_elapsed():
+                        self.state.shepherd.next_run_at = (
+                            datetime.now(UTC) + timedelta(seconds=interval)
+                        ).isoformat()
                     await self.state.save("state")
+                due = self._shepherd_due_at(datetime.now(UTC) + timedelta(seconds=interval))
         finally:
             self.state.change_bus.unsubscribe(changes)
 

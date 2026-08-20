@@ -158,6 +158,12 @@ maximum_sweeps_per_invocation = 2
         load_config(path)
 
 
+def test_shepherd_defaults_to_a_two_hour_interval(tmp_path: Path) -> None:
+    shepherd = load_config(write_project(tmp_path)).shepherd
+
+    assert shepherd.interval_seconds == 7200
+
+
 def test_shepherd_can_be_disabled_explicitly(tmp_path: Path) -> None:
     path = write_project(tmp_path)
     path.write_text(

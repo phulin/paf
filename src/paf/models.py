@@ -110,7 +110,7 @@ class ShepherdSettings:
     reasoning_effort: str = "medium"
     worker_model: str = "gpt-5.6-sol"
     worker_reasoning_effort: str = "medium"
-    interval_seconds: float = 1200.0
+    interval_seconds: float = 7200.0
     failure_threshold: int = 10
     maximum_failures_per_sweep: int = 50
     maximum_work_units_per_sweep: int = 32

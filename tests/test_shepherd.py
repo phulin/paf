@@ -275,6 +275,24 @@ async def test_shepherd_loop_replans_discarded_cases_on_restart(
 
 
 @pytest.mark.asyncio
+async def test_shepherd_cooldown_blocks_early_automatic_sweep(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    state = StateStore(config)
+    await state.load_or_create()
+    chapter = config.work_units[0]
+    await state.set_task(chapter.id, Stage.REVIEW, TaskStatus.FAILED, "root review error")
+    case = state.ensure_repair_case(state.key(chapter.id, Stage.REVIEW))
+    state.shepherd.next_run_at = "9999-01-01T00:00:00+00:00"
+    orchestrator = Orchestrator(config, state)
+
+    ran = await orchestrator._run_shepherd_sweep(trigger="failure-threshold", cases=[case])
+
+    assert ran is False
+    assert state.repair_sweeps == {}
+    await state.close()
+
+
+@pytest.mark.asyncio
 async def test_repair_worker_returns_integrated_edit_to_normal_stage_scheduler(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

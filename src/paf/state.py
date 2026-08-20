@@ -317,7 +317,7 @@ class ShepherdRecord:
     status: str = "idle"
     model: str = ""
     worker_model: str = ""
-    interval_seconds: float = 1200.0
+    interval_seconds: float = 7200.0
     failure_threshold: int = 10
     current_sweep_id: str = ""
     current_run_id: str = ""
