@@ -6613,7 +6613,7 @@ async def test_review_completion_cannot_resurrect_an_invalidated_generation(
 
 
 @pytest.mark.asyncio
-async def test_background_build_does_not_change_proof_stage(
+async def test_background_build_recertifies_successful_stale_proof(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
@@ -6638,7 +6638,37 @@ async def test_background_build_does_not_change_proof_stage(
     proof = state.task(chapter.id, Stage.PROVE)
     assert proof.status == TaskStatus.SUCCEEDED
     assert proof.detail == "proved"
-    assert proof.source_digest == "proved-source"
+    assert proof.source_digest == scope_digest(config.settings.repo, chapter)
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_background_build_reopens_successful_proof_only_after_build_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = config.chapters[0]
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await orchestrator.prepare()
+    await state.set_task(
+        chapter.id,
+        Stage.PROVE,
+        TaskStatus.SUCCEEDED,
+        "proved",
+        source_digest="proved-source",
+    )
+
+    async def refresh(_chapter: Chapter) -> ValidationResult:
+        return ValidationResult(False, 1, "build failed")
+
+    monkeypatch.setattr(orchestrator, "_refresh_stale_proof_build", refresh)
+
+    assert not await orchestrator._rebuild_dirty_chapter(chapter)
+    proof = state.task(chapter.id, Stage.PROVE)
+    assert proof.status == TaskStatus.PENDING
+    assert proof.detail == "stale proof no longer builds"
+    assert proof.source_digest is None
     await orchestrator.shutdown()
 
 
@@ -7149,6 +7179,48 @@ async def test_proof_task_failure_does_not_fail_or_block_the_review_tree(
     assert await orchestrator._review_tree(prove=True)
     assert state.task(chapter.id, Stage.PROVE).status == TaskStatus.FAILED
     assert all(task.status != TaskStatus.BLOCKED for task in state.tasks.values())
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_pending_proof_reopened_during_review_tree_is_scheduled_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = config.chapters[0]
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await orchestrator.prepare()
+    await mark_formalized(orchestrator)
+    await state.set_task(chapter.id, Stage.REVIEW, TaskStatus.SUCCEEDED, "reviewed")
+    attempts = 0
+
+    async def prove(attempted: Chapter, *, defer_review: bool = False) -> StageOutcome:
+        nonlocal attempts
+        assert attempted.id == chapter.id
+        assert defer_review
+        attempts += 1
+        if attempts == 1:
+            await state.set_task(
+                chapter.id,
+                Stage.PROVE,
+                TaskStatus.FAILED,
+                "proof chunks exhausted retries",
+            )
+            await state.set_task(
+                chapter.id,
+                Stage.PROVE,
+                TaskStatus.PENDING,
+                "manually set to pending",
+            )
+            return StageOutcome(ExecutionDisposition.FAILED)
+        return StageOutcome(ExecutionDisposition.SUCCEEDED)
+
+    monkeypatch.setattr(orchestrator, "_prove", prove)
+
+    assert await orchestrator._review_tree(prove=True)
+    assert attempts == 2
+    assert state.task(chapter.id, Stage.PROVE).status == TaskStatus.SUCCEEDED
     await orchestrator.shutdown()
 
 

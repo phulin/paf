@@ -5329,14 +5329,16 @@ class Orchestrator:
             initial_graph,
             persisted_clean if isinstance(persisted_clean, dict) else {},
         )
-        proof_results = {
-            chapter_id: True
+        stale_proof_builds = {
+            chapter_id
             for chapter_id in reviewed
             if (
                 self.state.task(chapter_id, Stage.PROVE).status == TaskStatus.SUCCEEDED
-                and isinstance(clean.get(chapter_id), dict)
-                and self.state.task(chapter_id, Stage.PROVE).source_digest
-                == clean[chapter_id].get("source_digest")
+                and (
+                    not isinstance(clean.get(chapter_id), dict)
+                    or self.state.task(chapter_id, Stage.PROVE).source_digest
+                    != clean[chapter_id].get("source_digest")
+                )
             )
         }
         proof_reviews = {chapter_id: 0 for chapter_id in by_id}
@@ -5411,8 +5413,6 @@ class Orchestrator:
                         for task in cancelled_proofs:
                             task.cancel()
                         await asyncio.gather(*cancelled_proofs, return_exceptions=True)
-                        for chapter_id in failed_formalizations:
-                            proof_results.pop(chapter_id, None)
                         await self._invalidate_reviews(
                             failed_formalizations,
                             detail="review blocked by failed formalization",
@@ -5428,17 +5428,14 @@ class Orchestrator:
                 self._proof_rechecks.clear()
                 failed_rebuilds.difference_update(new_rechecks)
                 dirty_value = self.state.formalize_graph.get("dirty", ())
-                dirty_builds = set(dirty_value) if isinstance(dirty_value, list) else set()
-                for chapter_id in dirty_builds:
-                    proof_results.pop(chapter_id, None)
+                dirty_builds = (
+                    set(dirty_value) if isinstance(dirty_value, list) else set()
+                ) | stale_proof_builds
                 reviewed.update(
                     chapter_id
                     for chapter_id in by_id
                     if self.state.task(chapter_id, Stage.REVIEW).status == TaskStatus.SUCCEEDED
                 )
-                for chapter_id in tuple(proof_results):
-                    if chapter_id not in reviewed:
-                        proof_results.pop(chapter_id, None)
                 # Findings reopen only their direct owners. Descendant agents
                 # that were already released against the previous clean build
                 # remain pinned to that snapshot and are allowed to drain.
@@ -5587,7 +5584,8 @@ class Orchestrator:
                     for chapter_id in graph.order:
                         if (
                             chapter_id in reviewed
-                            and chapter_id not in proof_results
+                            and self.state.task(chapter_id, Stage.PROVE).status
+                            not in {TaskStatus.SUCCEEDED, TaskStatus.FAILED}
                             and chapter_id not in proof_tasks
                             and chapter_id not in review_tasks
                             and chapter_id not in rebuild_tasks
@@ -5620,7 +5618,11 @@ class Orchestrator:
                             )
                         review_blocked.update(unresolved)
                         break
-                    if not prove or all(chapter_id in proof_results for chapter_id in reviewed):
+                    if not prove or all(
+                        self.state.task(chapter_id, Stage.PROVE).status
+                        in {TaskStatus.SUCCEEDED, TaskStatus.FAILED}
+                        for chapter_id in reviewed
+                    ):
                         break
                     raise RuntimeError(
                         "review scheduler has unfinished proofs but no runnable tasks"
@@ -5661,7 +5663,6 @@ class Orchestrator:
                                 TaskStatus.FAILED,
                                 "proof-review correspondence exhausted without a usable response",
                             )
-                            proof_results[chapter_id] = False
                         continue
                     if outcome.waiting:
                         rounds_used[chapter_id] = 0
@@ -5706,6 +5707,7 @@ class Orchestrator:
                 ]
                 for chapter_id in completed_rebuilds:
                     succeeded = rebuild_tasks.pop(chapter_id).result()
+                    stale_proof_builds.discard(chapter_id)
                     if not succeeded:
                         failed_rebuilds.add(chapter_id)
 
@@ -5717,23 +5719,31 @@ class Orchestrator:
                         continue
                     proof_outcome = proof_tasks.pop(chapter_id).result()
                     if proof_outcome.succeeded:
-                        proof_results[chapter_id] = True
+                        proof_task = self.state.task(chapter_id, Stage.PROVE)
+                        if proof_task.status != TaskStatus.SUCCEEDED:
+                            source_digest = await asyncio.to_thread(
+                                scope_digest, self.config.settings.repo, by_id[chapter_id]
+                            )
+                            await self.state.set_task(
+                                chapter_id,
+                                Stage.PROVE,
+                                TaskStatus.SUCCEEDED,
+                                "proof completed",
+                                source_digest=source_digest,
+                            )
                         continue
                     if proof_outcome.waiting:
-                        proof_results.pop(chapter_id, None)
                         continue
 
                     proof_task = self.state.task(chapter_id, Stage.PROVE)
                     primary_runs = [run for run in proof_task.runs if not run.auxiliary]
                     report = primary_runs[-1].report if primary_runs else None
                     if not isinstance(report, dict) or not report.get("failed_attempts"):
-                        proof_results[chapter_id] = False
                         continue
                     if (
                         proof_reviews[chapter_id]
                         >= self.config.stages[Stage.PROVE].unchanged_retry_limit
                     ):
-                        proof_results[chapter_id] = False
                         await self.state.set_task(
                             chapter_id,
                             Stage.PROVE,
@@ -5826,7 +5836,28 @@ class Orchestrator:
     async def _rebuild_dirty_chapter(self, chapter: WorkUnitLike) -> bool:
         """Refresh one invalidated exact build while its chapter has no agent."""
 
+        proof = self.state.task(chapter.id, Stage.PROVE)
+        was_proved = proof.status == TaskStatus.SUCCEEDED
         validation = await self._refresh_stale_proof_build(chapter)
+        if was_proved:
+            if validation.succeeded:
+                source_digest = await asyncio.to_thread(
+                    scope_digest, self.config.settings.repo, chapter
+                )
+                await self.state.set_task(
+                    chapter.id,
+                    Stage.PROVE,
+                    TaskStatus.SUCCEEDED,
+                    proof.detail,
+                    source_digest=source_digest,
+                )
+            else:
+                await self.state.set_task(
+                    chapter.id,
+                    Stage.PROVE,
+                    TaskStatus.PENDING,
+                    "stale proof no longer builds",
+                )
         return validation.succeeded
 
     async def _prove(self, chapter: WorkUnitLike, *, defer_review: bool = False) -> StageOutcome:
