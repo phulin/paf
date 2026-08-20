@@ -24,16 +24,28 @@ exists, do not repeat searches or failed approaches.
 1. Inspect the assigned declaration, local context, source passage, and directly relevant earlier
    APIs. Confirm signatures before use.
 2. Prefer an existing result, focused rewriting, a standard constructor/equivalence, then a
-   lower-level construction. Use focused private helpers when useful.
-3. Preserve and validate independent progress. Remove speculative edits, unused helpers, and
+   lower-level construction. Before writing the main proof, decompose its mathematical argument into
+   a short sequence of natural intermediate lemmas. Search for existing declarations that express
+   each step; when none exists, introduce a focused helper lemma with a meaningful mathematical
+   statement.
+3. Keep the final theorem proof small and structural: it should primarily instantiate, rewrite with,
+   and compose those lemmas. Avoid giant tactic blocks, deeply nested reasoning, or monolithic term
+   proofs. If a proof becomes difficult to read or debug, extract its substantive intermediate steps
+   into named lemmas.
+4. Prefer reusable source-level lemmas when an intermediate result captures genuine mathematics used
+   elsewhere; otherwise use a focused private helper near the theorem. Do not extract arbitrary
+   one-line tactic fragments or create helpers that merely restate the goal.
+5. Preserve and validate independent progress. Remove speculative edits, unused helpers, and
    abandoned imports.
-4. After editing, prepare affected dependencies once and request fresh diagnostics in import order.
+6. After editing, prepare affected dependencies once and request fresh diagnostics in import order.
 
 ## Constraints
 
 - Do not change a public declaration's interface. Report a defective statement for focused review.
 - Do not add placeholders, axioms, unsafe declarations, circular helpers, warning suppression,
   heartbeat workarounds, umbrella imports, or `aesop`.
+- Treat proof decomposition as part of correctness and maintainability. A proof that typechecks but
+  remains an unnecessarily large monolith should be refactored into natural lemmas before completion.
 - Keep imports focused and chronological. Leave holes outside the assignment unchanged.
 - Request an earlier-chapter result only after checking two concrete alternatives.
 
