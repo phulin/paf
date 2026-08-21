@@ -2528,13 +2528,39 @@ class StateStore:
         """Return compact run tabs and recent activity for one chapter detail view."""
 
         runs = sorted(self.chapter_runs(chapter_id), key=lambda run: (run.started_at, run.id))
+        return self._dashboard_runs(chapter_id, runs, selected_run_id=selected_run_id)
+
+    def dashboard_package_runs(
+        self, package_id: str, *, selected_run_id: str | None = None
+    ) -> dict[str, Any]:
+        """Return Steward and worker run history for one capability package."""
+
+        runs = sorted(
+            (
+                run
+                for run in self._runs_by_id.values()
+                if package_id in run.request_ids
+                and run.role in {"package_steward", "package_worker"}
+            ),
+            key=lambda run: (run.started_at, run.id),
+        )
+        return self._dashboard_runs(package_id, runs, selected_run_id=selected_run_id)
+
+    def _dashboard_runs(
+        self,
+        owner_id: str,
+        runs: Iterable[RunRecord],
+        *,
+        selected_run_id: str | None,
+    ) -> dict[str, Any]:
+        selected_runs = tuple(runs)
         selected = next(
-            (run for run in runs if run.id == selected_run_id),
-            runs[-1] if runs else None,
+            (run for run in selected_runs if run.id == selected_run_id),
+            selected_runs[-1] if selected_runs else None,
         )
         activity = self.activities.get(selected.id) if selected is not None else None
         return {
-            "work_unit_id": chapter_id,
+            "work_unit_id": owner_id,
             "runs": [
                 {
                     "id": run.id,
@@ -2545,7 +2571,7 @@ class StateStore:
                     "started_at": run.started_at,
                     "finished_at": run.finished_at,
                 }
-                for run in runs
+                for run in selected_runs
             ],
             "selected_run_id": selected.id if selected is not None else None,
             "activity": activity.as_dict() if activity is not None else None,

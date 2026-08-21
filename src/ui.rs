@@ -280,23 +280,44 @@ fn draw_package_detail(frame: &mut Frame<'_>, model: &mut DashboardModel) {
             .iter()
             .filter(|item| item.package_id == package_id)
             .count();
-        let handoff = match package.status.as_str() {
-            "waiting_dependency" => format!("blocked on {dependency_count} package dependencies"),
-            "waiting_reservation" => "waiting for an overlapping path reservation".into(),
-            "validating" => "checking the complete multi-file candidate".into(),
-            "integrating" => "publishing validated work".into(),
-            _ => model
-                .state
-                .steward_leases
-                .get(&package_id)
-                .map(|lease| format!("{} owns the package overlay", lease.agent_id))
-                .or_else(|| {
-                    package
-                        .disposition
-                        .as_ref()
-                        .map(|value| format!("closed as {value}"))
-                })
-                .unwrap_or_else(|| "ready for a Steward to claim".into()),
+        let waiting_tasks = model
+            .state
+            .tasks
+            .values()
+            .filter(|task| task.queued && task.detail.contains(&package_id))
+            .collect::<Vec<_>>();
+        let lease = model.state.steward_leases.get(&package_id);
+        let has_reservations = model
+            .state
+            .path_reservations
+            .values()
+            .any(|item| item.package_id == package_id);
+        let handoff = if let Some(lease) = lease {
+            match package.status.as_str() {
+                "validating" => format!("{} is validating canonical source", lease.agent_id),
+                "integrating" => format!("{} is publishing validated work", lease.agent_id),
+                _ => format!("{} is running a Steward turn", lease.agent_id),
+            }
+        } else {
+            match package.status.as_str() {
+                "waiting_dependency" => {
+                    format!("blocked on {dependency_count} package dependencies")
+                }
+                "waiting_reservation" => "waiting for an overlapping path reservation".into(),
+                "complete"
+                | "decomposed"
+                | "external"
+                | "statement_revision_required"
+                | "parked"
+                | "superseded" => package.disposition.as_ref().map_or_else(
+                    || format!("closed as {}", package.status),
+                    |value| format!("closed as {value}"),
+                ),
+                _ if has_reservations => {
+                    "between Steward turns · scope remains reserved · next turn pending".into()
+                }
+                _ => "awaiting Steward scheduling".into(),
+            }
         };
         lines.push(Line::styled(
             format!(
@@ -312,6 +333,19 @@ fn draw_package_detail(frame: &mut Frame<'_>, model: &mut DashboardModel) {
             )));
         } else {
             lines.push(Line::from("Steward lease: none"));
+        }
+        if !waiting_tasks.is_empty() {
+            lines.push(Line::styled(
+                format!(
+                    "Waiting ordinary tasks: {}",
+                    waiting_tasks
+                        .iter()
+                        .map(|task| format!("{}:{}", task.work_unit_id, task.stage))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                Style::default().fg(YELLOW),
+            ));
         }
         lines.push(Line::from(""));
         lines.push(Line::styled("Consumers", Style::default().fg(CYAN)));
@@ -453,7 +487,7 @@ fn draw_package_detail(frame: &mut Frame<'_>, model: &mut DashboardModel) {
         }
         lines.push(Line::from(""));
         lines.push(Line::styled(
-            "↑↓ select package  k/Esc/q back",
+            "↑↓ select package  Enter runs/timeline  k/Esc/q back",
             Style::default().fg(MUTED),
         ));
     }
@@ -534,7 +568,7 @@ fn summary(model: &DashboardModel) -> Paragraph<'static> {
             )),
         ]),
         Line::from(format!(
-            "Agents {}/{} · {} · queued {}    {}    Packages {} · active {} · waiting {}",
+            "Agents {}/{} · {} · waiting start {}    {}    Packages {} · active {} · waiting {}",
             state.agents.active,
             state.agents.maximum,
             agent_detail,
@@ -845,10 +879,15 @@ fn draw_status(frame: &mut Frame<'_>, model: &DashboardModel, area: Rect) {
 }
 
 fn draw_detail(frame: &mut Frame<'_>, model: &mut DashboardModel) {
-    let Some(row) = model.selected_row() else {
-        frame.render_widget(Paragraph::new("No work unit selected"), frame.area());
+    let row = model.selected_row();
+    let package = model
+        .detail_package_id
+        .as_ref()
+        .and_then(|package_id| model.state.capability_packages.get(package_id));
+    if row.is_none() && package.is_none() {
+        frame.render_widget(Paragraph::new("No run owner selected"), frame.area());
         return;
-    };
+    }
     let activity = model.selected_activity();
     let update_height = if activity.is_some_and(|value| !value.latest_summary.is_empty()) {
         (frame.area().height / 5).clamp(4, 10)
@@ -867,9 +906,15 @@ fn draw_detail(frame: &mut Frame<'_>, model: &mut DashboardModel) {
             Constraint::Length(1),
         ])
         .split(frame.area());
-    let active_task = latest_task(&row.tasks);
-    frame.render_widget(
-        Paragraph::new(format!(
+    let heading = if let Some(package) = package {
+        format!(
+            "Package · {} · {} · revision {}",
+            package.title, package.status, package.revision
+        )
+    } else {
+        let row = row.as_ref().expect("a non-package detail has a work unit");
+        let active_task = latest_task(&row.tasks);
+        format!(
             "{} · {:02} {} · {}",
             row.unit.document_id,
             row.unit.ordinal,
@@ -877,13 +922,20 @@ fn draw_detail(frame: &mut Frame<'_>, model: &mut DashboardModel) {
             active_task
                 .map(|task| format!("{} {}", title(&task.stage), task_status_label(task)))
                 .unwrap_or_else(|| "no run".into())
-        ))
-        .style(Style::default().fg(CYAN).add_modifier(Modifier::BOLD))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Agent detail "),
-        ),
+        )
+    };
+    frame.render_widget(
+        Paragraph::new(heading)
+            .style(Style::default().fg(CYAN).add_modifier(Modifier::BOLD))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(if package.is_some() {
+                        " Package agent detail "
+                    } else {
+                        " Agent detail "
+                    }),
+            ),
         layout[0],
     );
     let (run_titles, selected_run) = if model.detail_runs.is_empty() {
@@ -892,7 +944,14 @@ fn draw_detail(frame: &mut Frame<'_>, model: &mut DashboardModel) {
         let labels = model
             .detail_runs
             .iter()
-            .map(|run| format!("{} round {}", title(&run.stage), run.round))
+            .map(|run| {
+                format!(
+                    "{} · round {} · {}",
+                    run_role_title(&run.role, &run.stage),
+                    run.round,
+                    short_revision(&run.id)
+                )
+            })
             .collect::<Vec<_>>();
         visible_run_tabs(&labels, model.selected_run, layout[1].width as usize)
     };
@@ -904,8 +963,16 @@ fn draw_detail(frame: &mut Frame<'_>, model: &mut DashboardModel) {
             .block(Block::default().borders(Borders::BOTTOM).title(" Runs ")),
         layout[1],
     );
-    let pending_reason = model.pending_reason(&row);
-    let has_running_task = row.tasks.values().any(|task| task_is_running(task));
+    let pending_reason = row.as_ref().and_then(|row| model.pending_reason(row));
+    let has_running_task = if package.is_some() {
+        model
+            .detail_runs
+            .get(model.selected_run)
+            .is_some_and(|run| run.status == "running")
+    } else {
+        row.as_ref()
+            .is_some_and(|row| row.tasks.values().any(|task| task_is_running(task)))
+    };
     let metrics = activity.filter(|_| has_running_task).map_or_else(
         || {
             pending_reason
@@ -1536,7 +1603,7 @@ fn task_mark(task: &Task, building: bool) -> String {
     } else if let Some(letter) = auxiliary_role_letter(&task.active_auxiliary_role) {
         format!("▶ running ({letter})")
     } else if task.queued {
-        "· queued".into()
+        "· waiting start".into()
     } else if task.status == "running" && task.phase == "postprocess" {
         "◇ postprocess".into()
     } else {
@@ -1654,6 +1721,17 @@ fn title(value: &str) -> String {
         .next()
         .map(|first| first.to_uppercase().collect::<String>() + characters.as_str())
         .unwrap_or_default()
+}
+
+fn run_role_title(role: &str, stage: &str) -> String {
+    match role {
+        "package_steward" => "Steward".into(),
+        "package_worker" => "Package worker".into(),
+        "proof_review" => "Proof review".into(),
+        "warning_cleanup" => "Warning cleanup".into(),
+        "" => title(stage),
+        _ => role.replace('_', " "),
+    }
 }
 
 fn activity_kind(kind: &str) -> &str {
@@ -1899,6 +1977,11 @@ mod tests {
                         "package_id": "package-1", "agent_id": "steward-1", "generation": 3,
                         "heartbeat_at": "2026-08-21T00:30:00Z", "expires_at": "2026-08-21T01:00:00Z"
                     }},
+                    "tasks": {"book/chapter-02:prove": {
+                        "work_unit_id": "book/chapter-02", "stage": "prove",
+                        "status": "pending", "queued": true,
+                        "detail": "waiting for path reservation held by package-1"
+                    }},
                     "path_reservations": {}, "package_dependencies": [],
                     "relevant_read_interfaces": [{
                         "package_id": "package-1", "interface_id": "Mathlib.Transport",
@@ -1924,8 +2007,29 @@ mod tests {
         assert!(rendered.contains("Book.bridge"));
         assert!(rendered.contains("steward-1"));
         assert!(rendered.contains("Current handoff"));
+        assert!(rendered.contains("is running a Steward turn"));
         assert!(rendered.contains("prove naturality"));
         assert!(rendered.contains("Mathlib.Transport"));
+        assert!(rendered.contains("Enter runs/timeline"));
+        assert!(rendered.contains("Waiting ordinary tasks: book/chapter-02:prove"));
+
+        model.enter_package_run_detail("package-1".into());
+        model.apply_chapter_runs(crate::model::ChapterRuns {
+            work_unit_id: "package-1".into(),
+            selected_run_id: Some("b572f9ce7115".into()),
+            runs: vec![crate::model::HistoricalRun {
+                id: "b572f9ce7115".into(),
+                role: "package_steward".into(),
+                round: 6,
+                status: "succeeded".into(),
+                ..crate::model::HistoricalRun::default()
+            }],
+            ..crate::model::ChapterRuns::default()
+        });
+        terminal.draw(|frame| draw(frame, &mut model)).unwrap();
+        let run_detail = terminal.backend().to_string();
+        assert!(run_detail.contains("Package agent detail"));
+        assert!(run_detail.contains("Steward · round 6 · b572f9c"));
     }
 
     #[test]

@@ -431,6 +431,7 @@ pub struct DashboardModel {
     pub detail: bool,
     pub package_detail: bool,
     pub package_selected: usize,
+    pub detail_package_id: Option<String>,
     pub detail_tab: DetailTab,
     pub scroll: u16,
     pub detail_max_scroll: u16,
@@ -439,6 +440,7 @@ pub struct DashboardModel {
     pub selected_run: usize,
     pub run_prompts: HashMap<String, String>,
     loading_chapter_runs: Option<(String, Option<String>)>,
+    loading_package_runs: Option<(String, Option<String>)>,
     loading_prompt_runs: HashSet<String>,
     pub full_timeline_runs: HashSet<String>,
     pub loading_timeline_runs: HashSet<String>,
@@ -476,6 +478,7 @@ impl DashboardModel {
             detail: false,
             package_detail: false,
             package_selected: 0,
+            detail_package_id: None,
             detail_tab: detail_tab.map(DetailTab::from_name).unwrap_or_default(),
             scroll: 0,
             detail_max_scroll: 0,
@@ -484,6 +487,7 @@ impl DashboardModel {
             selected_run: 0,
             run_prompts: HashMap::new(),
             loading_chapter_runs: None,
+            loading_package_runs: None,
             loading_prompt_runs: HashSet::new(),
             full_timeline_runs: HashSet::new(),
             loading_timeline_runs: HashSet::new(),
@@ -797,8 +801,10 @@ impl DashboardModel {
     pub fn enter_detail(&mut self) {
         self.detail = true;
         self.package_detail = false;
+        self.detail_package_id = None;
         self.detail_runs.clear();
         self.loading_chapter_runs = None;
+        self.loading_package_runs = None;
         self.selected_run = 0;
         self.scroll = 0;
         self.detail_max_scroll = 0;
@@ -807,8 +813,10 @@ impl DashboardModel {
 
     pub fn leave_detail(&mut self) {
         self.detail = false;
+        self.package_detail = self.detail_package_id.take().is_some();
         self.detail_runs.clear();
         self.loading_chapter_runs = None;
+        self.loading_package_runs = None;
         self.selected_run = 0;
         self.run_prompts.clear();
         self.scroll = 0;
@@ -819,6 +827,8 @@ impl DashboardModel {
     pub fn enter_package_detail(&mut self) {
         self.package_detail = true;
         self.detail = false;
+        self.detail_package_id = None;
+        self.loading_package_runs = None;
         self.package_selected = self
             .package_selected
             .min(self.packages().len().saturating_sub(1));
@@ -829,6 +839,18 @@ impl DashboardModel {
 
     pub fn leave_package_detail(&mut self) {
         self.package_detail = false;
+        self.scroll = 0;
+        self.detail_max_scroll = 0;
+        self.detail_follow_tail = true;
+    }
+
+    pub fn enter_package_run_detail(&mut self, package_id: String) {
+        self.detail = true;
+        self.package_detail = false;
+        self.detail_package_id = Some(package_id);
+        self.detail_runs.clear();
+        self.loading_package_runs = None;
+        self.selected_run = 0;
         self.scroll = 0;
         self.detail_max_scroll = 0;
         self.detail_follow_tail = true;
@@ -906,6 +928,37 @@ impl DashboardModel {
             return false;
         }
         self.loading_chapter_runs = None;
+        self.apply_chapter_runs(details);
+        true
+    }
+
+    pub fn begin_package_runs_load(
+        &mut self,
+        package_id: &str,
+        selected_run_id: Option<&str>,
+    ) -> bool {
+        let request = (package_id.to_owned(), selected_run_id.map(str::to_owned));
+        if self.loading_package_runs.as_ref() == Some(&request) {
+            return false;
+        }
+        self.loading_package_runs = Some(request);
+        true
+    }
+
+    pub fn apply_loaded_package_runs(
+        &mut self,
+        package_id: &str,
+        selected_run_id: Option<&str>,
+        details: ChapterRuns,
+    ) -> bool {
+        let request = (package_id.to_owned(), selected_run_id.map(str::to_owned));
+        if self.loading_package_runs.as_ref() != Some(&request)
+            || !self.detail
+            || self.detail_package_id.as_deref() != Some(package_id)
+        {
+            return false;
+        }
+        self.loading_package_runs = None;
         self.apply_chapter_runs(details);
         true
     }
@@ -1461,6 +1514,36 @@ mod tests {
             },
         ));
         assert_eq!(model.selected_run_id(), Some("run-2"));
+    }
+
+    #[test]
+    fn package_run_detail_loads_history_and_returns_to_dossier() {
+        let mut model = DashboardModel::loading("test".into(), String::new());
+        model.enter_package_detail();
+        model.enter_package_run_detail("package-1".into());
+        assert!(model.begin_package_runs_load("package-1", None));
+        assert!(model.apply_loaded_package_runs(
+            "package-1",
+            None,
+            ChapterRuns {
+                work_unit_id: "package-1".into(),
+                selected_run_id: Some("steward-run".into()),
+                runs: vec![HistoricalRun {
+                    id: "steward-run".into(),
+                    role: "package_steward".into(),
+                    round: 3,
+                    ..HistoricalRun::default()
+                }],
+                ..ChapterRuns::default()
+            },
+        ));
+        assert_eq!(model.selected_run_id(), Some("steward-run"));
+
+        model.leave_detail();
+
+        assert!(!model.detail);
+        assert!(model.package_detail);
+        assert!(model.detail_package_id.is_none());
     }
 
     #[test]

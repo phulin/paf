@@ -420,6 +420,22 @@ class ControlServer:
                         chapter, selected_run_id=run_id
                     ),
                 }
+            elif command == "package_runs":
+                package_id = request.get("package_id")
+                run_id = request.get("run_id")
+                if not isinstance(package_id, str) or not package_id:
+                    raise ValueError("package_runs package_id must be a non-empty string")
+                if run_id is not None and (not isinstance(run_id, str) or not run_id):
+                    raise ValueError("package_runs run_id must be a non-empty string")
+                packages = self.orchestrator.state._database.load_package_state().packages
+                if package_id not in packages:
+                    raise ValueError(f"unknown package: {package_id}")
+                response = {
+                    "protocol_version": PROTOCOL_VERSION,
+                    "package_runs": self.orchestrator.state.dashboard_package_runs(
+                        package_id, selected_run_id=run_id
+                    ),
+                }
             elif command == "run_prompt":
                 run_id = request.get("run_id")
                 if not isinstance(run_id, str) or not run_id:

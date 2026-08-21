@@ -27,6 +27,11 @@ enum RuntimeEvent {
         selected_run_id: Option<String>,
         result: Box<Result<ChapterRuns, String>>,
     },
+    PackageRuns {
+        package_id: String,
+        selected_run_id: Option<String>,
+        result: Box<Result<ChapterRuns, String>>,
+    },
     Prompt {
         run_id: String,
         result: Result<String, String>,
@@ -151,7 +156,11 @@ pub fn run(
                 let complete = event.event == "complete";
                 model.apply(event)?;
                 if model.detail && model.detail_runs.is_empty() {
-                    request_chapter_runs(&mut model, socket_path, None, sender.clone());
+                    if model.detail_package_id.is_some() {
+                        request_package_runs(&mut model, socket_path, None, sender.clone());
+                    } else {
+                        request_chapter_runs(&mut model, socket_path, None, sender.clone());
+                    }
                 }
                 dirty = true;
                 if complete {
@@ -194,6 +203,19 @@ pub fn run(
             }) => {
                 let details = result.map_err(anyhow::Error::msg)?;
                 if model.apply_loaded_chapter_runs(&chapter, selected_run_id.as_deref(), details) {
+                    request_prompt_if_needed(&mut model, socket_path, sender.clone());
+                    request_timeline_if_needed(&mut model, socket_path, sender.clone());
+                }
+                dirty = true;
+            }
+            Ok(RuntimeEvent::PackageRuns {
+                package_id,
+                selected_run_id,
+                result,
+            }) => {
+                let details = result.map_err(anyhow::Error::msg)?;
+                if model.apply_loaded_package_runs(&package_id, selected_run_id.as_deref(), details)
+                {
                     request_prompt_if_needed(&mut model, socket_path, sender.clone());
                     request_timeline_if_needed(&mut model, socket_path, sender.clone());
                 }
@@ -331,7 +353,11 @@ fn handle_terminal_event_with_sender(
             .get(model.selected_run)
             .map(|run| run.id.clone());
         if selected_run != previous_run {
-            request_chapter_runs(model, socket_path, selected_run.as_deref(), sender.clone());
+            if model.detail_package_id.is_some() {
+                request_package_runs(model, socket_path, selected_run.as_deref(), sender.clone());
+            } else {
+                request_chapter_runs(model, socket_path, selected_run.as_deref(), sender.clone());
+            }
         }
         if model.detail_tab != previous_tab || selected_run != previous_run {
             request_prompt_if_needed(model, socket_path, sender);
@@ -339,6 +365,13 @@ fn handle_terminal_event_with_sender(
         return Ok(dirty);
     }
     if model.package_detail {
+        if key.code == KeyCode::Enter
+            && let Some(package_id) = model.selected_package().map(|value| value.id.clone())
+        {
+            model.enter_package_run_detail(package_id);
+            request_package_runs(model, socket_path, None, sender);
+            return Ok(true);
+        }
         return Ok(handle_package_key(key, model));
     }
     match key.code {
@@ -602,6 +635,47 @@ fn request_chapter_runs(
             .map_err(|error| error.to_string());
         let _ = sender.send(RuntimeEvent::ChapterRuns {
             chapter,
+            selected_run_id,
+            result: Box::new(result),
+        });
+    });
+}
+
+fn request_package_runs(
+    model: &mut DashboardModel,
+    socket_path: &str,
+    selected_run_id: Option<&str>,
+    sender: Sender<RuntimeEvent>,
+) {
+    let Some(package_id) = model.detail_package_id.clone() else {
+        return;
+    };
+    if !model.begin_package_runs_load(&package_id, selected_run_id) {
+        return;
+    }
+    let selected_run_id = selected_run_id.map(str::to_owned);
+    let mut request = json!({"command": "package_runs", "package_id": package_id});
+    if let Some(run_id) = &selected_run_id {
+        request["run_id"] = Value::String(run_id.clone());
+    }
+    let socket_path = socket_path.to_owned();
+    thread::spawn(move || {
+        let result = send_control_request(&socket_path, &request)
+            .and_then(|response| {
+                if let Some(error) = response.get("error") {
+                    bail!("orchestrator rejected package history request: {error}")
+                }
+                serde_json::from_value(
+                    response
+                        .get("package_runs")
+                        .cloned()
+                        .context("package history response omitted package_runs")?,
+                )
+                .context("invalid package history response")
+            })
+            .map_err(|error| error.to_string());
+        let _ = sender.send(RuntimeEvent::PackageRuns {
+            package_id,
             selected_run_id,
             result: Box::new(result),
         });

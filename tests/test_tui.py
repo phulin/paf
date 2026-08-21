@@ -328,6 +328,46 @@ async def test_chapter_run_projection_lists_history_and_selected_recent_activity
     assert len(full_timeline["recent"]) == 150
 
 
+async def test_package_run_projection_lists_only_its_steward_and_workers(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    state = StateStore(config)
+    await state.load_or_create()
+    chapter = config.chapters[0]
+    steward = await state.start_auxiliary_run(
+        chapter.id,
+        Stage.PROVE,
+        role="package_steward",
+        request_ids=("package-a",),
+        model="test-model",
+    )
+    worker = await state.start_auxiliary_run(
+        chapter.id,
+        Stage.PROVE,
+        role="package_worker",
+        request_ids=("package-a", "S1"),
+        model="test-model",
+    )
+    await state.start_auxiliary_run(
+        chapter.id,
+        Stage.PROVE,
+        role="package_steward",
+        request_ids=("package-b",),
+        model="test-model",
+    )
+    activity = state.activities.start(steward.id, chapter.id, "package_steward")
+    activity.current = "reviewing the package plan"
+    state.activities.save(activity)
+
+    details = state.dashboard_package_runs("package-a", selected_run_id=steward.id)
+
+    assert [(run["id"], run["role"]) for run in details["runs"]] == [
+        (steward.id, "package_steward"),
+        (worker.id, "package_worker"),
+    ]
+    assert details["selected_run_id"] == steward.id
+    assert details["activity"]["current"] == "reviewing the package plan"
+
+
 async def test_native_tui_connects_renders_and_exits_with_pipeline(
     monkeypatch,
     tmp_path: Path,

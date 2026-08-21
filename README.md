@@ -213,8 +213,10 @@ the Python orchestrator and consumes the same bounded dashboard model as the web
 versioned Unix-socket protocol. The server sends one initial snapshot, then pushes coalesced task,
 agent-activity, and global-state deltas directly from the in-process change bus; the TUI does not
 poll SQLite or repeatedly request full snapshots. Press `Enter` or `i` to inspect the selected
-agent, `k` to inspect capability-package lifecycle, consumers, plan steps, evidence, leases,
-reservations, dependencies, and integration state, and `p` to
+agent, or `k` to inspect capability-package lifecycle, consumers, plan steps, evidence, leases,
+reservations, dependencies, and integration state. In the package dossier, press `Enter` to inspect
+that package's Steward and worker runs, including their prompts, updates, files, and full timelines.
+Press `p` to
 pause or resume scheduling, and `q` to stop workers, preserve their private overlay changes, and
 return to the shell. Press `d` to detach the TUI while leaving a managed orchestrator running. The
 web dashboard exposes the same package dossier through its capability-packages metric card (or the
@@ -584,7 +586,8 @@ Repository hashing, JSON export, and database work run off the TUI event loop. T
 status (`pending`, `running`, `succeeded`, `failed`, `blocked`, or `interrupted`) plus a short detail
 describing what
 a running or pending task is doing. A transient `queued` marker distinguishes runnable pending stages
-that are waiting for an agent slot, and both the TUI and web dashboard label them accordingly.
+that are waiting to start, whether for an agent slot or a conflicting path reservation. Dashboards
+show the concrete wait detail rather than presenting every pre-start wait as a model-provider queue.
 Structural proof work is attached to a durable capability package while ordinary task cells retain
 their normal state machine. An active coordinator validation build labels its task cell `building`.
 Successful discovery reports enter a short bounded batch: PAF merges the reports, rebuilds the source
