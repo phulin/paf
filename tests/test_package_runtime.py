@@ -11,8 +11,6 @@ import pytest
 from paf.package_model import (
     CapabilityPackage,
     ConsumerStatus,
-    IntegrationJournal,
-    IntegrationPhase,
     PackageConsumer,
     PackageDisposition,
     PackageStatus,
@@ -24,14 +22,10 @@ from paf.package_model import (
 )
 from paf.package_runtime import (
     ConsumerValidation,
-    IntegrationResult,
-    PackageCandidateStore,
     PackageExecutionLayer,
-    PackageGitError,
-    PackageIntegrator,
+    PackageImport,
     PackageValidation,
     PackageWorkspace,
-    RelevantInterfaceGuard,
 )
 from paf.state_db import StateDatabase
 
@@ -132,8 +126,6 @@ def test_steward_claim_heartbeat_expiry_recovery_and_release_are_fenced(
         "second",
         expected_revision=current.revision,
         ttl_seconds=3600,
-        candidate_revision="candidate",
-        candidate_digest="dirty",
         now=LATE,
     )
     assert recovered.generation == first.generation + 1
@@ -202,79 +194,22 @@ def test_global_reservations_are_atomic_and_cover_package_vs_ordinary_conflicts(
     }
 
 
-def prepared_package(repo: Path) -> tuple[StateDatabase, CapabilityPackage, int, Path]:
-    store = StateDatabase(repo / ".paf")
-    store.initialize()
-    current = package(store)
-    lease = store.claim_steward_lease(
-        current.id,
-        "steward",
-        expected_revision=current.revision,
-        ttl_seconds=10**9,
-    )
-    current = store.load_package_state().packages[current.id]
-    current = store.reserve_package_paths(
-        (
-            PathReservation(
-                "lean/Book.lean",
-                ReservationMode.EXCLUSIVE_FILE,
-                current.id,
-                lease.generation,
-                EARLY,
-            ),
-        ),
-        expected_revision=current.revision,
-    )
-    overlay = repo / ".paf" / "test-overlays" / current.id
-    overlay.mkdir(parents=True)
-    shutil.copytree(repo / "lean", overlay / "lean")
-    candidates = PackageCandidateStore(repo, repo / ".paf", store)
-    candidates.materialize(current, overlay)
-    current, _candidate, _changed = candidates.commit(
-        current,
-        lease.generation,
-        overlay,
-        message="chore(packages): initialize candidate",
-    )
-    return store, current, lease.generation, overlay
-
-
-def test_candidate_store_resolves_legacy_lean_project_paths(tmp_path: Path) -> None:
-    repo = git_repo(tmp_path)
-    store = StateDatabase(repo / ".paf")
-    store.initialize()
-
-    resolved = PackageCandidateStore(repo, repo / ".paf", store).repository_path(repo, "Book.lean")
-
-    assert resolved == "lean/Book.lean"
-
-
-def commit_candidate(
-    store: StateDatabase, package_id: str, generation: int, overlay: Path, value: int = 2
-) -> str:
-    (overlay / "lean" / "Book.lean").write_text(f"def base := {value}\n", encoding="utf-8")
-    current = store.load_package_state().packages[package_id]
-    _current, candidate, _changed = PackageCandidateStore(
-        store.path.parent.parent, store.path.parent, store
-    ).commit(current, generation, overlay, message=f"feat: package value {value}")
-    return candidate
-
-
-def workspace_provider(repo: Path, store: StateDatabase):
-    async def acquire(package: CapabilityPackage, _generation: int) -> PackageWorkspace:
+def workspace_provider(repo: Path, _store: StateDatabase):
+    async def acquire(
+        package: CapabilityPackage, _generation: int, _scope: tuple[str, ...]
+    ) -> PackageWorkspace:
         parent = repo / ".paf" / "runtime-overlays"
         sequence = len(list(parent.glob("*"))) if parent.exists() else 0
         root = parent / f"{package.id}-{sequence}"
         root.mkdir(parents=True)
         shutil.copytree(repo / "lean", root / "lean")
-        PackageCandidateStore(repo, repo / ".paf", store).materialize(package, root)
 
-        async def changed_paths() -> tuple[str, ...]:
+        async def integrate(scope: tuple[str, ...], message: str) -> PackageImport:
             tracked = set(run_git(repo, "ls-files").splitlines())
             present = {
                 path.relative_to(root).as_posix() for path in root.rglob("*") if path.is_file()
             }
-            return tuple(
+            changed = tuple(
                 sorted(
                     path
                     for path in tracked | present
@@ -283,250 +218,63 @@ def workspace_provider(repo: Path, store: StateDatabase):
                     or (repo / path).read_bytes() != (root / path).read_bytes()
                 )
             )
+            outside = tuple(
+                path
+                for path in changed
+                if not any(
+                    path == allowed or path.startswith(f"{allowed.rstrip('/')}/")
+                    for allowed in scope
+                )
+            )
+            if outside:
+                raise ValueError("overlay changed paths outside scope: " + ", ".join(outside))
+            for path in changed:
+                source_path = root / path
+                destination = repo / path
+                if source_path.exists():
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(source_path, destination)
+                else:
+                    destination.unlink(missing_ok=True)
+            commit = ""
+            if changed:
+                run_git(repo, "add", "-A", "--", *changed)
+                run_git(repo, "commit", "-m", message)
+                commit = run_git(repo, "rev-parse", "HEAD")
+            return PackageImport(changed, commit, commit or run_git(repo, "rev-parse", "HEAD"))
 
         async def close() -> None:
             return
 
-        return PackageWorkspace(root, changed_paths, close)
+        return PackageWorkspace(root, integrate, close)
 
     return acquire
 
 
-def test_package_candidate_survives_lease_recovery_without_a_worktree(tmp_path: Path) -> None:
+def test_recovered_lease_has_no_private_git_candidate(tmp_path: Path) -> None:
     repo = git_repo(tmp_path)
-    store, current, generation, worktree = prepared_package(repo)
-    candidate = commit_candidate(store, current.id, generation, worktree, 99)
+    store = StateDatabase(repo / ".paf")
+    store.initialize()
+    current = package(store)
+    first = claim(store, current, "first")
     current = store.load_package_state().packages[current.id]
-    lease, recovery = store.recover_steward_lease(
+
+    recovered, record = store.recover_steward_lease(
         current.id,
         "replacement",
         expected_revision=current.revision,
-        ttl_seconds=10**9,
-        candidate_revision=candidate,
-        candidate_digest="candidate",
-        now="2100-01-01T00:00:00+00:00",
-    )
-    assert lease.generation == generation + 1
-    assert recovery.candidate_revision == candidate
-    replacement = repo / ".paf" / "test-overlays" / "replacement"
-    replacement.mkdir(parents=True)
-    shutil.copytree(repo / "lean", replacement / "lean")
-    PackageCandidateStore(repo, repo / ".paf", store).materialize(
-        store.load_package_state().packages[current.id], replacement
-    )
-    assert (replacement / "lean" / "Book.lean").read_text() == "def base := 99\n"
-
-
-def test_two_phase_integration_replays_candidate_after_stale_canonical(tmp_path: Path) -> None:
-    repo = git_repo(tmp_path)
-    store, current, generation, worktree = prepared_package(repo)
-    commit_candidate(store, current.id, generation, worktree)
-    current = store.load_package_state().packages[current.id]
-    guard = RelevantInterfaceGuard(store)
-    current = guard.capture(
-        current.id,
-        generation,
-        expected_revision=current.revision,
-        interface_ids=("Book.input",),
-        source_revision=current.base_revision,
-        digest=lambda _: "interface-v1",
-    )
-    integrator = PackageIntegrator(repo, repo / ".paf", store)
-    advanced = False
-
-    def validate(_: Path) -> str:
-        nonlocal advanced
-        if not advanced:
-            advanced = True
-            note = repo / "README.md"
-            note.write_text("concurrent canonical change\n", encoding="utf-8")
-            run_git(repo, "add", "README.md")
-            run_git(repo, "commit", "-m", "docs: concurrent change")
-        return "validation-v1"
-
-    result = integrator.integrate(
-        current.id,
-        generation,
-        validate=validate,
-        interface_digest=lambda _: "interface-v1",
-    )
-    assert not result.integrated
-    assert result.stale_reason == "canonical revision changed during validation"
-    retry = repo / ".paf" / "test-overlays" / "retry"
-    retry.mkdir(parents=True)
-    shutil.copytree(repo / "lean", retry / "lean")
-    current = store.load_package_state().packages[current.id]
-    candidates = PackageCandidateStore(repo, repo / ".paf", store)
-    candidates.materialize(current, retry)
-    candidates.commit(current, generation, retry, message="feat: replay package candidate")
-    result = integrator.integrate(
-        current.id,
-        generation,
-        validate=lambda _: "validation-v2",
-        interface_digest=lambda _: "interface-v1",
-    )
-    assert result.integrated
-    assert (repo / "lean" / "Book.lean").read_text(encoding="utf-8") == "def base := 2\n"
-    assert not store.load_package_state().reservations
-    assert any(
-        item.phase is IntegrationPhase.ABORTED
-        for item in store.load_package_state().integration_journal.values()
+        ttl_seconds=3600,
+        now=LATE,
     )
 
-
-def test_integration_rejects_dirty_worktree_and_changed_interface(tmp_path: Path) -> None:
-    repo = git_repo(tmp_path)
-    store, current, generation, worktree = prepared_package(repo)
-    commit_candidate(store, current.id, generation, worktree)
-    current = store.load_package_state().packages[current.id]
-    guard = RelevantInterfaceGuard(store)
-    current = guard.capture(
-        current.id,
-        generation,
-        expected_revision=current.revision,
-        interface_ids=("Book.input",),
-        source_revision=current.base_revision,
-        digest=lambda _: "before",
-    )
-    integrator = PackageIntegrator(repo, repo / ".paf", store)
-    dirty = repo / "uncommitted.txt"
-    dirty.write_text("dirty\n", encoding="utf-8")
-    with pytest.raises(PackageGitError, match="canonical worktree is dirty"):
-        integrator.integrate(
-            current.id,
-            generation,
-            validate=lambda _: "validation",
-            interface_digest=lambda _: "before",
-        )
-    dirty.unlink()
-    interface = "before"
-
-    def validate(_: Path) -> str:
-        nonlocal interface
-        interface = "after"
-        return "validation"
-
-    result = integrator.integrate(
-        current.id,
-        generation,
-        validate=validate,
-        interface_digest=lambda _: interface,
-    )
-    assert not result.integrated
-    assert result.stale_reason.startswith("relevant read interface changed")
-    assert run_git(repo, "rev-parse", "HEAD") == current.base_revision
+    assert recovered.generation == first.generation + 1
+    assert record.active_child_workers == ()
+    assert not run_git(repo, "for-each-ref", "--format=%(refname)", "refs/heads/paf")
 
 
-def test_integration_rejects_candidate_mutation_during_validation(tmp_path: Path) -> None:
-    repo = git_repo(tmp_path)
-    store, current, generation, worktree = prepared_package(repo)
-    commit_candidate(store, current.id, generation, worktree)
-    current = store.load_package_state().packages[current.id]
-    canonical_before = run_git(repo, "rev-parse", "HEAD")
-
-    def validate(_path: Path) -> str:
-        commit_candidate(store, current.id, generation, worktree, 3)
-        return "validation"
-
-    result = PackageIntegrator(repo, repo / ".paf", store).integrate(
-        current.id,
-        generation,
-        validate=validate,
-        interface_digest=lambda _: None,
-    )
-
-    assert not result.integrated
-    assert result.stale_reason == "package candidate changed during validation"
-    assert run_git(repo, "rev-parse", "HEAD") == canonical_before
-    assert store.load_package_state().integration_journal[result.journal_id].phase is (
-        IntegrationPhase.ABORTED
-    )
-
-
-def test_stale_integration_does_not_publish_provisional_consumer_acceptance(
+def test_ordinary_reservation_expiry_cannot_block_a_package_forever(
     tmp_path: Path,
 ) -> None:
-    repo = git_repo(tmp_path)
-    store, current, generation, worktree = prepared_package(repo)
-    store.attach_package_consumer(
-        current.id,
-        PackageConsumer("consumer-a", current.id, "chapter-a", "lean/Book.lean", "base", "prove"),
-        expected_revision=current.revision,
-        lease_generation=generation,
-    )
-    current = store.load_package_state().packages[current.id]
-    commit_candidate(store, current.id, generation, worktree)
-    current = store.load_package_state().packages[current.id]
-    guard = RelevantInterfaceGuard(store)
-    guard.capture(
-        current.id,
-        generation,
-        expected_revision=current.revision,
-        interface_ids=("Book.input",),
-        source_revision=current.base_revision,
-        digest=lambda _: "before",
-    )
-    interface = "before"
-
-    def validate(_: Path) -> str:
-        nonlocal interface
-        interface = "after"
-        return "validation"
-
-    result = PackageIntegrator(repo, repo / ".paf", store).integrate(
-        current.id,
-        generation,
-        validate=validate,
-        interface_digest=lambda _: interface,
-        provisional_consumer_ids=("consumer-a",),
-    )
-
-    assert not result.integrated
-    state = store.load_package_state()
-    assert state.consumers["consumer-a"].status is ConsumerStatus.OPEN
-    assert state.consumers["consumer-a"].accepted_revision is None
-    assert state.integration_journal[result.journal_id].provisional_consumer_ids == ("consumer-a",)
-
-
-def test_restart_reconciles_canonical_commit_without_reapplying_it(tmp_path: Path) -> None:
-    repo = git_repo(tmp_path)
-    store, current, generation, worktree = prepared_package(repo)
-    candidate = commit_candidate(store, current.id, generation, worktree)
-    current = store.load_package_state().packages[current.id]
-    store.attach_package_consumer(
-        current.id,
-        PackageConsumer("consumer-a", current.id, "chapter-a", "lean/Book.lean", "base", "prove"),
-        expected_revision=current.revision,
-        lease_generation=generation,
-    )
-    current = store.load_package_state().packages[current.id]
-    canonical_before = run_git(repo, "rev-parse", "HEAD")
-    journal = IntegrationJournal(
-        "interrupted-import",
-        current.id,
-        generation,
-        canonical_before,
-        candidate,
-        canonical_before,
-        IntegrationPhase.IMPORTING,
-        validation_digest="validated",
-        provisional_consumer_ids=("consumer-a",),
-    )
-    store.record_integration_journal(journal, expected_revision=current.revision)
-    run_git(repo, "merge", "--ff-only", candidate)
-
-    results = PackageIntegrator(repo, repo / ".paf", store).reconcile()
-
-    assert len(results) == 1 and results[0].integrated
-    state = store.load_package_state()
-    assert state.integration_journal[journal.id].phase is IntegrationPhase.FINALIZED
-    assert state.packages[current.id].integrated_revision == candidate
-    assert state.consumers["consumer-a"].status is ConsumerStatus.ACCEPTED
-    assert state.consumers["consumer-a"].accepted_revision == candidate
-    assert run_git(repo, "rev-list", "--count", "HEAD") == "2"
-
-
-def test_ordinary_reservation_expiry_cannot_block_a_package_forever(tmp_path: Path) -> None:
     store = StateDatabase(tmp_path / ".paf")
     store.initialize()
     ordinary = store.claim_ordinary_path_reservations(
@@ -548,59 +296,6 @@ def test_ordinary_reservation_expiry_cannot_block_a_package_forever(tmp_path: Pa
         expected_revision=current.revision,
     )
     assert result.granted
-
-
-def test_expired_generation_cannot_integrate_after_recovery(tmp_path: Path) -> None:
-    repo = git_repo(tmp_path)
-    store, current, generation, worktree = prepared_package(repo)
-    commit_candidate(store, current.id, generation, worktree)
-    current = store.load_package_state().packages[current.id]
-    replacement, _ = store.recover_steward_lease(
-        current.id,
-        "replacement",
-        expected_revision=current.revision,
-        ttl_seconds=10**9,
-        candidate_revision=PackageCandidateStore(repo, repo / ".paf", store).revision(current),
-        candidate_digest="clean",
-        now="2100-01-01T00:00:00+00:00",
-    )
-    assert replacement.generation > generation
-    with pytest.raises(ValueError, match="stale lease generation"):
-        PackageIntegrator(repo, repo / ".paf", store).integrate(
-            current.id,
-            generation,
-            validate=lambda _: "validation",
-            interface_digest=lambda _: None,
-        )
-
-
-def test_reconciliation_aborts_a_diverged_interrupted_import(tmp_path: Path) -> None:
-    repo = git_repo(tmp_path)
-    store, current, generation, worktree = prepared_package(repo)
-    candidate = commit_candidate(store, current.id, generation, worktree)
-    current = store.load_package_state().packages[current.id]
-    canonical_before = run_git(repo, "rev-parse", "HEAD")
-    journal = IntegrationJournal(
-        "diverged-import",
-        current.id,
-        generation,
-        canonical_before,
-        candidate,
-        canonical_before,
-        IntegrationPhase.IMPORTING,
-        validation_digest="validated",
-    )
-    store.record_integration_journal(journal, expected_revision=current.revision)
-    (repo / "README.md").write_text("diverged\n", encoding="utf-8")
-    run_git(repo, "add", "README.md")
-    run_git(repo, "commit", "-m", "docs: diverge")
-
-    result = PackageIntegrator(repo, repo / ".paf", store).reconcile()[0]
-
-    assert not result.integrated
-    assert store.load_package_state().integration_journal[journal.id].phase is (
-        IntegrationPhase.ABORTED
-    )
 
 
 def test_schema_v5_package_locks_migrate_into_global_authority(tmp_path: Path) -> None:
@@ -1109,7 +804,7 @@ async def test_package_execution_accepts_consumers_independently_and_wakes_only_
 
 
 @pytest.mark.asyncio
-async def test_runtime_does_not_publish_a_candidate_rebased_after_validation(
+async def test_overlay_agent_result_is_canonical_before_package_validation(
     tmp_path: Path,
 ) -> None:
     repo = git_repo(tmp_path)
@@ -1144,9 +839,8 @@ async def test_runtime_does_not_publish_a_candidate_rebased_after_validation(
 
     result = await runtime.execute(current.id)
 
-    assert result.status is PackageStatus.INVESTIGATING
-    assert result.detail == "canonical revision changed during package validation"
-    assert (repo / "lean" / "Book.lean").read_text(encoding="utf-8") == "def base := 1\n"
+    assert result.status is PackageStatus.COMPLETE
+    assert (repo / "lean" / "Book.lean").read_text(encoding="utf-8") == "def base := 2\n"
     assert (repo / "README.md").read_text(encoding="utf-8") == "concurrent canonical edit\n"
 
 
@@ -1245,9 +939,7 @@ async def test_replan_supersedes_abandoned_incomplete_steps(tmp_path: Path) -> N
 
 
 @pytest.mark.asyncio
-async def test_runtime_keeps_consumer_acceptance_provisional_when_integration_stales(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+async def test_runtime_keeps_consumer_open_when_package_validation_fails(tmp_path: Path) -> None:
     repo = git_repo(tmp_path)
     store = StateDatabase(repo / ".paf")
     store.initialize()
@@ -1270,7 +962,7 @@ async def test_runtime_keeps_consumer_acceptance_provisional_when_integration_st
         ),
     )
     report = disposition_report("continue", ("consumer-a",))
-    observed_during_integration: list[ConsumerStatus] = []
+    consumer_validations: list[str] = []
     woken: list[str] = []
 
     async def wake(ids):
@@ -1284,38 +976,24 @@ async def test_runtime_keeps_consumer_acceptance_provisional_when_integration_st
         run_steward=lambda *_args: asyncio.sleep(0, result=report),
         run_worker=lambda *_args: asyncio.sleep(0, result={}),
         validate_step=lambda *_args: PackageValidation(True, "step", "ok"),
-        validate_package=lambda *_args: PackageValidation(True, "package", "ok"),
-        validate_consumer=lambda _path, consumer: ConsumerValidation(
-            True,
-            "consumer",
-            "focused consumer check",
-            consumer.id,
-            (consumer.work_unit_id,),
+        validate_package=lambda *_args: PackageValidation(False, "package", "failed"),
+        validate_consumer=lambda _path, consumer: (
+            consumer_validations.append(consumer.id)
+            or ConsumerValidation(
+                True,
+                "consumer",
+                "focused consumer check",
+                consumer.id,
+                (consumer.work_unit_id,),
+            )
         ),
         wake_consumers=wake,
     )
 
-    def stale_integrate(package_id, _generation, **_kwargs):
-        observed_during_integration.append(
-            store.load_package_state().consumers["consumer-a"].status
-        )
-        head = run_git(repo, "rev-parse", "HEAD")
-        return IntegrationResult(
-            False,
-            package_id,
-            head,
-            head,
-            "package",
-            "canonical revision changed during validation",
-            "stale-journal",
-        )
-
-    monkeypatch.setattr(runtime.integrator, "integrate", stale_integrate)
-
     result = await runtime.execute(current.id)
 
-    assert observed_during_integration == [ConsumerStatus.OPEN]
-    assert result.status is PackageStatus.INVESTIGATING
+    assert consumer_validations == []
+    assert result.status is PackageStatus.IMPLEMENTING
     assert result.accepted_consumer_ids == ()
     assert woken == []
     consumer = store.load_package_state().consumers["consumer-a"]
@@ -1415,5 +1093,9 @@ async def test_package_execution_persists_nonimplementation_dispositions(
         assert current.id not in {package.id for package in runtime.ready_packages()}
     else:
         assert state.consumers["consumer-a"].status is ConsumerStatus.TERMINAL
-    if disposition != "waiting_dependency":
+    if disposition == "decomposed":
+        assert {value.package_id for value in state.reservations.values()} == {
+            state.consumers["consumer-a"].package_id
+        }
+    elif disposition != "waiting_dependency":
         assert not state.reservations

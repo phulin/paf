@@ -78,6 +78,7 @@ from paf.package_runtime import (
     ConsumerValidation,
     PackageExecutionLayer,
     PackageExecutionResult,
+    PackageImport,
     PackageReportError,
     PackageValidation,
     PackageWorkspace,
@@ -625,7 +626,10 @@ class Orchestrator:
             ),
             self.work_units[0].id,
         )
-        return _with_scope(self._work_units_by_id[anchor_id], package.write_scope)
+        return _with_scope(
+            self._work_units_by_id[anchor_id],
+            self._repository_package_scope(package.write_scope),
+        )
 
     async def _package_heartbeat(
         self, package_id: str, agent_id: str, generation: int, stop: asyncio.Event
@@ -676,28 +680,66 @@ class Orchestrator:
             raise PackageReportError(result.error or "package Steward agent failed")
         return result.report
 
+    def _repository_package_scope(self, scope: tuple[str, ...]) -> tuple[str, ...]:
+        """Resolve legacy Lean-root paths to repository-root overlay paths."""
+
+        resolved: list[str] = []
+        for path in scope:
+            direct = self.config.settings.repo / path
+            first_component = self.config.settings.repo / Path(path).parts[0]
+            if direct.exists() or first_component.is_dir():
+                resolved.append(path)
+                continue
+            prefixed = self.config.settings.lean_project / path
+            target = self.config.settings.repo / prefixed
+            resolved.append(prefixed.as_posix() if target.parent.exists() else path)
+        return tuple(dict.fromkeys(resolved))
+
     async def _acquire_package_workspace(
-        self, package: CapabilityPackage, generation: int
+        self, package: CapabilityPackage, generation: int, scope: tuple[str, ...]
     ) -> PackageWorkspace:
-        """Acquire and seed one package overlay under the canonical source barrier."""
+        """Acquire one ordinary overlay-backed agent workspace for a package turn."""
 
         if self.isolation.name != "fuse-overlay":
             raise RuntimeError("capability packages require fuse-overlay isolation")
+        anchor = _with_scope(self._package_anchor(package), self._repository_package_scope(scope))
         async with self.source_lock:
+            await self.git.ensure_clean(anchor)
             workspace = await self.isolation.acquire(
-                f"package-{package.id}-generation-{generation}"
+                f"package-{package.id}-generation-{generation}-{uuid4().hex[:12]}"
             )
-            assert isinstance(workspace, FuseWorkspace)
-            try:
-                await asyncio.to_thread(
-                    self.package_execution.candidates.materialize,
-                    package,
-                    workspace.root,
+        assert isinstance(workspace, FuseWorkspace)
+
+        async def integrate(paths: tuple[str, ...], message: str) -> PackageImport:
+            current_anchor = _with_scope(
+                self._package_anchor(package), self._repository_package_scope(paths)
+            )
+            async with self.source_lock:
+                await self.git.ensure_clean(current_anchor)
+                isolated = await workspace.collect(current_anchor, integration_lock=None)
+                if not isolated.accepted:
+                    detail = isolated.error
+                    if isolated.out_of_scope_paths:
+                        detail += ": " + ", ".join(isolated.out_of_scope_paths)
+                    raise PackageReportError(detail)
+                commit = await self.git.commit(
+                    current_anchor,
+                    Stage.PROVE,
+                    summary=message,
+                    changed_paths=isolated.changed_paths,
+                    subject=message,
                 )
-            except BaseException:
-                await workspace.close()
-                raise
-        return PackageWorkspace(workspace.root, workspace.changed_paths, workspace.close)
+                if isolated.changed_paths:
+                    self._mark_source_changed(
+                        unit.id for unit in self._package_owner_units(isolated.changed_paths)
+                    )
+                return PackageImport(
+                    isolated.changed_paths,
+                    commit,
+                    commit or await self.git.head(),
+                )
+
+        return PackageWorkspace(workspace.root, integrate, workspace.close)
 
     async def _run_package_worker_agent(
         self,
@@ -706,7 +748,10 @@ class Orchestrator:
         packet: dict[str, Any],
         worktree: Path,
     ) -> dict[str, Any]:
-        anchor = _with_scope(self._package_anchor(package), step.intended_paths)
+        anchor = _with_scope(
+            self._package_anchor(package),
+            self._repository_package_scope(step.intended_paths),
+        )
         run = await self.state.start_auxiliary_run(
             anchor.id,
             Stage.PROVE,
@@ -726,7 +771,8 @@ class Orchestrator:
         return result.report
 
     def _package_owner_units(self, paths: Iterable[str]) -> tuple[WorkUnitLike, ...]:
-        owner_ids = {owner_id for path in paths for owner_id in self._path_owner_ids(str(path))}
+        resolved = self._repository_package_scope(tuple(str(path) for path in paths))
+        owner_ids = {owner_id for path in resolved for owner_id in self._path_owner_ids(path)}
         return tuple(
             self._work_units_by_id[owner_id]
             for owner_id in sorted(owner_ids, key=self._work_unit_order.__getitem__)
@@ -773,7 +819,8 @@ class Orchestrator:
                 consumer.id,
             )
         validation = await self._validate_package_units(worktree, (unit,))
-        placeholder = declaration_uses_placeholder(worktree, consumer.path, consumer.declaration)
+        consumer_path = self._repository_package_scope((consumer.path,))[0]
+        placeholder = declaration_uses_placeholder(worktree, consumer_path, consumer.declaration)
         accepted = validation.succeeded and placeholder is False
         evidence = validation.evidence
         if placeholder is not False:
@@ -888,7 +935,6 @@ class Orchestrator:
         await self.isolation.prepare()
         report("Checking the Git worktree", 7)
         await self.git.prepare()
-        await asyncio.to_thread(self.package_execution.integrator.reconcile)
         await self.state.refresh_package_state()
         if self.config.steward.enabled:
             await self._schedule_ready_packages()

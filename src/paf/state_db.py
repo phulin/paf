@@ -20,8 +20,6 @@ from paf.package_model import (
     ConsumerStatus,
     EvidenceKind,
     GlobalPathReservation,
-    IntegrationJournal,
-    IntegrationPhase,
     PackageConsumer,
     PackageDependency,
     PackageDisposition,
@@ -49,7 +47,7 @@ from paf.package_model import (
 
 DATABASE_NAME = "state.sqlite3"
 LEGACY_BACKUP_NAME = "state.legacy-v6.json"
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 CHANGE_RETENTION = 10_000
 
 COLLECTION_SECTIONS = frozenset(
@@ -641,6 +639,24 @@ def _migrate_capability_packages_v9(connection: sqlite3.Connection) -> None:
         connection.execute("ALTER TABLE package_recoveries DROP COLUMN worktree_status")
 
 
+def _migrate_overlay_packages_v10(connection: sqlite3.Connection) -> None:
+    """Remove Git-candidate state now that package agents use ordinary overlays."""
+
+    package_columns = {
+        str(row[1]) for row in connection.execute("PRAGMA table_info(capability_packages)")
+    }
+    for column in ("base_revision", "branch"):
+        if column in package_columns:
+            connection.execute(f"ALTER TABLE capability_packages DROP COLUMN {column}")
+    recovery_columns = {
+        str(row[1]) for row in connection.execute("PRAGMA table_info(package_recoveries)")
+    }
+    for column in ("candidate_revision", "candidate_digest", "journal_phase"):
+        if column in recovery_columns:
+            connection.execute(f"ALTER TABLE package_recoveries DROP COLUMN {column}")
+    connection.execute("DROP TABLE IF EXISTS integration_journal")
+
+
 def _create_schema(connection: sqlite3.Connection) -> None:
     """Create the normalized current-state schema.
 
@@ -762,8 +778,6 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             mathematical_objective TEXT NOT NULL,
             status TEXT NOT NULL,
             disposition TEXT,
-            base_revision TEXT NOT NULL DEFAULT '',
-            branch TEXT NOT NULL DEFAULT '',
             parent_package_id TEXT REFERENCES capability_packages(id),
             plan_revision INTEGER NOT NULL DEFAULT 0,
             integrated_revision TEXT,
@@ -910,22 +924,6 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             source_revision TEXT NOT NULL,
             PRIMARY KEY(package_id, interface_id)
         );
-        CREATE TABLE IF NOT EXISTS integration_journal (
-            id TEXT PRIMARY KEY,
-            package_id TEXT NOT NULL REFERENCES capability_packages(id) ON DELETE CASCADE,
-            lease_generation INTEGER NOT NULL,
-            base_revision TEXT NOT NULL,
-            candidate_revision TEXT NOT NULL,
-            canonical_revision_before TEXT NOT NULL,
-            phase TEXT NOT NULL,
-            validation_digest TEXT NOT NULL,
-            canonical_revision_after TEXT,
-            provisional_consumer_ids BLOB NOT NULL DEFAULT '[]',
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS integration_journal_package
-            ON integration_journal(package_id, updated_at, id);
         CREATE TABLE IF NOT EXISTS upstream_request_imports (
             request_id TEXT PRIMARY KEY,
             package_id TEXT NOT NULL REFERENCES capability_packages(id),
@@ -959,10 +957,7 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             package_id TEXT NOT NULL REFERENCES capability_packages(id) ON DELETE CASCADE,
             prior_generation INTEGER NOT NULL,
             recovered_generation INTEGER NOT NULL,
-            candidate_revision TEXT NOT NULL,
-            candidate_digest TEXT NOT NULL,
             active_child_workers BLOB NOT NULL,
-            journal_phase TEXT,
             recovered_at TEXT NOT NULL
         );
         """
@@ -970,15 +965,7 @@ def _create_schema(connection: sqlite3.Connection) -> None:
     _migrate_path_reservations_v6(connection)
     _migrate_package_steps_v8(connection)
     _migrate_capability_packages_v9(connection)
-    journal_columns = {
-        str(row[1])
-        for row in connection.execute("PRAGMA table_info(integration_journal)").fetchall()
-    }
-    if "provisional_consumer_ids" not in journal_columns:
-        connection.execute(
-            "ALTER TABLE integration_journal ADD COLUMN "
-            "provisional_consumer_ids BLOB NOT NULL DEFAULT '[]'"
-        )
+    _migrate_overlay_packages_v10(connection)
     columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(runs)").fetchall()}
     for name, declaration in (
         ("work_unit_id", "TEXT NOT NULL DEFAULT ''"),
@@ -1350,9 +1337,9 @@ def _insert_package(connection: sqlite3.Connection, package: CapabilityPackage) 
         """
         INSERT INTO capability_packages(
             id, capability_key, title, mathematical_objective, status, disposition,
-            base_revision, branch, parent_package_id, plan_revision,
+            parent_package_id, plan_revision,
             integrated_revision, revision, created_at, updated_at
-        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             package.id,
@@ -1361,8 +1348,6 @@ def _insert_package(connection: sqlite3.Connection, package: CapabilityPackage) 
             package.mathematical_objective,
             str(package.status),
             str(package.disposition) if package.disposition is not None else None,
-            package.base_revision,
-            package.branch,
             package.parent_package_id,
             package.plan_revision,
             package.integrated_revision,
@@ -1688,7 +1673,7 @@ def _load_package_state(connection: sqlite3.Connection) -> PackageState:
     for row in connection.execute(
         """
         SELECT id, capability_key, title, mathematical_objective, status, disposition,
-            base_revision, branch, parent_package_id, plan_revision,
+            parent_package_id, plan_revision,
             integrated_revision, revision, created_at, updated_at
         FROM capability_packages ORDER BY created_at, id
         """
@@ -1706,14 +1691,12 @@ def _load_package_state(connection: sqlite3.Connection) -> PackageState:
             textbook_refs=textbook_refs.get(package_id, ()),
             write_scope=write_scopes.get(package_id, ()),
             expansion_scope=expansion_scopes.get(package_id, ()),
-            base_revision=str(row[6]),
-            branch=str(row[7]),
-            parent_package_id=str(row[8]) if row[8] is not None else None,
-            plan_revision=int(row[9]),
-            integrated_revision=str(row[10]) if row[10] is not None else None,
-            revision=int(row[11]),
-            created_at=str(row[12]),
-            updated_at=str(row[13]),
+            parent_package_id=str(row[6]) if row[6] is not None else None,
+            plan_revision=int(row[7]),
+            integrated_revision=str(row[8]) if row[8] is not None else None,
+            revision=int(row[9]),
+            created_at=str(row[10]),
+            updated_at=str(row[11]),
         )
 
     blockers = _group_ordered_items(
@@ -1885,28 +1868,6 @@ def _load_package_state(connection: sqlite3.Connection) -> PackageState:
             FROM package_read_interfaces ORDER BY package_id, interface_id"""
         )
     )
-    journals = {
-        str(row[0]): IntegrationJournal(
-            id=str(row[0]),
-            package_id=str(row[1]),
-            lease_generation=int(row[2]),
-            base_revision=str(row[3]),
-            candidate_revision=str(row[4]),
-            canonical_revision_before=str(row[5]),
-            phase=IntegrationPhase(str(row[6])),
-            validation_digest=str(row[7]),
-            canonical_revision_after=str(row[8]) if row[8] is not None else None,
-            provisional_consumer_ids=tuple(str(value) for value in json.loads(row[9])),
-            created_at=str(row[10]),
-            updated_at=str(row[11]),
-        )
-        for row in connection.execute(
-            """SELECT id, package_id, lease_generation, base_revision,
-                candidate_revision, canonical_revision_before, phase, validation_digest,
-                canonical_revision_after, provisional_consumer_ids, created_at, updated_at
-            FROM integration_journal ORDER BY created_at, id"""
-        )
-    }
     return PackageState(
         packages=packages,
         consumers=consumers,
@@ -1916,7 +1877,6 @@ def _load_package_state(connection: sqlite3.Connection) -> PackageState:
         reservations=reservations,
         dependencies=dependencies,
         relevant_read_interfaces=read_interfaces,
-        integration_journal=journals,
     )
 
 
@@ -2051,7 +2011,7 @@ def initialize_database(state_dir: Path) -> Path:
             if version == 1:
                 with connection:
                     _migrate_v1(connection)
-            elif version in {2, 3, 4, 5, 6, 7, 8}:
+            elif version in {2, 3, 4, 5, 6, 7, 8, 9}:
                 with connection:
                     _create_schema(connection)
             elif version != SCHEMA_VERSION:
@@ -3144,10 +3104,7 @@ class StateDatabase:
         *,
         expected_revision: int,
         ttl_seconds: float,
-        candidate_revision: str,
-        candidate_digest: str,
         active_child_workers: tuple[str, ...] = (),
-        journal_phase: IntegrationPhase | None = None,
         now: str | None = None,
     ) -> tuple[StewardLease, PackageRecovery]:
         recovered_at = now or _utc_now()
@@ -3203,17 +3160,14 @@ class StateDatabase:
             self._refence_package_reservation_queue(connection, package_id, generation)
             connection.execute(
                 """INSERT INTO package_recoveries(
-                    package_id, prior_generation, recovered_generation, candidate_revision,
-                    candidate_digest, active_child_workers, journal_phase, recovered_at
-                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)""",
+                    package_id, prior_generation, recovered_generation,
+                    active_child_workers, recovered_at
+                ) VALUES(?, ?, ?, ?, ?)""",
                 (
                     package_id,
                     prior_generation,
                     generation,
-                    candidate_revision,
-                    candidate_digest,
                     json.dumpb(list(active_child_workers)),
-                    str(journal_phase) if journal_phase is not None else None,
                     recovered_at,
                 ),
             )
@@ -3223,32 +3177,10 @@ class StateDatabase:
             package_id,
             prior_generation,
             generation,
-            candidate_revision,
-            candidate_digest,
             active_child_workers,
-            journal_phase,
             recovered_at,
         )
         return lease, recovery
-
-    def update_package_candidate(
-        self,
-        package_id: str,
-        *,
-        expected_revision: int,
-        lease_generation: int,
-        base_revision: str,
-        branch: str,
-    ) -> CapabilityPackage:
-        with _connect(self.path) as connection, connection:
-            self._assert_package_revision(connection, package_id, expected_revision)
-            self._assert_lease_generation(connection, package_id, lease_generation)
-            connection.execute(
-                """UPDATE capability_packages SET base_revision=?, branch=?,
-                    revision=revision+1, updated_at=? WHERE id=?""",
-                (base_revision, branch, _utc_now(), package_id),
-            )
-            return _load_package_state(connection).packages[package_id]
 
     @staticmethod
     def _reservation_conflicts(
@@ -3897,7 +3829,7 @@ class StateDatabase:
                 )
                 connection.execute("DELETE FROM package_consumers WHERE id=?", (consumer_id,))
 
-            for table in ("package_steps", "package_evidence", "integration_journal"):
+            for table in ("package_steps", "package_evidence"):
                 connection.execute(
                     f"UPDATE {table} SET package_id=? WHERE package_id=?",
                     (survivor_id, merged_id),
@@ -4134,232 +4066,6 @@ class StateDatabase:
                     )
                     for item in interfaces
                 ),
-            )
-            self._touch_package(connection, package_id)
-            return _load_package_state(connection).packages[package_id]
-
-    def record_integration_journal(
-        self,
-        journal: IntegrationJournal,
-        *,
-        expected_revision: int,
-    ) -> CapabilityPackage:
-        with _connect(self.path) as connection, connection:
-            self._assert_package_revision(connection, journal.package_id, expected_revision)
-            self._assert_lease_generation(connection, journal.package_id, journal.lease_generation)
-            existing = connection.execute(
-                "SELECT package_id, lease_generation FROM integration_journal WHERE id=?",
-                (journal.id,),
-            ).fetchone()
-            if existing is not None and (
-                str(existing[0]) != journal.package_id
-                or int(existing[1]) != journal.lease_generation
-            ):
-                raise ValueError("integration journal id belongs to another fenced generation")
-            now = _utc_now()
-            connection.execute(
-                """INSERT INTO integration_journal(
-                    id, package_id, lease_generation, base_revision, candidate_revision,
-                    canonical_revision_before, phase, validation_digest,
-                    canonical_revision_after, provisional_consumer_ids, created_at, updated_at
-                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(id) DO UPDATE SET phase=excluded.phase,
-                    validation_digest=excluded.validation_digest,
-                    canonical_revision_after=excluded.canonical_revision_after,
-                    provisional_consumer_ids=excluded.provisional_consumer_ids,
-                    updated_at=excluded.updated_at
-                WHERE integration_journal.package_id=excluded.package_id
-                    AND integration_journal.lease_generation=excluded.lease_generation""",
-                (
-                    journal.id,
-                    journal.package_id,
-                    journal.lease_generation,
-                    journal.base_revision,
-                    journal.candidate_revision,
-                    journal.canonical_revision_before,
-                    str(journal.phase),
-                    journal.validation_digest,
-                    journal.canonical_revision_after,
-                    json.dumpb(list(journal.provisional_consumer_ids)),
-                    journal.created_at or now,
-                    journal.updated_at or now,
-                ),
-            )
-            self._touch_package(connection, journal.package_id)
-            return _load_package_state(connection).packages[journal.package_id]
-
-    @staticmethod
-    def _accept_integration_consumers(
-        connection: sqlite3.Connection,
-        package_id: str,
-        consumer_ids: tuple[str, ...],
-        canonical_revision: str,
-        now: str,
-    ) -> None:
-        for consumer_id in consumer_ids:
-            row = connection.execute(
-                """SELECT package_id, status, accepted_revision
-                FROM package_consumers WHERE id=?""",
-                (consumer_id,),
-            ).fetchone()
-            if row is None or str(row[0]) != package_id:
-                raise ValueError(
-                    f"provisional consumer {consumer_id} does not belong to package {package_id}"
-                )
-            status = ConsumerStatus(str(row[1]))
-            accepted_revision = str(row[2]) if row[2] is not None else None
-            if status is ConsumerStatus.ACCEPTED:
-                if accepted_revision != canonical_revision:
-                    raise ValueError(
-                        f"consumer {consumer_id} was accepted at another canonical revision"
-                    )
-                continue
-            if status is not ConsumerStatus.OPEN:
-                raise ValueError(
-                    f"provisional consumer {consumer_id} is no longer open for acceptance"
-                )
-            connection.execute(
-                """UPDATE package_consumers SET status=?, accepted_revision=?,
-                    residual_goal='', updated_at=? WHERE id=? AND package_id=?""",
-                (
-                    str(ConsumerStatus.ACCEPTED),
-                    canonical_revision,
-                    now,
-                    consumer_id,
-                    package_id,
-                ),
-            )
-
-    def finalize_package_integration(
-        self,
-        journal_id: str,
-        *,
-        expected_revision: int,
-        lease_generation: int,
-        canonical_revision_after: str,
-        release_reservations: bool = True,
-    ) -> CapabilityPackage:
-        with _connect(self.path) as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            row = connection.execute(
-                """SELECT package_id, lease_generation, candidate_revision, phase,
-                    provisional_consumer_ids
-                FROM integration_journal WHERE id=?""",
-                (journal_id,),
-            ).fetchone()
-            if row is None:
-                raise KeyError(journal_id)
-            package_id = str(row[0])
-            self._assert_package_revision(connection, package_id, expected_revision)
-            self._assert_live_lease(connection, package_id, lease_generation)
-            if int(row[1]) != lease_generation:
-                raise ValueError("integration journal belongs to another fenced generation")
-            if str(row[2]) != canonical_revision_after:
-                raise ValueError("canonical revision does not equal the validated candidate")
-            if str(row[3]) not in {
-                str(IntegrationPhase.VALIDATED),
-                str(IntegrationPhase.IMPORTING),
-            }:
-                raise ValueError("integration journal is not ready to finalize")
-            now = _utc_now()
-            provisional_consumer_ids = tuple(str(value) for value in json.loads(row[4]))
-            self._accept_integration_consumers(
-                connection,
-                package_id,
-                provisional_consumer_ids,
-                canonical_revision_after,
-                now,
-            )
-            connection.execute(
-                """UPDATE integration_journal SET phase=?, canonical_revision_after=?,
-                    updated_at=? WHERE id=?""",
-                (str(IntegrationPhase.FINALIZED), canonical_revision_after, now, journal_id),
-            )
-            connection.execute(
-                """UPDATE capability_packages SET integrated_revision=?, revision=revision+1,
-                    updated_at=? WHERE id=?""",
-                (canonical_revision_after, now, package_id),
-            )
-            if release_reservations:
-                connection.execute(
-                    "DELETE FROM path_reservations WHERE owner_kind='package' AND owner_id=?",
-                    (package_id,),
-                )
-                self._wake_waiting_reservation_packages(connection, now)
-            connection.commit()
-        return self.load_package_state().packages[package_id]
-
-    def reconcile_imported_integration(
-        self,
-        journal_id: str,
-        *,
-        canonical_revision_after: str,
-        validation_digest: str,
-    ) -> CapabilityPackage:
-        """Finish durable state after Git advanced but the final transaction was interrupted."""
-
-        with _connect(self.path) as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            row = connection.execute(
-                """SELECT package_id, candidate_revision, phase, validation_digest,
-                    provisional_consumer_ids
-                FROM integration_journal WHERE id=?""",
-                (journal_id,),
-            ).fetchone()
-            if row is None:
-                raise KeyError(journal_id)
-            if str(row[1]) != canonical_revision_after:
-                raise ValueError("canonical revision does not equal journal candidate")
-            if str(row[2]) not in {
-                str(IntegrationPhase.IMPORTING),
-                str(IntegrationPhase.FINALIZED),
-            }:
-                raise ValueError("journal does not describe an interrupted import")
-            if not validation_digest or str(row[3]) != validation_digest:
-                raise ValueError("validation digest does not match interrupted import")
-            package_id = str(row[0])
-            now = _utc_now()
-            provisional_consumer_ids = tuple(str(value) for value in json.loads(row[4]))
-            self._accept_integration_consumers(
-                connection,
-                package_id,
-                provisional_consumer_ids,
-                canonical_revision_after,
-                now,
-            )
-            connection.execute(
-                """UPDATE integration_journal SET phase=?, canonical_revision_after=?,
-                    updated_at=? WHERE id=?""",
-                (str(IntegrationPhase.FINALIZED), canonical_revision_after, now, journal_id),
-            )
-            connection.execute(
-                """UPDATE capability_packages SET integrated_revision=?, revision=revision+1,
-                    updated_at=? WHERE id=? AND integrated_revision IS NOT ?""",
-                (canonical_revision_after, now, package_id, canonical_revision_after),
-            )
-            connection.execute(
-                "DELETE FROM path_reservations WHERE owner_kind='package' AND owner_id=?",
-                (package_id,),
-            )
-            self._wake_waiting_reservation_packages(connection, now)
-            connection.commit()
-        return self.load_package_state().packages[package_id]
-
-    def abort_integration_reconciliation(self, journal_id: str) -> CapabilityPackage:
-        """Record that an interrupted import cannot be replayed onto current history."""
-
-        with _connect(self.path) as connection, connection:
-            row = connection.execute(
-                "SELECT package_id, phase FROM integration_journal WHERE id=?", (journal_id,)
-            ).fetchone()
-            if row is None:
-                raise KeyError(journal_id)
-            if str(row[1]) != str(IntegrationPhase.IMPORTING):
-                raise ValueError("only an interrupted import may be reconciled as aborted")
-            package_id = str(row[0])
-            connection.execute(
-                "UPDATE integration_journal SET phase=?, updated_at=? WHERE id=?",
-                (str(IntegrationPhase.ABORTED), _utc_now(), journal_id),
             )
             self._touch_package(connection, package_id)
             return _load_package_state(connection).packages[package_id]

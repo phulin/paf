@@ -97,15 +97,6 @@ class ReservationDecision(StrEnum):
     CONFLICT = "conflict"
 
 
-class IntegrationPhase(StrEnum):
-    PREPARED = "prepared"
-    VALIDATING = "validating"
-    VALIDATED = "validated"
-    IMPORTING = "importing"
-    FINALIZED = "finalized"
-    ABORTED = "aborted"
-
-
 def normalize_capability_key(value: str) -> str:
     """Return the stable comparison form used by capability ownership."""
 
@@ -136,8 +127,6 @@ class CapabilityPackage:
     textbook_refs: tuple[str, ...] = ()
     write_scope: tuple[str, ...] = ()
     expansion_scope: tuple[str, ...] = ()
-    base_revision: str = ""
-    branch: str = ""
     parent_package_id: str | None = None
     plan_revision: int = 0
     integrated_revision: str | None = None
@@ -341,10 +330,7 @@ class PackageRecovery:
     package_id: str
     prior_generation: int
     recovered_generation: int
-    candidate_revision: str
-    candidate_digest: str
     active_child_workers: tuple[str, ...] = ()
-    journal_phase: IntegrationPhase | None = None
     recovered_at: str = ""
 
 
@@ -364,22 +350,6 @@ class RelevantReadInterface:
     source_revision: str = ""
 
 
-@dataclass(frozen=True)
-class IntegrationJournal:
-    id: str
-    package_id: str
-    lease_generation: int
-    base_revision: str
-    candidate_revision: str
-    canonical_revision_before: str
-    phase: IntegrationPhase
-    validation_digest: str = ""
-    canonical_revision_after: str | None = None
-    provisional_consumer_ids: tuple[str, ...] = ()
-    created_at: str = ""
-    updated_at: str = ""
-
-
 def package_step_key(package_id: str, step_id: str) -> str:
     """Return the in-memory key for a package-local plan step."""
 
@@ -396,7 +366,6 @@ class PackageState:
     reservations: dict[str, PathReservation] = field(default_factory=dict)
     dependencies: tuple[PackageDependency, ...] = ()
     relevant_read_interfaces: tuple[RelevantReadInterface, ...] = ()
-    integration_journal: dict[str, IntegrationJournal] = field(default_factory=dict)
 
     def package_for_capability(self, capability_key: str) -> CapabilityPackage | None:
         key = normalize_capability_key(capability_key)
@@ -446,7 +415,6 @@ class PackageState:
             "path_reservations": records(self.reservations),
             "package_dependencies": [asdict(value) for value in self.dependencies],
             "relevant_read_interfaces": [asdict(value) for value in self.relevant_read_interfaces],
-            "integration_journal": records(self.integration_journal),
         }
 
 

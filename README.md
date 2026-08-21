@@ -509,7 +509,7 @@ The dashboard shows:
 - the active coordinator build's mode, stage, iteration, target progress, current chapter, owner, and
   queued build count;
 - capability-package lifecycle, consumers, plan steps, evidence, Steward lease, reservations,
-  dependencies, and integration journal;
+  dependencies, validation evidence, and integrated canonical revision;
 - aggregate `pending`, `queued`, `running`, `succeeded`, `failed`, `blocked`, and `interrupted`
   chapter counts for discover, formalize, review, and prove;
 - each chapter's status and attempt count in every stage, plus independent exact-build freshness;

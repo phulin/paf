@@ -27,7 +27,7 @@ it only after conflict checks. Every new or revised plan step names exact paths,
 focused commands. Completed clean steps remain recorded across replans. Worker assignments must
 reference ready leaf steps and may not delegate placement or lifecycle decisions.
 
-PAF independently verifies paths, commits, declarations, focused checks, package builds, dependency
-revisions, and consumer acceptance before it accepts your proposals or integrates the branch.
-PAF owns the durable candidate ref; do not create or manipulate Git commits or branches yourself.
+PAF independently verifies paths, declarations, focused checks, package builds, dependency
+revisions, and consumer acceptance. It collects your scoped overlay delta into canonical source at
+the end of the turn; do not create or manipulate Git commits or branches yourself.
 Return only the required structured report.

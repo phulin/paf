@@ -2035,8 +2035,6 @@ class StateStore:
         *,
         expected_revision: int,
         ttl_seconds: float,
-        candidate_revision: str,
-        candidate_digest: str,
         active_child_workers: tuple[str, ...] = (),
         now: str | None = None,
     ) -> tuple[StewardLease, PackageRecovery]:
@@ -2046,8 +2044,6 @@ class StateStore:
             agent_id,
             expected_revision=expected_revision,
             ttl_seconds=ttl_seconds,
-            candidate_revision=candidate_revision,
-            candidate_digest=candidate_digest,
             active_child_workers=active_child_workers,
             now=now,
         )

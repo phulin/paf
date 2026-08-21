@@ -1,12 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-import fcntl
-import os
-import re
-import subprocess
-from collections.abc import Awaitable, Callable, Iterator
-from contextlib import contextmanager, suppress
+from collections.abc import Awaitable, Callable
+from contextlib import suppress
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from hashlib import sha256
@@ -19,8 +15,6 @@ from paf.package_model import (
     CapabilityPackage,
     ConsumerStatus,
     EvidenceKind,
-    IntegrationJournal,
-    IntegrationPhase,
     PackageConsumer,
     PackageDependency,
     PackageDisposition,
@@ -39,10 +33,6 @@ from paf.package_model import (
 from paf.state_db import StateDatabase
 
 
-class PackageGitError(RuntimeError):
-    pass
-
-
 class PackageReportError(ValueError):
     """A model report requested a mutation outside its fenced package authority."""
 
@@ -56,8 +46,17 @@ class PackageWorkspace:
     """One private, in-flight package overlay owned by the isolation layer."""
 
     root: Path
-    changed_paths: Callable[[], Awaitable[tuple[str, ...]]]
+    integrate: Callable[[tuple[str, ...], str], Awaitable[PackageImport]]
     close: Callable[[], Awaitable[None]]
+
+
+@dataclass(frozen=True)
+class PackageImport:
+    """One accepted overlay delta imported and committed on canonical source."""
+
+    changed_paths: tuple[str, ...]
+    commit: str
+    canonical_revision: str
 
 
 @dataclass(frozen=True)
@@ -65,273 +64,6 @@ class InterfaceChange:
     interface_id: str
     expected_digest: str
     actual_digest: str | None
-
-
-@dataclass(frozen=True)
-class IntegrationResult:
-    integrated: bool
-    package_id: str
-    candidate_revision: str
-    canonical_revision: str
-    validation_digest: str = ""
-    stale_reason: str = ""
-    journal_id: str = ""
-
-
-@dataclass(frozen=True)
-class IntegrationPreparation:
-    package_id: str
-    candidate_revision: str
-    canonical_revision: str
-
-
-def _slug(value: str) -> str:
-    clean = re.sub(r"[^A-Za-z0-9._-]+", "-", value).strip("-.")
-    if not clean:
-        raise ValueError("package id cannot form a Git branch name")
-    return clean
-
-
-def _reservation_contains(authority_path: str, mode: ReservationMode, path: str) -> bool:
-    return path == authority_path or (
-        mode is ReservationMode.EXCLUSIVE_SUBTREE
-        and path.startswith(f"{authority_path.rstrip('/')}/")
-    )
-
-
-class _Git:
-    def __init__(self, repo: Path) -> None:
-        self.repo = repo.resolve()
-
-    def run_bytes(
-        self,
-        *arguments: str,
-        cwd: Path | None = None,
-        check: bool = True,
-        env: dict[str, str] | None = None,
-    ) -> bytes:
-        result = subprocess.run(
-            ("git", "--literal-pathspecs", *arguments),
-            cwd=cwd or self.repo,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            check=False,
-            env=(os.environ | env) if env is not None else None,
-        )
-        if check and result.returncode:
-            output = result.stdout.decode(errors="replace")
-            raise PackageGitError(
-                f"git {' '.join(arguments[:2])} failed ({result.returncode}): "
-                f"{output[-4000:].strip()}"
-            )
-        return result.stdout
-
-    def run(
-        self,
-        *arguments: str,
-        cwd: Path | None = None,
-        check: bool = True,
-        env: dict[str, str] | None = None,
-    ) -> str:
-        return self.run_bytes(*arguments, cwd=cwd, check=check, env=env).decode(errors="replace")
-
-    def head(self, cwd: Path | None = None) -> str:
-        return self.run("rev-parse", "HEAD", cwd=cwd).strip()
-
-    def branch(self, cwd: Path | None = None) -> str:
-        return self.run("branch", "--show-current", cwd=cwd).strip()
-
-    def status(self, cwd: Path | None = None) -> str:
-        return self.run("status", "--porcelain=v1", "-z", cwd=cwd)
-
-    def dirty_paths(self, cwd: Path | None = None) -> tuple[str, ...]:
-        status = self.status(cwd)
-        paths: set[str] = set()
-        records = status.split("\0")
-        index = 0
-        while index < len(records):
-            record = records[index]
-            index += 1
-            if not record:
-                continue
-            path = record[3:]
-            if record[:2].strip().startswith(("R", "C")) and index < len(records):
-                path = records[index]
-                index += 1
-            paths.add(path)
-        return tuple(sorted(paths))
-
-
-class PackageCandidateStore:
-    """Persist package candidates as Git objects while agents edit only overlays."""
-
-    def __init__(self, repo: Path, state_dir: Path, database: StateDatabase) -> None:
-        self.repo = repo.resolve()
-        self.state_dir = state_dir.resolve()
-        self.database = database
-        self.git = _Git(self.repo)
-        self.indexes = self.state_dir / "package-indexes"
-
-    def branch(self, package_id: str) -> str:
-        return f"paf/package-{_slug(package_id)}"
-
-    def repository_path(self, root: Path, path: str) -> str:
-        """Resolve legacy Lean-project-relative authority against the repository root."""
-
-        direct = root / path
-        direct_tracked = self.git.run_bytes("ls-files", "-z", "--", path).rstrip(b"\0")
-        first_component = root / Path(path).parts[0]
-        if direct.exists() or direct_tracked or first_component.is_dir():
-            return path
-        prefixed = f"lean/{path}"
-        target = root / prefixed
-        tracked = self.git.run_bytes("ls-files", "-z", "--", prefixed).rstrip(b"\0")
-        if target.exists() or target.parent.exists() or tracked:
-            return prefixed
-        return path
-
-    def revision(self, package: CapabilityPackage) -> str:
-        for reference in (package.branch, self.branch(package.id)):
-            resolved = (
-                self.git.run("rev-parse", "--verify", reference, check=False).strip()
-                if reference
-                else ""
-            )
-            if re.fullmatch(r"[0-9a-fA-F]{40,64}", resolved):
-                return resolved
-        return package.base_revision or self.git.head()
-
-    def materialize(self, package: CapabilityPackage, root: Path) -> str:
-        """Replay the durable candidate delta into a fresh canonical overlay."""
-
-        canonical = self.git.head()
-        candidate = self.revision(package)
-        base = package.base_revision or candidate
-        changed = tuple(
-            path
-            for path in self.git.run_bytes("diff", "--name-only", "-z", base, candidate)
-            .decode(errors="surrogateescape")
-            .split("\0")
-            if path
-        )
-        reservations = tuple(
-            value
-            for value in self.database.load_package_state().reservations.values()
-            if value.package_id == package.id
-        )
-        authorities = tuple(
-            (self.repository_path(root, value.normalized_path), value.mode)
-            for value in reservations
-        )
-        invalid = tuple(
-            path
-            for path in changed
-            if not any(
-                _reservation_contains(authority_path, mode, path)
-                for authority_path, mode in authorities
-            )
-        )
-        if invalid:
-            raise PackageGitError(
-                "package candidate contains unreserved paths: " + ", ".join(invalid)
-            )
-        if changed:
-            advanced = tuple(
-                path
-                for path in self.git.run_bytes(
-                    "diff", "--name-only", "-z", base, canonical, "--", *changed
-                )
-                .decode(errors="surrogateescape")
-                .split("\0")
-                if path
-            )
-            if advanced:
-                raise PackageGitError(
-                    "canonical package scope changed since the candidate base: "
-                    + ", ".join(advanced)
-                )
-        for relative in changed:
-            destination = root / relative
-            record = self.git.run_bytes("ls-tree", "-z", candidate, "--", relative)
-            if not record:
-                destination.unlink(missing_ok=True)
-                continue
-            metadata, _separator, _path = record.partition(b"\t")
-            mode, kind, object_id = metadata.decode().split()
-            if kind != "blob" or mode not in {"100644", "100755"}:
-                raise PackageGitError(f"unsupported package candidate entry: {relative}")
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            destination.write_bytes(self.git.run_bytes("cat-file", "blob", object_id))
-            destination.chmod(int(mode[-3:], 8))
-        return canonical
-
-    def commit(
-        self,
-        package: CapabilityPackage,
-        generation: int,
-        root: Path,
-        *,
-        message: str,
-    ) -> tuple[CapabilityPackage, str, tuple[str, ...]]:
-        """Snapshot reserved overlay paths into one candidate commit without checkout."""
-
-        self.database.assert_live_steward_lease(package.id, generation)
-        canonical = self.git.head()
-        state = self.database.load_package_state()
-        reservations = tuple(
-            value
-            for value in state.reservations.values()
-            if value.package_id == package.id and value.lease_generation == generation
-        )
-        paths = tuple(self.repository_path(root, value.normalized_path) for value in reservations)
-        if not paths:
-            raise PackageGitError(f"package {package.id} has no reserved candidate paths")
-        self.indexes.mkdir(parents=True, exist_ok=True)
-        index = self.indexes / f"{_slug(package.id)}-{uuid4().hex}.index"
-        environment = {
-            "GIT_DIR": str(self.repo / ".git"),
-            "GIT_WORK_TREE": str(root),
-            "GIT_INDEX_FILE": str(index),
-        }
-        try:
-            self.git.run("read-tree", canonical, cwd=root, env=environment)
-            self.git.run("add", "-A", "--", *paths, cwd=root, env=environment)
-            changed = tuple(
-                path
-                for path in self.git.run_bytes(
-                    "diff", "--cached", "--name-only", "-z", canonical, cwd=root, env=environment
-                )
-                .decode(errors="surrogateescape")
-                .split("\0")
-                if path
-            )
-            tree = self.git.run("write-tree", cwd=root, env=environment).strip()
-        finally:
-            index.unlink(missing_ok=True)
-        previous = self.revision(package)
-        previous_tree = self.git.run("rev-parse", f"{previous}^{{tree}}").strip()
-        branch = self.branch(package.id)
-        if (
-            tree == previous_tree
-            and package.base_revision == canonical
-            and package.branch == branch
-        ):
-            return package, previous, ()
-        candidate = (
-            previous
-            if tree == previous_tree
-            else self.git.run("commit-tree", tree, "-p", canonical, "-m", message).strip()
-        )
-        self.git.run("update-ref", f"refs/heads/{branch}", candidate)
-        current = self.database.load_package_state().packages[package.id]
-        updated = self.database.update_package_candidate(
-            package.id,
-            expected_revision=current.revision,
-            lease_generation=generation,
-            base_revision=canonical,
-            branch=branch,
-        )
-        return updated, candidate, changed if candidate != previous else ()
 
 
 class RelevantInterfaceGuard:
@@ -374,255 +106,6 @@ class RelevantInterfaceGuard:
         )
 
 
-class PackageIntegrator:
-    """Optimistic two-phase Git integration with a restart-safe durable journal."""
-
-    def __init__(self, repo: Path, state_dir: Path, database: StateDatabase) -> None:
-        self.repo = repo.resolve()
-        self.state_dir = state_dir.resolve()
-        self.database = database
-        self.git = _Git(self.repo)
-        self.candidates = PackageCandidateStore(repo, state_dir, database)
-        self.interfaces = RelevantInterfaceGuard(database)
-        self.lock_path = self.state_dir / "locks" / "canonical-integration.lock"
-
-    @contextmanager
-    def _canonical_lock(self) -> Iterator[None]:
-        self.lock_path.parent.mkdir(parents=True, exist_ok=True)
-        with self.lock_path.open("a+b") as handle:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-            try:
-                yield
-            finally:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-
-    def _require_clean(self, path: Path, label: str) -> None:
-        dirty = self.git.dirty_paths(path)
-        if path.resolve() == self.repo:
-            try:
-                state_prefix = self.state_dir.relative_to(self.repo).as_posix()
-            except ValueError:
-                state_prefix = ""
-            if state_prefix:
-                dirty = tuple(
-                    value
-                    for value in dirty
-                    if value != state_prefix and not value.startswith(f"{state_prefix}/")
-                )
-        if dirty:
-            raise PackageGitError(f"{label} worktree is dirty: {', '.join(dirty)}")
-
-    def _record(self, journal: IntegrationJournal) -> CapabilityPackage:
-        package = self.database.load_package_state().packages[journal.package_id]
-        return self.database.record_integration_journal(journal, expected_revision=package.revision)
-
-    def prepare_candidate(self, package_id: str, lease_generation: int) -> IntegrationPreparation:
-        """Fence the candidate and canonical revisions used by overlay validation."""
-
-        package = self.database.load_package_state().packages[package_id]
-        with self._canonical_lock():
-            self.database.assert_live_steward_lease(package_id, lease_generation)
-            self._require_clean(self.repo, "canonical")
-            canonical = self.git.head()
-            return IntegrationPreparation(package_id, self.candidates.revision(package), canonical)
-
-    def integrate(
-        self,
-        package_id: str,
-        lease_generation: int,
-        *,
-        validate: Callable[[Path], str],
-        interface_digest: Callable[[str], str | None],
-        provisional_consumer_ids: tuple[str, ...] = (),
-        max_stale_retries: int = 2,
-        validated_candidate_revision: str | None = None,
-        validated_canonical_revision: str | None = None,
-    ) -> IntegrationResult:
-        if (validated_candidate_revision is None) != (validated_canonical_revision is None):
-            raise ValueError("prevalidated integration requires both candidate revisions")
-        del max_stale_retries
-        for _attempt in range(1):
-            package = self.database.load_package_state().packages[package_id]
-            with self._canonical_lock():
-                self.database.assert_live_steward_lease(package_id, lease_generation)
-                self._require_clean(self.repo, "canonical")
-                canonical_before = self.git.head()
-                candidate_before = self.candidates.revision(package)
-                if validated_candidate_revision is not None:
-                    if candidate_before != validated_candidate_revision:
-                        return IntegrationResult(
-                            False,
-                            package_id,
-                            candidate_before,
-                            canonical_before,
-                            stale_reason="package candidate changed after validation",
-                        )
-                    if canonical_before != validated_canonical_revision:
-                        return IntegrationResult(
-                            False,
-                            package_id,
-                            candidate_before,
-                            canonical_before,
-                            stale_reason="canonical revision changed during package validation",
-                        )
-                if canonical_before != package.base_revision:
-                    return IntegrationResult(
-                        False,
-                        package_id,
-                        candidate_before,
-                        canonical_before,
-                        stale_reason="canonical package base changed before validation",
-                    )
-                candidate = candidate_before
-                journal = IntegrationJournal(
-                    f"integration-{_slug(package_id)}-{lease_generation}-{uuid4().hex}",
-                    package_id,
-                    lease_generation,
-                    canonical_before,
-                    candidate,
-                    canonical_before,
-                    IntegrationPhase.PREPARED,
-                    provisional_consumer_ids=provisional_consumer_ids,
-                )
-                self._record(journal)
-
-            journal = replace(journal, phase=IntegrationPhase.VALIDATING)
-            self._record(journal)
-            validation_digest = validate(self.repo)
-            if not validation_digest:
-                raise ValueError("package validation must return a non-empty digest")
-            journal = replace(
-                journal,
-                phase=IntegrationPhase.VALIDATED,
-                validation_digest=validation_digest,
-            )
-            self._record(journal)
-
-            with self._canonical_lock():
-                self.database.assert_live_steward_lease(package_id, lease_generation)
-                self._require_clean(self.repo, "canonical")
-                current = self.git.head()
-                package = self.database.load_package_state().packages[package_id]
-                candidate_after_validation = self.candidates.revision(package)
-                if candidate_after_validation != candidate:
-                    journal = replace(journal, phase=IntegrationPhase.ABORTED)
-                    self._record(journal)
-                    return IntegrationResult(
-                        False,
-                        package_id,
-                        candidate,
-                        current,
-                        validation_digest,
-                        "package candidate changed during validation",
-                        journal.id,
-                    )
-                changes = self.interfaces.check(package_id, interface_digest)
-                if current != canonical_before:
-                    journal = replace(journal, phase=IntegrationPhase.ABORTED)
-                    self._record(journal)
-                    return IntegrationResult(
-                        False,
-                        package_id,
-                        candidate,
-                        current,
-                        validation_digest,
-                        "canonical revision changed during validation",
-                        journal.id,
-                    )
-                if changes:
-                    journal = replace(journal, phase=IntegrationPhase.ABORTED)
-                    self._record(journal)
-                    return IntegrationResult(
-                        False,
-                        package_id,
-                        candidate,
-                        current,
-                        validation_digest,
-                        "relevant read interface changed during validation: "
-                        + ", ".join(change.interface_id for change in changes),
-                        journal.id,
-                    )
-                journal = replace(journal, phase=IntegrationPhase.IMPORTING)
-                current_package = self._record(journal)
-                self.git.run("merge", "--ff-only", candidate)
-                canonical_after = self.git.head()
-                finalized = self.database.finalize_package_integration(
-                    journal.id,
-                    expected_revision=current_package.revision,
-                    lease_generation=lease_generation,
-                    canonical_revision_after=canonical_after,
-                )
-                return IntegrationResult(
-                    True,
-                    finalized.id,
-                    candidate,
-                    canonical_after,
-                    validation_digest,
-                    journal_id=journal.id,
-                )
-        raise AssertionError("package integration did not terminate")
-
-    def reconcile(self) -> tuple[IntegrationResult, ...]:
-        results: list[IntegrationResult] = []
-        journals = tuple(
-            journal
-            for journal in self.database.load_package_state().integration_journal.values()
-            if journal.phase is IntegrationPhase.IMPORTING
-        )
-        for journal in journals:
-            with self._canonical_lock():
-                self._require_clean(self.repo, "canonical")
-                canonical = self.git.head()
-                included = (
-                    subprocess.run(
-                        (
-                            "git",
-                            "merge-base",
-                            "--is-ancestor",
-                            journal.candidate_revision,
-                            canonical,
-                        ),
-                        cwd=self.repo,
-                        check=False,
-                    ).returncode
-                    == 0
-                )
-                if not included and canonical == journal.canonical_revision_before:
-                    self.git.run("merge", "--ff-only", journal.candidate_revision)
-                    canonical = self.git.head()
-                    included = True
-                if not included:
-                    self.database.abort_integration_reconciliation(journal.id)
-                    results.append(
-                        IntegrationResult(
-                            False,
-                            journal.package_id,
-                            journal.candidate_revision,
-                            canonical,
-                            journal.validation_digest,
-                            "canonical history diverged from interrupted import",
-                            journal.id,
-                        )
-                    )
-                    continue
-                package = self.database.reconcile_imported_integration(
-                    journal.id,
-                    canonical_revision_after=journal.candidate_revision,
-                    validation_digest=journal.validation_digest,
-                )
-                results.append(
-                    IntegrationResult(
-                        True,
-                        package.id,
-                        journal.candidate_revision,
-                        canonical,
-                        journal.validation_digest,
-                        journal_id=journal.id,
-                    )
-                )
-        return tuple(results)
-
-
 @dataclass(frozen=True)
 class PackageValidation:
     """Authoritative validation evidence produced outside the model report."""
@@ -661,7 +144,7 @@ PackageValidator = Callable[
 ConsumerValidator = Callable[
     [Path, PackageConsumer], ConsumerValidation | Awaitable[ConsumerValidation]
 ]
-WorkspaceProvider = Callable[[CapabilityPackage, int], Awaitable[PackageWorkspace]]
+WorkspaceProvider = Callable[[CapabilityPackage, int, tuple[str, ...]], Awaitable[PackageWorkspace]]
 
 
 async def _await_validation(
@@ -711,7 +194,7 @@ class PackageExecutionLayer:
         if lease_ttl_seconds <= 0 or maximum_worker_steps < 0:
             raise ValueError("package lease ttl must be positive and worker bound nonnegative")
         self.repo = repo.resolve()
-        self.state_dir = state_dir.resolve()
+        del state_dir
         self.database = database
         self.run_steward = run_steward
         self.run_worker = run_worker
@@ -723,9 +206,7 @@ class PackageExecutionLayer:
         self.wake_consumers = wake_consumers
         self.lease_ttl_seconds = lease_ttl_seconds
         self.maximum_worker_steps = maximum_worker_steps
-        self.candidates = PackageCandidateStore(repo, state_dir, database)
-        self.integrator = PackageIntegrator(repo, state_dir, database)
-        self.git = _Git(repo)
+        self.interfaces = RelevantInterfaceGuard(database)
         self._running: set[str] = set()
         self._running_lock = asyncio.Lock()
 
@@ -794,7 +275,7 @@ class PackageExecutionLayer:
             package_id=package_id,
             producer=producer,
             kind=kind,
-            source_revision=package.base_revision,
+            source_revision=package.integrated_revision or "",
             paths=paths,
             declarations=declarations,
             payload=payload,
@@ -822,19 +303,11 @@ class PackageExecutionLayer:
             expires = datetime.fromisoformat(existing.expires_at.replace("Z", "+00:00"))
             if expires > datetime.now(UTC):
                 raise ValueError(f"package {package.id} already has a live Steward")
-        journal = tuple(
-            value for value in state.integration_journal.values() if value.package_id == package.id
-        )
-        latest_phase = max(journal, key=lambda value: value.updated_at).phase if journal else None
-        candidate = self.candidates.revision(package)
         lease, recovery = self.database.recover_steward_lease(
             package.id,
             agent_id,
             expected_revision=package.revision,
             ttl_seconds=self.lease_ttl_seconds,
-            candidate_revision=candidate,
-            candidate_digest=sha256(candidate.encode()).hexdigest(),
-            journal_phase=latest_phase,
         )
         self._append_evidence(
             package.id,
@@ -843,11 +316,7 @@ class PackageExecutionLayer:
             kind=EvidenceKind.LEASE_RECOVERY,
             payload={
                 "prior_generation": recovery.prior_generation,
-                "candidate_revision": recovery.candidate_revision,
-                "candidate_digest": recovery.candidate_digest,
-                "journal_phase": (
-                    str(recovery.journal_phase) if recovery.journal_phase is not None else None
-                ),
+                "discarded_in_flight_overlay": True,
             },
         )
         return lease, self._current(package.id)
@@ -1106,35 +575,18 @@ class PackageExecutionLayer:
         workspace: PackageWorkspace,
         *,
         message: str,
-    ) -> tuple[str, tuple[str, ...]]:
-        changed = await workspace.changed_paths()
+    ) -> PackageImport:
         reservations = tuple(
             value
             for value in self.database.load_package_state().reservations.values()
             if value.package_id == package.id and value.lease_generation == generation
         )
-        authorities = tuple(
-            (self.candidates.repository_path(workspace.root, value.normalized_path), value.mode)
-            for value in reservations
+        if not reservations:
+            raise PackageReportError(f"package {package.id} has no reserved source paths")
+        self.database.assert_live_steward_lease(package.id, generation)
+        return await workspace.integrate(
+            tuple(value.normalized_path for value in reservations), message
         )
-        invalid = tuple(
-            path
-            for path in changed
-            if not any(
-                _reservation_contains(authority_path, mode, path)
-                for authority_path, mode in authorities
-            )
-        )
-        if invalid:
-            raise PackageReportError("package agent edited unreserved paths: " + ", ".join(invalid))
-        updated, candidate, committed = self.candidates.commit(
-            package,
-            generation,
-            workspace.root,
-            message=message,
-        )
-        del updated
-        return candidate, committed
 
     def _apply_dependencies(self, package_id: str, generation: int, report: dict[str, Any]) -> bool:
         requested = self._items(report, "package_dependency_requests")
@@ -1261,8 +713,8 @@ class PackageExecutionLayer:
         package_id: str,
         generation: int,
         report: dict[str, Any],
-        workspace: PackageWorkspace,
-    ) -> tuple[str, ...]:
+        canonical_revision: str,
+    ) -> tuple[tuple[str, ...], str]:
         assignments = self._items(report, "worker_assignments")
         if len(assignments) > self.maximum_worker_steps:
             raise PackageReportError("Steward exceeded the bounded worker-step limit")
@@ -1270,7 +722,6 @@ class PackageExecutionLayer:
         for assignment in assignments:
             worker_id = str(assignment.get("worker_id", ""))
             step = self._ready_step(package_id, str(assignment.get("step_id", "")))
-            before = self.candidates.revision(self._current(package_id))
             package = self._current(package_id)
             package = self.database.upsert_package_step(
                 replace(
@@ -1292,33 +743,20 @@ class PackageExecutionLayer:
                     for item in self.database.load_package_state().evidence_for(package_id)
                 ],
             }
-            self.database.assert_live_steward_lease(package_id, generation)
-            worker_report = await self.run_worker(package, step, packet, workspace.root)
-            if str(worker_report.get("step_id", "")) != step.id:
-                raise PackageReportError("worker report names the wrong step")
-            after, _committed = await self._commit_overlay_edits(
-                self._current(package_id),
-                generation,
-                workspace,
-                message=f"feat(packages): implement {step.objective}",
-            )
-            changed = tuple(
-                sorted(
-                    set(
-                        self.git.run("diff", "--name-only", f"{before}..{after}")
-                        .strip()
-                        .splitlines()
-                    )
-                    - {""}
+            workspace = await self.acquire_workspace(package, generation, step.intended_paths)
+            try:
+                self.database.assert_live_steward_lease(package_id, generation)
+                worker_report = await self.run_worker(package, step, packet, workspace.root)
+                if str(worker_report.get("step_id", "")) != step.id:
+                    raise PackageReportError("worker report names the wrong step")
+                imported = await workspace.integrate(
+                    step.intended_paths,
+                    f"feat(packages): implement {step.objective}",
                 )
-            )
-            intended_paths = {
-                self.candidates.repository_path(workspace.root, path)
-                for path in step.intended_paths
-            }
-            if not set(changed).issubset(intended_paths):
-                raise PackageReportError(f"worker {worker_id} edited outside its assigned paths")
-            validation = await _await_validation(self.validate_step(workspace.root, step))
+                canonical_revision = imported.canonical_revision
+            finally:
+                await workspace.close()
+            validation = await _await_validation(self.validate_step(self.repo, step))
             accepted = bool(worker_report.get("complete")) and validation.succeeded
             package = self._current(package_id)
             self.database.upsert_package_step(
@@ -1326,7 +764,9 @@ class PackageExecutionLayer:
                     step,
                     status=(PackageStepStatus.COMPLETE if accepted else PackageStepStatus.BLOCKED),
                     assigned_worker_id=worker_id,
-                    commit_ids=(*step.commit_ids, after) if after != before else step.commit_ids,
+                    commit_ids=(
+                        (*step.commit_ids, imported.commit) if imported.commit else step.commit_ids
+                    ),
                     remaining_gap=str(worker_report.get("remaining_gap", "")),
                 ),
                 expected_revision=package.revision,
@@ -1338,13 +778,13 @@ class PackageExecutionLayer:
                 producer=worker_id,
                 kind=EvidenceKind.WORKER_REPORT,
                 payload={"report": worker_report, "validation": validation.__dict__},
-                paths=changed,
+                paths=imported.changed_paths,
                 declarations=tuple(
                     str(value) for value in worker_report.get("changed_declarations", ())
                 ),
             )
             completed_workers.append(worker_id)
-        return tuple(completed_workers)
+        return tuple(completed_workers), canonical_revision
 
     async def _validate_consumers(
         self, package_id: str, generation: int, worktree: Path
@@ -1474,7 +914,7 @@ class PackageExecutionLayer:
         workspace: PackageWorkspace | None = None
         try:
             package = self._reserve_initial_scope(package, generation)
-            workspace = await self.acquire_workspace(package, generation)
+            workspace = await self.acquire_workspace(package, generation, package.write_scope)
             package = self.database.update_package_lifecycle(
                 package_id,
                 PackageStatus.INVESTIGATING,
@@ -1506,24 +946,30 @@ class PackageExecutionLayer:
             self._expand_scope(package_id, generation, report)
             self._apply_plan(package_id, generation, report)
             package = self._current(package_id)
-            steward_commit, steward_changed = await self._commit_overlay_edits(
+            steward_import = await self._commit_overlay_edits(
                 package,
                 generation,
                 workspace,
                 message=f"feat(packages): implement {package.title}",
             )
-            if steward_changed:
+            await workspace.close()
+            workspace = None
+            canonical_revision = steward_import.canonical_revision
+            if steward_import.changed_paths:
                 self._append_evidence(
                     package_id,
                     generation,
                     producer=lease.agent_id,
                     kind=EvidenceKind.COMMIT,
-                    payload={"commit_id": steward_commit, "owner": "Steward"},
+                    payload={"commit_id": steward_import.commit, "owner": "Steward"},
+                    paths=steward_import.changed_paths,
                 )
-            await self._assess_steward_steps(package_id, generation, report, workspace.root)
+            await self._assess_steward_steps(package_id, generation, report, self.repo)
             self._apply_consumer_classifications(package_id, generation, report)
             has_dependencies = self._apply_dependencies(package_id, generation, report)
-            workers = await self._run_workers(package_id, generation, report, workspace)
+            workers, canonical_revision = await self._run_workers(
+                package_id, generation, report, canonical_revision
+            )
             package = self._current(package_id)
             package = self.database.update_package_lifecycle(
                 package_id,
@@ -1531,13 +977,7 @@ class PackageExecutionLayer:
                 expected_revision=package.revision,
                 lease_generation=generation,
             )
-            preparation = await asyncio.to_thread(
-                self.integrator.prepare_candidate, package_id, generation
-            )
-            package = self._current(package_id)
-            package_validation = await _await_validation(
-                self.validate_package(workspace.root, package)
-            )
+            package_validation = await _await_validation(self.validate_package(self.repo, package))
             self._append_evidence(
                 package_id,
                 generation,
@@ -1551,49 +991,51 @@ class PackageExecutionLayer:
                     package_id,
                     PackageStatus.IMPLEMENTING,
                     expected_revision=current.revision,
+                    integrated_revision=canonical_revision,
                     lease_generation=generation,
                 )
                 return PackageExecutionResult(
                     package_id,
                     generation,
                     failed.status,
+                    canonical_revision,
                     worker_ids=workers,
                     detail=package_validation.evidence,
                 )
-            accepted, affected = await self._validate_consumers(
-                package_id, generation, workspace.root
-            )
-            current = self._current(package_id)
-            self.database.update_package_lifecycle(
-                package_id,
-                PackageStatus.INTEGRATING,
-                expected_revision=current.revision,
-                lease_generation=generation,
-            )
-            integration = await asyncio.to_thread(
-                self.integrator.integrate,
-                package_id,
-                generation,
-                validate=lambda _path: package_validation.digest,
-                interface_digest=self.interface_digest,
-                provisional_consumer_ids=accepted,
-                validated_candidate_revision=preparation.candidate_revision,
-                validated_canonical_revision=preparation.canonical_revision,
-            )
-            if not integration.integrated:
+            interface_changes = self.interfaces.check(package_id, self.interface_digest)
+            if interface_changes:
                 current = self._current(package_id)
                 stale = self.database.update_package_lifecycle(
                     package_id,
                     PackageStatus.INVESTIGATING,
                     expected_revision=current.revision,
+                    integrated_revision=canonical_revision,
                     lease_generation=generation,
+                )
+                detail = "relevant read interface changed during validation: " + ", ".join(
+                    change.interface_id for change in interface_changes
                 )
                 return PackageExecutionResult(
                     package_id,
                     generation,
                     stale.status,
+                    canonical_revision,
                     worker_ids=workers,
-                    detail=integration.stale_reason,
+                    detail=detail,
+                )
+            accepted, affected = await self._validate_consumers(package_id, generation, self.repo)
+            for consumer_id in accepted:
+                state = self.database.load_package_state()
+                consumer = state.consumers[consumer_id]
+                self.database.update_package_consumer(
+                    replace(
+                        consumer,
+                        status=ConsumerStatus.ACCEPTED,
+                        accepted_revision=canonical_revision,
+                        residual_goal="",
+                    ),
+                    expected_revision=state.packages[package_id].revision,
+                    lease_generation=generation,
                 )
             if report.get("disposition") == "decomposed":
                 self._decompose(package_id, generation, report)
@@ -1603,7 +1045,7 @@ class PackageExecutionLayer:
                     package_id,
                     generation,
                     PackageStatus.DECOMPOSED,
-                    integration.canonical_revision,
+                    canonical_revision,
                     workers,
                     accepted,
                     affected,
@@ -1618,7 +1060,7 @@ class PackageExecutionLayer:
                 status,
                 disposition=disposition,
                 expected_revision=current.revision,
-                integrated_revision=integration.canonical_revision,
+                integrated_revision=canonical_revision,
                 lease_generation=generation,
             )
             if affected and self.wake_consumers is not None:
@@ -1627,7 +1069,7 @@ class PackageExecutionLayer:
                 package_id,
                 generation,
                 final.status,
-                integration.canonical_revision,
+                canonical_revision,
                 workers,
                 accepted,
                 affected,

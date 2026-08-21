@@ -656,7 +656,7 @@ async def test_dependency_packages_bypass_fuse(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_package_agents_use_private_overlays_with_shared_dependencies(tmp_path: Path) -> None:
+async def test_agent_overlay_collects_source_with_shared_dependencies(tmp_path: Path) -> None:
     config_path = write_project(tmp_path, chapters="chapters = [1]")
     dependency = tmp_path / "lean" / ".lake" / "packages" / "dep" / "dependency.olean"
     dependency.parent.mkdir(parents=True)
@@ -666,13 +666,16 @@ async def test_package_agents_use_private_overlays_with_shared_dependencies(tmp_
     canonical_source.parent.mkdir(parents=True)
     canonical_source.write_bytes(b"def packageTarget := 1\n")
     await manager.prepare()
-    workspace = await manager.acquire("package-candidate")
+    workspace = await manager.acquire("package-agent")
     source = workspace.root / chapter.scope[0]
     original = canonical_source.read_bytes()
     try:
-        source.write_bytes(original + b"\n-- package candidate\n")
-        assert await workspace.changed_paths() == (chapter.scope[0],)
-        assert canonical_source.read_bytes() == original
+        changed_source = original + b"\n-- accepted overlay edit\n"
+        source.write_bytes(changed_source)
+        result = await workspace.collect(chapter)
+        assert result.accepted
+        assert result.changed_paths == (chapter.scope[0],)
+        assert canonical_source.read_bytes() == changed_source
         assert (workspace.root / dependency.relative_to(tmp_path)).read_bytes() == (
             b"shared dependency"
         )

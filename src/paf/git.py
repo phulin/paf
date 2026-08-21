@@ -122,6 +122,11 @@ class GitCommitter:
                 + ", ".join(dirty)
             )
 
+    async def head(self) -> str:
+        """Return the canonical repository revision."""
+
+        return (await self._checked("rev-parse", "HEAD")).strip() if self.enabled else ""
+
     async def commit(
         self,
         chapter: WorkUnitLike,

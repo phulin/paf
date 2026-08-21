@@ -66,11 +66,8 @@ pub struct CapabilityPackage {
     pub textbook_refs: Vec<String>,
     pub write_scope: Vec<String>,
     pub expansion_scope: Vec<String>,
-    pub base_revision: String,
     pub plan_revision: usize,
     pub revision: usize,
-    pub branch: String,
-    pub worktree: String,
     pub parent_package_id: Option<String>,
     pub integrated_revision: Option<String>,
     pub created_at: String,
@@ -162,22 +159,6 @@ pub struct RelevantReadInterface {
     pub interface_id: String,
     pub digest: String,
     pub source_revision: String,
-}
-
-#[derive(Clone, Debug, Default, Deserialize)]
-#[serde(default)]
-pub struct IntegrationJournal {
-    pub id: String,
-    pub package_id: String,
-    pub lease_generation: usize,
-    pub base_revision: String,
-    pub phase: String,
-    pub candidate_revision: String,
-    pub canonical_revision_before: String,
-    pub canonical_revision_after: Option<String>,
-    pub validation_digest: String,
-    pub provisional_consumer_ids: Vec<String>,
-    pub updated_at: String,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -320,7 +301,6 @@ pub struct SwarmState {
     pub path_reservations: HashMap<String, PathReservation>,
     pub package_dependencies: Vec<PackageDependency>,
     pub relevant_read_interfaces: Vec<RelevantReadInterface>,
-    pub integration_journal: HashMap<String, IntegrationJournal>,
     pub scheduling: Scheduling,
     pub source_dependency_tree: SourceDependencyTree,
     pub isolation: Isolation,
@@ -386,7 +366,6 @@ pub struct GlobalDelta {
     pub path_reservations: Option<HashMap<String, PathReservation>>,
     pub package_dependencies: Option<Vec<PackageDependency>>,
     pub relevant_read_interfaces: Option<Vec<RelevantReadInterface>>,
-    pub integration_journal: Option<HashMap<String, IntegrationJournal>>,
     pub scheduling: Option<Scheduling>,
     pub source_dependency_tree: Option<SourceDependencyTree>,
     pub isolation: Option<Isolation>,
@@ -631,10 +610,6 @@ impl DashboardModel {
         apply_optional(
             &mut self.state.relevant_read_interfaces,
             delta.globals.relevant_read_interfaces,
-        );
-        apply_optional(
-            &mut self.state.integration_journal,
-            delta.globals.integration_journal,
         );
         apply_optional(&mut self.state.scheduling, delta.globals.scheduling);
         apply_optional(

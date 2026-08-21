@@ -35,9 +35,8 @@ acceptance predicates.
    an agent edits it.
 4. Agents read repository-wide without read locks. Relevant read dependencies are protected by
    interface digests checked before integration.
-5. All package edits occur in a private fuse-overlay workspace. No package agent edits the
-   canonical checkout or shares a writable overlay concurrently with another agent. Durable
-   progress is a Git candidate ref created by PAF, never a checked-out package worktree.
+5. Every package agent edits a private fuse-overlay workspace. At the end of that agent turn, PAF
+   scopes and imports its accepted delta into canonical source exactly like an ordinary agent run.
 6. The package outcome is repository state, not an answer sent to another agent. A reusable result
    is complete only when its declaration exists, is placeholder-free, validates, and has passed the
    applicable consumer checks.
@@ -47,8 +46,8 @@ acceptance predicates.
    dependencies are atomic.
 9. Model reports are proposals and evidence. PAF alone grants leases, reserves paths, changes
    durable status, imports commits, and records acceptance.
-10. A crash, expired agent, stale worktree, or partially completed integration cannot publish stale
-    edits or create two owners for the same package.
+10. A crash or expired agent cannot publish its uncollected overlay or create two owners for the
+    same package.
 
 ## Conceptual model
 
@@ -112,9 +111,6 @@ CapabilityPackage
   steward_lease
   write_scope
   expansion_scope
-  base_revision
-  branch
-  worktree
   consumer_ids
   evidence_ids
   step_ids
@@ -225,16 +221,6 @@ PathReservation
   package_id
   lease_generation
   acquired_at
-
-IntegrationJournal
-  package_id
-  lease_generation
-  base_revision
-  candidate_revision
-  canonical_revision_before
-  phase
-  validation_digest
-  canonical_revision_after
 ```
 
 The lease generation is a fencing token. Every package mutation and integration operation supplies
@@ -344,10 +330,9 @@ A worker cannot change placement, expand scope, split the package, attach consum
 package completion. If it discovers that the objective is wrongly placed or needs another file, it
 returns evidence to the Steward without editing that path.
 
-The default execution mode is sequential workers in one private package overlay: one worker edits
-and yields, then PAF snapshots the reserved delta into the package candidate ref before another
-worker uses it. Agents never manipulate package branches or commits themselves, and two agents
-never edit the same overlay concurrently.
+Workers run sequentially, each in a fresh private overlay based on canonical source. PAF imports and
+commits one accepted scoped turn before acquiring the next worker's overlay. Agents never manipulate
+Git branches or commits themselves, and two agents never edit the same overlay concurrently.
 
 Worker failure does not create a peer request or a new review loop. Its report and validation become
 package evidence. The Steward revises the step, handles it directly, or splits a genuinely
@@ -410,29 +395,22 @@ When package A requests a path held by package B, PAF resolves the conflict in t
    and revalidate after B integrates.
 4. If the work is independent but physically colocated, queue A's expansion until B checkpoints and
    integrates.
-5. If B's lease has expired, fence its agent, freeze its worktree, and recover B before deciding
-   whether its reservations can be released.
+5. If B's lease has expired, fence its agent, discard any uncollected overlay, and recover B before
+   deciding whether its reservations can be released.
 
 The scheduler changes the package graph. It never instructs the agents to negotiate ownership by
 passing messages back and forth.
 
-### Worktrees
+### Overlay agent workspaces
 
-Each package generation uses an isolated worktree and branch:
+Each Steward turn and each bounded worker turn uses the same fuse-overlay workspace mechanism as an
+ordinary PAF agent. The overlay is in-flight process state, not a durable package checkout. PAF
+collects only reserved paths, performs stale-scope checks under the source barrier, imports the delta
+into canonical source, creates the coordinator-owned commit, and closes the overlay. The next turn
+starts from that canonical commit.
 
-```text
-.paf/worktrees/package-P42/
-paf/package-P42/generation-3
-```
-
-The package records its base revision, current branch HEAD, dirty-path digest, and latest validation
-digest. Before every agent run PAF verifies that the actual worktree matches the record. A dirty
-worktree from an interrupted agent is frozen and presented to the replacement Steward as inherited
-work; it is never automatically discarded.
-
-Child workers that run concurrently use child branches and worktrees. Their path subsets must be
-disjoint. The parent Steward integrates child commits into the package branch and resolves logical
-conflicts before package-level validation.
+If a turn is interrupted before collection, its edits were never accepted and are discarded. Work
+already collected at the end of an earlier turn is durable on the canonical branch.
 
 ### Read dependencies
 
@@ -444,24 +422,12 @@ Before integration PAF recomputes those digests. Implementation-only changes tha
 recorded interface do not invalidate the package. A relevant interface change returns affected
 steps to investigation or validation; it never permits a stale commit to publish automatically.
 
-### Integration lock
+### Source barrier
 
-Canonical Git integration uses one short-lived repository lock and an optimistic two-phase
-protocol. The Steward never holds the lock while thinking, editing, or running a long Lean build.
-PAF first captures canonical HEAD while acquiring the package overlay, replays the durable candidate
-delta there, and snapshots accepted reserved edits into a candidate commit whose parent is that
-exact revision. It then runs interface checks, focused validation, and affected builds in the
-private overlay.
-
-After validation PAF reacquires the lock. If canonical HEAD or any relevant interface digest has
-changed, it releases the lock and leaves the candidate ready for a fresh overlay round. Otherwise it imports the
-validated commits, records the new canonical revision and consumer results, releases paths no longer
-needed, and releases the integration lock. Thus no long validation blocks unrelated integrations,
-while no candidate validated against a stale base can publish.
-
-The integration journal makes these phases restart-safe. A commit found on the canonical branch
-without the final state update is reconciled by commit identity and validation digest; it is not
-blindly applied again.
+Overlay collection and the coordinator-owned canonical commit occur under the same short source
+barrier used by ordinary agents. Thinking, editing, and Lean validation do not hold that barrier.
+Scoped manifest comparison rejects a stale overlay when another accepted turn changed its assigned
+paths. Relevant interface digests are checked again before package or consumer acceptance.
 
 ### Lease expiry and fencing
 
@@ -469,9 +435,9 @@ The Steward heartbeats while it is inspecting, editing, waiting for workers, val
 integrating. Lease expiry makes the package eligible for recovery, but the fencing generation is
 what makes recovery safe. Every later state write or integration from the expired agent is rejected.
 
-Recovery records the worktree HEAD, status, diff digest, active child workers, and journal phase;
-increments the generation; and assigns a new Steward. Reservations remain with the package during
-recovery so another package cannot overwrite unfinished work.
+Recovery increments the generation and assigns a new Steward. Any uncollected overlay belonged to
+the expired agent and is discarded; accepted earlier turns are already canonical. Reservations
+remain with the package during recovery so another package cannot overwrite its scope.
 
 ## Package dependencies, merging, and splitting
 
@@ -481,7 +447,7 @@ but consumer acceptance waits for the dependency revision it recorded.
 
 Merging packages combines capability aliases, consumers, evidence, completed steps, dependencies,
 and reservations in one atomic operation. Only one Steward lease survives; the other agent is
-fenced and its worktree becomes an integration input to the surviving package.
+fenced, and any uncollected overlay is discarded.
 
 Splitting creates child packages only when the remaining capabilities are independently placeable
 and independently acceptable. Completed declarations stay with the package that owns their natural
@@ -507,7 +473,7 @@ its own file compiles.
 ### Package validation
 
 - every modified file compiles independently;
-- affected import dependents build against the candidate branch;
+- affected import dependents build against canonical source;
 - package-level focused tests pass;
 - new public interfaces match the plan or have an explicit revised plan;
 - relevant textbook statements and dependency direction are preserved;
@@ -517,7 +483,7 @@ its own file compiles.
 ### Consumer acceptance
 
 Each consumer has its own acceptance contract. Normally PAF runs a focused check of the named
-declaration on the integrated package branch. A consumer is accepted when its original blocker is
+declaration on canonical source. A consumer is accepted when its original blocker is
 gone and validation reaches the declaration without introducing a new package-owned obstruction.
 
 If the shared interface validates but the consumer exposes unrelated local work, the capability is
@@ -636,12 +602,12 @@ PAF validates all ids, paths, dependency edges, and lease generations. A report 
 scope or publish an edit. Free-form explanation is retained as evidence but never parsed to drive a
 state transition.
 
-Worker reports are smaller: changed declarations, commit, focused validation, exact remaining gap,
+Worker reports are smaller: changed declarations, focused validation, exact remaining gap,
 and newly discovered evidence. A worker cannot return ownership or lifecycle decisions.
 
 ## Persistence and recovery
 
-Packages, consumers, steps, evidence, leases, reservations, dependencies, and integration journals
+Packages, consumers, steps, evidence, leases, reservations, and dependencies
 belong in normalized durable tables. Runs continue to use the existing run history and token
 accounting. Package snapshots in status output are derived views rather than the authoritative
 record.
@@ -659,13 +625,11 @@ operations are transactional:
 - record consumer acceptance;
 - finalize integration and release reservations.
 
-Startup reconciliation handles worktree and Git state before assigning agents. It can recover:
+Startup recovery handles fenced package state before assigning agents. It can recover:
 
 - a lease with no live process;
-- a dirty package or child worktree;
-- a committed worker step not yet recorded complete;
-- a rebased and validated package not yet imported;
-- a canonical commit whose package state was not finalized;
+- a package whose prior Steward lease expired;
+- reservations or queued expansions fenced to the prior generation;
 - a package whose relevant read interfaces changed while it was idle.
 
 No recovery path infers mathematical success from an agent report or process exit code alone.
@@ -679,7 +643,7 @@ The primary UI object is the package, not a collection of peer requests. It shou
 - reserved and requested paths;
 - plan steps, dependencies, assigned workers, and commits;
 - package dependencies and downstream impact;
-- latest validation and integration journal phase;
+- latest validation evidence and integrated canonical revision;
 - exact parked, external, or statement-revision reason;
 - model usage, elapsed time, and cost for the package and its workers.
 
@@ -693,13 +657,13 @@ the configured validation evidence.
 The Steward design is substantively complete when the following properties hold:
 
 - two consumers of one missing result attach to one active package;
-- one Steward can modify and validate several reserved files in an isolated worktree;
+- one Steward can modify and validate several reserved files in an isolated overlay;
 - a weak worker receives and completes a small dependency-ordered lemma without gaining package
   authority;
 - conflicting path expansions create a merge, dependency, or queue decision without agent
   messaging or deadlock;
 - an expired Steward cannot update state or integrate after a new generation is assigned;
-- dirty and partially integrated work survives restart without duplicate commits;
+- accepted turns survive restart as canonical commits while uncollected overlays are discarded;
 - a package can close one consumer while splitting another consumer's new obstruction;
 - shared declarations are placed in appropriate earlier files and are not repeated in consumers;
 - old upstream requests import into packages and no new request/answer/retry loop is created;

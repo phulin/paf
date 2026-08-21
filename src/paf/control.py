@@ -106,11 +106,6 @@ def _package_view(state: PackageState, package_id: str) -> dict[str, Any]:
             for value in snapshot["package_dependencies"]
             if value.get("package_id") == package_id
         ],
-        "integration": [
-            value
-            for value in snapshot["integration_journal"].values()
-            if value.get("package_id") == package_id
-        ],
     }
 
 

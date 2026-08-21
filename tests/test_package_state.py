@@ -11,8 +11,6 @@ from paf.package_model import (
     CapabilityPackage,
     ConsumerStatus,
     EvidenceKind,
-    IntegrationJournal,
-    IntegrationPhase,
     PackageConsumer,
     PackageDependency,
     PackageDisposition,
@@ -72,23 +70,24 @@ def database(tmp_path: Path) -> StateDatabase:
     return result
 
 
-def test_schema_v8_migrates_package_worktrees_to_candidate_refs(tmp_path: Path) -> None:
+def test_schema_v9_removes_git_candidate_state(tmp_path: Path) -> None:
     store = database(tmp_path)
     with sqlite3.connect(store.path) as connection, connection:
         connection.execute(
-            "ALTER TABLE capability_packages ADD COLUMN worktree TEXT NOT NULL DEFAULT ''"
+            "ALTER TABLE capability_packages ADD COLUMN base_revision TEXT NOT NULL DEFAULT ''"
         )
         connection.execute(
-            "ALTER TABLE package_recoveries RENAME COLUMN candidate_revision TO worktree_head"
+            "ALTER TABLE capability_packages ADD COLUMN branch TEXT NOT NULL DEFAULT ''"
         )
         connection.execute(
-            "ALTER TABLE package_recoveries RENAME COLUMN candidate_digest TO dirty_digest"
+            "ALTER TABLE package_recoveries ADD COLUMN candidate_revision TEXT NOT NULL DEFAULT ''"
         )
         connection.execute(
-            "ALTER TABLE package_recoveries ADD COLUMN worktree_status TEXT NOT NULL DEFAULT ''"
+            "ALTER TABLE package_recoveries ADD COLUMN candidate_digest TEXT NOT NULL DEFAULT ''"
         )
-        connection.execute("UPDATE meta SET schema_version=8 WHERE singleton=1")
-        connection.execute("PRAGMA user_version=8")
+        connection.execute("ALTER TABLE package_recoveries ADD COLUMN journal_phase TEXT")
+        connection.execute("UPDATE meta SET schema_version=9 WHERE singleton=1")
+        connection.execute("PRAGMA user_version=9")
 
     store.initialize()
 
@@ -101,9 +100,8 @@ def test_schema_v8_migrates_package_worktrees_to_candidate_refs(tmp_path: Path) 
         }
         version = int(connection.execute("PRAGMA user_version").fetchone()[0])
     assert version == SCHEMA_VERSION
-    assert "worktree" not in package_columns
-    assert {"candidate_revision", "candidate_digest"}.issubset(recovery_columns)
-    assert not {"worktree_head", "worktree_status", "dirty_digest"} & recovery_columns
+    assert not {"worktree", "base_revision", "branch"} & package_columns
+    assert not {"candidate_revision", "candidate_digest", "journal_phase"} & recovery_columns
 
 
 def test_package_model_normalizes_identity_and_repository_paths() -> None:
@@ -270,27 +268,11 @@ def test_package_mutations_are_revisioned_and_lease_fenced(tmp_path: Path) -> No
         expected_revision=current.revision,
         lease_generation=3,
     )
-    current = store.record_integration_journal(
-        IntegrationJournal(
-            "journal-a",
-            "package-a",
-            3,
-            "base",
-            "candidate",
-            "canonical",
-            IntegrationPhase.PREPARED,
-            created_at=NOW,
-            updated_at=NOW,
-        ),
-        expected_revision=current.revision,
-    )
-
     state = store.load_package_state()
     assert state.step("package-a", "step-a").intended_declarations == ("Book.bridge",)
     assert state.leases["package-a"].generation == 3
     assert state.reservations["lean/Book/Chapter01.lean"].package_id == "package-a"
     assert state.relevant_read_interfaces[0].digest == "api-digest"
-    assert state.integration_journal["journal-a"].phase is IntegrationPhase.PREPARED
     current = store.upsert_package_step(
         PackageStep(
             id="step-b",

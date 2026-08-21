@@ -244,10 +244,9 @@ fn draw_package_detail(frame: &mut Frame<'_>, model: &mut DashboardModel) {
             package.status, package.revision, package.plan_revision
         )));
         lines.push(Line::from(package.mathematical_objective.clone()));
-        if !package.base_revision.is_empty() || package.integrated_revision.is_some() {
+        if package.integrated_revision.is_some() {
             lines.push(Line::from(format!(
-                "base {} · integrated {}",
-                short_revision(&package.base_revision),
+                "integrated {}",
                 package
                     .integrated_revision
                     .as_deref()
@@ -451,37 +450,6 @@ fn draw_package_detail(frame: &mut Frame<'_>, model: &mut DashboardModel) {
                 short_revision(&interface.digest),
                 short_revision(&interface.source_revision)
             )));
-        }
-        lines.push(Line::styled("Integration", Style::default().fg(CYAN)));
-        for journal in model
-            .state
-            .integration_journal
-            .values()
-            .filter(|item| item.package_id == package_id)
-        {
-            lines.push(Line::from(format!(
-                "  {} · fence {} · {} → {}",
-                journal.phase,
-                journal.lease_generation,
-                short_revision(&journal.candidate_revision),
-                journal
-                    .canonical_revision_after
-                    .as_deref()
-                    .map(short_revision)
-                    .unwrap_or_else(|| short_revision(&journal.canonical_revision_before))
-            )));
-            if !journal.validation_digest.is_empty() {
-                lines.push(Line::from(format!(
-                    "    validation: {}",
-                    short_revision(&journal.validation_digest)
-                )));
-            }
-            if !journal.provisional_consumer_ids.is_empty() {
-                lines.push(Line::from(format!(
-                    "    provisional: {}",
-                    journal.provisional_consumer_ids.join(", ")
-                )));
-            }
         }
         lines.push(Line::from(""));
         lines.push(Line::styled(
@@ -1936,13 +1904,6 @@ mod tests {
                         "package_id": "package-1", "interface_id": "Mathlib.Transport",
                         "digest": "1234567890abcdef", "source_revision": "abcdef1234567890"
                     }],
-                    "integration_journal": {"journal-1": {
-                        "id": "journal-1", "package_id": "package-1", "phase": "validated",
-                        "lease_generation": 3, "candidate_revision": "fedcba9876543210",
-                        "canonical_revision_before": "0123456789abcdef",
-                        "validation_digest": "9999999999999999",
-                        "provisional_consumer_ids": ["consumer-1"]
-                    }}
                 })),
                 delta: None,
                 preparation: None,
@@ -1965,7 +1926,6 @@ mod tests {
         assert!(rendered.contains("Current handoff"));
         assert!(rendered.contains("prove naturality"));
         assert!(rendered.contains("Mathlib.Transport"));
-        assert!(rendered.contains("provisional: consumer-1"));
     }
 
     #[test]
