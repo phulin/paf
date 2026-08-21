@@ -72,6 +72,11 @@ class EvidenceKind(StrEnum):
     COMMIT = "commit"
     EXTERNAL_DEPENDENCY = "external_dependency"
     UPSTREAM_REQUEST_IMPORT = "upstream_request_import"
+    STEWARD_REPORT = "steward_report"
+    WORKER_REPORT = "worker_report"
+    PLACEMENT_DECISION = "placement_decision"
+    CONSUMER_ACCEPTANCE = "consumer_acceptance"
+    LEASE_RECOVERY = "lease_recovery"
 
 
 class ReservationMode(StrEnum):

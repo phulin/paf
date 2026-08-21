@@ -19,6 +19,8 @@ from paf.codex import (
     DIAGNOSTIC_REVIEW_ROLE,
     DIAGNOSTIC_REVIEW_ROLES,
     DOWNSTREAM_RETRY_ROLE,
+    PACKAGE_STEWARD_ROLE,
+    PACKAGE_WORKER_ROLE,
     PROOF_REVIEW_ROLE,
     REPAIR_WORKER_ROLE,
     SHEPHERD_ROLE,
@@ -68,7 +70,24 @@ from paf.interface_fingerprint import (
 )
 from paf.isolation import FuseWorkspace, IsolationResult, create_isolation
 from paf.models import PipelineConfig, ProofTarget, Stage, WorkUnit, WorkUnitLike
-from paf.package_model import ReservationMode, ReservationSpec
+from paf.package_model import (
+    CapabilityPackage,
+    EvidenceKind,
+    PackageConsumer,
+    PackageDisposition,
+    PackageEvidence,
+    PackageStatus,
+    PackageStep,
+    ReservationMode,
+    ReservationSpec,
+)
+from paf.package_runtime import (
+    ConsumerValidation,
+    PackageExecutionLayer,
+    PackageExecutionResult,
+    PackageReportError,
+    PackageValidation,
+)
 from paf.scope import ScopeMatcher
 from paf.state import (
     BUILD_WARNING_REVIEW_KIND,
@@ -434,6 +453,14 @@ def _with_build_command(work_unit: WorkUnitLike, command: str) -> WorkUnitLike:
     return replace(work_unit, build_command=command)
 
 
+def _with_scope(work_unit: WorkUnitLike, scope: tuple[str, ...]) -> WorkUnitLike:
+    """Create a package assignment whose digest and sandbox cover all reserved paths."""
+
+    if isinstance(work_unit, WorkUnit):
+        return replace(work_unit, target=replace(work_unit._target(), scope=scope))
+    return replace(work_unit, scope=scope)
+
+
 def _scope_digests(
     root: Path,
     by_id: dict[str, WorkUnitLike],
@@ -586,6 +613,24 @@ class Orchestrator:
             tuple[str, Stage], tuple[RunRecord, asyncio.Task[AgentResult]]
         ] = {}
         self._live_agent_retry_requests: set[str] = set()
+        self._package_tasks: dict[str, asyncio.Task[PackageExecutionResult]] = {}
+        self.package_execution = PackageExecutionLayer(
+            config.settings.repo,
+            config.settings.state_dir,
+            state._database,
+            run_steward=self._run_package_steward_agent,
+            run_worker=self._run_package_worker_agent,
+            validate_step=self._validate_package_step,
+            validate_package=self._validate_capability_package,
+            validate_consumer=self._validate_package_consumer,
+            interface_digest=self._package_interface_digest,
+            wake_consumers=self._wake_package_consumers,
+            lease_ttl_seconds=(
+                config.settings.agent_timeout_seconds
+                + config.settings.validation_timeout_seconds
+                + 600
+            ),
+        )
 
     @property
     def chapters(self) -> tuple[WorkUnitLike, ...]:
@@ -595,6 +640,206 @@ class Orchestrator:
 
     def scheduling_snapshot(self) -> dict[str, object]:
         return scheduling_snapshot(self.statement_schedule, self.proof_schedule)
+
+    def _package_anchor(self, package: CapabilityPackage) -> WorkUnitLike:
+        consumers = self.state._database.load_package_state().consumers_for(package.id)
+        anchor_id = next(
+            (
+                consumer.work_unit_id
+                for consumer in consumers
+                if consumer.work_unit_id in self._work_units_by_id
+            ),
+            self.work_units[0].id,
+        )
+        return _with_scope(self._work_units_by_id[anchor_id], package.write_scope)
+
+    async def _package_heartbeat(
+        self, package_id: str, agent_id: str, generation: int, stop: asyncio.Event
+    ) -> None:
+        interval = max(30.0, self.config.settings.agent_timeout_seconds / 4)
+        while True:
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=interval)
+                return
+            except TimeoutError:
+                await self.state.heartbeat_steward_lease(
+                    package_id,
+                    agent_id,
+                    generation,
+                    ttl_seconds=(
+                        self.config.settings.agent_timeout_seconds
+                        + self.config.settings.validation_timeout_seconds
+                        + 600
+                    ),
+                )
+
+    async def _run_package_steward_agent(
+        self, package: CapabilityPackage, dossier: dict[str, Any], worktree: Path
+    ) -> dict[str, Any]:
+        anchor = self._package_anchor(package)
+        lease = self.state._database.load_package_state().leases[package.id]
+        run = await self.state.start_auxiliary_run(
+            anchor.id,
+            Stage.PROVE,
+            role=PACKAGE_STEWARD_ROLE,
+            request_ids=(package.id,),
+            model=self.config.shepherd.model,
+        )
+        stop = asyncio.Event()
+        heartbeat = asyncio.create_task(
+            self._package_heartbeat(package.id, lease.agent_id, lease.generation, stop)
+        )
+        await self.agent_slots.acquire(self.proof_schedule.priority(anchor.document_id))
+        try:
+            result = await self.executor.run_package_steward(
+                anchor, run, dossier, workspace_root=worktree
+            )
+        finally:
+            self.agent_slots.release()
+            stop.set()
+            await asyncio.gather(heartbeat, return_exceptions=True)
+        if not result.succeeded:
+            raise PackageReportError(result.error or "package Steward agent failed")
+        return result.report
+
+    async def _run_package_worker_agent(
+        self,
+        package: CapabilityPackage,
+        step: PackageStep,
+        packet: dict[str, Any],
+        worktree: Path,
+    ) -> dict[str, Any]:
+        anchor = _with_scope(self._package_anchor(package), step.intended_paths)
+        run = await self.state.start_auxiliary_run(
+            anchor.id,
+            Stage.PROVE,
+            role=PACKAGE_WORKER_ROLE,
+            request_ids=(package.id, step.id),
+            model=self.config.shepherd.worker_model,
+        )
+        await self.agent_slots.acquire(self.proof_schedule.priority(anchor.document_id))
+        try:
+            result = await self.executor.run_package_worker(
+                anchor, run, packet, workspace_root=worktree
+            )
+        finally:
+            self.agent_slots.release()
+        if not result.succeeded:
+            raise PackageReportError(result.error or f"package worker {step.id} failed")
+        return result.report
+
+    def _package_owner_units(self, paths: Iterable[str]) -> tuple[WorkUnitLike, ...]:
+        owner_ids = {owner_id for path in paths for owner_id in self._path_owner_ids(str(path))}
+        return tuple(
+            self._work_units_by_id[owner_id]
+            for owner_id in sorted(owner_ids, key=self._work_unit_order.__getitem__)
+        )
+
+    async def _validate_package_units(
+        self, worktree: Path, units: Iterable[WorkUnitLike]
+    ) -> PackageValidation:
+        outputs: list[str] = []
+        succeeded = True
+        for unit in dict.fromkeys(units):
+            result = await validate(self.config, unit, workspace_root=worktree)
+            outputs.append(f"{unit.id}:\n{result.output}")
+            succeeded = succeeded and result.succeeded
+        evidence = "\n\n".join(outputs) or "No configured owner build was required."
+        return PackageValidation(
+            succeeded,
+            hashlib.sha256(evidence.encode()).hexdigest(),
+            evidence,
+        )
+
+    async def _validate_package_step(self, worktree: Path, step: PackageStep) -> PackageValidation:
+        return await self._validate_package_units(
+            worktree, self._package_owner_units(step.intended_paths)
+        )
+
+    async def _validate_capability_package(
+        self, worktree: Path, package: CapabilityPackage
+    ) -> PackageValidation:
+        return await self._validate_package_units(
+            worktree, self._package_owner_units(package.write_scope)
+        )
+
+    async def _validate_package_consumer(
+        self, worktree: Path, consumer: PackageConsumer
+    ) -> ConsumerValidation:
+        unit = self._work_units_by_id.get(consumer.work_unit_id)
+        if unit is None:
+            return ConsumerValidation(
+                False,
+                hashlib.sha256(b"unknown consumer").hexdigest(),
+                f"consumer work unit {consumer.work_unit_id} is outside this scheduler",
+                consumer.id,
+            )
+        validation = await self._validate_package_units(worktree, (unit,))
+        placeholder = declaration_uses_placeholder(worktree, consumer.path, consumer.declaration)
+        accepted = validation.succeeded and placeholder is False
+        evidence = validation.evidence
+        if placeholder is not False:
+            evidence += "\n\nThe consumer declaration still contains a placeholder."
+        return ConsumerValidation(
+            accepted,
+            hashlib.sha256(evidence.encode()).hexdigest(),
+            evidence,
+            consumer.id,
+            (consumer.work_unit_id,),
+        )
+
+    def _package_interface_digest(self, interface_id: str) -> str | None:
+        path = self.config.settings.repo / interface_id
+        if path.is_file():
+            return hashlib.sha256(path.read_bytes()).hexdigest()
+        return None
+
+    async def _wake_package_consumers(self, work_unit_ids: tuple[str, ...]) -> None:
+        for work_unit_id in work_unit_ids:
+            if work_unit_id not in self._work_units_by_id:
+                continue
+            await self.state.set_task(
+                work_unit_id,
+                Stage.PROVE,
+                TaskStatus.PENDING,
+                "accepted capability package changed this consumer",
+            )
+            self._proof_rechecks.add(work_unit_id)
+
+    async def _schedule_ready_packages(self) -> bool:
+        launched = False
+        for package in self.package_execution.ready_packages():
+            if package.id in self._package_tasks:
+                continue
+            task = asyncio.create_task(
+                self._execute_package_task(package.id),
+                name=f"paf-package-{package.id}",
+            )
+            self._package_tasks[package.id] = task
+            launched = True
+        return launched
+
+    async def _execute_package_task(self, package_id: str) -> PackageExecutionResult:
+        try:
+            result = await self.package_execution.execute(package_id)
+            if result.integrated_revision:
+                owners = self._package_owner_units(
+                    self.state._database.load_package_state().packages[package_id].write_scope
+                )
+                self._mark_source_changed(unit.id for unit in owners)
+            return result
+        finally:
+            await self.state.refresh_package_state()
+
+    async def _drain_active_packages(self) -> tuple[PackageExecutionResult, ...]:
+        tasks = tuple(self._package_tasks.values())
+        if not tasks:
+            return ()
+        try:
+            results = await asyncio.gather(*tasks)
+            return tuple(results)
+        finally:
+            self._package_tasks.clear()
 
     async def prepare(
         self,
@@ -638,6 +883,9 @@ class Orchestrator:
         await self.isolation.prepare()
         report("Checking the Git worktree", 8)
         await self.git.prepare()
+        await asyncio.to_thread(self.package_execution.integrator.reconcile)
+        await self.state.refresh_package_state()
+        await self._schedule_ready_packages()
         if self.config.shepherd.enabled:
             restart_cases = await self._discard_persisted_repair_plans()
             self.state.shepherd.next_run_at = (
@@ -721,6 +969,11 @@ class Orchestrator:
 
     async def shutdown(self) -> None:
         try:
+            package_tasks = tuple(self._package_tasks.values())
+            for task in package_tasks:
+                task.cancel()
+            await asyncio.gather(*package_tasks, return_exceptions=True)
+            self._package_tasks.clear()
             if self._shepherd_task is not None:
                 self._shepherd_task.cancel()
                 await asyncio.gather(self._shepherd_task, return_exceptions=True)
@@ -3103,6 +3356,118 @@ class Orchestrator:
             unchanged_ids=(refs if isinstance(refs, list) else ()),
             upstream_candidates=(upstream if isinstance(upstream, list) else ()),
         )
+
+    @staticmethod
+    def _package_owned_blocker(blocker: dict[str, Any]) -> bool:
+        """Recognize structural, repeated, or cross-file work before legacy routing."""
+
+        candidate = blocker.get("upstream_candidate")
+        cross_file = isinstance(candidate, dict) and any(
+            str(path).strip() != str(blocker.get("path", "")).strip()
+            for path in candidate.get("owner_paths", ())
+            if isinstance(path, str)
+        )
+        return (
+            cross_file
+            or int(blocker.get("sightings", 0)) > 1
+            or str(blocker.get("disposition", ""))
+            in {
+                "missing_upstream",
+                "statement_review",
+                "interface_review",
+                "genuine_blocker",
+            }
+        )
+
+    async def _attach_structural_blockers_to_packages(
+        self,
+        chapter: WorkUnitLike,
+        blockers: Iterable[dict[str, Any]],
+    ) -> tuple[str, ...]:
+        package_ids: list[str] = []
+        for blocker in blockers:
+            if not self._package_owned_blocker(blocker):
+                continue
+            blocker_id = str(blocker.get("id", ""))
+            candidate = blocker.get("upstream_candidate")
+            raw_key = ""
+            owner_paths: list[str] = []
+            external = False
+            if isinstance(candidate, dict):
+                raw_key = str(candidate.get("capability_key", "")).strip()
+                owner_paths = [
+                    str(path).strip()
+                    for path in candidate.get("owner_paths", ())
+                    if isinstance(path, str)
+                    and path.strip()
+                    and self._path_owner_ids(str(path).strip())
+                ]
+                external = str(candidate.get("owner_kind", "")) == "external"
+            declaration = str(blocker.get("declaration", "")).strip()
+            residual_goal = self._normalized_blocker_goal(blocker)
+            capability_key = raw_key or f"proof-capability:{declaration}:{residual_goal}"
+            digest = hashlib.sha256(capability_key.casefold().encode()).hexdigest()[:20]
+            package_id = f"package-{digest}"
+            consumer_path = str(blocker.get("path", "")).strip()
+            paths = tuple(dict.fromkeys([*owner_paths, consumer_path]))
+            if not consumer_path or not paths:
+                continue
+            status = PackageStatus.EXTERNAL if external else PackageStatus.OBSERVED
+            package = CapabilityPackage(
+                package_id,
+                capability_key,
+                f"Capability for {declaration or residual_goal[:80]}",
+                str(
+                    candidate.get("needed_result", "")
+                    if isinstance(candidate, dict)
+                    else blocker.get("obstruction", "")
+                ).strip()
+                or f"Resolve the structural proof obstruction for {declaration}",
+                status=status,
+                disposition=(PackageDisposition.EXTERNAL if external else None),
+                write_scope=paths,
+                expansion_scope=paths,
+            )
+            source_digest = await asyncio.to_thread(
+                scope_digest, self.config.settings.repo, chapter
+            )
+            consumer = PackageConsumer(
+                id=f"consumer-{blocker_id}",
+                package_id=package_id,
+                work_unit_id=chapter.id,
+                path=consumer_path,
+                declaration=declaration,
+                stage=Stage.PROVE.value,
+                residual_goal=str(blocker.get("remaining_goal", "")),
+                source_digest=source_digest,
+                blocker_ids=(blocker_id,),
+                attempted_routes=tuple(str(value) for value in blocker.get("attempts", ())),
+                acceptance_contract={
+                    "build_command": chapter.build_command,
+                    "declaration": declaration,
+                },
+            )
+            evidence = PackageEvidence(
+                id=f"evidence-{blocker_id}-{str(blocker.get('fingerprint', ''))[:16]}",
+                package_id=package_id,
+                producer="proof-blocker-router",
+                kind=EvidenceKind.RESIDUAL_GOAL,
+                source_revision=source_digest,
+                paths=(consumer_path,),
+                declarations=(declaration,) if declaration else (),
+                payload={"blocker": blocker},
+                digest=str(blocker.get("fingerprint", "")),
+            )
+            attached, _created = await self.state.create_or_attach_capability_package(
+                package,
+                consumer=consumer,
+                evidence=(evidence,),
+            )
+            await self.state.attach_proof_blockers_to_package((blocker_id,), attached.id)
+            package_ids.append(attached.id)
+        if package_ids:
+            await self._schedule_ready_packages()
+        return tuple(dict.fromkeys(package_ids))
 
     async def _resolve_satisfied_proof_blockers(self, chapter: WorkUnitLike) -> None:
         resolved = []
@@ -6847,6 +7212,26 @@ class Orchestrator:
             blockers = await self._record_proof_blocker_deltas(
                 chapter, attempt.run, attempt.agent.report
             )
+            package_ids = await self._attach_structural_blockers_to_packages(chapter, blockers)
+            if package_ids:
+                await self.state.set_task(
+                    chapter.id,
+                    Stage.PROVE,
+                    TaskStatus.BLOCKED,
+                    "structural proof work attached to capability package(s): "
+                    + ", ".join(package_ids),
+                )
+                return StageOutcome(
+                    ExecutionDisposition.WAITING,
+                    tuple(
+                        Requirement(
+                            RequirementKind.CAPABILITY_PACKAGE,
+                            request_id=package_id,
+                            detail="package Steward owns the structural proof work",
+                        )
+                        for package_id in package_ids
+                    ),
+                )
             if durable_feedback := self._durable_blocker_feedback(chapter.id, assigned_targets):
                 feedback_ledger.append(durable_feedback)
             feedback = _bounded_proof_feedback(feedback_ledger)
@@ -7774,7 +8159,9 @@ class Orchestrator:
 
     async def run_pipeline(self) -> bool:
         generation = self._repair_progress_generation
+        await self._schedule_ready_packages()
         result = await self._run_pipeline_once()
+        await self._drain_active_packages()
         await self._trigger_threshold_shepherd()
         await self._drain_active_shepherd()
         if self._repair_progress_generation != generation:

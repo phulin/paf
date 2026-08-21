@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import sqlite3
 import subprocess
 from pathlib import Path
@@ -8,8 +9,10 @@ import pytest
 
 from paf.package_model import (
     CapabilityPackage,
+    ConsumerStatus,
     IntegrationJournal,
     IntegrationPhase,
+    PackageConsumer,
     PathReservation,
     ReservationDecision,
     ReservationMode,
@@ -17,8 +20,11 @@ from paf.package_model import (
     ReservationSpec,
 )
 from paf.package_runtime import (
+    ConsumerValidation,
+    PackageExecutionLayer,
     PackageGitError,
     PackageIntegrator,
+    PackageValidation,
     PackageWorktreeManager,
     RelevantInterfaceGuard,
 )
@@ -474,3 +480,205 @@ def test_schema_v5_package_locks_migrate_into_global_authority(tmp_path: Path) -
     assert len(migrated) == 1
     assert migrated[0].owner_kind is ReservationOwnerKind.PACKAGE
     assert migrated[0].owner_id == current.id
+
+
+def steward_report(
+    *,
+    disposition: str = "complete",
+    complete: bool = True,
+    consumers: tuple[str, ...] = ("consumer-a", "consumer-b"),
+) -> dict[str, object]:
+    return {
+        "complete": complete,
+        "summary": "implemented the shared interface and both consumers",
+        "issues": [],
+        "diagnosis": "A shared bridge belongs in the earlier support file.",
+        "placement_decision": {
+            "kind": "shared",
+            "paths": ["lean/Support.lean"],
+            "declarations": ["supportBridge"],
+            "rationale": "Both consumers use the same source-neutral fact.",
+        },
+        "scope_expansion_requests": [],
+        "plan_revision": {
+            "base_revision": 0,
+            "revision_reason": "Initial small-lemma plan.",
+            "steps": [
+                {
+                    "step_id": "interface",
+                    "objective": "Add supportBridge",
+                    "kind": "interface",
+                    "intended_declarations": ["supportBridge"],
+                    "intended_paths": ["lean/Support.lean"],
+                    "depends_on_step_ids": [],
+                    "validation_commands": ["check support"],
+                },
+                {
+                    "step_id": "consumer",
+                    "objective": "Use supportBridge",
+                    "kind": "consumer_integration",
+                    "intended_declarations": ["base"],
+                    "intended_paths": ["lean/Book.lean"],
+                    "depends_on_step_ids": ["interface"],
+                    "validation_commands": ["check consumer"],
+                },
+            ],
+        },
+        "completed_step_assessments": [
+            {
+                "step_id": "interface",
+                "accepted": True,
+                "commit_ids": [],
+                "validation_evidence": "support file checks",
+                "remaining_gap": "",
+            }
+        ],
+        "worker_assignments": [
+            {"step_id": "consumer", "worker_id": "worker-1", "objective": "wire consumer"}
+        ],
+        "package_dependency_requests": [],
+        "child_packages": [],
+        "consumer_assessments": [
+            {
+                "consumer_id": consumer_id,
+                "disposition": "accepted",
+                "acceptance_evidence": "focused declaration check",
+                "detached_package_id": None,
+                "remaining_obstruction": "",
+            }
+            for consumer_id in consumers
+        ],
+        "disposition": disposition,
+        "remaining_work": "",
+    }
+
+
+@pytest.mark.asyncio
+async def test_package_execution_integrates_multifile_steward_and_small_worker_steps(
+    tmp_path: Path,
+) -> None:
+    repo = git_repo(tmp_path)
+    support = repo / "lean" / "Support.lean"
+    support.write_text("def support := 1\n", encoding="utf-8")
+    run_git(repo, "add", "lean/Support.lean")
+    run_git(repo, "commit", "-m", "feat: add support")
+    store = StateDatabase(repo / ".paf")
+    store.initialize()
+    current, _ = store.create_or_attach_capability_package(
+        CapabilityPackage(
+            "P-multi",
+            "shared.bridge",
+            "Shared bridge",
+            "Implement and use a shared bridge",
+            write_scope=("lean/Support.lean", "lean/Book.lean"),
+            expansion_scope=("lean/Support.lean", "lean/Book.lean"),
+        ),
+        consumer=PackageConsumer(
+            "consumer-a", "P-multi", "chapter-a", "lean/Book.lean", "base", "prove"
+        ),
+    )
+    store.attach_package_consumer(
+        current.id,
+        PackageConsumer("consumer-b", "P-multi", "chapter-b", "lean/Book.lean", "base", "prove"),
+        expected_revision=current.revision,
+    )
+    woken: list[str] = []
+
+    async def run_steward(_package, _dossier, worktree):
+        (worktree / "lean" / "Support.lean").write_text(
+            "def support := 1\ndef supportBridge := support\n", encoding="utf-8"
+        )
+        return steward_report()
+
+    async def run_worker(_package, step, _packet, worktree):
+        (worktree / "lean" / "Book.lean").write_text(
+            "def base := supportBridge\n", encoding="utf-8"
+        )
+        run_git(worktree, "add", "lean/Book.lean")
+        run_git(worktree, "commit", "-m", "feat: wire package consumer")
+        return {
+            "complete": True,
+            "summary": "wired the bounded consumer",
+            "issues": [],
+            "step_id": step.id,
+            "changed_declarations": ["base"],
+            "changed_paths": ["lean/Book.lean"],
+            "commit_id": run_git(worktree, "rev-parse", "HEAD"),
+            "focused_validation": "consumer checks",
+            "remaining_gap": "",
+            "new_evidence": [],
+        }
+
+    async def wake(ids):
+        woken.extend(ids)
+
+    runtime = PackageExecutionLayer(
+        repo,
+        repo / ".paf",
+        store,
+        run_steward=run_steward,
+        run_worker=run_worker,
+        validate_step=lambda _path, _step: PackageValidation(True, "step", "step checks"),
+        validate_package=lambda _path, _package: PackageValidation(
+            True, "package", "package checks"
+        ),
+        validate_consumer=lambda _path, consumer: ConsumerValidation(
+            True,
+            f"consumer-{consumer.id}",
+            "consumer checks",
+            consumer.id,
+            (consumer.work_unit_id,),
+        ),
+        wake_consumers=wake,
+    )
+
+    result = await runtime.execute(current.id)
+
+    assert result.status.value == "complete"
+    assert result.worker_ids == ("worker-1",)
+    assert set(result.accepted_consumer_ids) == {"consumer-a", "consumer-b"}
+    assert set(woken) == {"chapter-a", "chapter-b"}
+    assert "supportBridge" in support.read_text(encoding="utf-8")
+    state = store.load_package_state()
+    assert all(value.status.value == "complete" for value in state.steps.values())
+    assert all(value.status is ConsumerStatus.ACCEPTED for value in state.consumers.values())
+
+
+@pytest.mark.asyncio
+async def test_package_execution_rejects_model_path_outside_expansion_scope(
+    tmp_path: Path,
+) -> None:
+    repo = git_repo(tmp_path)
+    store = StateDatabase(repo / ".paf")
+    store.initialize()
+    current = package(store, "P-invalid")
+    report = steward_report(consumers=())
+    report["scope_expansion_requests"] = [
+        {"path": "README.md", "mode": "exclusive_file", "reason": "wrong scope"}
+    ]
+    report["plan_revision"] = {
+        "base_revision": 0,
+        "revision_reason": "invalid",
+        "steps": [],
+    }
+    report["completed_step_assessments"] = []
+    report["worker_assignments"] = []
+
+    runtime = PackageExecutionLayer(
+        repo,
+        repo / ".paf",
+        store,
+        run_steward=lambda *_args: asyncio.sleep(0, result=report),
+        run_worker=lambda *_args: asyncio.sleep(0, result={}),
+        validate_step=lambda *_args: PackageValidation(True, "step", "ok"),
+        validate_package=lambda *_args: PackageValidation(True, "package", "ok"),
+        validate_consumer=lambda _path, consumer: ConsumerValidation(
+            False, "consumer", "not checked", consumer.id
+        ),
+    )
+
+    result = await runtime.execute(current.id)
+
+    assert result.status.value == "parked"
+    assert "invalid package path" in result.detail
+    assert not (repo / "README.md").exists()

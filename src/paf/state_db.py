@@ -2980,6 +2980,131 @@ class StateDatabase:
             )
         return self.load_package_state().packages[package_id]
 
+    def expand_package_write_scope(
+        self,
+        package_id: str,
+        lease_generation: int,
+        requested: tuple[ReservationSpec, ...],
+        *,
+        expected_revision: int,
+        acquired_at: str | None = None,
+        queue_on_conflict: bool = True,
+    ) -> ReservationResult:
+        """Atomically grant a bounded scope expansion and its path reservations."""
+
+        requested = canonical_reservation_specs(requested)
+        if not requested:
+            raise ValueError("at least one scope expansion path is required")
+        now = acquired_at or _utc_now()
+        with _connect(self.path) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._assert_package_revision(connection, package_id, expected_revision)
+            self._assert_live_lease(connection, package_id, lease_generation)
+            allowed = tuple(
+                str(row[0])
+                for row in connection.execute(
+                    """SELECT normalized_path FROM package_scopes
+                    WHERE package_id=? AND scope_kind='expansion'""",
+                    (package_id,),
+                )
+            )
+            invalid = tuple(
+                item.normalized_path
+                for item in requested
+                if not any(
+                    item.normalized_path == root
+                    or item.normalized_path.startswith(f"{root.rstrip('/')}/")
+                    for root in allowed
+                )
+            )
+            if invalid:
+                raise ValueError(
+                    "scope expansion is outside the configured expansion scope: "
+                    + ", ".join(invalid)
+                )
+            conflicts = self._reservation_conflict_rows(
+                connection, ReservationOwnerKind.PACKAGE, package_id, requested
+            )
+            if conflicts:
+                queue_id = None
+                decision = ReservationDecision.CONFLICT
+                if queue_on_conflict:
+                    decision = ReservationDecision.QUEUED
+                    queue_id = _stable_record_id(
+                        "reservation", "package", package_id, str(lease_generation)
+                    )
+                    connection.execute(
+                        """INSERT INTO path_reservation_queue VALUES(?, 'package', ?, ?, ?, ?, NULL)
+                        ON CONFLICT(id) DO UPDATE SET requested=excluded.requested,
+                            created_at=excluded.created_at""",
+                        (
+                            queue_id,
+                            package_id,
+                            lease_generation,
+                            json.dumpb(
+                                [
+                                    {"path": item.normalized_path, "mode": str(item.mode)}
+                                    for item in requested
+                                ]
+                            ),
+                            now,
+                        ),
+                    )
+                connection.commit()
+                return ReservationResult(
+                    decision,
+                    ReservationOwnerKind.PACKAGE,
+                    package_id,
+                    lease_generation,
+                    requested,
+                    conflicts,
+                    queue_id,
+                )
+            connection.executemany(
+                """INSERT INTO path_reservations(
+                    normalized_path, mode, owner_kind, owner_id, fence_generation,
+                    acquired_at, expires_at, package_id
+                ) VALUES(?, ?, 'package', ?, ?, ?, NULL, ?)""",
+                (
+                    (
+                        item.normalized_path,
+                        str(item.mode),
+                        package_id,
+                        lease_generation,
+                        now,
+                        package_id,
+                    )
+                    for item in requested
+                ),
+            )
+            next_ordinal = int(
+                connection.execute(
+                    """SELECT coalesce(max(ordinal), -1) + 1 FROM package_scopes
+                    WHERE package_id=? AND scope_kind='write'""",
+                    (package_id,),
+                ).fetchone()[0]
+            )
+            connection.executemany(
+                "INSERT OR IGNORE INTO package_scopes VALUES(?, 'write', ?, ?)",
+                (
+                    (package_id, item.normalized_path, next_ordinal + index)
+                    for index, item in enumerate(requested)
+                ),
+            )
+            connection.execute(
+                "DELETE FROM path_reservation_queue WHERE owner_kind='package' AND owner_id=?",
+                (package_id,),
+            )
+            self._touch_package(connection, package_id)
+            connection.commit()
+        return ReservationResult(
+            ReservationDecision.GRANTED,
+            ReservationOwnerKind.PACKAGE,
+            package_id,
+            lease_generation,
+            requested,
+        )
+
     @staticmethod
     def _clean_expired_ordinary_reservations(connection: sqlite3.Connection, now: str) -> None:
         connection.execute(

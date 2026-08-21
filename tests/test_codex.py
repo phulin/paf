@@ -14,6 +14,8 @@ from paf.activity import EVENT_TIMESTAMP_FIELD
 from paf.codex import (
     DIAGNOSTIC_REVIEW_ROLE,
     DOWNSTREAM_RETRY_ROLE,
+    PACKAGE_STEWARD_ROLE,
+    PACKAGE_WORKER_ROLE,
     REPAIR_WORKER_ROLE,
     REPORT_SCHEMAS,
     SHEPHERD_ROLE,
@@ -98,6 +100,34 @@ def test_record_jsonl_line_deduplicates_structured_mcp_result(
 
 def test_report_schemas_contain_only_fields_used_by_each_agent() -> None:
     expected = {
+        "package_steward": {
+            "complete",
+            "summary",
+            "issues",
+            "diagnosis",
+            "placement_decision",
+            "scope_expansion_requests",
+            "plan_revision",
+            "completed_step_assessments",
+            "worker_assignments",
+            "package_dependency_requests",
+            "child_packages",
+            "consumer_assessments",
+            "disposition",
+            "remaining_work",
+        },
+        "package_worker": {
+            "complete",
+            "summary",
+            "issues",
+            "step_id",
+            "changed_declarations",
+            "changed_paths",
+            "commit_id",
+            "focused_validation",
+            "remaining_gap",
+            "new_evidence",
+        },
         "shepherd": {"complete", "summary", "issues", "dispositions", "work_units"},
         "discover": {"complete", "summary", "issues", "source_dependencies"},
         "formalize": {"complete", "summary", "issues", "source_issues"},
@@ -632,6 +662,13 @@ def test_shepherd_planner_is_read_only_and_repair_workers_use_their_model(tmp_pa
     assert 'model_reasoning_effort="medium"' in shepherd
     assert repair[repair.index("--model") + 1] == "gpt-5.6-sol"
     assert 'model_reasoning_effort="medium"' in repair
+
+    package_steward = executor.command(Stage.PROVE, role=PACKAGE_STEWARD_ROLE)
+    package_worker = executor.command(Stage.PROVE, role=PACKAGE_WORKER_ROLE)
+    assert "--dangerously-bypass-approvals-and-sandbox" in package_steward
+    assert "--dangerously-bypass-approvals-and-sandbox" in package_worker
+    assert package_steward[package_steward.index("--model") + 1] == "gpt-5.6-sol"
+    assert package_worker[package_worker.index("--model") + 1] == "gpt-5.6-sol"
 
     customized = replace(
         config,

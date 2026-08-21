@@ -353,6 +353,223 @@ _SHEPHERD_WORK_UNITS_PROPERTY: dict[str, Any] = {
     },
 }
 
+_PACKAGE_STEP_ITEM: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "step_id": {"type": "string", "minLength": 1, "pattern": "^[A-Za-z0-9._-]+$"},
+        "objective": {"type": "string", "minLength": 1},
+        "kind": {
+            "type": "string",
+            "enum": [
+                "investigation",
+                "interface",
+                "supporting_lemma",
+                "consumer_integration",
+                "statement_revision",
+                "validation",
+            ],
+        },
+        "intended_declarations": {"type": "array", "items": {"type": "string", "minLength": 1}},
+        "intended_paths": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1},
+            "minItems": 1,
+        },
+        "depends_on_step_ids": {"type": "array", "items": {"type": "string", "minLength": 1}},
+        "validation_commands": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1},
+            "minItems": 1,
+        },
+    },
+    "required": [
+        "step_id",
+        "objective",
+        "kind",
+        "intended_declarations",
+        "intended_paths",
+        "depends_on_step_ids",
+        "validation_commands",
+    ],
+}
+
+_PACKAGE_STEWARD_PROPERTIES: dict[str, Any] = {
+    "complete": _REPORT_BASE_PROPERTIES["complete"],
+    "summary": _REPORT_BASE_PROPERTIES["summary"],
+    "issues": _REPORT_BASE_PROPERTIES["issues"],
+    "diagnosis": {"type": "string", "minLength": 1},
+    "placement_decision": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "kind": {
+                "type": "string",
+                "enum": [
+                    "existing",
+                    "consumer_local",
+                    "shared",
+                    "new_interface",
+                    "statement_revision",
+                    "external",
+                ],
+            },
+            "paths": {"type": "array", "items": {"type": "string", "minLength": 1}},
+            "declarations": {"type": "array", "items": {"type": "string", "minLength": 1}},
+            "rationale": {"type": "string", "minLength": 1},
+        },
+        "required": ["kind", "paths", "declarations", "rationale"],
+    },
+    "scope_expansion_requests": {
+        "type": "array",
+        "items": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "path": {"type": "string", "minLength": 1},
+                "mode": {"type": "string", "enum": ["exclusive_file", "exclusive_subtree"]},
+                "reason": {"type": "string", "minLength": 1},
+            },
+            "required": ["path", "mode", "reason"],
+        },
+    },
+    "plan_revision": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "base_revision": {"type": "integer", "minimum": 0},
+            "steps": {"type": "array", "items": _PACKAGE_STEP_ITEM},
+            "revision_reason": {"type": "string", "minLength": 1},
+        },
+        "required": ["base_revision", "steps", "revision_reason"],
+    },
+    "completed_step_assessments": {
+        "type": "array",
+        "items": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "step_id": {"type": "string", "minLength": 1},
+                "accepted": {"type": "boolean"},
+                "commit_ids": {"type": "array", "items": {"type": "string", "minLength": 1}},
+                "validation_evidence": {"type": "string", "minLength": 1},
+                "remaining_gap": {"type": "string"},
+            },
+            "required": [
+                "step_id",
+                "accepted",
+                "commit_ids",
+                "validation_evidence",
+                "remaining_gap",
+            ],
+        },
+    },
+    "worker_assignments": {
+        "type": "array",
+        "items": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "step_id": {"type": "string", "minLength": 1},
+                "worker_id": {"type": "string", "minLength": 1},
+                "objective": {"type": "string", "minLength": 1},
+            },
+            "required": ["step_id", "worker_id", "objective"],
+        },
+    },
+    "package_dependency_requests": {
+        "type": "array",
+        "items": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "package_id": {"type": "string", "minLength": 1},
+                "required_revision": {"type": ["string", "null"]},
+                "reason": {"type": "string", "minLength": 1},
+            },
+            "required": ["package_id", "required_revision", "reason"],
+        },
+    },
+    "child_packages": {
+        "type": "array",
+        "items": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "capability_key": {"type": "string", "minLength": 1},
+                "title": {"type": "string", "minLength": 1},
+                "mathematical_objective": {"type": "string", "minLength": 1},
+                "write_scope": {
+                    "type": "array",
+                    "items": {"type": "string", "minLength": 1},
+                    "minItems": 1,
+                },
+                "consumer_ids": {
+                    "type": "array",
+                    "items": {"type": "string", "minLength": 1},
+                },
+            },
+            "required": [
+                "capability_key",
+                "title",
+                "mathematical_objective",
+                "write_scope",
+                "consumer_ids",
+            ],
+        },
+    },
+    "consumer_assessments": {
+        "type": "array",
+        "items": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "consumer_id": {"type": "string", "minLength": 1},
+                "disposition": {
+                    "type": "string",
+                    "enum": ["accepted", "open", "detached", "terminal"],
+                },
+                "acceptance_evidence": {"type": "string"},
+                "detached_package_id": {"type": ["string", "null"]},
+                "remaining_obstruction": {"type": "string"},
+            },
+            "required": [
+                "consumer_id",
+                "disposition",
+                "acceptance_evidence",
+                "detached_package_id",
+                "remaining_obstruction",
+            ],
+        },
+    },
+    "disposition": {
+        "type": "string",
+        "enum": [
+            "continue",
+            "complete",
+            "waiting_dependency",
+            "decomposed",
+            "external",
+            "statement_revision_required",
+            "parked",
+        ],
+    },
+    "remaining_work": {"type": "string"},
+}
+
+_PACKAGE_WORKER_PROPERTIES: dict[str, Any] = {
+    "complete": _REPORT_BASE_PROPERTIES["complete"],
+    "summary": _REPORT_BASE_PROPERTIES["summary"],
+    "issues": _REPORT_BASE_PROPERTIES["issues"],
+    "step_id": {"type": "string", "minLength": 1},
+    "changed_declarations": {"type": "array", "items": {"type": "string", "minLength": 1}},
+    "changed_paths": {"type": "array", "items": {"type": "string", "minLength": 1}},
+    "commit_id": {"type": ["string", "null"]},
+    "focused_validation": {"type": "string", "minLength": 1},
+    "remaining_gap": {"type": "string"},
+    "new_evidence": {"type": "array", "items": {"type": "string", "minLength": 1}},
+}
+
 
 def _report_schema(title: str, properties: dict[str, Any]) -> dict[str, Any]:
     return {
@@ -366,6 +583,12 @@ def _report_schema(title: str, properties: dict[str, Any]) -> dict[str, Any]:
 
 
 REPORT_SCHEMAS: dict[str, dict[str, Any]] = {
+    "package_steward": _report_schema(
+        "PAF capability-package Steward report", _PACKAGE_STEWARD_PROPERTIES
+    ),
+    "package_worker": _report_schema(
+        "PAF capability-package worker report", _PACKAGE_WORKER_PROPERTIES
+    ),
     "shepherd": _report_schema(
         "PAF Shepherd repair plan",
         {
@@ -471,10 +694,14 @@ DIAGNOSTIC_REVIEW_PROMPT_PATH = Path(str(_PROMPT_RESOURCES.joinpath("diagnostic_
 WARNING_CLEANUP_PROMPT_PATH = Path(str(_PROMPT_RESOURCES.joinpath("warning_cleanup.md")))
 SHEPHERD_PROMPT_PATH = Path(str(_PROMPT_RESOURCES.joinpath("shepherd.md")))
 REPAIR_WORKER_PROMPT_PATH = Path(str(_PROMPT_RESOURCES.joinpath("repair_worker.md")))
+PACKAGE_STEWARD_PROMPT_PATH = Path(str(_PROMPT_RESOURCES.joinpath("package_steward.md")))
+PACKAGE_WORKER_PROMPT_PATH = Path(str(_PROMPT_RESOURCES.joinpath("package_worker.md")))
 UPSTREAM_REPAIR_ROLE = "upstream_repair"
 DOWNSTREAM_RETRY_ROLE = "downstream_retry"
 SHEPHERD_ROLE = "shepherd"
 REPAIR_WORKER_ROLE = "repair_worker"
+PACKAGE_STEWARD_ROLE = "package_steward"
+PACKAGE_WORKER_ROLE = "package_worker"
 DIAGNOSTIC_REVIEW_ROLE = "diagnostic_review"
 PROOF_REVIEW_ROLE = "proof_review"
 WARNING_CLEANUP_ROLE = "warning_cleanup"
@@ -485,6 +712,8 @@ DIAGNOSTIC_REVIEW_ROLES = frozenset({DIAGNOSTIC_REVIEW_ROLE, WARNING_REVIEW_ROLE
 
 
 def report_schema_key(stage: Stage, *, role: str = "", feedback: str = "") -> str:
+    if role in {PACKAGE_STEWARD_ROLE, PACKAGE_WORKER_ROLE}:
+        return role
     if role == SHEPHERD_ROLE:
         return SHEPHERD_ROLE
     if role == UPSTREAM_REPAIR_ROLE:
@@ -1523,7 +1752,9 @@ class CodexExecutor:
         upstream_requests: Iterable[dict[str, Any]] = (),
         proof_targets: Iterable[ProofTarget | dict[str, Any]] = (),
     ) -> str:
-        if role == REPAIR_WORKER_ROLE:
+        if role == PACKAGE_WORKER_ROLE:
+            prompt_path = PACKAGE_WORKER_PROMPT_PATH
+        elif role == REPAIR_WORKER_ROLE:
             prompt_path = REPAIR_WORKER_PROMPT_PATH
         elif role == WARNING_CLEANUP_ROLE:
             prompt_path = WARNING_CLEANUP_PROMPT_PATH
@@ -1544,7 +1775,7 @@ class CodexExecutor:
                 "non-`sorry` warnings."
             )
             template = template.replace("{diagnostic_trigger}", diagnostic_trigger)
-        if role == REPAIR_WORKER_ROLE:
+        if role in {REPAIR_WORKER_ROLE, PACKAGE_WORKER_ROLE}:
             instruction = feedback
             try:
                 repair_dossier = json.loads(feedback)
@@ -1562,7 +1793,8 @@ class CodexExecutor:
             base = render_prompt(template, chapter)
         common = (
             ""
-            if role != REPAIR_WORKER_ROLE and stage in (Stage.DISCOVER, Stage.PROVE)
+            if role not in {REPAIR_WORKER_ROLE, PACKAGE_WORKER_ROLE}
+            and stage in (Stage.DISCOVER, Stage.PROVE)
             else render_prompt(COMMON_PROMPT_PATH.read_text(encoding="utf-8"), chapter)
         )
         scope = "\n".join(f"- `{item}`" for item in chapter.scope)
@@ -1720,6 +1952,17 @@ current diagnostics override the earlier clean-build fact."""
 support from an earlier chapter. Use the attached Lean tools, edit only that earlier chapter, and
 fully prove every new declaration. PAF will merge and build the changes before retrying the later
             proofs. Do not work on unrelated placeholders."""
+        elif role == PACKAGE_STEWARD_ROLE:
+            stage_contract = """This is a writable capability-package Steward turn. You own the
+reserved package worktree and may edit every reserved path, including shared interfaces and
+consumers in several files. Make central interface edits yourself, delegate only bounded leaf
+steps, and return a complete package mutation report. Do not create upstream requests or use the
+legacy repair-sweep protocol."""
+        elif role == PACKAGE_WORKER_ROLE:
+            stage_contract = """This is one bounded capability-package worker step. Edit only the
+assigned paths in the package worktree, commit the completed step, and report exact validation and
+remaining evidence. You may not change placement, scope, dependencies, consumers, or package
+lifecycle."""
         elif role == REPAIR_WORKER_ROLE:
             stage_contract = f"""This is a bounded Shepherd repair work unit targeting the existing
 {stage.value} stage. Diagnose and fix the concrete blocker in the attached repair dossier. Keep the
@@ -1772,7 +2015,7 @@ isolation trees. Keep command output below roughly 12 KiB. {stage_contract}
             mcp_workflow = (
                 """Using a Lean tool opens and synchronizes the file it targets. Use focused
 diagnostics and other attached tools as needed to validate the custom repair instruction."""
-                if role == REPAIR_WORKER_ROLE
+                if role in {REPAIR_WORKER_ROLE, PACKAGE_WORKER_ROLE}
                 else {
                     Stage.FORMALIZE: """Using a Lean tool opens and synchronizes the file it
 targets. Follow the formalization workflow above for when and where to request diagnostics.""",
@@ -1798,6 +2041,8 @@ diagnostics from prerequisites to dependents.
             feedback_heading = (
                 "Targeted downstream retry handoff"
                 if role == DOWNSTREAM_RETRY_ROLE
+                else "Capability package worker packet"
+                if role == PACKAGE_WORKER_ROLE
                 else "Shepherd repair dossier"
                 if role == REPAIR_WORKER_ROLE
                 else "PAF validation diagnostics to repair"
@@ -1843,6 +2088,13 @@ diagnostics from prerequisites to dependents.
         payload = json.dumps(dossier, indent=2)
         return f"{template.rstrip()}\n\n## Failure dossier\n\n```json\n{payload}\n```\n"
 
+    def build_package_steward_prompt(self, dossier: dict[str, Any]) -> str:
+        """Render one complete, package-owned multi-file Steward assignment."""
+
+        template = PACKAGE_STEWARD_PROMPT_PATH.read_text(encoding="utf-8")
+        payload = json.dumps(dossier, indent=2)
+        return f"{template.rstrip()}\n\n## Package dossier\n\n```json\n{payload}\n```\n"
+
     def command(
         self,
         stage: Stage,
@@ -1880,10 +2132,10 @@ diagnostics from prerequisites to dependents.
             # `codex exec resume` does not accept the top-level `--sandbox`
             # option, but it does accept the equivalent config override.
             command.extend(["--config", f'sandbox_mode="{settings.sandbox}"'])
-        if role == SHEPHERD_ROLE:
+        if role in {SHEPHERD_ROLE, PACKAGE_STEWARD_ROLE}:
             model = self.config.shepherd.model
             reasoning_effort = self.config.shepherd.reasoning_effort
-        elif role == REPAIR_WORKER_ROLE:
+        elif role in {REPAIR_WORKER_ROLE, PACKAGE_WORKER_ROLE}:
             model = self.config.shepherd.worker_model
             reasoning_effort = self.config.shepherd.worker_reasoning_effort
         else:
@@ -2013,6 +2265,52 @@ diagnostics from prerequisites to dependents.
             run,
             prompt=prompt,
             workspace_root=self.config.settings.repo,
+        )
+
+    async def run_package_steward(
+        self,
+        anchor: WorkUnitLike,
+        run: RunRecord,
+        dossier: dict[str, Any],
+        *,
+        workspace_root: Path,
+    ) -> AgentResult:
+        """Run the fenced, writable Steward that owns one capability package."""
+
+        prompt = self.build_package_steward_prompt(dossier)
+        return await self._run_prompt(
+            anchor,
+            Stage.PROVE,
+            run,
+            prompt=prompt,
+            workspace_root=workspace_root,
+        )
+
+    async def run_package_worker(
+        self,
+        assignment: WorkUnitLike,
+        run: RunRecord,
+        packet: dict[str, Any],
+        *,
+        workspace_root: Path,
+    ) -> AgentResult:
+        """Execute one bounded sequential worker step in its package worktree."""
+
+        feedback = json.dumps(packet, indent=2)
+        prompt = self.build_prompt(
+            assignment,
+            Stage.PROVE,
+            role=PACKAGE_WORKER_ROLE,
+            feedback=feedback,
+            workspace_root=workspace_root,
+        )
+        return await self._run_prompt(
+            assignment,
+            Stage.PROVE,
+            run,
+            prompt=prompt,
+            feedback=feedback,
+            workspace_root=workspace_root,
         )
 
     async def _run_prompt(

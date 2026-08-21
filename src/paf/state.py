@@ -90,6 +90,7 @@ class RequirementKind(StrEnum):
     UPSTREAM_REQUEST = "upstream_request"
     PROOF_REVIEW_REQUEST = "proof_review_request"
     REPAIR_DEPENDENCY = "repair_dependency"
+    CAPABILITY_PACKAGE = "capability_package"
     GRAPH = "graph"
     LEGACY_BLOCK = "legacy_block"
 
@@ -2494,6 +2495,26 @@ class StateStore:
             self._mark_dirty(global_state=False, sections={"proof_blockers"})
             await self._persist()
 
+    async def attach_proof_blockers_to_package(
+        self, blocker_ids: Iterable[str], package_id: str
+    ) -> None:
+        """Move structural blockers under package ownership without a peer request."""
+
+        changed = False
+        for blocker_id in blocker_ids:
+            blocker = self.proof_blockers.get(str(blocker_id))
+            if not isinstance(blocker, dict):
+                continue
+            blocker["status"] = ProofBlockerStatus.WAITING_DEPENDENCY.value
+            blocker["package_id"] = package_id
+            blocker.pop("request_id", None)
+            blocker["updated_at"] = timestamp()
+            changed = True
+        if changed:
+            self.record_routing_event("proof_blocker_attached_to_package")
+            self._mark_dirty(global_state=False, sections={"proof_blockers"})
+            await self._persist()
+
     def upstream_requests_for_consumer(
         self,
         chapter_id: str,
@@ -2630,6 +2651,26 @@ class StateStore:
             owner_id,
             fence_generation,
         )
+
+    async def expand_package_write_scope(
+        self,
+        package_id: str,
+        lease_generation: int,
+        requested: tuple[ReservationSpec, ...],
+        *,
+        expected_revision: int,
+        queue_on_conflict: bool = True,
+    ) -> ReservationResult:
+        result = await asyncio.to_thread(
+            self._database.expand_package_write_scope,
+            package_id,
+            lease_generation,
+            requested,
+            expected_revision=expected_revision,
+            queue_on_conflict=queue_on_conflict,
+        )
+        await self.refresh_package_state()
+        return result
 
     async def create_or_attach_capability_package(
         self,
