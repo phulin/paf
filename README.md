@@ -710,9 +710,12 @@ worker_model = "gpt-5.6-sol"
 worker_reasoning_effort = "medium"
 lease_ttl_seconds = 14400
 maximum_worker_steps = 8
+max_concurrent_packages_per_work_unit = 1
 ```
 
 Set `enabled = false` to opt out for a project.
+The per-work-unit cap prevents a backlog of durable packages for one chapter from consuming the
+entire mutating-agent pool at once; increase it only when those packages are genuinely independent.
 
 Packages are durable execution objects rather than a fifth ordinary stage. Use `paf package list`,
 `paf package inspect PACKAGE`, `paf package park PACKAGE`, `paf package resume PACKAGE`, and

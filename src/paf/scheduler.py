@@ -696,9 +696,9 @@ class Orchestrator:
     def scheduling_snapshot(self) -> dict[str, object]:
         return scheduling_snapshot(self.statement_schedule, self.proof_schedule)
 
-    def _package_anchor(self, package: CapabilityPackage) -> WorkUnitLike:
+    def _package_anchor_work_unit_id(self, package: CapabilityPackage) -> str:
         consumers = self.state._database.load_package_state().consumers_for(package.id)
-        anchor_id = next(
+        return next(
             (
                 consumer.work_unit_id
                 for consumer in consumers
@@ -706,6 +706,9 @@ class Orchestrator:
             ),
             self.work_units[0].id,
         )
+
+    def _package_anchor(self, package: CapabilityPackage) -> WorkUnitLike:
+        anchor_id = self._package_anchor_work_unit_id(package)
         return _with_scope(
             self._work_units_by_id[anchor_id],
             self._repository_package_scope(package.write_scope),
@@ -953,14 +956,27 @@ class Orchestrator:
         if not self.git.enabled:
             return False
         launched = False
+        limit = self.config.steward.max_concurrent_packages_per_work_unit
+        active_by_work_unit: dict[str, int] = {}
+        package_state = self.state._database.load_package_state()
+        for package_id in self._package_tasks:
+            package = package_state.packages.get(package_id)
+            if package is None:
+                continue
+            work_unit_id = self._package_anchor_work_unit_id(package)
+            active_by_work_unit[work_unit_id] = active_by_work_unit.get(work_unit_id, 0) + 1
         for package in self.package_execution.ready_packages():
             if package.id in self._package_tasks:
+                continue
+            work_unit_id = self._package_anchor_work_unit_id(package)
+            if active_by_work_unit.get(work_unit_id, 0) >= limit:
                 continue
             task = asyncio.create_task(
                 self._execute_package_task(package.id),
                 name=f"paf-package-{package.id}",
             )
             self._package_tasks[package.id] = task
+            active_by_work_unit[work_unit_id] = active_by_work_unit.get(work_unit_id, 0) + 1
             launched = True
         return launched
 

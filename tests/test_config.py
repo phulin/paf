@@ -52,6 +52,7 @@ def test_discovers_chapters_and_renders_paths(tmp_path: Path) -> None:
     assert config.steward.reasoning_effort == "medium"
     assert config.steward.worker_model == "gpt-5.6-sol"
     assert config.steward.worker_reasoning_effort == "medium"
+    assert config.steward.max_concurrent_packages_per_work_unit == 1
 
 
 def test_loads_and_validates_discovery_concurrency(tmp_path: Path) -> None:
@@ -130,6 +131,7 @@ worker_model = "cheap-editor"
 worker_reasoning_effort = "max"
 lease_ttl_seconds = 1200
 maximum_worker_steps = 24
+max_concurrent_packages_per_work_unit = 2
 """,
         encoding="utf-8",
     )
@@ -142,6 +144,7 @@ maximum_worker_steps = 24
     assert steward.worker_reasoning_effort == "max"
     assert steward.lease_ttl_seconds == 1200
     assert steward.maximum_worker_steps == 24
+    assert steward.max_concurrent_packages_per_work_unit == 2
 
     path.write_text(
         path.read_text(encoding="utf-8").replace(
@@ -150,6 +153,18 @@ maximum_worker_steps = 24
         encoding="utf-8",
     )
     with pytest.raises(ValueError, match=r"steward\.lease_ttl_seconds"):
+        load_config(path)
+
+    path.write_text(
+        path.read_text(encoding="utf-8")
+        .replace("lease_ttl_seconds = 0", "lease_ttl_seconds = 1200")
+        .replace(
+            "max_concurrent_packages_per_work_unit = 2",
+            "max_concurrent_packages_per_work_unit = 0",
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match=r"steward\.max_concurrent_packages_per_work_unit"):
         load_config(path)
 
 

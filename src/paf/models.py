@@ -108,6 +108,7 @@ class StewardSettings:
     worker_reasoning_effort: str = "medium"
     lease_ttl_seconds: float = 14_400.0
     maximum_worker_steps: int = 8
+    max_concurrent_packages_per_work_unit: int = 1
 
 
 @dataclass(frozen=True)

@@ -28,6 +28,7 @@ worker_model = "gpt-5.6-sol"
 worker_reasoning_effort = "medium"
 lease_ttl_seconds = 14400
 maximum_worker_steps = 8
+max_concurrent_packages_per_work_unit = 1
 
 # The backend owns all Lean target layout and toolchain settings. Target templates
 # apply to [sources]-discovered corpora and can migrate legacy [[books]] entries;

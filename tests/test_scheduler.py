@@ -288,6 +288,39 @@ async def test_package_drain_continues_nonterminal_package_turns(tmp_path: Path)
     await orchestrator.state.close()
 
 
+@pytest.mark.asyncio
+async def test_package_scheduler_limits_concurrency_per_work_unit(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    orchestrator = Orchestrator(config, StateStore(config))
+    await orchestrator.state.load_or_create()
+    orchestrator.git.enabled = True
+    packages = tuple(
+        CapabilityPackage(f"package-{index}", f"key.{index}", f"Package {index}", "Implement")
+        for index in range(3)
+    )
+    for package in packages:
+        orchestrator.state._database.create_or_attach_capability_package(package)
+    completed: set[str] = set()
+
+    class FakePackageExecution:
+        def ready_packages(self):
+            return tuple(package for package in packages if package.id not in completed)
+
+        async def execute(self, package_id: str) -> PackageExecutionResult:
+            completed.add(package_id)
+            return PackageExecutionResult(package_id, 1, PackageStatus.COMPLETE)
+
+    orchestrator.package_execution = FakePackageExecution()  # ty: ignore[invalid-assignment]
+
+    assert await orchestrator._schedule_ready_packages()
+    assert tuple(orchestrator._package_tasks) == (packages[0].id,)
+    results = await orchestrator._drain_active_packages()
+
+    assert [result.package_id for result in results] == [package.id for package in packages]
+    assert not orchestrator._package_tasks
+    await orchestrator.state.close()
+
+
 def test_coordinator_build_output_shortens_diagnostic_paths(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path))
     state = StateStore(config)

@@ -567,11 +567,16 @@ def load_config(path: str | Path, *, project: Project | None = None) -> Pipeline
         worker_reasoning_effort=str(raw_steward.get("worker_reasoning_effort", "medium")),
         lease_ttl_seconds=float(raw_steward.get("lease_ttl_seconds", 14_400)),
         maximum_worker_steps=int(raw_steward.get("maximum_worker_steps", 8)),
+        max_concurrent_packages_per_work_unit=int(
+            raw_steward.get("max_concurrent_packages_per_work_unit", 1)
+        ),
     )
     if steward.lease_ttl_seconds <= 0:
         raise ValueError("steward.lease_ttl_seconds must be positive")
     if steward.maximum_worker_steps < 0:
         raise ValueError("steward.maximum_worker_steps must be nonnegative")
+    if steward.max_concurrent_packages_per_work_unit < 1:
+        raise ValueError("steward.max_concurrent_packages_per_work_unit must be positive")
 
     source_defaults, source_rules, source_discovery = _read_source_settings(data)
     if "backend" in data and "target" in data:
