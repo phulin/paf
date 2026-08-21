@@ -69,6 +69,30 @@ _SOURCE_ISSUES_PROPERTY: dict[str, Any] = {
     },
 }
 
+_CAPABILITY_PROPOSAL_PROPERTY: dict[str, Any] = {
+    "anyOf": [
+        {"type": "null"},
+        {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "capability_key": {"type": "string", "minLength": 1},
+                "owner_kind": {
+                    "type": "string",
+                    "enum": ["chapter", "consumer", "shared", "external"],
+                },
+                "owner_paths": {
+                    "type": "array",
+                    "items": {"type": "string", "minLength": 1},
+                    "minItems": 1,
+                },
+                "needed_result": {"type": "string", "minLength": 1},
+            },
+            "required": ["capability_key", "owner_kind", "owner_paths", "needed_result"],
+        },
+    ]
+}
+
 _FAILED_ATTEMPTS_PROPERTY: dict[str, Any] = {
     "type": "array",
     "items": {
@@ -94,7 +118,7 @@ _FAILED_ATTEMPTS_PROPERTY: dict[str, Any] = {
                     "genuine_blocker",
                 ],
             },
-            "capability": {"type": ["object", "null"]},
+            "capability": _CAPABILITY_PROPOSAL_PROPERTY,
         },
         "required": [
             "path",
@@ -189,7 +213,7 @@ _FINDING_ASSESSMENTS_PROPERTY: dict[str, Any] = {
             },
             "explanation": {"type": "string", "minLength": 1},
             "retry_contract": {"anyOf": [{"type": "null"}, _RETRY_CONTRACT_PROPERTY]},
-            "capability": {"type": ["object", "null"]},
+            "capability": _CAPABILITY_PROPOSAL_PROPERTY,
             "dependency_ids": {
                 "type": "array",
                 "items": {"type": "string", "minLength": 1},

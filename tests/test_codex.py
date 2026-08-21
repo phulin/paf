@@ -176,6 +176,28 @@ def test_report_schema_avoids_unsupported_codex_keywords() -> None:
     )
 
 
+def test_report_schema_closes_every_nested_object_shape() -> None:
+    def mappings(value: object) -> list[dict[str, object]]:
+        if isinstance(value, dict):
+            return [value, *(item for child in value.values() for item in mappings(child))]
+        if isinstance(value, list):
+            return [item for child in value for item in mappings(child)]
+        return []
+
+    def is_object_shape(value: dict[str, object]) -> bool:
+        raw_type = value.get("type")
+        return raw_type == "object" or (isinstance(raw_type, list) and "object" in raw_type)
+
+    object_shapes = [
+        value
+        for schema in REPORT_SCHEMAS.values()
+        for value in mappings(schema)
+        if is_object_shape(value)
+    ]
+    assert object_shapes
+    assert all(value.get("additionalProperties") is False for value in object_shapes)
+
+
 def test_extracts_api_equivalent_usage() -> None:
     usage = TokenUsage.from_event(
         {
