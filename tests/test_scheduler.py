@@ -5694,12 +5694,73 @@ async def test_standalone_failed_proof_attempt_queues_durable_review(
     review = orchestrator.state.task(chapter.id, Stage.REVIEW)
     proof = orchestrator.state.task(chapter.id, Stage.PROVE)
     assert review.status == TaskStatus.SUCCEEDED
-    assert proof.status == TaskStatus.PENDING
+    assert proof.status == TaskStatus.BLOCKED, (
+        proof.detail,
+        orchestrator.state.proof_blockers,
+        orchestrator.state.package_state.as_dict(),
+    )
     assert proof.source_digest is None
     feedback, request_ids = orchestrator._proof_review_feedback(chapter.id)
-    assert "the statement needs another hypothesis" in feedback
-    assert len(request_ids) == 1
+    assert not feedback
+    assert not request_ids
+    packages = orchestrator.state.package_state.packages
+    assert len(packages) == 1
+    assert next(iter(packages.values())).status.value == "observed"
+    assert not orchestrator.state.upstream_requests
     assert orchestrator.state.fixup_requests == {}
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_structural_blockers_cluster_into_one_package_without_ping_pong(
+    tmp_path: Path,
+) -> None:
+    config = with_example_modules(
+        load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    )
+    orchestrator = Orchestrator(config, StateStore(config))
+    await orchestrator.prepare()
+    first, second = config.chapters
+
+    async def attach(chapter: Chapter, blocker_id: str) -> str:
+        path = f"lean/Book/Chapter{chapter.number:02d}.lean"
+        attempt = failed_attempt(
+            "the shared bridge is missing",
+            path=path,
+            declaration=f"Book.consumer{chapter.number}",
+        ) | {"disposition": "missing_upstream"}
+        candidate = {
+            "capability_key": "Book.sharedBridge",
+            "blocked_declaration": attempt["declaration"],
+            "consumer_path": path,
+            "residual_goal": attempt["remaining_goal"],
+            "needed_result": "A shared bridge theorem",
+            "candidate_signature": "sharedBridge : True",
+            "owner_kind": "shared",
+            "owner_chapter_id": first.id,
+            "owner_paths": ["lean/Book/Chapter01.lean"],
+            "attempted_alternatives": attempt["attempts"],
+            "acceptance_tests": [chapter.build_command],
+        }
+        blockers = await orchestrator.state.record_proof_blockers(
+            chapter.id,
+            origin_run_id=f"run-{blocker_id}",
+            failed_attempts=(attempt,),
+            upstream_candidates=(candidate,),
+        )
+        package_ids = await orchestrator._attach_structural_blockers_to_packages(chapter, blockers)
+        return package_ids[0]
+
+    first_package = await attach(first, "first")
+    second_package = await attach(second, "second")
+    repeated_package = await attach(second, "second-repeat")
+
+    assert first_package == second_package == repeated_package
+    assert len(orchestrator.state.package_state.packages) == 1
+    assert len(orchestrator.state.package_state.consumers) == 2
+    assert not orchestrator.state.upstream_requests
+    assert not orchestrator._upstream_repair_tasks
+    assert not orchestrator._package_tasks
     await orchestrator.shutdown()
 
 
@@ -8073,7 +8134,6 @@ async def test_obstructed_proof_chunk_does_not_prevent_independent_chunk(
         state,
         [
             result(changed=False, placeholders=2, failed_attempts=[obstruction]),
-            result(changed=False, placeholders=2, failed_attempts=[obstruction]),
             result(changed=True, placeholders=1, failed_attempts=[]),
         ],
     )
@@ -8117,10 +8177,9 @@ async def test_obstructed_proof_chunk_does_not_prevent_independent_chunk(
     runs = state.task(chapter.id, Stage.PROVE).runs
     assert [run.proof_targets[0]["declaration"] for run in runs] == [
         "first",
-        "first",
         "second",
     ]
-    assert state.task(chapter.id, Stage.PROVE).status == TaskStatus.FAILED
+    assert state.task(chapter.id, Stage.PROVE).status == TaskStatus.BLOCKED
     assert "theorem second : True := by trivial" in source.read_text(encoding="utf-8")
     await orchestrator.shutdown()
 

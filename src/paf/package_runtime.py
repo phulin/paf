@@ -191,6 +191,40 @@ class PackageWorktreeManager:
             worktree=str(path),
         )
 
+    def activate(
+        self,
+        package: CapabilityPackage,
+        lease_generation: int,
+        *,
+        expected_revision: int,
+    ) -> CapabilityPackage:
+        """Create or fence a clean retained worktree for a new Steward generation."""
+
+        if not package.worktree:
+            return self.create(
+                package.id,
+                lease_generation,
+                expected_revision=expected_revision,
+                base_revision=package.base_revision or None,
+            )
+        snapshot = self.inspect(Path(package.worktree))
+        expected_branch = f"paf/package-{_slug(package.id)}/generation-{lease_generation}"
+        if snapshot.branch == expected_branch:
+            return package
+        if not snapshot.clean:
+            raise PackageGitError(
+                f"retained package worktree is dirty on fenced branch {snapshot.branch}"
+            )
+        self.git.run("branch", "-m", expected_branch, cwd=snapshot.path)
+        return self.database.update_package_workspace(
+            package.id,
+            expected_revision=expected_revision,
+            lease_generation=lease_generation,
+            base_revision=package.base_revision,
+            branch=expected_branch,
+            worktree=str(snapshot.path),
+        )
+
     def recover(
         self,
         package: CapabilityPackage,
@@ -817,6 +851,16 @@ class PackageExecutionLayer:
                     path.startswith(f"{root.rstrip('/')}/") for root in package.expansion_scope
                 ):
                     raise PackageReportError(f"model requested invalid package path: {path}")
+        placement = report.get("placement_decision")
+        if not isinstance(placement, dict):
+            raise PackageReportError("placement decision must be an object")
+        bounded_paths = set(package.write_scope) | set(package.expansion_scope)
+        for raw_path in placement.get("paths", ()):
+            path = normalize_repository_path(raw_path)
+            if not any(
+                path == root or path.startswith(f"{root.rstrip('/')}/") for root in bounded_paths
+            ):
+                raise PackageReportError(f"placement decision names invalid package path: {path}")
         state = self.database.load_package_state()
         consumer_ids = {value.id for value in state.consumers_for(package.id)}
         assessed = {
@@ -869,7 +913,22 @@ class PackageExecutionLayer:
         known_ids = {
             value.id for value in self.database.load_package_state().steps_for(package_id)
         } | {str(value.get("step_id", "")) for value in raw_steps if isinstance(value, dict)}
-        scope = set(self._current(package_id).write_scope)
+        reservations = tuple(
+            value
+            for value in self.database.load_package_state().reservations.values()
+            if value.package_id == package_id and value.lease_generation == generation
+        )
+
+        def reserved(path: str) -> bool:
+            return any(
+                path == value.normalized_path
+                or (
+                    value.mode is ReservationMode.EXCLUSIVE_SUBTREE
+                    and path.startswith(f"{value.normalized_path.rstrip('/')}/")
+                )
+                for value in reservations
+            )
+
         for raw in raw_steps:
             if not isinstance(raw, dict):
                 raise PackageReportError("package plan step must be an object")
@@ -880,7 +939,7 @@ class PackageExecutionLayer:
             )
             if not step_id or not set(dependencies).issubset(known_ids):
                 raise PackageReportError(f"step {step_id or '<empty>'} has invalid dependencies")
-            if not set(paths).issubset(scope):
+            if not all(reserved(path) for path in paths):
                 raise PackageReportError(f"step {step_id} names an unreserved path")
             existing = self.database.load_package_state().steps.get(step_id)
             status = (
@@ -933,12 +992,23 @@ class PackageExecutionLayer:
         self, package: CapabilityPackage, generation: int, worktree: Path, baseline: str
     ) -> str | None:
         changed = self._changed_paths(worktree, baseline)
-        reserved = {
-            value.normalized_path
+        reservations = tuple(
+            value
             for value in self.database.load_package_state().reservations.values()
             if value.package_id == package.id and value.lease_generation == generation
-        }
-        invalid = tuple(path for path in changed if path not in reserved)
+        )
+        invalid = tuple(
+            path
+            for path in changed
+            if not any(
+                path == value.normalized_path
+                or (
+                    value.mode is ReservationMode.EXCLUSIVE_SUBTREE
+                    and path.startswith(f"{value.normalized_path.rstrip('/')}/")
+                )
+                for value in reservations
+            )
+        )
         if invalid:
             raise PackageReportError("Steward edited unreserved paths: " + ", ".join(invalid))
         if not self.git.dirty_paths(worktree):
@@ -967,7 +1037,16 @@ class PackageExecutionLayer:
                 expected_revision=package.revision,
                 lease_generation=generation,
             )
-        return bool(requested)
+        state = self.database.load_package_state()
+        return any(
+            (dependency := state.packages.get(edge.depends_on_package_id)) is None
+            or dependency.status is not PackageStatus.COMPLETE
+            or (
+                edge.required_revision is not None
+                and dependency.integrated_revision != edge.required_revision
+            )
+            for edge in state.dependencies_of(package_id)
+        )
 
     async def _assess_steward_steps(
         self,
@@ -1276,13 +1355,9 @@ class PackageExecutionLayer:
         generation = lease.generation
         try:
             package = self._reserve_initial_scope(package, generation)
-            if not package.worktree:
-                package = self.worktrees.create(
-                    package_id,
-                    generation,
-                    expected_revision=package.revision,
-                    base_revision=package.base_revision or None,
-                )
+            package = self.worktrees.activate(
+                package, generation, expected_revision=package.revision
+            )
             worktree = Path(package.worktree)
             package = self.database.update_package_lifecycle(
                 package_id,

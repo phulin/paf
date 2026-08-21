@@ -13,6 +13,8 @@ from paf.package_model import (
     IntegrationJournal,
     IntegrationPhase,
     PackageConsumer,
+    PackageDisposition,
+    PackageStatus,
     PathReservation,
     ReservationDecision,
     ReservationMode,
@@ -553,6 +555,53 @@ def steward_report(
     }
 
 
+def disposition_report(
+    disposition: str,
+    consumer_ids: tuple[str, ...],
+    *,
+    child_packages: list[dict[str, object]] | None = None,
+    dependencies: list[dict[str, object]] | None = None,
+) -> dict[str, object]:
+    return {
+        "complete": disposition in {"complete", "external", "decomposed"},
+        "summary": f"classified package as {disposition}",
+        "issues": [],
+        "diagnosis": "The current source and consumers were checked.",
+        "placement_decision": {
+            "kind": "external" if disposition == "external" else "consumer_local",
+            "paths": ["lean/Book.lean"],
+            "declarations": ["base"],
+            "rationale": "The classification follows the current source boundary.",
+        },
+        "scope_expansion_requests": [],
+        "plan_revision": {
+            "base_revision": 0,
+            "revision_reason": "Classification requires no implementation steps.",
+            "steps": [],
+        },
+        "completed_step_assessments": [],
+        "worker_assignments": [],
+        "package_dependency_requests": dependencies or [],
+        "child_packages": child_packages or [],
+        "consumer_assessments": [
+            {
+                "consumer_id": consumer_id,
+                "disposition": "terminal" if disposition == "external" else "open",
+                "acceptance_evidence": (
+                    "Capability belongs to an unavailable dependency."
+                    if disposition == "external"
+                    else ""
+                ),
+                "detached_package_id": None,
+                "remaining_obstruction": "external gap" if disposition == "external" else "",
+            }
+            for consumer_id in consumer_ids
+        ],
+        "disposition": disposition,
+        "remaining_work": "exact remaining work",
+    }
+
+
 @pytest.mark.asyncio
 async def test_package_execution_integrates_multifile_steward_and_small_worker_steps(
     tmp_path: Path,
@@ -682,3 +731,155 @@ async def test_package_execution_rejects_model_path_outside_expansion_scope(
     assert result.status.value == "parked"
     assert "invalid package path" in result.detail
     assert not (repo / "README.md").exists()
+
+
+@pytest.mark.asyncio
+async def test_package_execution_accepts_consumers_independently_and_wakes_only_accepted(
+    tmp_path: Path,
+) -> None:
+    repo = git_repo(tmp_path)
+    store = StateDatabase(repo / ".paf")
+    store.initialize()
+    current, _ = store.create_or_attach_capability_package(
+        CapabilityPackage(
+            "P-partial",
+            "partial.consumers",
+            "Partial consumers",
+            "Validate consumers independently",
+            write_scope=("lean/Book.lean",),
+            expansion_scope=("lean/Book.lean",),
+        ),
+        consumer=PackageConsumer(
+            "consumer-a", "P-partial", "chapter-a", "lean/Book.lean", "base", "prove"
+        ),
+    )
+    store.attach_package_consumer(
+        current.id,
+        PackageConsumer("consumer-b", "P-partial", "chapter-b", "lean/Book.lean", "base", "prove"),
+        expected_revision=current.revision,
+    )
+    report = disposition_report("continue", ("consumer-a", "consumer-b"))
+    woken: list[str] = []
+
+    async def wake(ids):
+        woken.extend(ids)
+
+    runtime = PackageExecutionLayer(
+        repo,
+        repo / ".paf",
+        store,
+        run_steward=lambda *_args: asyncio.sleep(0, result=report),
+        run_worker=lambda *_args: asyncio.sleep(0, result={}),
+        validate_step=lambda *_args: PackageValidation(True, "step", "ok"),
+        validate_package=lambda *_args: PackageValidation(True, "package", "ok"),
+        validate_consumer=lambda _path, consumer: ConsumerValidation(
+            consumer.id == "consumer-a",
+            consumer.id,
+            "accepted" if consumer.id == "consumer-a" else "new local obstruction",
+            consumer.id,
+            (consumer.work_unit_id,),
+        ),
+        wake_consumers=wake,
+    )
+
+    result = await runtime.execute(current.id)
+
+    assert result.status.value == "implementing"
+    assert result.accepted_consumer_ids == ("consumer-a",)
+    assert woken == ["chapter-a"]
+    state = store.load_package_state()
+    assert state.consumers["consumer-a"].status is ConsumerStatus.ACCEPTED
+    assert state.consumers["consumer-b"].status is ConsumerStatus.OPEN
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("disposition", ["external", "waiting_dependency", "decomposed"])
+async def test_package_execution_persists_nonimplementation_dispositions(
+    tmp_path: Path, disposition: str
+) -> None:
+    repo = git_repo(tmp_path)
+    store = StateDatabase(repo / ".paf")
+    store.initialize()
+    dependency, _ = store.create_or_attach_capability_package(
+        CapabilityPackage("dependency", "dependency.key", "Dependency", "Dependency objective")
+    )
+    dependency = store.update_package_lifecycle(
+        dependency.id,
+        PackageStatus.COMPLETE,
+        disposition=PackageDisposition.IMPLEMENTED,
+        integrated_revision="dependency-revision",
+        expected_revision=dependency.revision,
+    )
+    current, _ = store.create_or_attach_capability_package(
+        CapabilityPackage(
+            "P-disposition",
+            f"disposition.{disposition}",
+            "Disposition package",
+            "Classify remaining work",
+            write_scope=("lean/Book.lean",),
+            expansion_scope=("lean/Book.lean",),
+        ),
+        consumer=PackageConsumer(
+            "consumer-a",
+            "P-disposition",
+            "chapter-a",
+            "lean/Book.lean",
+            "base",
+            "prove",
+        ),
+    )
+    children = (
+        [
+            {
+                "capability_key": "child.key",
+                "title": "Child capability",
+                "mathematical_objective": "Complete the independent child",
+                "write_scope": ["lean/Book.lean"],
+                "consumer_ids": ["consumer-a"],
+            }
+        ]
+        if disposition == "decomposed"
+        else []
+    )
+    dependencies = (
+        [
+            {
+                "package_id": dependency.id,
+                "required_revision": "newer-revision",
+                "reason": "The newer dependency interface is required.",
+            }
+        ]
+        if disposition == "waiting_dependency"
+        else []
+    )
+    report = disposition_report(
+        disposition,
+        ("consumer-a",),
+        child_packages=children,
+        dependencies=dependencies,
+    )
+    runtime = PackageExecutionLayer(
+        repo,
+        repo / ".paf",
+        store,
+        run_steward=lambda *_args: asyncio.sleep(0, result=report),
+        run_worker=lambda *_args: asyncio.sleep(0, result={}),
+        validate_step=lambda *_args: PackageValidation(True, "step", "ok"),
+        validate_package=lambda *_args: PackageValidation(True, "package", "ok"),
+        validate_consumer=lambda _path, consumer: ConsumerValidation(
+            False, "consumer", "still blocked", consumer.id
+        ),
+    )
+
+    result = await runtime.execute(current.id)
+
+    assert result.status.value == disposition
+    state = store.load_package_state()
+    if disposition == "decomposed":
+        assert state.packages[current.id].status.value == "decomposed"
+        assert state.consumers["consumer-a"].package_id != current.id
+    elif disposition == "waiting_dependency":
+        assert state.dependencies_of(current.id)[0].required_revision == "newer-revision"
+        assert current.id not in {package.id for package in runtime.ready_packages()}
+    else:
+        assert state.consumers["consumer-a"].status is ConsumerStatus.TERMINAL

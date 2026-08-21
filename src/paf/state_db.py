@@ -3064,7 +3064,12 @@ class StateDatabase:
                 """INSERT INTO path_reservations(
                     normalized_path, mode, owner_kind, owner_id, fence_generation,
                     acquired_at, expires_at, package_id
-                ) VALUES(?, ?, 'package', ?, ?, ?, NULL, ?)""",
+                ) VALUES(?, ?, 'package', ?, ?, ?, NULL, ?)
+                ON CONFLICT(normalized_path) DO UPDATE SET mode=excluded.mode,
+                    fence_generation=excluded.fence_generation,
+                    acquired_at=excluded.acquired_at
+                WHERE path_reservations.owner_kind='package'
+                    AND path_reservations.owner_id=excluded.owner_id""",
                 (
                     (
                         item.normalized_path,

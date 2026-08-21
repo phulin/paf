@@ -807,6 +807,8 @@ class Orchestrator:
             self._proof_rechecks.add(work_unit_id)
 
     async def _schedule_ready_packages(self) -> bool:
+        if not self.git.enabled:
+            return False
         launched = False
         for package in self.package_execution.ready_packages():
             if package.id in self._package_tasks:
@@ -3465,8 +3467,6 @@ class Orchestrator:
             )
             await self.state.attach_proof_blockers_to_package((blocker_id,), attached.id)
             package_ids.append(attached.id)
-        if package_ids:
-            await self._schedule_ready_packages()
         return tuple(dict.fromkeys(package_ids))
 
     async def _resolve_satisfied_proof_blockers(self, chapter: WorkUnitLike) -> None:
@@ -6725,6 +6725,7 @@ class Orchestrator:
         assigned_targets: tuple[ProofTarget, ...] = ()
         chunk_round = 0
         skipped_target_ids: set[str] = set()
+        blocking_package_ids: set[str] = set()
 
         def matches_target(value: dict[str, Any], target: ProofTarget) -> bool:
             path = str(value.get("path", value.get("consumer_path", "")))
@@ -7214,6 +7215,14 @@ class Orchestrator:
             )
             package_ids = await self._attach_structural_blockers_to_packages(chapter, blockers)
             if package_ids:
+                if chunked_proofs:
+                    blocking_package_ids.update(package_ids)
+                    skipped_target_ids.update(target.fingerprint for target in assigned_targets)
+                    assigned_targets = ()
+                    chunk_round = 0
+                    feedback_ledger.clear()
+                    feedback = ""
+                    continue
                 await self.state.set_task(
                     chapter.id,
                     Stage.PROVE,
@@ -7509,6 +7518,25 @@ class Orchestrator:
         unresolved_placeholders = await asyncio.to_thread(
             count_placeholders, self.config.settings.repo, chapter
         )
+        if blocking_package_ids:
+            await self.state.set_task(
+                chapter.id,
+                Stage.PROVE,
+                TaskStatus.BLOCKED,
+                "independent proof chunks exhausted; structural work remains in package(s): "
+                + ", ".join(sorted(blocking_package_ids)),
+            )
+            return StageOutcome(
+                ExecutionDisposition.WAITING,
+                tuple(
+                    Requirement(
+                        RequirementKind.CAPABILITY_PACKAGE,
+                        request_id=package_id,
+                        detail="package Steward owns the remaining structural proof work",
+                    )
+                    for package_id in sorted(blocking_package_ids)
+                ),
+            )
         await self.state.set_task(
             chapter.id,
             Stage.PROVE,
