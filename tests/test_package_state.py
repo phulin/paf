@@ -29,7 +29,7 @@ from paf.package_model import (
     normalize_repository_path,
 )
 from paf.state import StateStore
-from paf.state_db import StateDatabase, read_checkpoint
+from paf.state_db import SCHEMA_VERSION, StateDatabase, read_checkpoint
 from tests.support import write_project
 
 NOW = "2100-08-21T00:00:00+00:00"
@@ -70,6 +70,40 @@ def database(tmp_path: Path) -> StateDatabase:
     result = StateDatabase(tmp_path / ".paf")
     result.initialize()
     return result
+
+
+def test_schema_v8_migrates_package_worktrees_to_candidate_refs(tmp_path: Path) -> None:
+    store = database(tmp_path)
+    with sqlite3.connect(store.path) as connection, connection:
+        connection.execute(
+            "ALTER TABLE capability_packages ADD COLUMN worktree TEXT NOT NULL DEFAULT ''"
+        )
+        connection.execute(
+            "ALTER TABLE package_recoveries RENAME COLUMN candidate_revision TO worktree_head"
+        )
+        connection.execute(
+            "ALTER TABLE package_recoveries RENAME COLUMN candidate_digest TO dirty_digest"
+        )
+        connection.execute(
+            "ALTER TABLE package_recoveries ADD COLUMN worktree_status TEXT NOT NULL DEFAULT ''"
+        )
+        connection.execute("UPDATE meta SET schema_version=8 WHERE singleton=1")
+        connection.execute("PRAGMA user_version=8")
+
+    store.initialize()
+
+    with sqlite3.connect(store.path) as connection:
+        package_columns = {
+            str(row[1]) for row in connection.execute("PRAGMA table_info(capability_packages)")
+        }
+        recovery_columns = {
+            str(row[1]) for row in connection.execute("PRAGMA table_info(package_recoveries)")
+        }
+        version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+    assert version == SCHEMA_VERSION
+    assert "worktree" not in package_columns
+    assert {"candidate_revision", "candidate_digest"}.issubset(recovery_columns)
+    assert not {"worktree_head", "worktree_status", "dirty_digest"} & recovery_columns
 
 
 def test_package_model_normalizes_identity_and_repository_paths() -> None:

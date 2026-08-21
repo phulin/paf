@@ -315,12 +315,9 @@ class ControlServer:
                     current = database.load_package_state().packages.get(package_id)
                     if current is None:
                         raise ValueError(f"unknown capability package: {package_id}")
-                    lease, _recovery, _snapshot = await asyncio.to_thread(
-                        self.orchestrator.package_execution.worktrees.recover,
+                    lease, _current = await asyncio.to_thread(
+                        self.orchestrator.package_execution._claim,
                         current,
-                        f"operator-recovery-{package_id}",
-                        expected_revision=current.revision,
-                        ttl_seconds=self.orchestrator.package_execution.lease_ttl_seconds,
                     )
                     await asyncio.to_thread(
                         database.release_steward_lease,

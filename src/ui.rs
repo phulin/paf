@@ -290,7 +290,7 @@ fn draw_package_detail(frame: &mut Frame<'_>, model: &mut DashboardModel) {
                 .state
                 .steward_leases
                 .get(&package_id)
-                .map(|lease| format!("{} owns the package worktree", lease.agent_id))
+                .map(|lease| format!("{} owns the package overlay", lease.agent_id))
                 .or_else(|| {
                     package
                         .disposition

@@ -80,6 +80,7 @@ from paf.package_runtime import (
     PackageExecutionResult,
     PackageReportError,
     PackageValidation,
+    PackageWorkspace,
 )
 from paf.scope import ScopeMatcher
 from paf.state import (
@@ -598,6 +599,7 @@ class Orchestrator:
             validate_step=self._validate_package_step,
             validate_package=self._validate_capability_package,
             validate_consumer=self._validate_package_consumer,
+            acquire_workspace=self._acquire_package_workspace,
             interface_digest=self._package_interface_digest,
             wake_consumers=self._wake_package_consumers,
             lease_ttl_seconds=config.steward.lease_ttl_seconds,
@@ -673,6 +675,29 @@ class Orchestrator:
         if not result.succeeded:
             raise PackageReportError(result.error or "package Steward agent failed")
         return result.report
+
+    async def _acquire_package_workspace(
+        self, package: CapabilityPackage, generation: int
+    ) -> PackageWorkspace:
+        """Acquire and seed one package overlay under the canonical source barrier."""
+
+        if self.isolation.name != "fuse-overlay":
+            raise RuntimeError("capability packages require fuse-overlay isolation")
+        async with self.source_lock:
+            workspace = await self.isolation.acquire(
+                f"package-{package.id}-generation-{generation}"
+            )
+            assert isinstance(workspace, FuseWorkspace)
+            try:
+                await asyncio.to_thread(
+                    self.package_execution.candidates.materialize,
+                    package,
+                    workspace.root,
+                )
+            except BaseException:
+                await workspace.close()
+                raise
+        return PackageWorkspace(workspace.root, workspace.changed_paths, workspace.close)
 
     async def _run_package_worker_agent(
         self,

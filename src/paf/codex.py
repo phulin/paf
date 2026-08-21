@@ -443,7 +443,6 @@ _PACKAGE_WORKER_PROPERTIES: dict[str, Any] = {
     "step_id": {"type": "string", "minLength": 1},
     "changed_declarations": {"type": "array", "items": {"type": "string", "minLength": 1}},
     "changed_paths": {"type": "array", "items": {"type": "string", "minLength": 1}},
-    "commit_id": {"type": ["string", "null"]},
     "focused_validation": {"type": "string", "minLength": 1},
     "remaining_gap": {"type": "string"},
     "new_evidence": {"type": "array", "items": {"type": "string", "minLength": 1}},
@@ -1638,12 +1637,12 @@ current diagnostics override the earlier clean-build fact."""
         }[stage]
         if role == PACKAGE_STEWARD_ROLE:
             stage_contract = """This is a writable capability-package Steward turn. You own the
-reserved package worktree and may edit every reserved path, including shared interfaces and
+private package overlay and may edit every reserved path, including shared interfaces and
 consumers in several files. Make central interface edits yourself, delegate only bounded leaf
 steps, and return a complete package mutation report."""
         elif role == PACKAGE_WORKER_ROLE:
             stage_contract = """This is one bounded capability-package worker step. Edit only the
-assigned paths in the package worktree, commit the completed step, and report exact validation and
+assigned paths in the package overlay, and report exact validation and
 remaining evidence. You may not change placement, scope, dependencies, consumers, or package
 lifecycle."""
         validation_contract = {
@@ -1885,7 +1884,7 @@ diagnostics from prerequisites to dependents.
         *,
         workspace_root: Path,
     ) -> AgentResult:
-        """Execute one bounded sequential worker step in its package worktree."""
+        """Execute one bounded sequential worker step in its package overlay."""
 
         feedback = json.dumps(packet, indent=2)
         prompt = self.build_prompt(

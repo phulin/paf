@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import shutil
 import subprocess
 import sys
@@ -35,7 +36,7 @@ from paf.corpus import (
 from paf.display import activity_kind_badge, format_count, format_usage
 from paf.isolation import fuse_overlay_available
 from paf.models import PipelineConfig, Stage, WorkUnitLike
-from paf.package_runtime import PackageWorktreeManager
+from paf.package_runtime import PackageCandidateStore
 from paf.pricing import LEGACY_MODEL, CostEstimate, estimate_cost, format_usd
 from paf.project import Project, ProjectResolver
 from paf.scheduler import Orchestrator, scaffold_directories
@@ -177,7 +178,7 @@ def parser() -> argparse.ArgumentParser:
     resume_package.add_argument("package_id")
     resume_package.add_argument("--reason", default="")
     recover_package = package_commands.add_parser(
-        "recover", help="fence stale ownership and preserve the package worktree"
+        "recover", help="fence stale ownership and preserve the package candidate ref"
     )
     recover_package.add_argument("package_id")
 
@@ -1225,14 +1226,26 @@ def _control_response(
                 current = package_state.packages.get(package_id)
                 if current is None:
                     raise ValueError(f"unknown capability package: {package_id}") from None
-                manager = PackageWorktreeManager(
+                candidates = PackageCandidateStore(
                     config.settings.repo, config.settings.state_dir, database
                 )
-                lease, _recovery, _snapshot = manager.recover(
-                    current,
+                journal = tuple(
+                    value
+                    for value in package_state.integration_journal.values()
+                    if value.package_id == package_id
+                )
+                latest_phase = (
+                    max(journal, key=lambda value: value.updated_at).phase if journal else None
+                )
+                candidate = candidates.revision(current)
+                lease, _recovery = database.recover_steward_lease(
+                    package_id,
                     f"operator-recovery-{package_id}",
                     expected_revision=current.revision,
                     ttl_seconds=config.steward.lease_ttl_seconds,
+                    candidate_revision=candidate,
+                    candidate_digest=hashlib.sha256(candidate.encode()).hexdigest(),
+                    journal_phase=latest_phase,
                 )
                 database.release_steward_lease(package_id, lease.agent_id, lease.generation)
                 response = {"package": _package_view(database.load_package_state(), package_id)}

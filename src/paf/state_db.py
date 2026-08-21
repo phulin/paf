@@ -49,7 +49,7 @@ from paf.package_model import (
 
 DATABASE_NAME = "state.sqlite3"
 LEGACY_BACKUP_NAME = "state.legacy-v6.json"
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 CHANGE_RETENTION = 10_000
 
 COLLECTION_SECTIONS = frozenset(
@@ -622,6 +622,25 @@ def _migrate_package_steps_v8(connection: sqlite3.Connection) -> None:
     )
 
 
+def _migrate_capability_packages_v9(connection: sqlite3.Connection) -> None:
+    columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(capability_packages)")}
+    if "worktree" in columns:
+        connection.execute("ALTER TABLE capability_packages DROP COLUMN worktree")
+    recovery_columns = {
+        str(row[1]) for row in connection.execute("PRAGMA table_info(package_recoveries)")
+    }
+    if "worktree_head" in recovery_columns:
+        connection.execute(
+            "ALTER TABLE package_recoveries RENAME COLUMN worktree_head TO candidate_revision"
+        )
+    if "dirty_digest" in recovery_columns:
+        connection.execute(
+            "ALTER TABLE package_recoveries RENAME COLUMN dirty_digest TO candidate_digest"
+        )
+    if "worktree_status" in recovery_columns:
+        connection.execute("ALTER TABLE package_recoveries DROP COLUMN worktree_status")
+
+
 def _create_schema(connection: sqlite3.Connection) -> None:
     """Create the normalized current-state schema.
 
@@ -745,7 +764,6 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             disposition TEXT,
             base_revision TEXT NOT NULL DEFAULT '',
             branch TEXT NOT NULL DEFAULT '',
-            worktree TEXT NOT NULL DEFAULT '',
             parent_package_id TEXT REFERENCES capability_packages(id),
             plan_revision INTEGER NOT NULL DEFAULT 0,
             integrated_revision TEXT,
@@ -941,9 +959,8 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             package_id TEXT NOT NULL REFERENCES capability_packages(id) ON DELETE CASCADE,
             prior_generation INTEGER NOT NULL,
             recovered_generation INTEGER NOT NULL,
-            worktree_head TEXT NOT NULL,
-            worktree_status TEXT NOT NULL,
-            dirty_digest TEXT NOT NULL,
+            candidate_revision TEXT NOT NULL,
+            candidate_digest TEXT NOT NULL,
             active_child_workers BLOB NOT NULL,
             journal_phase TEXT,
             recovered_at TEXT NOT NULL
@@ -952,6 +969,7 @@ def _create_schema(connection: sqlite3.Connection) -> None:
     )
     _migrate_path_reservations_v6(connection)
     _migrate_package_steps_v8(connection)
+    _migrate_capability_packages_v9(connection)
     journal_columns = {
         str(row[1])
         for row in connection.execute("PRAGMA table_info(integration_journal)").fetchall()
@@ -1332,9 +1350,9 @@ def _insert_package(connection: sqlite3.Connection, package: CapabilityPackage) 
         """
         INSERT INTO capability_packages(
             id, capability_key, title, mathematical_objective, status, disposition,
-            base_revision, branch, worktree, parent_package_id, plan_revision,
+            base_revision, branch, parent_package_id, plan_revision,
             integrated_revision, revision, created_at, updated_at
-        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             package.id,
@@ -1345,7 +1363,6 @@ def _insert_package(connection: sqlite3.Connection, package: CapabilityPackage) 
             str(package.disposition) if package.disposition is not None else None,
             package.base_revision,
             package.branch,
-            package.worktree,
             package.parent_package_id,
             package.plan_revision,
             package.integrated_revision,
@@ -1671,7 +1688,7 @@ def _load_package_state(connection: sqlite3.Connection) -> PackageState:
     for row in connection.execute(
         """
         SELECT id, capability_key, title, mathematical_objective, status, disposition,
-            base_revision, branch, worktree, parent_package_id, plan_revision,
+            base_revision, branch, parent_package_id, plan_revision,
             integrated_revision, revision, created_at, updated_at
         FROM capability_packages ORDER BY created_at, id
         """
@@ -1691,13 +1708,12 @@ def _load_package_state(connection: sqlite3.Connection) -> PackageState:
             expansion_scope=expansion_scopes.get(package_id, ()),
             base_revision=str(row[6]),
             branch=str(row[7]),
-            worktree=str(row[8]),
-            parent_package_id=str(row[9]) if row[9] is not None else None,
-            plan_revision=int(row[10]),
-            integrated_revision=str(row[11]) if row[11] is not None else None,
-            revision=int(row[12]),
-            created_at=str(row[13]),
-            updated_at=str(row[14]),
+            parent_package_id=str(row[8]) if row[8] is not None else None,
+            plan_revision=int(row[9]),
+            integrated_revision=str(row[10]) if row[10] is not None else None,
+            revision=int(row[11]),
+            created_at=str(row[12]),
+            updated_at=str(row[13]),
         )
 
     blockers = _group_ordered_items(
@@ -2035,7 +2051,7 @@ def initialize_database(state_dir: Path) -> Path:
             if version == 1:
                 with connection:
                     _migrate_v1(connection)
-            elif version in {2, 3, 4, 5, 6, 7}:
+            elif version in {2, 3, 4, 5, 6, 7, 8}:
                 with connection:
                     _create_schema(connection)
             elif version != SCHEMA_VERSION:
@@ -3128,9 +3144,8 @@ class StateDatabase:
         *,
         expected_revision: int,
         ttl_seconds: float,
-        worktree_head: str,
-        worktree_status: str,
-        dirty_digest: str,
+        candidate_revision: str,
+        candidate_digest: str,
         active_child_workers: tuple[str, ...] = (),
         journal_phase: IntegrationPhase | None = None,
         now: str | None = None,
@@ -3188,16 +3203,15 @@ class StateDatabase:
             self._refence_package_reservation_queue(connection, package_id, generation)
             connection.execute(
                 """INSERT INTO package_recoveries(
-                    package_id, prior_generation, recovered_generation, worktree_head,
-                    worktree_status, dirty_digest, active_child_workers, journal_phase, recovered_at
-                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    package_id, prior_generation, recovered_generation, candidate_revision,
+                    candidate_digest, active_child_workers, journal_phase, recovered_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     package_id,
                     prior_generation,
                     generation,
-                    worktree_head,
-                    worktree_status,
-                    dirty_digest,
+                    candidate_revision,
+                    candidate_digest,
                     json.dumpb(list(active_child_workers)),
                     str(journal_phase) if journal_phase is not None else None,
                     recovered_at,
@@ -3209,16 +3223,15 @@ class StateDatabase:
             package_id,
             prior_generation,
             generation,
-            worktree_head,
-            worktree_status,
-            dirty_digest,
+            candidate_revision,
+            candidate_digest,
             active_child_workers,
             journal_phase,
             recovered_at,
         )
         return lease, recovery
 
-    def update_package_workspace(
+    def update_package_candidate(
         self,
         package_id: str,
         *,
@@ -3226,15 +3239,14 @@ class StateDatabase:
         lease_generation: int,
         base_revision: str,
         branch: str,
-        worktree: str,
     ) -> CapabilityPackage:
         with _connect(self.path) as connection, connection:
             self._assert_package_revision(connection, package_id, expected_revision)
             self._assert_lease_generation(connection, package_id, lease_generation)
             connection.execute(
-                """UPDATE capability_packages SET base_revision=?, branch=?, worktree=?,
+                """UPDATE capability_packages SET base_revision=?, branch=?,
                     revision=revision+1, updated_at=? WHERE id=?""",
-                (base_revision, branch, worktree, _utc_now(), package_id),
+                (base_revision, branch, _utc_now(), package_id),
             )
             return _load_package_state(connection).packages[package_id]
 

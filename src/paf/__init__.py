@@ -32,11 +32,11 @@ from paf.package_model import (
 from paf.package_runtime import (
     IntegrationResult,
     InterfaceChange,
+    PackageCandidateStore,
     PackageGitError,
     PackageIntegrator,
-    PackageWorktreeManager,
+    PackageWorkspace,
     RelevantInterfaceGuard,
-    WorktreeSnapshot,
 )
 from paf.project import Project, ProjectResolver
 
@@ -49,6 +49,7 @@ __all__ = [
     "IntegrationPhase",
     "IntegrationResult",
     "InterfaceChange",
+    "PackageCandidateStore",
     "PackageConsumer",
     "PackageDependency",
     "PackageDisposition",
@@ -61,7 +62,7 @@ __all__ = [
     "PackageStep",
     "PackageStepKind",
     "PackageStepStatus",
-    "PackageWorktreeManager",
+    "PackageWorkspace",
     "PathReservation",
     "Project",
     "ProjectResolver",
@@ -75,7 +76,6 @@ __all__ = [
     "ReservationSpec",
     "Stage",
     "StewardLease",
-    "WorktreeSnapshot",
     "canonical_reservation_specs",
 ]
 

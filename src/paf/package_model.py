@@ -138,7 +138,6 @@ class CapabilityPackage:
     expansion_scope: tuple[str, ...] = ()
     base_revision: str = ""
     branch: str = ""
-    worktree: str = ""
     parent_package_id: str | None = None
     plan_revision: int = 0
     integrated_revision: str | None = None
@@ -342,9 +341,8 @@ class PackageRecovery:
     package_id: str
     prior_generation: int
     recovered_generation: int
-    worktree_head: str
-    worktree_status: str
-    dirty_digest: str
+    candidate_revision: str
+    candidate_digest: str
     active_child_workers: tuple[str, ...] = ()
     journal_phase: IntegrationPhase | None = None
     recovered_at: str = ""

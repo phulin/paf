@@ -35,8 +35,9 @@ acceptance predicates.
    an agent edits it.
 4. Agents read repository-wide without read locks. Relevant read dependencies are protected by
    interface digests checked before integration.
-5. All package edits occur in an isolated package worktree. No package agent edits the canonical
-   worktree or shares a writable worktree concurrently with another agent.
+5. All package edits occur in a private fuse-overlay workspace. No package agent edits the
+   canonical checkout or shares a writable overlay concurrently with another agent. Durable
+   progress is a Git candidate ref created by PAF, never a checked-out package worktree.
 6. The package outcome is repository state, not an answer sent to another agent. A reusable result
    is complete only when its declaration exists, is placeholder-free, validates, and has passed the
    applicable consumer checks.
@@ -343,11 +344,10 @@ A worker cannot change placement, expand scope, split the package, attach consum
 package completion. If it discovers that the objective is wrongly placed or needs another file, it
 returns evidence to the Steward without editing that path.
 
-The default execution mode is sequential workers in the package worktree: one worker edits, commits,
-and yields; the Steward reviews the commit before another worker uses it. Independent steps with
-disjoint paths may use child worktrees. Each child receives a disjoint subset of the package's path
-reservations and returns commits to the Steward's package branch. Two agents never edit the same
-worktree concurrently.
+The default execution mode is sequential workers in one private package overlay: one worker edits
+and yields, then PAF snapshots the reserved delta into the package candidate ref before another
+worker uses it. Agents never manipulate package branches or commits themselves, and two agents
+never edit the same overlay concurrently.
 
 Worker failure does not create a peer request or a new review loop. Its report and validation become
 package evidence. The Steward revises the step, handles it directly, or splits a genuinely
@@ -448,12 +448,13 @@ steps to investigation or validation; it never permits a stale commit to publish
 
 Canonical Git integration uses one short-lived repository lock and an optimistic two-phase
 protocol. The Steward never holds the lock while thinking, editing, or running a long Lean build.
-PAF first acquires the lock to verify the lease and reservations, record canonical HEAD, and update
-the candidate branch to that exact revision. It then releases the lock and runs interface checks,
-focused validation, and affected builds in the package worktree.
+PAF first captures canonical HEAD while acquiring the package overlay, replays the durable candidate
+delta there, and snapshots accepted reserved edits into a candidate commit whose parent is that
+exact revision. It then runs interface checks, focused validation, and affected builds in the
+private overlay.
 
 After validation PAF reacquires the lock. If canonical HEAD or any relevant interface digest has
-changed, it releases the lock and repeats the update-and-validation phase. Otherwise it imports the
+changed, it releases the lock and leaves the candidate ready for a fresh overlay round. Otherwise it imports the
 validated commits, records the new canonical revision and consumer results, releases paths no longer
 needed, and releases the integration lock. Thus no long validation blocks unrelated integrations,
 while no candidate validated against a stale base can publish.

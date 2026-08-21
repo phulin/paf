@@ -118,7 +118,6 @@ def test_report_schemas_contain_only_fields_used_by_each_active_agent() -> None:
             "step_id",
             "changed_declarations",
             "changed_paths",
-            "commit_id",
             "focused_validation",
             "remaining_gap",
             "new_evidence",

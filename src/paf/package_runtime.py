@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import fcntl
+import os
 import re
 import subprocess
 from collections.abc import Awaitable, Callable, Iterator
@@ -24,11 +25,11 @@ from paf.package_model import (
     PackageDependency,
     PackageDisposition,
     PackageEvidence,
-    PackageRecovery,
     PackageStatus,
     PackageStep,
     PackageStepKind,
     PackageStepStatus,
+    PathReservation,
     RelevantReadInterface,
     ReservationMode,
     ReservationOwnerKind,
@@ -51,18 +52,13 @@ class PackageReservationWaiting(RuntimeError):
     """A package mutation is durably queued behind another path owner."""
 
 
-@dataclass(frozen=True)
-class WorktreeSnapshot:
-    path: Path
-    branch: str
-    head: str
-    status: str
-    dirty_paths: tuple[str, ...]
-    dirty_digest: str
+@dataclass
+class PackageWorkspace:
+    """One private, in-flight package overlay owned by the isolation layer."""
 
-    @property
-    def clean(self) -> bool:
-        return not self.dirty_paths
+    root: Path
+    changed_paths: Callable[[], Awaitable[tuple[str, ...]]]
+    close: Callable[[], Awaitable[None]]
 
 
 @dataclass(frozen=True)
@@ -97,25 +93,48 @@ def _slug(value: str) -> str:
     return clean
 
 
+def _reservation_contains(reservation: PathReservation, path: str) -> bool:
+    return path == reservation.normalized_path or (
+        reservation.mode is ReservationMode.EXCLUSIVE_SUBTREE
+        and path.startswith(f"{reservation.normalized_path.rstrip('/')}/")
+    )
+
+
 class _Git:
     def __init__(self, repo: Path) -> None:
         self.repo = repo.resolve()
 
-    def run(self, *arguments: str, cwd: Path | None = None, check: bool = True) -> str:
+    def run_bytes(
+        self,
+        *arguments: str,
+        cwd: Path | None = None,
+        check: bool = True,
+        env: dict[str, str] | None = None,
+    ) -> bytes:
         result = subprocess.run(
             ("git", "--literal-pathspecs", *arguments),
             cwd=cwd or self.repo,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             check=False,
+            env=(os.environ | env) if env is not None else None,
         )
-        output = result.stdout.decode(errors="replace")
         if check and result.returncode:
+            output = result.stdout.decode(errors="replace")
             raise PackageGitError(
                 f"git {' '.join(arguments[:2])} failed ({result.returncode}): "
                 f"{output[-4000:].strip()}"
             )
-        return output
+        return result.stdout
+
+    def run(
+        self,
+        *arguments: str,
+        cwd: Path | None = None,
+        check: bool = True,
+        env: dict[str, str] | None = None,
+    ) -> str:
+        return self.run_bytes(*arguments, cwd=cwd, check=check, env=env).decode(errors="replace")
 
     def head(self, cwd: Path | None = None) -> str:
         return self.run("rev-parse", "HEAD", cwd=cwd).strip()
@@ -144,176 +163,154 @@ class _Git:
         return tuple(sorted(paths))
 
 
-class PackageWorktreeManager:
-    """Create and recover fenced package worktrees without discarding dirty state."""
+class PackageCandidateStore:
+    """Persist package candidates as Git objects while agents edit only overlays."""
 
     def __init__(self, repo: Path, state_dir: Path, database: StateDatabase) -> None:
         self.repo = repo.resolve()
         self.state_dir = state_dir.resolve()
         self.database = database
         self.git = _Git(self.repo)
-        self.worktrees = self.state_dir / "worktrees"
+        self.indexes = self.state_dir / "package-indexes"
 
-    def inspect(self, path: Path) -> WorktreeSnapshot:
-        resolved = path.resolve()
-        status = self.git.status(resolved)
-        dirty_paths = self.git.dirty_paths(resolved)
-        return WorktreeSnapshot(
-            resolved,
-            self.git.branch(resolved),
-            self.git.head(resolved),
-            status,
-            dirty_paths,
-            sha256(status.encode()).hexdigest(),
-        )
+    def branch(self, package_id: str) -> str:
+        return f"paf/package-{_slug(package_id)}"
 
-    def create(
-        self,
-        package_id: str,
-        lease_generation: int,
-        *,
-        expected_revision: int,
-        base_revision: str | None = None,
-    ) -> CapabilityPackage:
-        slug = _slug(package_id)
-        path = self.worktrees / f"package-{slug}"
-        branch = f"paf/package-{slug}/generation-{lease_generation}"
-        base = base_revision or self.git.head()
-        self.database.assert_live_steward_lease(package_id, lease_generation)
-        self.worktrees.mkdir(parents=True, exist_ok=True)
-        if path.exists():
-            snapshot = self.inspect(path)
-            if snapshot.branch != branch:
-                raise PackageGitError(
-                    f"existing package worktree {path} is on {snapshot.branch}, expected {branch}"
-                )
-        else:
-            existing = self.git.run("branch", "--list", branch)
-            if existing:
-                self.git.run("worktree", "add", str(path), branch)
-            else:
-                self.git.run("worktree", "add", "-b", branch, str(path), base)
-        return self.database.update_package_workspace(
-            package_id,
-            expected_revision=expected_revision,
-            lease_generation=lease_generation,
-            base_revision=base,
-            branch=branch,
-            worktree=str(path),
-        )
-
-    def activate(
-        self,
-        package: CapabilityPackage,
-        lease_generation: int,
-        *,
-        expected_revision: int,
-    ) -> CapabilityPackage:
-        """Create or fence a clean retained worktree for a new Steward generation."""
-
-        if not package.worktree:
-            return self.create(
-                package.id,
-                lease_generation,
-                expected_revision=expected_revision,
-                base_revision=package.base_revision or None,
+    def revision(self, package: CapabilityPackage) -> str:
+        for reference in (package.branch, self.branch(package.id)):
+            resolved = (
+                self.git.run("rev-parse", "--verify", reference, check=False).strip()
+                if reference
+                else ""
             )
-        snapshot = self.inspect(Path(package.worktree))
-        expected_branch = f"paf/package-{_slug(package.id)}/generation-{lease_generation}"
-        if snapshot.branch == expected_branch:
-            return package
-        if not snapshot.clean:
-            raise PackageGitError(
-                f"retained package worktree is dirty on fenced branch {snapshot.branch}"
-            )
-        self.git.run("branch", "-m", expected_branch, cwd=snapshot.path)
-        return self.database.update_package_workspace(
-            package.id,
-            expected_revision=expected_revision,
-            lease_generation=lease_generation,
-            base_revision=package.base_revision,
-            branch=expected_branch,
-            worktree=str(snapshot.path),
-        )
+            if re.fullmatch(r"[0-9a-fA-F]{40,64}", resolved):
+                return resolved
+        return package.base_revision or self.git.head()
 
-    def recover(
-        self,
-        package: CapabilityPackage,
-        agent_id: str,
-        *,
-        expected_revision: int,
-        ttl_seconds: float,
-        active_child_workers: tuple[str, ...] = (),
-        now: str | None = None,
-    ) -> tuple[StewardLease, PackageRecovery, WorktreeSnapshot | None]:
-        snapshot = None
-        if package.worktree:
-            path = Path(package.worktree)
-            if path.exists():
-                snapshot = self.inspect(path)
-        journal = tuple(
+    def materialize(self, package: CapabilityPackage, root: Path) -> str:
+        """Replay the durable candidate delta into a fresh canonical overlay."""
+
+        canonical = self.git.head()
+        candidate = self.revision(package)
+        base = package.base_revision or candidate
+        changed = tuple(
+            path
+            for path in self.git.run_bytes("diff", "--name-only", "-z", base, candidate)
+            .decode(errors="surrogateescape")
+            .split("\0")
+            if path
+        )
+        reservations = tuple(
             value
-            for value in self.database.load_package_state().integration_journal.values()
+            for value in self.database.load_package_state().reservations.values()
             if value.package_id == package.id
         )
-        latest_phase = max(journal, key=lambda value: value.updated_at).phase if journal else None
-        lease, recovery = self.database.recover_steward_lease(
-            package.id,
-            agent_id,
-            expected_revision=expected_revision,
-            ttl_seconds=ttl_seconds,
-            worktree_head=snapshot.head if snapshot else "",
-            worktree_status=snapshot.status if snapshot else "",
-            dirty_digest=snapshot.dirty_digest if snapshot else sha256(b"").hexdigest(),
-            active_child_workers=active_child_workers,
-            journal_phase=latest_phase,
-            now=now,
+        invalid = tuple(
+            path
+            for path in changed
+            if not any(_reservation_contains(reservation, path) for reservation in reservations)
         )
-        recovered_package = self.database.load_package_state().packages[package.id]
-        if snapshot is None:
-            recovered_package = self.create(
-                package.id,
-                lease.generation,
-                expected_revision=recovered_package.revision,
-                base_revision=package.base_revision or None,
+        if invalid:
+            raise PackageGitError(
+                "package candidate contains unreserved paths: " + ", ".join(invalid)
             )
-            snapshot = self.inspect(Path(recovered_package.worktree))
-        elif snapshot.clean:
-            branch = f"paf/package-{_slug(package.id)}/generation-{lease.generation}"
-            if snapshot.branch != branch:
-                self.git.run("branch", "-m", branch, cwd=snapshot.path)
-                recovered_package = self.database.update_package_workspace(
-                    package.id,
-                    expected_revision=recovered_package.revision,
-                    lease_generation=lease.generation,
-                    base_revision=package.base_revision,
-                    branch=branch,
-                    worktree=str(snapshot.path),
+        if changed:
+            advanced = tuple(
+                path
+                for path in self.git.run_bytes(
+                    "diff", "--name-only", "-z", base, canonical, "--", *changed
                 )
-                snapshot = self.inspect(Path(recovered_package.worktree))
-        return lease, recovery, snapshot
+                .decode(errors="surrogateescape")
+                .split("\0")
+                if path
+            )
+            if advanced:
+                raise PackageGitError(
+                    "canonical package scope changed since the candidate base: "
+                    + ", ".join(advanced)
+                )
+        for relative in changed:
+            destination = root / relative
+            record = self.git.run_bytes("ls-tree", "-z", candidate, "--", relative)
+            if not record:
+                destination.unlink(missing_ok=True)
+                continue
+            metadata, _separator, _path = record.partition(b"\t")
+            mode, kind, object_id = metadata.decode().split()
+            if kind != "blob" or mode not in {"100644", "100755"}:
+                raise PackageGitError(f"unsupported package candidate entry: {relative}")
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(self.git.run_bytes("cat-file", "blob", object_id))
+            destination.chmod(int(mode[-3:], 8))
+        return canonical
 
-    @contextmanager
-    def sequential_worker(
-        self, package_id: str, lease_generation: int, worker_id: str
-    ) -> Iterator[Path]:
-        """Serialize workers in the package worktree while preserving fenced authority."""
+    def commit(
+        self,
+        package: CapabilityPackage,
+        generation: int,
+        root: Path,
+        *,
+        message: str,
+    ) -> tuple[CapabilityPackage, str, tuple[str, ...]]:
+        """Snapshot reserved overlay paths into one candidate commit without checkout."""
 
-        del worker_id
-        self.database.assert_live_steward_lease(package_id, lease_generation)
-        locks = self.state_dir / "locks"
-        locks.mkdir(parents=True, exist_ok=True)
-        lock_path = locks / f"package-worker-{_slug(package_id)}.lock"
-        with lock_path.open("a+b") as handle:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-            try:
-                self.database.assert_live_steward_lease(package_id, lease_generation)
-                package = self.database.load_package_state().packages[package_id]
-                if not package.worktree:
-                    raise ValueError(f"package {package_id} has no worktree")
-                yield Path(package.worktree)
-            finally:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        self.database.assert_live_steward_lease(package.id, generation)
+        canonical = self.git.head()
+        state = self.database.load_package_state()
+        reservations = tuple(
+            value
+            for value in state.reservations.values()
+            if value.package_id == package.id and value.lease_generation == generation
+        )
+        paths = tuple(value.normalized_path for value in reservations)
+        if not paths:
+            raise PackageGitError(f"package {package.id} has no reserved candidate paths")
+        self.indexes.mkdir(parents=True, exist_ok=True)
+        index = self.indexes / f"{_slug(package.id)}-{uuid4().hex}.index"
+        environment = {
+            "GIT_DIR": str(self.repo / ".git"),
+            "GIT_WORK_TREE": str(root),
+            "GIT_INDEX_FILE": str(index),
+        }
+        try:
+            self.git.run("read-tree", canonical, cwd=root, env=environment)
+            self.git.run("add", "-A", "--", *paths, cwd=root, env=environment)
+            changed = tuple(
+                path
+                for path in self.git.run_bytes(
+                    "diff", "--cached", "--name-only", "-z", canonical, cwd=root, env=environment
+                )
+                .decode(errors="surrogateescape")
+                .split("\0")
+                if path
+            )
+            tree = self.git.run("write-tree", cwd=root, env=environment).strip()
+        finally:
+            index.unlink(missing_ok=True)
+        previous = self.revision(package)
+        previous_tree = self.git.run("rev-parse", f"{previous}^{{tree}}").strip()
+        branch = self.branch(package.id)
+        if (
+            tree == previous_tree
+            and package.base_revision == canonical
+            and package.branch == branch
+        ):
+            return package, previous, ()
+        candidate = (
+            previous
+            if tree == previous_tree
+            else self.git.run("commit-tree", tree, "-p", canonical, "-m", message).strip()
+        )
+        self.git.run("update-ref", f"refs/heads/{branch}", candidate)
+        current = self.database.load_package_state().packages[package.id]
+        updated = self.database.update_package_candidate(
+            package.id,
+            expected_revision=current.revision,
+            lease_generation=generation,
+            base_revision=canonical,
+            branch=branch,
+        )
+        return updated, candidate, changed if candidate != previous else ()
 
 
 class RelevantInterfaceGuard:
@@ -364,6 +361,7 @@ class PackageIntegrator:
         self.state_dir = state_dir.resolve()
         self.database = database
         self.git = _Git(self.repo)
+        self.candidates = PackageCandidateStore(repo, state_dir, database)
         self.interfaces = RelevantInterfaceGuard(database)
         self.lock_path = self.state_dir / "locks" / "canonical-integration.lock"
 
@@ -398,28 +396,14 @@ class PackageIntegrator:
         return self.database.record_integration_journal(journal, expected_revision=package.revision)
 
     def prepare_candidate(self, package_id: str, lease_generation: int) -> IntegrationPreparation:
-        """Update a clean candidate to one exact canonical revision before validation."""
+        """Fence the candidate and canonical revisions used by overlay validation."""
 
         package = self.database.load_package_state().packages[package_id]
-        if not package.worktree:
-            raise ValueError(f"package {package_id} has no worktree")
-        worktree = Path(package.worktree)
         with self._canonical_lock():
             self.database.assert_live_steward_lease(package_id, lease_generation)
             self._require_clean(self.repo, "canonical")
-            self._require_clean(worktree, "package")
             canonical = self.git.head()
-            if canonical != package.base_revision:
-                self.git.run("rebase", canonical, cwd=worktree)
-                package = self.database.update_package_workspace(
-                    package_id,
-                    expected_revision=package.revision,
-                    lease_generation=lease_generation,
-                    base_revision=canonical,
-                    branch=package.branch,
-                    worktree=package.worktree,
-                )
-            return IntegrationPreparation(package_id, self.git.head(worktree), canonical)
+            return IntegrationPreparation(package_id, self.candidates.revision(package), canonical)
 
     def integrate(
         self,
@@ -435,17 +419,14 @@ class PackageIntegrator:
     ) -> IntegrationResult:
         if (validated_candidate_revision is None) != (validated_canonical_revision is None):
             raise ValueError("prevalidated integration requires both candidate revisions")
-        for attempt in range(max_stale_retries + 1):
+        del max_stale_retries
+        for _attempt in range(1):
             package = self.database.load_package_state().packages[package_id]
-            if not package.worktree:
-                raise ValueError(f"package {package_id} has no worktree")
-            worktree = Path(package.worktree)
             with self._canonical_lock():
                 self.database.assert_live_steward_lease(package_id, lease_generation)
                 self._require_clean(self.repo, "canonical")
-                self._require_clean(worktree, "package")
                 canonical_before = self.git.head()
-                candidate_before = self.git.head(worktree)
+                candidate_before = self.candidates.revision(package)
                 if validated_candidate_revision is not None:
                     if candidate_before != validated_candidate_revision:
                         return IntegrationResult(
@@ -464,16 +445,14 @@ class PackageIntegrator:
                             stale_reason="canonical revision changed during package validation",
                         )
                 if canonical_before != package.base_revision:
-                    self.git.run("rebase", canonical_before, cwd=worktree)
-                    package = self.database.update_package_workspace(
+                    return IntegrationResult(
+                        False,
                         package_id,
-                        expected_revision=package.revision,
-                        lease_generation=lease_generation,
-                        base_revision=canonical_before,
-                        branch=package.branch,
-                        worktree=package.worktree,
+                        candidate_before,
+                        canonical_before,
+                        stale_reason="canonical package base changed before validation",
                     )
-                candidate = self.git.head(worktree)
+                candidate = candidate_before
                 journal = IntegrationJournal(
                     f"integration-{_slug(package_id)}-{lease_generation}-{uuid4().hex}",
                     package_id,
@@ -488,7 +467,7 @@ class PackageIntegrator:
 
             journal = replace(journal, phase=IntegrationPhase.VALIDATING)
             self._record(journal)
-            validation_digest = validate(worktree)
+            validation_digest = validate(self.repo)
             if not validation_digest:
                 raise ValueError("package validation must return a non-empty digest")
             journal = replace(
@@ -502,31 +481,24 @@ class PackageIntegrator:
                 self.database.assert_live_steward_lease(package_id, lease_generation)
                 self._require_clean(self.repo, "canonical")
                 current = self.git.head()
-                candidate_after_validation = self.git.head(worktree)
-                dirty_candidate = self.git.dirty_paths(worktree)
-                if candidate_after_validation != candidate or dirty_candidate:
+                package = self.database.load_package_state().packages[package_id]
+                candidate_after_validation = self.candidates.revision(package)
+                if candidate_after_validation != candidate:
                     journal = replace(journal, phase=IntegrationPhase.ABORTED)
                     self._record(journal)
-                    reason = (
-                        "package candidate changed during validation"
-                        if candidate_after_validation != candidate
-                        else "package worktree became dirty during validation"
-                    )
                     return IntegrationResult(
                         False,
                         package_id,
                         candidate,
                         current,
                         validation_digest,
-                        reason,
+                        "package candidate changed during validation",
                         journal.id,
                     )
                 changes = self.interfaces.check(package_id, interface_digest)
                 if current != canonical_before:
                     journal = replace(journal, phase=IntegrationPhase.ABORTED)
                     self._record(journal)
-                    if attempt < max_stale_retries and not changes:
-                        continue
                     return IntegrationResult(
                         False,
                         package_id,
@@ -567,7 +539,7 @@ class PackageIntegrator:
                     validation_digest,
                     journal_id=journal.id,
                 )
-        raise AssertionError("stale integration retry loop did not terminate")
+        raise AssertionError("package integration did not terminate")
 
     def reconcile(self) -> tuple[IntegrationResult, ...]:
         results: list[IntegrationResult] = []
@@ -668,6 +640,7 @@ PackageValidator = Callable[
 ConsumerValidator = Callable[
     [Path, PackageConsumer], ConsumerValidation | Awaitable[ConsumerValidation]
 ]
+WorkspaceProvider = Callable[[CapabilityPackage, int], Awaitable[PackageWorkspace]]
 
 
 async def _await_validation(
@@ -708,6 +681,7 @@ class PackageExecutionLayer:
         validate_step: StepValidator,
         validate_package: PackageValidator,
         validate_consumer: ConsumerValidator,
+        acquire_workspace: WorkspaceProvider,
         interface_digest: Callable[[str], str | None] = lambda _interface: None,
         wake_consumers: Callable[[tuple[str, ...]], Awaitable[None]] | None = None,
         lease_ttl_seconds: float = 14_400,
@@ -723,11 +697,12 @@ class PackageExecutionLayer:
         self.validate_step = validate_step
         self.validate_package = validate_package
         self.validate_consumer = validate_consumer
+        self.acquire_workspace = acquire_workspace
         self.interface_digest = interface_digest
         self.wake_consumers = wake_consumers
         self.lease_ttl_seconds = lease_ttl_seconds
         self.maximum_worker_steps = maximum_worker_steps
-        self.worktrees = PackageWorktreeManager(repo, state_dir, database)
+        self.candidates = PackageCandidateStore(repo, state_dir, database)
         self.integrator = PackageIntegrator(repo, state_dir, database)
         self.git = _Git(repo)
         self._running: set[str] = set()
@@ -814,10 +789,7 @@ class PackageExecutionLayer:
         state = self.database.load_package_state()
         existing = state.leases.get(package.id)
         agent_id = f"steward-{package.id}-{uuid4().hex[:12]}"
-        dirty_retained_worktree = False
-        if existing is None and package.worktree and Path(package.worktree).exists():
-            dirty_retained_worktree = not self.worktrees.inspect(Path(package.worktree)).clean
-        if existing is None and not dirty_retained_worktree:
+        if existing is None:
             lease = self.database.claim_steward_lease(
                 package.id,
                 agent_id,
@@ -829,11 +801,19 @@ class PackageExecutionLayer:
             expires = datetime.fromisoformat(existing.expires_at.replace("Z", "+00:00"))
             if expires > datetime.now(UTC):
                 raise ValueError(f"package {package.id} already has a live Steward")
-        lease, recovery, _snapshot = self.worktrees.recover(
-            package,
+        journal = tuple(
+            value for value in state.integration_journal.values() if value.package_id == package.id
+        )
+        latest_phase = max(journal, key=lambda value: value.updated_at).phase if journal else None
+        candidate = self.candidates.revision(package)
+        lease, recovery = self.database.recover_steward_lease(
+            package.id,
             agent_id,
             expected_revision=package.revision,
             ttl_seconds=self.lease_ttl_seconds,
+            candidate_revision=candidate,
+            candidate_digest=sha256(candidate.encode()).hexdigest(),
+            journal_phase=latest_phase,
         )
         self._append_evidence(
             package.id,
@@ -842,8 +822,8 @@ class PackageExecutionLayer:
             kind=EvidenceKind.LEASE_RECOVERY,
             payload={
                 "prior_generation": recovery.prior_generation,
-                "worktree_head": recovery.worktree_head,
-                "dirty_digest": recovery.dirty_digest,
+                "candidate_revision": recovery.candidate_revision,
+                "candidate_digest": recovery.candidate_digest,
                 "journal_phase": (
                     str(recovery.journal_phase) if recovery.journal_phase is not None else None
                 ),
@@ -1098,16 +1078,15 @@ class PackageExecutionLayer:
             lease_generation=generation,
         )
 
-    def _changed_paths(self, worktree: Path, baseline: str) -> tuple[str, ...]:
-        committed = self.git.run("diff", "--name-only", f"{baseline}..HEAD", cwd=worktree)
-        return tuple(
-            sorted(set(committed.splitlines()).union(self.git.dirty_paths(worktree)) - {""})
-        )
-
-    def _commit_steward_edits(
-        self, package: CapabilityPackage, generation: int, worktree: Path, baseline: str
-    ) -> str | None:
-        changed = self._changed_paths(worktree, baseline)
+    async def _commit_overlay_edits(
+        self,
+        package: CapabilityPackage,
+        generation: int,
+        workspace: PackageWorkspace,
+        *,
+        message: str,
+    ) -> tuple[str, tuple[str, ...]]:
+        changed = await workspace.changed_paths()
         reservations = tuple(
             value
             for value in self.database.load_package_state().reservations.values()
@@ -1116,27 +1095,18 @@ class PackageExecutionLayer:
         invalid = tuple(
             path
             for path in changed
-            if not any(
-                path == value.normalized_path
-                or (
-                    value.mode is ReservationMode.EXCLUSIVE_SUBTREE
-                    and path.startswith(f"{value.normalized_path.rstrip('/')}/")
-                )
-                for value in reservations
-            )
+            if not any(_reservation_contains(value, path) for value in reservations)
         )
         if invalid:
-            raise PackageReportError("Steward edited unreserved paths: " + ", ".join(invalid))
-        if not self.git.dirty_paths(worktree):
-            return self.git.head(worktree) if self.git.head(worktree) != baseline else None
-        self.git.run("add", "--", *changed, cwd=worktree)
-        self.git.run(
-            "commit",
-            "-m",
-            f"feat(packages): implement {package.title}",
-            cwd=worktree,
+            raise PackageReportError("package agent edited unreserved paths: " + ", ".join(invalid))
+        updated, candidate, committed = self.candidates.commit(
+            package,
+            generation,
+            workspace.root,
+            message=message,
         )
-        return self.git.head(worktree)
+        del updated
+        return candidate, committed
 
     def _apply_dependencies(self, package_id: str, generation: int, report: dict[str, Any]) -> bool:
         requested = self._items(report, "package_dependency_requests")
@@ -1263,7 +1233,7 @@ class PackageExecutionLayer:
         package_id: str,
         generation: int,
         report: dict[str, Any],
-        worktree: Path,
+        workspace: PackageWorkspace,
     ) -> tuple[str, ...]:
         assignments = self._items(report, "worker_assignments")
         if len(assignments) > self.maximum_worker_steps:
@@ -1272,7 +1242,7 @@ class PackageExecutionLayer:
         for assignment in assignments:
             worker_id = str(assignment.get("worker_id", ""))
             step = self._ready_step(package_id, str(assignment.get("step_id", "")))
-            before = self.git.head(worktree)
+            before = self.candidates.revision(self._current(package_id))
             package = self._current(package_id)
             package = self.database.upsert_package_step(
                 replace(
@@ -1294,32 +1264,29 @@ class PackageExecutionLayer:
                     for item in self.database.load_package_state().evidence_for(package_id)
                 ],
             }
-            with self.worktrees.sequential_worker(package_id, generation, worker_id):
-                worker_report = await self.run_worker(package, step, packet, worktree)
+            self.database.assert_live_steward_lease(package_id, generation)
+            worker_report = await self.run_worker(package, step, packet, workspace.root)
             if str(worker_report.get("step_id", "")) != step.id:
                 raise PackageReportError("worker report names the wrong step")
-            dirty = self.git.dirty_paths(worktree)
-            after = self.git.head(worktree)
+            after, _committed = await self._commit_overlay_edits(
+                self._current(package_id),
+                generation,
+                workspace,
+                message=f"feat(packages): implement {step.objective}",
+            )
             changed = tuple(
                 sorted(
                     set(
-                        self.git.run("diff", "--name-only", f"{before}..{after}", cwd=worktree)
+                        self.git.run("diff", "--name-only", f"{before}..{after}")
                         .strip()
                         .splitlines()
                     )
                     - {""}
                 )
             )
-            if dirty:
-                raise PackageReportError(
-                    f"worker {worker_id} left uncommitted paths: {', '.join(dirty)}"
-                )
             if not set(changed).issubset(step.intended_paths):
                 raise PackageReportError(f"worker {worker_id} edited outside its assigned paths")
-            reported_commit = worker_report.get("commit_id")
-            if after != before and reported_commit != after:
-                raise PackageReportError(f"worker {worker_id} did not report its exact commit")
-            validation = await _await_validation(self.validate_step(worktree, step))
+            validation = await _await_validation(self.validate_step(workspace.root, step))
             accepted = bool(worker_report.get("complete")) and validation.succeeded
             package = self._current(package_id)
             self.database.upsert_package_step(
@@ -1472,33 +1439,19 @@ class PackageExecutionLayer:
             self._heartbeat_lease(lease, heartbeat_stop),
             name=f"paf-package-heartbeat-{package_id}",
         )
+        workspace: PackageWorkspace | None = None
         try:
             package = self._reserve_initial_scope(package, generation)
-            retained_dirty = bool(
-                package.worktree
-                and Path(package.worktree).exists()
-                and not self.worktrees.inspect(Path(package.worktree)).clean
-            )
-            if retained_dirty:
-                # `_claim` reached this branch only through fenced lease recovery. Preserve
-                # the isolated candidate exactly; its paths are checked after reservations
-                # are reacquired and before any commit is accepted.
-                self.database.assert_live_steward_lease(package_id, generation)
-            else:
-                package = self.worktrees.activate(
-                    package, generation, expected_revision=package.revision
-                )
-            worktree = Path(package.worktree)
+            workspace = await self.acquire_workspace(package, generation)
             package = self.database.update_package_lifecycle(
                 package_id,
                 PackageStatus.INVESTIGATING,
                 expected_revision=package.revision,
                 lease_generation=generation,
             )
-            baseline = self.git.head(worktree)
             report = self._validate_report(
                 package,
-                await self.run_steward(package, self._dossier(package, generation), worktree),
+                await self.run_steward(package, self._dossier(package, generation), workspace.root),
             )
             self._append_evidence(
                 package_id,
@@ -1521,8 +1474,13 @@ class PackageExecutionLayer:
             self._expand_scope(package_id, generation, report)
             self._apply_plan(package_id, generation, report)
             package = self._current(package_id)
-            steward_commit = self._commit_steward_edits(package, generation, worktree, baseline)
-            if steward_commit:
+            steward_commit, steward_changed = await self._commit_overlay_edits(
+                package,
+                generation,
+                workspace,
+                message=f"feat(packages): implement {package.title}",
+            )
+            if steward_changed:
                 self._append_evidence(
                     package_id,
                     generation,
@@ -1530,10 +1488,10 @@ class PackageExecutionLayer:
                     kind=EvidenceKind.COMMIT,
                     payload={"commit_id": steward_commit, "owner": "Steward"},
                 )
-            await self._assess_steward_steps(package_id, generation, report, worktree)
+            await self._assess_steward_steps(package_id, generation, report, workspace.root)
             self._apply_consumer_classifications(package_id, generation, report)
             has_dependencies = self._apply_dependencies(package_id, generation, report)
-            workers = await self._run_workers(package_id, generation, report, worktree)
+            workers = await self._run_workers(package_id, generation, report, workspace)
             package = self._current(package_id)
             package = self.database.update_package_lifecycle(
                 package_id,
@@ -1545,7 +1503,9 @@ class PackageExecutionLayer:
                 self.integrator.prepare_candidate, package_id, generation
             )
             package = self._current(package_id)
-            package_validation = await _await_validation(self.validate_package(worktree, package))
+            package_validation = await _await_validation(
+                self.validate_package(workspace.root, package)
+            )
             self._append_evidence(
                 package_id,
                 generation,
@@ -1568,7 +1528,9 @@ class PackageExecutionLayer:
                     worker_ids=workers,
                     detail=package_validation.evidence,
                 )
-            accepted, affected = await self._validate_consumers(package_id, generation, worktree)
+            accepted, affected = await self._validate_consumers(
+                package_id, generation, workspace.root
+            )
             current = self._current(package_id)
             self.database.update_package_lifecycle(
                 package_id,
@@ -1673,6 +1635,8 @@ class PackageExecutionLayer:
             )
             return PackageExecutionResult(package_id, generation, parked.status, detail=str(error))
         finally:
+            if workspace is not None:
+                await workspace.close()
             heartbeat_stop.set()
             await asyncio.gather(heartbeat, return_exceptions=True)
             release_reservations = self._current(package_id).status in _TERMINAL_PACKAGE_STATUSES

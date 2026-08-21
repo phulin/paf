@@ -656,6 +656,33 @@ async def test_dependency_packages_bypass_fuse(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_package_agents_use_private_overlays_with_shared_dependencies(tmp_path: Path) -> None:
+    config_path = write_project(tmp_path, chapters="chapters = [1]")
+    dependency = tmp_path / "lean" / ".lake" / "packages" / "dep" / "dependency.olean"
+    dependency.parent.mkdir(parents=True)
+    dependency.write_bytes(b"shared dependency")
+    manager, chapter = fuse_manager(config_path)
+    canonical_source = tmp_path / chapter.scope[0]
+    canonical_source.parent.mkdir(parents=True)
+    canonical_source.write_bytes(b"def packageTarget := 1\n")
+    await manager.prepare()
+    workspace = await manager.acquire("package-candidate")
+    source = workspace.root / chapter.scope[0]
+    original = canonical_source.read_bytes()
+    try:
+        source.write_bytes(original + b"\n-- package candidate\n")
+        assert await workspace.changed_paths() == (chapter.scope[0],)
+        assert canonical_source.read_bytes() == original
+        assert (workspace.root / dependency.relative_to(tmp_path)).read_bytes() == (
+            b"shared dependency"
+        )
+        assert not (workspace.root / ".git").exists()
+    finally:
+        await workspace.close()
+        await manager.close()
+
+
+@pytest.mark.asyncio
 async def test_cache_delta_publication_keeps_active_agent_snapshots_immutable(
     tmp_path: Path,
 ) -> None:

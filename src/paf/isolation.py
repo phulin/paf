@@ -335,6 +335,18 @@ class FuseWorkspace:
         self.closed = False
         self.preserved = False
 
+    async def changed_paths(self) -> tuple[str, ...]:
+        """Return the source delta represented by this private overlay."""
+
+        _base, _merged, changed = await asyncio.to_thread(
+            overlay_delta_manifests,
+            self.base,
+            self.root,
+            self.upper,
+            excluded=self.manager.excluded,
+        )
+        return changed
+
     async def collect(
         self,
         chapter: WorkUnitLike,
