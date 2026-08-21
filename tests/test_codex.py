@@ -188,6 +188,15 @@ def test_report_schema_closes_every_nested_object_shape() -> None:
         raw_type = value.get("type")
         return raw_type == "object" or (isinstance(raw_type, list) and "object" in raw_type)
 
+    def requires_every_property(value: dict[str, object]) -> bool:
+        raw_required = value.get("required")
+        raw_properties = value.get("properties")
+        return (
+            isinstance(raw_required, list)
+            and isinstance(raw_properties, dict)
+            and set(raw_required) == set(raw_properties)
+        )
+
     object_shapes = [
         value
         for schema in REPORT_SCHEMAS.values()
@@ -196,6 +205,7 @@ def test_report_schema_closes_every_nested_object_shape() -> None:
     ]
     assert object_shapes
     assert all(value.get("additionalProperties") is False for value in object_shapes)
+    assert all(requires_every_property(value) for value in object_shapes)
 
 
 def test_extracts_api_equivalent_usage() -> None:
