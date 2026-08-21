@@ -334,6 +334,85 @@ def _result_failed_modules(result: ValidationResult) -> tuple[str, ...]:
     return result.failed_modules or _failed_modules(result.output)
 
 
+def _path_aliases(path: str, *, repo: Path, lean_project: Path) -> tuple[str, ...]:
+    """Return repository- and Lean-root spellings used by Lake diagnostics."""
+
+    normalized = Path(path.replace("\\", "/")).as_posix().removeprefix("./")
+    repo_prefix = repo.as_posix().rstrip("/") + "/"
+    relative = normalized.removeprefix(repo_prefix)
+    lean_prefix = lean_project.as_posix().strip("/") + "/"
+    aliases = [relative]
+    if relative.startswith(lean_prefix):
+        aliases.append(relative.removeprefix(lean_prefix))
+    return tuple(dict.fromkeys(aliases))
+
+
+def _diagnostic_in_package_scope(
+    diagnostic: LeanDiagnostic,
+    scope: Iterable[str],
+    *,
+    repo: Path,
+    lean_project: Path,
+) -> bool:
+    """Whether a located diagnostic belongs to paths writable by a package."""
+
+    message = diagnostic.header.split(":", 1)[1].lstrip()
+    location = LEAN_LOCATION_RE.match(message)
+    if location is None:
+        # An unlocated warning cannot safely be classified as inherited.
+        return True
+    candidates = _path_aliases(location.group("path"), repo=repo, lean_project=lean_project)
+    patterns = tuple(
+        alias
+        for path in scope
+        for alias in _path_aliases(path, repo=repo, lean_project=lean_project)
+    )
+    matcher = ScopeMatcher(patterns)
+    return any(matcher.matches(candidate) for candidate in candidates)
+
+
+def _package_scope_validation(
+    result: ValidationResult,
+    scope: Iterable[str],
+    *,
+    repo: Path,
+    lean_project: Path,
+) -> ValidationResult:
+    """Project warning-only owner-build failures onto a package's writable scope."""
+
+    if result.succeeded or not result.compiler_succeeded:
+        return result
+    diagnostics = _result_diagnostics(result)
+    if not diagnostics:
+        # Keep ambiguous policy failures blocking rather than silently accepting them.
+        return result
+    relevant = tuple(
+        diagnostic
+        for diagnostic in diagnostics
+        if diagnostic.severity != "warning"
+        or _diagnostic_in_package_scope(
+            diagnostic,
+            scope,
+            repo=repo,
+            lean_project=lean_project,
+        )
+    )
+    if relevant:
+        output = "\n\n".join(diagnostic.text for diagnostic in relevant)
+        output += (
+            f"\n\nCoordinator rejected {len(relevant)} Lean diagnostic(s) within package scope."
+        )
+        return replace(result, output=output[-20_000:], diagnostics=relevant)
+    return ValidationResult(
+        True,
+        0,
+        "Owner build completed successfully; inherited warnings outside package scope "
+        "do not block package acceptance.",
+        process_exit_code=result.process_exit_code,
+        raw_log_path=result.raw_log_path,
+    )
+
+
 def _diagnostic_output_for_target(diagnostics: Iterable[LeanDiagnostic], target_id: str) -> str:
     """Render diagnostics with provenance for the target receiving the result."""
 
@@ -779,13 +858,23 @@ class Orchestrator:
         )
 
     async def _validate_package_units(
-        self, worktree: Path, units: Iterable[WorkUnitLike]
+        self,
+        worktree: Path,
+        units: Iterable[WorkUnitLike],
+        *,
+        scope: Iterable[str],
     ) -> PackageValidation:
         outputs: list[str] = []
         succeeded = True
         units_by_id = {unit.id: unit for unit in units}
         for unit in units_by_id.values():
             result = await validate(self.config, unit, workspace_root=worktree)
+            result = _package_scope_validation(
+                result,
+                scope,
+                repo=self.config.settings.repo,
+                lean_project=self.config.settings.lean_project,
+            )
             outputs.append(f"{unit.id}:\n{result.output}")
             succeeded = succeeded and result.succeeded
         evidence = "\n\n".join(outputs) or "No configured owner build was required."
@@ -797,14 +886,18 @@ class Orchestrator:
 
     async def _validate_package_step(self, worktree: Path, step: PackageStep) -> PackageValidation:
         return await self._validate_package_units(
-            worktree, self._package_owner_units(step.intended_paths)
+            worktree,
+            self._package_owner_units(step.intended_paths),
+            scope=self._repository_package_scope(step.intended_paths),
         )
 
     async def _validate_capability_package(
         self, worktree: Path, package: CapabilityPackage
     ) -> PackageValidation:
         return await self._validate_package_units(
-            worktree, self._package_owner_units(package.write_scope)
+            worktree,
+            self._package_owner_units(package.write_scope),
+            scope=self._repository_package_scope(package.write_scope),
         )
 
     async def _validate_package_consumer(
@@ -818,7 +911,11 @@ class Orchestrator:
                 f"consumer work unit {consumer.work_unit_id} is outside this scheduler",
                 consumer.id,
             )
-        validation = await self._validate_package_units(worktree, (unit,))
+        validation = await self._validate_package_units(
+            worktree,
+            (unit,),
+            scope=self._repository_package_scope((consumer.path,)),
+        )
         consumer_path = self._repository_package_scope((consumer.path,))[0]
         placeholder = declaration_uses_placeholder(worktree, consumer_path, consumer.declaration)
         accepted = validation.succeeded and placeholder is False

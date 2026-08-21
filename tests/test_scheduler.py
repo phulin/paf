@@ -140,10 +140,85 @@ async def test_package_validation_deduplicates_real_work_units_by_id(
 
     monkeypatch.setattr(scheduler_module, "validate", validation)
 
-    result = await orchestrator._validate_package_units(tmp_path, (unit, unit))
+    result = await orchestrator._validate_package_units(
+        tmp_path,
+        (unit, unit),
+        scope=("Book/Chapter01/Target.lean",),
+    )
 
     assert result.succeeded
     assert calls == [unit.id]
+
+
+@pytest.mark.asyncio
+async def test_package_validation_ignores_inherited_warnings_outside_scope(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    orchestrator = object.__new__(Orchestrator)
+    orchestrator.config = config
+    unit = config.work_units[0]
+
+    async def validation(
+        _config: PipelineConfig,
+        _current: Any,
+        **_kwargs: object,
+    ) -> ValidationResult:
+        return ValidationResult(
+            False,
+            1,
+            "warning: Book/Chapter01/Unrelated.lean:10:2: unused variable `h`\n\n"
+            "Coordinator rejected 1 non-sorry Lean warning(s):\n"
+            "warning: Book/Chapter01/Unrelated.lean:10:2: unused variable `h`",
+            process_exit_code=0,
+        )
+
+    monkeypatch.setattr(scheduler_module, "validate", validation)
+
+    result = await orchestrator._validate_package_units(
+        tmp_path,
+        (unit,),
+        scope=("Book/Chapter01/Target.lean",),
+    )
+
+    assert result.succeeded
+    assert "inherited warnings outside package scope" in result.evidence
+
+
+@pytest.mark.asyncio
+async def test_package_validation_rejects_warnings_inside_scope(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    orchestrator = object.__new__(Orchestrator)
+    orchestrator.config = config
+    unit = config.work_units[0]
+
+    async def validation(
+        _config: PipelineConfig,
+        _current: Any,
+        **_kwargs: object,
+    ) -> ValidationResult:
+        return ValidationResult(
+            False,
+            1,
+            "warning: Book/Chapter01/Target.lean:10:2: unused variable `h`\n\n"
+            "Coordinator rejected 1 non-sorry Lean warning(s):\n"
+            "warning: Book/Chapter01/Target.lean:10:2: unused variable `h`",
+            process_exit_code=0,
+        )
+
+    monkeypatch.setattr(scheduler_module, "validate", validation)
+
+    result = await orchestrator._validate_package_units(
+        tmp_path,
+        (unit,),
+        scope=("Book/Chapter01/Target.lean",),
+    )
+
+    assert not result.succeeded
+    assert result.evidence.count("unused variable `h`") == 1
+    assert "within package scope" in result.evidence
 
 
 @pytest.mark.asyncio
