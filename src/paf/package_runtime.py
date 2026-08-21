@@ -29,7 +29,6 @@ from paf.package_model import (
     PackageStep,
     PackageStepKind,
     PackageStepStatus,
-    PathReservation,
     RelevantReadInterface,
     ReservationMode,
     ReservationOwnerKind,
@@ -93,10 +92,10 @@ def _slug(value: str) -> str:
     return clean
 
 
-def _reservation_contains(reservation: PathReservation, path: str) -> bool:
-    return path == reservation.normalized_path or (
-        reservation.mode is ReservationMode.EXCLUSIVE_SUBTREE
-        and path.startswith(f"{reservation.normalized_path.rstrip('/')}/")
+def _reservation_contains(authority_path: str, mode: ReservationMode, path: str) -> bool:
+    return path == authority_path or (
+        mode is ReservationMode.EXCLUSIVE_SUBTREE
+        and path.startswith(f"{authority_path.rstrip('/')}/")
     )
 
 
@@ -176,6 +175,19 @@ class PackageCandidateStore:
     def branch(self, package_id: str) -> str:
         return f"paf/package-{_slug(package_id)}"
 
+    def repository_path(self, root: Path, path: str) -> str:
+        """Resolve legacy Lean-project-relative authority against the repository root."""
+
+        direct = root / path
+        if direct.exists() or direct.parent.exists():
+            return path
+        prefixed = f"lean/{path}"
+        target = root / prefixed
+        tracked = self.git.run_bytes("ls-files", "-z", "--", prefixed).rstrip(b"\0")
+        if target.exists() or target.parent.exists() or tracked:
+            return prefixed
+        return path
+
     def revision(self, package: CapabilityPackage) -> str:
         for reference in (package.branch, self.branch(package.id)):
             resolved = (
@@ -205,10 +217,17 @@ class PackageCandidateStore:
             for value in self.database.load_package_state().reservations.values()
             if value.package_id == package.id
         )
+        authorities = tuple(
+            (self.repository_path(root, value.normalized_path), value.mode)
+            for value in reservations
+        )
         invalid = tuple(
             path
             for path in changed
-            if not any(_reservation_contains(reservation, path) for reservation in reservations)
+            if not any(
+                _reservation_contains(authority_path, mode, path)
+                for authority_path, mode in authorities
+            )
         )
         if invalid:
             raise PackageGitError(
@@ -262,7 +281,7 @@ class PackageCandidateStore:
             for value in state.reservations.values()
             if value.package_id == package.id and value.lease_generation == generation
         )
-        paths = tuple(value.normalized_path for value in reservations)
+        paths = tuple(self.repository_path(root, value.normalized_path) for value in reservations)
         if not paths:
             raise PackageGitError(f"package {package.id} has no reserved candidate paths")
         self.indexes.mkdir(parents=True, exist_ok=True)
@@ -1092,10 +1111,17 @@ class PackageExecutionLayer:
             for value in self.database.load_package_state().reservations.values()
             if value.package_id == package.id and value.lease_generation == generation
         )
+        authorities = tuple(
+            (self.candidates.repository_path(workspace.root, value.normalized_path), value.mode)
+            for value in reservations
+        )
         invalid = tuple(
             path
             for path in changed
-            if not any(_reservation_contains(value, path) for value in reservations)
+            if not any(
+                _reservation_contains(authority_path, mode, path)
+                for authority_path, mode in authorities
+            )
         )
         if invalid:
             raise PackageReportError("package agent edited unreserved paths: " + ", ".join(invalid))
@@ -1284,7 +1310,11 @@ class PackageExecutionLayer:
                     - {""}
                 )
             )
-            if not set(changed).issubset(step.intended_paths):
+            intended_paths = {
+                self.candidates.repository_path(workspace.root, path)
+                for path in step.intended_paths
+            }
+            if not set(changed).issubset(intended_paths):
                 raise PackageReportError(f"worker {worker_id} edited outside its assigned paths")
             validation = await _await_validation(self.validate_step(workspace.root, step))
             accepted = bool(worker_report.get("complete")) and validation.succeeded

@@ -239,6 +239,16 @@ def prepared_package(repo: Path) -> tuple[StateDatabase, CapabilityPackage, int,
     return store, current, lease.generation, overlay
 
 
+def test_candidate_store_resolves_legacy_lean_project_paths(tmp_path: Path) -> None:
+    repo = git_repo(tmp_path)
+    store = StateDatabase(repo / ".paf")
+    store.initialize()
+
+    resolved = PackageCandidateStore(repo, repo / ".paf", store).repository_path(repo, "Book.lean")
+
+    assert resolved == "lean/Book.lean"
+
+
 def commit_candidate(
     store: StateDatabase, package_id: str, generation: int, overlay: Path, value: int = 2
 ) -> str:
