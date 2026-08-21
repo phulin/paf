@@ -31,8 +31,8 @@ from paf.state import StateStore
 from paf.state_db import StateDatabase, read_checkpoint
 from tests.support import write_project
 
-NOW = "2026-08-21T00:00:00+00:00"
-LATER = "2026-08-21T01:00:00+00:00"
+NOW = "2100-08-21T00:00:00+00:00"
+LATER = "2100-08-21T01:00:00+00:00"
 
 
 def package(package_id: str, key: str, *paths: str) -> CapabilityPackage:

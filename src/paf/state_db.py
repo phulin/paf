@@ -2307,13 +2307,15 @@ class StateDatabase:
         connection: sqlite3.Connection, package_id: str, generation: int
     ) -> None:
         row = connection.execute(
-            "SELECT generation FROM steward_leases WHERE package_id=?", (package_id,)
+            "SELECT generation, expires_at FROM steward_leases WHERE package_id=?", (package_id,)
         ).fetchone()
         if row is None or int(row[0]) != generation:
             actual = int(row[0]) if row is not None else None
             raise ValueError(
                 f"stale lease generation for {package_id}: expected {generation}, found {actual}"
             )
+        if _as_utc(str(row[1])) <= datetime.now(UTC):
+            raise ValueError(f"steward lease for {package_id} has expired")
 
     @staticmethod
     def _touch_package(connection: sqlite3.Connection, package_id: str) -> None:
