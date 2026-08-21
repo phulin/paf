@@ -712,7 +712,8 @@ class Orchestrator:
     ) -> PackageValidation:
         outputs: list[str] = []
         succeeded = True
-        for unit in dict.fromkeys(units):
+        units_by_id = {unit.id: unit for unit in units}
+        for unit in units_by_id.values():
             result = await validate(self.config, unit, workspace_root=worktree)
             outputs.append(f"{unit.id}:\n{result.output}")
             succeeded = succeeded and result.succeeded

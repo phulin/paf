@@ -44,11 +44,12 @@ from paf.package_model import (
     canonical_reservation_specs,
     normalize_capability_key,
     normalize_repository_path,
+    package_step_key,
 )
 
 DATABASE_NAME = "state.sqlite3"
 LEGACY_BACKUP_NAME = "state.legacy-v6.json"
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 CHANGE_RETENTION = 10_000
 
 COLLECTION_SECTIONS = frozenset(
@@ -546,6 +547,76 @@ def _migrate_path_reservations_v6(connection: sqlite3.Connection) -> None:
     )
 
 
+def _migrate_package_steps_v8(connection: sqlite3.Connection) -> None:
+    """Scope plan-step identities and relationships to their owning package."""
+
+    columns = connection.execute("PRAGMA table_info(package_steps)").fetchall()
+    primary_key = tuple(
+        str(row[1]) for row in sorted(columns, key=lambda row: int(row[5])) if int(row[5])
+    )
+    if primary_key == ("package_id", "id"):
+        return
+    connection.executescript(
+        """
+        CREATE TABLE package_steps_v8 (
+            package_id TEXT NOT NULL REFERENCES capability_packages(id) ON DELETE CASCADE,
+            id TEXT NOT NULL,
+            objective TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            status TEXT NOT NULL,
+            assigned_worker_id TEXT,
+            validation_contract BLOB NOT NULL,
+            remaining_gap TEXT NOT NULL,
+            plan_revision INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(package_id, id)
+        );
+        CREATE TABLE package_step_items_v8 (
+            package_id TEXT NOT NULL,
+            step_id TEXT NOT NULL,
+            item_kind TEXT NOT NULL CHECK(item_kind IN ('declaration', 'path', 'commit')),
+            item_value TEXT NOT NULL,
+            ordinal INTEGER NOT NULL,
+            PRIMARY KEY(package_id, step_id, item_kind, item_value),
+            FOREIGN KEY(package_id, step_id)
+                REFERENCES package_steps_v8(package_id, id) ON DELETE CASCADE
+        );
+        CREATE TABLE package_step_dependencies_v8 (
+            package_id TEXT NOT NULL,
+            step_id TEXT NOT NULL,
+            depends_on_step_id TEXT NOT NULL,
+            PRIMARY KEY(package_id, step_id, depends_on_step_id),
+            FOREIGN KEY(package_id, step_id)
+                REFERENCES package_steps_v8(package_id, id) ON DELETE CASCADE,
+            FOREIGN KEY(package_id, depends_on_step_id)
+                REFERENCES package_steps_v8(package_id, id)
+        );
+        INSERT INTO package_steps_v8
+        SELECT package_id, id, objective, kind, status, assigned_worker_id,
+            validation_contract, remaining_gap, plan_revision, created_at, updated_at
+        FROM package_steps;
+        INSERT INTO package_step_items_v8
+        SELECT steps.package_id, items.step_id, items.item_kind, items.item_value, items.ordinal
+        FROM package_step_items AS items
+        JOIN package_steps AS steps ON steps.id=items.step_id;
+        INSERT INTO package_step_dependencies_v8
+        SELECT steps.package_id, dependencies.step_id,
+            dependencies.depends_on_step_id
+        FROM package_step_dependencies AS dependencies
+        JOIN package_steps AS steps ON steps.id=dependencies.step_id;
+        DROP TABLE package_step_dependencies;
+        DROP TABLE package_step_items;
+        DROP TABLE package_steps;
+        ALTER TABLE package_steps_v8 RENAME TO package_steps;
+        ALTER TABLE package_step_items_v8 RENAME TO package_step_items;
+        ALTER TABLE package_step_dependencies_v8 RENAME TO package_step_dependencies;
+        CREATE INDEX package_steps_package_status
+            ON package_steps(package_id, status, id);
+        """
+    )
+
+
 def _create_schema(connection: sqlite3.Connection) -> None:
     """Create the normalized current-state schema.
 
@@ -730,8 +801,8 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             PRIMARY KEY(consumer_id, attempted_route)
         );
         CREATE TABLE IF NOT EXISTS package_steps (
-            id TEXT PRIMARY KEY,
             package_id TEXT NOT NULL REFERENCES capability_packages(id) ON DELETE CASCADE,
+            id TEXT NOT NULL,
             objective TEXT NOT NULL,
             kind TEXT NOT NULL,
             status TEXT NOT NULL,
@@ -740,21 +811,30 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             remaining_gap TEXT NOT NULL,
             plan_revision INTEGER NOT NULL,
             created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(package_id, id)
         );
         CREATE INDEX IF NOT EXISTS package_steps_package_status
             ON package_steps(package_id, status, id);
         CREATE TABLE IF NOT EXISTS package_step_items (
-            step_id TEXT NOT NULL REFERENCES package_steps(id) ON DELETE CASCADE,
+            package_id TEXT NOT NULL,
+            step_id TEXT NOT NULL,
             item_kind TEXT NOT NULL CHECK(item_kind IN ('declaration', 'path', 'commit')),
             item_value TEXT NOT NULL,
             ordinal INTEGER NOT NULL,
-            PRIMARY KEY(step_id, item_kind, item_value)
+            PRIMARY KEY(package_id, step_id, item_kind, item_value),
+            FOREIGN KEY(package_id, step_id)
+                REFERENCES package_steps(package_id, id) ON DELETE CASCADE
         );
         CREATE TABLE IF NOT EXISTS package_step_dependencies (
-            step_id TEXT NOT NULL REFERENCES package_steps(id) ON DELETE CASCADE,
-            depends_on_step_id TEXT NOT NULL REFERENCES package_steps(id),
-            PRIMARY KEY(step_id, depends_on_step_id)
+            package_id TEXT NOT NULL,
+            step_id TEXT NOT NULL,
+            depends_on_step_id TEXT NOT NULL,
+            PRIMARY KEY(package_id, step_id, depends_on_step_id),
+            FOREIGN KEY(package_id, step_id)
+                REFERENCES package_steps(package_id, id) ON DELETE CASCADE,
+            FOREIGN KEY(package_id, depends_on_step_id)
+                REFERENCES package_steps(package_id, id)
         );
         CREATE TABLE IF NOT EXISTS package_evidence (
             id TEXT PRIMARY KEY,
@@ -866,6 +946,7 @@ def _create_schema(connection: sqlite3.Connection) -> None:
         """
     )
     _migrate_path_reservations_v6(connection)
+    _migrate_package_steps_v8(connection)
     journal_columns = {
         str(row[1])
         for row in connection.execute("PRAGMA table_info(integration_journal)").fetchall()
@@ -1550,6 +1631,17 @@ def _group_ordered_items(
     return {key: tuple(values) for key, values in grouped.items()}
 
 
+def _group_package_step_items(
+    connection: sqlite3.Connection,
+    query: str,
+) -> dict[str, tuple[str, ...]]:
+    grouped: dict[str, list[str]] = {}
+    for package_id, step_id, value in connection.execute(query):
+        key = package_step_key(str(package_id), str(step_id))
+        grouped.setdefault(key, []).append(str(value))
+    return {key: tuple(values) for key, values in grouped.items()}
+
+
 def _load_package_state(connection: sqlite3.Connection) -> PackageState:
     aliases = _group_ordered_items(
         connection,
@@ -1643,25 +1735,25 @@ def _load_package_state(connection: sqlite3.Connection) -> PackageState:
             updated_at=str(row[13]),
         )
 
-    step_declarations = _group_ordered_items(
+    step_declarations = _group_package_step_items(
         connection,
-        """SELECT step_id, item_value FROM package_step_items WHERE item_kind='declaration'
-        ORDER BY step_id, ordinal, item_value""",
+        """SELECT package_id, step_id, item_value FROM package_step_items
+        WHERE item_kind='declaration' ORDER BY package_id, step_id, ordinal, item_value""",
     )
-    step_paths = _group_ordered_items(
+    step_paths = _group_package_step_items(
         connection,
-        """SELECT step_id, item_value FROM package_step_items WHERE item_kind='path'
-        ORDER BY step_id, ordinal, item_value""",
+        """SELECT package_id, step_id, item_value FROM package_step_items
+        WHERE item_kind='path' ORDER BY package_id, step_id, ordinal, item_value""",
     )
-    step_commits = _group_ordered_items(
+    step_commits = _group_package_step_items(
         connection,
-        """SELECT step_id, item_value FROM package_step_items WHERE item_kind='commit'
-        ORDER BY step_id, ordinal, item_value""",
+        """SELECT package_id, step_id, item_value FROM package_step_items
+        WHERE item_kind='commit' ORDER BY package_id, step_id, ordinal, item_value""",
     )
-    step_dependencies = _group_ordered_items(
+    step_dependencies = _group_package_step_items(
         connection,
-        """SELECT step_id, depends_on_step_id FROM package_step_dependencies
-        ORDER BY step_id, depends_on_step_id""",
+        """SELECT package_id, step_id, depends_on_step_id FROM package_step_dependencies
+        ORDER BY package_id, step_id, depends_on_step_id""",
     )
     steps: dict[str, PackageStep] = {}
     for row in connection.execute(
@@ -1671,9 +1763,11 @@ def _load_package_state(connection: sqlite3.Connection) -> PackageState:
     ):
         step_id = str(row[0])
         contract = json.loads(row[6])
-        steps[step_id] = PackageStep(
+        package_id = str(row[1])
+        key = package_step_key(package_id, step_id)
+        steps[key] = PackageStep(
             id=step_id,
-            package_id=str(row[1]),
+            package_id=package_id,
             objective=str(row[2]),
             kind=PackageStepKind(str(row[3])),
             status=PackageStepStatus(str(row[4])),
@@ -1681,10 +1775,10 @@ def _load_package_state(connection: sqlite3.Connection) -> PackageState:
             validation_contract=contract if isinstance(contract, dict) else {},
             remaining_gap=str(row[7]),
             plan_revision=int(row[8]),
-            intended_declarations=step_declarations.get(step_id, ()),
-            intended_paths=step_paths.get(step_id, ()),
-            depends_on_step_ids=step_dependencies.get(step_id, ()),
-            commit_ids=step_commits.get(step_id, ()),
+            intended_declarations=step_declarations.get(key, ()),
+            intended_paths=step_paths.get(key, ()),
+            depends_on_step_ids=step_dependencies.get(key, ()),
+            commit_ids=step_commits.get(key, ()),
             created_at=str(row[9]),
             updated_at=str(row[10]),
         )
@@ -1936,7 +2030,7 @@ def initialize_database(state_dir: Path) -> Path:
             if version == 1:
                 with connection:
                     _migrate_v1(connection)
-            elif version in {2, 3, 4, 5, 6}:
+            elif version in {2, 3, 4, 5, 6, 7}:
                 with connection:
                     _create_schema(connection)
             elif version != SCHEMA_VERSION:
@@ -2232,6 +2326,59 @@ class StateWriter:
                     return
         finally:
             connection.close()
+
+
+def _upsert_package_step_rows(connection: sqlite3.Connection, step: PackageStep) -> None:
+    now = _utc_now()
+    connection.execute(
+        """INSERT INTO package_steps(
+            package_id, id, objective, kind, status, assigned_worker_id,
+            validation_contract, remaining_gap, plan_revision, created_at, updated_at
+        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(package_id, id) DO UPDATE SET
+            objective=excluded.objective, kind=excluded.kind, status=excluded.status,
+            assigned_worker_id=excluded.assigned_worker_id,
+            validation_contract=excluded.validation_contract,
+            remaining_gap=excluded.remaining_gap,
+            plan_revision=excluded.plan_revision, updated_at=excluded.updated_at""",
+        (
+            step.package_id,
+            step.id,
+            step.objective,
+            str(step.kind),
+            str(step.status),
+            step.assigned_worker_id,
+            json.dumpb(step.validation_contract),
+            step.remaining_gap,
+            step.plan_revision,
+            step.created_at or now,
+            step.updated_at or now,
+        ),
+    )
+    connection.execute(
+        "DELETE FROM package_step_items WHERE package_id=? AND step_id=?",
+        (step.package_id, step.id),
+    )
+    connection.execute(
+        "DELETE FROM package_step_dependencies WHERE package_id=? AND step_id=?",
+        (step.package_id, step.id),
+    )
+    for kind, values in (
+        ("declaration", step.intended_declarations),
+        ("path", step.intended_paths),
+        ("commit", step.commit_ids),
+    ):
+        connection.executemany(
+            "INSERT INTO package_step_items VALUES(?, ?, ?, ?, ?)",
+            (
+                (step.package_id, step.id, kind, value, ordinal)
+                for ordinal, value in enumerate(values)
+            ),
+        )
+    connection.executemany(
+        "INSERT INTO package_step_dependencies VALUES(?, ?, ?)",
+        ((step.package_id, step.id, value) for value in step.depends_on_step_ids),
+    )
 
 
 class StateDatabase:
@@ -2672,61 +2819,16 @@ class StateDatabase:
             self._assert_package_revision(connection, step.package_id, expected_revision)
             if lease_generation is not None:
                 self._assert_lease_generation(connection, step.package_id, lease_generation)
-            existing_step = connection.execute(
-                "SELECT package_id FROM package_steps WHERE id=?", (step.id,)
-            ).fetchone()
-            if existing_step is not None and str(existing_step[0]) != step.package_id:
-                raise ValueError(f"step {step.id} belongs to a different package")
             for dependency_id in step.depends_on_step_ids:
                 row = connection.execute(
-                    "SELECT package_id FROM package_steps WHERE id=?", (dependency_id,)
+                    "SELECT 1 FROM package_steps WHERE package_id=? AND id=?",
+                    (step.package_id, dependency_id),
                 ).fetchone()
-                if row is None or str(row[0]) != step.package_id:
+                if row is None:
                     raise ValueError(
                         f"step dependency {dependency_id} does not belong to {step.package_id}"
                     )
-            now = _utc_now()
-            connection.execute(
-                """INSERT INTO package_steps(
-                    id, package_id, objective, kind, status, assigned_worker_id,
-                    validation_contract, remaining_gap, plan_revision, created_at, updated_at
-                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(id) DO UPDATE SET
-                    objective=excluded.objective, kind=excluded.kind, status=excluded.status,
-                    assigned_worker_id=excluded.assigned_worker_id,
-                    validation_contract=excluded.validation_contract,
-                    remaining_gap=excluded.remaining_gap,
-                    plan_revision=excluded.plan_revision, updated_at=excluded.updated_at
-                WHERE package_steps.package_id=excluded.package_id""",
-                (
-                    step.id,
-                    step.package_id,
-                    step.objective,
-                    str(step.kind),
-                    str(step.status),
-                    step.assigned_worker_id,
-                    json.dumpb(step.validation_contract),
-                    step.remaining_gap,
-                    step.plan_revision,
-                    step.created_at or now,
-                    step.updated_at or now,
-                ),
-            )
-            connection.execute("DELETE FROM package_step_items WHERE step_id=?", (step.id,))
-            connection.execute("DELETE FROM package_step_dependencies WHERE step_id=?", (step.id,))
-            for kind, values in (
-                ("declaration", step.intended_declarations),
-                ("path", step.intended_paths),
-                ("commit", step.commit_ids),
-            ):
-                connection.executemany(
-                    "INSERT INTO package_step_items VALUES(?, ?, ?, ?)",
-                    ((step.id, kind, value, ordinal) for ordinal, value in enumerate(values)),
-                )
-            connection.executemany(
-                "INSERT INTO package_step_dependencies VALUES(?, ?)",
-                ((step.id, value) for value in step.depends_on_step_ids),
-            )
+            _upsert_package_step_rows(connection, step)
             step_graph: dict[str, set[str]] = {
                 str(row[0]): set()
                 for row in connection.execute(
@@ -2734,16 +2836,87 @@ class StateDatabase:
                 )
             }
             for step_id, depends_on in connection.execute(
-                """SELECT dependencies.step_id, dependencies.depends_on_step_id
-                FROM package_step_dependencies AS dependencies
-                JOIN package_steps AS steps ON steps.id=dependencies.step_id
-                WHERE steps.package_id=?""",
+                """SELECT step_id, depends_on_step_id FROM package_step_dependencies
+                WHERE package_id=?""",
                 (step.package_id,),
             ):
                 step_graph.setdefault(str(step_id), set()).add(str(depends_on))
             self._assert_dependency_dag(step_graph)
             self._touch_package(connection, step.package_id)
             return _load_package_state(connection).packages[step.package_id]
+
+    def replace_package_plan(
+        self,
+        package_id: str,
+        steps: tuple[PackageStep, ...],
+        *,
+        plan_revision: int,
+        expected_revision: int,
+        lease_generation: int,
+    ) -> CapabilityPackage:
+        """Atomically publish one complete revision of a package plan."""
+
+        with _connect(self.path) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._assert_package_revision(connection, package_id, expected_revision)
+            self._assert_lease_generation(connection, package_id, lease_generation)
+            if any(step.package_id != package_id for step in steps):
+                raise ValueError("replacement plan contains a step from another package")
+            ids = {step.id for step in steps}
+            if len(ids) != len(steps):
+                raise ValueError("replacement plan repeats a step id")
+            existing_complete = {
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT id FROM package_steps WHERE package_id=? AND status=?",
+                    (package_id, str(PackageStepStatus.COMPLETE)),
+                )
+            }
+            known = ids | existing_complete
+            if any(not set(step.depends_on_step_ids).issubset(known) for step in steps):
+                raise ValueError("replacement plan contains an unknown dependency")
+            for step in steps:
+                _upsert_package_step_rows(connection, step)
+            if ids:
+                placeholders = ",".join("?" for _ in ids)
+                connection.execute(
+                    f"""UPDATE package_steps SET status=?, assigned_worker_id=NULL,
+                        plan_revision=?, updated_at=? WHERE package_id=?
+                        AND id NOT IN ({placeholders}) AND status NOT IN (?, ?)""",
+                    (
+                        str(PackageStepStatus.SUPERSEDED),
+                        plan_revision,
+                        _utc_now(),
+                        package_id,
+                        *sorted(ids),
+                        str(PackageStepStatus.COMPLETE),
+                        str(PackageStepStatus.SUPERSEDED),
+                    ),
+                )
+            else:
+                connection.execute(
+                    """UPDATE package_steps SET status=?, assigned_worker_id=NULL,
+                        plan_revision=?, updated_at=? WHERE package_id=?
+                        AND status NOT IN (?, ?)""",
+                    (
+                        str(PackageStepStatus.SUPERSEDED),
+                        plan_revision,
+                        _utc_now(),
+                        package_id,
+                        str(PackageStepStatus.COMPLETE),
+                        str(PackageStepStatus.SUPERSEDED),
+                    ),
+                )
+            graph = {step.id: set(step.depends_on_step_ids) for step in steps}
+            self._assert_dependency_dag(graph)
+            now = _utc_now()
+            connection.execute(
+                """UPDATE capability_packages SET status=?, plan_revision=?,
+                    revision=revision+1, updated_at=? WHERE id=?""",
+                (str(PackageStatus.PLANNED), plan_revision, now, package_id),
+            )
+            connection.commit()
+        return self.load_package_state().packages[package_id]
 
     def put_steward_lease(
         self, lease: StewardLease, *, expected_revision: int

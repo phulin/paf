@@ -970,6 +970,7 @@ async def test_package_execution_rejects_model_path_outside_expansion_scope(
     assert result.status.value == "parked"
     assert "invalid package path" in result.detail
     assert not (repo / "README.md").exists()
+    assert not store.load_package_state().reservations
 
 
 @pytest.mark.asyncio
@@ -1161,7 +1162,7 @@ async def test_replan_supersedes_abandoned_incomplete_steps(tmp_path: Path) -> N
 
     assert first.status is PackageStatus.IMPLEMENTING
     assert second.status is PackageStatus.COMPLETE
-    assert store.load_package_state().steps["abandoned"].status.value == "superseded"
+    assert store.load_package_state().step(current.id, "abandoned").status.value == "superseded"
 
 
 @pytest.mark.asyncio
@@ -1333,3 +1334,5 @@ async def test_package_execution_persists_nonimplementation_dispositions(
         assert current.id not in {package.id for package in runtime.ready_packages()}
     else:
         assert state.consumers["consumer-a"].status is ConsumerStatus.TERMINAL
+    if disposition != "waiting_dependency":
+        assert not state.reservations

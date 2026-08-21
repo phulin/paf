@@ -382,6 +382,12 @@ class IntegrationJournal:
     updated_at: str = ""
 
 
+def package_step_key(package_id: str, step_id: str) -> str:
+    """Return the in-memory key for a package-local plan step."""
+
+    return f"{package_id}\0{step_id}"
+
+
 @dataclass(frozen=True)
 class PackageState:
     packages: dict[str, CapabilityPackage] = field(default_factory=dict)
@@ -411,6 +417,12 @@ class PackageState:
 
     def steps_for(self, package_id: str) -> tuple[PackageStep, ...]:
         return tuple(value for value in self.steps.values() if value.package_id == package_id)
+
+    def step(self, package_id: str, step_id: str) -> PackageStep:
+        return self.steps[package_step_key(package_id, step_id)]
+
+    def get_step(self, package_id: str, step_id: str) -> PackageStep | None:
+        return self.steps.get(package_step_key(package_id, step_id))
 
     def evidence_for(self, package_id: str) -> tuple[PackageEvidence, ...]:
         return tuple(value for value in self.evidence.values() if value.package_id == package_id)

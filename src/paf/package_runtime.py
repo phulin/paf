@@ -1021,7 +1021,8 @@ class PackageExecutionLayer:
         if not isinstance(raw_steps, list):
             raise PackageReportError("package plan steps must be an array")
         next_revision = self._current(package_id).plan_revision + 1
-        existing_steps = self.database.load_package_state().steps_for(package_id)
+        state = self.database.load_package_state()
+        existing_steps = state.steps_for(package_id)
         reported_ids = tuple(
             str(value.get("step_id", "")) for value in raw_steps if isinstance(value, dict)
         )
@@ -1046,6 +1047,7 @@ class PackageExecutionLayer:
                 for value in reservations
             )
 
+        replacement_steps: list[PackageStep] = []
         for raw in raw_steps:
             if not isinstance(raw, dict):
                 raise PackageReportError("package plan step must be an object")
@@ -1058,7 +1060,7 @@ class PackageExecutionLayer:
                 raise PackageReportError(f"step {step_id or '<empty>'} has invalid dependencies")
             if not all(reserved(path) for path in paths):
                 raise PackageReportError(f"step {step_id} names an unreserved path")
-            existing = self.database.load_package_state().steps.get(step_id)
+            existing = state.get_step(package_id, step_id)
             status = (
                 existing.status
                 if existing is not None and existing.status is PackageStepStatus.COMPLETE
@@ -1066,8 +1068,7 @@ class PackageExecutionLayer:
                 if not dependencies
                 else PackageStepStatus.PENDING
             )
-            package = self._current(package_id)
-            self.database.upsert_package_step(
+            replacement_steps.append(
                 PackageStep(
                     id=step_id,
                     package_id=package_id,
@@ -1086,33 +1087,14 @@ class PackageExecutionLayer:
                     remaining_gap=existing.remaining_gap if existing is not None else "",
                     plan_revision=next_revision,
                     created_at=existing.created_at if existing is not None else "",
-                ),
-                expected_revision=package.revision,
-                lease_generation=generation,
-            )
-        for existing in existing_steps:
-            if existing.id in reported_ids or existing.status in {
-                PackageStepStatus.COMPLETE,
-                PackageStepStatus.SUPERSEDED,
-            }:
-                continue
-            package = self._current(package_id)
-            self.database.upsert_package_step(
-                replace(
-                    existing,
-                    status=PackageStepStatus.SUPERSEDED,
-                    assigned_worker_id=None,
-                    plan_revision=next_revision,
-                ),
-                expected_revision=package.revision,
-                lease_generation=generation,
+                )
             )
         package = self._current(package_id)
-        self.database.update_package_lifecycle(
+        self.database.replace_package_plan(
             package_id,
-            PackageStatus.PLANNED,
-            expected_revision=package.revision,
+            tuple(replacement_steps),
             plan_revision=next_revision,
+            expected_revision=package.revision,
             lease_generation=generation,
         )
 
@@ -1192,8 +1174,8 @@ class PackageExecutionLayer:
         for raw in self._items(report, "completed_step_assessments"):
             step_id = str(raw.get("step_id", ""))
             state = self.database.load_package_state()
-            step = state.steps.get(step_id)
-            if step is None or step.package_id != package_id:
+            step = state.get_step(package_id, step_id)
+            if step is None:
                 raise PackageReportError(f"completed assessment names unknown step {step_id}")
             validation = await _await_validation(self.validate_step(worktree, step))
             accepted = bool(raw.get("accepted")) and validation.succeeded
@@ -1262,14 +1244,14 @@ class PackageExecutionLayer:
 
     def _ready_step(self, package_id: str, step_id: str) -> PackageStep:
         state = self.database.load_package_state()
-        step = state.steps.get(step_id)
-        if step is None or step.package_id != package_id:
+        step = state.get_step(package_id, step_id)
+        if step is None:
             raise PackageReportError(f"worker assignment names unknown step {step_id}")
-        incomplete = [
-            value
-            for value in step.depends_on_step_ids
-            if state.steps[value].status is not PackageStepStatus.COMPLETE
-        ]
+        incomplete = []
+        for dependency_id in step.depends_on_step_ids:
+            dependency = state.get_step(package_id, dependency_id)
+            if dependency is None or dependency.status is not PackageStepStatus.COMPLETE:
+                incomplete.append(dependency_id)
         if incomplete:
             raise PackageReportError(
                 f"worker step {step_id} has incomplete dependencies: {', '.join(incomplete)}"
@@ -1691,14 +1673,13 @@ class PackageExecutionLayer:
             )
             return PackageExecutionResult(package_id, generation, parked.status, detail=str(error))
         finally:
-            # Terminal/retry scheduling obtains a fresh lease; reservations remain package-owned
-            # unless integration finalized and released them.
             heartbeat_stop.set()
             await asyncio.gather(heartbeat, return_exceptions=True)
+            release_reservations = self._current(package_id).status in _TERMINAL_PACKAGE_STATUSES
             with suppress(ValueError):
                 self.database.release_steward_lease(
                     package_id,
                     lease.agent_id,
                     generation,
-                    release_reservations=False,
+                    release_reservations=release_reservations,
                 )

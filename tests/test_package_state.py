@@ -87,6 +87,28 @@ def test_package_model_rejects_escaping_paths() -> None:
         package("package-a", "key", "/tmp/outside")
 
 
+def test_plan_step_ids_are_local_to_their_package(tmp_path: Path) -> None:
+    store = database(tmp_path)
+    first, _ = store.create_or_attach_capability_package(package("package-a", "key.a"))
+    second, _ = store.create_or_attach_capability_package(package("package-b", "key.b"))
+
+    for current in (first, second):
+        store.upsert_package_step(
+            PackageStep(
+                id="validate-package",
+                package_id=current.id,
+                objective=f"Validate {current.id}",
+                kind=PackageStepKind.VALIDATION,
+                status=PackageStepStatus.READY,
+            ),
+            expected_revision=current.revision,
+        )
+
+    state = store.load_package_state()
+    assert state.step("package-a", "validate-package").objective == "Validate package-a"
+    assert state.step("package-b", "validate-package").objective == "Validate package-b"
+
+
 @pytest.mark.asyncio
 async def test_package_mutations_publish_dashboard_projection(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
@@ -230,7 +252,7 @@ def test_package_mutations_are_revisioned_and_lease_fenced(tmp_path: Path) -> No
     )
 
     state = store.load_package_state()
-    assert state.steps["step-a"].intended_declarations == ("Book.bridge",)
+    assert state.step("package-a", "step-a").intended_declarations == ("Book.bridge",)
     assert state.leases["package-a"].generation == 3
     assert state.reservations["lean/Book/Chapter01.lean"].package_id == "package-a"
     assert state.relevant_read_interfaces[0].digest == "api-digest"
@@ -250,11 +272,11 @@ def test_package_mutations_are_revisioned_and_lease_fenced(tmp_path: Path) -> No
     )
     with pytest.raises(ValueError, match="cycle"):
         store.upsert_package_step(
-            replace(state.steps["step-a"], depends_on_step_ids=("step-b",)),
+            replace(state.step("package-a", "step-a"), depends_on_step_ids=("step-b",)),
             expected_revision=current.revision,
             lease_generation=3,
         )
-    assert store.load_package_state().steps["step-a"].depends_on_step_ids == ()
+    assert store.load_package_state().step("package-a", "step-a").depends_on_step_ids == ()
     with pytest.raises(ValueError, match="stale package revision"):
         store.append_package_evidence(
             PackageEvidence(

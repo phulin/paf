@@ -121,6 +121,32 @@ class FakeExecutor(CodexExecutor):
 
 
 @pytest.mark.asyncio
+async def test_package_validation_deduplicates_real_work_units_by_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    orchestrator = object.__new__(Orchestrator)
+    orchestrator.config = config
+    unit = config.work_units[0]
+    calls: list[str] = []
+
+    async def validation(
+        _config: PipelineConfig,
+        current: Any,
+        **_kwargs: object,
+    ) -> ValidationResult:
+        calls.append(current.id)
+        return ValidationResult(True, 0, "ok")
+
+    monkeypatch.setattr(scheduler_module, "validate", validation)
+
+    result = await orchestrator._validate_package_units(tmp_path, (unit, unit))
+
+    assert result.succeeded
+    assert calls == [unit.id]
+
+
+@pytest.mark.asyncio
 async def test_package_drain_schedules_newly_unblocked_dependencies(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
     orchestrator = Orchestrator(config, StateStore(config))
