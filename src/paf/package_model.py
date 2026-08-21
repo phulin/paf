@@ -18,6 +18,7 @@ class PackageStatus(StrEnum):
     INTEGRATING = "integrating"
     COMPLETE = "complete"
     WAITING_DEPENDENCY = "waiting_dependency"
+    WAITING_RESERVATION = "waiting_reservation"
     DECOMPOSED = "decomposed"
     EXTERNAL = "external"
     STATEMENT_REVISION_REQUIRED = "statement_revision_required"
@@ -375,6 +376,7 @@ class IntegrationJournal:
     phase: IntegrationPhase
     validation_digest: str = ""
     canonical_revision_after: str | None = None
+    provisional_consumer_ids: tuple[str, ...] = ()
     created_at: str = ""
     updated_at: str = ""
 

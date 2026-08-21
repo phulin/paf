@@ -23,6 +23,7 @@ from paf.package_model import (
 )
 from paf.package_runtime import (
     ConsumerValidation,
+    IntegrationResult,
     PackageExecutionLayer,
     PackageGitError,
     PackageIntegrator,
@@ -346,10 +347,61 @@ def test_integration_rejects_dirty_worktree_and_changed_interface(tmp_path: Path
     assert run_git(repo, "rev-parse", "HEAD") == current.base_revision
 
 
+def test_stale_integration_does_not_publish_provisional_consumer_acceptance(
+    tmp_path: Path,
+) -> None:
+    repo = git_repo(tmp_path)
+    store, current, generation, worktree = prepared_package(repo)
+    store.attach_package_consumer(
+        current.id,
+        PackageConsumer("consumer-a", current.id, "chapter-a", "lean/Book.lean", "base", "prove"),
+        expected_revision=current.revision,
+        lease_generation=generation,
+    )
+    current = store.load_package_state().packages[current.id]
+    commit_candidate(worktree)
+    guard = RelevantInterfaceGuard(store)
+    guard.capture(
+        current.id,
+        generation,
+        expected_revision=current.revision,
+        interface_ids=("Book.input",),
+        source_revision=current.base_revision,
+        digest=lambda _: "before",
+    )
+    interface = "before"
+
+    def validate(_: Path) -> str:
+        nonlocal interface
+        interface = "after"
+        return "validation"
+
+    result = PackageIntegrator(repo, repo / ".paf", store).integrate(
+        current.id,
+        generation,
+        validate=validate,
+        interface_digest=lambda _: interface,
+        provisional_consumer_ids=("consumer-a",),
+    )
+
+    assert not result.integrated
+    state = store.load_package_state()
+    assert state.consumers["consumer-a"].status is ConsumerStatus.OPEN
+    assert state.consumers["consumer-a"].accepted_revision is None
+    assert state.integration_journal[result.journal_id].provisional_consumer_ids == ("consumer-a",)
+
+
 def test_restart_reconciles_canonical_commit_without_reapplying_it(tmp_path: Path) -> None:
     repo = git_repo(tmp_path)
     store, current, generation, worktree = prepared_package(repo)
     candidate = commit_candidate(worktree)
+    store.attach_package_consumer(
+        current.id,
+        PackageConsumer("consumer-a", current.id, "chapter-a", "lean/Book.lean", "base", "prove"),
+        expected_revision=current.revision,
+        lease_generation=generation,
+    )
+    current = store.load_package_state().packages[current.id]
     canonical_before = run_git(repo, "rev-parse", "HEAD")
     journal = IntegrationJournal(
         "interrupted-import",
@@ -360,6 +412,7 @@ def test_restart_reconciles_canonical_commit_without_reapplying_it(tmp_path: Pat
         canonical_before,
         IntegrationPhase.IMPORTING,
         validation_digest="validated",
+        provisional_consumer_ids=("consumer-a",),
     )
     store.record_integration_journal(journal, expected_revision=current.revision)
     run_git(repo, "merge", "--ff-only", candidate)
@@ -370,6 +423,8 @@ def test_restart_reconciles_canonical_commit_without_reapplying_it(tmp_path: Pat
     state = store.load_package_state()
     assert state.integration_journal[journal.id].phase is IntegrationPhase.FINALIZED
     assert state.packages[current.id].integrated_revision == candidate
+    assert state.consumers["consumer-a"].status is ConsumerStatus.ACCEPTED
+    assert state.consumers["consumer-a"].accepted_revision == candidate
     assert run_git(repo, "rev-list", "--count", "HEAD") == "2"
 
 
@@ -603,6 +658,165 @@ def disposition_report(
 
 
 @pytest.mark.asyncio
+async def test_initial_scope_conflict_waits_durably_without_steward_ping_pong(
+    tmp_path: Path,
+) -> None:
+    repo = git_repo(tmp_path)
+    store = StateDatabase(repo / ".paf")
+    store.initialize()
+    ordinary = store.claim_ordinary_path_reservations(
+        "ordinary",
+        (ReservationSpec("lean/Book.lean"),),
+        ttl_seconds=3600,
+        now=EARLY,
+    )
+    current = package(store, "P-initial-wait")
+    steward_calls = 0
+
+    async def run_steward(*_args):
+        nonlocal steward_calls
+        steward_calls += 1
+        return disposition_report("complete", ())
+
+    runtime = PackageExecutionLayer(
+        repo,
+        repo / ".paf",
+        store,
+        run_steward=run_steward,
+        run_worker=lambda *_args: asyncio.sleep(0, result={}),
+        validate_step=lambda *_args: PackageValidation(True, "step", "ok"),
+        validate_package=lambda *_args: PackageValidation(True, "package", "ok"),
+        validate_consumer=lambda _path, consumer: ConsumerValidation(
+            False, "consumer", "not checked", consumer.id
+        ),
+    )
+
+    first = await runtime.execute(current.id)
+    second = await runtime.execute(current.id)
+
+    assert first.status is PackageStatus.WAITING_RESERVATION
+    assert second.status is PackageStatus.WAITING_RESERVATION
+    assert second.generation == 0
+    assert steward_calls == 0
+    assert runtime.ready_packages() == ()
+    with sqlite3.connect(store.path) as connection:
+        assert connection.execute(
+            "SELECT count(*) FROM path_reservation_queue WHERE owner_id=?", (current.id,)
+        ).fetchone() == (1,)
+
+    store.release_path_reservations(
+        ReservationOwnerKind.ORDINARY_TASK, ordinary.owner_id, ordinary.fence_generation
+    )
+
+    assert store.load_package_state().packages[current.id].status is PackageStatus.OBSERVED
+    assert tuple(value.id for value in runtime.ready_packages()) == (current.id,)
+    with sqlite3.connect(store.path) as connection:
+        assert connection.execute(
+            "SELECT count(*) FROM path_reservation_queue WHERE owner_id=?", (current.id,)
+        ).fetchone() == (0,)
+
+
+@pytest.mark.asyncio
+async def test_scope_expansion_wait_refences_queue_and_recovers_retained_edits(
+    tmp_path: Path,
+) -> None:
+    repo = git_repo(tmp_path)
+    support = repo / "lean" / "Support.lean"
+    support.write_text("def support := 1\n", encoding="utf-8")
+    run_git(repo, "add", "lean/Support.lean")
+    run_git(repo, "commit", "-m", "feat: add support")
+    store = StateDatabase(repo / ".paf")
+    store.initialize()
+    ordinary = store.claim_ordinary_path_reservations(
+        "ordinary-support",
+        (ReservationSpec("lean/Support.lean"),),
+        ttl_seconds=3600,
+        now=EARLY,
+    )
+    current, _ = store.create_or_attach_capability_package(
+        CapabilityPackage(
+            "P-expansion-wait",
+            "expansion.wait",
+            "Expansion wait",
+            "Wait safely for an expanded support path",
+            write_scope=("lean/Book.lean",),
+            expansion_scope=("lean/Book.lean", "lean/Support.lean"),
+        )
+    )
+    report = steward_report(consumers=())
+    report["scope_expansion_requests"] = [
+        {
+            "path": "lean/Support.lean",
+            "mode": "exclusive_file",
+            "reason": "the shared interface belongs here",
+        }
+    ]
+    report["plan_revision"] = {
+        "base_revision": 0,
+        "revision_reason": "the Steward owns this bounded interface edit",
+        "steps": [],
+    }
+    report["completed_step_assessments"] = []
+    report["worker_assignments"] = []
+    steward_calls = 0
+
+    async def run_steward(_package, _dossier, worktree):
+        nonlocal steward_calls
+        steward_calls += 1
+        (worktree / "lean" / "Support.lean").write_text(
+            "def support := 1\ndef sharedBridge := support\n", encoding="utf-8"
+        )
+        return report
+
+    runtime = PackageExecutionLayer(
+        repo,
+        repo / ".paf",
+        store,
+        run_steward=run_steward,
+        run_worker=lambda *_args: asyncio.sleep(0, result={}),
+        validate_step=lambda *_args: PackageValidation(True, "step", "ok"),
+        validate_package=lambda *_args: PackageValidation(True, "package", "ok"),
+        validate_consumer=lambda _path, consumer: ConsumerValidation(
+            False, "consumer", "not checked", consumer.id
+        ),
+    )
+
+    first = await runtime.execute(current.id)
+
+    assert first.status is PackageStatus.WAITING_RESERVATION
+    assert steward_calls == 1
+    waiting = store.load_package_state().packages[current.id]
+    replacement = store.claim_steward_lease(
+        current.id,
+        "replacement",
+        expected_revision=waiting.revision,
+        ttl_seconds=3600,
+    )
+    with sqlite3.connect(store.path) as connection:
+        rows = connection.execute(
+            """SELECT fence_generation FROM path_reservation_queue
+            WHERE owner_kind='package' AND owner_id=?""",
+            (current.id,),
+        ).fetchall()
+    assert rows == [(replacement.generation,)]
+    store.release_steward_lease(current.id, "replacement", replacement.generation)
+    store.release_path_reservations(
+        ReservationOwnerKind.ORDINARY_TASK, ordinary.owner_id, ordinary.fence_generation
+    )
+
+    assert store.load_package_state().packages[current.id].status is PackageStatus.OBSERVED
+    second = await runtime.execute(current.id)
+
+    assert second.status is PackageStatus.COMPLETE
+    assert steward_calls == 2
+    assert "sharedBridge" in support.read_text(encoding="utf-8")
+    with sqlite3.connect(store.path) as connection:
+        assert connection.execute(
+            "SELECT count(*) FROM path_reservation_queue WHERE owner_id=?", (current.id,)
+        ).fetchone() == (0,)
+
+
+@pytest.mark.asyncio
 async def test_package_execution_integrates_multifile_steward_and_small_worker_steps(
     tmp_path: Path,
 ) -> None:
@@ -790,6 +1004,84 @@ async def test_package_execution_accepts_consumers_independently_and_wakes_only_
     state = store.load_package_state()
     assert state.consumers["consumer-a"].status is ConsumerStatus.ACCEPTED
     assert state.consumers["consumer-b"].status is ConsumerStatus.OPEN
+
+
+@pytest.mark.asyncio
+async def test_runtime_keeps_consumer_acceptance_provisional_when_integration_stales(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = git_repo(tmp_path)
+    store = StateDatabase(repo / ".paf")
+    store.initialize()
+    current, _ = store.create_or_attach_capability_package(
+        CapabilityPackage(
+            "P-stale-consumer",
+            "stale.consumer",
+            "Stale consumer",
+            "Do not publish acceptance before integration",
+            write_scope=("lean/Book.lean",),
+            expansion_scope=("lean/Book.lean",),
+        ),
+        consumer=PackageConsumer(
+            "consumer-a",
+            "P-stale-consumer",
+            "chapter-a",
+            "lean/Book.lean",
+            "base",
+            "prove",
+        ),
+    )
+    report = disposition_report("continue", ("consumer-a",))
+    observed_during_integration: list[ConsumerStatus] = []
+    woken: list[str] = []
+
+    async def wake(ids):
+        woken.extend(ids)
+
+    runtime = PackageExecutionLayer(
+        repo,
+        repo / ".paf",
+        store,
+        run_steward=lambda *_args: asyncio.sleep(0, result=report),
+        run_worker=lambda *_args: asyncio.sleep(0, result={}),
+        validate_step=lambda *_args: PackageValidation(True, "step", "ok"),
+        validate_package=lambda *_args: PackageValidation(True, "package", "ok"),
+        validate_consumer=lambda _path, consumer: ConsumerValidation(
+            True,
+            "consumer",
+            "focused consumer check",
+            consumer.id,
+            (consumer.work_unit_id,),
+        ),
+        wake_consumers=wake,
+    )
+
+    def stale_integrate(package_id, _generation, **_kwargs):
+        observed_during_integration.append(
+            store.load_package_state().consumers["consumer-a"].status
+        )
+        head = run_git(repo, "rev-parse", "HEAD")
+        return IntegrationResult(
+            False,
+            package_id,
+            head,
+            head,
+            "package",
+            "canonical revision changed during validation",
+            "stale-journal",
+        )
+
+    monkeypatch.setattr(runtime.integrator, "integrate", stale_integrate)
+
+    result = await runtime.execute(current.id)
+
+    assert observed_during_integration == [ConsumerStatus.OPEN]
+    assert result.status is PackageStatus.INVESTIGATING
+    assert result.accepted_consumer_ids == ()
+    assert woken == []
+    consumer = store.load_package_state().consumers["consumer-a"]
+    assert consumer.status is ConsumerStatus.OPEN
+    assert consumer.accepted_revision is None
 
 
 @pytest.mark.asyncio

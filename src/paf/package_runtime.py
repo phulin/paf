@@ -47,6 +47,10 @@ class PackageReportError(ValueError):
     """A model report requested a mutation outside its fenced package authority."""
 
 
+class PackageReservationWaiting(RuntimeError):
+    """A package mutation is durably queued behind another path owner."""
+
+
 @dataclass(frozen=True)
 class WorktreeSnapshot:
     path: Path
@@ -393,6 +397,7 @@ class PackageIntegrator:
         *,
         validate: Callable[[Path], str],
         interface_digest: Callable[[str], str | None],
+        provisional_consumer_ids: tuple[str, ...] = (),
         max_stale_retries: int = 2,
     ) -> IntegrationResult:
         for attempt in range(max_stale_retries + 1):
@@ -424,6 +429,7 @@ class PackageIntegrator:
                     candidate,
                     canonical_before,
                     IntegrationPhase.PREPARED,
+                    provisional_consumer_ids=provisional_consumer_ids,
                 )
                 self._record(journal)
 
@@ -656,10 +662,15 @@ class PackageExecutionLayer:
         self._running_lock = asyncio.Lock()
 
     def ready_packages(self) -> tuple[CapabilityPackage, ...]:
+        self.database.wake_waiting_reservation_packages()
         state = self.database.load_package_state()
         ready: list[CapabilityPackage] = []
         for package in state.packages.values():
-            if package.status in _TERMINAL_PACKAGE_STATUSES or package.id in self._running:
+            if (
+                package.status in _TERMINAL_PACKAGE_STATUSES
+                or package.status is PackageStatus.WAITING_RESERVATION
+                or package.id in self._running
+            ):
                 continue
             dependencies = state.dependencies_of(package.id)
             if any(
@@ -731,7 +742,10 @@ class PackageExecutionLayer:
         state = self.database.load_package_state()
         existing = state.leases.get(package.id)
         agent_id = f"steward-{package.id}-{uuid4().hex[:12]}"
-        if existing is None:
+        dirty_retained_worktree = False
+        if existing is None and package.worktree and Path(package.worktree).exists():
+            dirty_retained_worktree = not self.worktrees.inspect(Path(package.worktree)).clean
+        if existing is None and not dirty_retained_worktree:
             lease = self.database.claim_steward_lease(
                 package.id,
                 agent_id,
@@ -739,9 +753,10 @@ class PackageExecutionLayer:
                 ttl_seconds=self.lease_ttl_seconds,
             )
             return lease, self._current(package.id)
-        expires = datetime.fromisoformat(existing.expires_at.replace("Z", "+00:00"))
-        if expires > datetime.now(UTC):
-            raise ValueError(f"package {package.id} already has a live Steward")
+        if existing is not None:
+            expires = datetime.fromisoformat(existing.expires_at.replace("Z", "+00:00"))
+            if expires > datetime.now(UTC):
+                raise ValueError(f"package {package.id} already has a live Steward")
         lease, recovery, _snapshot = self.worktrees.recover(
             package,
             agent_id,
@@ -779,7 +794,9 @@ class PackageExecutionLayer:
         )
         if not result.granted:
             owners = ", ".join(sorted({value.owner_id for value in result.conflicts}))
-            raise PackageReportError(f"package scope is waiting on path owner(s): {owners}")
+            raise PackageReservationWaiting(
+                f"initial package scope is queued behind path owner(s): {owners}"
+            )
         return self._current(package.id)
 
     def _dossier(self, package: CapabilityPackage, generation: int) -> dict[str, Any]:
@@ -901,7 +918,12 @@ class PackageExecutionLayer:
             expected_revision=package.revision,
             queue_on_conflict=True,
         )
-        return result.granted
+        if not result.granted:
+            owners = ", ".join(sorted({value.owner_id for value in result.conflicts}))
+            raise PackageReservationWaiting(
+                f"package scope expansion is queued behind path owner(s): {owners}"
+            )
+        return True
 
     def _apply_plan(self, package_id: str, generation: int, report: dict[str, Any]) -> None:
         raw_plan = report["plan_revision"]
@@ -1254,18 +1276,6 @@ class PackageExecutionLayer:
             )
             if not validation.succeeded:
                 continue
-            current = self._current(package_id)
-            candidate = self.git.head(worktree)
-            self.database.update_package_consumer(
-                replace(
-                    consumer,
-                    status=ConsumerStatus.ACCEPTED,
-                    accepted_revision=candidate,
-                    residual_goal="",
-                ),
-                expected_revision=current.revision,
-                lease_generation=generation,
-            )
             accepted.append(consumer.id)
             affected.update(validation.affected_work_unit_ids or (consumer.work_unit_id,))
         return tuple(accepted), tuple(sorted(affected))
@@ -1349,15 +1359,33 @@ class PackageExecutionLayer:
 
     async def _execute(self, package_id: str) -> PackageExecutionResult:
         package = self._current(package_id)
+        if package.status is PackageStatus.WAITING_RESERVATION:
+            self.database.wake_waiting_reservation_packages()
+            package = self._current(package_id)
+            if package.status is PackageStatus.WAITING_RESERVATION:
+                return PackageExecutionResult(
+                    package_id, 0, package.status, detail="path reservation remains queued"
+                )
         if package.status in _TERMINAL_PACKAGE_STATUSES:
             return PackageExecutionResult(package_id, 0, package.status, detail="already terminal")
         lease, package = self._claim(package)
         generation = lease.generation
         try:
             package = self._reserve_initial_scope(package, generation)
-            package = self.worktrees.activate(
-                package, generation, expected_revision=package.revision
+            retained_dirty = bool(
+                package.worktree
+                and Path(package.worktree).exists()
+                and not self.worktrees.inspect(Path(package.worktree)).clean
             )
+            if retained_dirty:
+                # `_claim` reached this branch only through fenced lease recovery. Preserve
+                # the isolated candidate exactly; its paths are checked after reservations
+                # are reacquired and before any commit is accepted.
+                self.database.assert_live_steward_lease(package_id, generation)
+            else:
+                package = self.worktrees.activate(
+                    package, generation, expected_revision=package.revision
+                )
             worktree = Path(package.worktree)
             package = self.database.update_package_lifecycle(
                 package_id,
@@ -1388,17 +1416,7 @@ class PackageExecutionLayer:
                 paths=tuple(str(value) for value in placement.get("paths", ())),
                 declarations=tuple(str(value) for value in placement.get("declarations", ())),
             )
-            if not self._expand_scope(package_id, generation, report):
-                current = self._current(package_id)
-                waiting = self.database.update_package_lifecycle(
-                    package_id,
-                    PackageStatus.IMPLEMENTING,
-                    expected_revision=current.revision,
-                    lease_generation=generation,
-                )
-                return PackageExecutionResult(
-                    package_id, generation, waiting.status, detail="scope expansion queued"
-                )
+            self._expand_scope(package_id, generation, report)
             self._apply_plan(package_id, generation, report)
             package = self._current(package_id)
             steward_commit = self._commit_steward_edits(package, generation, worktree, baseline)
@@ -1458,6 +1476,7 @@ class PackageExecutionLayer:
                 generation,
                 validate=lambda _path: package_validation.digest,
                 interface_digest=self.interface_digest,
+                provisional_consumer_ids=accepted,
             )
             if not integration.integrated:
                 current = self._current(package_id)
@@ -1472,7 +1491,6 @@ class PackageExecutionLayer:
                     generation,
                     stale.status,
                     worker_ids=workers,
-                    accepted_consumer_ids=accepted,
                     detail=integration.stale_reason,
                 )
             if report.get("disposition") == "decomposed":
@@ -1512,6 +1530,22 @@ class PackageExecutionLayer:
                 accepted,
                 affected,
             )
+        except PackageReservationWaiting as error:
+            self._append_evidence(
+                package_id,
+                generation,
+                producer=lease.agent_id,
+                kind=EvidenceKind.DIAGNOSTIC,
+                payload={"waiting_on_reservation": str(error)},
+            )
+            current = self._current(package_id)
+            waiting = self.database.update_package_lifecycle(
+                package_id,
+                PackageStatus.WAITING_RESERVATION,
+                expected_revision=current.revision,
+                lease_generation=generation,
+            )
+            return PackageExecutionResult(package_id, generation, waiting.status, detail=str(error))
         except PackageReportError as error:
             # Freeze all edits and retain ownership. A later fenced Steward sees the evidence.
             self._append_evidence(

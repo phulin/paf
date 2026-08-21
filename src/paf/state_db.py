@@ -817,6 +817,7 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             phase TEXT NOT NULL,
             validation_digest TEXT NOT NULL,
             canonical_revision_after TEXT,
+            provisional_consumer_ids BLOB NOT NULL DEFAULT '[]',
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
@@ -865,6 +866,15 @@ def _create_schema(connection: sqlite3.Connection) -> None:
         """
     )
     _migrate_path_reservations_v6(connection)
+    journal_columns = {
+        str(row[1])
+        for row in connection.execute("PRAGMA table_info(integration_journal)").fetchall()
+    }
+    if "provisional_consumer_ids" not in journal_columns:
+        connection.execute(
+            "ALTER TABLE integration_journal ADD COLUMN "
+            "provisional_consumer_ids BLOB NOT NULL DEFAULT '[]'"
+        )
     columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(runs)").fetchall()}
     for name, declaration in (
         ("work_unit_id", "TEXT NOT NULL DEFAULT ''"),
@@ -1758,13 +1768,14 @@ def _load_package_state(connection: sqlite3.Connection) -> PackageState:
             phase=IntegrationPhase(str(row[6])),
             validation_digest=str(row[7]),
             canonical_revision_after=str(row[8]) if row[8] is not None else None,
-            created_at=str(row[9]),
-            updated_at=str(row[10]),
+            provisional_consumer_ids=tuple(str(value) for value in json.loads(row[9])),
+            created_at=str(row[10]),
+            updated_at=str(row[11]),
         )
         for row in connection.execute(
             """SELECT id, package_id, lease_generation, base_revision,
                 candidate_revision, canonical_revision_before, phase, validation_digest,
-                canonical_revision_after, created_at, updated_at
+                canonical_revision_after, provisional_consumer_ids, created_at, updated_at
             FROM integration_journal ORDER BY created_at, id"""
         )
     }
@@ -2664,6 +2675,12 @@ class StateDatabase:
                     generation=max(generation, excluded.generation)""",
                 (lease.package_id, lease.generation),
             )
+            connection.execute(
+                """UPDATE path_reservations SET fence_generation=?
+                WHERE owner_kind='package' AND owner_id=?""",
+                (lease.generation, lease.package_id),
+            )
+            self._refence_package_reservation_queue(connection, lease.package_id, lease.generation)
             self._touch_package(connection, lease.package_id)
             return _load_package_state(connection).packages[lease.package_id]
 
@@ -2755,6 +2772,7 @@ class StateDatabase:
                 WHERE owner_kind='package' AND owner_id=?""",
                 (generation, package_id),
             )
+            self._refence_package_reservation_queue(connection, package_id, generation)
             self._touch_package(connection, package_id)
             connection.commit()
             return lease
@@ -2817,6 +2835,7 @@ class StateDatabase:
                     "DELETE FROM path_reservations WHERE owner_kind='package' AND owner_id=?",
                     (package_id,),
                 )
+                self._wake_waiting_reservation_packages(connection, now or _utc_now())
             self._touch_package(connection, package_id)
             connection.commit()
 
@@ -2884,6 +2903,7 @@ class StateDatabase:
                 WHERE owner_kind='package' AND owner_id=?""",
                 (generation, package_id),
             )
+            self._refence_package_reservation_queue(connection, package_id, generation)
             connection.execute(
                 """INSERT INTO package_recoveries(
                     package_id, prior_generation, recovered_generation, worktree_head,
@@ -3030,13 +3050,12 @@ class StateDatabase:
                 decision = ReservationDecision.CONFLICT
                 if queue_on_conflict:
                     decision = ReservationDecision.QUEUED
-                    queue_id = _stable_record_id(
-                        "reservation", "package", package_id, str(lease_generation)
-                    )
+                    queue_id = _stable_record_id("reservation", "package", package_id)
                     connection.execute(
                         """INSERT INTO path_reservation_queue VALUES(?, 'package', ?, ?, ?, ?, NULL)
-                        ON CONFLICT(id) DO UPDATE SET requested=excluded.requested,
-                            created_at=excluded.created_at""",
+                        ON CONFLICT(id) DO UPDATE SET
+                            fence_generation=excluded.fence_generation,
+                            requested=excluded.requested, created_at=excluded.created_at""",
                         (
                             queue_id,
                             package_id,
@@ -3122,6 +3141,98 @@ class StateDatabase:
             "DELETE FROM path_reservation_queue WHERE expires_at IS NOT NULL AND expires_at <= ?",
             (now,),
         )
+
+    @staticmethod
+    def _refence_package_reservation_queue(
+        connection: sqlite3.Connection, package_id: str, generation: int
+    ) -> None:
+        rows = connection.execute(
+            """SELECT requested, created_at FROM path_reservation_queue
+            WHERE owner_kind='package' AND owner_id=? ORDER BY created_at DESC, id DESC""",
+            (package_id,),
+        ).fetchall()
+        if not rows:
+            return
+        connection.execute(
+            "DELETE FROM path_reservation_queue WHERE owner_kind='package' AND owner_id=?",
+            (package_id,),
+        )
+        connection.execute(
+            """INSERT INTO path_reservation_queue
+            VALUES(?, 'package', ?, ?, ?, ?, NULL)""",
+            (
+                _stable_record_id("reservation", "package", package_id),
+                package_id,
+                generation,
+                rows[0][0],
+                str(rows[0][1]),
+            ),
+        )
+
+    @classmethod
+    def _wake_waiting_reservation_packages(
+        cls, connection: sqlite3.Connection, now: str
+    ) -> tuple[str, ...]:
+        cls._clean_expired_ordinary_reservations(connection, now)
+        waiting = tuple(
+            str(row[0])
+            for row in connection.execute(
+                "SELECT id FROM capability_packages WHERE status=? ORDER BY created_at, id",
+                (str(PackageStatus.WAITING_RESERVATION),),
+            )
+        )
+        woken: list[str] = []
+        for package_id in waiting:
+            fence = connection.execute(
+                "SELECT generation FROM steward_lease_fences WHERE package_id=?",
+                (package_id,),
+            ).fetchone()
+            rows = connection.execute(
+                """SELECT requested, created_at FROM path_reservation_queue
+                WHERE owner_kind='package' AND owner_id=?
+                ORDER BY created_at DESC, id DESC""",
+                (package_id,),
+            ).fetchall()
+            if fence is None or not rows:
+                continue
+            generation = int(fence[0])
+            cls._refence_package_reservation_queue(connection, package_id, generation)
+            requested = canonical_reservation_specs(
+                tuple(
+                    ReservationSpec(str(item["path"]), ReservationMode(str(item["mode"])))
+                    for item in json.loads(rows[0][0])
+                )
+            )
+            if cls._reservation_conflict_rows(
+                connection, ReservationOwnerKind.PACKAGE, package_id, requested
+            ):
+                continue
+            connection.execute(
+                "DELETE FROM path_reservation_queue WHERE owner_kind='package' AND owner_id=?",
+                (package_id,),
+            )
+            connection.execute(
+                """UPDATE capability_packages SET status=?, revision=revision+1,
+                    updated_at=? WHERE id=? AND status=?""",
+                (
+                    str(PackageStatus.OBSERVED),
+                    now,
+                    package_id,
+                    str(PackageStatus.WAITING_RESERVATION),
+                ),
+            )
+            woken.append(package_id)
+        return tuple(woken)
+
+    def wake_waiting_reservation_packages(self, *, now: str | None = None) -> tuple[str, ...]:
+        """Make conflict-free queued packages schedulable without granting an old fence."""
+
+        observed_at = now or _utc_now()
+        with _connect(self.path) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            woken = self._wake_waiting_reservation_packages(connection, observed_at)
+            connection.commit()
+            return woken
 
     @classmethod
     def _reservation_conflict_rows(
@@ -3213,12 +3324,12 @@ class StateDatabase:
                     else ReservationDecision.CONFLICT
                 )
                 if queue_on_conflict:
-                    queue_id = _stable_record_id(
-                        "reservation", str(owner_kind), owner_id, str(fence_generation)
-                    )
+                    queue_id = _stable_record_id("reservation", str(owner_kind), owner_id)
                     connection.execute(
                         """INSERT INTO path_reservation_queue VALUES(?, ?, ?, ?, ?, ?, ?)
-                        ON CONFLICT(id) DO UPDATE SET requested=excluded.requested,
+                        ON CONFLICT(id) DO UPDATE SET
+                            fence_generation=excluded.fence_generation,
+                            requested=excluded.requested,
                             created_at=excluded.created_at, expires_at=excluded.expires_at""",
                         (
                             queue_id,
@@ -3349,6 +3460,7 @@ class StateDatabase:
                 )
             else:
                 self._touch_package(connection, owner_id)
+            self._wake_waiting_reservation_packages(connection, _utc_now())
             connection.commit()
 
     def load_path_reservations(
@@ -3752,10 +3864,15 @@ class StateDatabase:
                 raise ValueError("integration journal id belongs to another fenced generation")
             now = _utc_now()
             connection.execute(
-                """INSERT INTO integration_journal VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """INSERT INTO integration_journal(
+                    id, package_id, lease_generation, base_revision, candidate_revision,
+                    canonical_revision_before, phase, validation_digest,
+                    canonical_revision_after, provisional_consumer_ids, created_at, updated_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET phase=excluded.phase,
                     validation_digest=excluded.validation_digest,
                     canonical_revision_after=excluded.canonical_revision_after,
+                    provisional_consumer_ids=excluded.provisional_consumer_ids,
                     updated_at=excluded.updated_at
                 WHERE integration_journal.package_id=excluded.package_id
                     AND integration_journal.lease_generation=excluded.lease_generation""",
@@ -3769,12 +3886,55 @@ class StateDatabase:
                     str(journal.phase),
                     journal.validation_digest,
                     journal.canonical_revision_after,
+                    json.dumpb(list(journal.provisional_consumer_ids)),
                     journal.created_at or now,
                     journal.updated_at or now,
                 ),
             )
             self._touch_package(connection, journal.package_id)
             return _load_package_state(connection).packages[journal.package_id]
+
+    @staticmethod
+    def _accept_integration_consumers(
+        connection: sqlite3.Connection,
+        package_id: str,
+        consumer_ids: tuple[str, ...],
+        canonical_revision: str,
+        now: str,
+    ) -> None:
+        for consumer_id in consumer_ids:
+            row = connection.execute(
+                """SELECT package_id, status, accepted_revision
+                FROM package_consumers WHERE id=?""",
+                (consumer_id,),
+            ).fetchone()
+            if row is None or str(row[0]) != package_id:
+                raise ValueError(
+                    f"provisional consumer {consumer_id} does not belong to package {package_id}"
+                )
+            status = ConsumerStatus(str(row[1]))
+            accepted_revision = str(row[2]) if row[2] is not None else None
+            if status is ConsumerStatus.ACCEPTED:
+                if accepted_revision != canonical_revision:
+                    raise ValueError(
+                        f"consumer {consumer_id} was accepted at another canonical revision"
+                    )
+                continue
+            if status is not ConsumerStatus.OPEN:
+                raise ValueError(
+                    f"provisional consumer {consumer_id} is no longer open for acceptance"
+                )
+            connection.execute(
+                """UPDATE package_consumers SET status=?, accepted_revision=?,
+                    residual_goal='', updated_at=? WHERE id=? AND package_id=?""",
+                (
+                    str(ConsumerStatus.ACCEPTED),
+                    canonical_revision,
+                    now,
+                    consumer_id,
+                    package_id,
+                ),
+            )
 
     def finalize_package_integration(
         self,
@@ -3788,7 +3948,8 @@ class StateDatabase:
         with _connect(self.path) as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
-                """SELECT package_id, lease_generation, candidate_revision, phase
+                """SELECT package_id, lease_generation, candidate_revision, phase,
+                    provisional_consumer_ids
                 FROM integration_journal WHERE id=?""",
                 (journal_id,),
             ).fetchone()
@@ -3807,6 +3968,14 @@ class StateDatabase:
             }:
                 raise ValueError("integration journal is not ready to finalize")
             now = _utc_now()
+            provisional_consumer_ids = tuple(str(value) for value in json.loads(row[4]))
+            self._accept_integration_consumers(
+                connection,
+                package_id,
+                provisional_consumer_ids,
+                canonical_revision_after,
+                now,
+            )
             connection.execute(
                 """UPDATE integration_journal SET phase=?, canonical_revision_after=?,
                     updated_at=? WHERE id=?""",
@@ -3822,6 +3991,7 @@ class StateDatabase:
                     "DELETE FROM path_reservations WHERE owner_kind='package' AND owner_id=?",
                     (package_id,),
                 )
+                self._wake_waiting_reservation_packages(connection, now)
             connection.commit()
         return self.load_package_state().packages[package_id]
 
@@ -3837,7 +4007,8 @@ class StateDatabase:
         with _connect(self.path) as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
-                """SELECT package_id, candidate_revision, phase, validation_digest
+                """SELECT package_id, candidate_revision, phase, validation_digest,
+                    provisional_consumer_ids
                 FROM integration_journal WHERE id=?""",
                 (journal_id,),
             ).fetchone()
@@ -3854,6 +4025,14 @@ class StateDatabase:
                 raise ValueError("validation digest does not match interrupted import")
             package_id = str(row[0])
             now = _utc_now()
+            provisional_consumer_ids = tuple(str(value) for value in json.loads(row[4]))
+            self._accept_integration_consumers(
+                connection,
+                package_id,
+                provisional_consumer_ids,
+                canonical_revision_after,
+                now,
+            )
             connection.execute(
                 """UPDATE integration_journal SET phase=?, canonical_revision_after=?,
                     updated_at=? WHERE id=?""",
@@ -3868,6 +4047,7 @@ class StateDatabase:
                 "DELETE FROM path_reservations WHERE owner_kind='package' AND owner_id=?",
                 (package_id,),
             )
+            self._wake_waiting_reservation_packages(connection, now)
             connection.commit()
         return self.load_package_state().packages[package_id]
 
