@@ -179,7 +179,9 @@ class PackageCandidateStore:
         """Resolve legacy Lean-project-relative authority against the repository root."""
 
         direct = root / path
-        if direct.exists() or direct.parent.exists():
+        direct_tracked = self.git.run_bytes("ls-files", "-z", "--", path).rstrip(b"\0")
+        first_component = root / Path(path).parts[0]
+        if direct.exists() or direct_tracked or first_component.is_dir():
             return path
         prefixed = f"lean/{path}"
         target = root / prefixed
