@@ -102,6 +102,7 @@ from paf.warning_cleanup import (
 
 MAXIMUM_COORDINATOR_BUILD_TARGETS = 500
 MAXIMUM_STALE_REVIEW_SNAPSHOT_RETRIES = 3
+MAXIMUM_CONCURRENT_UPSTREAM_OWNER_REVIEWS = 2
 REVIEW_REPORT_RETRY_PROMPT = """Your previous review turn did not satisfy the report contract:
 
 {error}
@@ -986,7 +987,16 @@ class Orchestrator:
         return tuple(results)
 
     async def _route_migrated_upstream_requests(self) -> None:
-        """Schedule one focused tandem review for each migrated consumer observation."""
+        """Keep a small bounded frontier of owner-batched tandem reviews."""
+
+        active_owner_ids = {
+            owner_id
+            for value in self.state.proof_review_requests.values()
+            if isinstance(value, dict) and value.get("kind") == UPSTREAM_REQUEST_REVIEW_KIND
+            for feedback in (value.get("feedback"),)
+            if isinstance(feedback, dict)
+            for owner_id in feedback
+        }
 
         for request_id, request in sorted(self.state.upstream_requests.items()):
             if request.get("status") not in {
@@ -1018,6 +1028,11 @@ class Orchestrator:
                 else consumer_id
             )
             owner = self._work_units_by_id[owner_id]
+            if (
+                owner_id not in active_owner_ids
+                and len(active_owner_ids) >= MAXIMUM_CONCURRENT_UPSTREAM_OWNER_REVIEWS
+            ):
+                continue
             request["owner_chapter_id"] = owner_id
             request["updated_at"] = datetime.now(UTC).isoformat()
             blockers = [
@@ -1059,6 +1074,7 @@ class Orchestrator:
                 },
             )
             await self.state.update_upstream_request(request_id, UpstreamRequestStatus.EVALUATING)
+            active_owner_ids.add(owner_id)
 
     async def prepare(
         self,
@@ -3062,7 +3078,7 @@ class Orchestrator:
                     "declaration": declaration,
                 },
             }
-            request_id, created = await self.state.enqueue_upstream_request(
+            request_id, _created = await self.state.enqueue_upstream_request(
                 request,
                 consumer_chapter_id=chapter.id,
                 owner_chapter_id=owner_id,
@@ -3070,39 +3086,7 @@ class Orchestrator:
                 origin_run_id=str((blocker.get("origin_run_ids") or [""])[-1]),
             )
             request_ids.append(request_id)
-            if not created:
-                continue
-            owner = self.config.work_unit(owner_id)
-            feedback = {
-                owner_id: (
-                    "Evaluate this downstream observation together with the suspected upstream "
-                    "interface. Decide where the responsibility belongs. If the upstream result "
-                    "is missing, wrong, or too weak, make the smallest source-faithful repair in "
-                    "your assigned upstream scope. If the existing interface is sufficient, "
-                    "return a checked retry route for the consumer.\n\n"
-                    f"Failed proof `{declaration}` in `{consumer_path}`:\n"
-                    f"Remaining goal:\n{blocker.get('remaining_goal', '')}\n"
-                    f"Observed obstruction:\n{blocker.get('obstruction', '')}\n"
-                    f"Requested result:\n{request['needed_result']}\n"
-                    "Checked attempts:\n- "
-                    + "\n- ".join(str(value) for value in blocker.get("attempts", ()))
-                    + "\nSuspected upstream paths:\n- "
-                    + "\n- ".join(owner_paths)
-                )
-            }
-            await self.state.enqueue_proof_review_request(
-                feedback,
-                origin_run_id=request_id,
-                kind=UPSTREAM_REQUEST_REVIEW_KIND,
-                request_id=request_id,
-                blocker_ids=(blocker_id,),
-                source_digests={
-                    owner_id: await asyncio.to_thread(
-                        scope_digest, self.config.settings.repo, owner
-                    )
-                },
-            )
-            await self.state.update_upstream_request(request_id, UpstreamRequestStatus.EVALUATING)
+        await self._route_migrated_upstream_requests()
         return tuple(dict.fromkeys(request_ids))
 
     async def _resolve_satisfied_proof_blockers(self, chapter: WorkUnitLike) -> None:
@@ -4703,6 +4687,7 @@ class Orchestrator:
                     TaskStatus.SUCCEEDED,
                     detail,
                 )
+            await self._route_migrated_upstream_requests()
             return True
 
     async def _apply_proof_review_outcomes(

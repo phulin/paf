@@ -5443,6 +5443,48 @@ async def test_structural_blockers_create_one_upstream_request_without_ping_pong
 
 
 @pytest.mark.asyncio
+async def test_upstream_reviews_keep_two_owner_frontiers(tmp_path: Path) -> None:
+    config_path = write_project(tmp_path, chapters="chapters = [1, 2, 3, 4]")
+    source = tmp_path / "books" / "book.md"
+    source.write_text(
+        source.read_text(encoding="utf-8")
+        + "\n## 3. Third chapter\n\nThird.\n\n## 4. Fourth chapter\n\nFourth.\n",
+        encoding="utf-8",
+    )
+    config = with_example_modules(load_config(config_path))
+    orchestrator = Orchestrator(config, StateStore(config))
+    await orchestrator.state.load_or_create()
+    consumer = config.chapters[3]
+    for owner in config.chapters[:3]:
+        await orchestrator.state.enqueue_upstream_request(
+            {
+                "consumer_path": "lean/Book/Chapter04.lean",
+                "blocked_declaration": f"Book.consumer{owner.number}",
+                "residual_goal": "True",
+                "needed_result": f"support from chapter {owner.number}",
+                "owner_paths": [f"lean/Book/Chapter{owner.number:02d}.lean"],
+                "attempted_alternatives": ["simp", "exact existing"],
+            },
+            consumer_chapter_id=consumer.id,
+            owner_chapter_id=owner.id,
+            blocker_ids=(f"missing-{owner.number}",),
+        )
+
+    await orchestrator._route_migrated_upstream_requests()
+
+    owner_ids = {
+        owner_id
+        for request in orchestrator.state.proof_review_requests.values()
+        for owner_id in request["feedback"]
+    }
+    statuses = [request["status"] for request in orchestrator.state.upstream_requests.values()]
+    assert len(owner_ids) == 2
+    assert statuses.count("evaluating") == 2
+    assert statuses.count("open") == 1
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_external_candidate_still_requires_steward_disposition(tmp_path: Path) -> None:
     config = with_example_modules(load_config(write_project(tmp_path, chapters="chapters = [1]")))
     chapter = config.chapters[0]
