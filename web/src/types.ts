@@ -26,8 +26,6 @@ export interface Task {
   waiting_on?: Requirement[];
   scheduling_status?: SchedulingStatus;
   blocked_by?: string[];
-  repairing?: boolean;
-  repair_work_unit_id?: string;
   phase?: TaskPhase;
   detail: string;
   rounds: number;
@@ -66,56 +64,86 @@ export interface CoordinatorBuild {
   output_tail: string[];
 }
 
-export interface Shepherd {
-  enabled: boolean;
-  status: "idle" | "planning" | "repairing" | "error" | string;
-  model: string;
-  worker_model: string;
-  interval_seconds: number;
-  failure_threshold: number;
-  current_sweep_id: string;
-  current_run_id: string;
-  last_started_at?: string | null;
-  last_finished_at?: string | null;
-  next_run_at?: string | null;
-  last_summary: string;
-  last_error: string;
-  pending_failures: number;
-  planned_units: number;
-  running_units: number;
-  succeeded_units: number;
-  failed_units: number;
-  cost?: { estimated_usd: number };
-  agents?: ShepherdAgent[];
-  runs?: ShepherdRun[];
-}
-
-export interface ShepherdRun {
+export interface CapabilityPackage {
   id: string;
+  capability_key: string;
+  title: string;
+  mathematical_objective: string;
   status: string;
-  trigger: string;
-  failure_count: number;
-  started_at: string;
-  finished_at?: string | null;
-  summary: string;
-  error: string;
-  agents: ShepherdAgent[];
+  disposition?: string | null;
+  write_scope: string[];
+  expansion_scope: string[];
+  plan_revision: number;
+  revision: number;
+  branch: string;
+  worktree: string;
+  integrated_revision?: string | null;
+  updated_at: string;
 }
 
-export interface ShepherdAgent {
-  run_id: string;
-  role: "shepherd" | "repair_worker" | string;
+export interface PackageConsumer {
+  id: string;
+  package_id: string;
   work_unit_id: string;
-  document_id?: string;
-  document_title?: string;
-  ordinal?: number;
-  unit_title?: string;
-  location?: string;
-  stage: Stage | string;
+  path: string;
+  declaration: string;
+  stage: string;
+  residual_goal: string;
   status: string;
-  label: string;
-  repair_work_unit_id: string;
+}
+
+export interface PackageStep {
+  id: string;
+  package_id: string;
+  kind: string;
+  title: string;
   objective: string;
+  status: string;
+  assigned_agent_id?: string | null;
+  depends_on: string[];
+  write_scope: string[];
+}
+
+export interface PackageEvidence {
+  id: string;
+  package_id: string;
+  producer: string;
+  kind: string;
+  paths: string[];
+  declarations: string[];
+  payload: Record<string, unknown>;
+  created_at: string;
+}
+
+export interface StewardLease {
+  package_id: string;
+  agent_id: string;
+  generation: number;
+  heartbeat_at: string;
+  expires_at: string;
+}
+
+export interface PathReservation {
+  normalized_path: string;
+  package_id: string;
+  mode: string;
+  lease_generation: number;
+}
+
+export interface PackageDependency {
+  package_id: string;
+  depends_on_package_id: string;
+  required_revision?: string | null;
+}
+
+export interface IntegrationJournal {
+  id: string;
+  package_id: string;
+  phase: string;
+  candidate_revision: string;
+  canonical_revision_before: string;
+  canonical_revision_after?: string | null;
+  updated_at: string;
 }
 
 export interface SwarmState {
@@ -140,7 +168,14 @@ export interface SwarmState {
   };
   isolation?: { backend?: string };
   coordinator_build: CoordinatorBuild;
-  shepherd?: Shepherd;
+  capability_packages?: Record<string, CapabilityPackage>;
+  package_consumers?: Record<string, PackageConsumer>;
+  package_steps?: Record<string, PackageStep>;
+  package_evidence?: Record<string, PackageEvidence>;
+  steward_leases?: Record<string, StewardLease>;
+  path_reservations?: Record<string, PathReservation>;
+  package_dependencies?: PackageDependency[];
+  integration_journal?: Record<string, IntegrationJournal>;
   tasks: Record<string, Task>;
   activities?: Record<string, AgentActivity>;
 }

@@ -27,8 +27,8 @@ const SURFACE: Color = Color::Rgb(36, 40, 59);
 pub fn draw(frame: &mut Frame<'_>, model: &mut DashboardModel) {
     if model.detail {
         draw_detail(frame, model);
-    } else if model.shepherd_detail {
-        draw_shepherd_detail(frame, model);
+    } else if model.package_detail {
+        draw_package_detail(frame, model);
     } else {
         draw_dashboard(frame, model);
     }
@@ -183,7 +183,7 @@ fn draw_dashboard(frame: &mut Frame<'_>, model: &DashboardModel) {
     draw_status(frame, model, layout[4]);
     frame.render_widget(
         Paragraph::new(
-            "↑↓ select  Enter/i inspect  / search  s shepherd  p pause/resume  r reload TUI  d detach  q stop",
+            "↑↓ select  Enter/i inspect  / search  k packages  p pause/resume  r reload TUI  d detach  q stop",
         )
         .style(Style::default().fg(MUTED))
         .alignment(Alignment::Center),
@@ -191,116 +191,23 @@ fn draw_dashboard(frame: &mut Frame<'_>, model: &DashboardModel) {
     );
 }
 
-fn draw_shepherd_detail(frame: &mut Frame<'_>, model: &mut DashboardModel) {
-    let shepherd = &model.state.shepherd;
-    let agents = model.selected_shepherd_agents();
-    let selected_run = model.selected_shepherd_run();
+fn draw_package_detail(frame: &mut Frame<'_>, model: &mut DashboardModel) {
+    let packages = model.packages();
+    let selected_id = model.selected_package().map(|package| package.id.clone());
     let layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(4),
-            Constraint::Length(3),
-            Constraint::Length((agents.len().clamp(1, 8) + 3) as u16),
-            Constraint::Min(6),
-            Constraint::Length(1),
-        ])
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(34), Constraint::Percentage(66)])
         .split(frame.area());
-    let summary = selected_run.map_or_else(
-        || {
-            if shepherd.last_error.is_empty() {
-                shepherd.last_summary.as_str()
-            } else {
-                shepherd.last_error.as_str()
-            }
-        },
-        |run| {
-            if run.error.is_empty() {
-                run.summary.as_str()
-            } else {
-                run.error.as_str()
-            }
-        },
-    );
-    frame.render_widget(
-        Paragraph::new(vec![
-            Line::styled(
-                format!("Shepherd · {}", shepherd.status),
-                Style::default().fg(YELLOW).add_modifier(Modifier::BOLD),
-            ),
-            Line::from(format!(
-                "failures {} · repairs {}/{} · succeeded {} · failed {} · cost ${:.2}    {}",
-                shepherd.pending_failures,
-                shepherd.running_units,
-                shepherd.planned_units,
-                shepherd.succeeded_units,
-                shepherd.failed_units,
-                shepherd.cost.estimated_usd,
-                summary,
-            )),
-        ])
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Shepherd trace "),
-        ),
-        layout[0],
-    );
-
-    let tab_titles = if shepherd.runs.is_empty() {
-        vec![Line::from("Latest")]
+    let rows = if packages.is_empty() {
+        vec![Row::new(["—", "No capability packages", ""])]
     } else {
-        shepherd
-            .runs
+        packages
             .iter()
-            .enumerate()
-            .map(|(index, run)| Line::from(format!("Run {} · {}", index + 1, title(&run.status))))
-            .collect()
-    };
-    frame.render_widget(
-        Tabs::new(tab_titles)
-            .select(model.shepherd_run_selected)
-            .highlight_style(Style::default().fg(YELLOW).add_modifier(Modifier::BOLD))
-            .divider(" │ ")
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(" Shepherd runs "),
-            ),
-        layout[1],
-    );
-
-    let rows = if agents.is_empty() {
-        vec![Row::new(["—", "No Shepherd sweep has run yet", "", "", ""])]
-    } else {
-        agents
-            .iter()
-            .map(|agent| {
-                let book = if !agent.document_title.is_empty() {
-                    agent.document_title.clone()
-                } else if !agent.document_id.is_empty() {
-                    agent.document_id.clone()
-                } else {
-                    "Sweep".into()
-                };
-                let chapter = if !agent.location.is_empty() {
-                    agent.location.clone()
-                } else if let Some(ordinal) = agent.ordinal {
-                    format!("Chapter {ordinal} · {}", agent.unit_title)
-                } else if !agent.unit_title.is_empty() {
-                    agent.unit_title.clone()
-                } else {
-                    agent.work_unit_id.clone()
-                };
-                Row::new(vec![
-                    if agent.role == "shepherd" {
-                        Cell::from("planner")
-                    } else {
-                        Cell::from("worker")
-                    },
-                    Cell::from(book),
-                    Cell::from(chapter),
-                    Cell::from(agent.objective.clone()),
-                    Cell::from(agent.status.clone()),
+            .map(|package| {
+                Row::new([
+                    package.status.clone(),
+                    package.title.clone(),
+                    package.capability_key.clone(),
                 ])
             })
             .collect()
@@ -308,40 +215,145 @@ fn draw_shepherd_detail(frame: &mut Frame<'_>, model: &mut DashboardModel) {
     let table = Table::new(
         rows,
         [
-            Constraint::Length(9),
-            Constraint::Length(20),
-            Constraint::Min(24),
-            Constraint::Min(28),
-            Constraint::Length(13),
+            Constraint::Length(18),
+            Constraint::Min(22),
+            Constraint::Min(20),
         ],
     )
-    .header(
-        Row::new(["Role", "Book", "Chapter", "Objective", "Status"])
-            .style(Style::default().fg(CYAN).add_modifier(Modifier::BOLD)),
-    )
+    .header(Row::new(["Lifecycle", "Package", "Capability"]).style(Style::default().fg(CYAN)))
     .row_highlight_style(Style::default().bg(SURFACE).add_modifier(Modifier::BOLD))
     .highlight_symbol("▸ ")
     .block(
         Block::default()
             .borders(Borders::ALL)
-            .title(" Relevant agents "),
+            .title(" Capability packages "),
     );
-    let mut table_state = TableState::default()
-        .with_selected((!agents.is_empty()).then_some(model.shepherd_selected));
-    frame.render_stateful_widget(table, layout[2], &mut table_state);
+    let mut state =
+        TableState::default().with_selected(selected_id.as_ref().map(|_| model.package_selected));
+    frame.render_stateful_widget(table, layout[0], &mut state);
 
-    let text = detail_text(
-        DetailTab::Timeline,
-        model.selected_shepherd_activity(),
-        None,
-        None,
-    );
-    draw_detail_content(frame, model, text, layout[3]);
+    let mut lines = Vec::new();
+    if let Some(package_id) = selected_id {
+        let package = &model.state.capability_packages[&package_id];
+        lines.push(Line::styled(
+            package.title.clone(),
+            Style::default().fg(YELLOW).add_modifier(Modifier::BOLD),
+        ));
+        lines.push(Line::from(format!(
+            "{} · revision {} · plan {}",
+            package.status, package.revision, package.plan_revision
+        )));
+        lines.push(Line::from(package.mathematical_objective.clone()));
+        if let Some(lease) = model.state.steward_leases.get(&package_id) {
+            lines.push(Line::from(format!(
+                "Steward lease: {} · generation {} · expires {}",
+                lease.agent_id, lease.generation, lease.expires_at
+            )));
+        } else {
+            lines.push(Line::from("Steward lease: none"));
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::styled("Consumers", Style::default().fg(CYAN)));
+        for consumer in model
+            .state
+            .package_consumers
+            .values()
+            .filter(|item| item.package_id == package_id)
+        {
+            lines.push(Line::from(format!(
+                "  {} · {} · {}",
+                consumer.status, consumer.declaration, consumer.path
+            )));
+            if !consumer.residual_goal.is_empty() {
+                lines.push(Line::from(format!("    {}", consumer.residual_goal)));
+            }
+        }
+        lines.push(Line::styled("Plan steps", Style::default().fg(CYAN)));
+        for step in model
+            .state
+            .package_steps
+            .values()
+            .filter(|item| item.package_id == package_id)
+        {
+            lines.push(Line::from(format!(
+                "  {} · {} · {}",
+                step.status, step.kind, step.title
+            )));
+        }
+        lines.push(Line::styled("Evidence", Style::default().fg(CYAN)));
+        for evidence in model
+            .state
+            .package_evidence
+            .values()
+            .filter(|item| item.package_id == package_id)
+        {
+            lines.push(Line::from(format!(
+                "  {} · {} · {}",
+                evidence.kind,
+                evidence.producer,
+                evidence.declarations.join(", ")
+            )));
+        }
+        lines.push(Line::styled(
+            "Reservations and dependencies",
+            Style::default().fg(CYAN),
+        ));
+        for reservation in model
+            .state
+            .path_reservations
+            .values()
+            .filter(|item| item.package_id == package_id)
+        {
+            lines.push(Line::from(format!(
+                "  {} · {} · generation {}",
+                reservation.normalized_path, reservation.mode, reservation.lease_generation
+            )));
+        }
+        for dependency in model
+            .state
+            .package_dependencies
+            .iter()
+            .filter(|item| item.package_id == package_id)
+        {
+            lines.push(Line::from(format!(
+                "  depends on {} · {}",
+                dependency.depends_on_package_id,
+                dependency
+                    .required_revision
+                    .as_deref()
+                    .unwrap_or("any accepted revision")
+            )));
+        }
+        lines.push(Line::styled("Integration", Style::default().fg(CYAN)));
+        for journal in model
+            .state
+            .integration_journal
+            .values()
+            .filter(|item| item.package_id == package_id)
+        {
+            lines.push(Line::from(format!(
+                "  {} · {} → {}",
+                journal.phase,
+                journal.candidate_revision,
+                journal
+                    .canonical_revision_after
+                    .as_deref()
+                    .unwrap_or(&journal.canonical_revision_before)
+            )));
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::styled(
+            "↑↓ select package  k/Esc/q back",
+            Style::default().fg(MUTED),
+        ));
+    }
     frame.render_widget(
-        Paragraph::new("←→ switch run  ↑↓ select agent  Enter open full agent view  s/Esc/q back")
-            .style(Style::default().fg(MUTED))
-            .alignment(Alignment::Center),
-        layout[4],
+        Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Package dossier "),
+        ),
+        layout[1],
     );
 }
 
@@ -408,21 +420,26 @@ fn summary(model: &DashboardModel) -> Paragraph<'static> {
             )),
         ]),
         Line::from(format!(
-            "Agents {}/{} · {} · queued {}    {}    Shepherd {} · ${:.2} · failures {} · repair {}/{}",
+            "Agents {}/{} · {} · queued {}    {}    Packages {} · active {} · waiting {}",
             state.agents.active,
             state.agents.maximum,
             agent_detail,
             state.agents.queued,
             build,
-            if state.shepherd.enabled {
-                state.shepherd.status.as_str()
-            } else {
-                "off"
-            },
-            state.shepherd.cost.estimated_usd,
-            state.shepherd.pending_failures,
-            state.shepherd.running_units,
-            state.shepherd.planned_units,
+            state.capability_packages.len(),
+            state
+                .capability_packages
+                .values()
+                .filter(|package| matches!(
+                    package.status.as_str(),
+                    "investigating" | "planned" | "implementing" | "validating" | "integrating"
+                ))
+                .count(),
+            state
+                .capability_packages
+                .values()
+                .filter(|package| package.status.starts_with("waiting_"))
+                .count(),
         )),
         Line::from(format!(
             "revision {} · isolation {} · Lean MCP on · stream {}",
@@ -457,9 +474,6 @@ fn draw_stage_cards(frame: &mut Frame<'_>, model: &DashboardModel, area: Rect) {
         {
             current.postprocess += 1;
         }
-        if task.repairing {
-            current.repairing += 1;
-        }
         if model.is_building(task.work_unit_id.as_str(), task.stage.as_str()) {
             current.building += 1;
         }
@@ -475,8 +489,8 @@ fn draw_stage_cards(frame: &mut Frame<'_>, model: &DashboardModel, area: Rect) {
             .unwrap_or_default();
         let content = vec![
             Line::from(format!(
-                "agent {agents} · repair {} · post {} · build {}",
-                statistics.repairing, statistics.postprocess, statistics.building
+                "agent {agents} · post {} · build {}",
+                statistics.postprocess, statistics.building
             )),
             Line::from(vec![
                 Span::styled(
@@ -632,7 +646,6 @@ struct StageStatistics {
     interrupted: usize,
     postprocess: usize,
     building: usize,
-    repairing: usize,
 }
 
 fn draw_status(frame: &mut Frame<'_>, model: &DashboardModel, area: Rect) {
@@ -765,13 +778,7 @@ fn draw_detail(frame: &mut Frame<'_>, model: &mut DashboardModel) {
         let labels = model
             .detail_runs
             .iter()
-            .map(|run| match run.role.as_str() {
-                "shepherd" => "Shepherd planner".into(),
-                "repair_worker" => {
-                    format!("Repair {} round {}", title(&run.stage), run.round)
-                }
-                _ => format!("{} round {}", title(&run.stage), run.round),
-            })
+            .map(|run| format!("{} round {}", title(&run.stage), run.round))
             .collect::<Vec<_>>();
         visible_run_tabs(&labels, model.selected_run, layout[1].width as usize)
     };
@@ -784,10 +791,7 @@ fn draw_detail(frame: &mut Frame<'_>, model: &mut DashboardModel) {
         layout[1],
     );
     let pending_reason = model.pending_reason(&row);
-    let has_running_task = row
-        .tasks
-        .values()
-        .any(|task| task_is_running(task) || task.repairing);
+    let has_running_task = row.tasks.values().any(|task| task_is_running(task));
     let metrics = activity.filter(|_| has_running_task).map_or_else(
         || {
             pending_reason
@@ -1372,10 +1376,7 @@ fn current_activity(
     if build.active && model.is_build_target(row.unit.id.as_str()) {
         return "coordinator finalize".into();
     }
-    let has_running_task = row
-        .tasks
-        .values()
-        .any(|task| task_is_running(task) || task.repairing);
+    let has_running_task = row.tasks.values().any(|task| task_is_running(task));
     if let Some(activity) = activity.filter(|_| has_running_task) {
         let idle = elapsed_seconds(&activity.updated_at);
         return if idle >= 60 {
@@ -1418,8 +1419,6 @@ fn row_spend(row: &RowModel<'_>) -> String {
 fn task_mark(task: &Task, building: bool) -> String {
     let mark = if building {
         "◆ building".into()
-    } else if task.repairing {
-        "↻ repairing".into()
     } else if let Some(letter) = auxiliary_role_letter(&task.active_auxiliary_role) {
         format!("▶ running ({letter})")
     } else if task.queued {
@@ -1459,7 +1458,7 @@ fn task_mark_style(task: &Task, building: bool) -> Style {
     if building {
         return Style::default().fg(PURPLE);
     }
-    if task.repairing || task.queued || (task.status == "running" && task.phase == "postprocess") {
+    if task.queued || (task.status == "running" && task.phase == "postprocess") {
         return Style::default();
     }
     match task_display_status(task) {
@@ -1494,10 +1493,9 @@ fn task_is_running(task: &Task) -> bool {
 
 fn auxiliary_role_letter(role: &str) -> Option<&'static str> {
     match role {
-        "upstream_repair" => Some("u"),
         "warning_cleanup" => Some("w"),
-        "repair_worker" => Some("r"),
-        "shepherd" => Some("s"),
+        "package_steward" => Some("s"),
+        "package_worker" => Some("p"),
         "" => None,
         _ => Some("a"),
     }
@@ -1753,7 +1751,7 @@ mod tests {
     }
 
     #[test]
-    fn renders_shepherd_trace_and_relevant_agent_navigation() {
+    fn renders_package_lifecycle_and_dossier() {
         let mut model = DashboardModel::loading("pipeline".into(), String::new());
         model
             .apply(WireEvent {
@@ -1762,89 +1760,48 @@ mod tests {
                 status: "running".into(),
                 result: None,
                 snapshot: Some(serde_json::json!({
-                    "shepherd": {
-                        "enabled": true,
-                        "status": "repairing",
-                        "pending_failures": 2,
-                        "planned_units": 1,
-                        "running_units": 1,
-                        "current_sweep_id": "sweep-2",
-                        "cost": {"estimated_usd": 3.25},
-                        "last_summary": "repair the shared blocker",
-                        "runs": [{
-                            "id": "sweep-1",
-                            "status": "completed",
-                            "summary": "older repair",
-                            "agents": []
-                        }, {
-                            "id": "sweep-2",
-                            "status": "repairing",
-                            "failure_count": 2,
-                            "summary": "repair the shared blocker",
-                            "agents": [{
-                            "run_id": "plan-run",
-                            "role": "shepherd",
-                            "work_unit_id": "book/chapter-01",
-                            "stage": "discover",
-                            "status": "running",
-                            "label": "Shepherd planner",
-                            "objective": "rank repair candidates",
-                            "location": "2 chapters in 1 book"
-                        }, {
-                            "run_id": "worker-run",
-                            "role": "repair_worker",
-                            "work_unit_id": "book/chapter-01",
-                            "stage": "review",
-                            "status": "running",
-                            "label": "Repair review",
-                            "repair_work_unit_id": "repair-1",
-                            "objective": "repair the failed declaration",
-                            "document_title": "Algebra",
-                            "ordinal": 3,
-                            "unit_title": "Ideals"
-                        }]
-                        }]
-                    },
-                    "activities": {
-                        "plan-run": {
-                            "run_id": "plan-run",
-                            "current": "ranking repair candidates",
-                            "recent": [{
-                                "sequence": 1,
-                                "at": "2026-08-16T00:00:00+00:00",
-                                "kind": "reasoning",
-                                "status": "started",
-                                "title": "Inspect failures"
-                            }]
-                        }
-                    }
+                    "capability_packages": {"package-1": {
+                        "id": "package-1", "capability_key": "book.transport",
+                        "title": "Transport bridge", "mathematical_objective": "Implement the shared bridge",
+                        "status": "implementing", "revision": 4, "plan_revision": 2,
+                        "updated_at": "2026-08-21T00:00:00Z"
+                    }},
+                    "package_consumers": {"consumer-1": {
+                        "id": "consumer-1", "package_id": "package-1", "status": "open",
+                        "declaration": "Book.target", "path": "lean/Book/Chapter02.lean",
+                        "residual_goal": "⊢ Result x"
+                    }},
+                    "package_steps": {"step-1": {
+                        "id": "step-1", "package_id": "package-1", "status": "implementing",
+                        "kind": "interface", "title": "Add bridge"
+                    }},
+                    "package_evidence": {"evidence-1": {
+                        "id": "evidence-1", "package_id": "package-1", "kind": "lean_probe",
+                        "producer": "package-worker", "declarations": ["Book.bridge"]
+                    }},
+                    "steward_leases": {"package-1": {
+                        "package_id": "package-1", "agent_id": "steward-1", "generation": 3,
+                        "expires_at": "2026-08-21T01:00:00Z"
+                    }},
+                    "path_reservations": {}, "package_dependencies": [], "integration_journal": {}
                 })),
                 delta: None,
                 preparation: None,
                 message: String::new(),
             })
             .unwrap();
-        assert_eq!(model.state.shepherd.cost.estimated_usd, 3.25);
-        model.enter_shepherd_detail();
-        assert_eq!(model.shepherd_run_selected, 1);
+        model.enter_package_detail();
 
         let backend = TestBackend::new(140, 32);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| draw(frame, &mut model)).unwrap();
         let rendered = terminal.backend().to_string();
-        assert!(rendered.contains("Shepherd trace"));
-        assert!(rendered.contains("Run 1 · Completed"));
-        assert!(rendered.contains("Run 2 · Repairing"));
-        assert!(rendered.contains("2 chapters in 1 book"));
-        assert!(rendered.contains("Algebra"));
-        assert!(rendered.contains("Chapter 3 · Ideals"));
-        assert!(rendered.contains("cost $3.25"));
-        assert!(rendered.contains("Inspect failures"));
-        assert!(rendered.contains("Enter open full agent view"));
-
-        model.move_shepherd_run_selection(-1);
-        assert_eq!(model.shepherd_run_selected, 0);
-        assert!(model.selected_shepherd_agent().is_none());
+        assert!(rendered.contains("Capability packages"));
+        assert!(rendered.contains("Transport bridge"));
+        assert!(rendered.contains("Book.target"));
+        assert!(rendered.contains("Add bridge"));
+        assert!(rendered.contains("Book.bridge"));
+        assert!(rendered.contains("steward-1"));
     }
 
     #[test]
@@ -2005,19 +1962,6 @@ mod tests {
     }
 
     #[test]
-    fn coordinator_build_wins_over_repairing_overlay() {
-        let task = Task {
-            status: "failed".into(),
-            repairing: true,
-            rounds: 2,
-            ..Task::default()
-        };
-
-        assert_eq!(task_mark(&task, false), "↻ repairing (2)");
-        assert_eq!(task_mark(&task, true), "◆ building (2)");
-    }
-
-    #[test]
     fn task_marks_color_running_done_failed_blocked_and_building() {
         let task = |status: &str| Task {
             status: status.into(),
@@ -2035,10 +1979,9 @@ mod tests {
     #[test]
     fn task_marks_distinguish_auxiliary_run_roles() {
         for (role, letter) in [
-            ("upstream_repair", "u"),
             ("warning_cleanup", "w"),
-            ("repair_worker", "r"),
-            ("shepherd", "s"),
+            ("package_steward", "s"),
+            ("package_worker", "p"),
             ("future_auxiliary_role", "a"),
         ] {
             let task = Task {

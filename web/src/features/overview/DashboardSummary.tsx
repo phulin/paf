@@ -1,4 +1,4 @@
-import { CheckCircle2, ShieldCheck, Users, Zap } from "lucide-react";
+import { Boxes, CheckCircle2, Users, Zap } from "lucide-react";
 import type { ReactNode } from "react";
 import { ProgressBar } from "../../components/Controls";
 import { formatNumber } from "../../lib/format";
@@ -83,12 +83,12 @@ export function DashboardSummary({
   state,
   rows,
   connected,
-  openShepherd,
+  openPackages,
 }: {
   state: SwarmState;
   rows: ChapterRow[];
   connected: boolean;
-  openShepherd: () => void;
+  openPackages: () => void;
 }) {
   const tasks = Object.values(state.tasks ?? {});
   const successful = tasks.filter((task) => task.status === "succeeded").length;
@@ -110,7 +110,11 @@ export function DashboardSummary({
       task.scheduling_status === "blocked",
   ).length;
   const completion = tasks.length ? Math.round((100 * successful) / tasks.length) : 0;
-  const shepherd = state.shepherd;
+  const packages = Object.values(state.capability_packages ?? {});
+  const activePackages = packages.filter((item) =>
+    ["investigating", "planned", "implementing", "validating", "integrating"].includes(item.status),
+  ).length;
+  const waitingPackages = packages.filter((item) => item.status.startsWith("waiting_")).length;
 
   return (
     <>
@@ -164,20 +168,21 @@ export function DashboardSummary({
           accent="var(--violet)"
         />
         <MetricCard
-          icon={<ShieldCheck size={19} />}
-          label="Shepherd"
-          value={shepherd?.enabled ? shepherd.status : "off"}
+          icon={<Boxes size={19} />}
+          label="Capability packages"
+          value={`${activePackages} active`}
           detail={
             <>
-              <span>{shepherd?.pending_failures ?? failed} failures</span>
+              <span>{packages.length} total</span>
               <i />
-              {shepherd?.running_units ?? 0} repairing
-              <i />${(shepherd?.cost?.estimated_usd ?? 0).toFixed(2)}
+              {waitingPackages} waiting
+              <i />
+              {failed} blocked tasks
               {!connected && " · demo"}
             </>
           }
-          accent={shepherd?.status === "error" ? "var(--red)" : "var(--amber)"}
-          onClick={openShepherd}
+          accent={waitingPackages ? "var(--amber)" : "var(--green)"}
+          onClick={openPackages}
         />
       </div>
       <section className="pipeline-strip">

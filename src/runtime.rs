@@ -223,7 +223,7 @@ pub fn run(
             }
             Err(RecvTimeoutError::Timeout) => {
                 // This is a presentation clock for idle/elapsed labels, never a state poll.
-                dirty = model.detail || model.shepherd_detail || model.state.agents.active > 0;
+                dirty = model.detail || model.package_detail || model.state.agents.active > 0;
             }
             Err(RecvTimeoutError::Disconnected) => {
                 bail!("dashboard event sources disconnected unexpectedly")
@@ -338,8 +338,8 @@ fn handle_terminal_event_with_sender(
         }
         return Ok(dirty);
     }
-    if model.shepherd_detail {
-        return handle_shepherd_key(key, model, socket_path, sender);
+    if model.package_detail {
+        return Ok(handle_package_key(key, model));
     }
     match key.code {
         KeyCode::Char('q') | KeyCode::Char('c')
@@ -362,11 +362,11 @@ fn handle_terminal_event_with_sender(
             }
             Ok(true)
         }
-        KeyCode::Char('s') => {
-            model.enter_shepherd_detail();
+        KeyCode::Char('k') => {
+            model.enter_package_detail();
             Ok(true)
         }
-        KeyCode::Up | KeyCode::Char('k') => {
+        KeyCode::Up => {
             model.move_selection(-1);
             Ok(true)
         }
@@ -523,7 +523,7 @@ fn handle_mouse_event(mouse: MouseEvent, model: &mut DashboardModel) -> bool {
         MouseEventKind::ScrollDown => MOUSE_SCROLL_ROWS,
         _ => return false,
     };
-    if model.detail || model.shepherd_detail {
+    if model.detail || model.package_detail {
         model.scroll_detail(delta as i16);
     } else {
         model.move_selection(delta);
@@ -531,48 +531,20 @@ fn handle_mouse_event(mouse: MouseEvent, model: &mut DashboardModel) -> bool {
     true
 }
 
-fn handle_shepherd_key(
-    key: KeyEvent,
-    model: &mut DashboardModel,
-    socket_path: &str,
-    sender: Sender<RuntimeEvent>,
-) -> Result<bool> {
+fn handle_package_key(key: KeyEvent, model: &mut DashboardModel) -> bool {
     match key.code {
-        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('s') => {
-            model.leave_shepherd_detail();
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('k') => {
+            model.leave_package_detail();
         }
-        KeyCode::Up | KeyCode::Char('k') => model.move_shepherd_selection(-1),
-        KeyCode::Down | KeyCode::Char('j') => model.move_shepherd_selection(1),
-        KeyCode::Left | KeyCode::Char('h') => model.move_shepherd_run_selection(-1),
-        KeyCode::Right | KeyCode::Char('l') | KeyCode::Tab => model.move_shepherd_run_selection(1),
-        KeyCode::BackTab => model.move_shepherd_run_selection(-1),
-        KeyCode::PageUp => model.move_shepherd_selection(-10),
-        KeyCode::PageDown => model.move_shepherd_selection(10),
-        KeyCode::Home => model.move_shepherd_selection(-(model.shepherd_selected as isize)),
-        KeyCode::End => model.move_shepherd_selection(isize::MAX),
-        KeyCode::Enter | KeyCode::Char('i') => {
-            let Some(agent) = model.selected_shepherd_agent().cloned() else {
-                return Ok(false);
-            };
-            if agent.run_id.is_empty() || agent.work_unit_id.is_empty() {
-                return Ok(false);
-            }
-            let Some(selected) = model
-                .rows()
-                .iter()
-                .position(|row| row.unit.id == agent.work_unit_id)
-            else {
-                return Ok(false);
-            };
-            model.selected = selected;
-            model.enter_detail();
-            // Applying the chapter response schedules the selected run's transcript.
-            // History loading itself must never block input handling.
-            request_chapter_runs(model, socket_path, Some(&agent.run_id), sender);
-        }
-        _ => return Ok(false),
+        KeyCode::Up | KeyCode::Char('j') => model.move_package_selection(-1),
+        KeyCode::Down => model.move_package_selection(1),
+        KeyCode::PageUp => model.move_package_selection(-10),
+        KeyCode::PageDown => model.move_package_selection(10),
+        KeyCode::Home => model.move_package_selection(-(model.package_selected as isize)),
+        KeyCode::End => model.move_package_selection(isize::MAX),
+        _ => return false,
     }
-    Ok(true)
+    true
 }
 
 fn handle_detail_key(key: KeyEvent, model: &mut DashboardModel) -> Result<bool> {
@@ -850,16 +822,16 @@ mod tests {
     }
 
     #[test]
-    fn shepherd_key_opens_and_closes_the_trace_view() {
+    fn package_key_opens_and_closes_the_package_view() {
         let mut model = DashboardModel::loading("test".into(), String::new());
         model.preparation = None;
-        let shepherd_key = Event::Key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        let package_key = Event::Key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
 
-        assert!(handle_terminal_event(shepherd_key.clone(), &mut model, "/unused").unwrap());
-        assert!(model.shepherd_detail);
+        assert!(handle_terminal_event(package_key.clone(), &mut model, "/unused").unwrap());
+        assert!(model.package_detail);
         assert!(!model.detail);
-        assert!(handle_terminal_event(shepherd_key, &mut model, "/unused").unwrap());
-        assert!(!model.shepherd_detail);
+        assert!(handle_terminal_event(package_key, &mut model, "/unused").unwrap());
+        assert!(!model.package_detail);
         assert!(!model.stopping);
     }
 

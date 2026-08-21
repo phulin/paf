@@ -4,7 +4,6 @@ import {
   CircleDashed,
   PauseCircle,
   Play,
-  RotateCw,
   XCircle,
 } from "lucide-react";
 import { compactTaskDetail, timeAgo } from "../../lib/format";
@@ -31,7 +30,6 @@ export function StatusPill({
   status = "pending",
   rounds,
   building = false,
-  repairing = false,
   queued = false,
   schedulingStatus,
   phase = "idle",
@@ -39,7 +37,6 @@ export function StatusPill({
   status?: TaskStatus;
   rounds?: number;
   building?: boolean;
-  repairing?: boolean;
   queued?: boolean;
   schedulingStatus?: SchedulingStatus;
   phase?: TaskPhase;
@@ -48,28 +45,24 @@ export function StatusPill({
     status === "pending" && schedulingStatus === "blocked" ? "blocked" : status;
   const displayStatus = building
     ? "building"
-    : repairing
-      ? "repairing"
-      : queued
-        ? "queued"
-        : status === "running" && phase === "postprocess"
-          ? "postprocess"
-          : effectiveStatus;
+    : queued
+      ? "queued"
+      : status === "running" && phase === "postprocess"
+        ? "postprocess"
+        : effectiveStatus;
   return (
     <span className={`status-pill status-${displayStatus}`}>
-      {repairing && !building ? <RotateCw size={13} /> : <StatusIcon status={effectiveStatus} />}
+      <StatusIcon status={effectiveStatus} />
       <span>
         {building
           ? "building"
-          : repairing
-            ? "repairing"
-            : queued
-              ? "queued"
-              : displayStatus === "postprocess"
-                ? "postprocess"
-                : effectiveStatus === "succeeded"
-                  ? "done"
-                  : effectiveStatus}
+          : queued
+            ? "queued"
+            : displayStatus === "postprocess"
+              ? "postprocess"
+              : effectiveStatus === "succeeded"
+                ? "done"
+                : effectiveStatus}
       </span>
       {Boolean(rounds) && <span className="round-count">×{rounds}</span>}
     </span>
@@ -77,17 +70,6 @@ export function StatusPill({
 }
 
 export function ActivityCell({ activity, task }: { activity?: AgentActivity; task?: Task }) {
-  if (task?.repairing && !activity?.current) {
-    return (
-      <div className="activity-cell active">
-        <span className="pulse-small" />
-        <div>
-          <strong>Shepherd repair in progress</strong>
-          <span>{task.repair_work_unit_id || timeAgo(task.updated_at)}</span>
-        </div>
-      </div>
-    );
-  }
   if (task?.status === "running" && task.phase === "postprocess") {
     return (
       <div className="activity-cell active postprocess">

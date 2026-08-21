@@ -55,60 +55,99 @@ pub struct CoordinatorBuild {
 
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default)]
-pub struct Shepherd {
-    pub enabled: bool,
-    pub status: String,
-    pub model: String,
-    pub worker_model: String,
-    pub interval_seconds: f64,
-    pub failure_threshold: usize,
-    pub current_sweep_id: String,
-    pub current_run_id: String,
-    pub last_started_at: Option<String>,
-    pub last_finished_at: Option<String>,
-    pub next_run_at: Option<String>,
-    pub last_summary: String,
-    pub last_error: String,
-    pub pending_failures: usize,
-    pub planned_units: usize,
-    pub running_units: usize,
-    pub succeeded_units: usize,
-    pub failed_units: usize,
-    pub cost: Cost,
-    pub agents: Vec<ShepherdAgent>,
-    pub runs: Vec<ShepherdRun>,
-}
-
-#[derive(Clone, Debug, Default, Deserialize)]
-#[serde(default)]
-pub struct ShepherdRun {
+pub struct CapabilityPackage {
     pub id: String,
+    pub capability_key: String,
+    pub title: String,
+    pub mathematical_objective: String,
     pub status: String,
-    pub trigger: String,
-    pub failure_count: usize,
-    pub started_at: String,
-    pub finished_at: Option<String>,
-    pub summary: String,
-    pub error: String,
-    pub agents: Vec<ShepherdAgent>,
+    pub disposition: Option<String>,
+    pub write_scope: Vec<String>,
+    pub expansion_scope: Vec<String>,
+    pub plan_revision: usize,
+    pub revision: usize,
+    pub branch: String,
+    pub worktree: String,
+    pub integrated_revision: Option<String>,
+    pub updated_at: String,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default)]
-pub struct ShepherdAgent {
-    pub run_id: String,
-    pub role: String,
+pub struct PackageConsumer {
+    pub id: String,
+    pub package_id: String,
     pub work_unit_id: String,
+    pub path: String,
+    pub declaration: String,
     pub stage: String,
+    pub residual_goal: String,
     pub status: String,
-    pub label: String,
-    pub repair_work_unit_id: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct PackageStep {
+    pub id: String,
+    pub package_id: String,
+    pub kind: String,
+    pub title: String,
     pub objective: String,
-    pub document_id: String,
-    pub document_title: String,
-    pub ordinal: Option<usize>,
-    pub unit_title: String,
-    pub location: String,
+    pub status: String,
+    pub assigned_agent_id: Option<String>,
+    pub depends_on: Vec<String>,
+    pub write_scope: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct PackageEvidence {
+    pub id: String,
+    pub package_id: String,
+    pub producer: String,
+    pub kind: String,
+    pub paths: Vec<String>,
+    pub declarations: Vec<String>,
+    pub created_at: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct StewardLease {
+    pub package_id: String,
+    pub agent_id: String,
+    pub generation: usize,
+    pub heartbeat_at: String,
+    pub expires_at: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct PathReservation {
+    pub normalized_path: String,
+    pub package_id: String,
+    pub mode: String,
+    pub lease_generation: usize,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct PackageDependency {
+    pub package_id: String,
+    pub depends_on_package_id: String,
+    pub required_revision: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct IntegrationJournal {
+    pub id: String,
+    pub package_id: String,
+    pub phase: String,
+    pub candidate_revision: String,
+    pub canonical_revision_before: String,
+    pub canonical_revision_after: Option<String>,
+    pub updated_at: String,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -128,8 +167,6 @@ pub struct Task {
     pub head_build_status: String,
     pub sorry_count: Option<usize>,
     pub blocked_by: Vec<String>,
-    pub repairing: bool,
-    pub repair_work_unit_id: String,
     pub rounds: usize,
     pub updated_at: String,
     pub latest_run_id: Option<String>,
@@ -245,7 +282,14 @@ pub struct SwarmState {
     pub cost: Cost,
     pub agents: Agents,
     pub coordinator_build: CoordinatorBuild,
-    pub shepherd: Shepherd,
+    pub capability_packages: HashMap<String, CapabilityPackage>,
+    pub package_consumers: HashMap<String, PackageConsumer>,
+    pub package_steps: HashMap<String, PackageStep>,
+    pub package_evidence: HashMap<String, PackageEvidence>,
+    pub steward_leases: HashMap<String, StewardLease>,
+    pub path_reservations: HashMap<String, PathReservation>,
+    pub package_dependencies: Vec<PackageDependency>,
+    pub integration_journal: HashMap<String, IntegrationJournal>,
     pub scheduling: Scheduling,
     pub source_dependency_tree: SourceDependencyTree,
     pub isolation: Isolation,
@@ -303,7 +347,14 @@ pub struct GlobalDelta {
     pub cost: Option<Cost>,
     pub agents: Option<Agents>,
     pub coordinator_build: Option<CoordinatorBuild>,
-    pub shepherd: Option<Shepherd>,
+    pub capability_packages: Option<HashMap<String, CapabilityPackage>>,
+    pub package_consumers: Option<HashMap<String, PackageConsumer>>,
+    pub package_steps: Option<HashMap<String, PackageStep>>,
+    pub package_evidence: Option<HashMap<String, PackageEvidence>>,
+    pub steward_leases: Option<HashMap<String, StewardLease>>,
+    pub path_reservations: Option<HashMap<String, PathReservation>>,
+    pub package_dependencies: Option<Vec<PackageDependency>>,
+    pub integration_journal: Option<HashMap<String, IntegrationJournal>>,
     pub scheduling: Option<Scheduling>,
     pub source_dependency_tree: Option<SourceDependencyTree>,
     pub isolation: Option<Isolation>,
@@ -367,9 +418,8 @@ pub struct DashboardModel {
     pub result: Option<bool>,
     pub selected: usize,
     pub detail: bool,
-    pub shepherd_detail: bool,
-    pub shepherd_run_selected: usize,
-    pub shepherd_selected: usize,
+    pub package_detail: bool,
+    pub package_selected: usize,
     pub detail_tab: DetailTab,
     pub scroll: u16,
     pub detail_max_scroll: u16,
@@ -413,9 +463,8 @@ impl DashboardModel {
             result: None,
             selected: 0,
             detail: false,
-            shepherd_detail: false,
-            shepherd_run_selected: 0,
-            shepherd_selected: 0,
+            package_detail: false,
+            package_selected: 0,
             detail_tab: detail_tab.map(DetailTab::from_name).unwrap_or_default(),
             scroll: 0,
             detail_max_scroll: 0,
@@ -525,7 +574,32 @@ impl DashboardModel {
             &mut self.state.coordinator_build,
             delta.globals.coordinator_build,
         );
-        apply_optional(&mut self.state.shepherd, delta.globals.shepherd);
+        apply_optional(
+            &mut self.state.capability_packages,
+            delta.globals.capability_packages,
+        );
+        apply_optional(
+            &mut self.state.package_consumers,
+            delta.globals.package_consumers,
+        );
+        apply_optional(&mut self.state.package_steps, delta.globals.package_steps);
+        apply_optional(
+            &mut self.state.package_evidence,
+            delta.globals.package_evidence,
+        );
+        apply_optional(&mut self.state.steward_leases, delta.globals.steward_leases);
+        apply_optional(
+            &mut self.state.path_reservations,
+            delta.globals.path_reservations,
+        );
+        apply_optional(
+            &mut self.state.package_dependencies,
+            delta.globals.package_dependencies,
+        );
+        apply_optional(
+            &mut self.state.integration_journal,
+            delta.globals.integration_journal,
+        );
         apply_optional(&mut self.state.scheduling, delta.globals.scheduling);
         apply_optional(
             &mut self.state.source_dependency_tree,
@@ -617,7 +691,7 @@ impl DashboardModel {
         if self.detail {
             self.leave_detail();
         }
-        self.shepherd_detail = false;
+        self.package_detail = false;
     }
 
     pub fn push_search_character(&mut self, character: char) {
@@ -711,7 +785,7 @@ impl DashboardModel {
 
     pub fn enter_detail(&mut self) {
         self.detail = true;
-        self.shepherd_detail = false;
+        self.package_detail = false;
         self.detail_runs.clear();
         self.loading_chapter_runs = None;
         self.selected_run = 0;
@@ -731,96 +805,56 @@ impl DashboardModel {
         self.detail_follow_tail = true;
     }
 
-    pub fn enter_shepherd_detail(&mut self) {
-        self.shepherd_detail = true;
+    pub fn enter_package_detail(&mut self) {
+        self.package_detail = true;
         self.detail = false;
-        self.shepherd_run_selected = self
-            .state
-            .shepherd
-            .runs
-            .iter()
-            .position(|run| run.id == self.state.shepherd.current_sweep_id)
-            .unwrap_or_else(|| self.state.shepherd.runs.len().saturating_sub(1));
-        self.shepherd_selected = self
-            .selected_shepherd_agents()
-            .iter()
-            .position(|agent| !agent.run_id.is_empty() && agent.status == "running")
-            .unwrap_or(0);
+        self.package_selected = self
+            .package_selected
+            .min(self.packages().len().saturating_sub(1));
         self.scroll = 0;
         self.detail_max_scroll = 0;
         self.detail_follow_tail = true;
     }
 
-    pub fn leave_shepherd_detail(&mut self) {
-        self.shepherd_detail = false;
+    pub fn leave_package_detail(&mut self) {
+        self.package_detail = false;
         self.scroll = 0;
         self.detail_max_scroll = 0;
         self.detail_follow_tail = true;
     }
 
-    pub fn selected_shepherd_agent(&self) -> Option<&ShepherdAgent> {
-        self.selected_shepherd_agents().get(self.shepherd_selected)
+    pub fn packages(&self) -> Vec<&CapabilityPackage> {
+        let mut packages = self.state.capability_packages.values().collect::<Vec<_>>();
+        packages.sort_by(|left, right| {
+            right
+                .updated_at
+                .cmp(&left.updated_at)
+                .then(left.id.cmp(&right.id))
+        });
+        packages
     }
 
-    pub fn selected_shepherd_run(&self) -> Option<&ShepherdRun> {
-        self.state.shepherd.runs.get(self.shepherd_run_selected)
+    pub fn selected_package(&self) -> Option<&CapabilityPackage> {
+        self.packages().get(self.package_selected).copied()
     }
 
-    pub fn selected_shepherd_agents(&self) -> &[ShepherdAgent] {
-        self.selected_shepherd_run()
-            .map_or(self.state.shepherd.agents.as_slice(), |run| {
-                run.agents.as_slice()
-            })
-    }
-
-    pub fn selected_shepherd_activity(&self) -> Option<&Activity> {
-        let run_id = &self.selected_shepherd_agent()?.run_id;
-        self.state.activities.get(run_id)
-    }
-
-    pub fn move_shepherd_selection(&mut self, delta: isize) {
-        let length = self.selected_shepherd_agents().len();
+    pub fn move_package_selection(&mut self, delta: isize) {
+        let length = self.packages().len();
         if length == 0 {
-            self.shepherd_selected = 0;
+            self.package_selected = 0;
             return;
         }
-        self.shepherd_selected = self
-            .shepherd_selected
+        self.package_selected = self
+            .package_selected
             .saturating_add_signed(delta)
             .min(length - 1);
-        self.scroll = 0;
-        self.detail_max_scroll = 0;
-        self.detail_follow_tail = true;
-    }
-
-    pub fn move_shepherd_run_selection(&mut self, delta: isize) {
-        let length = self.state.shepherd.runs.len();
-        if length == 0 {
-            self.shepherd_run_selected = 0;
-            return;
-        }
-        self.shepherd_run_selected = self
-            .shepherd_run_selected
-            .saturating_add_signed(delta)
-            .min(length - 1);
-        self.shepherd_selected = self
-            .selected_shepherd_agents()
-            .iter()
-            .position(|agent| !agent.run_id.is_empty() && agent.status == "running")
-            .unwrap_or(0);
         self.scroll = 0;
         self.detail_max_scroll = 0;
         self.detail_follow_tail = true;
     }
 
     pub fn trace_run_id(&self) -> Option<&str> {
-        if self.shepherd_detail {
-            self.selected_shepherd_agent()
-                .map(|agent| agent.run_id.as_str())
-                .filter(|run_id| !run_id.is_empty())
-        } else {
-            self.selected_run_id()
-        }
+        self.selected_run_id()
     }
 
     pub fn selected_run_id(&self) -> Option<&str> {
