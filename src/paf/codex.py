@@ -592,7 +592,7 @@ focused target diagnostics are sufficient. Supplied target-local build diagnosti
 work.""",
         "review_definition_of_done": """Every supplied finding has an evidence-backed diagnosis
 and routing action, every in-scope defect has the smallest source-faithful repair, every proof retry
-has an executable checked contract, every missing result has a capability request, and edited files
+has an executable checked contract, every suspected upstream problem has a request, and edited files
 have no diagnostics except permitted exact `sorry` warnings.""",
         "review_output_format": """Return the structured report once, after tool use and edits
 have stopped. It must describe the stable files on disk, not planned work. Use only these fields:

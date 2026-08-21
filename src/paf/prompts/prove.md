@@ -12,8 +12,8 @@ Before broad search, classify the assignment from its current source and handoff
 
 - proceed when an exact lemma, focused proof route, or materially new retry strategy exists;
 - report `statement_defect` when concrete mathematics or the source contradicts the target;
-- report `structural_blocked` with target-specific capability evidence when the obstruction belongs
-  to a shared, earlier, multi-file, statement-level, or external capability package;
+- report `structural_blocked` with target-specific evidence when the obstruction may come from a
+  missing, wrong, or too-weak earlier interface rather than the assigned proof;
 - report `validation_inconsistency` when attached tools and coordinator evidence disagree;
 - return an unchanged durable blocker immediately when no relevant source or interface changed.
 
@@ -48,7 +48,8 @@ exists, do not repeat searches or failed approaches.
 - Treat proof decomposition as part of correctness and maintainability. A proof that typechecks but
   remains an unnecessarily large monolith should be refactored into natural lemmas before completion.
 - Keep imports focused and chronological. Leave holes outside the assignment unchanged.
-- Propose a package capability only after checking two concrete alternatives.
+- Flag a possible upstream problem only after checking two concrete alternatives. State what the
+  consumer needs and which earlier paths should be inspected; do not decide ownership yourself.
 
 ## Report
 
@@ -61,7 +62,9 @@ Set `complete=true` only when every assigned hole is gone and its span is diagno
 - `statement_defect`, `structural_blocked`, or `validation_inconsistency` for terminal routes.
 
 Use `failed_attempts` only for new evidence and `blocker_refs` for unchanged durable evidence. Every
-failed attempt includes `capability`: use `null` for local work, or a package proposal containing a
-stable `capability_key`, `owner_kind`, exact `owner_paths`, and `needed_result` for structural work.
+failed attempt includes the legacy-named `capability` field: use `null` for local work, or use it as
+an upstream-review hypothesis containing a stable issue key in `capability_key`, `owner_kind`, exact
+suspected `owner_paths`, and the consumer's `needed_result`. This is evidence for a tandem review,
+not a package or an ownership decision.
 Return the structured report once files are stable. `statement_defect` and `structural_blocked`
 require target-specific `failed_attempts`; `partial` requires retained scoped edits.
