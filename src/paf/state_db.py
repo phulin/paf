@@ -605,6 +605,11 @@ def _migrate_package_steps_v8(connection: sqlite3.Connection) -> None:
             dependencies.depends_on_step_id
         FROM package_step_dependencies AS dependencies
         JOIN package_steps AS steps ON steps.id=dependencies.step_id;
+        DELETE FROM package_steps_v8
+        WHERE plan_revision > (
+            SELECT packages.plan_revision FROM capability_packages AS packages
+            WHERE packages.id=package_steps_v8.package_id
+        );
         DROP TABLE package_step_dependencies;
         DROP TABLE package_step_items;
         DROP TABLE package_steps;
