@@ -28,6 +28,7 @@ from paf.package_model import (
     ReservationOwnerKind,
     ReservationSpec,
     StewardLease,
+    normalize_capability_key,
     normalize_repository_path,
 )
 from paf.state_db import StateDatabase
@@ -386,6 +387,94 @@ class PackageExecutionLayer:
             raise PackageReportError(f"package report field {key} must be an object array")
         return tuple(value)
 
+    @staticmethod
+    def _path_is_covered(path: str, scopes: tuple[str, ...]) -> bool:
+        return any(path == scope or path.startswith(f"{scope.rstrip('/')}/") for scope in scopes)
+
+    def _validate_decomposition(
+        self,
+        package: CapabilityPackage,
+        raw_children: tuple[dict[str, Any], ...],
+    ) -> None:
+        """Reject malformed splits before any report-driven state is applied."""
+
+        state = self.database.load_package_state()
+        open_consumers = {
+            value.id: value
+            for value in state.consumers_for(package.id)
+            if value.status is ConsumerStatus.OPEN
+        }
+        existing_keys = {value.capability_key for value in state.packages.values()}
+        child_keys: set[str] = set()
+        child_scopes: dict[str, tuple[str, ...]] = {}
+        assignments: dict[str, str] = {}
+        parent_scope = package.write_scope
+        for raw in raw_children:
+            key = normalize_capability_key(str(raw.get("capability_key", "")))
+            if not key or key in child_keys:
+                raise PackageReportError("decomposition child capability keys must be distinct")
+            if key in existing_keys:
+                raise PackageReportError(f"decomposition child capability already exists: {key}")
+            child_keys.add(key)
+            try:
+                scope = tuple(
+                    dict.fromkeys(
+                        normalize_repository_path(str(value))
+                        for value in raw.get("write_scope", ())
+                    )
+                )
+            except (TypeError, ValueError) as error:
+                raise PackageReportError(f"invalid decomposition child scope: {error}") from error
+            if not scope:
+                raise PackageReportError("decomposition children require a non-empty write scope")
+            if any(not self._path_is_covered(path, parent_scope) for path in scope):
+                raise PackageReportError("decomposed child requests path outside parent scope")
+            child_scopes[key] = scope
+            raw_consumer_ids = raw.get("consumer_ids", ())
+            if not isinstance(raw_consumer_ids, list):
+                raise PackageReportError("decomposition child consumer_ids must be an array")
+            for value in raw_consumer_ids:
+                consumer_id = str(value)
+                if consumer_id in assignments:
+                    raise PackageReportError("a consumer was assigned to multiple child packages")
+                assignments[consumer_id] = key
+
+        scopes = tuple((key, scope) for key, values in child_scopes.items() for scope in values)
+        for index, (left_key, left) in enumerate(scopes):
+            for right_key, right in scopes[index + 1 :]:
+                if left_key != right_key and (
+                    self._path_is_covered(left, (right,)) or self._path_is_covered(right, (left,))
+                ):
+                    raise PackageReportError(
+                        f"decomposition child scopes overlap: {left} and {right}"
+                    )
+
+        if set(assignments) != set(open_consumers):
+            raise PackageReportError(
+                "decomposition must assign every and only open package consumer"
+            )
+        for consumer_id, child_key in assignments.items():
+            consumer = open_consumers[consumer_id]
+            if consumer.path and not self._path_is_covered(
+                normalize_repository_path(consumer.path), child_scopes[child_key]
+            ):
+                raise PackageReportError(
+                    f"consumer {consumer_id} path is outside its decomposition child scope"
+                )
+
+        for reservation in state.reservations.values():
+            if reservation.package_id != package.id:
+                continue
+            owners = [
+                key
+                for key, scope in child_scopes.items()
+                if self._path_is_covered(reservation.normalized_path, scope)
+            ]
+            if len(owners) > 1:
+                raise PackageReportError(
+                    f"reservation {reservation.normalized_path} belongs to multiple child scopes"
+                )
+
     def _validate_report(
         self, package: CapabilityPackage, report: dict[str, Any]
     ) -> dict[str, Any]:
@@ -456,6 +545,8 @@ class PackageExecutionLayer:
             raise PackageReportError("decomposed disposition requires child packages")
         if report.get("disposition") != "decomposed" and children:
             raise PackageReportError("child packages require the decomposed disposition")
+        if children:
+            self._validate_decomposition(package, children)
         return report
 
     def _expand_scope(self, package_id: str, generation: int, report: dict[str, Any]) -> bool:
@@ -850,6 +941,7 @@ class PackageExecutionLayer:
     ) -> tuple[CapabilityPackage, ...]:
         raw_children = self._items(report, "child_packages")
         state = self.database.load_package_state()
+        self._validate_decomposition(state.packages[package_id], raw_children)
         open_consumers = {
             value.id
             for value in state.consumers_for(package_id)
@@ -865,9 +957,11 @@ class PackageExecutionLayer:
             if assigned.intersection(consumer_ids):
                 raise PackageReportError("a consumer was assigned to multiple child packages")
             assigned.update(consumer_ids)
-            scope = tuple(str(value) for value in raw.get("write_scope", ()))
-            if not set(scope).issubset(set(state.packages[package_id].write_scope)):
-                raise PackageReportError("decomposed child requests path outside parent scope")
+            scope = tuple(
+                dict.fromkeys(
+                    normalize_repository_path(str(value)) for value in raw.get("write_scope", ())
+                )
+            )
             children.append(
                 CapabilityPackage(
                     child_id,

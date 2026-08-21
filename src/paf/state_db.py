@@ -3973,10 +3973,15 @@ class StateDatabase:
                         str(path) == scope or str(path).startswith(f"{scope}/") for scope in scopes
                     )
                 ]
-                if len(owners) != 1:
-                    raise ValueError(
-                        f"reservation {path} must belong to exactly one split child scope"
+                if len(owners) > 1:
+                    raise ValueError(f"reservation {path} belongs to multiple split child scopes")
+                if not owners:
+                    connection.execute(
+                        """DELETE FROM path_reservations
+                        WHERE normalized_path=? AND owner_kind='package' AND owner_id=?""",
+                        (str(path), parent_id),
                     )
+                    continue
                 connection.execute(
                     """UPDATE path_reservations SET package_id=?, owner_id=?
                     WHERE normalized_path=?""",
@@ -4035,6 +4040,7 @@ class StateDatabase:
                     parent_id,
                 ),
             )
+            self._wake_waiting_reservation_packages(connection, now)
             state = _load_package_state(connection)
             return tuple(state.packages[child.id] for child in children)
 

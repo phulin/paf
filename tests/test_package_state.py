@@ -351,7 +351,13 @@ def test_dependencies_reject_cycles_and_merge_transfers_ownership(tmp_path: Path
 def test_split_moves_open_consumers_dependencies_and_reservations(tmp_path: Path) -> None:
     store = database(tmp_path)
     parent, _ = store.create_or_attach_capability_package(
-        package("parent", "parent.key", "lean/Book/A.lean", "lean/Book/B.lean"),
+        package(
+            "parent",
+            "parent.key",
+            "lean/Book/A.lean",
+            "lean/Book/B.lean",
+            "lean/Book/Unused.lean",
+        ),
         consumer=consumer("consumer-a", "parent", "Book.a"),
     )
     attached = store.attach_package_consumer(
@@ -368,6 +374,9 @@ def test_split_moves_open_consumers_dependencies_and_reservations(tmp_path: Path
         (
             PathReservation("lean/Book/A.lean", ReservationMode.EXCLUSIVE_FILE, "parent", 1, NOW),
             PathReservation("lean/Book/B.lean", ReservationMode.EXCLUSIVE_FILE, "parent", 1, NOW),
+            PathReservation(
+                "lean/Book/Unused.lean", ReservationMode.EXCLUSIVE_FILE, "parent", 1, NOW
+            ),
         ),
         expected_revision=parent.revision,
     )
@@ -387,6 +396,8 @@ def test_split_moves_open_consumers_dependencies_and_reservations(tmp_path: Path
     assert state.consumers["consumer-a"].package_id == "child-a"
     assert state.consumers["consumer-b"].package_id == "child-b"
     assert state.reservations["lean/Book/A.lean"].package_id == "child-a"
+    assert state.reservations["lean/Book/B.lean"].package_id == "child-b"
+    assert "lean/Book/Unused.lean" not in state.reservations
     assert "parent" not in state.leases
 
 

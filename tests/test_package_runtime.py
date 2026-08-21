@@ -451,6 +451,70 @@ def disposition_report(
     }
 
 
+def test_decomposition_report_rejects_consumer_outside_child_scope(tmp_path: Path) -> None:
+    repo = git_repo(tmp_path)
+    consumer_path = repo / "lean" / "Consumer.lean"
+    consumer_path.write_text("theorem consumer : True := by sorry\n", encoding="utf-8")
+    run_git(repo, "add", ".")
+    run_git(repo, "commit", "-m", "test: add consumer")
+    store = StateDatabase(repo / ".paf")
+    store.initialize()
+    current, _ = store.create_or_attach_capability_package(
+        CapabilityPackage(
+            "parent",
+            "parent.key",
+            "Parent",
+            "Implement the parent",
+            write_scope=("lean/Book.lean", "lean/Consumer.lean"),
+            expansion_scope=("lean/Book.lean", "lean/Consumer.lean"),
+        ),
+        consumer=PackageConsumer(
+            "consumer-a",
+            "parent",
+            "chapter-a",
+            "lean/Consumer.lean",
+            "consumer",
+            "prove",
+        ),
+    )
+    report = disposition_report(
+        "decomposed",
+        ("consumer-a",),
+        child_packages=[
+            {
+                "capability_key": "child.key",
+                "title": "Child",
+                "mathematical_objective": "Implement the child",
+                "write_scope": ["lean/Book.lean"],
+                "consumer_ids": ["consumer-a"],
+            }
+        ],
+    )
+    runtime = PackageExecutionLayer(
+        repo,
+        repo / ".paf",
+        store,
+        acquire_workspace=workspace_provider(repo, store),
+        run_steward=lambda *_args: asyncio.sleep(0, result=report),
+        run_worker=lambda *_args: asyncio.sleep(0, result={}),
+        validate_step=lambda *_args: PackageValidation(True, "step", "ok"),
+        validate_package=lambda *_args: PackageValidation(True, "package", "ok"),
+        validate_consumer=lambda _path, consumer: ConsumerValidation(
+            False, "consumer", "still blocked", consumer.id
+        ),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="consumer consumer-a path is outside its decomposition child scope",
+    ):
+        runtime._validate_report(current, report)
+
+    state = store.load_package_state()
+    assert state.packages[current.id].status is PackageStatus.OBSERVED
+    assert state.consumers["consumer-a"].package_id == current.id
+
+
 @pytest.mark.asyncio
 async def test_initial_scope_conflict_waits_durably_without_steward_ping_pong(
     tmp_path: Path,

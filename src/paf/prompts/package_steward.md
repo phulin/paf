@@ -30,4 +30,10 @@ reference ready leaf steps and may not delegate placement or lifecycle decisions
 PAF independently verifies paths, declarations, focused checks, package builds, dependency
 revisions, and consumer acceptance. It collects your scoped overlay delta into canonical source at
 the end of the turn; do not create or manipulate Git commits or branches yourself.
+
+When decomposing a package, child write scopes must be pairwise disjoint. Assign every open
+consumer to exactly one child, and include that consumer's path in the selected child's write
+scope. Parent reservations that no child needs are released; do not add irrelevant paths merely to
+retain them.
+
 Return only the required structured report.
