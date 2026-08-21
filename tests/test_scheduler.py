@@ -5485,6 +5485,81 @@ async def test_upstream_reviews_keep_two_owner_frontiers(tmp_path: Path) -> None
 
 
 @pytest.mark.asyncio
+async def test_consumer_triage_can_retarget_an_upstream_request(tmp_path: Path) -> None:
+    config = with_example_modules(
+        load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    )
+    owner, consumer = config.chapters
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await orchestrator.prepare()
+    blocker = (
+        await state.record_proof_blockers(
+            consumer.id,
+            origin_run_id="proof-run",
+            failed_attempts=[
+                failed_attempt(
+                    "placement is not yet known",
+                    path="lean/Book/Chapter02.lean",
+                )
+            ],
+        )
+    )[0]
+    request_id, _ = await state.enqueue_upstream_request(
+        {
+            "consumer_path": "lean/Book/Chapter02.lean",
+            "blocked_declaration": "Book.target",
+            "residual_goal": "True",
+            "needed_result": "a bridge",
+            "owner_paths": [],
+        },
+        consumer_chapter_id=consumer.id,
+        owner_chapter_id=consumer.id,
+        blocker_ids=(str(blocker["id"]),),
+    )
+    await state.enqueue_proof_review_request(
+        {consumer.id: "Failed proof `Book.target` in `lean/Book/Chapter02.lean`"},
+        origin_run_id=request_id,
+        kind=scheduler_module.UPSTREAM_REQUEST_REVIEW_KIND,
+        request_id=request_id,
+        blocker_ids=(str(blocker["id"]),),
+    )
+    run = await state.start_auxiliary_run(
+        consumer.id,
+        Stage.REVIEW,
+        role=PROOF_REVIEW_ROLE,
+        request_ids=(request_id,),
+    )
+    await state.finish_run(
+        run,
+        status=TaskStatus.SUCCEEDED,
+        report={
+            "complete": True,
+            "finding_assessments": [
+                finding_resolution(
+                    f"{request_id}:1",
+                    action="request_upstream",
+                    diagnosis="missing_capability",
+                    capability={
+                        "capability_key": "book.bridge",
+                        "owner_kind": "chapter",
+                        "owner_paths": ["lean/Book/Chapter01.lean"],
+                        "needed_result": "a bridge",
+                    },
+                )
+            ],
+        },
+    )
+
+    assert await orchestrator._complete_review(consumer, "triaged", proof_request_ids=(request_id,))
+    upstream = state.upstream_requests[request_id]
+    assert upstream["owner_chapter_id"] == owner.id
+    assert upstream["status"] == "evaluating"
+    assert set(state.proof_review_requests[request_id]["feedback"]) == {owner.id}
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_external_candidate_still_requires_steward_disposition(tmp_path: Path) -> None:
     config = with_example_modules(load_config(write_project(tmp_path, chapters="chapters = [1]")))
     chapter = config.chapters[0]

@@ -4756,6 +4756,39 @@ class Orchestrator:
                         int(blocker.get("review_exchange_count", 0)) + 1
                     )
 
+                if upstream_review and action == "request_upstream":
+                    candidate = assessment.get("upstream_request")
+                    upstream = self.state.upstream_requests.get(request_id)
+                    if isinstance(candidate, dict) and isinstance(upstream, dict):
+                        for field in (
+                            "capability_key",
+                            "owner_kind",
+                            "owner_paths",
+                            "needed_result",
+                        ):
+                            if field in candidate:
+                                upstream[field] = candidate[field]
+                        await self.state.set_proof_blocker_status(
+                            (blocker_id,), ProofBlockerStatus.UPSTREAM_REQUESTED
+                        )
+                        await self.state.update_upstream_request(
+                            request_id,
+                            UpstreamRequestStatus.OPEN,
+                            decision=assessment,
+                            evaluation_run_id=run.id,
+                        )
+                    else:
+                        await self.state.set_proof_blocker_status(
+                            (blocker_id,), ProofBlockerStatus.BLOCKED
+                        )
+                        await self.state.update_upstream_request(
+                            request_id,
+                            UpstreamRequestStatus.NEEDS_HUMAN,
+                            decision=assessment,
+                            evaluation_run_id=run.id,
+                        )
+                    continue
+
                 if placeholder is False:
                     status = ProofBlockerStatus.RESOLVED
                 elif action == "drop_stale_target" and placeholder is None:
