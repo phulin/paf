@@ -33,6 +33,16 @@ class IsolationResult:
     error: str = ""
     commit: str = ""
 
+    @property
+    def stale_scope(self) -> bool:
+        """Whether a concurrent integration invalidated this workspace snapshot."""
+
+        return (
+            not self.accepted
+            and self.error
+            == "assigned scope changed after this agent started; retry on a fresh generation"
+        )
+
     def as_dict(self) -> dict[str, object]:
         return {
             "accepted": self.accepted,

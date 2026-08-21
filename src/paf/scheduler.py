@@ -100,6 +100,7 @@ from paf.warning_cleanup import (
 )
 
 MAXIMUM_COORDINATOR_BUILD_TARGETS = 500
+MAXIMUM_STALE_REVIEW_SNAPSHOT_RETRIES = 3
 REVIEW_REPORT_RETRY_PROMPT = """Your previous review turn did not satisfy the report contract:
 
 {error}
@@ -174,6 +175,7 @@ class StageOutcome:
     complete: bool = True
     run_id: str = ""
     report_error: str = ""
+    retry_fresh: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.disposition, ExecutionDisposition):
@@ -2143,10 +2145,16 @@ class Orchestrator:
                         status=ValidationStatus.DEFERRED,
                     )
             else:
+                stale_snapshot = isolated.stale_scope
                 validation = ValidationResult(
                     False,
                     1,
                     f"Isolation rejected the agent result: {isolated.error}",
+                    status=(
+                        ValidationStatus.STALE_SNAPSHOT
+                        if stale_snapshot
+                        else ValidationStatus.TARGET_FAILED
+                    ),
                 )
             if not isolated.accepted:
                 detail = isolated.error
@@ -2157,6 +2165,7 @@ class Orchestrator:
                     False,
                     1,
                     f"Isolation rejected the agent result: {detail}\n\n{validation.output}",
+                    status=validation.status,
                 )
                 await self.state.update_run(run, status=TaskStatus.FAILED)
             await self.state.update_run(
@@ -4259,6 +4268,21 @@ class Orchestrator:
                 complete=False,
                 run_id=attempt.run.id,
             )
+        if attempt.validation.status is ValidationStatus.STALE_SNAPSHOT:
+            if not auxiliary_request:
+                await self.state.set_task(
+                    chapter.id,
+                    Stage.REVIEW,
+                    TaskStatus.RUNNING,
+                    "review snapshot became stale; fresh isolation retry queued",
+                )
+            return StageOutcome(
+                ExecutionDisposition.WAITING,
+                changed=False,
+                complete=False,
+                run_id=attempt.run.id,
+                retry_fresh=True,
+            )
         report_error = ""
         if not attempt.agent.report and not attempt.agent.capacity_exhausted:
             report_error = attempt.agent.error or "review returned no structured final report"
@@ -5167,6 +5191,7 @@ class Orchestrator:
         resume_run_id = ""
         resume_prompt = ""
         zero_work_report_retries = 0
+        stale_snapshot_retries = 0
 
         async def queue_report_retry(outcome: StageOutcome, error: str) -> bool:
             nonlocal resume_thread_id, resume_run_id, resume_prompt, zero_work_report_retries
@@ -5247,6 +5272,25 @@ class Orchestrator:
             resume_run_id = ""
             resume_prompt = ""
             review_feedback = ""
+            if outcome.retry_fresh:
+                stale_snapshot_retries += 1
+                # A concurrent integration invalidating an isolation snapshot is infrastructure
+                # contention, not a semantic review cycle. Retry from the new live scope without
+                # charging the chapter's review budget or resuming the stale agent conversation.
+                rounds_used[chapter.id] = max(0, rounds_used[chapter.id] - 1)
+                if stale_snapshot_retries > MAXIMUM_STALE_REVIEW_SNAPSHOT_RETRIES:
+                    await set_review_task(
+                        TaskStatus.FAILED,
+                        "review scope remained unstable after repeated fresh isolation retries",
+                    )
+                    return StageOutcome(ExecutionDisposition.FAILED)
+                await set_review_task(
+                    TaskStatus.RUNNING,
+                    "review snapshot became stale; retrying from the current scope "
+                    f"({stale_snapshot_retries}/{MAXIMUM_STALE_REVIEW_SNAPSHOT_RETRIES})",
+                )
+                continue
+            stale_snapshot_retries = 0
             if outcome.report_error:
                 review_feedback = attempt_feedback
                 if source_changed:

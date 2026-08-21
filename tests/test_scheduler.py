@@ -4364,6 +4364,47 @@ async def test_changed_review_remains_active_until_rebuild_finishes(tmp_path: Pa
 
 
 @pytest.mark.asyncio
+async def test_review_classifies_stale_isolation_as_a_fresh_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await orchestrator.prepare()
+    chapter = config.chapters[0]
+    run = await state.start_run(chapter.id, Stage.REVIEW)
+    stale_agent = replace(
+        result(changed=True),
+        succeeded=False,
+        error="assigned scope changed after this agent started; retry on a fresh generation",
+    )
+
+    async def attempt(*_args: object, **_kwargs: object) -> Attempt:
+        return Attempt(
+            stale_agent,
+            ValidationResult(
+                False,
+                1,
+                "Isolation rejected the agent result",
+                status=ValidationStatus.STALE_SNAPSHOT,
+            ),
+            run,
+        )
+
+    monkeypatch.setattr(orchestrator, "_attempt", attempt)
+
+    outcome = await orchestrator._review_once(chapter)
+
+    assert outcome.waiting
+    assert outcome.retry_fresh
+    assert not outcome.changed
+    task = state.task(chapter.id, Stage.REVIEW)
+    assert task.status == TaskStatus.RUNNING
+    assert task.detail == "review snapshot became stale; fresh isolation retry queued"
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_review_snapshot_and_merge_do_not_acquire_coordinator_build_queue(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -4540,6 +4581,45 @@ async def test_capacity_failure_consumes_a_review_round(
 
     assert not await orchestrator._review_chapter_to_clean(chapter, rounds)
     assert rounds[chapter.id] == 1
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_stale_review_snapshot_retries_fresh_without_consuming_round(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = config.chapters[0]
+    orchestrator = Orchestrator(config, StateStore(config))
+    await orchestrator.prepare()
+    outcomes = iter(
+        (
+            StageOutcome(
+                ExecutionDisposition.WAITING,
+                changed=False,
+                complete=False,
+                retry_fresh=True,
+            ),
+            StageOutcome(ExecutionDisposition.SUCCEEDED, changed=False, complete=True),
+        )
+    )
+    reruns: list[bool] = []
+
+    async def clean(*_args: object, **_kwargs: object) -> dict[str, str]:
+        return {}
+
+    async def review(_chapter: Chapter, *, rerun: bool = False, feedback: str = "") -> StageOutcome:
+        del feedback
+        reruns.append(rerun)
+        return next(outcomes)
+
+    monkeypatch.setattr(orchestrator, "_review_build", clean)
+    monkeypatch.setattr(orchestrator, "_review_once", review)
+    rounds = {chapter.id: 0}
+
+    assert await orchestrator._review_chapter_to_clean(chapter, rounds)
+    assert rounds[chapter.id] == 1
+    assert reruns == [False, False]
     await orchestrator.shutdown()
 
 

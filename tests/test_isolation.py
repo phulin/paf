@@ -520,6 +520,7 @@ async def test_fuse_overlay_imports_scope_and_rejects_a_stale_writer(tmp_path: P
 
     assert accepted.accepted
     assert not rejected.accepted
+    assert rejected.stale_scope
     assert "fresh generation" in rejected.error
     assert (
         (tmp_path / "lean" / "Book" / "Chapter01.lean")
