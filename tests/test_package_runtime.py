@@ -298,7 +298,7 @@ def test_ordinary_reservation_expiry_cannot_block_a_package_forever(
     assert result.granted
 
 
-def test_schema_v5_package_locks_migrate_into_global_authority(tmp_path: Path) -> None:
+def test_schema_v5_package_locks_are_released_during_archive_migration(tmp_path: Path) -> None:
     store = StateDatabase(tmp_path / ".paf")
     store.initialize()
     current = package(store)
@@ -328,9 +328,7 @@ def test_schema_v5_package_locks_migrate_into_global_authority(tmp_path: Path) -
     store.initialize()
 
     migrated = store.load_path_reservations(now=EARLY)
-    assert len(migrated) == 1
-    assert migrated[0].owner_kind is ReservationOwnerKind.PACKAGE
-    assert migrated[0].owner_id == current.id
+    assert migrated == ()
 
 
 def steward_report(
