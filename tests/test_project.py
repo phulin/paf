@@ -14,7 +14,7 @@ from paf.config import infer_config, load_config
 from paf.models import PipelineConfig, Stage
 from paf.project import ProjectResolver
 from paf.state import StateStore, TaskStatus, TokenUsage
-from paf.state_db import StateDatabase, read_checkpoint, read_full_snapshot
+from paf.state_db import SCHEMA_VERSION, StateDatabase, read_checkpoint, read_full_snapshot
 from tests.support import write_project
 
 
@@ -232,7 +232,7 @@ async def test_schema_v2_global_graphs_migrate_to_relational_rows(tmp_path: Path
         request_count = connection.execute(
             "SELECT count(*) FROM state_items WHERE section='upstream_requests'"
         ).fetchone()[0]
-    assert version == 5
+    assert version == SCHEMA_VERSION
     assert len(header_payload) < 10_000
     assert "source_dependency_tree" not in json.loads(header_payload)
     assert edge_count == 1
@@ -265,8 +265,8 @@ async def test_schema_v3_adds_interface_invalidation_events(tmp_path: Path) -> N
             "SELECT name FROM sqlite_master WHERE type='table' "
             "AND name='interface_invalidation_events'"
         ).fetchone()
-    assert version == 5
-    assert meta_version == 5
+    assert version == SCHEMA_VERSION
+    assert meta_version == SCHEMA_VERSION
     assert event_table == ("interface_invalidation_events",)
 
 

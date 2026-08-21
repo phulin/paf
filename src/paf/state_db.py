@@ -8,7 +8,7 @@ import threading
 import time
 from concurrent.futures import Future
 from dataclasses import dataclass, field, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
 from typing import Any
@@ -19,12 +19,14 @@ from paf.package_model import (
     CapabilityPackage,
     ConsumerStatus,
     EvidenceKind,
+    GlobalPathReservation,
     IntegrationJournal,
     IntegrationPhase,
     PackageConsumer,
     PackageDependency,
     PackageDisposition,
     PackageEvidence,
+    PackageRecovery,
     PackageState,
     PackageStatus,
     PackageStep,
@@ -32,16 +34,22 @@ from paf.package_model import (
     PackageStepStatus,
     PathReservation,
     RelevantReadInterface,
+    ReservationConflict,
+    ReservationDecision,
     ReservationMode,
+    ReservationOwnerKind,
+    ReservationResult,
+    ReservationSpec,
     StewardLease,
     UpstreamRequestImport,
+    canonical_reservation_specs,
     normalize_capability_key,
     normalize_repository_path,
 )
 
 DATABASE_NAME = "state.sqlite3"
 LEGACY_BACKUP_NAME = "state.legacy-v6.json"
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 CHANGE_RETENTION = 10_000
 
 COLLECTION_SECTIONS = frozenset(
@@ -503,6 +511,41 @@ def _create_v1_schema(connection: sqlite3.Connection) -> None:
     connection.execute("PRAGMA user_version=1")
 
 
+def _migrate_path_reservations_v6(connection: sqlite3.Connection) -> None:
+    """Make the historical package table the one global reservation authority."""
+
+    columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(path_reservations)")}
+    if "owner_kind" in columns:
+        return
+    connection.execute("ALTER TABLE path_reservations RENAME TO package_path_reservations_v5")
+    connection.executescript(
+        """
+        CREATE TABLE path_reservations (
+            normalized_path TEXT PRIMARY KEY,
+            mode TEXT NOT NULL,
+            owner_kind TEXT NOT NULL CHECK(owner_kind IN ('package', 'ordinary_task')),
+            owner_id TEXT NOT NULL,
+            fence_generation INTEGER NOT NULL,
+            acquired_at TEXT NOT NULL,
+            expires_at TEXT,
+            package_id TEXT REFERENCES capability_packages(id) ON DELETE CASCADE,
+            CHECK((owner_kind = 'package' AND package_id = owner_id) OR
+                  (owner_kind = 'ordinary_task' AND package_id IS NULL))
+        );
+        CREATE INDEX path_reservations_owner
+            ON path_reservations(owner_kind, owner_id, normalized_path);
+        INSERT INTO path_reservations(
+            normalized_path, mode, owner_kind, owner_id, fence_generation,
+            acquired_at, expires_at, package_id
+        )
+        SELECT normalized_path, mode, 'package', package_id, lease_generation,
+            acquired_at, NULL, package_id
+        FROM package_path_reservations_v5;
+        DROP TABLE package_path_reservations_v5;
+        """
+    )
+
+
 def _create_schema(connection: sqlite3.Connection) -> None:
     """Create the normalized current-state schema.
 
@@ -786,8 +829,42 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             source_digest TEXT NOT NULL,
             imported_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS steward_lease_fences (
+            package_id TEXT PRIMARY KEY REFERENCES capability_packages(id) ON DELETE CASCADE,
+            generation INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS ordinary_reservation_leases (
+            owner_id TEXT PRIMARY KEY,
+            generation INTEGER NOT NULL,
+            acquired_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS path_reservation_queue (
+            id TEXT PRIMARY KEY,
+            owner_kind TEXT NOT NULL,
+            owner_id TEXT NOT NULL,
+            fence_generation INTEGER NOT NULL,
+            requested BLOB NOT NULL,
+            created_at TEXT NOT NULL,
+            expires_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS path_reservation_queue_owner
+            ON path_reservation_queue(owner_kind, owner_id, created_at, id);
+        CREATE TABLE IF NOT EXISTS package_recoveries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            package_id TEXT NOT NULL REFERENCES capability_packages(id) ON DELETE CASCADE,
+            prior_generation INTEGER NOT NULL,
+            recovered_generation INTEGER NOT NULL,
+            worktree_head TEXT NOT NULL,
+            worktree_status TEXT NOT NULL,
+            dirty_digest TEXT NOT NULL,
+            active_child_workers BLOB NOT NULL,
+            journal_phase TEXT,
+            recovered_at TEXT NOT NULL
+        );
         """
     )
+    _migrate_path_reservations_v6(connection)
     columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(runs)").fetchall()}
     for name, declaration in (
         ("work_unit_id", "TEXT NOT NULL DEFAULT ''"),
@@ -1109,6 +1186,19 @@ def _upstream_request_batches(requests: Any) -> dict[str, list[str]]:
 
 def _utc_now() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def _as_utc(value: str | None) -> datetime:
+    if not value:
+        return datetime.now(UTC)
+    parsed = datetime.fromisoformat(value)
+    return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed.astimezone(UTC)
+
+
+def _expires(now: str, ttl_seconds: float) -> str:
+    if ttl_seconds <= 0:
+        raise ValueError("lease ttl must be positive")
+    return (_as_utc(now) + timedelta(seconds=ttl_seconds)).isoformat()
 
 
 def _content_digest(value: Any) -> str:
@@ -1629,8 +1719,8 @@ def _load_package_state(connection: sqlite3.Connection) -> PackageState:
             acquired_at=str(row[4]),
         )
         for row in connection.execute(
-            """SELECT normalized_path, mode, package_id, lease_generation, acquired_at
-            FROM path_reservations ORDER BY normalized_path"""
+            """SELECT normalized_path, mode, owner_id, fence_generation, acquired_at
+            FROM path_reservations WHERE owner_kind='package' ORDER BY normalized_path"""
         )
     }
     dependencies = tuple(
@@ -1840,7 +1930,7 @@ def initialize_database(state_dir: Path) -> Path:
             if version == 1:
                 with connection:
                     _migrate_v1(connection)
-            elif version in {2, 3, 4}:
+            elif version in {2, 3, 4, 5}:
                 with connection:
                     _create_schema(connection)
             elif version != SCHEMA_VERSION:
@@ -2566,8 +2656,283 @@ class StateDatabase:
                     lease.expires_at,
                 ),
             )
+            connection.execute(
+                """INSERT INTO steward_lease_fences VALUES(?, ?)
+                ON CONFLICT(package_id) DO UPDATE SET
+                    generation=max(generation, excluded.generation)""",
+                (lease.package_id, lease.generation),
+            )
             self._touch_package(connection, lease.package_id)
             return _load_package_state(connection).packages[lease.package_id]
+
+    @staticmethod
+    def _assert_live_lease(
+        connection: sqlite3.Connection,
+        package_id: str,
+        generation: int,
+        *,
+        agent_id: str | None = None,
+        now: str | None = None,
+    ) -> None:
+        row = connection.execute(
+            "SELECT agent_id, generation, expires_at FROM steward_leases WHERE package_id=?",
+            (package_id,),
+        ).fetchone()
+        if row is None or int(row[1]) != generation:
+            actual = int(row[1]) if row is not None else None
+            raise ValueError(
+                f"stale lease generation for {package_id}: expected {generation}, found {actual}"
+            )
+        if agent_id is not None and str(row[0]) != agent_id:
+            raise ValueError(f"steward lease for {package_id} belongs to another agent")
+        if _as_utc(str(row[2])) <= _as_utc(now):
+            raise ValueError(f"steward lease for {package_id} has expired")
+
+    def claim_steward_lease(
+        self,
+        package_id: str,
+        agent_id: str,
+        *,
+        expected_revision: int,
+        ttl_seconds: float,
+        now: str | None = None,
+    ) -> StewardLease:
+        claimed_at = now or _utc_now()
+        with _connect(self.path) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._assert_package_revision(connection, package_id, expected_revision)
+            row = connection.execute(
+                "SELECT agent_id, generation, acquired_at, expires_at FROM steward_leases "
+                "WHERE package_id=?",
+                (package_id,),
+            ).fetchone()
+            fence = connection.execute(
+                "SELECT generation FROM steward_lease_fences WHERE package_id=?", (package_id,)
+            ).fetchone()
+            last_generation = max(
+                int(row[1]) if row is not None else 0,
+                int(fence[0]) if fence is not None else 0,
+            )
+            if row is not None and _as_utc(str(row[3])) > _as_utc(claimed_at):
+                if str(row[0]) != agent_id:
+                    raise ValueError(f"package {package_id} already has a live steward")
+                generation = int(row[1])
+                acquired_at = str(row[2])
+            else:
+                generation = last_generation + 1
+                acquired_at = claimed_at
+            lease = StewardLease(
+                package_id,
+                agent_id,
+                generation,
+                acquired_at,
+                claimed_at,
+                _expires(claimed_at, ttl_seconds),
+            )
+            connection.execute(
+                """INSERT INTO steward_leases VALUES(?, ?, ?, ?, ?, ?)
+                ON CONFLICT(package_id) DO UPDATE SET agent_id=excluded.agent_id,
+                    generation=excluded.generation, acquired_at=excluded.acquired_at,
+                    heartbeat_at=excluded.heartbeat_at, expires_at=excluded.expires_at""",
+                (
+                    lease.package_id,
+                    lease.agent_id,
+                    lease.generation,
+                    lease.acquired_at,
+                    lease.heartbeat_at,
+                    lease.expires_at,
+                ),
+            )
+            connection.execute(
+                """INSERT INTO steward_lease_fences VALUES(?, ?)
+                ON CONFLICT(package_id) DO UPDATE SET generation=excluded.generation""",
+                (package_id, generation),
+            )
+            connection.execute(
+                """UPDATE path_reservations SET fence_generation=?
+                WHERE owner_kind='package' AND owner_id=?""",
+                (generation, package_id),
+            )
+            self._touch_package(connection, package_id)
+            connection.commit()
+            return lease
+
+    def heartbeat_steward_lease(
+        self,
+        package_id: str,
+        agent_id: str,
+        generation: int,
+        *,
+        ttl_seconds: float,
+        now: str | None = None,
+    ) -> StewardLease:
+        heartbeat_at = now or _utc_now()
+        with _connect(self.path) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._assert_live_lease(
+                connection, package_id, generation, agent_id=agent_id, now=heartbeat_at
+            )
+            expires_at = _expires(heartbeat_at, ttl_seconds)
+            connection.execute(
+                "UPDATE steward_leases SET heartbeat_at=?, expires_at=? WHERE package_id=?",
+                (heartbeat_at, expires_at, package_id),
+            )
+            row = connection.execute(
+                """SELECT package_id, agent_id, generation, acquired_at, heartbeat_at, expires_at
+                FROM steward_leases WHERE package_id=?""",
+                (package_id,),
+            ).fetchone()
+            connection.commit()
+            assert row is not None
+            return StewardLease(str(row[0]), str(row[1]), int(row[2]), *map(str, row[3:]))
+
+    def assert_live_steward_lease(
+        self,
+        package_id: str,
+        generation: int,
+        *,
+        agent_id: str | None = None,
+        now: str | None = None,
+    ) -> None:
+        with _connect(self.path) as connection:
+            self._assert_live_lease(connection, package_id, generation, agent_id=agent_id, now=now)
+
+    def release_steward_lease(
+        self,
+        package_id: str,
+        agent_id: str,
+        generation: int,
+        *,
+        release_reservations: bool = False,
+        now: str | None = None,
+    ) -> None:
+        with _connect(self.path) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._assert_live_lease(connection, package_id, generation, agent_id=agent_id, now=now)
+            connection.execute("DELETE FROM steward_leases WHERE package_id=?", (package_id,))
+            if release_reservations:
+                connection.execute(
+                    "DELETE FROM path_reservations WHERE owner_kind='package' AND owner_id=?",
+                    (package_id,),
+                )
+            self._touch_package(connection, package_id)
+            connection.commit()
+
+    def recover_steward_lease(
+        self,
+        package_id: str,
+        agent_id: str,
+        *,
+        expected_revision: int,
+        ttl_seconds: float,
+        worktree_head: str,
+        worktree_status: str,
+        dirty_digest: str,
+        active_child_workers: tuple[str, ...] = (),
+        journal_phase: IntegrationPhase | None = None,
+        now: str | None = None,
+    ) -> tuple[StewardLease, PackageRecovery]:
+        recovered_at = now or _utc_now()
+        with _connect(self.path) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._assert_package_revision(connection, package_id, expected_revision)
+            row = connection.execute(
+                "SELECT generation, expires_at FROM steward_leases WHERE package_id=?",
+                (package_id,),
+            ).fetchone()
+            if row is not None and _as_utc(str(row[1])) > _as_utc(recovered_at):
+                raise ValueError(f"cannot recover package {package_id} with a live steward")
+            fence = connection.execute(
+                "SELECT generation FROM steward_lease_fences WHERE package_id=?", (package_id,)
+            ).fetchone()
+            prior_generation = max(
+                int(row[0]) if row is not None else 0,
+                int(fence[0]) if fence is not None else 0,
+            )
+            generation = prior_generation + 1
+            lease = StewardLease(
+                package_id,
+                agent_id,
+                generation,
+                recovered_at,
+                recovered_at,
+                _expires(recovered_at, ttl_seconds),
+            )
+            connection.execute(
+                """INSERT INTO steward_leases VALUES(?, ?, ?, ?, ?, ?)
+                ON CONFLICT(package_id) DO UPDATE SET agent_id=excluded.agent_id,
+                    generation=excluded.generation, acquired_at=excluded.acquired_at,
+                    heartbeat_at=excluded.heartbeat_at, expires_at=excluded.expires_at""",
+                (
+                    lease.package_id,
+                    lease.agent_id,
+                    lease.generation,
+                    lease.acquired_at,
+                    lease.heartbeat_at,
+                    lease.expires_at,
+                ),
+            )
+            connection.execute(
+                """INSERT INTO steward_lease_fences VALUES(?, ?)
+                ON CONFLICT(package_id) DO UPDATE SET generation=excluded.generation""",
+                (package_id, generation),
+            )
+            connection.execute(
+                """UPDATE path_reservations SET fence_generation=?
+                WHERE owner_kind='package' AND owner_id=?""",
+                (generation, package_id),
+            )
+            connection.execute(
+                """INSERT INTO package_recoveries(
+                    package_id, prior_generation, recovered_generation, worktree_head,
+                    worktree_status, dirty_digest, active_child_workers, journal_phase, recovered_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    package_id,
+                    prior_generation,
+                    generation,
+                    worktree_head,
+                    worktree_status,
+                    dirty_digest,
+                    json.dumpb(list(active_child_workers)),
+                    str(journal_phase) if journal_phase is not None else None,
+                    recovered_at,
+                ),
+            )
+            self._touch_package(connection, package_id)
+            connection.commit()
+        recovery = PackageRecovery(
+            package_id,
+            prior_generation,
+            generation,
+            worktree_head,
+            worktree_status,
+            dirty_digest,
+            active_child_workers,
+            journal_phase,
+            recovered_at,
+        )
+        return lease, recovery
+
+    def update_package_workspace(
+        self,
+        package_id: str,
+        *,
+        expected_revision: int,
+        lease_generation: int,
+        base_revision: str,
+        branch: str,
+        worktree: str,
+    ) -> CapabilityPackage:
+        with _connect(self.path) as connection, connection:
+            self._assert_package_revision(connection, package_id, expected_revision)
+            self._assert_lease_generation(connection, package_id, lease_generation)
+            connection.execute(
+                """UPDATE capability_packages SET base_revision=?, branch=?, worktree=?,
+                    revision=revision+1, updated_at=? WHERE id=?""",
+                (base_revision, branch, worktree, _utc_now(), package_id),
+            )
+            return _load_package_state(connection).packages[package_id]
 
     @staticmethod
     def _reservation_conflicts(
@@ -2597,46 +2962,285 @@ class StateDatabase:
             raise ValueError("one atomic reservation set must share a package and generation")
         package_id = next(iter(package_ids))
         generation = next(iter(generations))
-        with _connect(self.path) as connection, connection:
-            self._assert_package_revision(connection, package_id, expected_revision)
-            self._assert_lease_generation(connection, package_id, generation)
-            requested = sorted(reservations, key=lambda item: item.normalized_path)
-            for index, item in enumerate(requested):
-                for other in requested[index + 1 :]:
-                    if self._reservation_conflicts(
-                        item.normalized_path, str(item.mode), other.normalized_path, str(other.mode)
-                    ):
-                        raise ValueError("requested reservation set overlaps itself")
-                for path, mode, owner in connection.execute(
-                    "SELECT normalized_path, mode, package_id FROM path_reservations"
+        result = self.acquire_path_reservations(
+            ReservationOwnerKind.PACKAGE,
+            package_id,
+            generation,
+            tuple(ReservationSpec(item.normalized_path, item.mode) for item in reservations),
+            acquired_at=min(item.acquired_at for item in reservations),
+            expected_revision=expected_revision,
+        )
+        if not result.granted:
+            conflict = result.conflicts[0]
+            raise ValueError(
+                f"path {conflict.requested_path} conflicts with "
+                f"{conflict.owner_kind} {conflict.owner_id}"
+            )
+        return self.load_package_state().packages[package_id]
+
+    @staticmethod
+    def _clean_expired_ordinary_reservations(connection: sqlite3.Connection, now: str) -> None:
+        connection.execute(
+            """DELETE FROM path_reservations WHERE owner_kind='ordinary_task'
+            AND expires_at IS NOT NULL AND expires_at <= ?""",
+            (now,),
+        )
+        connection.execute("DELETE FROM ordinary_reservation_leases WHERE expires_at <= ?", (now,))
+        connection.execute(
+            "DELETE FROM path_reservation_queue WHERE expires_at IS NOT NULL AND expires_at <= ?",
+            (now,),
+        )
+
+    @classmethod
+    def _reservation_conflict_rows(
+        cls,
+        connection: sqlite3.Connection,
+        owner_kind: ReservationOwnerKind,
+        owner_id: str,
+        requested: tuple[ReservationSpec, ...],
+    ) -> tuple[ReservationConflict, ...]:
+        held = tuple(
+            GlobalPathReservation(
+                str(row[0]),
+                ReservationMode(str(row[1])),
+                ReservationOwnerKind(str(row[2])),
+                str(row[3]),
+                int(row[4]),
+                str(row[5]),
+                str(row[6]) if row[6] is not None else None,
+            )
+            for row in connection.execute(
+                """SELECT normalized_path, mode, owner_kind, owner_id, fence_generation,
+                    acquired_at, expires_at FROM path_reservations ORDER BY normalized_path"""
+            )
+            if (str(row[2]), str(row[3])) != (str(owner_kind), owner_id)
+        )
+        return tuple(
+            ReservationConflict(
+                item.normalized_path,
+                item.mode,
+                current.normalized_path,
+                current.mode,
+                current.owner_kind,
+                current.owner_id,
+            )
+            for item in requested
+            for current in held
+            if cls._reservation_conflicts(
+                item.normalized_path,
+                str(item.mode),
+                current.normalized_path,
+                str(current.mode),
+            )
+        )
+
+    def acquire_path_reservations(
+        self,
+        owner_kind: ReservationOwnerKind,
+        owner_id: str,
+        fence_generation: int,
+        requested: tuple[ReservationSpec, ...],
+        *,
+        acquired_at: str | None = None,
+        expires_at: str | None = None,
+        expected_revision: int | None = None,
+        queue_on_conflict: bool = False,
+    ) -> ReservationResult:
+        if not owner_id or fence_generation <= 0 or not requested:
+            raise ValueError("reservation owner, positive fence, and paths are required")
+        requested = canonical_reservation_specs(requested)
+        for index, item in enumerate(requested):
+            for other in requested[index + 1 :]:
+                if self._reservation_conflicts(
+                    item.normalized_path, str(item.mode), other.normalized_path, str(other.mode)
                 ):
-                    if str(owner) == package_id:
-                        continue
-                    if self._reservation_conflicts(
-                        item.normalized_path, str(item.mode), str(path), str(mode)
-                    ):
-                        raise ValueError(
-                            f"path {item.normalized_path} conflicts with package {owner}"
-                        )
+                    raise ValueError("requested reservation set overlaps itself")
+        now = acquired_at or _utc_now()
+        with _connect(self.path) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._clean_expired_ordinary_reservations(connection, now)
+            if owner_kind is ReservationOwnerKind.PACKAGE:
+                if expected_revision is None:
+                    raise ValueError("package reservations require an expected revision")
+                self._assert_package_revision(connection, owner_id, expected_revision)
+                self._assert_lease_generation(connection, owner_id, fence_generation)
+            else:
+                row = connection.execute(
+                    """SELECT generation, expires_at FROM ordinary_reservation_leases
+                    WHERE owner_id=?""",
+                    (owner_id,),
+                ).fetchone()
+                if row is None or int(row[0]) != fence_generation or str(row[1]) <= now:
+                    raise ValueError(f"stale ordinary-task reservation fence for {owner_id}")
+            conflicts = self._reservation_conflict_rows(connection, owner_kind, owner_id, requested)
+            queue_id: str | None = None
+            if conflicts:
+                decision = (
+                    ReservationDecision.QUEUED
+                    if queue_on_conflict
+                    else ReservationDecision.CONFLICT
+                )
+                if queue_on_conflict:
+                    queue_id = _stable_record_id(
+                        "reservation", str(owner_kind), owner_id, str(fence_generation)
+                    )
+                    connection.execute(
+                        """INSERT INTO path_reservation_queue VALUES(?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(id) DO UPDATE SET requested=excluded.requested,
+                            created_at=excluded.created_at, expires_at=excluded.expires_at""",
+                        (
+                            queue_id,
+                            str(owner_kind),
+                            owner_id,
+                            fence_generation,
+                            json.dumpb(
+                                [
+                                    {"path": item.normalized_path, "mode": str(item.mode)}
+                                    for item in requested
+                                ]
+                            ),
+                            now,
+                            expires_at,
+                        ),
+                    )
+                connection.commit()
+                return ReservationResult(
+                    decision,
+                    owner_kind,
+                    owner_id,
+                    fence_generation,
+                    requested,
+                    conflicts,
+                    queue_id,
+                )
             connection.executemany(
-                """INSERT INTO path_reservations VALUES(?, ?, ?, ?, ?)
+                """INSERT INTO path_reservations(
+                    normalized_path, mode, owner_kind, owner_id, fence_generation,
+                    acquired_at, expires_at, package_id
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(normalized_path) DO UPDATE SET mode=excluded.mode,
-                    package_id=excluded.package_id,
-                    lease_generation=excluded.lease_generation,
-                    acquired_at=excluded.acquired_at""",
+                    fence_generation=excluded.fence_generation,
+                    acquired_at=excluded.acquired_at, expires_at=excluded.expires_at
+                WHERE path_reservations.owner_kind=excluded.owner_kind
+                    AND path_reservations.owner_id=excluded.owner_id""",
                 (
                     (
                         item.normalized_path,
                         str(item.mode),
-                        item.package_id,
-                        item.lease_generation,
-                        item.acquired_at,
+                        str(owner_kind),
+                        owner_id,
+                        fence_generation,
+                        now,
+                        expires_at,
+                        owner_id if owner_kind is ReservationOwnerKind.PACKAGE else None,
                     )
                     for item in requested
                 ),
             )
-            self._touch_package(connection, package_id)
-            return _load_package_state(connection).packages[package_id]
+            connection.execute(
+                "DELETE FROM path_reservation_queue WHERE owner_kind=? AND owner_id=?",
+                (str(owner_kind), owner_id),
+            )
+            if owner_kind is ReservationOwnerKind.PACKAGE:
+                self._touch_package(connection, owner_id)
+            connection.commit()
+            return ReservationResult(
+                ReservationDecision.GRANTED,
+                owner_kind,
+                owner_id,
+                fence_generation,
+                requested,
+            )
+
+    def claim_ordinary_path_reservations(
+        self,
+        owner_id: str,
+        requested: tuple[ReservationSpec, ...],
+        *,
+        ttl_seconds: float,
+        now: str | None = None,
+        queue_on_conflict: bool = True,
+    ) -> ReservationResult:
+        acquired_at = now or _utc_now()
+        expires_at = _expires(acquired_at, ttl_seconds)
+        with _connect(self.path) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._clean_expired_ordinary_reservations(connection, acquired_at)
+            row = connection.execute(
+                "SELECT generation FROM ordinary_reservation_leases WHERE owner_id=?", (owner_id,)
+            ).fetchone()
+            generation = int(row[0]) if row is not None else 1
+            connection.execute(
+                """INSERT INTO ordinary_reservation_leases VALUES(?, ?, ?, ?)
+                ON CONFLICT(owner_id) DO UPDATE SET expires_at=excluded.expires_at""",
+                (owner_id, generation, acquired_at, expires_at),
+            )
+            connection.commit()
+        return self.acquire_path_reservations(
+            ReservationOwnerKind.ORDINARY_TASK,
+            owner_id,
+            generation,
+            requested,
+            acquired_at=acquired_at,
+            expires_at=expires_at,
+            queue_on_conflict=queue_on_conflict,
+        )
+
+    def release_path_reservations(
+        self,
+        owner_kind: ReservationOwnerKind,
+        owner_id: str,
+        fence_generation: int,
+    ) -> None:
+        with _connect(self.path) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if owner_kind is ReservationOwnerKind.PACKAGE:
+                self._assert_lease_generation(connection, owner_id, fence_generation)
+            else:
+                row = connection.execute(
+                    "SELECT generation FROM ordinary_reservation_leases WHERE owner_id=?",
+                    (owner_id,),
+                ).fetchone()
+                if row is None or int(row[0]) != fence_generation:
+                    raise ValueError(f"stale ordinary-task reservation fence for {owner_id}")
+            connection.execute(
+                "DELETE FROM path_reservations WHERE owner_kind=? AND owner_id=?",
+                (str(owner_kind), owner_id),
+            )
+            connection.execute(
+                "DELETE FROM path_reservation_queue WHERE owner_kind=? AND owner_id=?",
+                (str(owner_kind), owner_id),
+            )
+            if owner_kind is ReservationOwnerKind.ORDINARY_TASK:
+                connection.execute(
+                    "DELETE FROM ordinary_reservation_leases WHERE owner_id=?", (owner_id,)
+                )
+            else:
+                self._touch_package(connection, owner_id)
+            connection.commit()
+
+    def load_path_reservations(
+        self, *, now: str | None = None
+    ) -> tuple[GlobalPathReservation, ...]:
+        observed_at = now or _utc_now()
+        with _connect(self.path) as connection, connection:
+            self._clean_expired_ordinary_reservations(connection, observed_at)
+            return tuple(
+                GlobalPathReservation(
+                    str(row[0]),
+                    ReservationMode(str(row[1])),
+                    ReservationOwnerKind(str(row[2])),
+                    str(row[3]),
+                    int(row[4]),
+                    str(row[5]),
+                    str(row[6]) if row[6] is not None else None,
+                )
+                for row in connection.execute(
+                    """SELECT normalized_path, mode, owner_kind, owner_id,
+                        fence_generation, acquired_at, expires_at
+                    FROM path_reservations ORDER BY normalized_path"""
+                )
+            )
 
     @staticmethod
     def _dependency_graph(connection: sqlite3.Connection) -> dict[str, set[str]]:
@@ -2780,8 +3384,9 @@ class StateDatabase:
                 )
                 connection.execute(f"DELETE FROM {table} WHERE package_id=?", (merged_id,))
             connection.execute(
-                "UPDATE path_reservations SET package_id=? WHERE package_id=?",
-                (survivor_id, merged_id),
+                """UPDATE path_reservations SET package_id=?, owner_id=?
+                WHERE owner_kind='package' AND owner_id=?""",
+                (survivor_id, survivor_id, merged_id),
             )
             connection.execute(
                 "UPDATE capability_packages SET parent_package_id=? WHERE parent_package_id=?",
@@ -2887,7 +3492,8 @@ class StateDatabase:
 
             child_scopes = {child.id: child.write_scope for child in children}
             for path, _mode in connection.execute(
-                "SELECT normalized_path, mode FROM path_reservations WHERE package_id=?",
+                """SELECT normalized_path, mode FROM path_reservations
+                WHERE owner_kind='package' AND owner_id=?""",
                 (parent_id,),
             ).fetchall():
                 owners = [
@@ -2902,8 +3508,9 @@ class StateDatabase:
                         f"reservation {path} must belong to exactly one split child scope"
                     )
                 connection.execute(
-                    "UPDATE path_reservations SET package_id=? WHERE normalized_path=?",
-                    (owners[0], str(path)),
+                    """UPDATE path_reservations SET package_id=?, owner_id=?
+                    WHERE normalized_path=?""",
+                    (owners[0], owners[0], str(path)),
                 )
 
             incoming: list[tuple[str, str | None, str]] = []
@@ -3036,6 +3643,120 @@ class StateDatabase:
             )
             self._touch_package(connection, journal.package_id)
             return _load_package_state(connection).packages[journal.package_id]
+
+    def finalize_package_integration(
+        self,
+        journal_id: str,
+        *,
+        expected_revision: int,
+        lease_generation: int,
+        canonical_revision_after: str,
+        release_reservations: bool = True,
+    ) -> CapabilityPackage:
+        with _connect(self.path) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """SELECT package_id, lease_generation, candidate_revision, phase
+                FROM integration_journal WHERE id=?""",
+                (journal_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(journal_id)
+            package_id = str(row[0])
+            self._assert_package_revision(connection, package_id, expected_revision)
+            self._assert_live_lease(connection, package_id, lease_generation)
+            if int(row[1]) != lease_generation:
+                raise ValueError("integration journal belongs to another fenced generation")
+            if str(row[2]) != canonical_revision_after:
+                raise ValueError("canonical revision does not equal the validated candidate")
+            if str(row[3]) not in {
+                str(IntegrationPhase.VALIDATED),
+                str(IntegrationPhase.IMPORTING),
+            }:
+                raise ValueError("integration journal is not ready to finalize")
+            now = _utc_now()
+            connection.execute(
+                """UPDATE integration_journal SET phase=?, canonical_revision_after=?,
+                    updated_at=? WHERE id=?""",
+                (str(IntegrationPhase.FINALIZED), canonical_revision_after, now, journal_id),
+            )
+            connection.execute(
+                """UPDATE capability_packages SET integrated_revision=?, revision=revision+1,
+                    updated_at=? WHERE id=?""",
+                (canonical_revision_after, now, package_id),
+            )
+            if release_reservations:
+                connection.execute(
+                    "DELETE FROM path_reservations WHERE owner_kind='package' AND owner_id=?",
+                    (package_id,),
+                )
+            connection.commit()
+        return self.load_package_state().packages[package_id]
+
+    def reconcile_imported_integration(
+        self,
+        journal_id: str,
+        *,
+        canonical_revision_after: str,
+        validation_digest: str,
+    ) -> CapabilityPackage:
+        """Finish durable state after Git advanced but the final transaction was interrupted."""
+
+        with _connect(self.path) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """SELECT package_id, candidate_revision, phase, validation_digest
+                FROM integration_journal WHERE id=?""",
+                (journal_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(journal_id)
+            if str(row[1]) != canonical_revision_after:
+                raise ValueError("canonical revision does not equal journal candidate")
+            if str(row[2]) not in {
+                str(IntegrationPhase.IMPORTING),
+                str(IntegrationPhase.FINALIZED),
+            }:
+                raise ValueError("journal does not describe an interrupted import")
+            if not validation_digest or str(row[3]) != validation_digest:
+                raise ValueError("validation digest does not match interrupted import")
+            package_id = str(row[0])
+            now = _utc_now()
+            connection.execute(
+                """UPDATE integration_journal SET phase=?, canonical_revision_after=?,
+                    updated_at=? WHERE id=?""",
+                (str(IntegrationPhase.FINALIZED), canonical_revision_after, now, journal_id),
+            )
+            connection.execute(
+                """UPDATE capability_packages SET integrated_revision=?, revision=revision+1,
+                    updated_at=? WHERE id=? AND integrated_revision IS NOT ?""",
+                (canonical_revision_after, now, package_id, canonical_revision_after),
+            )
+            connection.execute(
+                "DELETE FROM path_reservations WHERE owner_kind='package' AND owner_id=?",
+                (package_id,),
+            )
+            connection.commit()
+        return self.load_package_state().packages[package_id]
+
+    def abort_integration_reconciliation(self, journal_id: str) -> CapabilityPackage:
+        """Record that an interrupted import cannot be replayed onto current history."""
+
+        with _connect(self.path) as connection, connection:
+            row = connection.execute(
+                "SELECT package_id, phase FROM integration_journal WHERE id=?", (journal_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(journal_id)
+            if str(row[1]) != str(IntegrationPhase.IMPORTING):
+                raise ValueError("only an interrupted import may be reconciled as aborted")
+            package_id = str(row[0])
+            connection.execute(
+                "UPDATE integration_journal SET phase=?, updated_at=? WHERE id=?",
+                (str(IntegrationPhase.ABORTED), _utc_now(), journal_id),
+            )
+            self._touch_package(connection, package_id)
+            return _load_package_state(connection).packages[package_id]
 
     def write_delta(
         self, write: DatabaseWrite, *, connection: sqlite3.Connection | None = None

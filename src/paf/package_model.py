@@ -79,6 +79,17 @@ class ReservationMode(StrEnum):
     EXCLUSIVE_SUBTREE = "exclusive_subtree"
 
 
+class ReservationOwnerKind(StrEnum):
+    PACKAGE = "package"
+    ORDINARY_TASK = "ordinary_task"
+
+
+class ReservationDecision(StrEnum):
+    GRANTED = "granted"
+    QUEUED = "queued"
+    CONFLICT = "conflict"
+
+
 class IntegrationPhase(StrEnum):
     PREPARED = "prepared"
     VALIDATING = "validating"
@@ -249,6 +260,87 @@ class PathReservation:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "normalized_path", normalize_repository_path(self.normalized_path))
+
+
+@dataclass(frozen=True)
+class ReservationSpec:
+    normalized_path: str
+    mode: ReservationMode = ReservationMode.EXCLUSIVE_FILE
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "normalized_path", normalize_repository_path(self.normalized_path))
+
+
+def canonical_reservation_specs(values: tuple[ReservationSpec, ...]) -> tuple[ReservationSpec, ...]:
+    """Sort, deduplicate, and remove paths covered by a requested subtree."""
+
+    by_path: dict[str, ReservationSpec] = {}
+    for value in values:
+        current = by_path.get(value.normalized_path)
+        if current is None or value.mode is ReservationMode.EXCLUSIVE_SUBTREE:
+            by_path[value.normalized_path] = value
+    ordered = tuple(sorted(by_path.values(), key=lambda item: item.normalized_path))
+    return tuple(
+        item
+        for item in ordered
+        if not any(
+            other.mode is ReservationMode.EXCLUSIVE_SUBTREE
+            and item.normalized_path.startswith(f"{other.normalized_path}/")
+            for other in ordered
+        )
+    )
+
+
+@dataclass(frozen=True)
+class GlobalPathReservation:
+    normalized_path: str
+    mode: ReservationMode
+    owner_kind: ReservationOwnerKind
+    owner_id: str
+    fence_generation: int
+    acquired_at: str
+    expires_at: str | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "normalized_path", normalize_repository_path(self.normalized_path))
+
+
+@dataclass(frozen=True)
+class ReservationConflict:
+    requested_path: str
+    requested_mode: ReservationMode
+    held_path: str
+    held_mode: ReservationMode
+    owner_kind: ReservationOwnerKind
+    owner_id: str
+
+
+@dataclass(frozen=True)
+class ReservationResult:
+    decision: ReservationDecision
+    owner_kind: ReservationOwnerKind
+    owner_id: str
+    fence_generation: int
+    requested: tuple[ReservationSpec, ...]
+    conflicts: tuple[ReservationConflict, ...] = ()
+    queue_id: str | None = None
+
+    @property
+    def granted(self) -> bool:
+        return self.decision is ReservationDecision.GRANTED
+
+
+@dataclass(frozen=True)
+class PackageRecovery:
+    package_id: str
+    prior_generation: int
+    recovered_generation: int
+    worktree_head: str
+    worktree_status: str
+    dirty_digest: str
+    active_child_workers: tuple[str, ...] = ()
+    journal_phase: IntegrationPhase | None = None
+    recovered_at: str = ""
 
 
 @dataclass(frozen=True)
