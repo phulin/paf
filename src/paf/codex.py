@@ -182,7 +182,6 @@ _FINDING_ASSESSMENTS_PROPERTY: dict[str, Any] = {
                     "repair_and_retry",
                     "retry_with_route",
                     "attach_package",
-                    "send_to_roadmap",
                     "wait_for_dependency",
                     "park_external",
                     "drop_stale_target",

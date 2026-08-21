@@ -110,7 +110,7 @@ class ProofBlockerStatus(StrEnum):
     OPEN = "open"
     REVIEW_REQUESTED = "review_requested"
     WAITING_DEPENDENCY = "waiting_dependency"
-    ROADMAP = "roadmap"
+    PACKAGE_REQUIRED = "package_required"
     PARKED = "parked"
     BLOCKED = "blocked"
     RESOLVED = "resolved"
@@ -1881,7 +1881,7 @@ class StateStore:
                 if retry_cause and blocker.get("last_attempted_retry_cause_digest") != retry_cause:
                     blocker["last_attempted_retry_cause_digest"] = retry_cause
                     blocker["last_retry_run_id"] = origin_run_id
-                    blocker["status"] = ProofBlockerStatus.ROADMAP.value
+                    blocker["status"] = ProofBlockerStatus.PACKAGE_REQUIRED.value
                     self.record_routing_event("unchanged_retry_suppressed")
             disposition = str(raw.get("disposition", "")).strip()
             if disposition:
@@ -1913,7 +1913,7 @@ class StateStore:
                 if retry_cause and blocker.get("last_attempted_retry_cause_digest") != retry_cause:
                     blocker["last_attempted_retry_cause_digest"] = retry_cause
                     blocker["last_retry_run_id"] = origin_run_id
-                    blocker["status"] = ProofBlockerStatus.ROADMAP.value
+                    blocker["status"] = ProofBlockerStatus.PACKAGE_REQUIRED.value
                     self.record_routing_event("unchanged_retry_suppressed")
             blocker["updated_at"] = timestamp()
             changed[str(blocker["id"])] = blocker

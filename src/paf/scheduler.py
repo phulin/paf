@@ -4439,6 +4439,8 @@ class Orchestrator:
                     if candidate is not None:
                         blocker["capability"] = candidate
                         blocker["disposition"] = "missing_capability"
+                    else:
+                        blocker["disposition"] = "genuine_blocker"
                     package_ids = await self._attach_structural_blockers_to_packages(
                         chapter, (blocker,)
                     )
@@ -4466,16 +4468,6 @@ class Orchestrator:
                         if dependency_ids
                         else ProofBlockerStatus.PARKED
                     )
-                elif action == "send_to_roadmap":
-                    blocker["disposition"] = "genuine_blocker"
-                    package_ids = await self._attach_structural_blockers_to_packages(
-                        chapter, (blocker,)
-                    )
-                    status = (
-                        ProofBlockerStatus.WAITING_DEPENDENCY
-                        if package_ids
-                        else ProofBlockerStatus.ROADMAP
-                    )
                 elif action == "park_external":
                     blocker["capability"] = {
                         "capability_key": (
@@ -4502,7 +4494,7 @@ class Orchestrator:
                 await self.state.set_proof_blocker_status((blocker_id,), status)
                 routed_statuses.append(status)
 
-        if ProofBlockerStatus.ROADMAP in routed_statuses:
+        if ProofBlockerStatus.PACKAGE_REQUIRED in routed_statuses:
             await self.state.set_task(
                 chapter.id,
                 Stage.PROVE,
@@ -4608,7 +4600,7 @@ class Orchestrator:
             return "interface_defect", "repair_and_retry"
         # Legacy prose has no checked retry contract. Parking it is safer than recreating the
         # review/proof loop; an operator can reopen it when evidence changes.
-        return "genuine_blocker", "send_to_roadmap"
+        return "genuine_blocker", "attach_package"
 
     async def _invalidate_reviews(
         self,
@@ -6428,7 +6420,7 @@ class Orchestrator:
             for blocker in blockers:
                 blocker_id = str(blocker.get("id", ""))
                 if blocker.get("status") in {
-                    ProofBlockerStatus.ROADMAP.value,
+                    ProofBlockerStatus.PACKAGE_REQUIRED.value,
                     ProofBlockerStatus.PARKED.value,
                     ProofBlockerStatus.WAITING_DEPENDENCY.value,
                 }:
@@ -6509,16 +6501,16 @@ class Orchestrator:
                 }
                 if routed_statuses.intersection(
                     {
-                        ProofBlockerStatus.ROADMAP.value,
+                        ProofBlockerStatus.PACKAGE_REQUIRED.value,
                         ProofBlockerStatus.PARKED.value,
                         ProofBlockerStatus.WAITING_DEPENDENCY.value,
                     }
                 ):
-                    roadmap_required = ProofBlockerStatus.ROADMAP.value in routed_statuses
+                    package_required = ProofBlockerStatus.PACKAGE_REQUIRED.value in routed_statuses
                     await self.state.set_task(
                         chapter.id,
                         Stage.PROVE,
-                        TaskStatus.FAILED if roadmap_required else TaskStatus.BLOCKED,
+                        TaskStatus.FAILED if package_required else TaskStatus.BLOCKED,
                         "proof blocker routed without unchanged retry: "
                         + ", ".join(terminal_blockers),
                     )

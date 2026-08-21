@@ -5122,7 +5122,7 @@ async def test_structural_blockers_cluster_into_one_package_without_ping_pong(
     [
         ("repair_and_retry", True, ProofBlockerStatus.OPEN),
         ("retry_with_route", False, ProofBlockerStatus.OPEN),
-        ("send_to_roadmap", False, ProofBlockerStatus.WAITING_DEPENDENCY),
+        ("attach_package", False, ProofBlockerStatus.WAITING_DEPENDENCY),
     ],
 )
 async def test_completed_review_routes_blocker_by_structured_action(
@@ -5297,7 +5297,7 @@ async def test_build_warning_review_request_does_not_block_proof_readiness(
 
 
 @pytest.mark.asyncio
-async def test_noop_proof_review_routes_once_to_roadmap(tmp_path: Path) -> None:
+async def test_noop_proof_review_routes_once_to_package(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
     chapter = config.chapters[0]
     source = tmp_path / "lean" / "Book" / "Chapter01.lean"
@@ -5334,7 +5334,7 @@ async def test_noop_proof_review_routes_once_to_roadmap(tmp_path: Path) -> None:
             "finding_assessments": [
                 finding_resolution(
                     f"{request_id}:1",
-                    action="send_to_roadmap",
+                    action="attach_package",
                     diagnosis="genuine_blocker",
                 )
             ],
@@ -5534,7 +5534,7 @@ async def test_proof_review_drops_confirmed_stale_target(tmp_path: Path) -> None
 
 
 @pytest.mark.asyncio
-async def test_exhausted_retry_contract_routes_to_roadmap_without_second_review(
+async def test_exhausted_retry_contract_requires_package_without_second_review(
     tmp_path: Path,
 ) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
@@ -5557,7 +5557,7 @@ async def test_exhausted_retry_contract_routes_to_roadmap_without_second_review(
         failed_attempts=[failed_attempt("the original strategy failed")],
     )
 
-    assert retained[0]["status"] == ProofBlockerStatus.ROADMAP
+    assert retained[0]["status"] == ProofBlockerStatus.PACKAGE_REQUIRED
     assert retained[0]["last_attempted_retry_cause_digest"] == "checked-route-v1"
     assert state.routing_metrics["unchanged_retry_suppressed"] == 1
     await state.close()
