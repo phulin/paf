@@ -1388,7 +1388,11 @@ def _import_upstream_request(
     raw_answer = request.get("answer")
     answer: dict[str, Any] = raw_answer if isinstance(raw_answer, dict) else {}
     disposition = str(answer.get("disposition", ""))
-    external = str(request.get("owner_kind", "chapter")) != "chapter" or disposition == "external"
+    # The old proof agent's owner kind was only a placement hypothesis.  In
+    # particular, ``consumer`` and ``shared`` never meant that the capability
+    # was unavailable, and even an ``external`` hypothesis still required an
+    # upstream answer before it became a terminal fact.
+    external = disposition == "external"
     if package_id is None:
         package_id = _stable_record_id("package", capability_key)
         title = str(
@@ -1410,6 +1414,11 @@ def _import_upstream_request(
             updated_at=str(request.get("updated_at", now)),
         )
         _insert_package(connection, package)
+    package_status = str(
+        connection.execute(
+            "SELECT status FROM capability_packages WHERE id=?", (package_id,)
+        ).fetchone()[0]
+    )
 
     attachments = request.get("consumers")
     if not isinstance(attachments, list) or not attachments:
@@ -1431,7 +1440,7 @@ def _import_upstream_request(
             ConsumerStatus.ACCEPTED
             if old_status == "closed" and bool(raw.get("closed_by_run_id"))
             else ConsumerStatus.TERMINAL
-            if old_status == "closed"
+            if old_status == "closed" or package_status == str(PackageStatus.EXTERNAL)
             else ConsumerStatus.OPEN
         )
         consumer_id = _stable_record_id(
@@ -2363,6 +2372,27 @@ class StateDatabase:
                     ),
                 ).fetchone()
                 _insert_consumer(connection, attached)
+                if prior is None and not created:
+                    current_status = PackageStatus(
+                        str(
+                            connection.execute(
+                                "SELECT status FROM capability_packages WHERE id=?", (package_id,)
+                            ).fetchone()[0]
+                        )
+                    )
+                    if current_status in {
+                        PackageStatus.COMPLETE,
+                        PackageStatus.DECOMPOSED,
+                        PackageStatus.EXTERNAL,
+                    }:
+                        # New current evidence invalidates a terminal root's claim that all
+                        # consumers have been classified.  Reopen the same capability owner
+                        # instead of stranding an open consumer on an unschedulable package.
+                        connection.execute(
+                            """UPDATE capability_packages SET status=?, disposition=NULL
+                            WHERE id=?""",
+                            (str(PackageStatus.OBSERVED), package_id),
+                        )
                 changed = changed or prior is None
             for item in evidence:
                 evidence_id = item.id

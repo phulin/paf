@@ -112,7 +112,9 @@ export function DashboardSummary({
   const completion = tasks.length ? Math.round((100 * successful) / tasks.length) : 0;
   const packages = Object.values(state.capability_packages ?? {});
   const activePackages = packages.filter((item) =>
-    ["investigating", "planned", "implementing", "validating", "integrating"].includes(item.status),
+    ["observed", "investigating", "planned", "implementing", "validating", "integrating"].includes(
+      item.status,
+    ),
   ).length;
   const waitingPackages = packages.filter((item) => item.status.startsWith("waiting_")).length;
 

@@ -275,9 +275,14 @@ fn draw_package_detail(frame: &mut Frame<'_>, model: &mut DashboardModel) {
             .values()
             .filter(|item| item.package_id == package_id)
         {
+            let worker = step
+                .assigned_worker_id
+                .as_deref()
+                .map(|value| format!(" · {value}"))
+                .unwrap_or_default();
             lines.push(Line::from(format!(
-                "  {} · {} · {}",
-                step.status, step.kind, step.title
+                "  {} · {} · {}{}",
+                step.status, step.kind, step.objective, worker
             )));
         }
         lines.push(Line::styled("Evidence", Style::default().fg(CYAN)));
@@ -1773,7 +1778,8 @@ mod tests {
                     }},
                     "package_steps": {"step-1": {
                         "id": "step-1", "package_id": "package-1", "status": "implementing",
-                        "kind": "interface", "title": "Add bridge"
+                        "kind": "interface", "objective": "Add bridge",
+                        "assigned_worker_id": "worker-1"
                     }},
                     "package_evidence": {"evidence-1": {
                         "id": "evidence-1", "package_id": "package-1", "kind": "lean_probe",
@@ -1800,6 +1806,7 @@ mod tests {
         assert!(rendered.contains("Transport bridge"));
         assert!(rendered.contains("Book.target"));
         assert!(rendered.contains("Add bridge"));
+        assert!(rendered.contains("worker-1"));
         assert!(rendered.contains("Book.bridge"));
         assert!(rendered.contains("steward-1"));
     }

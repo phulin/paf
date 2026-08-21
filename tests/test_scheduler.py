@@ -28,6 +28,8 @@ from paf.corpus import WorkUnitImportGraph
 from paf.git import GitCommitError
 from paf.hashing import stable_digest_text
 from paf.models import Chapter, PipelineConfig, ProofTarget, Stage
+from paf.package_model import CapabilityPackage, PackageStatus
+from paf.package_runtime import PackageExecutionResult
 from paf.scheduler import (
     BUILD_ERROR_REVIEW_KIND,
     BUILD_WARNING_REVIEW_KIND,
@@ -116,6 +118,38 @@ class FakeExecutor(CodexExecutor):
             thread_id=result.thread_id or thread_id,
         )
         return result
+
+
+@pytest.mark.asyncio
+async def test_package_drain_schedules_newly_unblocked_dependencies(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    orchestrator = Orchestrator(config, StateStore(config))
+    await orchestrator.state.load_or_create()
+    orchestrator.git.enabled = True
+    prerequisite = CapabilityPackage("prerequisite", "key.a", "A", "Implement A")
+    dependent = CapabilityPackage("dependent", "key.b", "B", "Implement B")
+    executed: list[str] = []
+
+    class FakePackageExecution:
+        def ready_packages(self):
+            if not executed:
+                return (prerequisite,)
+            if executed == [prerequisite.id]:
+                return (dependent,)
+            return ()
+
+        async def execute(self, package_id: str) -> PackageExecutionResult:
+            executed.append(package_id)
+            return PackageExecutionResult(package_id, 1, PackageStatus.COMPLETE)
+
+    orchestrator.package_execution = FakePackageExecution()  # ty: ignore[invalid-assignment]
+
+    assert await orchestrator._schedule_ready_packages()
+    results = await orchestrator._drain_active_packages()
+
+    assert executed == [prerequisite.id, dependent.id]
+    assert [result.package_id for result in results] == executed
+    await orchestrator.state.close()
 
 
 def test_coordinator_build_output_shortens_diagnostic_paths(tmp_path: Path) -> None:
@@ -5113,6 +5147,89 @@ async def test_structural_blockers_cluster_into_one_package_without_ping_pong(
     assert len(orchestrator.state.package_state.packages) == 1
     assert len(orchestrator.state.package_state.consumers) == 2
     assert not orchestrator._package_tasks
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_external_candidate_still_requires_steward_disposition(tmp_path: Path) -> None:
+    config = with_example_modules(load_config(write_project(tmp_path, chapters="chapters = [1]")))
+    chapter = config.chapters[0]
+    source = tmp_path / "lean" / "Book" / "Chapter01.lean"
+    source.parent.mkdir(parents=True)
+    source.write_text("theorem target : True := by sorry\n", encoding="utf-8")
+    orchestrator = Orchestrator(config, StateStore(config))
+    await orchestrator.prepare()
+    attempt = failed_attempt(
+        "the result may belong to an unavailable dependency",
+        path="lean/Book/Chapter01.lean",
+        declaration="Book.target",
+    ) | {"disposition": "missing_capability"}
+    candidate = {
+        "capability_key": "external:book.target",
+        "blocked_declaration": "Book.target",
+        "consumer_path": "lean/Book/Chapter01.lean",
+        "residual_goal": attempt["remaining_goal"],
+        "needed_result": "A theorem currently believed to be external",
+        "candidate_signature": "",
+        "owner_kind": "external",
+        "owner_chapter_id": chapter.id,
+        "owner_paths": ["lean/Book/Chapter01.lean"],
+        "attempted_alternatives": attempt["attempts"],
+        "acceptance_tests": [chapter.build_command],
+    }
+    blockers = await orchestrator.state.record_proof_blockers(
+        chapter.id,
+        origin_run_id="proof-run",
+        failed_attempts=(attempt,),
+        capability_candidates=(candidate,),
+    )
+
+    package_ids = await orchestrator._attach_structural_blockers_to_packages(chapter, blockers)
+
+    package = orchestrator.state.package_state.packages[package_ids[0]]
+    assert package.status.value == "observed"
+    assert package.disposition is None
+    assert orchestrator.state.package_state.consumers_for(package.id)[0].status.value == "open"
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_structural_blocker_consumer_path_must_belong_to_work_unit(
+    tmp_path: Path,
+) -> None:
+    config = with_example_modules(load_config(write_project(tmp_path, chapters="chapters = [1]")))
+    chapter = config.chapters[0]
+    orchestrator = Orchestrator(config, StateStore(config))
+    await orchestrator.prepare()
+    attempt = failed_attempt(
+        "the report named a path outside the assigned source scope",
+        path="pyproject.toml",
+        declaration="Book.target",
+    ) | {"disposition": "missing_capability"}
+    candidate = {
+        "capability_key": "invalid.path",
+        "blocked_declaration": "Book.target",
+        "consumer_path": "pyproject.toml",
+        "residual_goal": attempt["remaining_goal"],
+        "needed_result": "Do not reserve this path",
+        "candidate_signature": "",
+        "owner_kind": "consumer",
+        "owner_chapter_id": chapter.id,
+        "owner_paths": ["pyproject.toml"],
+        "attempted_alternatives": attempt["attempts"],
+        "acceptance_tests": [chapter.build_command],
+    }
+    blockers = await orchestrator.state.record_proof_blockers(
+        chapter.id,
+        origin_run_id="proof-run",
+        failed_attempts=(attempt,),
+        capability_candidates=(candidate,),
+    )
+
+    package_ids = await orchestrator._attach_structural_blockers_to_packages(chapter, blockers)
+
+    assert package_ids == ()
+    assert orchestrator.state.package_state.packages == {}
     await orchestrator.shutdown()
 
 

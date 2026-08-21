@@ -91,12 +91,15 @@ pub struct PackageStep {
     pub id: String,
     pub package_id: String,
     pub kind: String,
-    pub title: String,
     pub objective: String,
     pub status: String,
-    pub assigned_agent_id: Option<String>,
-    pub depends_on: Vec<String>,
-    pub write_scope: Vec<String>,
+    pub assigned_worker_id: Option<String>,
+    pub intended_declarations: Vec<String>,
+    pub intended_paths: Vec<String>,
+    pub depends_on_step_ids: Vec<String>,
+    pub commit_ids: Vec<String>,
+    pub remaining_gap: String,
+    pub plan_revision: usize,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]

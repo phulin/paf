@@ -69,9 +69,7 @@ from paf.package_model import (
     CapabilityPackage,
     EvidenceKind,
     PackageConsumer,
-    PackageDisposition,
     PackageEvidence,
-    PackageStatus,
     PackageStep,
     ReservationMode,
     ReservationSpec,
@@ -778,12 +776,13 @@ class Orchestrator:
             )
             self._proof_rechecks.add(work_unit_id)
 
-    async def _schedule_ready_packages(self) -> bool:
+    async def _schedule_ready_packages(self, *, exclude: Iterable[str] = ()) -> bool:
         if not self.git.enabled:
             return False
+        excluded = set(exclude)
         launched = False
         for package in self.package_execution.ready_packages():
-            if package.id in self._package_tasks:
+            if package.id in self._package_tasks or package.id in excluded:
                 continue
             task = asyncio.create_task(
                 self._execute_package_task(package.id),
@@ -806,14 +805,20 @@ class Orchestrator:
             await self.state.refresh_package_state()
 
     async def _drain_active_packages(self) -> tuple[PackageExecutionResult, ...]:
-        tasks = tuple(self._package_tasks.values())
-        if not tasks:
-            return ()
-        try:
-            results = await asyncio.gather(*tasks)
-            return tuple(results)
-        finally:
-            self._package_tasks.clear()
+        results: list[PackageExecutionResult] = []
+        attempted: set[str] = set()
+        while self._package_tasks:
+            active = dict(self._package_tasks)
+            attempted.update(active)
+            try:
+                results.extend(await asyncio.gather(*active.values()))
+            finally:
+                for package_id, task in active.items():
+                    if self._package_tasks.get(package_id) is task:
+                        self._package_tasks.pop(package_id, None)
+            if self.config.steward.enabled:
+                await self._schedule_ready_packages(exclude=attempted)
+        return tuple(results)
 
     async def prepare(
         self,
@@ -2693,7 +2698,6 @@ class Orchestrator:
             candidate = blocker.get("capability")
             raw_key = ""
             owner_paths: list[str] = []
-            external = False
             if isinstance(candidate, dict):
                 raw_key = str(candidate.get("capability_key", "")).strip()
                 owner_paths = [
@@ -2703,17 +2707,17 @@ class Orchestrator:
                     and path.strip()
                     and self._path_owner_ids(str(path).strip())
                 ]
-                external = str(candidate.get("owner_kind", "")) == "external"
             declaration = str(blocker.get("declaration", "")).strip()
             residual_goal = self._normalized_blocker_goal(blocker)
             capability_key = raw_key or f"proof-capability:{declaration}:{residual_goal}"
             digest = hashlib.sha256(capability_key.casefold().encode()).hexdigest()[:20]
             package_id = f"package-{digest}"
             consumer_path = str(blocker.get("path", "")).strip()
+            if chapter.id not in self._path_owner_ids(consumer_path):
+                continue
             paths = tuple(dict.fromkeys([*owner_paths, consumer_path]))
             if not consumer_path or not paths:
                 continue
-            status = PackageStatus.EXTERNAL if external else PackageStatus.OBSERVED
             package = CapabilityPackage(
                 package_id,
                 capability_key,
@@ -2724,8 +2728,6 @@ class Orchestrator:
                     else blocker.get("obstruction", "")
                 ).strip()
                 or f"Resolve the structural proof obstruction for {declaration}",
-                status=status,
-                disposition=(PackageDisposition.EXTERNAL if external else None),
                 write_scope=paths,
                 expansion_scope=paths,
             )

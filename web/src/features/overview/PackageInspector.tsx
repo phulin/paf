@@ -132,12 +132,12 @@ function PackageDetail({ state, value }: { state: SwarmState; value: CapabilityP
       <PackageSection title="Plan steps" empty="No plan recorded">
         {steps.map((item) => (
           <article key={item.id}>
-            <strong>{item.title}</strong>
+            <strong>{item.objective}</strong>
             <span>
               {item.kind} · {item.status}
-              {item.assigned_agent_id ? ` · ${item.assigned_agent_id}` : ""}
+              {item.assigned_worker_id ? ` · ${item.assigned_worker_id}` : ""}
             </span>
-            <p>{item.objective}</p>
+            <p>{item.intended_declarations.join(", ") || item.intended_paths.join(", ")}</p>
           </article>
         ))}
       </PackageSection>

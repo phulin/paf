@@ -83,6 +83,13 @@ class IntegrationResult:
     journal_id: str = ""
 
 
+@dataclass(frozen=True)
+class IntegrationPreparation:
+    package_id: str
+    candidate_revision: str
+    canonical_revision: str
+
+
 def _slug(value: str) -> str:
     clean = re.sub(r"[^A-Za-z0-9._-]+", "-", value).strip("-.")
     if not clean:
@@ -390,6 +397,30 @@ class PackageIntegrator:
         package = self.database.load_package_state().packages[journal.package_id]
         return self.database.record_integration_journal(journal, expected_revision=package.revision)
 
+    def prepare_candidate(self, package_id: str, lease_generation: int) -> IntegrationPreparation:
+        """Update a clean candidate to one exact canonical revision before validation."""
+
+        package = self.database.load_package_state().packages[package_id]
+        if not package.worktree:
+            raise ValueError(f"package {package_id} has no worktree")
+        worktree = Path(package.worktree)
+        with self._canonical_lock():
+            self.database.assert_live_steward_lease(package_id, lease_generation)
+            self._require_clean(self.repo, "canonical")
+            self._require_clean(worktree, "package")
+            canonical = self.git.head()
+            if canonical != package.base_revision:
+                self.git.run("rebase", canonical, cwd=worktree)
+                package = self.database.update_package_workspace(
+                    package_id,
+                    expected_revision=package.revision,
+                    lease_generation=lease_generation,
+                    base_revision=canonical,
+                    branch=package.branch,
+                    worktree=package.worktree,
+                )
+            return IntegrationPreparation(package_id, self.git.head(worktree), canonical)
+
     def integrate(
         self,
         package_id: str,
@@ -399,7 +430,11 @@ class PackageIntegrator:
         interface_digest: Callable[[str], str | None],
         provisional_consumer_ids: tuple[str, ...] = (),
         max_stale_retries: int = 2,
+        validated_candidate_revision: str | None = None,
+        validated_canonical_revision: str | None = None,
     ) -> IntegrationResult:
+        if (validated_candidate_revision is None) != (validated_canonical_revision is None):
+            raise ValueError("prevalidated integration requires both candidate revisions")
         for attempt in range(max_stale_retries + 1):
             package = self.database.load_package_state().packages[package_id]
             if not package.worktree:
@@ -410,6 +445,24 @@ class PackageIntegrator:
                 self._require_clean(self.repo, "canonical")
                 self._require_clean(worktree, "package")
                 canonical_before = self.git.head()
+                candidate_before = self.git.head(worktree)
+                if validated_candidate_revision is not None:
+                    if candidate_before != validated_candidate_revision:
+                        return IntegrationResult(
+                            False,
+                            package_id,
+                            candidate_before,
+                            canonical_before,
+                            stale_reason="package candidate changed after validation",
+                        )
+                    if canonical_before != validated_canonical_revision:
+                        return IntegrationResult(
+                            False,
+                            package_id,
+                            candidate_before,
+                            canonical_before,
+                            stale_reason="canonical revision changed during package validation",
+                        )
                 if canonical_before != package.base_revision:
                     self.git.run("rebase", canonical_before, cwd=worktree)
                     package = self.database.update_package_workspace(
@@ -449,6 +502,25 @@ class PackageIntegrator:
                 self.database.assert_live_steward_lease(package_id, lease_generation)
                 self._require_clean(self.repo, "canonical")
                 current = self.git.head()
+                candidate_after_validation = self.git.head(worktree)
+                dirty_candidate = self.git.dirty_paths(worktree)
+                if candidate_after_validation != candidate or dirty_candidate:
+                    journal = replace(journal, phase=IntegrationPhase.ABORTED)
+                    self._record(journal)
+                    reason = (
+                        "package candidate changed during validation"
+                        if candidate_after_validation != candidate
+                        else "package worktree became dirty during validation"
+                    )
+                    return IntegrationResult(
+                        False,
+                        package_id,
+                        candidate,
+                        current,
+                        validation_digest,
+                        reason,
+                        journal.id,
+                    )
                 changes = self.interfaces.check(package_id, interface_digest)
                 if current != canonical_before:
                     journal = replace(journal, phase=IntegrationPhase.ABORTED)
@@ -779,6 +851,23 @@ class PackageExecutionLayer:
         )
         return lease, self._current(package.id)
 
+    async def _heartbeat_lease(self, lease: StewardLease, stop: asyncio.Event) -> None:
+        """Renew package authority through workers, validation, and integration."""
+
+        interval = max(0.01, min(60.0, self.lease_ttl_seconds / 3))
+        while True:
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=interval)
+                return
+            except TimeoutError:
+                await asyncio.to_thread(
+                    self.database.heartbeat_steward_lease,
+                    lease.package_id,
+                    lease.agent_id,
+                    lease.generation,
+                    ttl_seconds=self.lease_ttl_seconds,
+                )
+
     def _reserve_initial_scope(
         self, package: CapabilityPackage, generation: int
     ) -> CapabilityPackage:
@@ -932,9 +1021,15 @@ class PackageExecutionLayer:
         if not isinstance(raw_steps, list):
             raise PackageReportError("package plan steps must be an array")
         next_revision = self._current(package_id).plan_revision + 1
+        existing_steps = self.database.load_package_state().steps_for(package_id)
+        reported_ids = tuple(
+            str(value.get("step_id", "")) for value in raw_steps if isinstance(value, dict)
+        )
+        if len(set(reported_ids)) != len(reported_ids):
+            raise PackageReportError("package plan repeats a step id")
         known_ids = {
-            value.id for value in self.database.load_package_state().steps_for(package_id)
-        } | {str(value.get("step_id", "")) for value in raw_steps if isinstance(value, dict)}
+            value.id for value in existing_steps if value.status is PackageStepStatus.COMPLETE
+        } | set(reported_ids)
         reservations = tuple(
             value
             for value in self.database.load_package_state().reservations.values()
@@ -991,6 +1086,23 @@ class PackageExecutionLayer:
                     remaining_gap=existing.remaining_gap if existing is not None else "",
                     plan_revision=next_revision,
                     created_at=existing.created_at if existing is not None else "",
+                ),
+                expected_revision=package.revision,
+                lease_generation=generation,
+            )
+        for existing in existing_steps:
+            if existing.id in reported_ids or existing.status in {
+                PackageStepStatus.COMPLETE,
+                PackageStepStatus.SUPERSEDED,
+            }:
+                continue
+            package = self._current(package_id)
+            self.database.upsert_package_step(
+                replace(
+                    existing,
+                    status=PackageStepStatus.SUPERSEDED,
+                    assigned_worker_id=None,
+                    plan_revision=next_revision,
                 ),
                 expected_revision=package.revision,
                 lease_generation=generation,
@@ -1303,7 +1415,10 @@ class PackageExecutionLayer:
         if (
             disposition == "complete"
             and report.get("complete") is True
-            and all(value.status is PackageStepStatus.COMPLETE for value in steps)
+            and all(
+                value.status in {PackageStepStatus.COMPLETE, PackageStepStatus.SUPERSEDED}
+                for value in steps
+            )
             and all(value.status is not ConsumerStatus.OPEN for value in consumers)
         ):
             return PackageStatus.COMPLETE, PackageDisposition.IMPLEMENTED
@@ -1370,6 +1485,11 @@ class PackageExecutionLayer:
             return PackageExecutionResult(package_id, 0, package.status, detail="already terminal")
         lease, package = self._claim(package)
         generation = lease.generation
+        heartbeat_stop = asyncio.Event()
+        heartbeat = asyncio.create_task(
+            self._heartbeat_lease(lease, heartbeat_stop),
+            name=f"paf-package-heartbeat-{package_id}",
+        )
         try:
             package = self._reserve_initial_scope(package, generation)
             retained_dirty = bool(
@@ -1439,6 +1559,10 @@ class PackageExecutionLayer:
                 expected_revision=package.revision,
                 lease_generation=generation,
             )
+            preparation = await asyncio.to_thread(
+                self.integrator.prepare_candidate, package_id, generation
+            )
+            package = self._current(package_id)
             package_validation = await _await_validation(self.validate_package(worktree, package))
             self._append_evidence(
                 package_id,
@@ -1477,6 +1601,8 @@ class PackageExecutionLayer:
                 validate=lambda _path: package_validation.digest,
                 interface_digest=self.interface_digest,
                 provisional_consumer_ids=accepted,
+                validated_candidate_revision=preparation.candidate_revision,
+                validated_canonical_revision=preparation.canonical_revision,
             )
             if not integration.integrated:
                 current = self._current(package_id)
@@ -1567,6 +1693,8 @@ class PackageExecutionLayer:
         finally:
             # Terminal/retry scheduling obtains a fresh lease; reservations remain package-owned
             # unless integration finalized and released them.
+            heartbeat_stop.set()
+            await asyncio.gather(heartbeat, return_exceptions=True)
             with suppress(ValueError):
                 self.database.release_steward_lease(
                     package_id,

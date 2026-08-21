@@ -96,12 +96,15 @@ export interface PackageStep {
   id: string;
   package_id: string;
   kind: string;
-  title: string;
   objective: string;
   status: string;
-  assigned_agent_id?: string | null;
-  depends_on: string[];
-  write_scope: string[];
+  assigned_worker_id?: string | null;
+  intended_declarations: string[];
+  intended_paths: string[];
+  depends_on_step_ids: string[];
+  commit_ids: string[];
+  remaining_gap: string;
+  plan_revision: number;
 }
 
 export interface PackageEvidence {

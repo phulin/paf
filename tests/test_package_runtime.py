@@ -347,6 +347,31 @@ def test_integration_rejects_dirty_worktree_and_changed_interface(tmp_path: Path
     assert run_git(repo, "rev-parse", "HEAD") == current.base_revision
 
 
+def test_integration_rejects_candidate_mutation_during_validation(tmp_path: Path) -> None:
+    repo = git_repo(tmp_path)
+    store, current, generation, worktree = prepared_package(repo)
+    commit_candidate(worktree)
+    canonical_before = run_git(repo, "rev-parse", "HEAD")
+
+    def validate(path: Path) -> str:
+        (path / "lean" / "Book.lean").write_text("def base := 3\n", encoding="utf-8")
+        return "validation"
+
+    result = PackageIntegrator(repo, repo / ".paf", store).integrate(
+        current.id,
+        generation,
+        validate=validate,
+        interface_digest=lambda _: None,
+    )
+
+    assert not result.integrated
+    assert result.stale_reason == "package worktree became dirty during validation"
+    assert run_git(repo, "rev-parse", "HEAD") == canonical_before
+    assert store.load_package_state().integration_journal[result.journal_id].phase is (
+        IntegrationPhase.ABORTED
+    )
+
+
 def test_stale_integration_does_not_publish_provisional_consumer_acceptance(
     tmp_path: Path,
 ) -> None:
@@ -1004,6 +1029,139 @@ async def test_package_execution_accepts_consumers_independently_and_wakes_only_
     state = store.load_package_state()
     assert state.consumers["consumer-a"].status is ConsumerStatus.ACCEPTED
     assert state.consumers["consumer-b"].status is ConsumerStatus.OPEN
+
+
+@pytest.mark.asyncio
+async def test_runtime_does_not_publish_a_candidate_rebased_after_validation(
+    tmp_path: Path,
+) -> None:
+    repo = git_repo(tmp_path)
+    store = StateDatabase(repo / ".paf")
+    store.initialize()
+    current = package(store, "P-prevalidated")
+    report = disposition_report("complete", ())
+
+    async def run_steward(_package, _dossier, worktree):
+        (worktree / "lean" / "Book.lean").write_text("def base := 2\n", encoding="utf-8")
+        return report
+
+    async def validate_package(_worktree, _package):
+        (repo / "README.md").write_text("concurrent canonical edit\n", encoding="utf-8")
+        run_git(repo, "add", "README.md")
+        run_git(repo, "commit", "-m", "docs: concurrent validation edit")
+        return PackageValidation(True, "package", "validated before canonical changed")
+
+    runtime = PackageExecutionLayer(
+        repo,
+        repo / ".paf",
+        store,
+        run_steward=run_steward,
+        run_worker=lambda *_args: asyncio.sleep(0, result={}),
+        validate_step=lambda *_args: PackageValidation(True, "step", "ok"),
+        validate_package=validate_package,
+        validate_consumer=lambda _path, consumer: ConsumerValidation(
+            False, "consumer", "not checked", consumer.id
+        ),
+    )
+
+    result = await runtime.execute(current.id)
+
+    assert result.status is PackageStatus.INVESTIGATING
+    assert result.detail == "canonical revision changed during package validation"
+    assert (repo / "lean" / "Book.lean").read_text(encoding="utf-8") == "def base := 1\n"
+    assert (repo / "README.md").read_text(encoding="utf-8") == "concurrent canonical edit\n"
+
+
+@pytest.mark.asyncio
+async def test_package_lease_is_renewed_during_validation(tmp_path: Path) -> None:
+    repo = git_repo(tmp_path)
+    store = StateDatabase(repo / ".paf")
+    store.initialize()
+    current = package(store, "P-heartbeat")
+    report = disposition_report("complete", ())
+
+    async def validate_package(_worktree, _package):
+        await asyncio.sleep(0.7)
+        return PackageValidation(True, "package", "slow validation completed")
+
+    runtime = PackageExecutionLayer(
+        repo,
+        repo / ".paf",
+        store,
+        run_steward=lambda *_args: asyncio.sleep(0, result=report),
+        run_worker=lambda *_args: asyncio.sleep(0, result={}),
+        validate_step=lambda *_args: PackageValidation(True, "step", "ok"),
+        validate_package=validate_package,
+        validate_consumer=lambda _path, consumer: ConsumerValidation(
+            False, "consumer", "not checked", consumer.id
+        ),
+        lease_ttl_seconds=0.3,
+    )
+
+    result = await runtime.execute(current.id)
+
+    assert result.status is PackageStatus.COMPLETE
+
+
+@pytest.mark.asyncio
+async def test_replan_supersedes_abandoned_incomplete_steps(tmp_path: Path) -> None:
+    repo = git_repo(tmp_path)
+    store = StateDatabase(repo / ".paf")
+    store.initialize()
+    current = package(store, "P-replan")
+    first_report = disposition_report("continue", ())
+    first_report["plan_revision"] = {
+        "base_revision": 0,
+        "revision_reason": "Try the initial interface plan.",
+        "steps": [
+            {
+                "step_id": "abandoned",
+                "objective": "Try an interface that evidence later disproves",
+                "kind": "interface",
+                "intended_declarations": ["abandonedBridge"],
+                "intended_paths": ["lean/Book.lean"],
+                "depends_on_step_ids": [],
+                "validation_commands": ["check abandonedBridge"],
+            }
+        ],
+    }
+    second_report = disposition_report("complete", ())
+    second_report["plan_revision"] = {
+        "base_revision": 1,
+        "revision_reason": "Evidence disproved the abandoned interface plan.",
+        "steps": [],
+    }
+    reports = [first_report, second_report]
+    validations = 0
+
+    async def validate_package(_worktree, _package):
+        nonlocal validations
+        validations += 1
+        return PackageValidation(
+            validations > 1,
+            f"package-{validations}",
+            "first plan disproved" if validations == 1 else "revised plan validated",
+        )
+
+    runtime = PackageExecutionLayer(
+        repo,
+        repo / ".paf",
+        store,
+        run_steward=lambda *_args: asyncio.sleep(0, result=reports.pop(0)),
+        run_worker=lambda *_args: asyncio.sleep(0, result={}),
+        validate_step=lambda *_args: PackageValidation(True, "step", "ok"),
+        validate_package=validate_package,
+        validate_consumer=lambda _path, consumer: ConsumerValidation(
+            False, "consumer", "not checked", consumer.id
+        ),
+    )
+
+    first = await runtime.execute(current.id)
+    second = await runtime.execute(current.id)
+
+    assert first.status is PackageStatus.IMPLEMENTING
+    assert second.status is PackageStatus.COMPLETE
+    assert store.load_package_state().steps["abandoned"].status.value == "superseded"
 
 
 @pytest.mark.asyncio

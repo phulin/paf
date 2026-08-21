@@ -15,6 +15,7 @@ from paf.package_model import (
     IntegrationPhase,
     PackageConsumer,
     PackageDependency,
+    PackageDisposition,
     PackageEvidence,
     PackageStatus,
     PackageStep,
@@ -141,6 +142,35 @@ def test_create_deduplicates_capability_and_persists_normalized_records(
     with sqlite3.connect(store.path) as connection:
         assert connection.execute("SELECT count(*) FROM capability_packages").fetchone() == (1,)
         assert connection.execute("SELECT count(*) FROM package_consumers").fetchone() == (2,)
+
+
+@pytest.mark.parametrize("terminal", [PackageStatus.COMPLETE, PackageStatus.EXTERNAL])
+def test_new_consumer_reopens_a_terminal_capability_owner(
+    tmp_path: Path, terminal: PackageStatus
+) -> None:
+    store = database(tmp_path)
+    current, _ = store.create_or_attach_capability_package(package("package-a", "key.a"))
+    current = store.update_package_lifecycle(
+        current.id,
+        terminal,
+        disposition=(
+            PackageDisposition.IMPLEMENTED
+            if terminal is PackageStatus.COMPLETE
+            else PackageDisposition.EXTERNAL
+        ),
+        expected_revision=current.revision,
+    )
+
+    reopened, created = store.create_or_attach_capability_package(
+        package("ignored", "key.a"),
+        consumer=consumer("consumer-new", "ignored", "Book.newConsumer"),
+        expected_revision=current.revision,
+    )
+
+    assert not created
+    assert reopened.status is PackageStatus.OBSERVED
+    assert reopened.disposition is None
+    assert store.load_package_state().consumers["consumer-new"].status is ConsumerStatus.OPEN
 
 
 def test_package_mutations_are_revisioned_and_lease_fenced(tmp_path: Path) -> None:
@@ -391,3 +421,47 @@ async def test_legacy_upstream_state_imports_once_without_runtime_projection(
     assert "upstream_request_imports" not in checkpoint
     assert checkpoint["capability_packages"][package_id]["status"] == "observed"
     assert checkpoint["package_consumers"]
+
+
+def test_legacy_owner_hypotheses_do_not_bypass_steward_disposition(tmp_path: Path) -> None:
+    store = database(tmp_path)
+    requests = {
+        "shared": {
+            "capability_key": "Book.Shared",
+            "owner_kind": "shared",
+            "consumer_chapter_id": "book/chapter-02",
+            "consumer_path": "lean/Book/Chapter02.lean",
+            "blocked_declaration": "Book.sharedConsumer",
+            "needed_result": "A shared bridge",
+        },
+        "external-proposal": {
+            "capability_key": "Book.ProposedExternal",
+            "owner_kind": "external",
+            "consumer_chapter_id": "book/chapter-02",
+            "consumer_path": "lean/Book/Chapter02.lean",
+            "blocked_declaration": "Book.externalConsumer",
+            "needed_result": "A possibly external bridge",
+        },
+        "confirmed-external": {
+            "capability_key": "Book.ConfirmedExternal",
+            "owner_kind": "external",
+            "consumer_chapter_id": "book/chapter-02",
+            "consumer_path": "lean/Book/Chapter02.lean",
+            "blocked_declaration": "Book.confirmedExternalConsumer",
+            "needed_result": "An unavailable external theorem",
+            "answer": {
+                "disposition": "external",
+                "rejection_reason": "The dependency is unavailable.",
+            },
+        },
+    }
+
+    imported = store.import_legacy_upstream_state(requests)
+    state = store.load_package_state()
+
+    assert state.packages[imported["shared"]].status is PackageStatus.OBSERVED
+    assert state.packages[imported["external-proposal"]].status is PackageStatus.OBSERVED
+    confirmed = state.packages[imported["confirmed-external"]]
+    assert confirmed.status is PackageStatus.EXTERNAL
+    assert confirmed.disposition is PackageDisposition.EXTERNAL
+    assert state.consumers_for(confirmed.id)[0].status is ConsumerStatus.TERMINAL
