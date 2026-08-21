@@ -560,7 +560,9 @@ def load_config(path: str | Path, *, project: Project | None = None) -> Pipeline
     if unsupported := removed_sweep_keys.intersection(raw_steward):
         raise ValueError(f"repair-sweep settings were removed: {', '.join(sorted(unsupported))}")
     steward = StewardSettings(
-        enabled=bool(raw_steward.get("enabled", True)),
+        # Retained only so existing configuration files continue to parse. Capability packages
+        # are an archive after schema v11 and cannot launch Steward agents.
+        enabled=False,
         model=str(raw_steward.get("model", "gpt-5.6-sol")),
         reasoning_effort=str(raw_steward.get("reasoning_effort", "medium")),
         worker_model=str(raw_steward.get("worker_model", "gpt-5.6-sol")),

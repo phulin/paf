@@ -198,6 +198,34 @@ def test_create_deduplicates_capability_and_persists_normalized_records(
         assert connection.execute("SELECT count(*) FROM package_consumers").fetchone() == (2,)
 
 
+@pytest.mark.asyncio
+async def test_schema_v10_open_consumers_migrate_to_upstream_requests(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    state = StateStore(config)
+    await state.load_or_create()
+    await state.create_or_attach_capability_package(
+        package("legacy-package", "Book.Transport", "lean/Book/Chapter01.lean"),
+        consumer=consumer("legacy-consumer", "legacy-package", "Book.consumer"),
+    )
+    await state.close()
+    with sqlite3.connect(state.database_path) as connection, connection:
+        connection.execute("UPDATE meta SET schema_version=10 WHERE singleton=1")
+        connection.execute("PRAGMA user_version=10")
+
+    migrated = StateStore(config)
+    await migrated.load_or_create()
+
+    request = migrated.upstream_requests["upstream-legacy-consumer"]
+    assert request["consumer_chapter_id"] == "book/chapter-02"
+    assert request["owner_paths"] == ["lean/Book/Chapter01.lean"]
+    assert request["legacy_package_id"] == "legacy-package"
+    assert migrated.package_state.packages["legacy-package"].status == PackageStatus.OBSERVED
+    with sqlite3.connect(migrated.database_path) as connection:
+        assert connection.execute("SELECT count(*) FROM steward_leases").fetchone() == (0,)
+        assert connection.execute("SELECT count(*) FROM path_reservations").fetchone() == (0,)
+    await migrated.close()
+
+
 @pytest.mark.parametrize("terminal", [PackageStatus.COMPLETE, PackageStatus.EXTERNAL])
 def test_new_consumer_reopens_a_terminal_capability_owner(
     tmp_path: Path, terminal: PackageStatus
@@ -466,7 +494,7 @@ async def test_legacy_upstream_state_imports_once_without_runtime_projection(
 
     checkpoint = read_checkpoint(config.settings.state_dir)
     assert checkpoint is not None
-    assert "upstream_requests" not in checkpoint
+    assert checkpoint["upstream_requests"] == {}
     assert "upstream_request_imports" not in checkpoint
     assert checkpoint["capability_packages"][package_id]["status"] == "observed"
     assert checkpoint["package_consumers"]

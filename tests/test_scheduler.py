@@ -245,11 +245,11 @@ async def test_package_drain_schedules_newly_unblocked_dependencies(tmp_path: Pa
 
     orchestrator.package_execution = FakePackageExecution()  # ty: ignore[invalid-assignment]
 
-    assert await orchestrator._schedule_ready_packages()
+    assert not await orchestrator._schedule_ready_packages()
     results = await orchestrator._drain_active_packages()
 
-    assert executed == [prerequisite.id, dependent.id]
-    assert [result.package_id for result in results] == executed
+    assert executed == []
+    assert results == ()
     await orchestrator.state.close()
 
 
@@ -279,11 +279,8 @@ async def test_package_drain_continues_nonterminal_package_turns(tmp_path: Path)
 
     results = await orchestrator._drain_active_packages()
 
-    assert executions == 2
-    assert [result.status for result in results] == [
-        PackageStatus.IMPLEMENTING,
-        PackageStatus.COMPLETE,
-    ]
+    assert executions == 0
+    assert results == ()
     assert not orchestrator._package_tasks
     await orchestrator.state.close()
 
@@ -312,11 +309,12 @@ async def test_package_scheduler_limits_concurrency_per_work_unit(tmp_path: Path
 
     orchestrator.package_execution = FakePackageExecution()  # ty: ignore[invalid-assignment]
 
-    assert await orchestrator._schedule_ready_packages()
-    assert tuple(orchestrator._package_tasks) == (packages[0].id,)
+    assert not await orchestrator._schedule_ready_packages()
+    assert not orchestrator._package_tasks
     results = await orchestrator._drain_active_packages()
 
-    assert [result.package_id for result in results] == [package.id for package in packages]
+    assert results == ()
+    assert completed == set()
     assert not orchestrator._package_tasks
     await orchestrator.state.close()
 
@@ -426,7 +424,7 @@ def finding_resolution(
         "action": action,
         "explanation": explanation,
         "retry_contract": retry_contract,
-        "capability": capability,
+        "upstream_request": capability,
         "dependency_ids": dependency_ids or [],
     }
 
@@ -5379,24 +5377,22 @@ async def test_standalone_failed_proof_attempt_queues_durable_review(
     review = orchestrator.state.task(chapter.id, Stage.REVIEW)
     proof = orchestrator.state.task(chapter.id, Stage.PROVE)
     assert review.status == TaskStatus.SUCCEEDED
-    assert proof.status == TaskStatus.BLOCKED, (
+    assert proof.status == TaskStatus.PENDING, (
         proof.detail,
         orchestrator.state.proof_blockers,
         orchestrator.state.package_state.as_dict(),
     )
     assert proof.source_digest is None
     feedback, request_ids = orchestrator._proof_review_feedback(chapter.id)
-    assert not feedback
-    assert not request_ids
-    packages = orchestrator.state.package_state.packages
-    assert len(packages) == 1
-    assert next(iter(packages.values())).status.value == "observed"
+    assert feedback
+    assert request_ids
+    assert orchestrator.state.package_state.packages == {}
     assert orchestrator.state.fixup_requests == {}
     await orchestrator.shutdown()
 
 
 @pytest.mark.asyncio
-async def test_structural_blockers_cluster_into_one_package_without_ping_pong(
+async def test_structural_blockers_create_one_upstream_request_without_ping_pong(
     tmp_path: Path,
 ) -> None:
     config = with_example_modules(
@@ -5406,7 +5402,7 @@ async def test_structural_blockers_cluster_into_one_package_without_ping_pong(
     await orchestrator.prepare()
     first, second = config.chapters
 
-    async def attach(chapter: Chapter, blocker_id: str) -> str:
+    async def request(chapter: Chapter, blocker_id: str) -> str:
         path = f"lean/Book/Chapter{chapter.number:02d}.lean"
         attempt = failed_attempt(
             "the shared bridge is missing",
@@ -5432,16 +5428,16 @@ async def test_structural_blockers_cluster_into_one_package_without_ping_pong(
             failed_attempts=(attempt,),
             capability_candidates=(candidate,),
         )
-        package_ids = await orchestrator._attach_structural_blockers_to_packages(chapter, blockers)
-        return package_ids[0]
+        request_ids = await orchestrator._request_upstream_for_blockers(chapter, blockers)
+        return request_ids[0]
 
-    first_package = await attach(first, "first")
-    second_package = await attach(second, "second")
-    repeated_package = await attach(second, "second-repeat")
+    first_request = await request(second, "second")
+    repeated_request = await request(second, "second-repeat")
 
-    assert first_package == second_package == repeated_package
-    assert len(orchestrator.state.package_state.packages) == 1
-    assert len(orchestrator.state.package_state.consumers) == 2
+    assert first_request == repeated_request
+    assert len(orchestrator.state.upstream_requests) == 1
+    assert orchestrator.state.upstream_requests[first_request]["owner_chapter_id"] == first.id
+    assert orchestrator.state.package_state.packages == {}
     assert not orchestrator._package_tasks
     await orchestrator.shutdown()
 
@@ -5480,12 +5476,10 @@ async def test_external_candidate_still_requires_steward_disposition(tmp_path: P
         capability_candidates=(candidate,),
     )
 
-    package_ids = await orchestrator._attach_structural_blockers_to_packages(chapter, blockers)
+    request_ids = await orchestrator._request_upstream_for_blockers(chapter, blockers)
 
-    package = orchestrator.state.package_state.packages[package_ids[0]]
-    assert package.status.value == "observed"
-    assert package.disposition is None
-    assert orchestrator.state.package_state.consumers_for(package.id)[0].status.value == "open"
+    assert request_ids == ()
+    assert orchestrator.state.upstream_requests == {}
     await orchestrator.shutdown()
 
 
@@ -5522,9 +5516,9 @@ async def test_structural_blocker_consumer_path_must_belong_to_work_unit(
         capability_candidates=(candidate,),
     )
 
-    package_ids = await orchestrator._attach_structural_blockers_to_packages(chapter, blockers)
+    request_ids = await orchestrator._request_upstream_for_blockers(chapter, blockers)
 
-    assert package_ids == ()
+    assert request_ids == ()
     assert orchestrator.state.package_state.packages == {}
     await orchestrator.shutdown()
 
@@ -5535,7 +5529,7 @@ async def test_structural_blocker_consumer_path_must_belong_to_work_unit(
     [
         ("repair_and_retry", True, ProofBlockerStatus.OPEN),
         ("retry_with_route", False, ProofBlockerStatus.OPEN),
-        ("attach_package", False, ProofBlockerStatus.WAITING_DEPENDENCY),
+        ("request_upstream", False, ProofBlockerStatus.BLOCKED),
     ],
 )
 async def test_completed_review_routes_blocker_by_structured_action(
@@ -5590,8 +5584,8 @@ async def test_completed_review_routes_blocker_by_structured_action(
     if expected is ProofBlockerStatus.OPEN:
         assert state.proof_blockers[blocker_id]["retry_sighting_baseline"] == 1
     else:
-        assert state.task(chapter.id, Stage.PROVE).status == TaskStatus.PENDING
-        assert state.proof_blockers[blocker_id]["package_id"] in state.package_state.packages
+        assert state.task(chapter.id, Stage.PROVE).status == TaskStatus.BLOCKED
+        assert state.package_state.packages == {}
     assert state.proof_blockers[blocker_id]["review_exchange_count"] == 1
     assert request_id not in state.proof_review_requests
     await orchestrator.shutdown()
@@ -5747,7 +5741,7 @@ async def test_noop_proof_review_routes_once_to_package(tmp_path: Path) -> None:
             "finding_assessments": [
                 finding_resolution(
                     f"{request_id}:1",
-                    action="attach_package",
+                    action="request_upstream",
                     diagnosis="genuine_blocker",
                 )
             ],
@@ -5757,19 +5751,18 @@ async def test_noop_proof_review_routes_once_to_package(tmp_path: Path) -> None:
     await state.finish_proof_review_requests(chapter.id, (request_id,))
 
     blocker = state.proof_blockers[blocker_id]
-    assert blocker["status"] == ProofBlockerStatus.WAITING_DEPENDENCY.value
+    assert blocker["status"] == ProofBlockerStatus.BLOCKED.value
     assert blocker["review_exchange_count"] == 1
     assert len(blocker["review_responses"]) == 1
     proof = state.task(chapter.id, Stage.PROVE)
-    assert proof.status == TaskStatus.PENDING
-    assert "capability package" in proof.detail
-    assert blocker["package_id"] in state.package_state.packages
+    assert proof.status == TaskStatus.BLOCKED
+    assert state.package_state.packages == {}
     assert state.task(chapter.id, Stage.REVIEW).status == TaskStatus.SUCCEEDED
     await orchestrator.shutdown()
 
 
 @pytest.mark.asyncio
-async def test_proof_review_can_attach_missing_capability_package(tmp_path: Path) -> None:
+async def test_proof_review_can_open_upstream_request(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
     owner, consumer = config.chapters
     root = tmp_path / "lean" / "Book"
@@ -5810,7 +5803,7 @@ async def test_proof_review_can_attach_missing_capability_package(tmp_path: Path
                 finding_resolution(
                     f"{request_id}:1",
                     diagnosis="missing_capability",
-                    action="attach_package",
+                    action="request_upstream",
                     capability={
                         "capability_key": "book.transport",
                         "blocked_declaration": "Book.target",
@@ -5833,14 +5826,12 @@ async def test_proof_review_can_attach_missing_capability_package(tmp_path: Path
         consumer, "reviewed", proof_request_ids=(request_id,)
     )
     blocker = state.proof_blockers[blocker_id]
-    assert blocker["status"] == ProofBlockerStatus.WAITING_DEPENDENCY
-    package = state.package_state.packages[blocker["package_id"]]
-    assert package.capability_key == "book.transport"
-    assert package.write_scope == (
-        "lean/Book/Chapter01.lean",
-        "lean/Book/Chapter02.lean",
-    )
-    assert state.package_state.consumers_for(package.id)[0].work_unit_id == consumer.id
+    assert blocker["status"] == ProofBlockerStatus.UPSTREAM_REQUESTED
+    upstream = state.upstream_requests[blocker["upstream_request_id"]]
+    assert upstream["capability_key"] == "book.transport"
+    assert upstream["owner_chapter_id"] == owner.id
+    assert upstream["consumer_chapter_id"] == consumer.id
+    assert state.package_state.packages == {}
     await orchestrator.shutdown()
 
 
@@ -5970,7 +5961,7 @@ async def test_exhausted_retry_contract_requires_package_without_second_review(
         failed_attempts=[failed_attempt("the original strategy failed")],
     )
 
-    assert retained[0]["status"] == ProofBlockerStatus.PACKAGE_REQUIRED
+    assert retained[0]["status"] == ProofBlockerStatus.OPEN
     assert retained[0]["last_attempted_retry_cause_digest"] == "checked-route-v1"
     assert state.routing_metrics["unchanged_retry_suppressed"] == 1
     await state.close()
@@ -7402,7 +7393,7 @@ async def test_obstructed_proof_chunk_does_not_prevent_independent_chunk(
         "first",
         "second",
     ]
-    assert state.task(chapter.id, Stage.PROVE).status == TaskStatus.BLOCKED
+    assert state.task(chapter.id, Stage.PROVE).status == TaskStatus.PENDING
     assert "theorem second : True := by trivial" in source.read_text(encoding="utf-8")
     await orchestrator.shutdown()
 

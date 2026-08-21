@@ -47,7 +47,7 @@ from paf.package_model import (
 
 DATABASE_NAME = "state.sqlite3"
 LEGACY_BACKUP_NAME = "state.legacy-v6.json"
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 CHANGE_RETENTION = 10_000
 
 COLLECTION_SECTIONS = frozenset(
@@ -55,6 +55,7 @@ COLLECTION_SECTIONS = frozenset(
         "scheduling",
         "fixup_requests",
         "proof_review_requests",
+        "upstream_requests",
         "proof_blockers",
         "thread_cumulative_usage",
         "coordinator_targets",
@@ -65,7 +66,6 @@ NORMALIZED_STATE_KEYS = COLLECTION_SECTIONS.difference({"coordinator_targets"}) 
 LEGACY_RUNTIME_KEYS = frozenset(
     {
         "shepherd",
-        "upstream_requests",
         "upstream_request_batches",
         "failure_records",
         "repair_cases",
@@ -978,10 +978,10 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             connection.execute(f"ALTER TABLE runs ADD COLUMN {name} {declaration}")
     if previous_version == 2:
         _migrate_v2_globals(connection)
-    _import_persisted_upstream_requests(connection)
+    _migrate_package_consumers_to_upstream_requests(connection)
     connection.execute(
         "DELETE FROM state_items WHERE section IN "
-        "('upstream_requests', 'failure_records', 'repair_cases', 'repair_sweeps', "
+        "('failure_records', 'repair_cases', 'repair_sweeps', "
         "'repair_work_units')"
     )
     connection.execute(
@@ -1061,7 +1061,6 @@ def _migrate_v2_globals(connection: sqlite3.Connection) -> None:
         _replace_collection(connection, section, checkpoint.get(section, {}))
     for section in GRAPH_SECTIONS:
         _replace_graph(connection, section, checkpoint.get(section, {}))
-    _import_legacy_request_mapping(connection, checkpoint.get("upstream_requests"))
     coordinator_row = connection.execute(
         "SELECT payload FROM globals WHERE key='coordinator_build'"
     ).fetchone()
@@ -1107,7 +1106,6 @@ def _upsert_normalized_checkpoint(
         _replace_collection(connection, section, checkpoint.get(section, {}))
     for section in GRAPH_SECTIONS:
         _replace_graph(connection, section, checkpoint.get(section, {}))
-    _import_legacy_request_mapping(connection, checkpoint.get("upstream_requests"))
     connection.executemany(
         """
         INSERT INTO documents(id, ordinal, payload) VALUES(?, ?, ?)
@@ -1616,6 +1614,106 @@ def _import_persisted_upstream_requests(connection: sqlite3.Connection) -> dict[
     return imported
 
 
+def _migrate_package_consumers_to_upstream_requests(
+    connection: sqlite3.Connection,
+) -> int:
+    """Turn each unresolved package consumer into one durable upstream request.
+
+    Package rows remain as historical evidence.  Their execution-only leases and queued
+    reservations are discarded so opening an existing project cannot restart Stewards.
+    """
+
+    ordinal_row = connection.execute(
+        "SELECT coalesce(max(ordinal), -1) FROM state_items WHERE section='upstream_requests'"
+    ).fetchone()
+    ordinal = int(ordinal_row[0]) + 1 if ordinal_row is not None else 0
+    migrated = 0
+    rows = connection.execute(
+        """
+        SELECT c.id, c.package_id, c.work_unit_id, c.path, c.declaration,
+            c.residual_goal, c.source_digest, c.acceptance_contract,
+            c.created_at, c.updated_at, p.capability_key, p.title,
+            p.mathematical_objective
+        FROM package_consumers c
+        JOIN capability_packages p ON p.id=c.package_id
+        WHERE c.status='open'
+        ORDER BY c.created_at, c.id
+        """
+    ).fetchall()
+    for row in rows:
+        consumer_id = str(row[0])
+        request_id = f"upstream-{consumer_id}"
+        if connection.execute(
+            "SELECT 1 FROM state_items WHERE section='upstream_requests' AND item_key=?",
+            (request_id,),
+        ).fetchone():
+            continue
+        package_id = str(row[1])
+        owner_paths = [
+            str(value[0])
+            for value in connection.execute(
+                """SELECT normalized_path FROM package_scopes
+                WHERE package_id=? AND scope_kind='write'
+                ORDER BY ordinal, normalized_path""",
+                (package_id,),
+            )
+            if str(value[0]) != str(row[3])
+        ]
+        blocker_ids = [
+            str(value[0])
+            for value in connection.execute(
+                """SELECT blocker_id FROM package_consumer_blockers
+                WHERE consumer_id=? ORDER BY ordinal, blocker_id""",
+                (consumer_id,),
+            )
+        ]
+        attempted_routes = [
+            str(value[0])
+            for value in connection.execute(
+                """SELECT attempted_route FROM package_consumer_routes
+                WHERE consumer_id=? ORDER BY ordinal, attempted_route""",
+                (consumer_id,),
+            )
+        ]
+        acceptance = json.loads(row[7])
+        request = {
+            "id": request_id,
+            "status": "open",
+            "consumer_chapter_id": str(row[2]),
+            "consumer_path": str(row[3]),
+            "blocked_declaration": str(row[4]),
+            "residual_goal": str(row[5]),
+            "needed_result": str(row[12]),
+            "capability_key": str(row[10]),
+            "title": str(row[11]),
+            "owner_chapter_id": "",
+            "owner_paths": owner_paths,
+            "attempted_alternatives": attempted_routes,
+            "acceptance_tests": acceptance if isinstance(acceptance, dict) else {},
+            "blocker_ids": blocker_ids,
+            "origin_run_ids": [],
+            "source_digest": str(row[6] or ""),
+            "legacy_package_id": package_id,
+            "legacy_consumer_id": consumer_id,
+            "created_at": str(row[8]),
+            "updated_at": str(row[9]),
+        }
+        connection.execute(
+            """INSERT INTO state_items(section, item_key, ordinal, revision, payload)
+            VALUES('upstream_requests', ?, ?, 0, ?)""",
+            (request_id, ordinal, json.dumpb(request)),
+        )
+        ordinal += 1
+        migrated += 1
+
+    # These are runtime claims, not historical evidence.  Dropping them is what makes the
+    # migration safe to open: no old package can retain mutation authority.
+    connection.execute("DELETE FROM path_reservations")
+    connection.execute("DELETE FROM path_reservation_queue WHERE owner_kind='package'")
+    connection.execute("DELETE FROM steward_leases")
+    return migrated
+
+
 def _import_legacy_request_mapping(connection: sqlite3.Connection, requests: Any) -> dict[str, str]:
     """Import once at the persistence boundary without hydrating legacy runtime state."""
 
@@ -2011,7 +2109,7 @@ def initialize_database(state_dir: Path) -> Path:
             if version == 1:
                 with connection:
                     _migrate_v1(connection)
-            elif version in {2, 3, 4, 5, 6, 7, 8, 9}:
+            elif version in {2, 3, 4, 5, 6, 7, 8, 9, 10}:
                 with connection:
                     _create_schema(connection)
             elif version != SCHEMA_VERSION:

@@ -67,9 +67,7 @@ from paf.isolation import FuseWorkspace, IsolationResult, create_isolation
 from paf.models import PipelineConfig, ProofTarget, Stage, WorkUnit, WorkUnitLike
 from paf.package_model import (
     CapabilityPackage,
-    EvidenceKind,
     PackageConsumer,
-    PackageEvidence,
     PackageStep,
     ReservationMode,
     ReservationSpec,
@@ -93,6 +91,7 @@ from paf.state import (
     StateStore,
     TaskPhase,
     TaskStatus,
+    UpstreamRequestStatus,
 )
 from paf.warning_cleanup import (
     WarningCleanupResult,
@@ -283,6 +282,7 @@ DISCOVERY_BATCH_SECONDS = 0.025
 DISCOVERY_BATCH_MAXIMUM = 256
 DIAGNOSTIC_OWNER_CACHE_MAXIMUM = 16_384
 PROOF_FINDING_REVIEW_KIND = "proof_finding"
+UPSTREAM_REQUEST_REVIEW_KIND = "upstream_request"
 BUILD_ERROR_REVIEW_KIND = "build_error"
 DETERMINISTIC_WARNING_CLEANUP_ROLE = "deterministic_warning_cleanup"
 LEGACY_DIAGNOSTIC_REVIEW_KIND = "diagnostic"
@@ -953,32 +953,9 @@ class Orchestrator:
             self._proof_rechecks.add(work_unit_id)
 
     async def _schedule_ready_packages(self) -> bool:
-        if not self.git.enabled:
-            return False
-        launched = False
-        limit = self.config.steward.max_concurrent_packages_per_work_unit
-        active_by_work_unit: dict[str, int] = {}
-        package_state = self.state._database.load_package_state()
-        for package_id in self._package_tasks:
-            package = package_state.packages.get(package_id)
-            if package is None:
-                continue
-            work_unit_id = self._package_anchor_work_unit_id(package)
-            active_by_work_unit[work_unit_id] = active_by_work_unit.get(work_unit_id, 0) + 1
-        for package in self.package_execution.ready_packages():
-            if package.id in self._package_tasks:
-                continue
-            work_unit_id = self._package_anchor_work_unit_id(package)
-            if active_by_work_unit.get(work_unit_id, 0) >= limit:
-                continue
-            task = asyncio.create_task(
-                self._execute_package_task(package.id),
-                name=f"paf-package-{package.id}",
-            )
-            self._package_tasks[package.id] = task
-            active_by_work_unit[work_unit_id] = active_by_work_unit.get(work_unit_id, 0) + 1
-            launched = True
-        return launched
+        """Legacy packages are an archive and never create executable work."""
+
+        return False
 
     async def _execute_package_task(self, package_id: str) -> PackageExecutionResult:
         try:
@@ -1007,6 +984,81 @@ class Orchestrator:
                     if self._package_tasks.get(package_id) is task:
                         self._package_tasks.pop(package_id, None)
         return tuple(results)
+
+    async def _route_migrated_upstream_requests(self) -> None:
+        """Schedule one focused tandem review for each migrated consumer observation."""
+
+        for request_id, request in sorted(self.state.upstream_requests.items()):
+            if request.get("status") not in {
+                UpstreamRequestStatus.OPEN.value,
+                UpstreamRequestStatus.EVALUATING.value,
+            }:
+                continue
+            if request_id in self.state.proof_review_requests:
+                continue
+            consumer_id = str(request.get("consumer_chapter_id", ""))
+            consumer = self._work_units_by_id.get(consumer_id)
+            if consumer is None:
+                await self.state.update_upstream_request(
+                    request_id, UpstreamRequestStatus.NEEDS_HUMAN
+                )
+                continue
+            raw_paths = request.get("owner_paths")
+            owner_paths = [str(value) for value in raw_paths] if isinstance(raw_paths, list) else []
+            candidate_ids = {
+                owner_id
+                for path in owner_paths
+                for owner_id in self._path_owner_ids(path)
+                if self._work_unit_order.get(owner_id, 10**9)
+                < self._work_unit_order.get(consumer_id, -1)
+            }
+            owner_id = (
+                max(candidate_ids, key=self._work_unit_order.__getitem__)
+                if candidate_ids
+                else consumer_id
+            )
+            owner = self._work_units_by_id[owner_id]
+            request["owner_chapter_id"] = owner_id
+            request["updated_at"] = datetime.now(UTC).isoformat()
+            blockers = [
+                str(value)
+                for value in request.get("blocker_ids", ())
+                if str(value) in self.state.proof_blockers
+            ]
+            await self.state.set_proof_blocker_status(
+                blockers,
+                ProofBlockerStatus.UPSTREAM_REQUESTED,
+                request_id=request_id,
+            )
+            feedback = {
+                owner_id: (
+                    "Evaluate this downstream observation together with the suspected upstream "
+                    "interface. Decide whether the result belongs upstream, is already available "
+                    "but too weakly exposed, or must be handled by the consumer. Make the smallest "
+                    "source-faithful upstream repair only when the evidence supports it.\n\n"
+                    f"Failed proof `{request.get('blocked_declaration', '')}` in "
+                    f"`{request.get('consumer_path', '')}`:\n"
+                    f"Remaining goal:\n{request.get('residual_goal', '')}\n"
+                    f"Requested result:\n{request.get('needed_result', '')}\n"
+                    "Checked attempts:\n- "
+                    + "\n- ".join(str(value) for value in request.get("attempted_alternatives", ()))
+                    + "\nSuspected upstream paths:\n- "
+                    + "\n- ".join(owner_paths)
+                )
+            }
+            await self.state.enqueue_proof_review_request(
+                feedback,
+                origin_run_id=request_id,
+                kind=UPSTREAM_REQUEST_REVIEW_KIND,
+                request_id=request_id,
+                blocker_ids=blockers,
+                source_digests={
+                    owner_id: await asyncio.to_thread(
+                        scope_digest, self.config.settings.repo, owner
+                    )
+                },
+            )
+            await self.state.update_upstream_request(request_id, UpstreamRequestStatus.EVALUATING)
 
     async def prepare(
         self,
@@ -1042,6 +1094,7 @@ class Orchestrator:
                     detail="recovered post-review findings",
                 )
         await self.state.migrate_stale_snapshot_review_requests()
+        await self._route_migrated_upstream_requests()
         report("Preparing agent execution", 5)
         await self.executor.prepare()
         report("Preparing isolated workspaces and Lean caches", 6)
@@ -1049,8 +1102,6 @@ class Orchestrator:
         report("Checking the Git worktree", 7)
         await self.git.prepare()
         await self.state.refresh_package_state()
-        if self.config.steward.enabled:
-            await self._schedule_ready_packages()
         report("Preparation complete", 7)
 
     async def _commit_agent_changes(
@@ -2931,8 +2982,8 @@ class Orchestrator:
         )
 
     @staticmethod
-    def _package_owned_blocker(blocker: dict[str, Any]) -> bool:
-        """Recognize structural, repeated, or cross-file work before legacy routing."""
+    def _upstream_candidate_blocker(blocker: dict[str, Any]) -> bool:
+        """Recognize evidence that should be evaluated against an earlier interface."""
 
         candidate = blocker.get("capability")
         cross_file = isinstance(candidate, dict) and any(
@@ -2952,21 +3003,19 @@ class Orchestrator:
             }
         )
 
-    async def _attach_structural_blockers_to_packages(
+    async def _request_upstream_for_blockers(
         self,
         chapter: WorkUnitLike,
         blockers: Iterable[dict[str, Any]],
     ) -> tuple[str, ...]:
-        package_ids: list[str] = []
+        request_ids: list[str] = []
         for blocker in blockers:
-            if not self._package_owned_blocker(blocker):
+            if not self._upstream_candidate_blocker(blocker):
                 continue
             blocker_id = str(blocker.get("id", ""))
             candidate = blocker.get("capability")
-            raw_key = ""
             owner_paths: list[str] = []
             if isinstance(candidate, dict):
-                raw_key = str(candidate.get("capability_key", "")).strip()
                 owner_paths = [
                     str(path).strip()
                     for path in candidate.get("owner_paths", ())
@@ -2975,67 +3024,86 @@ class Orchestrator:
                     and self._path_owner_ids(str(path).strip())
                 ]
             declaration = str(blocker.get("declaration", "")).strip()
-            residual_goal = self._normalized_blocker_goal(blocker)
-            capability_key = raw_key or f"proof-capability:{declaration}:{residual_goal}"
-            digest = hashlib.sha256(capability_key.casefold().encode()).hexdigest()[:20]
-            package_id = f"package-{digest}"
             consumer_path = str(blocker.get("path", "")).strip()
             if chapter.id not in self._path_owner_ids(consumer_path):
                 continue
-            paths = tuple(dict.fromkeys([*owner_paths, consumer_path]))
-            if not consumer_path or not paths:
+            owner_ids = {
+                owner_id for path in owner_paths for owner_id in self._path_owner_ids(path)
+            }
+            earlier_owner_ids = {
+                owner_id
+                for owner_id in owner_ids
+                if self._work_unit_order.get(owner_id, 10**9)
+                < self._work_unit_order.get(chapter.id, -1)
+            }
+            if len(earlier_owner_ids) != 1:
+                blocker["upstream_routing_error"] = (
+                    "suspected owner paths must resolve to exactly one earlier work unit"
+                )
                 continue
-            package = CapabilityPackage(
-                package_id,
-                capability_key,
-                f"Capability for {declaration or residual_goal[:80]}",
-                str(
+            owner_id = next(iter(earlier_owner_ids))
+            request = {
+                "consumer_path": consumer_path,
+                "blocked_declaration": declaration,
+                "residual_goal": str(blocker.get("remaining_goal", "")),
+                "obstruction": str(blocker.get("obstruction", "")),
+                "needed_result": str(
                     candidate.get("needed_result", "")
                     if isinstance(candidate, dict)
                     else blocker.get("obstruction", "")
-                ).strip()
-                or f"Resolve the structural proof obstruction for {declaration}",
-                write_scope=paths,
-                expansion_scope=paths,
-            )
-            source_digest = await asyncio.to_thread(
-                scope_digest, self.config.settings.repo, chapter
-            )
-            consumer = PackageConsumer(
-                id=f"consumer-{blocker_id}",
-                package_id=package_id,
-                work_unit_id=chapter.id,
-                path=consumer_path,
-                declaration=declaration,
-                stage=Stage.PROVE.value,
-                residual_goal=str(blocker.get("remaining_goal", "")),
-                source_digest=source_digest,
-                blocker_ids=(blocker_id,),
-                attempted_routes=tuple(str(value) for value in blocker.get("attempts", ())),
-                acceptance_contract={
+                ).strip(),
+                "capability_key": str(
+                    candidate.get("capability_key", "") if isinstance(candidate, dict) else ""
+                ).strip(),
+                "owner_paths": sorted(dict.fromkeys(owner_paths)),
+                "attempted_alternatives": list(blocker.get("attempts", ())),
+                "acceptance_tests": {
                     "build_command": chapter.build_command,
                     "declaration": declaration,
                 },
+            }
+            request_id, created = await self.state.enqueue_upstream_request(
+                request,
+                consumer_chapter_id=chapter.id,
+                owner_chapter_id=owner_id,
+                blocker_ids=(blocker_id,),
+                origin_run_id=str((blocker.get("origin_run_ids") or [""])[-1]),
             )
-            evidence = PackageEvidence(
-                id=f"evidence-{blocker_id}-{str(blocker.get('fingerprint', ''))[:16]}",
-                package_id=package_id,
-                producer="proof-blocker-router",
-                kind=EvidenceKind.RESIDUAL_GOAL,
-                source_revision=source_digest,
-                paths=(consumer_path,),
-                declarations=(declaration,) if declaration else (),
-                payload={"blocker": blocker},
-                digest=str(blocker.get("fingerprint", "")),
+            request_ids.append(request_id)
+            if not created:
+                continue
+            owner = self.config.work_unit(owner_id)
+            feedback = {
+                owner_id: (
+                    "Evaluate this downstream observation together with the suspected upstream "
+                    "interface. Decide where the responsibility belongs. If the upstream result "
+                    "is missing, wrong, or too weak, make the smallest source-faithful repair in "
+                    "your assigned upstream scope. If the existing interface is sufficient, "
+                    "return a checked retry route for the consumer.\n\n"
+                    f"Failed proof `{declaration}` in `{consumer_path}`:\n"
+                    f"Remaining goal:\n{blocker.get('remaining_goal', '')}\n"
+                    f"Observed obstruction:\n{blocker.get('obstruction', '')}\n"
+                    f"Requested result:\n{request['needed_result']}\n"
+                    "Checked attempts:\n- "
+                    + "\n- ".join(str(value) for value in blocker.get("attempts", ()))
+                    + "\nSuspected upstream paths:\n- "
+                    + "\n- ".join(owner_paths)
+                )
+            }
+            await self.state.enqueue_proof_review_request(
+                feedback,
+                origin_run_id=request_id,
+                kind=UPSTREAM_REQUEST_REVIEW_KIND,
+                request_id=request_id,
+                blocker_ids=(blocker_id,),
+                source_digests={
+                    owner_id: await asyncio.to_thread(
+                        scope_digest, self.config.settings.repo, owner
+                    )
+                },
             )
-            attached, _created = await self.state.create_or_attach_capability_package(
-                package,
-                consumer=consumer,
-                evidence=(evidence,),
-            )
-            await self.state.attach_proof_blockers_to_package((blocker_id,), attached.id)
-            package_ids.append(attached.id)
-        return tuple(dict.fromkeys(package_ids))
+            await self.state.update_upstream_request(request_id, UpstreamRequestStatus.EVALUATING)
+        return tuple(dict.fromkeys(request_ids))
 
     async def _resolve_satisfied_proof_blockers(self, chapter: WorkUnitLike) -> None:
         resolved = []
@@ -4664,8 +4732,12 @@ class Orchestrator:
         waiting_dependencies: set[str] = set()
         for request_id in request_ids:
             request = self.state.proof_review_requests.get(request_id)
-            if not isinstance(request, dict) or request.get("kind") != PROOF_FINDING_REVIEW_KIND:
+            if not isinstance(request, dict) or request.get("kind") not in {
+                PROOF_FINDING_REVIEW_KIND,
+                UPSTREAM_REQUEST_REVIEW_KIND,
+            }:
                 continue
+            upstream_review = request.get("kind") == UPSTREAM_REQUEST_REVIEW_KIND
             raw_ids = request.get("blocker_ids")
             blocker_ids = [str(value) for value in raw_ids] if isinstance(raw_ids, list) else []
             for index, blocker_id in enumerate(blocker_ids, start=1):
@@ -4718,19 +4790,19 @@ class Orchestrator:
                     )
                     blocker["retry_sighting_baseline"] = int(blocker.get("sightings", 0))
                     status = ProofBlockerStatus.OPEN
-                elif action == "attach_package":
-                    candidate = assessment.get("capability")
+                elif action == "request_upstream":
+                    candidate = assessment.get("upstream_request")
                     if candidate is not None:
                         blocker["capability"] = candidate
                         blocker["disposition"] = "missing_capability"
                     else:
                         blocker["disposition"] = "genuine_blocker"
-                    package_ids = await self._attach_structural_blockers_to_packages(
+                    upstream_request_ids = await self._request_upstream_for_blockers(
                         chapter, (blocker,)
                     )
-                    if package_ids:
-                        blocker["package_id"] = package_ids[0]
-                        status = ProofBlockerStatus.WAITING_DEPENDENCY
+                    if upstream_request_ids:
+                        blocker["upstream_request_id"] = upstream_request_ids[0]
+                        status = ProofBlockerStatus.UPSTREAM_REQUESTED
                     else:
                         status = ProofBlockerStatus.BLOCKED
                 elif action == "wait_for_dependency":
@@ -4763,12 +4835,12 @@ class Orchestrator:
                         "needed_result": response or str(blocker.get("obstruction", "")),
                     }
                     blocker["disposition"] = "missing_capability"
-                    package_ids = await self._attach_structural_blockers_to_packages(
+                    upstream_request_ids = await self._request_upstream_for_blockers(
                         chapter, (blocker,)
                     )
                     status = (
-                        ProofBlockerStatus.WAITING_DEPENDENCY
-                        if package_ids
+                        ProofBlockerStatus.UPSTREAM_REQUESTED
+                        if upstream_request_ids
                         else ProofBlockerStatus.PARKED
                     )
                 else:
@@ -4776,16 +4848,40 @@ class Orchestrator:
                     # evidence, not permission to rerun the same proof.
                     status = ProofBlockerStatus.BLOCKED
                 await self.state.set_proof_blocker_status((blocker_id,), status)
+                if upstream_review:
+                    consumer_id = str(blocker.get("consumer_chapter_id", ""))
+                    if status is ProofBlockerStatus.OPEN:
+                        request_status = (
+                            UpstreamRequestStatus.VERIFIED
+                            if action == "repair_and_retry" and run.changed
+                            else UpstreamRequestStatus.REJECTED
+                        )
+                        await self.state.set_task(
+                            consumer_id,
+                            Stage.PROVE,
+                            TaskStatus.PENDING,
+                            "upstream evaluation supplied a validated repair or retry route",
+                        )
+                    elif status is ProofBlockerStatus.RESOLVED:
+                        request_status = UpstreamRequestStatus.VERIFIED
+                    else:
+                        request_status = UpstreamRequestStatus.NEEDS_HUMAN
+                        await self.state.set_task(
+                            consumer_id,
+                            Stage.PROVE,
+                            TaskStatus.BLOCKED,
+                            "upstream evaluation needs a human placement decision",
+                        )
+                    await self.state.update_upstream_request(
+                        request_id,
+                        request_status,
+                        decision=assessment,
+                        evaluation_run_id=run.id,
+                    )
+                    continue
                 routed_statuses.append(status)
 
-        if ProofBlockerStatus.PACKAGE_REQUIRED in routed_statuses:
-            await self.state.set_task(
-                chapter.id,
-                Stage.PROVE,
-                TaskStatus.FAILED,
-                "proof review routed unresolved mathematics to package work",
-            )
-        elif ProofBlockerStatus.OPEN in routed_statuses:
+        if ProofBlockerStatus.OPEN in routed_statuses:
             # Keep making source-local progress when some independent blockers are parked. The
             # durable blocker ledger prevents the proof agent from losing those terminal routes.
             await self.state.set_task(
@@ -4808,14 +4904,14 @@ class Orchestrator:
                 ),
                 "proof review deferred validation until dependencies are repaired",
             )
-        elif ProofBlockerStatus.WAITING_DEPENDENCY in routed_statuses:
-            package_ids = sorted(
+        elif ProofBlockerStatus.UPSTREAM_REQUESTED in routed_statuses:
+            upstream_request_ids = sorted(
                 {
-                    str(blocker.get("package_id", ""))
+                    str(blocker.get("upstream_request_id", ""))
                     for blocker in self.state.proof_blockers.values()
                     if blocker.get("consumer_chapter_id") == chapter.id
-                    and blocker.get("status") == ProofBlockerStatus.WAITING_DEPENDENCY.value
-                    and blocker.get("package_id")
+                    and blocker.get("status") == ProofBlockerStatus.UPSTREAM_REQUESTED.value
+                    and blocker.get("upstream_request_id")
                 }
             )
             await self.state.set_task_waiting(
@@ -4823,14 +4919,13 @@ class Orchestrator:
                 Stage.PROVE,
                 (
                     Requirement(
-                        RequirementKind.CAPABILITY_PACKAGE,
-                        request_id=package_id,
-                        detail="package Steward owns the reviewed structural proof work",
+                        RequirementKind.UPSTREAM_REQUEST,
+                        request_id=request_id,
+                        detail="waiting for tandem upstream evaluation",
                     )
-                    for package_id in package_ids
+                    for request_id in upstream_request_ids
                 ),
-                "proof review attached structural work to capability package(s): "
-                + ", ".join(package_ids),
+                "proof review opened upstream request(s): " + ", ".join(upstream_request_ids),
             )
         elif any(status is ProofBlockerStatus.PARKED for status in routed_statuses):
             await self.state.set_task(
@@ -4884,7 +4979,7 @@ class Orchestrator:
             return "interface_defect", "repair_and_retry"
         # Legacy prose has no checked retry contract. Parking it is safer than recreating the
         # review/proof loop; an operator can reopen it when evidence changes.
-        return "genuine_blocker", "attach_package"
+        return "genuine_blocker", "request_upstream"
 
     async def _invalidate_reviews(
         self,
@@ -6335,7 +6430,7 @@ class Orchestrator:
         assigned_targets: tuple[ProofTarget, ...] = ()
         chunk_round = 0
         skipped_target_ids: set[str] = set()
-        blocking_package_ids: set[str] = set()
+        blocking_upstream_request_ids: set[str] = set()
 
         def matches_target(value: dict[str, Any], target: ProofTarget) -> bool:
             path = str(value.get("path", value.get("consumer_path", "")))
@@ -6671,10 +6766,10 @@ class Orchestrator:
             blockers = await self._record_proof_blocker_deltas(
                 chapter, attempt.run, attempt.agent.report
             )
-            package_ids = await self._attach_structural_blockers_to_packages(chapter, blockers)
-            if package_ids:
+            upstream_request_ids = await self._request_upstream_for_blockers(chapter, blockers)
+            if upstream_request_ids:
                 if chunked_proofs:
-                    blocking_package_ids.update(package_ids)
+                    blocking_upstream_request_ids.update(upstream_request_ids)
                     skipped_target_ids.update(target.fingerprint for target in assigned_targets)
                     assigned_targets = ()
                     chunk_round = 0
@@ -6685,20 +6780,43 @@ class Orchestrator:
                     chapter.id,
                     Stage.PROVE,
                     TaskStatus.BLOCKED,
-                    "structural proof work attached to capability package(s): "
-                    + ", ".join(package_ids),
+                    "structural proof work opened upstream request(s): "
+                    + ", ".join(upstream_request_ids),
                 )
                 return StageOutcome(
                     ExecutionDisposition.WAITING,
                     tuple(
                         Requirement(
-                            RequirementKind.CAPABILITY_PACKAGE,
-                            request_id=package_id,
-                            detail="package Steward owns the structural proof work",
+                            RequirementKind.UPSTREAM_REQUEST,
+                            request_id=request_id,
+                            detail="waiting for tandem upstream evaluation",
                         )
-                        for package_id in package_ids
+                        for request_id in upstream_request_ids
                     ),
                 )
+            local_structural_blockers = tuple(
+                blocker
+                for blocker in blockers
+                if str(blocker.get("disposition", ""))
+                in {"genuine_blocker", "statement_review", "interface_review"}
+            )
+            if chunked_proofs and local_structural_blockers:
+                review_ids = await self._queue_proof_review(
+                    chapter,
+                    attempt.agent.report,
+                    origin_run_id=attempt.run.id,
+                )
+                await self.state.set_proof_blocker_status(
+                    (str(blocker["id"]) for blocker in local_structural_blockers),
+                    ProofBlockerStatus.REVIEW_REQUESTED,
+                    request_id=review_ids[0] if review_ids else "",
+                )
+                skipped_target_ids.update(target.fingerprint for target in assigned_targets)
+                assigned_targets = ()
+                chunk_round = 0
+                feedback_ledger.clear()
+                feedback = ""
+                continue
             if durable_feedback := self._durable_blocker_feedback(chapter.id, assigned_targets):
                 feedback_ledger.append(durable_feedback)
             feedback = _bounded_proof_feedback(feedback_ledger)
@@ -6731,7 +6849,7 @@ class Orchestrator:
             for blocker in blockers:
                 blocker_id = str(blocker.get("id", ""))
                 if blocker.get("status") in {
-                    ProofBlockerStatus.PACKAGE_REQUIRED.value,
+                    ProofBlockerStatus.UPSTREAM_REQUESTED.value,
                     ProofBlockerStatus.PARKED.value,
                     ProofBlockerStatus.WAITING_DEPENDENCY.value,
                 }:
@@ -6812,16 +6930,15 @@ class Orchestrator:
                 }
                 if routed_statuses.intersection(
                     {
-                        ProofBlockerStatus.PACKAGE_REQUIRED.value,
+                        ProofBlockerStatus.UPSTREAM_REQUESTED.value,
                         ProofBlockerStatus.PARKED.value,
                         ProofBlockerStatus.WAITING_DEPENDENCY.value,
                     }
                 ):
-                    package_required = ProofBlockerStatus.PACKAGE_REQUIRED.value in routed_statuses
                     await self.state.set_task(
                         chapter.id,
                         Stage.PROVE,
-                        TaskStatus.FAILED if package_required else TaskStatus.BLOCKED,
+                        TaskStatus.BLOCKED,
                         "proof blocker routed without unchanged retry: "
                         + ", ".join(terminal_blockers),
                     )
@@ -6890,25 +7007,41 @@ class Orchestrator:
         unresolved_placeholders = await asyncio.to_thread(
             count_placeholders, self.config.settings.repo, chapter
         )
-        if blocking_package_ids:
+        if blocking_upstream_request_ids:
             await self.state.set_task(
                 chapter.id,
                 Stage.PROVE,
                 TaskStatus.BLOCKED,
-                "independent proof chunks exhausted; structural work remains in package(s): "
-                + ", ".join(sorted(blocking_package_ids)),
+                "independent proof chunks exhausted; upstream evaluation remains: "
+                + ", ".join(sorted(blocking_upstream_request_ids)),
             )
             return StageOutcome(
                 ExecutionDisposition.WAITING,
                 tuple(
                     Requirement(
-                        RequirementKind.CAPABILITY_PACKAGE,
-                        request_id=package_id,
-                        detail="package Steward owns the remaining structural proof work",
+                        RequirementKind.UPSTREAM_REQUEST,
+                        request_id=request_id,
+                        detail="waiting for tandem upstream evaluation",
                     )
-                    for package_id in sorted(blocking_package_ids)
+                    for request_id in sorted(blocking_upstream_request_ids)
                 ),
             )
+        pending_review_ids = self._proof_review_feedback(chapter.id)[1]
+        if pending_review_ids:
+            await self.state.set_task_waiting(
+                chapter.id,
+                Stage.PROVE,
+                (
+                    Requirement(
+                        RequirementKind.PROOF_REVIEW_REQUEST,
+                        request_id=request_id,
+                        detail="waiting for focused blocker evaluation",
+                    )
+                    for request_id in pending_review_ids
+                ),
+                "proof work paused for focused blocker evaluation",
+            )
+            return StageOutcome(ExecutionDisposition.WAITING)
         await self.state.set_task(
             chapter.id,
             Stage.PROVE,
@@ -6979,25 +7112,7 @@ class Orchestrator:
             raise
 
     async def run_pipeline(self) -> bool:
-        result = True
-        while True:
-            if self.config.steward.enabled:
-                await self._schedule_ready_packages()
-            pipeline = asyncio.create_task(self._run_pipeline_once())
-            packages = asyncio.create_task(self._drain_active_packages())
-            try:
-                pipeline_result, package_results = await asyncio.gather(pipeline, packages)
-            except BaseException:
-                pipeline.cancel()
-                packages.cancel()
-                await asyncio.gather(pipeline, packages, return_exceptions=True)
-                raise
-            result = pipeline_result and result
-            # Packages may be attached after an initially empty drain exits. Drain those before
-            # deciding whether canonical package changes require another ordinary pipeline pass.
-            late_results = await self._drain_active_packages()
-            if not package_results and not late_results:
-                break
+        result = await self._run_pipeline_once()
         cleanup = await self._drain_warning_cleanups()
         if cleanup.clean and cleanup.changed:
             result = await self.run_pipeline()

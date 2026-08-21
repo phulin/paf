@@ -205,7 +205,7 @@ _FINDING_ASSESSMENTS_PROPERTY: dict[str, Any] = {
                 "enum": [
                     "repair_and_retry",
                     "retry_with_route",
-                    "attach_package",
+                    "request_upstream",
                     "wait_for_dependency",
                     "park_external",
                     "drop_stale_target",
@@ -213,7 +213,7 @@ _FINDING_ASSESSMENTS_PROPERTY: dict[str, Any] = {
             },
             "explanation": {"type": "string", "minLength": 1},
             "retry_contract": {"anyOf": [{"type": "null"}, _RETRY_CONTRACT_PROPERTY]},
-            "capability": _CAPABILITY_PROPOSAL_PROPERTY,
+            "upstream_request": _CAPABILITY_PROPOSAL_PROPERTY,
             "dependency_ids": {
                 "type": "array",
                 "items": {"type": "string", "minLength": 1},
@@ -226,7 +226,7 @@ _FINDING_ASSESSMENTS_PROPERTY: dict[str, Any] = {
             "action",
             "explanation",
             "retry_contract",
-            "capability",
+            "upstream_request",
             "dependency_ids",
         ],
     },
@@ -579,9 +579,10 @@ sound interface when only the proof strategy failed.""",
 and one machine-actionable next action. First confirm that the declaration is live and the supplied
 evidence is current. Check the exact statement against the source, test obvious counterexamples,
 and inspect only the focused APIs needed to route it. Call a retry route executable only when every
-substantial step names an exact existing declaration and a focused Lean probe checks the critical
-composition. If a required step is absent, attach package evidence or send the target to package
-work. Treat unrelated prerequisite diagnostics as a dependency wait, not a mathematical
+ substantial step names an exact existing declaration and a focused Lean probe checks the critical
+composition. If a required result belongs in an earlier module, make an upstream request naming
+the consumer obstruction and the suspected owner paths. Treat unrelated prerequisite diagnostics
+as a dependency wait, not a mathematical
 proof failure.""",
         "review_guardrails": """Do not spend the assignment proving existing proposition
 placeholders. Do not broaden from the named findings into unrelated chapter cleanup. Do not repeat
@@ -607,9 +608,9 @@ have stopped. It must describe the stable files on disk, not planned work. Use o
 - `finding_assessments`: one entry for each supplied proof finding. Copy its exact `finding_id` and
   a concise identifying `finding`; choose a `diagnosis` and `action`; give checked `explanation`;
   supply an executable `retry_contract` only for `retry_with_route` (otherwise `null`); and supply
-  `capability` only for `attach_package`, and name exact `dependency_ids` for a dependency wait.
-  Package evidence must include a stable capability key, placement hypothesis, acceptance checks,
-  and the consumer obstruction.""",
+  `upstream_request` only for `request_upstream`, and name exact `dependency_ids` for a dependency
+  wait. An upstream request must state the result needed by the consumer and the earlier paths the
+  evaluator must inspect; it does not assign ownership or prescribe an implementation.""",
     }
     for key, value in values.items():
         template = template.replace("{" + key + "}", value)

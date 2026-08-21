@@ -87,6 +87,7 @@ class RequirementKind(StrEnum):
     COORDINATOR_OWNER = "coordinator_owner"
     BUILD_FRESHNESS = "build_freshness"
     PROOF_REVIEW_REQUEST = "proof_review_request"
+    UPSTREAM_REQUEST = "upstream_request"
     CAPABILITY_PACKAGE = "capability_package"
     GRAPH = "graph"
     LEGACY_BLOCK = "legacy_block"
@@ -109,11 +110,22 @@ class Readiness:
 class ProofBlockerStatus(StrEnum):
     OPEN = "open"
     REVIEW_REQUESTED = "review_requested"
+    UPSTREAM_REQUESTED = "upstream_requested"
     WAITING_DEPENDENCY = "waiting_dependency"
     PACKAGE_REQUIRED = "package_required"
     PARKED = "parked"
     BLOCKED = "blocked"
     RESOLVED = "resolved"
+
+
+class UpstreamRequestStatus(StrEnum):
+    """Lifecycle of a downstream observation requiring tandem upstream evaluation."""
+
+    OPEN = "open"
+    EVALUATING = "evaluating"
+    VERIFIED = "verified"
+    REJECTED = "rejected"
+    NEEDS_HUMAN = "needs_human"
 
 
 @dataclass
@@ -437,6 +449,7 @@ class StateStore:
         self.formalize_graph: dict[str, Any] = {}
         self.fixup_requests: dict[str, dict[str, Any]] = {}
         self.proof_review_requests: dict[str, dict[str, Any]] = {}
+        self.upstream_requests: dict[str, dict[str, Any]] = {}
         self.package_state = PackageState()
         self.proof_blockers: dict[str, dict[str, Any]] = {}
         self.routing_metrics: dict[str, int] = {}
@@ -503,6 +516,13 @@ class StateStore:
                 self.proof_review_requests = {
                     request_id: dict(value)
                     for request_id, value in raw_proof_review_requests.items()
+                    if isinstance(request_id, str) and isinstance(value, dict)
+                }
+            raw_upstream_requests = raw.get("upstream_requests")
+            if isinstance(raw_upstream_requests, dict):
+                self.upstream_requests = {
+                    request_id: dict(value)
+                    for request_id, value in raw_upstream_requests.items()
                     if isinstance(request_id, str) and isinstance(value, dict)
                 }
             raw_proof_blockers = raw.get("proof_blockers")
@@ -638,6 +658,7 @@ class StateStore:
                     }
                 )
                 self.source_issues[issue.id] = issue
+        self._normalize_upstream_request_state()
         configured = {chapter.id for chapter in self.config.work_units}
         self.tasks = {
             key: task for key, task in self.tasks.items() if task.chapter_id in configured
@@ -754,6 +775,59 @@ class StateStore:
         self._issues_dirty = True
         self._dirty_run_ids.update(run.id for run in (*recovered_runs, *migrated_usage_runs))
         await self.flush()
+
+    def _normalize_upstream_request_state(self) -> None:
+        """Repair imported request records and ensure every request has a blocker root."""
+
+        valid_statuses = {value.value for value in UpstreamRequestStatus}
+        next_number = 1 + max(
+            (int(key[1:]) for key in self.proof_blockers if key[1:].isdigit()),
+            default=0,
+        )
+        for request_id, request in self.upstream_requests.items():
+            request["id"] = request_id
+            if request.get("status") not in valid_statuses:
+                request["status"] = UpstreamRequestStatus.OPEN.value
+            blocker_ids = [
+                str(value)
+                for value in request.get("blocker_ids", ())
+                if str(value) in self.proof_blockers
+            ]
+            if not blocker_ids:
+                blocker_id = f"B{next_number}"
+                next_number += 1
+                now = timestamp()
+                self.proof_blockers[blocker_id] = {
+                    "id": blocker_id,
+                    "fingerprint": stable_digest_text(request_id)[:20],
+                    "consumer_chapter_id": str(request.get("consumer_chapter_id", "")),
+                    "path": str(request.get("consumer_path", "")),
+                    "declaration": str(request.get("blocked_declaration", "")),
+                    "remaining_goal": str(request.get("residual_goal", "")),
+                    "obstruction": str(request.get("needed_result", "")),
+                    "disposition": "missing_capability",
+                    "attempts": list(request.get("attempted_alternatives", ())),
+                    "origin_run_ids": list(request.get("origin_run_ids", ())),
+                    "sightings": 1,
+                    "status": ProofBlockerStatus.UPSTREAM_REQUESTED.value,
+                    "upstream_request_id": request_id,
+                    "created_at": str(request.get("created_at") or now),
+                    "updated_at": now,
+                }
+                blocker_ids = [blocker_id]
+            request["blocker_ids"] = blocker_ids
+            for blocker_id in blocker_ids:
+                blocker = self.proof_blockers[blocker_id]
+                if blocker.get("status") in {
+                    ProofBlockerStatus.PACKAGE_REQUIRED.value,
+                    ProofBlockerStatus.WAITING_DEPENDENCY.value,
+                } and request.get("status") in {
+                    UpstreamRequestStatus.OPEN.value,
+                    UpstreamRequestStatus.EVALUATING.value,
+                }:
+                    blocker["status"] = ProofBlockerStatus.UPSTREAM_REQUESTED.value
+                blocker["upstream_request_id"] = request_id
+                blocker.pop("package_id", None)
 
     def _normalize_cumulative_thread_usage(self) -> list[RunRecord]:
         """Migrate legacy per-run cumulative counters to thread-local deltas once."""
@@ -1062,6 +1136,7 @@ class StateStore:
                 "formalize_graph": self.formalize_graph,
                 "fixup_requests": self.fixup_requests,
                 "proof_review_requests": self.proof_review_requests,
+                "upstream_requests": self.upstream_requests,
                 "proof_blockers": self.proof_blockers,
                 "thread_cumulative_usage": {
                     thread_id: self._usage_dict(usage)
@@ -1881,7 +1956,7 @@ class StateStore:
                 if retry_cause and blocker.get("last_attempted_retry_cause_digest") != retry_cause:
                     blocker["last_attempted_retry_cause_digest"] = retry_cause
                     blocker["last_retry_run_id"] = origin_run_id
-                    blocker["status"] = ProofBlockerStatus.PACKAGE_REQUIRED.value
+                    blocker["status"] = ProofBlockerStatus.OPEN.value
                     self.record_routing_event("unchanged_retry_suppressed")
             disposition = str(raw.get("disposition", "")).strip()
             if disposition:
@@ -1913,7 +1988,7 @@ class StateStore:
                 if retry_cause and blocker.get("last_attempted_retry_cause_digest") != retry_cause:
                     blocker["last_attempted_retry_cause_digest"] = retry_cause
                     blocker["last_retry_run_id"] = origin_run_id
-                    blocker["status"] = ProofBlockerStatus.PACKAGE_REQUIRED.value
+                    blocker["status"] = ProofBlockerStatus.OPEN.value
                     self.record_routing_event("unchanged_retry_suppressed")
             blocker["updated_at"] = timestamp()
             changed[str(blocker["id"])] = blocker
@@ -2375,6 +2450,74 @@ class StateStore:
                 )
                 await self._persist()
         return affected
+
+    async def enqueue_upstream_request(
+        self,
+        request: dict[str, Any],
+        *,
+        consumer_chapter_id: str,
+        owner_chapter_id: str,
+        blocker_ids: Iterable[str] = (),
+        origin_run_id: str = "",
+    ) -> tuple[str, bool]:
+        """Persist one consumer observation without assigning an execution owner."""
+
+        selected_blockers = tuple(dict.fromkeys(str(value) for value in blocker_ids if value))
+        for request_id, existing in self.upstream_requests.items():
+            if selected_blockers and selected_blockers == tuple(existing.get("blocker_ids", ())):
+                return request_id, False
+        request_id = str(request.get("id", "")).strip() or f"upstream-{uuid4().hex[:12]}"
+        now = timestamp()
+        value = dict(request)
+        value.update(
+            {
+                "id": request_id,
+                "status": UpstreamRequestStatus.OPEN.value,
+                "consumer_chapter_id": consumer_chapter_id,
+                "owner_chapter_id": owner_chapter_id,
+                "blocker_ids": list(selected_blockers),
+                "origin_run_ids": [origin_run_id] if origin_run_id else [],
+                "created_at": str(value.get("created_at") or now),
+                "updated_at": now,
+            }
+        )
+        self.upstream_requests[request_id] = value
+        for blocker_id in selected_blockers:
+            blocker = self.proof_blockers.get(blocker_id)
+            if not isinstance(blocker, dict):
+                continue
+            blocker["status"] = ProofBlockerStatus.UPSTREAM_REQUESTED.value
+            blocker["upstream_request_id"] = request_id
+            blocker.pop("package_id", None)
+            blocker["updated_at"] = now
+        self.record_routing_event("upstream_request.created")
+        self._dirty_projection_work_units.update({consumer_chapter_id, owner_chapter_id})
+        self._mark_dirty(
+            global_state=False,
+            sections={"upstream_requests", "proof_blockers"},
+        )
+        await self._persist()
+        return request_id, True
+
+    async def update_upstream_request(
+        self,
+        request_id: str,
+        status: UpstreamRequestStatus,
+        *,
+        decision: dict[str, Any] | None = None,
+        evaluation_run_id: str = "",
+    ) -> None:
+        request = self.upstream_requests.get(request_id)
+        if not isinstance(request, dict):
+            return
+        request["status"] = status.value
+        request["updated_at"] = timestamp()
+        if decision is not None:
+            request["decision"] = decision
+        if evaluation_run_id:
+            request["evaluation_run_id"] = evaluation_run_id
+        self._mark_dirty(global_state=False, sections={"upstream_requests"})
+        await self._persist()
 
     async def enqueue_proof_review_request(
         self,

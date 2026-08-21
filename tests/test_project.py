@@ -243,15 +243,12 @@ async def test_schema_v2_global_graphs_migrate_to_relational_rows(tmp_path: Path
     assert len(header_payload) < 10_000
     assert "source_dependency_tree" not in json.loads(header_payload)
     assert edge_count == 1
-    assert request_count == 0
+    assert request_count == 1
     migrated = read_full_snapshot(config.settings.state_dir)
     assert migrated is not None
     assert migrated["source_dependency_tree"]["edges"] == [[first.id, second.id]]
-    assert "upstream_requests" not in migrated
-    assert any(
-        value["capability_key"] == "book.legacycapability"
-        for value in migrated["capability_packages"].values()
-    )
+    assert migrated["upstream_requests"]["request-1"]["capability_key"] == ("Book.LegacyCapability")
+    assert migrated["capability_packages"] == {}
 
 
 @pytest.mark.asyncio
@@ -281,7 +278,7 @@ async def test_schema_v3_adds_interface_invalidation_events(tmp_path: Path) -> N
     assert event_table == ("interface_invalidation_events",)
 
 
-def test_legacy_json_checkpoint_imports_upstream_requests_into_packages_once(
+def test_legacy_json_checkpoint_preserves_upstream_requests(
     tmp_path: Path,
 ) -> None:
     state_dir = tmp_path / ".paf"
@@ -313,22 +310,14 @@ def test_legacy_json_checkpoint_imports_upstream_requests_into_packages_once(
 
     database = StateDatabase(state_dir)
     database.initialize()
-    first = database.load_package_state()
+    first = read_checkpoint(state_dir)
     database.initialize()
-    second = database.load_package_state()
+    second = read_checkpoint(state_dir)
 
-    imported = next(
-        package
-        for package in first.packages.values()
-        if package.capability_key == "book.legacy bridge"
-    )
-    assert first.consumers_for(imported.id)[0].declaration == "Book.consumer"
-    assert len(first.evidence_for(imported.id)) == 1
+    assert first is not None
+    assert first["upstream_requests"]["legacy-request"] == request
     assert second == first
-    checkpoint = read_checkpoint(state_dir)
-    assert checkpoint is not None
-    assert "upstream_requests" not in checkpoint
-    assert "upstream_request_imports" not in checkpoint
+    assert first["capability_packages"] == {}
 
 
 def test_explicit_project_and_paf_toml_resolve_all_project_paths(tmp_path: Path) -> None:

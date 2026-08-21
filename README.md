@@ -20,12 +20,10 @@ flowchart LR
     R -->|changed, findings, or build failure| R
     R -->|succeeded| P
     P -->|statement/API problem; reopen affected reviews| R
-    P -->|missing structural capability| CP[Capability package]
-    CP --> ST[Steward plan and implementation]
-    ST -->|bounded delegated steps| PW[Package workers]
-    PW --> IV[Package validation and integration]
-    ST --> IV
-    IV -->|consumer acceptance| P
+    P -->|possible upstream problem| U[Upstream request]
+    U --> E[Tandem downstream/upstream review]
+    E -->|upstream repair or checked rejection| P
+    E -->|unclear placement| H[Human decision]
     P -->|no placeholders + Lean valid| D[Done]
 ```
 
@@ -469,12 +467,12 @@ After the daemon exits, `status`, `snapshot`, and `wait` fall back to the persis
   failure. Proof
   validation uses the same visible coordinator-build record and fair build lane; it never holds the
   build queue while the proof agent edits, takes a snapshot, or merges its scoped patch.
-- If sustained checked proof work exposes a genuinely missing structural capability, the proof
+- If sustained checked proof work exposes a possible upstream defect or missing result, the proof
   agent records the blocked declaration and consumer path, exact residual goal, needed result,
   placement hypothesis, acceptance checks, and materially different attempted alternatives. The
-  coordinator creates or attaches a durable capability package. One fenced Steward owns its scope,
-  plan, evidence, validation, integration, and consumer acceptance; package workers may implement
-  bounded disjoint steps. Consumers are woken only after accepted integration.
+  coordinator opens one durable upstream request and gives a focused evaluator both the downstream
+  evidence and suspected earlier interface. A validated upstream repair or checked rejection route
+  wakes the consumer; an unclear placement stops for human review.
 - A proof agent may change proof bodies but not declaration interfaces. It reports each unresolved
   proof through structured `failed_attempts`, including checked approaches and the exact remaining
   goal, plus a machine-actionable disposition. Statement defects and missing-capability evidence
@@ -591,18 +589,18 @@ describing what
 a running or pending task is doing. A transient `queued` marker distinguishes runnable pending stages
 that are waiting to start, whether for an agent slot or a conflicting path reservation. Dashboards
 show the concrete wait detail rather than presenting every pre-start wait as a model-provider queue.
-Structural proof work is attached to a durable capability package while ordinary task cells retain
-their normal state machine. An active coordinator validation build labels its task cell `building`.
+Structural proof work opens a durable upstream request while ordinary task cells retain their normal
+state machine. An active coordinator validation build labels its task cell `building`.
 Successful discovery reports enter a short bounded batch: PAF merges the reports, rebuilds the source
 dependency graph once, and persists the graph plus all task promotions atomically. At most twice the
 configured discovery-agent pool is scheduled at once. Dashboards count live run records as working
 agents. Running tasks persist an explicit `agent` or `postprocess` phase, so the TUI and web dashboard
 show completed agent work awaiting integration, graph persistence, or coordinator verification as
 postprocessing.
-Proof-review evidence that identifies missing structural work creates or attaches to a capability
-package. The package, rather than a request/answer retry exchange, owns implementation, validation,
-integration, and consumer acceptance. Legacy request state is imported once at the persistence
-boundary and is never projected back into runtime. The chapter table displays exact-build
+Proof-review evidence that identifies a possible earlier defect creates an upstream request. A
+focused evaluator sees the consumer and suspected upstream interface together, validates the
+placement decision, and then wakes the consumer. Legacy capability packages remain visible only as
+historical evidence and never launch agents. The chapter table displays exact-build
 freshness independently of whether a past formalize task succeeded. A coordinator-build record tracks the
 single serialized Lake build, and the TUI also shows its owner and queued jobs. Running run records—not
 chapter-stage records—are the authoritative live-agent count.
@@ -697,9 +695,8 @@ lean_project = "lean" # relative to swarm.repo; contains lakefile and lean-toolc
 lean_mcp_tool_timeout_seconds = 300
 ```
 
-Capability-package execution is enabled by default. A writable Steward owns one fenced package
-generation, maintains its plan and scope, and may delegate bounded steps to package workers. Both
-roles default to Sol/medium and compete for ordinary agent capacity:
+The `[steward]` table is accepted only for compatibility with older project files. Capability
+packages are archived and its `enabled` value is ignored:
 
 ```toml
 [steward]
@@ -713,14 +710,9 @@ maximum_worker_steps = 8
 max_concurrent_packages_per_work_unit = 1
 ```
 
-Set `enabled = false` to opt out for a project.
-The per-work-unit cap prevents a backlog of durable packages for one chapter from consuming the
-entire mutating-agent pool at once; increase it only when those packages are genuinely independent.
-
-Packages are durable execution objects rather than a fifth ordinary stage. Use `paf package list`,
-`paf package inspect PACKAGE`, `paf package park PACKAGE`, `paf package resume PACKAGE`, and
-`paf package recover PACKAGE` for operator control. Accepted package integration wakes consumers
-through the normal proof scheduler.
+Schema v11 converts each open legacy package consumer into one upstream request and releases all
+Steward leases and package reservations. Plans, splits, workers, and package dependencies are not
+migrated into executable work. See [the upstream-request design](docs/repair-sweeps.md).
 
 When Lean MCP is enabled, orchestrator startup bootstraps `lean_project` if it does not already
 contain both `lean-toolchain` and a Lake file. PAF pins the active Lean version, creates a matching

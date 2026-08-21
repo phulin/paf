@@ -48,7 +48,7 @@ def test_discovers_chapters_and_renders_paths(tmp_path: Path) -> None:
     assert config.settings.cache_compaction_layers == 32
     assert not hasattr(config.settings, "interface_invalidation")
     assert config.steward.model == "gpt-5.6-sol"
-    assert config.steward.enabled is True
+    assert config.steward.enabled is False
     assert config.steward.reasoning_effort == "medium"
     assert config.steward.worker_model == "gpt-5.6-sol"
     assert config.steward.worker_reasoning_effort == "medium"
@@ -138,7 +138,7 @@ max_concurrent_packages_per_work_unit = 2
 
     steward = load_config(path).steward
 
-    assert steward.enabled is True
+    assert steward.enabled is False
     assert steward.model == "strong-planner"
     assert steward.worker_model == "cheap-editor"
     assert steward.worker_reasoning_effort == "max"

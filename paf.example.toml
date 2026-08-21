@@ -18,8 +18,8 @@ cache_compaction_layers = 32
 lean_project = "lean"
 lean_mcp_tool_timeout_seconds = 300
 
-# The Steward owns durable capability packages and may delegate bounded plan
-# steps to package workers with an independently configurable model.
+# Legacy compatibility only. Schema v11 archives capability packages and ignores
+# this execution toggle; upstream requests use ordinary focused review agents.
 [steward]
 enabled = true
 model = "gpt-5.6-sol"
