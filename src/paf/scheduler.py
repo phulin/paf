@@ -864,6 +864,7 @@ class Orchestrator:
         await self.state.load_or_create()
         report("Recovering interrupted work", 2)
         await self.state.requeue_interrupted(resume_agents=self.resume_agents)
+        await self.state.retire_imported_upstream_requests()
         report("Scaffolding work-unit directories", 3)
         self.scaffold()
         report("Recovering upstream requests", 4)
@@ -3778,7 +3779,7 @@ class Orchestrator:
             )
 
     async def _recover_upstream_requests(self) -> None:
-        """Recover a proof report persisted just before its request handoff was checkpointed."""
+        """Recover uncheckpointed structural reports directly into package ownership."""
 
         persisted_origins: set[str] = set()
         for request in self.state.upstream_requests.values():
@@ -3794,19 +3795,10 @@ class Orchestrator:
                 report = run.report if isinstance(run.report, dict) else {}
                 if not report.get("upstream_requests"):
                     continue
-                issues = report.get("issues")
-                previous = "Recovered upstream handoff from completed proof run " + run.id
-                if isinstance(issues, list) and issues:
-                    previous += ":\n- " + "\n- ".join(
-                        str(issue) for issue in issues if isinstance(issue, str)
-                    )
-                await self._record_upstream_requests(
-                    chapter,
-                    run,
-                    report,
-                    previous_attempts=previous,
-                )
-                persisted_origins.add(run.id)
+                blockers = await self._record_proof_blocker_deltas(chapter, run, report)
+                package_ids = await self._attach_structural_blockers_to_packages(chapter, blockers)
+                if package_ids:
+                    persisted_origins.add(run.id)
 
     async def _recover_proof_review_requests(self) -> None:
         """Recover durable blockers and only escalate repeated review evidence."""
@@ -5169,16 +5161,26 @@ class Orchestrator:
                 elif action == "request_upstream":
                     raw_requests = assessment.get("upstream_requests")
                     requests = raw_requests if isinstance(raw_requests, list) else []
-                    upstream_ids = await self._record_upstream_requests(
-                        chapter,
-                        run,
-                        {"upstream_requests": requests},
-                        previous_attempts=self._durable_blocker_feedback(chapter.id, ()),
+                    candidate = next(
+                        (
+                            value
+                            for value in requests
+                            if isinstance(value, dict)
+                            and str(value.get("blocked_declaration", ""))
+                            == str(blocker.get("declaration", ""))
+                            and str(value.get("consumer_path", "")) == str(blocker.get("path", ""))
+                        ),
+                        requests[0] if requests and isinstance(requests[0], dict) else None,
                     )
-                    if upstream_ids:
-                        blocker["request_ids"] = list(upstream_ids)
-                        blocker["request_id"] = upstream_ids[0]
-                        status = ProofBlockerStatus.UPSTREAM_REQUESTED
+                    if candidate is not None:
+                        blocker["upstream_candidate"] = candidate
+                        blocker["disposition"] = "missing_upstream"
+                    package_ids = await self._attach_structural_blockers_to_packages(
+                        chapter, (blocker,)
+                    )
+                    if package_ids:
+                        blocker["package_id"] = package_ids[0]
+                        status = ProofBlockerStatus.WAITING_DEPENDENCY
                     else:
                         status = ProofBlockerStatus.BLOCKED
                 elif action == "wait_for_dependency":
@@ -5201,9 +5203,34 @@ class Orchestrator:
                         else ProofBlockerStatus.PARKED
                     )
                 elif action == "send_to_roadmap":
-                    status = ProofBlockerStatus.ROADMAP
+                    blocker["disposition"] = "genuine_blocker"
+                    package_ids = await self._attach_structural_blockers_to_packages(
+                        chapter, (blocker,)
+                    )
+                    status = (
+                        ProofBlockerStatus.WAITING_DEPENDENCY
+                        if package_ids
+                        else ProofBlockerStatus.ROADMAP
+                    )
                 elif action == "park_external":
-                    status = ProofBlockerStatus.PARKED
+                    blocker["upstream_candidate"] = {
+                        "capability_key": (
+                            f"external:{blocker.get('declaration', '')}:"
+                            f"{self._normalized_blocker_goal(blocker)}"
+                        ),
+                        "owner_kind": "external",
+                        "owner_paths": [str(blocker.get("path", ""))],
+                        "needed_result": response or str(blocker.get("obstruction", "")),
+                    }
+                    blocker["disposition"] = "missing_upstream"
+                    package_ids = await self._attach_structural_blockers_to_packages(
+                        chapter, (blocker,)
+                    )
+                    status = (
+                        ProofBlockerStatus.WAITING_DEPENDENCY
+                        if package_ids
+                        else ProofBlockerStatus.PARKED
+                    )
                 else:
                     # A review that neither changed source nor supplied a checked route is terminal
                     # evidence, not permission to rerun the same proof.
@@ -5240,6 +5267,30 @@ class Orchestrator:
                     for dependency_id in sorted(waiting_dependencies)
                 ),
                 "proof review deferred validation until dependencies are repaired",
+            )
+        elif ProofBlockerStatus.WAITING_DEPENDENCY in routed_statuses:
+            package_ids = sorted(
+                {
+                    str(blocker.get("package_id", ""))
+                    for blocker in self.state.proof_blockers.values()
+                    if blocker.get("consumer_chapter_id") == chapter.id
+                    and blocker.get("status") == ProofBlockerStatus.WAITING_DEPENDENCY.value
+                    and blocker.get("package_id")
+                }
+            )
+            await self.state.set_task_waiting(
+                chapter.id,
+                Stage.PROVE,
+                (
+                    Requirement(
+                        RequirementKind.CAPABILITY_PACKAGE,
+                        request_id=package_id,
+                        detail="package Steward owns the reviewed structural proof work",
+                    )
+                    for package_id in package_ids
+                ),
+                "proof review attached structural work to capability package(s): "
+                + ", ".join(package_ids),
             )
         elif any(status is ProofBlockerStatus.PARKED for status in routed_statuses):
             await self.state.set_task(

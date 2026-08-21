@@ -2515,6 +2515,43 @@ class StateStore:
             self._mark_dirty(global_state=False, sections={"proof_blockers"})
             await self._persist()
 
+    async def retire_imported_upstream_requests(self) -> tuple[str, ...]:
+        """Make the one-way package import authoritative over legacy request state."""
+
+        imported = self.package_state.upstream_request_imports
+        if not imported:
+            return ()
+        retired: list[str] = []
+        now = timestamp()
+        for request_id, record in imported.items():
+            request = self.upstream_requests.get(request_id)
+            if isinstance(request, dict) and request.get("status") != UpstreamRequestStatus.CLOSED:
+                request["status"] = UpstreamRequestStatus.CLOSED.value
+                request["closed_at"] = now
+                request["closed_reason"] = f"imported into capability package {record.package_id}"
+                request["package_id"] = record.package_id
+                request["updated_at"] = now
+                retired.append(request_id)
+            for blocker in self.proof_blockers.values():
+                request_ids = {
+                    str(blocker.get("request_id", "")),
+                    *(str(value) for value in blocker.get("request_ids", ())),
+                }
+                if request_id not in request_ids:
+                    continue
+                blocker["status"] = ProofBlockerStatus.WAITING_DEPENDENCY.value
+                blocker["package_id"] = record.package_id
+                blocker.pop("request_id", None)
+                blocker.pop("request_ids", None)
+                blocker["updated_at"] = now
+        if retired:
+            self._mark_dirty(
+                global_state=False,
+                sections={"upstream_requests", "proof_blockers"},
+            )
+            await self._persist()
+        return tuple(retired)
+
     def upstream_requests_for_consumer(
         self,
         chapter_id: str,

@@ -5770,7 +5770,7 @@ async def test_structural_blockers_cluster_into_one_package_without_ping_pong(
     [
         ("repair_and_retry", True, ProofBlockerStatus.OPEN),
         ("retry_with_route", False, ProofBlockerStatus.OPEN),
-        ("send_to_roadmap", False, ProofBlockerStatus.ROADMAP),
+        ("send_to_roadmap", False, ProofBlockerStatus.WAITING_DEPENDENCY),
     ],
 )
 async def test_completed_review_routes_blocker_by_structured_action(
@@ -5825,7 +5825,8 @@ async def test_completed_review_routes_blocker_by_structured_action(
     if expected is ProofBlockerStatus.OPEN:
         assert state.proof_blockers[blocker_id]["retry_sighting_baseline"] == 1
     else:
-        assert state.task(chapter.id, Stage.PROVE).status == TaskStatus.FAILED
+        assert state.task(chapter.id, Stage.PROVE).status == TaskStatus.PENDING
+        assert state.proof_blockers[blocker_id]["package_id"] in state.package_state.packages
     assert state.proof_blockers[blocker_id]["review_exchange_count"] == 1
     assert request_id not in state.proof_review_requests
     await orchestrator.shutdown()
@@ -5991,12 +5992,13 @@ async def test_noop_proof_review_routes_once_to_roadmap(tmp_path: Path) -> None:
     await state.finish_proof_review_requests(chapter.id, (request_id,))
 
     blocker = state.proof_blockers[blocker_id]
-    assert blocker["status"] == ProofBlockerStatus.ROADMAP.value
+    assert blocker["status"] == ProofBlockerStatus.WAITING_DEPENDENCY.value
     assert blocker["review_exchange_count"] == 1
     assert len(blocker["review_responses"]) == 1
     proof = state.task(chapter.id, Stage.PROVE)
-    assert proof.status == TaskStatus.FAILED
-    assert "Shepherd roadmap" in proof.detail
+    assert proof.status == TaskStatus.PENDING
+    assert "capability package" in proof.detail
+    assert blocker["package_id"] in state.package_state.packages
     assert state.task(chapter.id, Stage.REVIEW).status == TaskStatus.SUCCEEDED
     await orchestrator.shutdown()
 
@@ -6015,7 +6017,12 @@ async def test_proof_review_can_route_missing_capability_upstream(tmp_path: Path
     blockers = await state.record_proof_blockers(
         consumer.id,
         origin_run_id="proof-run",
-        failed_attempts=[failed_attempt("a reusable transport result is missing")],
+        failed_attempts=[
+            failed_attempt(
+                "a reusable transport result is missing",
+                path="lean/Book/Chapter02.lean",
+            )
+        ],
     )
     blocker_id = str(blockers[0]["id"])
     request_id, _ = await state.enqueue_proof_review_request(
@@ -6062,12 +6069,16 @@ async def test_proof_review_can_route_missing_capability_upstream(tmp_path: Path
     assert await orchestrator._complete_review(
         consumer, "reviewed", proof_request_ids=(request_id,)
     )
-    upstream = next(iter(state.upstream_requests.values()))
-    assert upstream["capability_key"] == "book.transport"
-    assert upstream["status"] == UpstreamRequestStatus.REQUESTED
+    assert not state.upstream_requests
     blocker = state.proof_blockers[blocker_id]
-    assert blocker["status"] == ProofBlockerStatus.UPSTREAM_REQUESTED
-    assert blocker["request_ids"] == [upstream["id"]]
+    assert blocker["status"] == ProofBlockerStatus.WAITING_DEPENDENCY
+    package = state.package_state.packages[blocker["package_id"]]
+    assert package.capability_key == "book.transport"
+    assert package.write_scope == (
+        "lean/Book/Chapter01.lean",
+        "lean/Book/Chapter02.lean",
+    )
+    assert state.package_state.consumers_for(package.id)[0].work_unit_id == consumer.id
     await orchestrator.shutdown()
 
 
