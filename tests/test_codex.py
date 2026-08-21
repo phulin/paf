@@ -174,13 +174,24 @@ def test_report_schema_records_complete_upstream_handoffs() -> None:
         "owner_chapter_id",
         "owner_paths",
         "attempted_alternatives",
+        "capability_key",
+        "candidate_signature",
+        "owner_kind",
+        "acceptance_tests",
     }
+    review = REPORT_SCHEMAS["proof_review"]["properties"]["finding_assessments"]["items"]
+    assert {"diagnosis", "action", "retry_contract", "upstream_requests"}.issubset(
+        review["required"]
+    )
     assert request["properties"]["attempted_alternatives"]["minItems"] == 2
     answer = REPORT_SCHEMAS["upstream_repair"]["properties"]["upstream_answers"]["items"]
     assert answer["properties"]["disposition"]["enum"] == [
         "added",
         "existing",
+        "partial",
         "downstream",
+        "external",
+        "decompose",
     ]
 
 

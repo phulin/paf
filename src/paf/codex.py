@@ -127,38 +127,54 @@ _PROOF_DISPOSITION_PROPERTY: dict[str, Any] = {
     ),
 }
 
+_UPSTREAM_REQUEST_ITEM: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "capability_key": {"type": "string"},
+        "blocked_declaration": {"type": "string", "minLength": 1},
+        "consumer_path": {"type": "string", "minLength": 1},
+        "residual_goal": {"type": "string", "minLength": 1},
+        "needed_result": {"type": "string", "minLength": 1},
+        "candidate_signature": {"type": "string"},
+        "owner_kind": {
+            "type": "string",
+            "enum": ["chapter", "consumer", "shared", "external"],
+        },
+        "owner_chapter_id": {"type": "string", "minLength": 1},
+        "owner_paths": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1},
+            "minItems": 1,
+        },
+        "attempted_alternatives": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1},
+            "minItems": 2,
+        },
+        "acceptance_tests": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1},
+        },
+    },
+    "required": [
+        "capability_key",
+        "blocked_declaration",
+        "consumer_path",
+        "residual_goal",
+        "needed_result",
+        "candidate_signature",
+        "owner_kind",
+        "owner_chapter_id",
+        "owner_paths",
+        "attempted_alternatives",
+        "acceptance_tests",
+    ],
+}
+
 _UPSTREAM_REQUESTS_PROPERTY: dict[str, Any] = {
     "type": "array",
-    "items": {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": {
-            "blocked_declaration": {"type": "string", "minLength": 1},
-            "consumer_path": {"type": "string", "minLength": 1},
-            "residual_goal": {"type": "string", "minLength": 1},
-            "needed_result": {"type": "string", "minLength": 1},
-            "owner_chapter_id": {"type": "string", "minLength": 1},
-            "owner_paths": {
-                "type": "array",
-                "items": {"type": "string", "minLength": 1},
-                "minItems": 1,
-            },
-            "attempted_alternatives": {
-                "type": "array",
-                "items": {"type": "string", "minLength": 1},
-                "minItems": 2,
-            },
-        },
-        "required": [
-            "blocked_declaration",
-            "consumer_path",
-            "residual_goal",
-            "needed_result",
-            "owner_chapter_id",
-            "owner_paths",
-            "attempted_alternatives",
-        ],
-    },
+    "items": _UPSTREAM_REQUEST_ITEM,
 }
 
 _UPSTREAM_ANSWERS_PROPERTY: dict[str, Any] = {
@@ -174,7 +190,14 @@ _UPSTREAM_ANSWERS_PROPERTY: dict[str, Any] = {
             },
             "disposition": {
                 "type": "string",
-                "enum": ["added", "existing", "downstream"],
+                "enum": [
+                    "added",
+                    "existing",
+                    "partial",
+                    "downstream",
+                    "external",
+                    "decompose",
+                ],
             },
             "declarations": {
                 "type": "array",
@@ -182,6 +205,12 @@ _UPSTREAM_ANSWERS_PROPERTY: dict[str, Any] = {
             },
             "usage_guidance": {"type": "string"},
             "rejection_reason": {"type": "string"},
+            "remaining_work": {"type": "string"},
+            "retry_contract": {"type": ["object", "null"]},
+            "child_requests": {
+                "type": "array",
+                "items": _UPSTREAM_REQUEST_ITEM,
+            },
         },
         "required": [
             "request_ids",
@@ -189,8 +218,37 @@ _UPSTREAM_ANSWERS_PROPERTY: dict[str, Any] = {
             "declarations",
             "usage_guidance",
             "rejection_reason",
+            "remaining_work",
+            "retry_contract",
+            "child_requests",
         ],
     },
+}
+
+_RETRY_CONTRACT_PROPERTY: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "new_information": {"type": "string", "minLength": 1},
+        "declarations": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1},
+        },
+        "intermediate_claims": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1},
+            "minItems": 1,
+        },
+        "critical_probe": {"type": "string", "minLength": 1},
+        "known_remaining_gap": {"type": "string"},
+    },
+    "required": [
+        "new_information",
+        "declarations",
+        "intermediate_claims",
+        "critical_probe",
+        "known_remaining_gap",
+    ],
 }
 
 _FINDING_ASSESSMENTS_PROPERTY: dict[str, Any] = {
@@ -201,13 +259,49 @@ _FINDING_ASSESSMENTS_PROPERTY: dict[str, Any] = {
         "properties": {
             "finding_id": {"type": "string", "minLength": 1},
             "finding": {"type": "string", "minLength": 1},
-            "assessment": {
+            "diagnosis": {
                 "type": "string",
-                "enum": ["confirmed", "rejected", "reframed"],
+                "enum": [
+                    "statement_defect",
+                    "interface_defect",
+                    "missing_capability",
+                    "consumer_local_proof",
+                    "stale_target",
+                    "external_gap",
+                    "validation_noise",
+                    "genuine_blocker",
+                ],
+            },
+            "action": {
+                "type": "string",
+                "enum": [
+                    "repair_and_retry",
+                    "retry_with_route",
+                    "request_upstream",
+                    "send_to_roadmap",
+                    "wait_for_dependency",
+                    "park_external",
+                    "drop_stale_target",
+                ],
             },
             "explanation": {"type": "string", "minLength": 1},
+            "retry_contract": {"anyOf": [{"type": "null"}, _RETRY_CONTRACT_PROPERTY]},
+            "upstream_requests": _UPSTREAM_REQUESTS_PROPERTY,
+            "dependency_ids": {
+                "type": "array",
+                "items": {"type": "string", "minLength": 1},
+            },
         },
-        "required": ["finding_id", "finding", "assessment", "explanation"],
+        "required": [
+            "finding_id",
+            "finding",
+            "diagnosis",
+            "action",
+            "explanation",
+            "retry_contract",
+            "upstream_requests",
+            "dependency_ids",
+        ],
     },
 }
 
@@ -445,11 +539,12 @@ have stopped. It must describe the stable files on disk, not planned work. Use o
   two meaningfully different checked `attempts`, exact `remaining_goal`, concrete `obstruction`, and
   a `disposition`: `retry`, `missing_upstream`, `statement_review`, `interface_review`, or
   `genuine_blocker`.
-- `upstream_answers`: one answer for every supplied request id. Each entry gives `request_ids`, a
-  `disposition` of `added`, `existing`, or `downstream`, exact fully qualified `declarations`,
-  concrete `usage_guidance`, and a `rejection_reason`. For `downstream`, leave `declarations` empty
-  and explain why this earlier chapter is not the right owner. For the other dispositions, leave
-  `rejection_reason` empty.""",
+- `upstream_answers`: one independent answer for every supplied request id. Use `added` or
+  `existing` for a complete capability; `partial` for fully proved declarations that reduce but do
+  not discharge it; `downstream` only with an executable retry contract; `external` for an
+  unavailable dependency; or `decompose` with smaller child requests. Give exact declarations,
+  concrete usage guidance, remaining work, and rejection reason as appropriate. One hard request
+  must not prevent useful answers for the others from being reported.""",
         }
     else:
         values = {
@@ -460,18 +555,24 @@ the corresponding source passages. Do not spend time re-auditing unrelated chapt
 every genuine statement or supporting-interface problem in the focused scope. You are authorized to
 make the smallest source-faithful public correction when the evidence confirms a defect. Preserve a
 sound interface when only the proof strategy failed.""",
-            "review_workflow_details": """Account for every supplied finding ID as confirmed,
-rejected, or reframed. Check the exact statement against the source, test obvious counterexamples,
-and inspect only the focused earlier APIs needed to decide it. A confirmed defect must be repaired
-when it is in scope; a rejected finding must name a concrete viable proof route.""",
+            "review_workflow_details": """Account for every supplied finding ID with one diagnosis
+and one machine-actionable next action. First confirm that the declaration is live and the supplied
+evidence is current. Check the exact statement against the source, test obvious counterexamples,
+and inspect only the focused APIs needed to route it. Call a retry route executable only when every
+substantial step names an exact existing declaration and a focused Lean probe checks the critical
+composition. If a required step is absent, emit an upstream capability request or send the target
+to roadmap work. Treat unrelated prerequisite diagnostics as a dependency wait, not a mathematical
+proof failure.""",
             "review_guardrails": """Do not spend the assignment proving existing proposition
-placeholders. Do not broaden from the named findings into unrelated chapter cleanup. A no-change
-review must explain the concrete viable proof route or why the blocker is terminal. Supplied build
-diagnostics remain required work.""",
-            "review_definition_of_done": """Every supplied finding has an evidence-backed
-assessment, every confirmed in-scope defect has the smallest source-faithful repair, rejected or
-reframed findings have actionable proof guidance, and edited files have no diagnostics except
-permitted exact `sorry` warnings.""",
+placeholders. Do not broaden from the named findings into unrelated chapter cleanup. Do not repeat
+searches already recorded in the blocker ledger. A no-change review must route each blocker rather
+than merely restate it. Do not request a full dependency validation when no source was edited;
+focused target diagnostics are sufficient. Supplied target-local build diagnostics remain required
+work.""",
+            "review_definition_of_done": """Every supplied finding has an evidence-backed diagnosis
+and routing action, every in-scope defect has the smallest source-faithful repair, every proof retry
+has an executable checked contract, every missing result has a capability request, and edited files
+have no diagnostics except permitted exact `sorry` warnings.""",
             "review_output_format": """Return the structured report once, after tool use and edits
 have stopped. It must describe the stable files on disk, not planned work. Use only these fields:
 
@@ -483,9 +584,12 @@ have stopped. It must describe the stable files on disk, not planned work. Use o
 - `source_issues`: genuine defects in the informal textbook; otherwise an empty list. Each entry
   must give `location`, an exact identifying `source_excerpt`, a mathematical `description`, and the
   smallest `suggested_correction`.
-- `finding_assessments`: one entry for each supplied proof finding. Copy its exact `finding_id`,
-  copy a concise identifying `finding`, classify its `assessment` as `confirmed`, `rejected`,
-  or `reframed`, and give the evidence in `explanation`.""",
+- `finding_assessments`: one entry for each supplied proof finding. Copy its exact `finding_id` and
+  a concise identifying `finding`; choose a `diagnosis` and `action`; give checked `explanation`;
+  supply an executable `retry_contract` only for `retry_with_route` (otherwise `null`); and supply
+  `upstream_requests` only for `request_upstream`, and name exact `dependency_ids` for a dependency
+  wait. Capability requests must include a stable
+  `capability_key`, placement kind, acceptance tests, and the ordinary owner/consumer evidence.""",
         }
     for key, value in values.items():
         template = template.replace("{" + key + "}", value)

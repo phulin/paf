@@ -86,7 +86,8 @@ new reports use `diagnosis` and `action`.
 - `retry_with_route` requires a nonempty executable retry contract and records its digest.
 - `request_upstream` validates and enqueues the supplied capability requests, then marks the blocker
   `upstream_requested`.
-- `send_to_roadmap`, `park_external`, and an unresolved `genuine_blocker` mark the blocker `blocked`.
+- `send_to_roadmap` marks the blocker `roadmap`; `park_external` marks it `parked`; an
+  unresolved `genuine_blocker` remains `blocked`.
 - `wait_for_dependency` leaves the blocker waiting without incrementing semantic review exchanges.
 - `drop_stale_target` resolves the blocker only after the declaration lookup confirms that the
   target no longer exists or no longer contains a placeholder.
@@ -175,8 +176,8 @@ Upstream answers are independent per capability. Supported dispositions are:
 - `decompose`
 
 An owner run need not answer every request successfully. Valid answers are persisted individually;
-missing or invalid answers remain requested with an attempt error. They do not force unrelated
-answers into escalation.
+missing or invalid answers are parked with an attempt error so they cannot create an automatic
+retry loop. They do not force unrelated answers into escalation.
 
 `partial` records fully proved declarations that reduce the capability but do not satisfy its
 acceptance contract. `decompose` creates smaller child capability requests. `downstream` routes to a
@@ -229,7 +230,7 @@ This avoids inventing a second roadmap subsystem.
 
 ## 9. Observability
 
-Persist counters/events for:
+Persist bounded counters for:
 
 - review resolutions by diagnosis/action;
 - no-op reviews;

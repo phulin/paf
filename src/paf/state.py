@@ -137,6 +137,8 @@ class UpstreamRequestStatus(StrEnum):
 
     REQUESTED = "requested"
     ANSWERED = "answered"
+    PARTIAL = "partial"
+    PARKED = "parked"
     CLOSED = "closed"
     ESCALATED = "escalated"
 
@@ -145,6 +147,9 @@ class ProofBlockerStatus(StrEnum):
     OPEN = "open"
     UPSTREAM_REQUESTED = "upstream_requested"
     REVIEW_REQUESTED = "review_requested"
+    WAITING_DEPENDENCY = "waiting_dependency"
+    ROADMAP = "roadmap"
+    PARKED = "parked"
     BLOCKED = "blocked"
     RESOLVED = "resolved"
 
@@ -548,6 +553,7 @@ class StateStore:
         self.proof_review_requests: dict[str, dict[str, Any]] = {}
         self.upstream_requests: dict[str, dict[str, Any]] = {}
         self.proof_blockers: dict[str, dict[str, Any]] = {}
+        self.routing_metrics: dict[str, int] = {}
         self.thread_cumulative_usage: dict[str, TokenUsage] = {}
         self.isolation: dict[str, Any] = {}
         self.coordinator_build = CoordinatorBuildRecord()
@@ -637,6 +643,13 @@ class StateStore:
                     blocker_id: dict(value)
                     for blocker_id, value in raw_proof_blockers.items()
                     if isinstance(blocker_id, str) and isinstance(value, dict)
+                }
+            raw_routing_metrics = raw.get("routing_metrics")
+            if isinstance(raw_routing_metrics, dict):
+                self.routing_metrics = {
+                    str(name): int(value)
+                    for name, value in raw_routing_metrics.items()
+                    if isinstance(value, int)
                 }
             raw_thread_usage = raw.get("thread_cumulative_usage")
             if isinstance(raw_thread_usage, dict):
@@ -1283,7 +1296,14 @@ class StateStore:
             "agents": self.agent_summary(),
             "isolation": self.isolation,
             "shepherd": shepherd,
+            "routing_metrics": dict(sorted(self.routing_metrics.items())),
         }
+
+    def record_routing_event(self, name: str, count: int = 1) -> None:
+        """Record a bounded blocker-routing counter in the global snapshot."""
+
+        self.routing_metrics[name] = self.routing_metrics.get(name, 0) + count
+        self._mark_dirty(global_state=True)
 
     def _global_snapshot(self) -> dict[str, Any]:
         return self._bounded_global_snapshot(include_shepherd_agents=True) | {
@@ -2195,9 +2215,39 @@ class StateStore:
             request.setdefault("id", request_id)
             request.setdefault("created_at", created_at)
             request.setdefault("updated_at", created_at)
-            for name in ("origin_run_ids", "owner_paths", "attempted_alternatives"):
+            for name in (
+                "origin_run_ids",
+                "owner_paths",
+                "attempted_alternatives",
+                "acceptance_tests",
+            ):
                 if not isinstance(request.get(name), list):
                     request[name] = []
+            request.setdefault("owner_kind", "chapter")
+            owner_id = str(request.get("owner_chapter_id", ""))
+            capability_source = str(
+                request.get("candidate_signature") or request.get("needed_result", "")
+            )
+            normalized = re.sub(r"\s+", " ", capability_source).strip().casefold()
+            request.setdefault(
+                "capability_key",
+                f"{owner_id}:{stable_digest_text(normalized)[:16]}",
+            )
+            consumers = request.get("consumers")
+            if not isinstance(consumers, list) or not consumers:
+                origins = request.get("origin_run_ids", [])
+                request["consumers"] = [
+                    {
+                        "consumer_chapter_id": str(request.get("consumer_chapter_id", "")),
+                        "blocked_declaration": str(request.get("blocked_declaration", "")),
+                        "consumer_path": str(request.get("consumer_path", "")),
+                        "residual_goal": str(request.get("residual_goal", "")),
+                        "attempted_alternatives": list(request.get("attempted_alternatives", [])),
+                        "acceptance_tests": list(request.get("acceptance_tests", [])),
+                        "origin_run_ids": list(origins),
+                        "status": str(request.get("status", "requested")),
+                    }
+                ]
             if not isinstance(request.get("previous_attempts"), str):
                 request["previous_attempts"] = ""
             if request.get("answer") is not None and not isinstance(request.get("answer"), dict):
@@ -2352,6 +2402,12 @@ class StateStore:
                 origins.append(origin_run_id)
                 sightings = blocker.get("sightings", 0)
                 blocker["sightings"] = (sightings if isinstance(sightings, int) else 0) + 1
+                retry_cause = str(blocker.get("retry_cause_digest", ""))
+                if retry_cause and blocker.get("last_attempted_retry_cause_digest") != retry_cause:
+                    blocker["last_attempted_retry_cause_digest"] = retry_cause
+                    blocker["last_retry_run_id"] = origin_run_id
+                    blocker["status"] = ProofBlockerStatus.ROADMAP.value
+                    self.record_routing_event("unchanged_retry_suppressed")
             disposition = str(raw.get("disposition", "")).strip()
             if disposition:
                 blocker["disposition"] = disposition
@@ -2378,6 +2434,12 @@ class StateStore:
                 origins.append(origin_run_id)
                 sightings = blocker.get("sightings", 0)
                 blocker["sightings"] = (sightings if isinstance(sightings, int) else 0) + 1
+                retry_cause = str(blocker.get("retry_cause_digest", ""))
+                if retry_cause and blocker.get("last_attempted_retry_cause_digest") != retry_cause:
+                    blocker["last_attempted_retry_cause_digest"] = retry_cause
+                    blocker["last_retry_run_id"] = origin_run_id
+                    blocker["status"] = ProofBlockerStatus.ROADMAP.value
+                    self.record_routing_event("unchanged_retry_suppressed")
             blocker["updated_at"] = timestamp()
             changed[str(blocker["id"])] = blocker
         if changed:
@@ -2416,7 +2478,13 @@ class StateStore:
         return tuple(
             request
             for _, request in sorted(self.upstream_requests.items())
-            if request.get("consumer_chapter_id") == chapter_id
+            if (
+                request.get("consumer_chapter_id") == chapter_id
+                or any(
+                    isinstance(consumer, dict) and consumer.get("consumer_chapter_id") == chapter_id
+                    for consumer in request.get("consumers", [])
+                )
+            )
             and (selected is None or UpstreamRequestStatus(str(request.get("status"))) in selected)
         )
 
@@ -2432,26 +2500,75 @@ class StateStore:
     ) -> tuple[str, bool]:
         """Persist one proof-to-upstream handoff without collapsing its evidence."""
 
-        fingerprint_fields = (
-            consumer_chapter_id,
-            str(request.get("blocked_declaration", "")).strip(),
-            str(request.get("consumer_path", "")).strip(),
-            str(request.get("needed_result", "")).strip(),
-            owner_chapter_id,
-        )
+        owner_kind = str(request.get("owner_kind", "chapter")).strip() or "chapter"
+        capability_key = str(request.get("capability_key", "")).strip()
+        if not capability_key:
+            capability_source = str(
+                request.get("candidate_signature") or request.get("needed_result", "")
+            )
+            normalized = re.sub(r"\s+", " ", capability_source).strip().casefold()
+            capability_key = f"{owner_chapter_id}:{stable_digest_text(normalized)[:16]}"
+        fingerprint_fields = (owner_kind, owner_chapter_id, capability_key)
         identity = "\0".join(fingerprint_fields)
         fingerprint = stable_digest_text(identity)[:16]
         transitional_fingerprint = digest_text(identity)
+        legacy_identity = "\0".join(
+            (
+                consumer_chapter_id,
+                str(request.get("blocked_declaration", "")).strip(),
+                str(request.get("consumer_path", "")).strip(),
+                str(request.get("needed_result", "")).strip(),
+                owner_chapter_id,
+            )
+        )
+        legacy_fingerprints = {
+            stable_digest_text(legacy_identity)[:16],
+            digest_text(legacy_identity),
+        }
+        attachment = self._upstream_consumer_attachment(
+            request,
+            consumer_chapter_id=consumer_chapter_id,
+            origin_run_id=origin_run_id,
+        )
         for request_id, existing in self.upstream_requests.items():
-            if existing.get("fingerprint") not in {fingerprint, transitional_fingerprint}:
+            if existing.get("fingerprint") not in {
+                fingerprint,
+                transitional_fingerprint,
+                *legacy_fingerprints,
+            }:
                 continue
             if existing.get("status") == UpstreamRequestStatus.CLOSED.value:
                 continue
             existing["fingerprint"] = fingerprint
+            existing["capability_key"] = capability_key
+            existing["owner_kind"] = owner_kind
+            if isinstance(existing.get("answer"), dict):
+                attachment["status"] = str(
+                    existing.get("status", UpstreamRequestStatus.ANSWERED.value)
+                )
+            consumers = existing.setdefault("consumers", [])
+            if isinstance(consumers, list):
+                current = next(
+                    (
+                        value
+                        for value in consumers
+                        if isinstance(value, dict)
+                        and value.get("consumer_chapter_id") == consumer_chapter_id
+                        and value.get("blocked_declaration") == attachment["blocked_declaration"]
+                    ),
+                    None,
+                )
+                if current is None:
+                    consumers.append(attachment)
+                else:
+                    origins = current.setdefault("origin_run_ids", [])
+                    if isinstance(origins, list) and origin_run_id not in origins:
+                        origins.append(origin_run_id)
             origin_run_ids = existing.setdefault("origin_run_ids", [])
             if isinstance(origin_run_ids, list) and origin_run_id not in origin_run_ids:
                 origin_run_ids.append(origin_run_id)
             existing["sightings"] = int(existing.get("sightings", 1)) + 1
+            self.record_routing_event("capability_deduplicated")
             existing["updated_at"] = timestamp()
             self._mark_dirty(global_state=False, sections={"upstream_requests"})
             await self._persist()
@@ -2462,6 +2579,8 @@ class StateStore:
         status = (
             UpstreamRequestStatus.ESCALATED
             if escalation_reason
+            else UpstreamRequestStatus.PARKED
+            if owner_kind != "chapter"
             else UpstreamRequestStatus.REQUESTED
         )
         attempted = request.get("attempted_alternatives")
@@ -2469,6 +2588,8 @@ class StateStore:
         record: dict[str, Any] = {
             "id": request_id,
             "fingerprint": fingerprint,
+            "capability_key": capability_key,
+            "owner_kind": owner_kind,
             "status": status.value,
             "consumer_chapter_id": consumer_chapter_id,
             "origin_run_ids": [origin_run_id],
@@ -2495,6 +2616,13 @@ class StateStore:
             if isinstance(attempted, list)
             else [],
             "previous_attempts": previous_attempts,
+            "candidate_signature": str(request.get("candidate_signature", "")).strip(),
+            "acceptance_tests": [
+                str(item).strip()
+                for item in request.get("acceptance_tests", [])
+                if isinstance(item, str) and item.strip()
+            ],
+            "consumers": [attachment],
             "answer": None,
             "sightings": 1,
             "created_at": now,
@@ -2508,6 +2636,32 @@ class StateStore:
         self._mark_dirty(global_state=False, sections={"upstream_requests"})
         await self._persist()
         return request_id, True
+
+    @staticmethod
+    def _upstream_consumer_attachment(
+        request: dict[str, Any],
+        *,
+        consumer_chapter_id: str,
+        origin_run_id: str,
+    ) -> dict[str, Any]:
+        return {
+            "consumer_chapter_id": consumer_chapter_id,
+            "blocked_declaration": str(request.get("blocked_declaration", "")).strip(),
+            "consumer_path": str(request.get("consumer_path", "")).strip(),
+            "residual_goal": str(request.get("residual_goal", "")).strip(),
+            "attempted_alternatives": [
+                str(item).strip()
+                for item in request.get("attempted_alternatives", [])
+                if isinstance(item, str) and item.strip()
+            ],
+            "acceptance_tests": [
+                str(item).strip()
+                for item in request.get("acceptance_tests", [])
+                if isinstance(item, str) and item.strip()
+            ],
+            "origin_run_ids": [origin_run_id],
+            "status": "requested",
+        }
 
     async def record_upstream_answers(
         self,
@@ -2531,11 +2685,15 @@ class StateStore:
                 answer = answers.get(request_id)
                 if answer is None:
                     reason = error or "targeted upstream repair returned no usable answer"
-                    request["status"] = UpstreamRequestStatus.ESCALATED.value
-                    request["escalation_reason"] = reason
-                    request["escalated_at"] = timestamp()
+                    request["status"] = UpstreamRequestStatus.PARKED.value
+                    request["last_attempt_error"] = reason
+                    consumers = request.get("consumers")
+                    if isinstance(consumers, list):
+                        for consumer in consumers:
+                            if isinstance(consumer, dict) and consumer.get("status") != "closed":
+                                consumer["status"] = UpstreamRequestStatus.PARKED.value
+                                consumer["last_attempt_error"] = reason
                     if run_id is not None:
-                        request["escalated_by_run_id"] = run_id
                         request["repair_run_id"] = run_id
                     request["updated_at"] = timestamp()
                     changed = True
@@ -2546,7 +2704,19 @@ class StateStore:
                 request["answer"] = persisted_answer
                 if run_id is not None:
                     request["repair_run_id"] = run_id
-                request["status"] = UpstreamRequestStatus.ANSWERED.value
+                disposition = str(answer.get("disposition", ""))
+                request["status"] = (
+                    UpstreamRequestStatus.PARTIAL.value
+                    if disposition == "partial"
+                    else UpstreamRequestStatus.PARKED.value
+                    if disposition in {"external", "decompose"}
+                    else UpstreamRequestStatus.ANSWERED.value
+                )
+                consumers = request.get("consumers")
+                if isinstance(consumers, list):
+                    for consumer in consumers:
+                        if isinstance(consumer, dict) and consumer.get("status") != "closed":
+                            consumer["status"] = request["status"]
                 request["updated_at"] = timestamp()
                 request.pop("escalation_reason", None)
                 request.pop("escalated_at", None)
@@ -2562,6 +2732,7 @@ class StateStore:
         *,
         run_id: str | None,
         succeeded_ids: Iterable[str],
+        consumer_chapter_id: str | None = None,
         error: str = "",
         success_detail: str = "blocked declaration succeeded in the targeted downstream retry",
     ) -> tuple[str, ...]:
@@ -2578,6 +2749,31 @@ class StateStore:
                 status = UpstreamRequestStatus(str(request.get("status")))
                 if status is UpstreamRequestStatus.CLOSED:
                     continue
+                consumers = request.get("consumers")
+                consumer_values = (
+                    [value for value in consumers if isinstance(value, dict)]
+                    if isinstance(consumers, list)
+                    else []
+                )
+                attachments = [
+                    value
+                    for value in consumer_values
+                    if consumer_chapter_id is None
+                    or value.get("consumer_chapter_id") == consumer_chapter_id
+                ]
+                if request_id in succeeded and attachments:
+                    for attachment in attachments:
+                        attachment["status"] = "closed"
+                        attachment["closed_by_run_id"] = run_id
+                        attachment["closed_reason"] = success_detail
+                    remaining = [
+                        value for value in consumer_values if value.get("status") != "closed"
+                    ]
+                    if remaining:
+                        request["status"] = self._aggregate_upstream_consumer_status(remaining)
+                        request["updated_at"] = timestamp()
+                        changed = True
+                        continue
                 if request_id in succeeded:
                     request["status"] = UpstreamRequestStatus.CLOSED.value
                     request["closed_at"] = timestamp()
@@ -2597,9 +2793,16 @@ class StateStore:
                 reason = error or (
                     "blocked declaration remained unresolved after its targeted downstream retry"
                 )
-                request["status"] = UpstreamRequestStatus.ESCALATED.value
-                request["escalation_reason"] = reason
-                request["escalated_at"] = timestamp()
+                if attachments:
+                    for attachment in attachments:
+                        attachment["status"] = "parked"
+                        attachment["last_attempt_error"] = reason
+                    request["status"] = self._aggregate_upstream_consumer_status(consumer_values)
+                    request["last_attempt_error"] = reason
+                else:
+                    request["status"] = UpstreamRequestStatus.ESCALATED.value
+                    request["escalation_reason"] = reason
+                    request["escalated_at"] = timestamp()
                 if run_id is not None:
                     request["escalated_by_run_id"] = run_id
                     request["retry_run_id"] = run_id
@@ -2609,6 +2812,19 @@ class StateStore:
                 self._mark_dirty(global_state=False, sections={"upstream_requests"})
                 await self._persist()
         return tuple(closed)
+
+    @staticmethod
+    def _aggregate_upstream_consumer_status(consumers: Iterable[dict[str, Any]]) -> str:
+        statuses = {str(value.get("status", "")) for value in consumers}
+        if statuses == {"closed"}:
+            return UpstreamRequestStatus.CLOSED.value
+        if "requested" in statuses:
+            return UpstreamRequestStatus.REQUESTED.value
+        if "answered" in statuses:
+            return UpstreamRequestStatus.ANSWERED.value
+        if "partial" in statuses:
+            return UpstreamRequestStatus.PARTIAL.value
+        return UpstreamRequestStatus.PARKED.value
 
     async def reopen_escalated_upstream_requests(self, chapter_ids: Iterable[str]) -> list[str]:
         """Treat the explicit manual unblock command as authority to retry the handoff."""

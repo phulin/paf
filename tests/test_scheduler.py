@@ -186,7 +186,7 @@ def result(
     complete: bool = True,
     issues: list[str] | None = None,
     failed_attempts: list[dict[str, Any]] | None = None,
-    finding_assessments: list[dict[str, str]] | None = None,
+    finding_assessments: list[dict[str, Any]] | None = None,
 ) -> AgentResult:
     report: dict[str, Any] = {
         "complete": complete,
@@ -205,6 +205,38 @@ def result(
         usage=TokenUsage(input_tokens=10, output_tokens=5, measured=True),
         report=report,
     )
+
+
+def finding_resolution(
+    finding_id: str,
+    *,
+    action: str,
+    diagnosis: str = "consumer_local_proof",
+    explanation: str = "checked against the source",
+    retry_contract: dict[str, Any] | None = None,
+    upstream_requests: list[dict[str, Any]] | None = None,
+    dependency_ids: list[str] | None = None,
+) -> dict[str, Any]:
+    return {
+        "finding_id": finding_id,
+        "finding": "Book.target remains unproved",
+        "diagnosis": diagnosis,
+        "action": action,
+        "explanation": explanation,
+        "retry_contract": retry_contract,
+        "upstream_requests": upstream_requests or [],
+        "dependency_ids": dependency_ids or [],
+    }
+
+
+def executable_retry_contract() -> dict[str, Any]:
+    return {
+        "new_information": "A checked finite-presentation induction route is now available.",
+        "declarations": ["Book.induction_step"],
+        "intermediate_claims": ["reduce to the finite presentation"],
+        "critical_probe": "lean_goal accepted `apply Book.induction_step`",
+        "known_remaining_gap": "",
+    }
 
 
 async def mark_discovered(
@@ -1437,7 +1469,7 @@ async def test_proof_review_retries_missing_finding_assessments_in_same_session(
 
 
 @pytest.mark.asyncio
-async def test_malformed_review_report_resumes_same_session(tmp_path: Path) -> None:
+async def test_zero_work_malformed_review_report_starts_fresh_session(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
     chapter = config.chapters[0]
     state = StateStore(config)
@@ -1464,8 +1496,8 @@ async def test_malformed_review_report_resumes_same_session(tmp_path: Path) -> N
 
     assert await orchestrator._review_chapter_to_clean(chapter, {chapter.id: 0})
     assert state.task(chapter.id, Stage.REVIEW).rounds == 2
-    assert executor.resume_thread_ids == [None, "malformed-session"]
-    assert "structured final report" in executor.resume_prompts[-1]
+    assert executor.resume_thread_ids == [None, None]
+    assert state.routing_metrics["zero_work_review_report"] == 1
     await orchestrator.shutdown()
 
 
@@ -1597,18 +1629,148 @@ async def test_upstream_requests_persist_answers_and_batch_by_owner(tmp_path: Pa
     reloaded = StateStore(config)
     await reloaded.load_or_create()
     persisted = reloaded.upstream_requests[request_id]
-    assert persisted["status"] == UpstreamRequestStatus.ESCALATED
+    assert persisted["status"] == UpstreamRequestStatus.PARKED
     assert persisted["answer"]["declarations"] == ["Book.transport_input_result"]
     assert persisted["repair_run_id"] == "repair-run"
     assert persisted["retry_run_id"] == "retry-run"
-    assert persisted["escalation_reason"] == "the residual goal remained"
+    assert persisted["last_attempt_error"] == "the residual goal remained"
+    assert persisted["consumers"][0]["status"] == "parked"
     assert not {"answers", "repair_attempts", "retry_attempts", "history"}.intersection(persisted)
     assert reloaded.upstream_request_batches() == {}
 
     assert await reloaded.unblock() == [f"{consumer.id}:prove"]
-    assert reloaded.upstream_requests[request_id]["status"] == UpstreamRequestStatus.ANSWERED
+    assert reloaded.upstream_requests[request_id]["status"] == UpstreamRequestStatus.PARKED
     assert reloaded.upstream_requests[request_id]["answer"] == persisted["answer"]
     await reloaded.close()
+
+
+@pytest.mark.asyncio
+async def test_capability_request_is_shared_across_consumers_and_closes_independently(
+    tmp_path: Path,
+) -> None:
+    config_path = write_project(tmp_path, chapters="chapters = [1, 2, 3]")
+    (tmp_path / "books" / "book.md").write_text(
+        "# Book\n\n## 1. First chapter\n\nText.\n\n## 2. Second chapter\n\n## 3. Third chapter\n",
+        encoding="utf-8",
+    )
+    config = load_config(config_path)
+    owner, first, second = config.chapters
+    state = StateStore(config)
+    await state.load_or_create()
+
+    async def attach(consumer: Chapter, declaration: str) -> str:
+        request_id, _ = await state.enqueue_upstream_request(
+            {
+                "capability_key": "book.shared_transport",
+                "owner_kind": "chapter",
+                "blocked_declaration": declaration,
+                "consumer_path": f"lean/Book/Chapter0{consumer.number}.lean",
+                "residual_goal": "⊢ Result x",
+                "needed_result": "shared transport",
+                "owner_chapter_id": owner.id,
+                "owner_paths": ["lean/Book/Chapter01.lean"],
+                "attempted_alternatives": ["simp", "exact candidate"],
+                "acceptance_tests": [f"{declaration} accepts Book.shared_transport"],
+            },
+            consumer_chapter_id=consumer.id,
+            origin_run_id=f"proof-{consumer.number}",
+            owner_chapter_id=owner.id,
+            previous_attempts="checked attempt",
+        )
+        return request_id
+
+    first_id = await attach(first, "firstTarget")
+    second_id = await attach(second, "secondTarget")
+    assert first_id == second_id
+    request = state.upstream_requests[first_id]
+    assert len(request["consumers"]) == 2
+    assert state.routing_metrics["capability_deduplicated"] == 1
+
+    await state.record_upstream_answers(
+        (first_id,),
+        run_id="repair",
+        answers={
+            first_id: {
+                "disposition": "existing",
+                "declarations": ["Book.shared_transport"],
+                "usage_guidance": "Apply the shared transport.",
+                "rejection_reason": "",
+            }
+        },
+    )
+    await state.finish_upstream_requests(
+        (first_id,),
+        run_id="retry-first",
+        succeeded_ids=(first_id,),
+        consumer_chapter_id=first.id,
+    )
+    assert request["status"] == UpstreamRequestStatus.ANSWERED
+    assert {value["status"] for value in request["consumers"]} == {"closed", "answered"}
+
+    await state.finish_upstream_requests(
+        (first_id,),
+        run_id="retry-second",
+        succeeded_ids=(first_id,),
+        consumer_chapter_id=second.id,
+    )
+    assert request["status"] == UpstreamRequestStatus.CLOSED
+    await state.close()
+
+
+@pytest.mark.asyncio
+async def test_upstream_batch_persists_partial_and_missing_answers_independently(
+    tmp_path: Path,
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    owner, consumer = config.chapters
+    state = StateStore(config)
+    await state.load_or_create()
+    request_ids = []
+    for index in range(3):
+        request_id, _ = await state.enqueue_upstream_request(
+            {
+                "capability_key": f"book.capability.{index}",
+                "blocked_declaration": f"target{index}",
+                "consumer_path": "lean/Book/Chapter02.lean",
+                "residual_goal": f"⊢ Result {index}",
+                "needed_result": f"capability {index}",
+                "owner_chapter_id": owner.id,
+                "owner_paths": ["lean/Book/Chapter01.lean"],
+                "attempted_alternatives": ["simp", "exact candidate"],
+            },
+            consumer_chapter_id=consumer.id,
+            origin_run_id=f"proof-{index}",
+            owner_chapter_id=owner.id,
+            previous_attempts="checked attempt",
+        )
+        request_ids.append(request_id)
+
+    await state.record_upstream_answers(
+        request_ids,
+        run_id="repair",
+        answers={
+            request_ids[0]: {
+                "disposition": "existing",
+                "declarations": ["Book.complete"],
+                "usage_guidance": "Apply it.",
+                "rejection_reason": "",
+            },
+            request_ids[1]: {
+                "disposition": "partial",
+                "declarations": ["Book.partial"],
+                "usage_guidance": "Use it for the first reduction.",
+                "rejection_reason": "",
+                "remaining_work": "The terminal dimension equality remains.",
+            },
+        },
+        error="the third capability received no usable answer",
+    )
+
+    assert state.upstream_requests[request_ids[0]]["status"] == UpstreamRequestStatus.ANSWERED
+    assert state.upstream_requests[request_ids[1]]["status"] == UpstreamRequestStatus.PARTIAL
+    assert state.upstream_requests[request_ids[2]]["status"] == UpstreamRequestStatus.PARKED
+    assert "no usable answer" in state.upstream_requests[request_ids[2]]["last_attempt_error"]
+    await state.close()
 
 
 @pytest.mark.asyncio
@@ -1731,6 +1893,7 @@ async def test_interrupted_runs_leave_requests_at_last_completed_fact(tmp_path: 
         owner_chapter_id=owner.id,
         previous_attempts="attempt two",
     )
+    assert retry_id == repair_id
     await state.record_upstream_answers(
         (retry_id,),
         run_id="repair-run",
@@ -1754,9 +1917,11 @@ async def test_interrupted_runs_leave_requests_at_last_completed_fact(tmp_path: 
     recovered = StateStore(config)
     await recovered.load_or_create()
 
-    assert recovered.upstream_requests[repair_id]["status"] == UpstreamRequestStatus.REQUESTED
-    assert recovered.upstream_requests[retry_id]["status"] == UpstreamRequestStatus.ANSWERED
-    assert recovered.upstream_request_batches() == {owner.id: [repair_id]}
+    request = recovered.upstream_requests[repair_id]
+    assert request["status"] == UpstreamRequestStatus.ANSWERED
+    assert len(request["consumers"]) == 2
+    assert {consumer["status"] for consumer in request["consumers"]} == {"answered"}
+    assert recovered.upstream_request_batches() == {}
     assert recovered.task(owner.id, Stage.PROVE).runs[-1].id == repair_run.id
     assert recovered.task(owner.id, Stage.PROVE).runs[-1].status == TaskStatus.INTERRUPTED
     assert recovered.task(consumer.id, Stage.PROVE).runs[-1].id == retry_run.id
@@ -5540,17 +5705,18 @@ async def test_standalone_failed_proof_attempt_queues_durable_review(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("assessment", "review_changed"),
+    ("action", "review_changed", "expected"),
     [
-        ("confirmed", False),
-        ("rejected", False),
-        ("reframed", True),
+        ("repair_and_retry", True, ProofBlockerStatus.OPEN),
+        ("retry_with_route", False, ProofBlockerStatus.OPEN),
+        ("send_to_roadmap", False, ProofBlockerStatus.ROADMAP),
     ],
 )
-async def test_completed_review_deterministically_reopens_blocker(
+async def test_completed_review_routes_blocker_by_structured_action(
     tmp_path: Path,
-    assessment: str,
+    action: str,
     review_changed: bool,
+    expected: ProofBlockerStatus,
 ) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
     chapter = config.chapters[0]
@@ -5582,19 +5748,23 @@ async def test_completed_review_deterministically_reopens_blocker(
         report={
             "complete": True,
             "finding_assessments": [
-                {
-                    "finding_id": f"{request_id}:1",
-                    "finding": "Book.target is blocked",
-                    "assessment": assessment,
-                    "explanation": "checked against the source",
-                }
+                finding_resolution(
+                    f"{request_id}:1",
+                    action=action,
+                    retry_contract=(
+                        executable_retry_contract() if action == "retry_with_route" else None
+                    ),
+                )
             ],
         },
     )
 
     assert await orchestrator._complete_review(chapter, "reviewed", proof_request_ids=(request_id,))
-    assert state.proof_blockers[blocker_id]["status"] == ProofBlockerStatus.OPEN.value
-    assert state.proof_blockers[blocker_id]["retry_sighting_baseline"] == 1
+    assert state.proof_blockers[blocker_id]["status"] == expected.value
+    if expected is ProofBlockerStatus.OPEN:
+        assert state.proof_blockers[blocker_id]["retry_sighting_baseline"] == 1
+    else:
+        assert state.task(chapter.id, Stage.PROVE).status == TaskStatus.FAILED
     assert state.proof_blockers[blocker_id]["review_exchange_count"] == 1
     assert request_id not in state.proof_review_requests
     await orchestrator.shutdown()
@@ -5631,12 +5801,12 @@ async def test_proof_review_request_is_auxiliary_to_green_review(tmp_path: Path)
             result(
                 changed=False,
                 finding_assessments=[
-                    {
-                        "finding_id": f"{request_id}:1",
-                        "finding": "Book.target remains unproved",
-                        "assessment": "reframed",
-                        "explanation": "Try induction on the finite presentation next.",
-                    }
+                    finding_resolution(
+                        f"{request_id}:1",
+                        action="retry_with_route",
+                        explanation="Try induction on the finite presentation next.",
+                        retry_contract=executable_retry_contract(),
+                    )
                 ],
             )
         ],
@@ -5713,7 +5883,7 @@ async def test_build_warning_review_request_does_not_block_proof_readiness(
 
 
 @pytest.mark.asyncio
-async def test_proof_review_exchange_cap_blocks_proof_not_review(tmp_path: Path) -> None:
+async def test_noop_proof_review_routes_once_to_roadmap(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
     chapter = config.chapters[0]
     source = tmp_path / "lean" / "Book" / "Chapter01.lean"
@@ -5730,59 +5900,357 @@ async def test_proof_review_exchange_cap_blocks_proof_not_review(tmp_path: Path)
         failed_attempts=[failed_attempt("statement/interface strategy stalled")],
     )
     blocker_id = str(blockers[0]["id"])
-    maximum = config.stages[Stage.PROVE].unchanged_retry_limit
-
-    for exchange in range(1, maximum + 1):
-        request_id, _ = await state.enqueue_proof_review_request(
-            {chapter.id: "Failed proof `Book.target` in `lean/Book/Chapter01.lean`"},
-            origin_run_id=f"proof-run-{exchange}",
-            blocker_ids=(blocker_id,),
-        )
-        await state.set_proof_blocker_status((blocker_id,), ProofBlockerStatus.REVIEW_REQUESTED)
-        run = await state.start_auxiliary_run(
-            chapter.id,
-            Stage.REVIEW,
-            role=PROOF_REVIEW_ROLE,
-            request_ids=(request_id,),
-        )
-        await state.finish_run(
-            run,
-            status=TaskStatus.SUCCEEDED,
-            report={
-                "complete": True,
-                "finding_assessments": [
-                    {
-                        "finding_id": f"{request_id}:1",
-                        "finding": "Book.target remains unproved",
-                        "assessment": "reframed",
-                        "explanation": f"review response {exchange}",
-                    }
-                ],
-            },
-        )
-        await orchestrator._apply_proof_review_outcomes(chapter, (request_id,))
-        await state.finish_proof_review_requests(chapter.id, (request_id,))
-        assert state.proof_blockers[blocker_id]["status"] == ProofBlockerStatus.OPEN.value
-        assert state.task(chapter.id, Stage.REVIEW).status == TaskStatus.SUCCEEDED
+    request_id, _ = await state.enqueue_proof_review_request(
+        {chapter.id: "Failed proof `Book.target` in `lean/Book/Chapter01.lean`"},
+        origin_run_id="proof-run-1",
+        blocker_ids=(blocker_id,),
+    )
+    await state.set_proof_blocker_status((blocker_id,), ProofBlockerStatus.REVIEW_REQUESTED)
+    run = await state.start_auxiliary_run(
+        chapter.id,
+        Stage.REVIEW,
+        role=PROOF_REVIEW_ROLE,
+        request_ids=(request_id,),
+    )
+    await state.finish_run(
+        run,
+        status=TaskStatus.SUCCEEDED,
+        report={
+            "complete": True,
+            "finding_assessments": [
+                finding_resolution(
+                    f"{request_id}:1",
+                    action="send_to_roadmap",
+                    diagnosis="genuine_blocker",
+                )
+            ],
+        },
+    )
+    await orchestrator._apply_proof_review_outcomes(chapter, (request_id,))
+    await state.finish_proof_review_requests(chapter.id, (request_id,))
 
     blocker = state.proof_blockers[blocker_id]
-    assert blocker["review_exchange_count"] == maximum
-    assert len(blocker["review_responses"]) == maximum
-    orchestrator.executor = FakeExecutor(
-        state,
-        [
-            result(
-                changed=False,
-                placeholders=1,
-                failed_attempts=[failed_attempt("statement/interface strategy stalled")],
-            )
-        ],
-    )
-    assert not await orchestrator._prove(chapter)
+    assert blocker["status"] == ProofBlockerStatus.ROADMAP.value
+    assert blocker["review_exchange_count"] == 1
+    assert len(blocker["review_responses"]) == 1
     proof = state.task(chapter.id, Stage.PROVE)
     assert proof.status == TaskStatus.FAILED
-    assert "durable blockers retained" in proof.detail
+    assert "Shepherd roadmap" in proof.detail
     assert state.task(chapter.id, Stage.REVIEW).status == TaskStatus.SUCCEEDED
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_proof_review_can_route_missing_capability_upstream(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    owner, consumer = config.chapters
+    root = tmp_path / "lean" / "Book"
+    root.mkdir(parents=True)
+    (root / "Chapter01.lean").write_text("theorem support : True := by trivial\n")
+    (root / "Chapter02.lean").write_text("theorem target : True := by sorry\n")
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await orchestrator.prepare()
+    blockers = await state.record_proof_blockers(
+        consumer.id,
+        origin_run_id="proof-run",
+        failed_attempts=[failed_attempt("a reusable transport result is missing")],
+    )
+    blocker_id = str(blockers[0]["id"])
+    request_id, _ = await state.enqueue_proof_review_request(
+        {consumer.id: "Failed proof `Book.target` in `lean/Book/Chapter02.lean`"},
+        origin_run_id="proof-run",
+        blocker_ids=(blocker_id,),
+    )
+    run = await state.start_auxiliary_run(
+        consumer.id,
+        Stage.REVIEW,
+        role=PROOF_REVIEW_ROLE,
+        request_ids=(request_id,),
+    )
+    await state.finish_run(
+        run,
+        status=TaskStatus.SUCCEEDED,
+        report={
+            "complete": True,
+            "finding_assessments": [
+                finding_resolution(
+                    f"{request_id}:1",
+                    diagnosis="missing_capability",
+                    action="request_upstream",
+                    upstream_requests=[
+                        {
+                            "capability_key": "book.transport",
+                            "blocked_declaration": "Book.target",
+                            "consumer_path": "lean/Book/Chapter02.lean",
+                            "residual_goal": "⊢ True",
+                            "needed_result": "a reusable transport theorem",
+                            "candidate_signature": "theorem transport : True",
+                            "owner_kind": "chapter",
+                            "owner_chapter_id": owner.id,
+                            "owner_paths": ["lean/Book/Chapter01.lean"],
+                            "attempted_alternatives": ["simp", "exact support"],
+                            "acceptance_tests": ["Book.target accepts `exact Book.transport`"],
+                        }
+                    ],
+                )
+            ],
+        },
+    )
+
+    assert await orchestrator._complete_review(
+        consumer, "reviewed", proof_request_ids=(request_id,)
+    )
+    upstream = next(iter(state.upstream_requests.values()))
+    assert upstream["capability_key"] == "book.transport"
+    assert upstream["status"] == UpstreamRequestStatus.REQUESTED
+    blocker = state.proof_blockers[blocker_id]
+    assert blocker["status"] == ProofBlockerStatus.UPSTREAM_REQUESTED
+    assert blocker["request_ids"] == [upstream["id"]]
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_proof_review_dependency_wait_does_not_consume_exchange(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    dependency, consumer = config.chapters
+    root = tmp_path / "lean" / "Book"
+    root.mkdir(parents=True)
+    (root / "Chapter02.lean").write_text("theorem target : True := by sorry\n")
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await orchestrator.prepare()
+    blocker = (
+        await state.record_proof_blockers(
+            consumer.id,
+            origin_run_id="proof-run",
+            failed_attempts=[failed_attempt("an unrelated prerequisite failed to build")],
+        )
+    )[0]
+    blocker_id = str(blocker["id"])
+    request_id, _ = await state.enqueue_proof_review_request(
+        {consumer.id: "Failed proof `Book.target` in `lean/Book/Chapter02.lean`"},
+        origin_run_id="proof-run",
+        blocker_ids=(blocker_id,),
+    )
+    run = await state.start_auxiliary_run(
+        consumer.id, Stage.REVIEW, role=PROOF_REVIEW_ROLE, request_ids=(request_id,)
+    )
+    await state.finish_run(
+        run,
+        status=TaskStatus.SUCCEEDED,
+        report={
+            "complete": True,
+            "finding_assessments": [
+                finding_resolution(
+                    f"{request_id}:1",
+                    diagnosis="validation_noise",
+                    action="wait_for_dependency",
+                    dependency_ids=[dependency.id],
+                )
+            ],
+        },
+    )
+
+    await orchestrator._complete_review(consumer, "reviewed", proof_request_ids=(request_id,))
+    blocker = state.proof_blockers[blocker_id]
+    assert blocker["status"] == ProofBlockerStatus.WAITING_DEPENDENCY
+    assert blocker.get("review_exchange_count", 0) == 0
+    proof = state.task(consumer.id, Stage.PROVE)
+    assert proof.status == TaskStatus.PENDING
+    assert any(
+        requirement.owner_task_key == state.key(dependency.id, Stage.PROVE)
+        for requirement in proof.waiting_on
+    )
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_proof_review_drops_confirmed_stale_target(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = config.chapters[0]
+    path = tmp_path / "lean" / "Book" / "Chapter01.lean"
+    path.parent.mkdir(parents=True)
+    path.write_text("theorem replacement : True := by trivial\n")
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await orchestrator.prepare()
+    blocker = (
+        await state.record_proof_blockers(
+            chapter.id,
+            origin_run_id="proof-run",
+            failed_attempts=[failed_attempt("captured target was removed")],
+        )
+    )[0]
+    blocker_id = str(blocker["id"])
+    request_id, _ = await state.enqueue_proof_review_request(
+        {chapter.id: "Failed proof `Book.target` in `lean/Book/Chapter01.lean`"},
+        origin_run_id="proof-run",
+        blocker_ids=(blocker_id,),
+    )
+    run = await state.start_auxiliary_run(
+        chapter.id, Stage.REVIEW, role=PROOF_REVIEW_ROLE, request_ids=(request_id,)
+    )
+    await state.finish_run(
+        run,
+        status=TaskStatus.SUCCEEDED,
+        report={
+            "complete": True,
+            "finding_assessments": [
+                finding_resolution(
+                    f"{request_id}:1",
+                    diagnosis="stale_target",
+                    action="drop_stale_target",
+                )
+            ],
+        },
+    )
+
+    await orchestrator._complete_review(chapter, "reviewed", proof_request_ids=(request_id,))
+    assert state.proof_blockers[blocker_id]["status"] == ProofBlockerStatus.RESOLVED
+    assert state.routing_metrics["stale_target_dropped"] == 1
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_exhausted_retry_contract_routes_to_roadmap_without_second_review(
+    tmp_path: Path,
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = config.chapters[0]
+    state = StateStore(config)
+    await state.load_or_create()
+    blocker = (
+        await state.record_proof_blockers(
+            chapter.id,
+            origin_run_id="initial-proof",
+            failed_attempts=[failed_attempt("the original strategy failed")],
+        )
+    )[0]
+    blocker["retry_cause_digest"] = "checked-route-v1"
+    blocker["status"] = ProofBlockerStatus.OPEN.value
+
+    retained = await state.record_proof_blockers(
+        chapter.id,
+        origin_run_id="contract-retry",
+        failed_attempts=[failed_attempt("the original strategy failed")],
+    )
+
+    assert retained[0]["status"] == ProofBlockerStatus.ROADMAP
+    assert retained[0]["last_attempted_retry_cause_digest"] == "checked-route-v1"
+    assert state.routing_metrics["unchanged_retry_suppressed"] == 1
+    await state.close()
+
+
+@pytest.mark.asyncio
+async def test_decomposed_upstream_answer_materializes_child_capability(
+    tmp_path: Path,
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    owner, consumer = config.chapters
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await orchestrator.prepare()
+    parent_id, _ = await state.enqueue_upstream_request(
+        {
+            "capability_key": "book.large_bridge",
+            "owner_kind": "chapter",
+            "blocked_declaration": "Book.target",
+            "consumer_path": "lean/Book/Chapter02.lean",
+            "residual_goal": "⊢ LargeBridge x",
+            "needed_result": "a large bridge",
+            "owner_chapter_id": owner.id,
+            "owner_paths": ["lean/Book/Chapter01.lean"],
+            "attempted_alternatives": ["simp", "exact existingBridge"],
+            "acceptance_tests": ["Book.target accepts the bridge"],
+        },
+        consumer_chapter_id=consumer.id,
+        origin_run_id="proof-run",
+        owner_chapter_id=owner.id,
+        previous_attempts="checked existing interfaces",
+    )
+    repair_run = await state.start_auxiliary_run(
+        owner.id,
+        Stage.PROVE,
+        role="upstream_repair",
+        request_ids=(parent_id,),
+    )
+    answer = {
+        "disposition": "decompose",
+        "declarations": [],
+        "usage_guidance": "",
+        "rejection_reason": "The original capability combines two independent interfaces.",
+        "remaining_work": "",
+        "retry_contract": None,
+        "child_requests": [
+            {
+                "capability_key": "book.small_bridge",
+                "owner_kind": "chapter",
+                "needed_result": "the first small bridge",
+                "candidate_signature": "Book.smallBridge (x : X) : SmallBridge x",
+                "owner_chapter_id": owner.id,
+                "owner_paths": ["lean/Book/Chapter01.lean"],
+                "attempted_alternatives": ["simp", "exact existingBridge"],
+                "acceptance_tests": ["Book.target accepts Book.smallBridge"],
+            }
+        ],
+    }
+
+    await orchestrator._expand_decomposed_upstream_answers(
+        {parent_id: answer},
+        origin_run=repair_run,
+    )
+
+    child_ids = answer["child_request_ids"]
+    assert isinstance(child_ids, list)
+    assert all(isinstance(child_id, str) for child_id in child_ids)
+    assert len(child_ids) == 1
+    child_id = child_ids[0]
+    assert isinstance(child_id, str)
+    child = state.upstream_requests[child_id]
+    assert child["capability_key"] == "book.small_bridge"
+    assert child["consumer_chapter_id"] == consumer.id
+    assert child["blocked_declaration"] == "Book.target"
+    assert child["status"] == UpstreamRequestStatus.REQUESTED
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_external_capability_is_persisted_parked_without_chapter_rejection(
+    tmp_path: Path,
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    consumer = config.chapters[0]
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await orchestrator.prepare()
+    request, owner_id, error = orchestrator._normalize_upstream_request(
+        consumer,
+        {
+            "capability_key": "mathlib.missing_completion_bridge",
+            "owner_kind": "external",
+            "blocked_declaration": "Book.target",
+            "consumer_path": "lean/Book/Chapter01.lean",
+            "residual_goal": "⊢ CompletionBridge R",
+            "needed_result": "a multiplicative completion bridge",
+            "owner_chapter_id": "mathlib",
+            "owner_paths": ["Mathlib/Topology/Algebra/Completion.lean"],
+            "attempted_alternatives": ["library search", "construct a local equivalence"],
+            "acceptance_tests": ["Book.target accepts the completion bridge"],
+        },
+    )
+    request_id, _ = await state.enqueue_upstream_request(
+        request,
+        consumer_chapter_id=consumer.id,
+        origin_run_id="proof-run",
+        owner_chapter_id=owner_id,
+        previous_attempts="searched the selected source prefix",
+        escalation_reason=error,
+    )
+
+    assert error == ""
+    assert state.upstream_requests[request_id]["owner_kind"] == "external"
+    assert state.upstream_requests[request_id]["status"] == UpstreamRequestStatus.PARKED
     await orchestrator.shutdown()
 
 
@@ -6002,7 +6470,7 @@ async def test_proof_upstream_request_runs_repair_then_targeted_retry(
 
 
 @pytest.mark.asyncio
-async def test_upstream_request_escalates_only_after_failed_targeted_retry(
+async def test_downstream_answer_without_executable_contract_is_parked(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -6112,13 +6580,12 @@ async def test_upstream_request_escalates_only_after_failed_targeted_retry(
     monkeypatch.setattr(orchestrator.executor, "run_upstream_repair", repair_agent)
 
     assert not await orchestrator._prove(consumer)
-    assert proof_attempts == 2
+    assert proof_attempts == 1
     request = next(iter(orchestrator.state.upstream_requests.values()))
-    assert request["status"] == UpstreamRequestStatus.ESCALATED
-    assert request["answer"]["disposition"] == "downstream"
-    assert request["retry_run_id"] == orchestrator.state.task(consumer.id, Stage.PROVE).runs[-1].id
-    assert "blocked declaration remained unresolved" in request["escalation_reason"]
-    assert orchestrator.state.task(consumer.id, Stage.PROVE).status == TaskStatus.FAILED
+    assert request["status"] == UpstreamRequestStatus.PARKED
+    assert request["answer"] is None
+    assert "checked retry contract" in request["last_attempt_error"]
+    assert orchestrator.state.task(consumer.id, Stage.PROVE).status == TaskStatus.BLOCKED
     await orchestrator.shutdown()
 
 
