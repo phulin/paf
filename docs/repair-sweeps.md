@@ -1,4 +1,6 @@
-# Shepherd capability packages
+# Capability-package Steward architecture
+
+**Status: authoritative implementation contract (Phase 4 cutover).**
 
 Status: design for replacing repair sweeps and upstream requests
 
@@ -12,9 +14,9 @@ and downstream retry agents distributes that decision across agents that see dif
 the problem. Even correct local diagnoses can therefore produce repeated requests and retries with
 no one responsible for the final repository state.
 
-The Shepherd is the durable owner of a **capability package**: a coherent mathematical objective,
+The Steward is the durable owner of a **capability package**: a coherent mathematical objective,
 all consumers currently blocked on it, the files in which it may be implemented, and the evidence
-needed to validate it. A Shepherd may inspect the whole repository, edit several reserved files,
+needed to validate it. A Steward may inspect the whole repository, edit several reserved files,
 create supporting lemmas, revise the package plan after Lean probes, delegate independent leaf work,
 and integrate the result. Other agents contribute evidence or scoped commits to the package; they do
 not negotiate ownership with one another.
@@ -26,8 +28,8 @@ acceptance predicates.
 
 ## Core invariants
 
-1. One mathematical capability has one active root package and one active Shepherd.
-2. The Shepherd is the only agent that may change package scope, plan, placement, dependencies,
+1. One mathematical capability has one active root package and one active Steward.
+2. The Steward is the only agent that may change package scope, plan, placement, dependencies,
    consumer acceptance, or terminal disposition.
 3. A package may span several source files, but every writable path is exclusively reserved before
    an agent edits it.
@@ -39,7 +41,7 @@ acceptance predicates.
    is complete only when its declaration exists, is placeholder-free, validates, and has passed the
    applicable consumer checks.
 7. General results are placed at the earliest natural abstraction layer. Consumer-specific facts
-   remain with their consumers. The Shepherd must search existing interfaces before adding either.
+   remain with their consumers. The Steward must search existing interfaces before adding either.
 8. A package may be split or merged, but the state transition and transfer of consumers, locks, and
    dependencies are atomic.
 9. Model reports are proposals and evidence. PAF alone grants leases, reserves paths, changes
@@ -76,7 +78,7 @@ blocker evidence
 capability package <--------- additional consumers
       |
       v
-Shepherd investigates, plans, edits, and delegates
+Steward investigates, plans, edits, and delegates
       |
       v
 package validation and consumer acceptance
@@ -87,7 +89,7 @@ package validation and consumer acceptance
       +---- statement revision: retain explicit human-visible decision
 ```
 
-There is no upstream answer followed by a downstream retry. The Shepherd either implements the
+There is no upstream answer followed by a downstream retry. The Steward either implements the
 capability and validates its consumers, implements only a well-defined sub-capability and splits the
 remainder, discovers that the work is consumer-local and edits there, or records why the package
 cannot currently be completed.
@@ -126,11 +128,11 @@ CapabilityPackage
 
 `capability_key` identifies the mathematical interface, not a consumer failure. PAF derives an
 initial key from the desired declaration/signature, principal constants in the residual goal, and
-the proposed abstraction module. The Shepherd may add aliases or merge packages after inspection,
+the proposed abstraction module. The Steward may add aliases or merge packages after inspection,
 but it may not silently change a package's identity.
 
 `write_scope` is the exact reserved set of files or subtrees. `expansion_scope` is a bounded set of
-paths the Shepherd may request when investigation shows that a result belongs at a different layer.
+paths the Steward may request when investigation shows that a result belongs at a different layer.
 Read access is repository-wide.
 
 ### PackageConsumer
@@ -180,7 +182,7 @@ revision, and validation. Steps describe mathematical deliverables rather than g
 “try again.” A useful implementation plan normally contains many small dependency-ordered lemmas so
 that weak workers receive bounded goals.
 
-The plan is revisioned. The Shepherd may revise it after an elaboration probe disproves an expected
+The plan is revisioned. The Steward may revise it after an elaboration probe disproves an expected
 API, but completed clean declarations remain recorded as completed steps rather than being erased by
 the replan.
 
@@ -249,10 +251,10 @@ same package when they share a capability key or when several strong signals agr
 - overlapping exact declarations attempted by proof agents;
 - the same natural owner module;
 - a direct import or textbook dependency;
-- an explicit alias established by a prior Shepherd decision.
+- an explicit alias established by a prior Steward decision.
 
 Adjacency alone is insufficient. Two failures in neighboring chapters may require unrelated
-mathematics. Semantic embeddings may suggest candidates for a Shepherd to inspect, but they should
+mathematics. Semantic embeddings may suggest candidates for a Steward to inspect, but they should
 not establish durable identity or ownership.
 
 Initial scope is derived from the consumer files, exact proposed owner paths, and configured module
@@ -261,11 +263,11 @@ known repository scope. If no safe writable owner can be derived, the package be
 `investigating` with consumer files reserved only when editing them is already justified.
 
 When a new blocker matches an active package, PAF attaches it as a consumer and wakes the existing
-Shepherd. It does not launch another planner or ask the consumer agent to contact the owner.
+Steward. It does not launch another planner or ask the consumer agent to contact the owner.
 
-## The Shepherd
+## The Steward
 
-The Shepherd is a long-lived strong-model agent attached to one package generation. It is not a
+The Steward is a long-lived strong-model agent attached to one package generation. It is not a
 read-only sweep planner. Its job is to leave the mathematical cluster in the best coherent
 repository state achievable within the package:
 
@@ -281,12 +283,12 @@ repository state achievable within the package:
 9. update affected consumers and run package acceptance;
 10. complete, split, merge, or park the package with exact remaining work.
 
-The Shepherd may edit any reserved file, including multiple chapters and shared support modules. It
+The Steward may edit any reserved file, including multiple chapters and shared support modules. It
 may correct an internal statement when the textbook or surrounding formalization shows that the
 statement is wrong. Public statement changes must be explicit plan steps with recorded affected
 consumers; they are never incidental elaboration cleanup.
 
-The Shepherd must not:
+The Steward must not:
 
 - add a duplicate result instead of finding an existing declaration;
 - place a general theorem in a late consumer merely because that file is already writable;
@@ -297,12 +299,12 @@ The Shepherd must not:
 - delegate the placement decision or package lifecycle to a worker;
 - send a prose request to another package and wait for an answer.
 
-If another package owns required work, the Shepherd records a package dependency. PAF—not the two
+If another package owns required work, the Steward records a package dependency. PAF—not the two
 agents—then attaches, merges, or orders the packages.
 
 ## Mathematical plan and source placement
 
-The plan is both an implementation guide for the Shepherd and a roadmap from which weak workers can
+The plan is both an implementation guide for the Steward and a roadmap from which weak workers can
 take leaves. For every intended public declaration it records:
 
 - a fully qualified candidate name and signature;
@@ -314,15 +316,15 @@ take leaves. For every intended public declaration it records:
 - a focused probe for the first nontrivial composition;
 - the consumers expected to become checkable.
 
-The Shepherd searches the selected chronological source prefix and Mathlib before introducing a
+The Steward searches the selected chronological source prefix and Mathlib before introducing a
 result. If an existing declaration suffices, the package plan records its use and proceeds directly
 to consumer integration. If a new result has several consumers or is source-neutral, it belongs in
-an earlier shared file. If it is merely an awkward specialization, the Shepherd should prove a
+an earlier shared file. If it is merely an awkward specialization, the Steward should prove a
 general helper and make the specialization a short corollary.
 
 Source files should accumulate small named lemmas rather than giant conjunctions, opaque local
 proofs, or repeated bridges. Package validation checks for newly duplicated declaration names and
-for equivalent capability aliases already known to the registry. The Shepherd remains responsible
+for equivalent capability aliases already known to the registry. The Steward remains responsible
 for mathematical duplication that cannot be detected syntactically.
 
 ## Delegated workers
@@ -339,16 +341,16 @@ Workers exist to execute bounded package steps, not to steer the package. A work
 
 A worker cannot change placement, expand scope, split the package, attach consumers, or declare
 package completion. If it discovers that the objective is wrongly placed or needs another file, it
-returns evidence to the Shepherd without editing that path.
+returns evidence to the Steward without editing that path.
 
 The default execution mode is sequential workers in the package worktree: one worker edits, commits,
-and yields; the Shepherd reviews the commit before another worker uses it. Independent steps with
+and yields; the Steward reviews the commit before another worker uses it. Independent steps with
 disjoint paths may use child worktrees. Each child receives a disjoint subset of the package's path
-reservations and returns commits to the Shepherd's package branch. Two agents never edit the same
+reservations and returns commits to the Steward's package branch. Two agents never edit the same
 worktree concurrently.
 
 Worker failure does not create a peer request or a new review loop. Its report and validation become
-package evidence. The Shepherd revises the step, handles it directly, or splits a genuinely
+package evidence. The Steward revises the step, handles it directly, or splits a genuinely
 independent capability.
 
 ## Locking and isolation
@@ -362,8 +364,8 @@ cannot stop unrelated packages from editing the same support file. PAF therefore
 - one active package reservation per canonical capability key or alias;
 - exclusive path reservations for every file or subtree a package may write.
 
-The package owns reservations; the current Shepherd holds a renewable lease over the package. A
-replacement Shepherd inherits the package reservations after receiving a new fenced generation.
+The package owns reservations; the current Steward holds a renewable lease over the package. A
+replacement Steward inherits the package reservations after receiving a new fenced generation.
 
 Every mutating PAF agent participates in this reservation system, not only package agents. An
 ordinary formalize, review, or prove run receives an ephemeral reservation for its configured write
@@ -394,14 +396,14 @@ holding a partial new set, which prevents lock-order deadlocks.
 
 An active package may retain its existing reservations while waiting for an expansion decision.
 PAF does not let that wait continue indefinitely: it either records a package dependency, merges the
-packages, queues the expansion behind a finishing package, or asks the Shepherd to checkpoint and
+packages, queues the expansion behind a finishing package, or asks the Steward to checkpoint and
 release paths on which it cannot currently progress.
 
 ### Scope expansion conflicts
 
 When package A requests a path held by package B, PAF resolves the conflict in this order:
 
-1. If the capabilities are equivalent, merge A and B under one package and one Shepherd.
+1. If the capabilities are equivalent, merge A and B under one package and one Steward.
 2. If A needs an interface B is already implementing, attach A's consumer or add a package
    dependency on B.
 3. If A can proceed against B's recorded intended interface, allow work on A's other reserved paths
@@ -425,11 +427,11 @@ paf/package-P42/generation-3
 
 The package records its base revision, current branch HEAD, dirty-path digest, and latest validation
 digest. Before every agent run PAF verifies that the actual worktree matches the record. A dirty
-worktree from an interrupted agent is frozen and presented to the replacement Shepherd as inherited
+worktree from an interrupted agent is frozen and presented to the replacement Steward as inherited
 work; it is never automatically discarded.
 
 Child workers that run concurrently use child branches and worktrees. Their path subsets must be
-disjoint. The parent Shepherd integrates child commits into the package branch and resolves logical
+disjoint. The parent Steward integrates child commits into the package branch and resolves logical
 conflicts before package-level validation.
 
 ### Read dependencies
@@ -445,7 +447,7 @@ steps to investigation or validation; it never permits a stale commit to publish
 ### Integration lock
 
 Canonical Git integration uses one short-lived repository lock and an optimistic two-phase
-protocol. The Shepherd never holds the lock while thinking, editing, or running a long Lean build.
+protocol. The Steward never holds the lock while thinking, editing, or running a long Lean build.
 PAF first acquires the lock to verify the lease and reservations, record canonical HEAD, and update
 the candidate branch to that exact revision. It then releases the lock and runs interface checks,
 focused validation, and affected builds in the package worktree.
@@ -462,12 +464,12 @@ blindly applied again.
 
 ### Lease expiry and fencing
 
-The Shepherd heartbeats while it is inspecting, editing, waiting for workers, validating, and
+The Steward heartbeats while it is inspecting, editing, waiting for workers, validating, and
 integrating. Lease expiry makes the package eligible for recovery, but the fencing generation is
 what makes recovery safe. Every later state write or integration from the expired agent is rejected.
 
 Recovery records the worktree HEAD, status, diff digest, active child workers, and journal phase;
-increments the generation; and assigns a new Shepherd. Reservations remain with the package during
+increments the generation; and assigns a new Steward. Reservations remain with the package during
 recovery so another package cannot overwrite unfinished work.
 
 ## Package dependencies, merging, and splitting
@@ -477,7 +479,7 @@ durable DAG edge, not a message. A dependent package may investigate and impleme
 but consumer acceptance waits for the dependency revision it recorded.
 
 Merging packages combines capability aliases, consumers, evidence, completed steps, dependencies,
-and reservations in one atomic operation. Only one Shepherd lease survives; the other agent is
+and reservations in one atomic operation. Only one Steward lease survives; the other agent is
 fenced and its worktree becomes an integration input to the surviving package.
 
 Splitting creates child packages only when the remaining capabilities are independently placeable
@@ -486,7 +488,7 @@ interface. Consumers are explicitly reassigned. The parent becomes `decomposed` 
 open consumer belongs to a live child or is otherwise terminally classified.
 
 Package dependencies must remain acyclic. PAF rejects an edge that creates a cycle and asks the
-Shepherd to merge the mutually dependent packages or design a lower common interface.
+Steward to merge the mutually dependent packages or design a lower common interface.
 
 ## Validation and acceptance
 
@@ -561,7 +563,7 @@ linear stage. Ready package work competes with ordinary work using the downstrea
 consumers it can release. The model may select a bounded effort class, but it cannot invent numeric
 priority.
 
-Only one Shepherd turn for a package runs at a time. Worker steps may run concurrently when their
+Only one Steward turn for a package runs at a time. Worker steps may run concurrently when their
 dependencies are satisfied and their writable path subsets are disjoint. Package agents count
 against the same global model and mutation capacity as ordinary agents; the integration/build queue
 remains serialized where the underlying tools require it.
@@ -609,12 +611,12 @@ an owner agent, reopen an unchanged proof, or conduct a separate request convers
 
 ## Prompt and report contracts
 
-The Shepherd prompt supplies the complete package dossier rather than a sweep of unrelated failed
+The Steward prompt supplies the complete package dossier rather than a sweep of unrelated failed
 tasks. It includes current consumers, relevant textbook material, source and import graphs, exact
 blockers, prior attempts, known capability aliases, reservations, dependency packages, completed
 steps, and validation history.
 
-The Shepherd's structured report describes mutations to the package model:
+The Steward's structured report describes mutations to the package model:
 
 ```text
 diagnosis
@@ -647,7 +649,7 @@ Every package mutation uses optimistic revision checking plus the lease fencing 
 operations are transactional:
 
 - attach a consumer;
-- claim or renew a Shepherd lease;
+- claim or renew a Steward lease;
 - acquire or expand path reservations;
 - revise a plan;
 - assign a worker step;
@@ -671,7 +673,7 @@ No recovery path infers mathematical success from an agent report or process exi
 
 The primary UI object is the package, not a collection of peer requests. It should show:
 
-- capability, lifecycle state, Shepherd, lease generation, and heartbeat;
+- capability, lifecycle state, Steward, lease generation, and heartbeat;
 - consumers and their acceptance state;
 - reserved and requested paths;
 - plan steps, dependencies, assigned workers, and commits;
@@ -687,15 +689,15 @@ the configured validation evidence.
 
 ## Acceptance criteria for the implementation
 
-The Shepherd design is substantively complete when the following properties hold:
+The Steward design is substantively complete when the following properties hold:
 
 - two consumers of one missing result attach to one active package;
-- one Shepherd can modify and validate several reserved files in an isolated worktree;
+- one Steward can modify and validate several reserved files in an isolated worktree;
 - a weak worker receives and completes a small dependency-ordered lemma without gaining package
   authority;
 - conflicting path expansions create a merge, dependency, or queue decision without agent
   messaging or deadlock;
-- an expired Shepherd cannot update state or integrate after a new generation is assigned;
+- an expired Steward cannot update state or integrate after a new generation is assigned;
 - dirty and partially integrated work survives restart without duplicate commits;
 - a package can close one consumer while splitting another consumer's new obstruction;
 - shared declarations are placed in appropriate earlier files and are not repeated in consumers;

@@ -20,15 +20,12 @@ flowchart LR
     R -->|changed, findings, or build failure| R
     R -->|succeeded| P
     P -->|statement/API problem; reopen affected reviews| R
-    P -->|missing earlier interface| UQ[Upstream request: requested]
-    UQ --> UR[Temporary owner repair run]
-    UR -->|exact answer persisted| UA[answered]
-    UA --> UT[Fresh consumer proof run]
-    UT -->|named declaration proved + Lean valid| UC[closed]
-    UC --> P
-    UQ -->|invalid request| UM[escalated]
-    UR -->|no clean durable answer| UM
-    UT -->|named declaration still blocked| UM
+    P -->|missing structural capability| CP[Capability package]
+    CP --> ST[Steward plan and implementation]
+    ST -->|bounded delegated steps| PW[Package workers]
+    PW --> IV[Package validation and integration]
+    ST --> IV
+    IV -->|consumer acceptance| P
     P -->|no placeholders + Lean valid| D[Done]
 ```
 
@@ -216,11 +213,12 @@ the Python orchestrator and consumes the same bounded dashboard model as the web
 versioned Unix-socket protocol. The server sends one initial snapshot, then pushes coalesced task,
 agent-activity, and global-state deltas directly from the in-process change bus; the TUI does not
 poll SQLite or repeatedly request full snapshots. Press `Enter` or `i` to inspect the selected
-agent, `s` to open the Shepherd trace and jump directly to its planner or repair workers, `p` to
+agent, `k` to inspect capability-package lifecycle, consumers, plan steps, evidence, leases,
+reservations, dependencies, and integration state, and `p` to
 pause or resume scheduling, and `q` to stop workers, preserve their private overlay changes, and
 return to the shell. Press `d` to detach the TUI while leaving a managed orchestrator running. The
-web dashboard exposes the same trace and agent links through its Shepherd metric card (or the `s`
-shortcut).
+web dashboard exposes the same package dossier through its capability-packages metric card (or the
+`k` shortcut).
 
 Add `--no-tui` for CI, a process supervisor, or log-only operation. Add `--force` to rerun tasks
 already persisted as successful. Without `--force`, successful stages are resumable and skipped.
@@ -352,7 +350,6 @@ uv run paf agent retry "$TARGET" --chapter book02/chapter-08
 uv run paf agent retry "$TARGET"
 uv run paf agent state "$TARGET" --chapter book02/chapter-08 --stage prove --state pending
 uv run paf agent unblock "$TARGET"
-uv run paf agent clear-upstream-requests "$TARGET"
 uv run paf agent snapshot "$TARGET"
 uv run paf agent snapshot "$TARGET" --output snapshot.json
 uv run paf agent inspect "$TARGET" --chapter 8
@@ -377,15 +374,14 @@ assignment, resuming the same Codex session when a thread id is available. Other
 scheduler keep running. Without `--chapter`, `retry` resets every `failed` task to `pending` while
 retaining run history. When a retried stage succeeds, tasks blocked by that failure are automatically
 returned to `pending` as their prerequisites recover; unrelated blocks remain intact. This is
-distinct from `unblock`, which resets all `blocked` tasks and reopens any escalated upstream
-handoffs.
+distinct from `unblock`, which resets all `blocked` tasks.
 `unblock` resets every persisted `blocked` task to `pending` without deleting its run history. It can
 be issued against either a live daemon or offline state; pending tasks are eligible the next time the
-corresponding stage is scheduled. For a manually escalated upstream proof request, it also reopens
-the durable handoff while retaining any existing answer and all repair/retry evidence.
-`clear-upstream-requests` manually closes every outstanding upstream request while retaining its
-history. It makes the affected proofs eligible for a later retry, which may issue a fresh request if
-the upstream dependency is still missing. The command does not retry or unblock tasks itself.
+corresponding stage is scheduled.
+
+Capability packages have separate operator commands: `paf package list`, `inspect`, `park`,
+`resume`, and `recover`. These operate on package lifecycle and fenced ownership without rewriting
+ordinary task history.
 
 For a long-lived managing agent, the `rpc` facade accepts newline-delimited JSON commands on stdin and
 returns one JSON response per line:
@@ -395,8 +391,8 @@ printf '%s\n' '{"command":"status"}' '{"command":"snapshot"}' \
   | uv run paf agent rpc "$TARGET"
 ```
 
-Accepted RPC commands are `status`, `snapshot`, `pause`, `resume`, `retry`, `unblock`,
-`clear-upstream-requests`, `stop`, `wait`, and `inspect`. A retry request may include `chapter`;
+Accepted RPC commands are `status`, `snapshot`, `pause`, `resume`, `retry`, `unblock`, `stop`,
+`wait`, `inspect`, and the `package-*` controls. A retry request may include `chapter`;
 omitting it retries every failed task.
 Inspection requests may include `chapter` or `run`, for example
 `{"command":"inspect","chapter":"book02/chapter-08"}`. The daemon
@@ -468,33 +464,16 @@ After the daemon exits, `status`, `snapshot`, and `wait` fall back to the persis
   failure. Proof
   validation uses the same visible coordinator-build record and fair build lane; it never holds the
   build queue while the proof agent edits, takes a snapshot, or merges its scoped patch.
-- If sustained checked proof work exposes a genuinely missing earlier interface, the proof agent
-  records the blocked declaration and consumer path, exact residual goal, minimal result needed,
-  proposed owner chapter and paths, and at least two materially different attempted alternatives.
-  When all exact owner paths resolve to one selected work unit, that path-derived owner is
-  authoritative even if the agent supplied a noncanonical owner label.
-  It keeps working on independent declarations. The coordinator persists the request before doing
-  anything else and batches all requested records by owner chapter. A targeted variant of the
-  failed-proof re-review receives the complete batch, consumer declaration excerpts, residual goals,
-  prior attempts, upstream source paths, and relevant textbook excerpts. Owner and ordinary chapter
-  agents share the same per-chapter lock, while this auxiliary run leaves the owner's ordinary proof
-  task and round count untouched. A clean repair either adds and proves the interface, identifies an
-  existing exact declaration, or records why the bridge belongs downstream. Reported additions and in-corpus
-  declarations are checked against the integrated placeholder-free sources before their answers are
-  accepted. The request remains `requested` while this agent runs and becomes `answered` only after
-  that completed answer is durably stored.
-- Every accepted answer is retained in durable state, including exact declaration names,
-  application guidance, or the downstream-placement rejection. The consumer then gets exactly one
-  fresh targeted proof agent with the original request, durable answer, and previous attempt ledger.
-  The request remains `answered` while that retry runs.
-  Only a clean coordinator build in which the named blocked declaration no longer contains a
-  placeholder closes the request. A malformed request, failed owner repair, unusable answer, or failed
-  targeted retry blocks the proof task and marks the request `escalated`; ordinary `unblock` explicitly
-  authorizes another targeted attempt without erasing run history.
+- If sustained checked proof work exposes a genuinely missing structural capability, the proof
+  agent records the blocked declaration and consumer path, exact residual goal, needed result,
+  placement hypothesis, acceptance checks, and materially different attempted alternatives. The
+  coordinator creates or attaches a durable capability package. One fenced Steward owns its scope,
+  plan, evidence, validation, integration, and consumer acceptance; package workers may implement
+  bounded disjoint steps. Consumers are woken only after accepted integration.
 - A proof agent may change proof bodies but not declaration interfaces. It reports each unresolved
   proof through structured `failed_attempts`, including checked approaches and the exact remaining
-  goal, plus a machine-actionable disposition. Statement defects and valid upstream requests route
-  immediately; ordinary unchanged blockers receive at most `unchanged_retry_limit` sightings. A
+  goal, plus a machine-actionable disposition. Statement defects and missing-capability evidence
+  route immediately; ordinary unchanged blockers receive at most `unchanged_retry_limit` sightings. A
   clean agent exit with an incomplete report is recorded as a blocked run rather than a successful
   proof run.
 
@@ -529,8 +508,8 @@ The dashboard shows:
   concurrency pool;
 - the active coordinator build's mode, stage, iteration, target progress, current chapter, owner, and
   queued build count;
-- Shepherd status, lifetime planner/repair-worker cost, pending failure count, and planned/running
-  repair units;
+- capability-package lifecycle, consumers, plan steps, evidence, Steward lease, reservations,
+  dependencies, and integration journal;
 - aggregate `pending`, `queued`, `running`, `succeeded`, `failed`, `blocked`, and `interrupted`
   chapter counts for discover, formalize, review, and prove;
 - each chapter's status and attempt count in every stage, plus independent exact-build freshness;
@@ -606,26 +585,18 @@ status (`pending`, `running`, `succeeded`, `failed`, `blocked`, or `interrupted`
 describing what
 a running or pending task is doing. A transient `queued` marker distinguishes runnable pending stages
 that are waiting for an agent slot, and both the TUI and web dashboard label them accordingly.
-An independent persisted `repairing` overlay and repair-work-unit id identify the exact stage cell
-currently owned by a Shepherd worker without mutating that task's ordinary state machine. An active
-coordinator validation build takes display precedence and labels that cell `building`.
+Structural proof work is attached to a durable capability package while ordinary task cells retain
+their normal state machine. An active coordinator validation build labels its task cell `building`.
 Successful discovery reports enter a short bounded batch: PAF merges the reports, rebuilds the source
 dependency graph once, and persists the graph plus all task promotions atomically. At most twice the
 configured discovery-agent pool is scheduled at once. Dashboards count live run records as working
 agents. Running tasks persist an explicit `agent` or `postprocess` phase, so the TUI and web dashboard
 show completed agent work awaiting integration, graph persistence, or coordinator verification as
 postprocessing.
-Statement repair requests are checkpointed before entering the
-in-memory batching queue and removed only after their dependency-aware review pass returns. Upstream
-proof requests instead remain in the checkpoint permanently and record only completed facts:
-`requested`, `answered`, `closed`, or `escalated`. Their owner-grouped requested batches are exported
-in the snapshot. Active repair and retry work exists only as ordinary persisted run records. Because a
-request changes state only after that work completes, generic interrupted-run recovery naturally
-leaves an interrupted repair `requested` and an interrupted consumer retry `answered`; no separate
-request-state rewind is needed. Recovery also reconstructs both a handoff from a completed proof report
-when the process stopped between those two durable writes and proof-requested statement repairs written
-by older orchestrators that invalidated review state before checkpointing the handoff. The chapter table
-displays exact-build
+Proof-review evidence that identifies missing structural work creates or attaches to a capability
+package. The package, rather than a request/answer retry exchange, owns implementation, validation,
+integration, and consumer acceptance. Legacy request state is imported once at the persistence
+boundary and is never projected back into runtime. The chapter table displays exact-build
 freshness independently of whether a past formalize task succeeded. A coordinator-build record tracks the
 single serialized Lake build, and the TUI also shows its owner and queued jobs. Running run records—not
 chapter-stage records—are the authoritative live-agent count.
@@ -720,33 +691,27 @@ lean_project = "lean" # relative to swarm.repo; contains lakefile and lean-toolc
 lean_mcp_tool_timeout_seconds = 300
 ```
 
-Failure repair is enabled by default. The Shepherd uses a strong read-only model to plan bounded,
-independent repair work units at most once every two hours. A sweep runs when the interval expires
-or, once that cooldown has elapsed, whenever 10 new terminal failures have accumulated.
-Scoped repair workers have their own model and reasoning settings, defaulting to Sol/medium.
-Repairs receive an effort-based priority boost and compete directly for the ordinary global agent
-capacity:
+Capability-package execution is enabled by default. A writable Steward owns one fenced package
+generation, maintains its plan and scope, and may delegate bounded steps to package workers. Both
+roles default to Sol/medium and compete for ordinary agent capacity:
 
 ```toml
-[shepherd]
+[steward]
 enabled = true
 model = "gpt-5.6-sol"
 reasoning_effort = "medium"
 worker_model = "gpt-5.6-sol"
 worker_reasoning_effort = "medium"
-interval_seconds = 7200
-failure_threshold = 10
-maximum_failures_per_sweep = 50
-maximum_work_units_per_sweep = 32
-maximum_consecutive_no_progress_sweeps = 3
+lease_ttl_seconds = 14400
+maximum_worker_steps = 8
 ```
 
 Set `enabled = false` to opt out for a project.
 
-Repair is an auxiliary overlay, not a fifth stage. The Shepherd may target any existing
-discover/formalize/review/prove cell. While the repair worker runs, the TUI and web matrix label
-that cell `repairing`; after its edits integrate, the underlying task returns to the normal stage
-queue for building and validation.
+Packages are durable execution objects rather than a fifth ordinary stage. Use `paf package list`,
+`paf package inspect PACKAGE`, `paf package park PACKAGE`, `paf package resume PACKAGE`, and
+`paf package recover PACKAGE` for operator control. Accepted package integration wakes consumers
+through the normal proof scheduler.
 
 When Lean MCP is enabled, orchestrator startup bootstraps `lean_project` if it does not already
 contain both `lean-toolchain` and a Lake file. PAF pins the active Lean version, creates a matching
