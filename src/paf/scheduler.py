@@ -68,6 +68,7 @@ from paf.interface_fingerprint import (
 )
 from paf.isolation import FuseWorkspace, IsolationResult, create_isolation
 from paf.models import PipelineConfig, ProofTarget, Stage, WorkUnit, WorkUnitLike
+from paf.package_model import ReservationMode, ReservationSpec
 from paf.scope import ScopeMatcher
 from paf.state import (
     BUILD_WARNING_REVIEW_KIND,
@@ -439,6 +440,37 @@ def _scope_digests(
     work_unit_ids: Iterable[str],
 ) -> dict[str, str]:
     return {work_unit_id: scope_digest(root, by_id[work_unit_id]) for work_unit_id in work_unit_ids}
+
+
+def _mutation_reservation_specs(work_unit: WorkUnitLike) -> tuple[ReservationSpec, ...]:
+    specs: list[ReservationSpec] = []
+    for pattern in work_unit.scope:
+        wildcard = min(
+            (index for marker in "*[?" if (index := pattern.find(marker)) >= 0),
+            default=-1,
+        )
+        if wildcard < 0:
+            specs.append(ReservationSpec(pattern, ReservationMode.EXCLUSIVE_FILE))
+            continue
+        prefix = pattern[:wildcard].rstrip("/")
+        if not prefix:
+            raise ValueError(f"mutating scope is too broad to reserve safely: {pattern}")
+        if "/" not in prefix or not pattern[:wildcard].endswith("/"):
+            prefix = prefix.rsplit("/", 1)[0] if "/" in prefix else "."
+        specs.append(ReservationSpec(prefix, ReservationMode.EXCLUSIVE_SUBTREE))
+    unique = tuple(dict.fromkeys(specs))
+    subtrees = tuple(
+        item.normalized_path for item in unique if item.mode is ReservationMode.EXCLUSIVE_SUBTREE
+    )
+    return tuple(
+        item
+        for item in unique
+        if item.mode is ReservationMode.EXCLUSIVE_SUBTREE
+        or not any(
+            item.normalized_path == subtree or item.normalized_path.startswith(f"{subtree}/")
+            for subtree in subtrees
+        )
+    )
 
 
 class Orchestrator:
@@ -1622,6 +1654,12 @@ class Orchestrator:
         await chapter_lock.acquire()
         chapter_lock_held = True
         slot_held = False
+        reservation = None
+        reservation_owner_id = (
+            f"ordinary-{chapter.id}-{stage.value}-{uuid4().hex}"
+            if stage is not Stage.DISCOVER
+            else ""
+        )
         slots = (
             self.discovery_slots if stage is Stage.DISCOVER and not auxiliary else self.agent_slots
         )
@@ -1635,6 +1673,22 @@ class Orchestrator:
                     queue_detail or f"queued for {stage.value} agent",
                     queued=True,
                 )
+            if reservation_owner_id:
+                specs = _mutation_reservation_specs(chapter)
+                while True:
+                    reservation = await self.state.claim_ordinary_path_reservations(
+                        reservation_owner_id,
+                        specs,
+                        ttl_seconds=(
+                            self.config.settings.agent_timeout_seconds
+                            + self.config.settings.validation_timeout_seconds
+                            + 300
+                        ),
+                    )
+                    if reservation.granted:
+                        break
+                    await self.control.checkpoint()
+                    await asyncio.sleep(0.1)
             await slots.acquire(
                 priority_override
                 if priority_override is not None
@@ -1642,6 +1696,10 @@ class Orchestrator:
             )
             slot_held = True
         except BaseException:
+            if reservation is not None:
+                await self.state.release_ordinary_path_reservations(
+                    reservation_owner_id, reservation.fence_generation
+                )
             chapter_lock.release()
             task = self.state.task(chapter.id, stage)
             if not auxiliary and task.queued:
@@ -1969,6 +2027,10 @@ class Orchestrator:
                 await workspace.close()
             if source_held:
                 self.source_lock.release()
+            if reservation is not None:
+                await self.state.release_ordinary_path_reservations(
+                    reservation_owner_id, reservation.fence_generation
+                )
             if chapter_lock_held:
                 chapter_lock.release()
             task = self.state.task(chapter.id, stage)
@@ -2493,7 +2555,8 @@ class Orchestrator:
                 or not self._executable_retry_contract(retry_contract)
             ):
                 errors.append(
-                    "a downstream answer must reject the placement and provide a checked retry contract"
+                    "a downstream answer must reject the placement and provide a checked "
+                    "retry contract"
                 )
                 continue
             if disposition == "external" and (declarations or not rejection.strip()):
@@ -3221,8 +3284,8 @@ class Orchestrator:
             chapter.id: (
                 f"Proof work in `{chapter.id}` left checked failures. Evaluate this evidence while "
                 "re-reviewing the complete assigned scope. If it makes logical sense to provide "
-                "additional results in this module to satisfy the reported defect in the downstream "
-                "module, do so:\n\n" + attempt_feedback
+                "additional results in this module to satisfy the reported defect in the "
+                "downstream module, do so:\n\n" + attempt_feedback
             )
         }
         attempts = report.get("failed_attempts")

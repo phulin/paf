@@ -30,8 +30,13 @@ from paf.package_model import (
     PackageDependency,
     PackageDisposition,
     PackageEvidence,
+    PackageRecovery,
     PackageState,
     PackageStatus,
+    ReservationOwnerKind,
+    ReservationResult,
+    ReservationSpec,
+    StewardLease,
 )
 from paf.pricing import LEGACY_MODEL, CostEstimate, estimate_cost
 from paf.state_db import (
@@ -2512,6 +2517,119 @@ class StateStore:
     async def refresh_package_state(self) -> PackageState:
         self.package_state = await asyncio.to_thread(self._database.load_package_state)
         return self.package_state
+
+    async def claim_steward_lease(
+        self,
+        package_id: str,
+        agent_id: str,
+        *,
+        expected_revision: int,
+        ttl_seconds: float,
+        now: str | None = None,
+    ) -> StewardLease:
+        lease = await asyncio.to_thread(
+            self._database.claim_steward_lease,
+            package_id,
+            agent_id,
+            expected_revision=expected_revision,
+            ttl_seconds=ttl_seconds,
+            now=now,
+        )
+        await self.refresh_package_state()
+        return lease
+
+    async def heartbeat_steward_lease(
+        self,
+        package_id: str,
+        agent_id: str,
+        generation: int,
+        *,
+        ttl_seconds: float,
+        now: str | None = None,
+    ) -> StewardLease:
+        lease = await asyncio.to_thread(
+            self._database.heartbeat_steward_lease,
+            package_id,
+            agent_id,
+            generation,
+            ttl_seconds=ttl_seconds,
+            now=now,
+        )
+        await self.refresh_package_state()
+        return lease
+
+    async def release_steward_lease(
+        self,
+        package_id: str,
+        agent_id: str,
+        generation: int,
+        *,
+        release_reservations: bool = False,
+        now: str | None = None,
+    ) -> None:
+        await asyncio.to_thread(
+            self._database.release_steward_lease,
+            package_id,
+            agent_id,
+            generation,
+            release_reservations=release_reservations,
+            now=now,
+        )
+        await self.refresh_package_state()
+
+    async def recover_steward_lease(
+        self,
+        package_id: str,
+        agent_id: str,
+        *,
+        expected_revision: int,
+        ttl_seconds: float,
+        worktree_head: str,
+        worktree_status: str,
+        dirty_digest: str,
+        active_child_workers: tuple[str, ...] = (),
+        now: str | None = None,
+    ) -> tuple[StewardLease, PackageRecovery]:
+        result = await asyncio.to_thread(
+            self._database.recover_steward_lease,
+            package_id,
+            agent_id,
+            expected_revision=expected_revision,
+            ttl_seconds=ttl_seconds,
+            worktree_head=worktree_head,
+            worktree_status=worktree_status,
+            dirty_digest=dirty_digest,
+            active_child_workers=active_child_workers,
+            now=now,
+        )
+        await self.refresh_package_state()
+        return result
+
+    async def claim_ordinary_path_reservations(
+        self,
+        owner_id: str,
+        requested: tuple[ReservationSpec, ...],
+        *,
+        ttl_seconds: float,
+        queue_on_conflict: bool = True,
+    ) -> ReservationResult:
+        return await asyncio.to_thread(
+            self._database.claim_ordinary_path_reservations,
+            owner_id,
+            requested,
+            ttl_seconds=ttl_seconds,
+            queue_on_conflict=queue_on_conflict,
+        )
+
+    async def release_ordinary_path_reservations(
+        self, owner_id: str, fence_generation: int
+    ) -> None:
+        await asyncio.to_thread(
+            self._database.release_path_reservations,
+            ReservationOwnerKind.ORDINARY_TASK,
+            owner_id,
+            fence_generation,
+        )
 
     async def create_or_attach_capability_package(
         self,
