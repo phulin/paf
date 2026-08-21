@@ -88,12 +88,13 @@ _FAILED_ATTEMPTS_PROPERTY: dict[str, Any] = {
                 "type": "string",
                 "enum": [
                     "retry",
-                    "missing_upstream",
+                    "missing_capability",
                     "statement_review",
                     "interface_review",
                     "genuine_blocker",
                 ],
             },
+            "capability": {"type": ["object", "null"]},
         },
         "required": [
             "path",
@@ -102,6 +103,7 @@ _FAILED_ATTEMPTS_PROPERTY: dict[str, Any] = {
             "remaining_goal",
             "obstruction",
             "disposition",
+            "capability",
         ],
     },
 }
@@ -119,110 +121,12 @@ _PROOF_DISPOSITION_PROPERTY: dict[str, Any] = {
         "partial",
         "retryable",
         "statement_defect",
-        "upstream_blocked",
+        "structural_blocked",
         "validation_inconsistency",
     ],
     "description": (
         "Machine-actionable next state. Use retryable only when a materially new strategy remains."
     ),
-}
-
-_UPSTREAM_REQUEST_ITEM: dict[str, Any] = {
-    "type": "object",
-    "additionalProperties": False,
-    "properties": {
-        "capability_key": {"type": "string"},
-        "blocked_declaration": {"type": "string", "minLength": 1},
-        "consumer_path": {"type": "string", "minLength": 1},
-        "residual_goal": {"type": "string", "minLength": 1},
-        "needed_result": {"type": "string", "minLength": 1},
-        "candidate_signature": {"type": "string"},
-        "owner_kind": {
-            "type": "string",
-            "enum": ["chapter", "consumer", "shared", "external"],
-        },
-        "owner_chapter_id": {"type": "string", "minLength": 1},
-        "owner_paths": {
-            "type": "array",
-            "items": {"type": "string", "minLength": 1},
-            "minItems": 1,
-        },
-        "attempted_alternatives": {
-            "type": "array",
-            "items": {"type": "string", "minLength": 1},
-            "minItems": 2,
-        },
-        "acceptance_tests": {
-            "type": "array",
-            "items": {"type": "string", "minLength": 1},
-        },
-    },
-    "required": [
-        "capability_key",
-        "blocked_declaration",
-        "consumer_path",
-        "residual_goal",
-        "needed_result",
-        "candidate_signature",
-        "owner_kind",
-        "owner_chapter_id",
-        "owner_paths",
-        "attempted_alternatives",
-        "acceptance_tests",
-    ],
-}
-
-_UPSTREAM_REQUESTS_PROPERTY: dict[str, Any] = {
-    "type": "array",
-    "items": _UPSTREAM_REQUEST_ITEM,
-}
-
-_UPSTREAM_ANSWERS_PROPERTY: dict[str, Any] = {
-    "type": "array",
-    "items": {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": {
-            "request_ids": {
-                "type": "array",
-                "items": {"type": "string", "minLength": 1},
-                "minItems": 1,
-            },
-            "disposition": {
-                "type": "string",
-                "enum": [
-                    "added",
-                    "existing",
-                    "partial",
-                    "downstream",
-                    "external",
-                    "decompose",
-                ],
-            },
-            "declarations": {
-                "type": "array",
-                "items": {"type": "string", "minLength": 1},
-            },
-            "usage_guidance": {"type": "string"},
-            "rejection_reason": {"type": "string"},
-            "remaining_work": {"type": "string"},
-            "retry_contract": {"type": ["object", "null"]},
-            "child_requests": {
-                "type": "array",
-                "items": _UPSTREAM_REQUEST_ITEM,
-            },
-        },
-        "required": [
-            "request_ids",
-            "disposition",
-            "declarations",
-            "usage_guidance",
-            "rejection_reason",
-            "remaining_work",
-            "retry_contract",
-            "child_requests",
-        ],
-    },
 }
 
 _RETRY_CONTRACT_PROPERTY: dict[str, Any] = {
@@ -277,7 +181,7 @@ _FINDING_ASSESSMENTS_PROPERTY: dict[str, Any] = {
                 "enum": [
                     "repair_and_retry",
                     "retry_with_route",
-                    "request_upstream",
+                    "attach_package",
                     "send_to_roadmap",
                     "wait_for_dependency",
                     "park_external",
@@ -286,7 +190,7 @@ _FINDING_ASSESSMENTS_PROPERTY: dict[str, Any] = {
             },
             "explanation": {"type": "string", "minLength": 1},
             "retry_contract": {"anyOf": [{"type": "null"}, _RETRY_CONTRACT_PROPERTY]},
-            "upstream_requests": _UPSTREAM_REQUESTS_PROPERTY,
+            "capability": {"type": ["object", "null"]},
             "dependency_ids": {
                 "type": "array",
                 "items": {"type": "string", "minLength": 1},
@@ -299,56 +203,8 @@ _FINDING_ASSESSMENTS_PROPERTY: dict[str, Any] = {
             "action",
             "explanation",
             "retry_contract",
-            "upstream_requests",
+            "capability",
             "dependency_ids",
-        ],
-    },
-}
-
-_SHEPHERD_DISPOSITIONS_PROPERTY: dict[str, Any] = {
-    "type": "array",
-    "items": {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": {
-            "case_id": {"type": "string", "minLength": 1},
-            "disposition": {
-                "type": "string",
-                "enum": ["repair", "defer", "ignore"],
-            },
-            "reason": {"type": "string", "minLength": 1},
-        },
-        "required": ["case_id", "disposition", "reason"],
-    },
-}
-
-_SHEPHERD_WORK_UNITS_PROPERTY: dict[str, Any] = {
-    "type": "array",
-    "items": {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": {
-            "key": {"type": "string", "minLength": 1, "pattern": "^[a-zA-Z0-9_-]+$"},
-            "case_ids": {
-                "type": "array",
-                "items": {"type": "string", "minLength": 1},
-                "minItems": 1,
-            },
-            "owner_chapter_id": {"type": "string", "minLength": 1},
-            "target_stage": {
-                "type": "string",
-                "enum": [stage.value for stage in Stage],
-            },
-            "objective": {"type": "string", "minLength": 1},
-            "effort": {"type": "string", "enum": ["small", "medium", "large"]},
-        },
-        "required": [
-            "key",
-            "case_ids",
-            "owner_chapter_id",
-            "target_stage",
-            "objective",
-            "effort",
         ],
     },
 }
@@ -589,16 +445,6 @@ REPORT_SCHEMAS: dict[str, dict[str, Any]] = {
     "package_worker": _report_schema(
         "PAF capability-package worker report", _PACKAGE_WORKER_PROPERTIES
     ),
-    "shepherd": _report_schema(
-        "PAF Shepherd repair plan",
-        {
-            "complete": _REPORT_BASE_PROPERTIES["complete"],
-            "summary": _REPORT_BASE_PROPERTIES["summary"],
-            "issues": _REPORT_BASE_PROPERTIES["issues"],
-            "dispositions": _SHEPHERD_DISPOSITIONS_PROPERTY,
-            "work_units": _SHEPHERD_WORK_UNITS_PROPERTY,
-        },
-    ),
     "discover": _report_schema(
         "PAF discovery report",
         _REPORT_BASE_PROPERTIES | {"source_dependencies": _SOURCE_DEPENDENCIES_PROPERTY},
@@ -635,27 +481,6 @@ REPORT_SCHEMAS: dict[str, dict[str, Any]] = {
             "source_issues": _SOURCE_ISSUES_PROPERTY,
             "failed_attempts": _FAILED_ATTEMPTS_PROPERTY,
             "blocker_refs": _BLOCKER_REFS_PROPERTY,
-            "upstream_requests": _UPSTREAM_REQUESTS_PROPERTY,
-        },
-    ),
-    "downstream_retry": _report_schema(
-        "PAF downstream proof retry report",
-        _REPORT_BASE_PROPERTIES
-        | {
-            "disposition": _PROOF_DISPOSITION_PROPERTY,
-            "source_issues": _SOURCE_ISSUES_PROPERTY,
-            "failed_attempts": _FAILED_ATTEMPTS_PROPERTY,
-            "blocker_refs": _BLOCKER_REFS_PROPERTY,
-            "upstream_requests": _UPSTREAM_REQUESTS_PROPERTY,
-        },
-    ),
-    "upstream_repair": _report_schema(
-        "PAF upstream proof repair report",
-        _REPORT_BASE_PROPERTIES
-        | {
-            "source_issues": _SOURCE_ISSUES_PROPERTY,
-            "failed_attempts": _FAILED_ATTEMPTS_PROPERTY,
-            "upstream_answers": _UPSTREAM_ANSWERS_PROPERTY,
         },
     ),
 }
@@ -692,14 +517,8 @@ COMMON_PROMPT_PATH = Path(str(_PROMPT_RESOURCES.joinpath("common.md")))
 PROOF_REVIEW_PROMPT_PATH = Path(str(_PROMPT_RESOURCES.joinpath("proof_review.md")))
 DIAGNOSTIC_REVIEW_PROMPT_PATH = Path(str(_PROMPT_RESOURCES.joinpath("diagnostic_review.md")))
 WARNING_CLEANUP_PROMPT_PATH = Path(str(_PROMPT_RESOURCES.joinpath("warning_cleanup.md")))
-SHEPHERD_PROMPT_PATH = Path(str(_PROMPT_RESOURCES.joinpath("shepherd.md")))
-REPAIR_WORKER_PROMPT_PATH = Path(str(_PROMPT_RESOURCES.joinpath("repair_worker.md")))
 PACKAGE_STEWARD_PROMPT_PATH = Path(str(_PROMPT_RESOURCES.joinpath("package_steward.md")))
 PACKAGE_WORKER_PROMPT_PATH = Path(str(_PROMPT_RESOURCES.joinpath("package_worker.md")))
-UPSTREAM_REPAIR_ROLE = "upstream_repair"
-DOWNSTREAM_RETRY_ROLE = "downstream_retry"
-SHEPHERD_ROLE = "shepherd"
-REPAIR_WORKER_ROLE = "repair_worker"
 PACKAGE_STEWARD_ROLE = "package_steward"
 PACKAGE_WORKER_ROLE = "package_worker"
 DIAGNOSTIC_REVIEW_ROLE = "diagnostic_review"
@@ -714,12 +533,6 @@ DIAGNOSTIC_REVIEW_ROLES = frozenset({DIAGNOSTIC_REVIEW_ROLE, WARNING_REVIEW_ROLE
 def report_schema_key(stage: Stage, *, role: str = "", feedback: str = "") -> str:
     if role in {PACKAGE_STEWARD_ROLE, PACKAGE_WORKER_ROLE}:
         return role
-    if role == SHEPHERD_ROLE:
-        return SHEPHERD_ROLE
-    if role == UPSTREAM_REPAIR_ROLE:
-        return UPSTREAM_REPAIR_ROLE
-    if role == DOWNSTREAM_RETRY_ROLE:
-        return DOWNSTREAM_RETRY_ROLE
     if role == WARNING_CLEANUP_ROLE:
         return WARNING_CLEANUP_ROLE
     if role == DIAGNOSTIC_REVIEW_ROLE:
@@ -732,77 +545,33 @@ def report_schema_key(stage: Stage, *, role: str = "", feedback: str = "") -> st
 
 
 def render_review_variant(template: str, *, role: str = "") -> str:
-    if role == UPSTREAM_REPAIR_ROLE:
-        values = {
-            "review_assignment": """This is a targeted upstream-support review. One or more later
-proofs request reusable mathematics from this earlier chapter. Answer those requests together; do
-not audit the rest of the chapter or work on unrelated proof placeholders.""",
-            "review_goal_details": """For every request, decide whether the needed result already
-exists, naturally belongs in this earlier chapter as a new declaration, or depends on later material
-and must remain downstream. Fully prove every declaration you add. This assignment permits no new
-placeholders.""",
-            "review_workflow_details": """Cover every supplied upstream request ID and only the
-earlier-chapter declarations needed to answer it. Group requests that need the same result. For an
-existing result, record its exact fully qualified name and concrete use. For a genuine earlier gap,
-add and fully prove the smallest reusable result. For a downstream result, explain the ownership
-boundary and give a viable later-chapter direction.""",
-            "review_guardrails": """Do not change existing interfaces or edit the requesting
-chapter. Do not add `sorry`, `admit`, axioms, unsafe declarations, unused helpers, cosmetic aliases,
-or a theorem tailored merely to restate a later proof's final goal.""",
-            "review_definition_of_done": """Every supplied request ID has one evidence-backed
-answer, every added declaration is fully proved and free of diagnostics, all requesting proofs have
-concrete usage guidance or a justified downstream disposition, and no unrelated source was
-changed.""",
-            "review_output_format": """Return the structured report once, after tool use and edits
-have stopped. It must describe the stable files on disk, not planned work. Use only these fields:
-
-- `complete`: `true` only when the definition of done is met.
-- `summary`: if edits remain, concise past-tense prose naming the added declarations and their
-  purpose, suitable for a commit body; otherwise, why no edit was needed.
-- `issues`: tooling, diagnostic, or out-of-scope blockers; otherwise an empty list.
-- `source_issues`: genuine defects in the informal textbook; otherwise an empty list. Each entry
-  must give `location`, an exact identifying `source_excerpt`, a mathematical `description`, and the
-  smallest `suggested_correction`.
-- `failed_attempts`: any new supporting declaration that could not be proved; otherwise an empty
-  list. Each entry must give its repository-relative `path`, fully qualified `declaration`, at least
-  two meaningfully different checked `attempts`, exact `remaining_goal`, concrete `obstruction`, and
-  a `disposition`: `retry`, `missing_upstream`, `statement_review`, `interface_review`, or
-  `genuine_blocker`.
-- `upstream_answers`: one independent answer for every supplied request id. Use `added` or
-  `existing` for a complete capability; `partial` for fully proved declarations that reduce but do
-  not discharge it; `downstream` only with an executable retry contract; `external` for an
-  unavailable dependency; or `decompose` with smaller child requests. Give exact declarations,
-  concrete usage guidance, remaining work, and rejection reason as appropriate. One hard request
-  must not prevent useful answers for the others from being reported.""",
-        }
-    else:
-        values = {
-            "review_assignment": """This is a focused statement and interface review triggered by
+    values = {
+        "review_assignment": """This is a focused statement and interface review triggered by
 failed proof evidence. Review the named declarations, their immediate supporting interfaces, and
 the corresponding source passages. Do not spend time re-auditing unrelated chapter declarations.""",
-            "review_goal_details": """This remains review work, not a second proof attempt. Repair
+        "review_goal_details": """This remains review work, not a second proof attempt. Repair
 every genuine statement or supporting-interface problem in the focused scope. You are authorized to
 make the smallest source-faithful public correction when the evidence confirms a defect. Preserve a
 sound interface when only the proof strategy failed.""",
-            "review_workflow_details": """Account for every supplied finding ID with one diagnosis
+        "review_workflow_details": """Account for every supplied finding ID with one diagnosis
 and one machine-actionable next action. First confirm that the declaration is live and the supplied
 evidence is current. Check the exact statement against the source, test obvious counterexamples,
 and inspect only the focused APIs needed to route it. Call a retry route executable only when every
 substantial step names an exact existing declaration and a focused Lean probe checks the critical
-composition. If a required step is absent, emit an upstream capability request or send the target
-to roadmap work. Treat unrelated prerequisite diagnostics as a dependency wait, not a mathematical
+composition. If a required step is absent, attach package evidence or send the target to package
+work. Treat unrelated prerequisite diagnostics as a dependency wait, not a mathematical
 proof failure.""",
-            "review_guardrails": """Do not spend the assignment proving existing proposition
+        "review_guardrails": """Do not spend the assignment proving existing proposition
 placeholders. Do not broaden from the named findings into unrelated chapter cleanup. Do not repeat
 searches already recorded in the blocker ledger. A no-change review must route each blocker rather
 than merely restate it. Do not request a full dependency validation when no source was edited;
 focused target diagnostics are sufficient. Supplied target-local build diagnostics remain required
 work.""",
-            "review_definition_of_done": """Every supplied finding has an evidence-backed diagnosis
+        "review_definition_of_done": """Every supplied finding has an evidence-backed diagnosis
 and routing action, every in-scope defect has the smallest source-faithful repair, every proof retry
 has an executable checked contract, every missing result has a capability request, and edited files
 have no diagnostics except permitted exact `sorry` warnings.""",
-            "review_output_format": """Return the structured report once, after tool use and edits
+        "review_output_format": """Return the structured report once, after tool use and edits
 have stopped. It must describe the stable files on disk, not planned work. Use only these fields:
 
 - `complete`: `true` only when the definition of done is met.
@@ -816,17 +585,16 @@ have stopped. It must describe the stable files on disk, not planned work. Use o
 - `finding_assessments`: one entry for each supplied proof finding. Copy its exact `finding_id` and
   a concise identifying `finding`; choose a `diagnosis` and `action`; give checked `explanation`;
   supply an executable `retry_contract` only for `retry_with_route` (otherwise `null`); and supply
-  `upstream_requests` only for `request_upstream`, and name exact `dependency_ids` for a dependency
-  wait. Capability requests must include a stable
-  `capability_key`, placement kind, acceptance tests, and the ordinary owner/consumer evidence.""",
-        }
+  `capability` only for `attach_package`, and name exact `dependency_ids` for a dependency wait.
+  Package evidence must include a stable capability key, placement hypothesis, acceptance checks,
+  and the consumer obstruction.""",
+    }
     for key, value in values.items():
         template = template.replace("{" + key + "}", value)
     return template
 
 
 CAPACITY_RESUME_PROMPT = "Continue from the interrupted turn and complete the assigned task."
-UPSTREAM_SOURCE_BUNDLE_MAX_CHARS = 240_000
 LEAN_DECLARATION_RE = re.compile(
     r"^[ \t]*(?:(?:noncomputable|private|protected|unsafe|opaque)[ \t]+)*"
     r"(?:theorem|lemma|def|abbrev|structure|class|instance)[ \t]+"
@@ -866,7 +634,7 @@ class ValidationStatus(StrEnum):
     TARGET_WARNINGS = "target_warnings"
     DEFERRED = "deferred"
     TARGET_FAILED = "target_failed"
-    UPSTREAM_FAILED = "upstream_failed"
+    DEPENDENCY_FAILED = "dependency_failed"
     UNATTRIBUTED_BUILD_FAILURE = "unattributed_build_failure"
     STALE_SNAPSHOT = "stale_snapshot"
 
@@ -1076,98 +844,6 @@ def declaration_uses_placeholder_in_chapter(
         if status is not None:
             matches.append(status)
     return any(matches) if matches else None
-
-
-def _upstream_source_bundle(
-    repo: Path,
-    owner: WorkUnitLike,
-    requests: Iterable[dict[str, Any]],
-    chapters: Iterable[WorkUnitLike],
-    maximum: int = UPSTREAM_SOURCE_BUNDLE_MAX_CHARS,
-) -> str:
-    """Supply exact requests and their relevant source evidence to one repair agent."""
-
-    selected = tuple(requests)
-    by_id = {chapter.id: chapter for chapter in chapters}
-    parts = [
-        "## Evidence supplied by PAF\n\n",
-        "The following line-numbered material contains the requests to answer, the relevant files "
-        "from this chapter, the later statements that need help, and the related book excerpts. "
-        "Read other files only when a focused search requires them.\n",
-        "\n### Requests to answer\n",
-    ]
-    for request in selected:
-        request_id = str(request.get("id", "unknown"))
-        parts.extend(
-            [
-                f"\n### Request `{request_id}`\n\n",
-                f"- Requesting chapter: `{request.get('consumer_chapter_id', '')}`\n",
-                f"- Blocked declaration: `{request.get('blocked_declaration', '')}`\n",
-                f"- Requesting file: `{request.get('consumer_path', '')}`\n",
-                f"- Residual goal: `{request.get('residual_goal', '')}`\n",
-                f"- Requested result: {request.get('needed_result', '')}\n",
-                "- Attempted alternatives:\n",
-            ]
-        )
-        attempted = request.get("attempted_alternatives")
-        if isinstance(attempted, list):
-            parts.extend(f"  - {item}\n" for item in attempted if isinstance(item, str))
-        previous = request.get("previous_attempts")
-        if isinstance(previous, str) and previous.strip():
-            parts.extend(["- Earlier proof attempts:\n\n", "```text\n", previous, "\n```\n"])
-
-    # Keep the exact requesting declarations ahead of potentially large textbook and owner-source
-    # excerpts so the bounded evidence packet cannot truncate the statements the repair must serve.
-    parts.append("\n### Relevant declarations from the requesting chapters\n")
-    for request in selected:
-        relative = str(request.get("consumer_path", ""))
-        declaration = str(request.get("blocked_declaration", ""))
-        excerpt = _declaration_excerpt(repo / relative, declaration)
-        parts.append(f"\n### `{relative}` — `{declaration}`\n\n")
-        if excerpt is None:
-            parts.append("[The named declaration from the requesting chapter was not found.]\n")
-            continue
-        start, lines = excerpt
-        parts.append(_line_numbered(lines, start=start))
-
-    excerpt_chapters = {owner.id}
-    excerpt_chapters.update(str(request.get("consumer_chapter_id", "")) for request in selected)
-    parts.append("\n### Relevant book excerpts\n")
-    for chapter_id in sorted(excerpt_chapters):
-        chapter = by_id.get(chapter_id)
-        if chapter is None:
-            continue
-        path, excerpt = _textbook_chapter_excerpt(repo, chapter)
-        parts.extend([f"\n### `{path}` — {chapter.id}\n\n", excerpt])
-
-    matcher = ScopeMatcher(owner.scope)
-    owner_path_set: set[str] = set()
-    for request in selected:
-        raw_paths = request.get("owner_paths")
-        if not isinstance(raw_paths, list):
-            continue
-        owner_path_set.update(
-            path for path in raw_paths if isinstance(path, str) and matcher.matches(path)
-        )
-    owner_paths = sorted(owner_path_set)
-    parts.append("\n### Files in this earlier chapter\n")
-    for relative in owner_paths:
-        path = repo / relative
-        parts.append(f"\n### `{relative}`\n\n")
-        if not path.is_file():
-            parts.append("[File is missing; create it only if the normal owner scope permits.]\n")
-            continue
-        parts.append(
-            _line_numbered(path.read_text(encoding="utf-8", errors="replace").splitlines())
-        )
-
-    bundle = "".join(parts)
-    if len(bundle) <= maximum:
-        return bundle
-    marker = f"\n[Earlier-chapter repair evidence truncated at {maximum:,} characters.]\n"
-    if len(marker) >= maximum:
-        return marker[:maximum]
-    return bundle[: maximum - len(marker)] + marker
 
 
 def scope_digest(repo: Path, chapter: WorkUnitLike) -> str:
@@ -1749,20 +1425,15 @@ class CodexExecutor:
         feedback: str = "",
         workspace_root: Path | None = None,
         role: str = "",
-        upstream_requests: Iterable[dict[str, Any]] = (),
         proof_targets: Iterable[ProofTarget | dict[str, Any]] = (),
     ) -> str:
         if role == PACKAGE_WORKER_ROLE:
             prompt_path = PACKAGE_WORKER_PROMPT_PATH
-        elif role == REPAIR_WORKER_ROLE:
-            prompt_path = REPAIR_WORKER_PROMPT_PATH
         elif role == WARNING_CLEANUP_ROLE:
             prompt_path = WARNING_CLEANUP_PROMPT_PATH
         elif role == DIAGNOSTIC_REVIEW_ROLE:
             prompt_path = DIAGNOSTIC_REVIEW_PROMPT_PATH
-        elif role in {UPSTREAM_REPAIR_ROLE, PROOF_REVIEW_ROLE} or (
-            stage is Stage.REVIEW and feedback
-        ):
+        elif role == PROOF_REVIEW_ROLE or (stage is Stage.REVIEW and feedback):
             prompt_path = PROOF_REVIEW_PROMPT_PATH
         else:
             prompt_path = self.config.stages[stage].prompt
@@ -1775,7 +1446,7 @@ class CodexExecutor:
                 "non-`sorry` warnings."
             )
             template = template.replace("{diagnostic_trigger}", diagnostic_trigger)
-        if role in {REPAIR_WORKER_ROLE, PACKAGE_WORKER_ROLE}:
+        if role == PACKAGE_WORKER_ROLE:
             instruction = feedback
             try:
                 repair_dossier = json.loads(feedback)
@@ -1793,8 +1464,7 @@ class CodexExecutor:
             base = render_prompt(template, chapter)
         common = (
             ""
-            if role not in {REPAIR_WORKER_ROLE, PACKAGE_WORKER_ROLE}
-            and stage in (Stage.DISCOVER, Stage.PROVE)
+            if role != PACKAGE_WORKER_ROLE and stage in (Stage.DISCOVER, Stage.PROVE)
             else render_prompt(COMMON_PROMPT_PATH.read_text(encoding="utf-8"), chapter)
         )
         scope = "\n".join(f"- `{item}`" for item in chapter.scope)
@@ -1814,18 +1484,14 @@ class CodexExecutor:
             entries = entries or "No earlier chapters are available."
             input_catalog = f"\n### Available chapters and ids\n\n{entries}\n"
         proof_retry_contract = ""
-        if stage is Stage.PROVE and feedback and role != UPSTREAM_REPAIR_ROLE:
+        if stage is Stage.PROVE and feedback:
             proof_retry_contract = """
 This is a retry. The handoff below is the complete delta from the previous attempt. Before using
 tools, identify a materially new premise, API, or strategy. If there is none, return the unchanged
 blocker immediately. Do not repeat prior searches or evidence."""
         selected_proof_targets = tuple(proof_targets)
         proof_assignment = ""
-        if (
-            stage is Stage.PROVE
-            and selected_proof_targets
-            and role not in {UPSTREAM_REPAIR_ROLE, REPAIR_WORKER_ROLE}
-        ):
+        if stage is Stage.PROVE and selected_proof_targets and role != PACKAGE_WORKER_ROLE:
             rendered_targets: list[str] = []
             assigned_placeholders = 0
             for target in selected_proof_targets:
@@ -1947,29 +1613,16 @@ must finish without errors or warnings. PAF will build the chapter after the att
 current diagnostics override the earlier clean-build fact."""
             + proof_retry_contract,
         }[stage]
-        if role == UPSTREAM_REPAIR_ROLE:
-            stage_contract = """This temporary attempt answers a group of requests for mathematical
-support from an earlier chapter. Use the attached Lean tools, edit only that earlier chapter, and
-fully prove every new declaration. PAF will merge and build the changes before retrying the later
-            proofs. Do not work on unrelated placeholders."""
-        elif role == PACKAGE_STEWARD_ROLE:
+        if role == PACKAGE_STEWARD_ROLE:
             stage_contract = """This is a writable capability-package Steward turn. You own the
 reserved package worktree and may edit every reserved path, including shared interfaces and
 consumers in several files. Make central interface edits yourself, delegate only bounded leaf
-steps, and return a complete package mutation report. Do not create upstream requests or use the
-legacy repair-sweep protocol."""
+steps, and return a complete package mutation report."""
         elif role == PACKAGE_WORKER_ROLE:
             stage_contract = """This is one bounded capability-package worker step. Edit only the
 assigned paths in the package worktree, commit the completed step, and report exact validation and
 remaining evidence. You may not change placement, scope, dependencies, consumers, or package
 lifecycle."""
-        elif role == REPAIR_WORKER_ROLE:
-            stage_contract = f"""This is a bounded Shepherd repair work unit targeting the existing
-{stage.value} stage. Diagnose and fix the concrete blocker in the attached repair dossier. Keep the
-change as small as possible and do not broaden into unrelated cleanup. The custom repair instruction
-replaces the ordinary {stage.value} stage mission; the target stage still determines filesystem,
-tool, report-schema, and validation constraints. PAF will independently validate and integrate the
-result."""
         validation_contract = {
             Stage.DISCOVER: "PAF validates and saves the reported source dependencies.",
             Stage.FORMALIZE: "PAF independently checks the allowed file changes, placeholders, "
@@ -2015,7 +1668,7 @@ isolation trees. Keep command output below roughly 12 KiB. {stage_contract}
             mcp_workflow = (
                 """Using a Lean tool opens and synchronizes the file it targets. Use focused
 diagnostics and other attached tools as needed to validate the custom repair instruction."""
-                if role in {REPAIR_WORKER_ROLE, PACKAGE_WORKER_ROLE}
+                if role == PACKAGE_WORKER_ROLE
                 else {
                     Stage.FORMALIZE: """Using a Lean tool opens and synchronizes the file it
 targets. Follow the formalization workflow above for when and where to request diagnostics.""",
@@ -2039,12 +1692,8 @@ diagnostics from prerequisites to dependents.
 """
         if feedback:
             feedback_heading = (
-                "Targeted downstream retry handoff"
-                if role == DOWNSTREAM_RETRY_ROLE
-                else "Capability package worker packet"
+                "Capability package worker packet"
                 if role == PACKAGE_WORKER_ROLE
-                else "Shepherd repair dossier"
-                if role == REPAIR_WORKER_ROLE
                 else "PAF validation diagnostics to repair"
                 if role in DIAGNOSTIC_REVIEW_ROLES
                 else {
@@ -2055,38 +1704,7 @@ diagnostics from prerequisites to dependents.
                 }[stage]
             )
             contract += f"\n## {feedback_heading}\n\n```text\n{_bounded_feedback(feedback)}\n```\n"
-        evidence = ""
-        if role == UPSTREAM_REPAIR_ROLE:
-            root = workspace_root or self.config.settings.repo
-            evidence = (
-                _upstream_source_bundle(
-                    root,
-                    chapter,
-                    upstream_requests,
-                    self.config.chapters,
-                ).rstrip()
-                + "\n\n"
-            )
-        return f"{base.rstrip()}\n\n{evidence}{common.rstrip()}\n{contract}"
-
-    def build_shepherd_prompt(
-        self,
-        failures: Iterable[dict[str, Any]],
-        *,
-        scheduling: dict[str, Any],
-    ) -> str:
-        template = SHEPHERD_PROMPT_PATH.read_text(encoding="utf-8")
-        dossier = {
-            "failures": list(failures),
-            "scheduling": scheduling,
-            "limits": {
-                "maximum_work_units": self.config.shepherd.maximum_work_units_per_sweep,
-                "allowed_chapter_ids": [unit.id for unit in self.config.work_units],
-                "allowed_stages": [stage.value for stage in Stage],
-            },
-        }
-        payload = json.dumps(dossier, indent=2)
-        return f"{template.rstrip()}\n\n## Failure dossier\n\n```json\n{payload}\n```\n"
+        return f"{base.rstrip()}\n\n{common.rstrip()}\n{contract}"
 
     def build_package_steward_prompt(self, dossier: dict[str, Any]) -> str:
         """Render one complete, package-owned multi-file Steward assignment."""
@@ -2116,11 +1734,7 @@ diagnostics from prerequisites to dependents.
         command.extend(["--output-schema", str(self.schema_paths[schema_key])])
         if root != settings.repo:
             command.append("--skip-git-repo-check")
-        if role == SHEPHERD_ROLE and resume_thread_id is None:
-            command.extend(["--sandbox", "read-only"])
-        elif role == SHEPHERD_ROLE:
-            command.extend(["--config", 'sandbox_mode="read-only"'])
-        elif settings.bypass_approvals_and_sandbox:
+        if settings.bypass_approvals_and_sandbox:
             command.append("--dangerously-bypass-approvals-and-sandbox")
         elif settings.approve_for_me and resume_thread_id is None:
             # Current Codex versions make --approve-for-me mutually exclusive
@@ -2132,12 +1746,12 @@ diagnostics from prerequisites to dependents.
             # `codex exec resume` does not accept the top-level `--sandbox`
             # option, but it does accept the equivalent config override.
             command.extend(["--config", f'sandbox_mode="{settings.sandbox}"'])
-        if role in {SHEPHERD_ROLE, PACKAGE_STEWARD_ROLE}:
-            model = self.config.shepherd.model
-            reasoning_effort = self.config.shepherd.reasoning_effort
-        elif role in {REPAIR_WORKER_ROLE, PACKAGE_WORKER_ROLE}:
-            model = self.config.shepherd.worker_model
-            reasoning_effort = self.config.shepherd.worker_reasoning_effort
+        if role == PACKAGE_STEWARD_ROLE:
+            model = self.config.steward.model
+            reasoning_effort = self.config.steward.reasoning_effort
+        elif role == PACKAGE_WORKER_ROLE:
+            model = self.config.steward.worker_model
+            reasoning_effort = self.config.steward.worker_reasoning_effort
         else:
             model = self.config.model_for(stage)
             reasoning_effort = self.config.reasoning_effort_for(stage)
@@ -2219,52 +1833,6 @@ diagnostics from prerequisites to dependents.
             resume_thread_id=thread_id,
             resume_run_id=previous_run_id,
             resume_prompt=reminder,
-        )
-
-    async def run_upstream_repair(
-        self,
-        chapter: WorkUnitLike,
-        run: RunRecord,
-        requests: Iterable[dict[str, Any]],
-        *,
-        workspace_root: Path | None = None,
-    ) -> AgentResult:
-        """Run one proof-capable temporary agent over an owner-grouped request batch."""
-
-        root = workspace_root or self.config.settings.repo
-        selected = tuple(requests)
-        prompt = self.build_prompt(
-            chapter,
-            Stage.PROVE,
-            workspace_root=root,
-            role=UPSTREAM_REPAIR_ROLE,
-            upstream_requests=selected,
-        )
-        return await self._run_prompt(
-            chapter,
-            Stage.PROVE,
-            run,
-            prompt=prompt,
-            workspace_root=root,
-        )
-
-    async def run_shepherd(
-        self,
-        anchor: WorkUnitLike,
-        run: RunRecord,
-        failures: Iterable[dict[str, Any]],
-        *,
-        scheduling: dict[str, Any],
-    ) -> AgentResult:
-        """Ask the strong, read-only Shepherd model for bounded repair work units."""
-
-        prompt = self.build_shepherd_prompt(failures, scheduling=scheduling)
-        return await self._run_prompt(
-            anchor,
-            Stage.DISCOVER,
-            run,
-            prompt=prompt,
-            workspace_root=self.config.settings.repo,
         )
 
     async def run_package_steward(

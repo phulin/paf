@@ -816,7 +816,7 @@ class PackageExecutionLayer:
             "rules": {
                 "sequential_workers": True,
                 "maximum_worker_steps": self.maximum_worker_steps,
-                "no_upstream_requests": True,
+                "package_owns_structural_work": True,
             },
         }
 

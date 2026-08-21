@@ -27,7 +27,6 @@ from paf.package_model import (
     ReservationResult,
     ReservationSpec,
     StewardLease,
-    UpstreamRequestImport,
     canonical_reservation_specs,
 )
 from paf.package_runtime import (
@@ -76,7 +75,6 @@ __all__ = [
     "ReservationSpec",
     "Stage",
     "StewardLease",
-    "UpstreamRequestImport",
     "WorktreeSnapshot",
     "canonical_reservation_specs",
 ]

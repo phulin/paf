@@ -7,7 +7,7 @@ from collections import deque
 from collections.abc import Callable, Coroutine, Iterable
 from contextlib import suppress
 from dataclasses import dataclass, field, replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
 from threading import Lock
@@ -18,13 +18,9 @@ from paf import json_codec as json
 from paf.codex import (
     DIAGNOSTIC_REVIEW_ROLE,
     DIAGNOSTIC_REVIEW_ROLES,
-    DOWNSTREAM_RETRY_ROLE,
     PACKAGE_STEWARD_ROLE,
     PACKAGE_WORKER_ROLE,
     PROOF_REVIEW_ROLE,
-    REPAIR_WORKER_ROLE,
-    SHEPHERD_ROLE,
-    UPSTREAM_REPAIR_ROLE,
     WARNING_REVIEW_ROLE,
     AgentResult,
     CodexExecutor,
@@ -32,7 +28,6 @@ from paf.codex import (
     ValidationStatus,
     count_placeholders,
     declaration_uses_placeholder,
-    declaration_uses_placeholder_in_chapter,
     migrate_scope_digests,
     proof_target_chunk,
     proof_target_spans,
@@ -92,17 +87,12 @@ from paf.scope import ScopeMatcher
 from paf.state import (
     BUILD_WARNING_REVIEW_KIND,
     ProofBlockerStatus,
-    RepairCaseRecord,
-    RepairCaseStatus,
-    RepairWorkUnitRecord,
-    RepairWorkUnitStatus,
     Requirement,
     RequirementKind,
     RunRecord,
     StateStore,
     TaskPhase,
     TaskStatus,
-    UpstreamRequestStatus,
 )
 from paf.warning_cleanup import (
     WarningCleanupResult,
@@ -112,7 +102,6 @@ from paf.warning_cleanup import (
 )
 
 MAXIMUM_COORDINATOR_BUILD_TARGETS = 500
-REPAIR_EFFORT = {"small": 1.0, "medium": 3.0, "large": 8.0}
 REVIEW_REPORT_RETRY_PROMPT = """Your previous review turn did not satisfy the report contract:
 
 {error}
@@ -130,10 +119,6 @@ the same proof assignment, use the attached validation diagnostics as required w
 cause within your assigned proof edits, focused helpers, or imports. Do not edit an unrelated
 declaration merely because it reports a downstream symptom. Return only after validation is clean or
 you have precise new blocker evidence."""
-
-
-class ShepherdPlanError(ValueError):
-    """The Shepherd returned a plan that cannot safely enter the scheduler."""
 
 
 async def _gather_cancel_on_error[T](
@@ -577,10 +562,6 @@ class Orchestrator:
             phase="proofs",
             selected_documents=selected_documents,
         )
-        self._repair_priority_offset = 1.0 + max(
-            [*self.statement_schedule.rank.values(), *self.proof_schedule.rank.values()],
-            default=0.0,
-        )
         self.state.scheduling = self.scheduling_snapshot()
         self.agent_slots = PriorityLimiter(config.settings.max_agents)
         discovery_max_agents = config.stages[Stage.DISCOVER].max_agents
@@ -603,12 +584,6 @@ class Orchestrator:
         self._review_invalidation_generations: dict[str, int] = {}
         self._review_generation_lock = asyncio.Lock()
         self._chapter_agent_locks = {chapter.id: asyncio.Lock() for chapter in self.work_units}
-        self._upstream_repair_tasks: dict[str, asyncio.Task[None]] = {}
-        self._shepherd_task: asyncio.Task[None] | None = None
-        self._shepherd_lock = asyncio.Lock()
-        self._consecutive_no_progress_sweeps = 0
-        self._last_shepherd_case_fingerprints: tuple[str, ...] = ()
-        self._repair_progress_generation = 0
         self._live_agent_tasks: dict[
             tuple[str, Stage], tuple[RunRecord, asyncio.Task[AgentResult]]
         ] = {}
@@ -625,11 +600,8 @@ class Orchestrator:
             validate_consumer=self._validate_package_consumer,
             interface_digest=self._package_interface_digest,
             wake_consumers=self._wake_package_consumers,
-            lease_ttl_seconds=(
-                config.settings.agent_timeout_seconds
-                + config.settings.validation_timeout_seconds
-                + 600
-            ),
+            lease_ttl_seconds=config.steward.lease_ttl_seconds,
+            maximum_worker_steps=config.steward.maximum_worker_steps,
         )
 
     @property
@@ -683,7 +655,7 @@ class Orchestrator:
             Stage.PROVE,
             role=PACKAGE_STEWARD_ROLE,
             request_ids=(package.id,),
-            model=self.config.shepherd.model,
+            model=self.config.steward.model,
         )
         stop = asyncio.Event()
         heartbeat = asyncio.create_task(
@@ -715,7 +687,7 @@ class Orchestrator:
             Stage.PROVE,
             role=PACKAGE_WORKER_ROLE,
             request_ids=(package.id, step.id),
-            model=self.config.shepherd.worker_model,
+            model=self.config.steward.worker_model,
         )
         await self.agent_slots.acquire(self.proof_schedule.priority(anchor.document_id))
         try:
@@ -847,7 +819,7 @@ class Orchestrator:
         self,
         progress: Callable[[str, int, int], None] | None = None,
     ) -> None:
-        total = 9
+        total = 7
 
         def report(phase: str, completed: int) -> None:
             if progress is not None:
@@ -864,12 +836,9 @@ class Orchestrator:
         await self.state.load_or_create()
         report("Recovering interrupted work", 2)
         await self.state.requeue_interrupted(resume_agents=self.resume_agents)
-        await self.state.retire_imported_upstream_requests()
         report("Scaffolding work-unit directories", 3)
         self.scaffold()
-        report("Recovering upstream requests", 4)
-        await self._recover_upstream_requests()
-        report("Migrating persisted workflow state", 5)
+        report("Migrating persisted workflow state", 4)
         await self._migrate_persisted_content_digests()
         migrated = await self.state.migrate_post_review_fixups()
         if migrated:
@@ -880,25 +849,17 @@ class Orchestrator:
                     detail="recovered post-review findings",
                 )
         await self.state.migrate_stale_snapshot_review_requests()
-        report("Preparing agent execution", 6)
+        report("Preparing agent execution", 5)
         await self.executor.prepare()
-        report("Preparing isolated workspaces and Lean caches", 7)
+        report("Preparing isolated workspaces and Lean caches", 6)
         await self.isolation.prepare()
-        report("Checking the Git worktree", 8)
+        report("Checking the Git worktree", 7)
         await self.git.prepare()
         await asyncio.to_thread(self.package_execution.integrator.reconcile)
         await self.state.refresh_package_state()
-        await self._schedule_ready_packages()
-        if self.config.shepherd.enabled:
-            restart_cases = await self._discard_persisted_repair_plans()
-            self.state.shepherd.next_run_at = (
-                datetime.now(UTC) + timedelta(seconds=self.config.shepherd.interval_seconds)
-            ).isoformat()
-            await self.state.save("state")
-            self._shepherd_task = asyncio.create_task(
-                self._shepherd_loop(restart_cases), name="paf-shepherd"
-            )
-        report("Preparation complete", 9)
+        if self.config.steward.enabled:
+            await self._schedule_ready_packages()
+        report("Preparation complete", 7)
 
     async def _commit_agent_changes(
         self,
@@ -977,10 +938,6 @@ class Orchestrator:
                 task.cancel()
             await asyncio.gather(*package_tasks, return_exceptions=True)
             self._package_tasks.clear()
-            if self._shepherd_task is not None:
-                self._shepherd_task.cancel()
-                await asyncio.gather(self._shepherd_task, return_exceptions=True)
-                self._shepherd_task = None
             if self._discovery_batch_task is not None:
                 self._discovery_batch_task.cancel()
                 await asyncio.gather(self._discovery_batch_task, return_exceptions=True)
@@ -989,11 +946,6 @@ class Orchestrator:
                 if not pending.future.done():
                     pending.future.cancel()
             self._pending_discoveries.clear()
-            repairs = tuple(self._upstream_repair_tasks.values())
-            for task in repairs:
-                task.cancel()
-            await asyncio.gather(*repairs, return_exceptions=True)
-            self._upstream_repair_tasks.clear()
             if self._build_dispatch_task is not None:
                 self._build_dispatch_task.cancel()
                 await asyncio.gather(self._build_dispatch_task, return_exceptions=True)
@@ -1316,7 +1268,7 @@ class Orchestrator:
         """Retain records whose own source is unchanged.
 
         Dependency freshness is represented separately.  A proof-body change
-        upstream must not erase a descendant's locally validated build fact.
+        a dependency must not erase a descendant's locally validated build fact.
         """
 
         def retain() -> dict[str, dict[str, Any]]:
@@ -1883,7 +1835,6 @@ class Orchestrator:
         queue_detail: str = "",
         role: str = "",
         request_ids: Iterable[str] = (),
-        upstream_requests: Iterable[dict[str, Any]] = (),
         proof_targets: Iterable[ProofTarget] = (),
         priority_override: float | None = None,
         resume_thread_id: str | None = None,
@@ -1891,14 +1842,10 @@ class Orchestrator:
         resume_prompt: str = "",
     ) -> Attempt:
         auxiliary = role in {
-            UPSTREAM_REPAIR_ROLE,
-            REPAIR_WORKER_ROLE,
             WARNING_REVIEW_ROLE,
             PROOF_REVIEW_ROLE,
         }
-        upstream_repair = role == UPSTREAM_REPAIR_ROLE
         selected_request_ids = tuple(dict.fromkeys(request_ids))
-        selected_upstream_requests = tuple(upstream_requests)
         selected_proof_targets = tuple(proof_targets)
         await self.control.checkpoint()
         schedule = (
@@ -1979,9 +1926,7 @@ class Orchestrator:
                     stage,
                     role=role,
                     request_ids=selected_request_ids,
-                    model=(
-                        self.config.shepherd.worker_model if role == REPAIR_WORKER_ROLE else None
-                    ),
+                    model=None,
                 )
             else:
                 started = await self.state.start_run(chapter.id, stage)
@@ -2000,11 +1945,7 @@ class Orchestrator:
             return started
 
         try:
-            if role == REPAIR_WORKER_ROLE and selected_request_ids:
-                await self.state.start_repair_work_unit(selected_request_ids[0])
             run = await start_agent_run()
-            if role == REPAIR_WORKER_ROLE and selected_request_ids:
-                await self.state.link_repair_work_unit_run(selected_request_ids[0], run.id)
             if live_discovery:
                 workspace_root = self.config.settings.repo
             elif self.isolation.name == "shared":
@@ -2041,13 +1982,6 @@ class Orchestrator:
                         feedback=feedback,
                         workspace_root=workspace_root,
                     )
-                elif upstream_repair:
-                    operation = self.executor.run_upstream_repair(
-                        chapter,
-                        run,
-                        selected_upstream_requests,
-                        workspace_root=workspace_root,
-                    )
                 else:
                     operation = self.executor.run(
                         chapter,
@@ -2064,9 +1998,9 @@ class Orchestrator:
                     agent = await agent_task
                 except asyncio.CancelledError:
                     current = asyncio.current_task()
-                    targeted_retry = active_run.id in self._live_agent_retry_requests
+                    operator_retry = active_run.id in self._live_agent_retry_requests
                     if (
-                        not targeted_retry
+                        not operator_retry
                         or self.control.stopping
                         or (current is not None and current.cancelling())
                     ):
@@ -2139,14 +2073,7 @@ class Orchestrator:
                 for target in selected_proof_targets
             )
             if isolated.accepted:
-                if role == REPAIR_WORKER_ROLE:
-                    validation = ValidationResult(
-                        True,
-                        0,
-                        "validation deferred to the normal stage scheduler",
-                        status=ValidationStatus.DEFERRED,
-                    )
-                elif stage is Stage.PROVE and (
+                if stage is Stage.PROVE and (
                     agent.changed or self.force or assigned_targets_satisfied
                 ):
                     snapshots: dict[str, ValidatedBuildSnapshot] = {}
@@ -2154,13 +2081,7 @@ class Orchestrator:
                         await self._build_chapters(
                             (chapter,),
                             publish_if_clean=True,
-                            mode=(
-                                "upstream-repair-certification"
-                                if upstream_repair
-                                else "shepherd-repair-certification"
-                                if role == REPAIR_WORKER_ROLE
-                                else "proof-certification"
-                            ),
+                            mode="proof-certification",
                             stage=Stage.PROVE,
                             snapshots=snapshots,
                         )
@@ -2382,10 +2303,10 @@ class Orchestrator:
                     return await self._complete_formalize_build(
                         chapter, validation, snapshots[chapter.id]
                     )
-                if validation.status is ValidationStatus.UPSTREAM_FAILED:
-                    return await self._block_on_upstream_diagnostics(chapter, validation)
+                if validation.status is ValidationStatus.DEPENDENCY_FAILED:
+                    return await self._block_on_dependency_diagnostics(chapter, validation)
                 if validation.blocked_by:
-                    await self._block_on_upstream_diagnostics(
+                    await self._block_on_dependency_diagnostics(
                         chapter, validation, block_consumer=False
                     )
                 diagnostics = await self._build_feedback_async({chapter.id: validation})
@@ -2436,10 +2357,12 @@ class Orchestrator:
                 return await self._complete_formalize_build(
                     chapter, validation, snapshots[chapter.id]
                 )
-            if validation.status is ValidationStatus.UPSTREAM_FAILED:
-                return await self._block_on_upstream_diagnostics(chapter, validation)
+            if validation.status is ValidationStatus.DEPENDENCY_FAILED:
+                return await self._block_on_dependency_diagnostics(chapter, validation)
             if validation.blocked_by:
-                await self._block_on_upstream_diagnostics(chapter, validation, block_consumer=False)
+                await self._block_on_dependency_diagnostics(
+                    chapter, validation, block_consumer=False
+                )
 
         await self.state.set_task(
             chapter.id,
@@ -2483,7 +2406,7 @@ class Orchestrator:
         )
         return StageOutcome(ExecutionDisposition.WAITING)
 
-    async def _block_on_upstream_diagnostics(
+    async def _block_on_dependency_diagnostics(
         self,
         consumer: WorkUnitLike,
         validation: ValidationResult,
@@ -2535,7 +2458,7 @@ class Orchestrator:
                     consumer.id,
                     Stage.FORMALIZE,
                     requirements,
-                    "waiting for upstream coordinator diagnostic owners",
+                    "waiting for coordinator diagnostic dependency owners",
                 )
         return StageOutcome(
             ExecutionDisposition.WAITING,
@@ -2589,640 +2512,7 @@ class Orchestrator:
             owners.extend(self._path_owners.get(parent, ()))
         return self._ordered_owner_ids(owners)
 
-    def _is_earlier_work_unit(self, owner: WorkUnitLike, consumer: WorkUnitLike) -> bool:
-        if owner.document_id == consumer.document_id:
-            return owner.number < consumer.number
-        document_order = {
-            document.id: index for index, document in enumerate(self.config.documents)
-        }
-        return document_order.get(owner.document_id, -1) < document_order.get(
-            consumer.document_id, -1
-        )
-
-    def _normalize_upstream_request(
-        self,
-        consumer: WorkUnitLike,
-        raw: Any,
-    ) -> tuple[dict[str, Any], str, str]:
-        """Resolve one owner from exact paths and retain why an unsafe handoff was rejected."""
-
-        if not isinstance(raw, dict):
-            return {}, "", "proof agent returned a non-object upstream request"
-        request = dict(raw)
-        owner_kind = str(request.get("owner_kind", "chapter")).strip() or "chapter"
-        request["owner_kind"] = owner_kind
-        request["candidate_signature"] = str(request.get("candidate_signature", "")).strip()
-        request["acceptance_tests"] = [
-            str(item).strip()
-            for item in request.get("acceptance_tests", [])
-            if isinstance(item, str) and item.strip()
-        ]
-        required_strings = (
-            "blocked_declaration",
-            "consumer_path",
-            "residual_goal",
-            "needed_result",
-            "owner_chapter_id",
-        )
-        missing = [
-            name
-            for name in required_strings
-            if not isinstance(request.get(name), str) or not request[name].strip()
-        ]
-        owner_paths = request.get("owner_paths")
-        alternatives = request.get("attempted_alternatives")
-        if not isinstance(owner_paths, list) or not all(
-            isinstance(path, str) and path.strip() for path in owner_paths
-        ):
-            missing.append("owner_paths")
-            owner_paths = []
-        valid_alternatives = (
-            [item for item in alternatives if isinstance(item, str) and item.strip()]
-            if isinstance(alternatives, list)
-            else []
-        )
-        if len(valid_alternatives) < 2:
-            missing.append("attempted_alternatives")
-        proposed_owner = str(request.get("owner_chapter_id", "")).strip()
-        if missing:
-            return (
-                request,
-                proposed_owner,
-                (
-                    "upstream request is missing required evidence: "
-                    + ", ".join(sorted(set(missing)))
-                ),
-            )
-
-        consumer_path = str(request["consumer_path"]).strip()
-        if consumer.id not in self._path_owner_ids(consumer_path):
-            return (
-                request,
-                proposed_owner,
-                (f"consumer path `{consumer_path}` is not owned by {consumer.id}"),
-            )
-        if owner_kind == "consumer":
-            request["owner_chapter_id"] = consumer.id
-            request["capability_key"] = self._capability_key(request, consumer.id)
-            return request, consumer.id, ""
-        if owner_kind == "external":
-            request["owner_chapter_id"] = proposed_owner or "external"
-            request["capability_key"] = self._capability_key(request, request["owner_chapter_id"])
-            return request, str(request["owner_chapter_id"]), ""
-
-        path_owners = {
-            owner_id for path in owner_paths for owner_id in self._path_owner_ids(str(path))
-        }
-        if len(path_owners) != 1:
-            return (
-                request,
-                proposed_owner,
-                ("upstream owner paths must resolve to exactly one selected chapter"),
-            )
-        owner_id = next(iter(path_owners))
-        by_id = {chapter.id: chapter for chapter in self.work_units}
-        owner = by_id.get(owner_id)
-        if owner is None:
-            return request, owner_id, "path-derived owner chapter is outside this swarm selection"
-        if owner_kind == "chapter" and not self._is_earlier_work_unit(owner, consumer):
-            return (
-                request,
-                owner_id,
-                (
-                    f"path-derived owner {owner_id} is not chronologically earlier than "
-                    f"{consumer.id}"
-                ),
-            )
-        request.update({name: str(request[name]).strip() for name in required_strings})
-        request["owner_chapter_id"] = owner_id
-        request["capability_key"] = self._capability_key(request, owner_id)
-        request["owner_paths"] = sorted(dict.fromkeys(str(path).strip() for path in owner_paths))
-        request["attempted_alternatives"] = [str(item).strip() for item in valid_alternatives]
-        return request, owner_id, ""
-
     @staticmethod
-    def _capability_key(request: dict[str, Any], owner_id: str) -> str:
-        supplied = str(request.get("capability_key", "")).strip()
-        if supplied:
-            return supplied
-        source = str(request.get("candidate_signature") or request.get("needed_result", ""))
-        normalized = re.sub(r"\s+", " ", source).strip().casefold()
-        return f"{owner_id}:{tagged_digest_text(normalized).split(':', 1)[-1]}"
-
-    async def _record_upstream_requests(
-        self,
-        chapter: WorkUnitLike,
-        run: RunRecord,
-        report: dict[str, Any],
-        *,
-        previous_attempts: str,
-        forced_escalation: str = "",
-    ) -> tuple[str, ...]:
-        raw_requests = report.get("upstream_requests")
-        if not isinstance(raw_requests, list):
-            return ()
-        request_ids: list[str] = []
-        for raw in raw_requests:
-            request, owner_id, escalation = self._normalize_upstream_request(chapter, raw)
-            escalation = forced_escalation or escalation
-            request_id, _ = await self.state.enqueue_upstream_request(
-                request,
-                consumer_chapter_id=chapter.id,
-                origin_run_id=run.id,
-                owner_chapter_id=owner_id,
-                previous_attempts=previous_attempts,
-                escalation_reason=escalation,
-            )
-            request_ids.append(request_id)
-        if request_ids:
-            await self.state.set_task(
-                chapter.id,
-                Stage.PROVE,
-                TaskStatus.PENDING,
-                f"recorded {len(request_ids)} upstream proof request(s)",
-            )
-        return tuple(dict.fromkeys(request_ids))
-
-    def _parse_upstream_answers(
-        self,
-        report: dict[str, Any],
-        request_ids: Iterable[str],
-    ) -> tuple[dict[str, dict[str, Any]], str]:
-        expected = set(request_ids)
-        raw_answers = report.get("upstream_answers")
-        if not isinstance(raw_answers, list):
-            return {}, "targeted upstream repair returned no `upstream_answers` array"
-        answers: dict[str, dict[str, Any]] = {}
-        errors: list[str] = []
-        for raw in raw_answers:
-            if not isinstance(raw, dict):
-                errors.append("an upstream answer was not an object")
-                continue
-            covered = raw.get("request_ids")
-            disposition = raw.get("disposition")
-            declarations = raw.get("declarations")
-            guidance = raw.get("usage_guidance")
-            rejection = raw.get("rejection_reason")
-            remaining_work = raw.get("remaining_work", "")
-            retry_contract = raw.get("retry_contract")
-            child_requests = raw.get("child_requests", [])
-            if not isinstance(covered, list) or not covered:
-                errors.append("an upstream answer had no request ids")
-                continue
-            covered_ids = [item for item in covered if isinstance(item, str)]
-            if len(covered_ids) != len(covered) or not set(covered_ids).issubset(expected):
-                errors.append("an upstream answer named an unknown request id")
-                continue
-            if disposition not in {
-                "added",
-                "existing",
-                "partial",
-                "downstream",
-                "external",
-                "decompose",
-            }:
-                errors.append("an upstream answer had an invalid disposition")
-                continue
-            if not isinstance(declarations, list) or not all(
-                isinstance(item, str) and item.strip() for item in declarations
-            ):
-                errors.append("an upstream answer had invalid declaration names")
-                continue
-            if (
-                not isinstance(guidance, str)
-                or not isinstance(rejection, str)
-                or not isinstance(remaining_work, str)
-                or not isinstance(child_requests, list)
-            ):
-                errors.append("an upstream answer had invalid guidance")
-                continue
-            if disposition in {"added", "existing"} and (not declarations or not guidance.strip()):
-                errors.append(f"a {disposition} answer omitted declarations or usage guidance")
-                continue
-            if disposition == "partial" and (
-                not declarations or not guidance.strip() or not remaining_work.strip()
-            ):
-                errors.append("a partial answer omitted declarations, guidance, or remaining work")
-                continue
-            if disposition == "downstream" and (
-                declarations
-                or not rejection.strip()
-                or not guidance.strip()
-                or not self._executable_retry_contract(retry_contract)
-            ):
-                errors.append(
-                    "a downstream answer must reject the placement and provide a checked "
-                    "retry contract"
-                )
-                continue
-            if disposition == "external" and (declarations or not rejection.strip()):
-                errors.append("an external answer must name its unavailable dependency")
-                continue
-            if disposition == "decompose" and (declarations or not child_requests):
-                errors.append("a decomposed answer must provide child requests")
-                continue
-            normalized = {
-                "disposition": disposition,
-                "declarations": list(dict.fromkeys(item.strip() for item in declarations)),
-                "usage_guidance": guidance.strip(),
-                "rejection_reason": rejection.strip(),
-                "remaining_work": remaining_work.strip(),
-                "retry_contract": retry_contract,
-                "child_requests": child_requests,
-            }
-            for request_id in covered_ids:
-                if request_id in answers:
-                    errors.append(f"request {request_id} received more than one answer")
-                    continue
-                answers[request_id] = normalized
-        missing = expected.difference(answers)
-        if missing:
-            errors.append("missing answers for: " + ", ".join(sorted(missing)))
-        return answers, "; ".join(errors)
-
-    def _validate_upstream_answer_declarations(
-        self,
-        owner: WorkUnitLike,
-        answers: dict[str, dict[str, Any]],
-        *,
-        agent_changed: bool,
-    ) -> tuple[dict[str, dict[str, Any]], str]:
-        """Reject claimed interfaces contradicted by the integrated Lean sources.
-
-        New declarations must resolve in the assigned owner chapter and be placeholder-free.
-        Existing declarations may come from pinned external dependencies; when they resolve in the
-        selected chronological LastLib prefix, they must likewise be placeholder-free. The fresh
-        downstream retry remains the semantic check for declarations supplied by Mathlib or an
-        unselected earlier book.
-        """
-
-        repo = self.config.settings.repo
-        chronological_prefix = tuple(
-            chapter
-            for chapter in self.work_units
-            if chapter.id == owner.id or self._is_earlier_work_unit(chapter, owner)
-        )
-        accepted: dict[str, dict[str, Any]] = {}
-        errors: list[str] = []
-        for request_id, answer in answers.items():
-            disposition = str(answer.get("disposition", ""))
-            declarations = tuple(
-                declaration
-                for declaration in answer.get("declarations", [])
-                if isinstance(declaration, str)
-            )
-            request_errors: list[str] = []
-            if disposition == "added" and not agent_changed:
-                request_errors.append(
-                    "reported an added interface without an integrated source edit"
-                )
-            for declaration in declarations:
-                if disposition == "added":
-                    status = declaration_uses_placeholder_in_chapter(repo, owner, declaration)
-                    if status is None:
-                        request_errors.append(
-                            f"added declaration `{declaration}` was not found in {owner.id}"
-                        )
-                    elif status:
-                        request_errors.append(
-                            f"added declaration `{declaration}` still uses a placeholder"
-                        )
-                    continue
-                statuses = tuple(
-                    status
-                    for chapter in chronological_prefix
-                    if (
-                        status := declaration_uses_placeholder_in_chapter(
-                            repo,
-                            chapter,
-                            declaration,
-                        )
-                    )
-                    is not None
-                )
-                if any(statuses):
-                    request_errors.append(
-                        f"existing declaration `{declaration}` resolves to an unproved "
-                        "LastLib declaration"
-                    )
-            if request_errors:
-                errors.append(f"request {request_id}: " + ", ".join(request_errors))
-            else:
-                accepted[request_id] = answer
-        return accepted, "; ".join(errors)
-
-    async def _expand_decomposed_upstream_answers(
-        self,
-        answers: dict[str, dict[str, Any]],
-        *,
-        origin_run: RunRecord,
-    ) -> None:
-        """Materialize smaller capability contracts without coupling their outcomes."""
-
-        by_id = {chapter.id: chapter for chapter in self.work_units}
-        for parent_id, answer in answers.items():
-            if answer.get("disposition") != "decompose":
-                continue
-            parent = self.state.upstream_requests.get(parent_id)
-            if not isinstance(parent, dict):
-                continue
-            child_ids: list[str] = []
-            for raw_child in answer.get("child_requests", []):
-                if not isinstance(raw_child, dict):
-                    continue
-                for attachment in parent.get("consumers", []):
-                    if not isinstance(attachment, dict):
-                        continue
-                    consumer_id = str(attachment.get("consumer_chapter_id", ""))
-                    consumer = by_id.get(consumer_id)
-                    if consumer is None:
-                        continue
-                    child = dict(raw_child)
-                    child.setdefault(
-                        "blocked_declaration", attachment.get("blocked_declaration", "")
-                    )
-                    child.setdefault("consumer_path", attachment.get("consumer_path", ""))
-                    child.setdefault("residual_goal", attachment.get("residual_goal", ""))
-                    normalized, owner_id, error = self._normalize_upstream_request(consumer, child)
-                    child_id, _ = await self.state.enqueue_upstream_request(
-                        normalized,
-                        consumer_chapter_id=consumer_id,
-                        origin_run_id=origin_run.id,
-                        owner_chapter_id=owner_id,
-                        previous_attempts=str(parent.get("previous_attempts", "")),
-                        escalation_reason=error,
-                    )
-                    child_ids.append(child_id)
-            answer["child_request_ids"] = list(dict.fromkeys(child_ids))
-
-    async def _repair_upstream_owner(self, owner_id: str) -> None:
-        """Coalesce one owner's requested records without persisting an in-flight state."""
-
-        await asyncio.sleep(0)
-        request_ids = tuple(self.state.upstream_request_batches().get(owner_id, ()))
-        if not request_ids:
-            return
-        by_id = {chapter.id: chapter for chapter in self.work_units}
-        owner = by_id.get(owner_id)
-        run_id: str | None = None
-
-        async def escalate(message: str) -> None:
-            await self.state.record_upstream_answers(
-                request_ids,
-                run_id=run_id,
-                answers={},
-                error=message,
-            )
-
-        if owner is None:
-            await escalate("upstream owner is outside this swarm selection")
-            return
-        requests = tuple(self.state.upstream_requests[request_id] for request_id in request_ids)
-        try:
-            if not await self._proof_build_is_fresh(owner):
-                refresh = await self._refresh_stale_proof_build(owner)
-                if not refresh.succeeded:
-                    await escalate(
-                        "owner sources failed coordinator refresh before targeted repair: "
-                        + refresh.output[-4000:]
-                    )
-                    return
-            attempt = await self._attempt(
-                owner,
-                Stage.PROVE,
-                role=UPSTREAM_REPAIR_ROLE,
-                request_ids=request_ids,
-                upstream_requests=requests,
-            )
-            run_id = attempt.run.id
-            if not (attempt.agent.succeeded and attempt.validation.succeeded):
-                await escalate(
-                    "targeted upstream repair did not complete with a clean owner build:\n"
-                    + attempt.feedback()[-6000:]
-                )
-                return
-            answers, answer_error = self._parse_upstream_answers(
-                attempt.agent.report,
-                request_ids,
-            )
-            answers, declaration_error = self._validate_upstream_answer_declarations(
-                owner,
-                answers,
-                agent_changed=attempt.agent.changed,
-            )
-            answer_error = "; ".join(error for error in (answer_error, declaration_error) if error)
-            await self._expand_decomposed_upstream_answers(
-                answers,
-                origin_run=attempt.run,
-            )
-            await self.state.record_upstream_answers(
-                request_ids,
-                run_id=run_id,
-                answers=answers,
-                error=answer_error,
-            )
-            owner_proof = self.state.task(owner.id, Stage.PROVE)
-            owner_placeholders = await asyncio.to_thread(
-                count_placeholders, self.config.settings.repo, owner
-            )
-            if (
-                attempt.agent.changed
-                and owner_proof.status == TaskStatus.SUCCEEDED
-                and owner_placeholders == 0
-            ):
-                owner_digest = await asyncio.to_thread(
-                    scope_digest, self.config.settings.repo, owner
-                )
-                await self.state.set_task(
-                    owner.id,
-                    Stage.PROVE,
-                    TaskStatus.SUCCEEDED,
-                    "proved upstream interface repair validated",
-                    source_digest=owner_digest,
-                )
-        except Exception as error:
-            await escalate(f"targeted upstream repair orchestration failed: {error}")
-
-    async def _ensure_upstream_answers(self, request_ids: Iterable[str]) -> tuple[str, ...]:
-        """Run owner batches until every supplied request is answered or escalated."""
-
-        selected = tuple(dict.fromkeys(request_ids))
-        while True:
-            requested_by_owner: dict[str, list[str]] = {}
-            for request_id in selected:
-                request = self.state.upstream_requests.get(request_id)
-                if not isinstance(request, dict):
-                    continue
-                if request.get("status") != UpstreamRequestStatus.REQUESTED.value:
-                    continue
-                owner_id = str(request.get("owner_chapter_id", ""))
-                if owner_id:
-                    requested_by_owner.setdefault(owner_id, []).append(request_id)
-            if not requested_by_owner:
-                break
-            tasks: list[asyncio.Task[None]] = []
-            for owner_id in requested_by_owner:
-                task = self._upstream_repair_tasks.get(owner_id)
-                if task is None or task.done():
-                    task = asyncio.create_task(self._repair_upstream_owner(owner_id))
-                    self._upstream_repair_tasks[owner_id] = task
-                tasks.append(task)
-            await asyncio.gather(*tasks)
-            for owner_id, task in tuple(self._upstream_repair_tasks.items()):
-                if task.done():
-                    self._upstream_repair_tasks.pop(owner_id, None)
-        return tuple(
-            request_id
-            for request_id in selected
-            if (
-                isinstance((request := self.state.upstream_requests.get(request_id)), dict)
-                and request.get("status") == UpstreamRequestStatus.ANSWERED.value
-            )
-        )
-
-    def _upstream_retry_feedback(
-        self,
-        request_ids: Iterable[str],
-        previous_attempts: str,
-        *,
-        consumer_chapter_id: str,
-    ) -> str:
-        blocks = [
-            "This is the single targeted downstream retry for the durable upstream handoff. "
-            "Prove each named blocked declaration using the answer, or use the rejection guidance "
-            "to construct the bridge locally. Continue any independent proof work, but do not "
-            "repeat or silently replace the upstream request."
-        ]
-        for request_id in request_ids:
-            request = self.state.upstream_requests[request_id]
-            consumer = next(
-                (
-                    value
-                    for value in request.get("consumers", [])
-                    if isinstance(value, dict)
-                    and value.get("consumer_chapter_id") == consumer_chapter_id
-                ),
-                request,
-            )
-            raw_answer = request.get("answer")
-            answer: dict[str, Any] = raw_answer if isinstance(raw_answer, dict) else {}
-            blocks.append(
-                f"Request `{request_id}`\n"
-                f"Capability: `{request.get('capability_key', '')}`\n"
-                f"Blocked declaration: `{consumer.get('blocked_declaration', '')}` in "
-                f"`{consumer.get('consumer_path', '')}`\n"
-                f"Original residual goal:\n{consumer.get('residual_goal', '')}\n"
-                f"Original upstream result requested:\n{request.get('needed_result', '')}\n"
-                "Original attempted alternatives:\n- "
-                + "\n- ".join(consumer.get("attempted_alternatives", []))
-                + f"\nUpstream disposition: {answer.get('disposition', '')}\n"
-                + "Exact declarations: "
-                + ", ".join(answer.get("declarations", []))
-                + f"\nUsage guidance:\n{answer.get('usage_guidance', '')}\n"
-                + f"Rejection reason:\n{answer.get('rejection_reason', '')}"
-            )
-        if previous_attempts:
-            blocks.append("Previous proof-attempt ledger:\n" + previous_attempts)
-        return _bounded_proof_feedback(blocks)
-
-    def _upstream_ids_for_consumer_status(
-        self,
-        request_ids: Iterable[str],
-        consumer_chapter_id: str,
-        statuses: set[str],
-    ) -> tuple[str, ...]:
-        selected: list[str] = []
-        for request_id in request_ids:
-            request = self.state.upstream_requests.get(request_id)
-            if not isinstance(request, dict):
-                continue
-            attachments = [
-                value
-                for value in request.get("consumers", [])
-                if isinstance(value, dict)
-                and value.get("consumer_chapter_id") == consumer_chapter_id
-            ]
-            current = (
-                {str(value.get("status", "")) for value in attachments}
-                if attachments
-                else {str(request.get("status", ""))}
-            )
-            if current.intersection(statuses):
-                selected.append(request_id)
-        return tuple(selected)
-
-    def _succeeded_upstream_request_ids(
-        self,
-        request_ids: Iterable[str],
-        validation: ValidationResult,
-        *,
-        consumer_chapter_id: str,
-    ) -> tuple[str, ...]:
-        if not validation.succeeded:
-            return ()
-        succeeded: list[str] = []
-        for request_id in request_ids:
-            request = self.state.upstream_requests.get(request_id)
-            if not isinstance(request, dict):
-                continue
-            consumers = request.get("consumers")
-            attachments = (
-                [
-                    value
-                    for value in consumers
-                    if isinstance(value, dict)
-                    and value.get("consumer_chapter_id") == consumer_chapter_id
-                ]
-                if isinstance(consumers, list)
-                else []
-            )
-            targets = attachments or [request]
-            if targets and all(
-                declaration_uses_placeholder(
-                    self.config.settings.repo,
-                    str(target.get("consumer_path", "")),
-                    str(target.get("blocked_declaration", "")),
-                )
-                is False
-                for target in targets
-            ):
-                succeeded.append(request_id)
-                self.state.record_routing_event("consumer_acceptance_succeeded")
-            else:
-                self.state.record_routing_event("consumer_acceptance_failed")
-        return tuple(succeeded)
-
-    async def _close_previously_satisfied_upstream_requests(
-        self,
-        chapter: WorkUnitLike,
-        *,
-        build_fresh: bool,
-    ) -> tuple[str, ...]:
-        if not build_fresh:
-            return ()
-        requests = self.state.upstream_requests_for_consumer(chapter.id)
-        candidates = tuple(
-            str(request.get("id", ""))
-            for request in requests
-            if request.get("status") != UpstreamRequestStatus.CLOSED.value
-        )
-        succeeded = self._succeeded_upstream_request_ids(
-            candidates,
-            ValidationResult(True, 0, "existing clean coordinator build"),
-            consumer_chapter_id=chapter.id,
-        )
-        if succeeded:
-            await self.state.finish_upstream_requests(
-                succeeded,
-                run_id=None,
-                succeeded_ids=succeeded,
-                consumer_chapter_id=chapter.id,
-                success_detail=(
-                    "blocked declaration was already proved in validated current sources"
-                ),
-            )
-        return succeeded
-
     @staticmethod
     def _failed_attempt_feedback(report: dict[str, Any]) -> str:
         """Render structured proof failures for an independent chapter review."""
@@ -3351,20 +2641,28 @@ class Orchestrator:
     ) -> tuple[dict[str, Any], ...]:
         attempts = report.get("failed_attempts")
         refs = report.get("blocker_refs")
-        upstream = report.get("upstream_requests")
+        capabilities = (
+            [
+                value.get("capability")
+                for value in attempts
+                if isinstance(value, dict) and isinstance(value.get("capability"), dict)
+            ]
+            if isinstance(attempts, list)
+            else []
+        )
         return await self.state.record_proof_blockers(
             chapter.id,
             origin_run_id=run.id,
             failed_attempts=(attempts if isinstance(attempts, list) else ()),
             unchanged_ids=(refs if isinstance(refs, list) else ()),
-            upstream_candidates=(upstream if isinstance(upstream, list) else ()),
+            capability_candidates=capabilities,
         )
 
     @staticmethod
     def _package_owned_blocker(blocker: dict[str, Any]) -> bool:
         """Recognize structural, repeated, or cross-file work before legacy routing."""
 
-        candidate = blocker.get("upstream_candidate")
+        candidate = blocker.get("capability")
         cross_file = isinstance(candidate, dict) and any(
             str(path).strip() != str(blocker.get("path", "")).strip()
             for path in candidate.get("owner_paths", ())
@@ -3375,7 +2673,7 @@ class Orchestrator:
             or int(blocker.get("sightings", 0)) > 1
             or str(blocker.get("disposition", ""))
             in {
-                "missing_upstream",
+                "missing_capability",
                 "statement_review",
                 "interface_review",
                 "genuine_blocker",
@@ -3392,7 +2690,7 @@ class Orchestrator:
             if not self._package_owned_blocker(blocker):
                 continue
             blocker_id = str(blocker.get("id", ""))
-            candidate = blocker.get("upstream_candidate")
+            candidate = blocker.get("capability")
             raw_key = ""
             owner_paths: list[str] = []
             external = False
@@ -3778,28 +3076,6 @@ class Orchestrator:
                 "durable review remains green; no pending findings for this chapter",
             )
 
-    async def _recover_upstream_requests(self) -> None:
-        """Recover uncheckpointed structural reports directly into package ownership."""
-
-        persisted_origins: set[str] = set()
-        for request in self.state.upstream_requests.values():
-            origin_run_ids = request.get("origin_run_ids")
-            if not isinstance(origin_run_ids, list):
-                continue
-            persisted_origins.update(origin for origin in origin_run_ids if isinstance(origin, str))
-        for chapter in self.work_units:
-            for run in self.state.task(chapter.id, Stage.PROVE).runs:
-                if run.auxiliary or run.id in persisted_origins:
-                    continue
-                self.state.load_run_details(run)
-                report = run.report if isinstance(run.report, dict) else {}
-                if not report.get("upstream_requests"):
-                    continue
-                blockers = await self._record_proof_blocker_deltas(chapter, run, report)
-                package_ids = await self._attach_structural_blockers_to_packages(chapter, blockers)
-                if package_ids:
-                    persisted_origins.add(run.id)
-
     async def _recover_proof_review_requests(self) -> None:
         """Recover durable blockers and only escalate repeated review evidence."""
 
@@ -3957,7 +3233,7 @@ class Orchestrator:
                 if target_id in error_owners:
                     status = ValidationStatus.TARGET_FAILED
                 elif blocked_by:
-                    status = ValidationStatus.UPSTREAM_FAILED
+                    status = ValidationStatus.DEPENDENCY_FAILED
                 elif target_id in warning_owners:
                     status = ValidationStatus.TARGET_WARNINGS
                 elif result.compiler_succeeded:
@@ -3966,7 +3242,7 @@ class Orchestrator:
                     partitioned[target_id] = ValidationResult(
                         True,
                         0,
-                        "Lake build succeeded; warnings belong to upstream dependencies.",
+                        "Lake build succeeded; warnings belong to dependencies.",
                         process_exit_code=0,
                         status=ValidationStatus.CLEAN,
                         raw_log_path=result.raw_log_path,
@@ -3976,7 +3252,7 @@ class Orchestrator:
                     # The combined process failed, but this target's closure contains
                     # warnings only.  The actual error belongs to another batch target,
                     # and the process may have stopped before reaching this one.  Retry
-                    # it separately instead of promoting an upstream warning to a build
+                    # it separately instead of promoting a dependency warning to a build
                     # failure and reopening an already successful owner.
                     partitioned[target_id] = ValidationResult(
                         False,
@@ -4041,7 +3317,7 @@ class Orchestrator:
                 continue
             if result.status is ValidationStatus.TARGET_FAILED:
                 owners = (target_id,)
-            elif result.status is ValidationStatus.UPSTREAM_FAILED:
+            elif result.status is ValidationStatus.DEPENDENCY_FAILED:
                 owners = result.blocked_by
             else:
                 continue
@@ -4095,7 +3371,7 @@ class Orchestrator:
                         if diagnostics
                         else broken.result.output
                     ),
-                    status=ValidationStatus.UPSTREAM_FAILED,
+                    status=ValidationStatus.DEPENDENCY_FAILED,
                     blocked_by=(owner_id,),
                 )
         return results
@@ -5158,23 +4434,11 @@ class Orchestrator:
                     )
                     blocker["retry_sighting_baseline"] = int(blocker.get("sightings", 0))
                     status = ProofBlockerStatus.OPEN
-                elif action == "request_upstream":
-                    raw_requests = assessment.get("upstream_requests")
-                    requests = raw_requests if isinstance(raw_requests, list) else []
-                    candidate = next(
-                        (
-                            value
-                            for value in requests
-                            if isinstance(value, dict)
-                            and str(value.get("blocked_declaration", ""))
-                            == str(blocker.get("declaration", ""))
-                            and str(value.get("consumer_path", "")) == str(blocker.get("path", ""))
-                        ),
-                        requests[0] if requests and isinstance(requests[0], dict) else None,
-                    )
+                elif action == "attach_package":
+                    candidate = assessment.get("capability")
                     if candidate is not None:
-                        blocker["upstream_candidate"] = candidate
-                        blocker["disposition"] = "missing_upstream"
+                        blocker["capability"] = candidate
+                        blocker["disposition"] = "missing_capability"
                     package_ids = await self._attach_structural_blockers_to_packages(
                         chapter, (blocker,)
                     )
@@ -5213,7 +4477,7 @@ class Orchestrator:
                         else ProofBlockerStatus.ROADMAP
                     )
                 elif action == "park_external":
-                    blocker["upstream_candidate"] = {
+                    blocker["capability"] = {
                         "capability_key": (
                             f"external:{blocker.get('declaration', '')}:"
                             f"{self._normalized_blocker_goal(blocker)}"
@@ -5222,7 +4486,7 @@ class Orchestrator:
                         "owner_paths": [str(blocker.get("path", ""))],
                         "needed_result": response or str(blocker.get("obstruction", "")),
                     }
-                    blocker["disposition"] = "missing_upstream"
+                    blocker["disposition"] = "missing_capability"
                     package_ids = await self._attach_structural_blockers_to_packages(
                         chapter, (blocker,)
                     )
@@ -5243,7 +4507,7 @@ class Orchestrator:
                 chapter.id,
                 Stage.PROVE,
                 TaskStatus.FAILED,
-                "proof review routed unresolved mathematics to Shepherd roadmap work",
+                "proof review routed unresolved mathematics to package work",
             )
         elif ProofBlockerStatus.OPEN in routed_statuses:
             # Keep making source-local progress when some independent blockers are parked. The
@@ -5343,7 +4607,7 @@ class Orchestrator:
         if source_changed and legacy == "confirmed":
             return "interface_defect", "repair_and_retry"
         # Legacy prose has no checked retry contract. Parking it is safer than recreating the
-        # review/proof loop; an operator or Shepherd can reopen it with changed evidence.
+        # review/proof loop; an operator can reopen it when evidence changes.
         return "genuine_blocker", "send_to_roadmap"
 
     async def _invalidate_reviews(
@@ -6069,7 +5333,7 @@ class Orchestrator:
                             chapter.id,
                             Stage.REVIEW,
                             requirements,
-                            "waiting for upstream coordinator diagnostic owners",
+                            "waiting for coordinator diagnostic dependency owners",
                         )
                         return StageOutcome(ExecutionDisposition.WAITING, requirements)
                     await set_review_task(
@@ -6693,10 +5957,6 @@ class Orchestrator:
                     count_placeholders, self.config.settings.repo, chapter
                 )
                 await self.state.record_sorry_count(chapter.id, placeholders)
-                await self._close_previously_satisfied_upstream_requests(
-                    chapter,
-                    build_fresh=True,
-                )
                 return StageOutcome(ExecutionDisposition.SUCCEEDED)
             files = scoped_files(self.config.settings.repo, chapter)
             if files:
@@ -6750,10 +6010,6 @@ class Orchestrator:
                                 f"fresh exact build confirmed; {placeholders} placeholders remain",
                             )
                 if placeholders == 0 and build_fresh:
-                    await self._close_previously_satisfied_upstream_requests(
-                        chapter,
-                        build_fresh=True,
-                    )
                     source_digest = await asyncio.to_thread(
                         scope_digest, self.config.settings.repo, chapter
                     )
@@ -6805,82 +6061,10 @@ class Orchestrator:
         stalled_rounds = 0
         previous_placeholders: int | None = None
         proof_round = 0
-        await self._close_previously_satisfied_upstream_requests(
-            chapter,
-            build_fresh=build_fresh,
-        )
-        durable_requests = self.state.upstream_requests_for_consumer(
-            chapter.id,
-            statuses=(
-                UpstreamRequestStatus.REQUESTED,
-                UpstreamRequestStatus.ANSWERED,
-                UpstreamRequestStatus.PARTIAL,
-                UpstreamRequestStatus.PARKED,
-                UpstreamRequestStatus.ESCALATED,
-            ),
-        )
-        durable_ids = tuple(str(request["id"]) for request in durable_requests)
-        await self._ensure_upstream_answers(durable_ids)
-        answered_ids = self._upstream_ids_for_consumer_status(
-            durable_ids,
-            chapter.id,
-            {UpstreamRequestStatus.ANSWERED.value, "answered"},
-        )
-        routed = self._upstream_ids_for_consumer_status(
-            durable_ids,
-            chapter.id,
-            {
-                UpstreamRequestStatus.PARTIAL.value,
-                UpstreamRequestStatus.PARKED.value,
-                "partial",
-                "parked",
-            },
-        )
-        if routed:
-            await self.state.set_task(
-                chapter.id,
-                Stage.PROVE,
-                TaskStatus.BLOCKED,
-                "waiting for upstream capability roadmap: " + ", ".join(routed),
-            )
-            return StageOutcome(ExecutionDisposition.FAILED)
-        escalated = tuple(
-            request_id
-            for request_id in durable_ids
-            if self.state.upstream_requests[request_id].get("status")
-            == UpstreamRequestStatus.ESCALATED.value
-        )
-        if escalated:
-            await self.state.set_task(
-                chapter.id,
-                Stage.PROVE,
-                TaskStatus.FAILED,
-                "upstream request requires manual escalation: " + ", ".join(escalated),
-            )
-            return StageOutcome(ExecutionDisposition.FAILED)
-        targeted_request_ids = answered_ids
         proof_resume_thread_id: str | None = None
         proof_resume_run_id = ""
         proof_resume_prompt = ""
-        if targeted_request_ids:
-            feedback = self._upstream_retry_feedback(
-                targeted_request_ids,
-                _bounded_proof_feedback(feedback_ledger),
-                consumer_chapter_id=chapter.id,
-            )
-        while chunked_proofs or proof_round < proof_maximum or targeted_request_ids:
-            targeted_retry = bool(targeted_request_ids)
-            if targeted_retry:
-                # The durable fact remains `answered` until this fresh run has a terminal result.
-                targeted_request_ids = tuple(
-                    request_id
-                    for request_id in targeted_request_ids
-                    if self.state.upstream_requests[request_id].get("status")
-                    == UpstreamRequestStatus.ANSWERED.value
-                )
-                targeted_retry = bool(targeted_request_ids)
-                if not targeted_retry:
-                    continue
+        while chunked_proofs or proof_round < proof_maximum:
             if chunked_proofs and not assigned_targets:
                 discovered_targets = await asyncio.to_thread(
                     proof_targets, self.config.settings.repo, chapter
@@ -6916,19 +6100,6 @@ class Orchestrator:
                     )
                     if not candidates:
                         break
-                    if targeted_retry:
-                        requests = tuple(
-                            self.state.upstream_requests[request_id]
-                            for request_id in targeted_request_ids
-                            if request_id in self.state.upstream_requests
-                        )
-                        requested = tuple(
-                            target
-                            for target in candidates
-                            if any(matches_target(request, target) for request in requests)
-                        )
-                        if requested:
-                            candidates = requested
                     blocked_candidates = tuple(
                         target
                         for target in candidates
@@ -6958,18 +6129,11 @@ class Orchestrator:
                     Stage.PROVE,
                     feedback=feedback,
                     queue_detail=(
-                        "targeted downstream retry for upstream request(s): "
-                        + ", ".join(targeted_request_ids)
-                        if targeted_retry
-                        else (
-                            f"proof chunk retry {chunk_round + 1}/{proof_maximum}: "
-                            + ", ".join(target.declaration for target in assigned_targets)
-                            if chunked_proofs
-                            else f"proof round {proof_round + 1}/{proof_maximum}"
-                        )
+                        f"proof chunk retry {chunk_round + 1}/{proof_maximum}: "
+                        + ", ".join(target.declaration for target in assigned_targets)
+                        if chunked_proofs
+                        else f"proof round {proof_round + 1}/{proof_maximum}"
                     ),
-                    role=DOWNSTREAM_RETRY_ROLE if targeted_retry else "",
-                    request_ids=targeted_request_ids,
                     proof_targets=assigned_targets,
                     resume_thread_id=proof_resume_thread_id,
                     resume_run_id=proof_resume_run_id,
@@ -6992,23 +6156,11 @@ class Orchestrator:
                     ),
                 )
             if attempt.agent.capacity_exhausted:
-                if targeted_retry:
-                    await self.state.finish_upstream_requests(
-                        targeted_request_ids,
-                        run_id=attempt.run.id,
-                        succeeded_ids=(),
-                        consumer_chapter_id=chapter.id,
-                        error="targeted downstream retry exhausted model capacity",
-                    )
                 await self.state.set_task(
                     chapter.id,
                     Stage.PROVE,
                     TaskStatus.FAILED,
-                    (
-                        "targeted downstream retry requires manual escalation"
-                        if targeted_retry
-                        else "model capacity remained unavailable after the configured retries"
-                    ),
+                    "model capacity remained unavailable after the configured retries",
                 )
                 return StageOutcome(ExecutionDisposition.FAILED)
             coordinator_validation = attempt.validation
@@ -7069,54 +6221,6 @@ class Orchestrator:
                     proof_resume_thread_id = attempt.agent.thread_id
                     proof_resume_run_id = attempt.run.id
                     proof_resume_prompt = PROOF_VALIDATION_RETRY_PROMPT
-            if targeted_retry:
-                succeeded_request_ids = self._succeeded_upstream_request_ids(
-                    targeted_request_ids,
-                    attempt.validation,
-                    consumer_chapter_id=chapter.id,
-                )
-                unresolved = set(targeted_request_ids).difference(succeeded_request_ids)
-                retry_error = ""
-                if unresolved:
-                    retry_error = (
-                        "blocked declaration remained unresolved after a clean targeted retry"
-                        if attempt.validation.succeeded
-                        else "targeted retry did not validate: "
-                        + (
-                            routed_validation_output
-                            or "diagnostics were routed to their source owners"
-                        )[-4000:]
-                    )
-                await self.state.finish_upstream_requests(
-                    targeted_request_ids,
-                    run_id=attempt.run.id,
-                    succeeded_ids=succeeded_request_ids,
-                    consumer_chapter_id=chapter.id,
-                    error=retry_error,
-                )
-                targeted_request_ids = ()
-                if unresolved:
-                    feedback_ledger.append(
-                        f"Targeted downstream retry {proof_round}:\n"
-                        + attempt.feedback(validation_output=routed_validation_output)
-                    )
-                    await self._record_upstream_requests(
-                        chapter,
-                        attempt.run,
-                        attempt.agent.report,
-                        previous_attempts=_bounded_proof_feedback(feedback_ledger),
-                        forced_escalation=(
-                            "targeted downstream retry requested another upstream cycle; "
-                            "manual evaluation is required"
-                        ),
-                    )
-                    await self.state.set_task(
-                        chapter.id,
-                        Stage.PROVE,
-                        TaskStatus.FAILED,
-                        "targeted downstream retry did not prove: " + ", ".join(sorted(unresolved)),
-                    )
-                    return StageOutcome(ExecutionDisposition.FAILED)
             if (
                 not coordinator_validation.succeeded
                 and attempt.validation.succeeded
@@ -7295,30 +6399,6 @@ class Orchestrator:
             if durable_feedback := self._durable_blocker_feedback(chapter.id, assigned_targets):
                 feedback_ledger.append(durable_feedback)
             feedback = _bounded_proof_feedback(feedback_ledger)
-            raw_upstream = attempt.agent.report.get("upstream_requests")
-            reported_upstream = (
-                tuple(item for item in raw_upstream if isinstance(item, dict))
-                if isinstance(raw_upstream, list)
-                else ()
-            )
-            attached_upstream = tuple(
-                blocker.get("upstream_candidate")
-                for blocker in blockers
-                if isinstance(blocker.get("upstream_candidate"), dict)
-            )
-            unmatched_upstream = tuple(
-                item for item in reported_upstream if item not in attached_upstream
-            )
-            upstream_request_ids = (
-                await self._record_upstream_requests(
-                    chapter,
-                    attempt.run,
-                    {"upstream_requests": list(unmatched_upstream)},
-                    previous_attempts=feedback,
-                )
-                if unmatched_upstream
-                else ()
-            )
             if report_disposition == "statement_defect" and not blockers:
                 await self.state.set_task(
                     chapter.id,
@@ -7327,12 +6407,12 @@ class Orchestrator:
                     "statement defect report lacked target-specific failed-attempt evidence",
                 )
                 return StageOutcome(ExecutionDisposition.FAILED)
-            if report_disposition == "upstream_blocked" and not upstream_request_ids:
+            if report_disposition == "structural_blocked" and not blockers:
                 await self.state.set_task(
                     chapter.id,
                     Stage.PROVE,
                     TaskStatus.FAILED,
-                    "upstream-blocked report lacked a valid owner request",
+                    "structural-blocked report lacked package evidence",
                 )
                 return StageOutcome(ExecutionDisposition.FAILED)
             if report_disposition == "partial" and not attempt.agent.changed:
@@ -7357,8 +6437,8 @@ class Orchestrator:
                 sightings = int(blocker.get("sightings", 0))
                 retry_baseline = int(blocker.get("retry_sighting_baseline", 0))
                 immediate_handoff = (
-                    report_disposition in {"statement_defect", "upstream_blocked"}
-                    or isinstance(blocker.get("upstream_candidate"), dict)
+                    report_disposition in {"statement_defect", "structural_blocked"}
+                    or isinstance(blocker.get("capability"), dict)
                     or self._blocker_needs_review(blocker)
                 )
                 retry_limit = (
@@ -7368,21 +6448,7 @@ class Orchestrator:
                 )
                 if sightings - retry_baseline < retry_limit:
                     continue
-                candidate = blocker.get("upstream_candidate")
-                if isinstance(candidate, dict):
-                    ids = await self._record_upstream_requests(
-                        chapter,
-                        attempt.run,
-                        {"upstream_requests": [candidate]},
-                        previous_attempts=feedback,
-                    )
-                    upstream_request_ids += ids
-                    await self.state.set_proof_blocker_status(
-                        (blocker_id,),
-                        ProofBlockerStatus.UPSTREAM_REQUESTED,
-                        request_id=ids[0] if ids else "",
-                    )
-                elif self._blocker_needs_review(blocker):
+                if self._blocker_needs_review(blocker):
                     if (
                         int(blocker.get("review_exchange_count", 0))
                         >= self.config.stages[Stage.PROVE].unchanged_retry_limit
@@ -7407,7 +6473,6 @@ class Orchestrator:
                         (blocker_id,), ProofBlockerStatus.BLOCKED
                     )
                     terminal_blockers.append(blocker_id)
-            upstream_request_ids = tuple(dict.fromkeys(upstream_request_ids))
             if review_queued:
                 await self.state.set_task(
                     chapter.id,
@@ -7426,53 +6491,6 @@ class Orchestrator:
                         for request_id in self._proof_review_feedback(chapter.id)[1]
                     ),
                 )
-            if upstream_request_ids:
-                await self._ensure_upstream_answers(upstream_request_ids)
-                answered_ids = self._upstream_ids_for_consumer_status(
-                    upstream_request_ids,
-                    chapter.id,
-                    {UpstreamRequestStatus.ANSWERED.value, "answered"},
-                )
-                routed = self._upstream_ids_for_consumer_status(
-                    upstream_request_ids,
-                    chapter.id,
-                    {
-                        UpstreamRequestStatus.PARTIAL.value,
-                        UpstreamRequestStatus.PARKED.value,
-                        "partial",
-                        "parked",
-                    },
-                )
-                if routed:
-                    await self.state.set_task(
-                        chapter.id,
-                        Stage.PROVE,
-                        TaskStatus.BLOCKED,
-                        "upstream capability requires roadmap or external work: "
-                        + ", ".join(routed),
-                    )
-                    return StageOutcome(ExecutionDisposition.FAILED)
-                escalated = tuple(
-                    request_id
-                    for request_id in upstream_request_ids
-                    if self.state.upstream_requests[request_id].get("status")
-                    == UpstreamRequestStatus.ESCALATED.value
-                )
-                if escalated:
-                    await self.state.set_task(
-                        chapter.id,
-                        Stage.PROVE,
-                        TaskStatus.FAILED,
-                        "upstream request requires manual escalation: " + ", ".join(escalated),
-                    )
-                    return StageOutcome(ExecutionDisposition.FAILED)
-                targeted_request_ids = answered_ids
-                feedback = self._upstream_retry_feedback(
-                    targeted_request_ids,
-                    feedback,
-                    consumer_chapter_id=chapter.id,
-                )
-                continue
             if (
                 chunked_proofs
                 and terminal_blockers
@@ -7605,583 +6623,6 @@ class Orchestrator:
         )
         return StageOutcome(ExecutionDisposition.FAILED)
 
-    def _repair_cases(self, *, periodic: bool) -> list[RepairCaseRecord]:
-        selected = {chapter.id for chapter in self.work_units}
-        cases: list[RepairCaseRecord] = []
-        for task_key, task in self.state.shepherd_repairable_tasks():
-            if task.chapter_id not in selected:
-                continue
-            case = self.state.ensure_repair_case(task_key)
-            if case.status == RepairCaseStatus.OPEN or (
-                periodic and case.status == RepairCaseStatus.EXHAUSTED
-            ):
-                cases.append(case)
-        return cases
-
-    def _repair_failure_evidence(self, case: RepairCaseRecord) -> dict[str, Any]:
-        task = self.state.tasks[case.task_key]
-        run = task.runs[-1] if task.runs else None
-        report: dict[str, Any] = {}
-        validation: dict[str, Any] = {}
-        if run is not None and isinstance(run.report, dict):
-            for key in (
-                "summary",
-                "issues",
-                "failed_attempts",
-                "upstream_requests",
-                "finding_assessments",
-            ):
-                if key in run.report:
-                    report[key] = run.report[key]
-        if run is not None and isinstance(run.validation, dict):
-            validation = dict(run.validation)
-            output = validation.get("output")
-            if isinstance(output, str) and len(output) > 12_000:
-                validation["output"] = output[-12_000:]
-        return {
-            "case_id": case.id,
-            "task_key": case.task_key,
-            "work_unit_id": case.chapter_id,
-            "stage": case.stage,
-            "status": str(task.status),
-            "detail": task.detail,
-            "updated_at": task.updated_at,
-            "latest_run": (
-                {
-                    "id": run.id,
-                    "role": run.role,
-                    "model": run.model,
-                    "exit_code": run.exit_code,
-                    "changed": run.changed,
-                    "placeholders": run.placeholders,
-                    "report": report,
-                    "validation": validation,
-                }
-                if run is not None
-                else None
-            ),
-        }
-
-    async def _reconcile_stale_formalizations(self, task_keys: Iterable[str]) -> bool:
-        """Resolve stale formalize failures from durable facts before hiring an agent."""
-
-        progressed = False
-        clean_value = self.state.formalize_graph.get("clean", {})
-        clean = clean_value if isinstance(clean_value, dict) else {}
-        for task_key in dict.fromkeys(task_keys):
-            task = self.state.tasks.get(task_key)
-            if task is None:
-                continue
-            if task.stage != Stage.FORMALIZE or task.status != TaskStatus.FAILED:
-                continue
-            chapter = self._work_units_by_id.get(task.chapter_id)
-            if chapter is None:
-                continue
-            current_digest = await asyncio.to_thread(
-                scope_digest, self.config.settings.repo, chapter
-            )
-            record = clean.get(chapter.id)
-            if isinstance(record, dict) and record.get("source_digest") == current_digest:
-                task.recovering_failure = True
-                await self.state.set_task(
-                    chapter.id,
-                    Stage.FORMALIZE,
-                    TaskStatus.SUCCEEDED,
-                    "reconciled from matching published clean build",
-                )
-                progressed = True
-                continue
-            latest = task.runs[-1] if task.runs else None
-            if latest is None or latest.status != TaskStatus.SUCCEEDED:
-                continue
-            self.state.load_run_details(latest)
-            report = latest.report if isinstance(latest.report, dict) else {}
-            source_unchanged = latest.source_digest == current_digest
-            if report.get("complete") is not True or not source_unchanged:
-                continue
-            task.recovering_failure = True
-            await self.state.set_task(
-                chapter.id,
-                Stage.FORMALIZE,
-                TaskStatus.PENDING,
-                "completed unchanged agent queued for normal coordinator build",
-            )
-            progressed = True
-        return progressed
-
-    def _validate_shepherd_plan(
-        self,
-        sweep_id: str,
-        cases: Iterable[RepairCaseRecord],
-        report: dict[str, Any],
-    ) -> list[RepairWorkUnitRecord]:
-        selected_cases = {case.id: case for case in cases}
-        raw_dispositions = report.get("dispositions")
-        raw_units = report.get("work_units")
-        if not report.get("complete"):
-            raise ShepherdPlanError("Shepherd did not complete the repair plan")
-        if not isinstance(raw_dispositions, list) or not isinstance(raw_units, list):
-            raise ShepherdPlanError("Shepherd plan is missing dispositions or work units")
-        if len(raw_units) > self.config.shepherd.maximum_work_units_per_sweep:
-            raise ShepherdPlanError("Shepherd plan exceeds the configured work-unit limit")
-
-        dispositions: dict[str, str] = {}
-        for value in raw_dispositions:
-            if not isinstance(value, dict):
-                raise ShepherdPlanError("Shepherd disposition must be an object")
-            case_id = value.get("case_id")
-            disposition = value.get("disposition")
-            if not isinstance(case_id, str) or case_id not in selected_cases:
-                raise ShepherdPlanError(f"Shepherd disposition has unknown case id: {case_id}")
-            if case_id in dispositions:
-                raise ShepherdPlanError(f"Shepherd disposition repeats case id: {case_id}")
-            if disposition not in {"repair", "defer", "ignore"}:
-                raise ShepherdPlanError(f"Shepherd disposition is invalid for case {case_id}")
-            dispositions[case_id] = disposition
-        if set(dispositions) != set(selected_cases):
-            missing = sorted(set(selected_cases).difference(dispositions))
-            raise ShepherdPlanError("Shepherd omitted case dispositions: " + ", ".join(missing))
-
-        selected_chapters = {chapter.id: chapter for chapter in self.work_units}
-        by_key: dict[str, dict[str, Any]] = {}
-        covered_cases: set[str] = set()
-        for value in raw_units:
-            if not isinstance(value, dict):
-                raise ShepherdPlanError("Shepherd work unit must be an object")
-            key = value.get("key")
-            if not isinstance(key, str) or not key:
-                raise ShepherdPlanError("Shepherd work unit has no local key")
-            if key in by_key:
-                raise ShepherdPlanError(f"Shepherd work-unit key is repeated: {key}")
-            case_ids = value.get("case_ids")
-            if not isinstance(case_ids, list) or not case_ids:
-                raise ShepherdPlanError(f"Shepherd work unit {key} has no cases")
-            if any(case_id not in selected_cases for case_id in case_ids):
-                raise ShepherdPlanError(f"Shepherd work unit {key} references an unknown case")
-            if any(dispositions[case_id] != "repair" for case_id in case_ids):
-                raise ShepherdPlanError(f"Shepherd work unit {key} references a deferred case")
-            owner = value.get("owner_chapter_id")
-            if not isinstance(owner, str) or owner not in selected_chapters:
-                raise ShepherdPlanError(f"Shepherd work unit {key} has an unknown owner")
-            try:
-                Stage(str(value.get("target_stage")))
-            except ValueError as error:
-                raise ShepherdPlanError(
-                    f"Shepherd work unit {key} has an invalid target stage"
-                ) from error
-            effort = value.get("effort")
-            if effort not in REPAIR_EFFORT:
-                raise ShepherdPlanError(f"Shepherd work unit {key} has invalid effort")
-            objective = value.get("objective")
-            if not isinstance(objective, str) or not objective.strip():
-                raise ShepherdPlanError(f"Shepherd work unit {key} has no objective")
-            by_key[key] = value
-            covered_cases.update(case_ids)
-
-        required_cases = {
-            case_id for case_id, disposition in dispositions.items() if disposition == "repair"
-        }
-        if covered_cases != required_cases:
-            missing = sorted(required_cases.difference(covered_cases))
-            extra = sorted(covered_cases.difference(required_cases))
-            raise ShepherdPlanError(
-                "Shepherd work-unit coverage does not match repair dispositions"
-                + (f"; missing: {', '.join(missing)}" if missing else "")
-                + (f"; extra: {', '.join(extra)}" if extra else "")
-            )
-        id_by_key = {key: f"{sweep_id}-{key}" for key in by_key}
-        units: list[RepairWorkUnitRecord] = []
-        for key, value in by_key.items():
-            owner = selected_chapters[str(value["owner_chapter_id"])]
-            stage = Stage(str(value["target_stage"]))
-            schedule = self.statement_schedule if stage is not Stage.PROVE else self.proof_schedule
-            units.append(
-                RepairWorkUnitRecord(
-                    id=id_by_key[key],
-                    sweep_id=sweep_id,
-                    case_ids=list(dict.fromkeys(value["case_ids"])),
-                    task_keys=[self.state.key(owner.id, stage)],
-                    owner_chapter_id=owner.id,
-                    target_stage=stage.value,
-                    objective=str(value["objective"]),
-                    effort=str(value["effort"]),
-                    priority=self._repair_priority_offset
-                    + schedule.priority(owner.document_id)
-                    + REPAIR_EFFORT[str(value["effort"])],
-                )
-            )
-        return units
-
-    async def _run_repair_work_unit(self, unit: RepairWorkUnitRecord) -> StageOutcome:
-        active_cases = [
-            self.state.repair_cases[case_id]
-            for case_id in unit.case_ids
-            if self.state.tasks[self.state.repair_cases[case_id].task_key].status
-            == TaskStatus.FAILED
-        ]
-        if not active_cases:
-            await self.state.finish_repair_work_unit(
-                unit.id,
-                status=RepairWorkUnitStatus.SUPERSEDED,
-                detail="all covered failures were resolved before this repair ran",
-            )
-            return StageOutcome(ExecutionDisposition.WAITING)
-        chapter = self.config.work_unit(unit.owner_chapter_id)
-        stage = Stage(unit.target_stage)
-        before_placeholders = (
-            await asyncio.to_thread(count_placeholders, self.config.settings.repo, chapter)
-            if stage is Stage.PROVE
-            else None
-        )
-        dossier = {
-            "repair_work_unit_id": unit.id,
-            "objective": unit.objective,
-            "target_stage": unit.target_stage,
-            "effort": unit.effort,
-            "covered_failures": [self._repair_failure_evidence(case) for case in active_cases],
-        }
-        try:
-            attempt = await self._attempt(
-                chapter,
-                stage,
-                feedback=json.dumps(dossier, indent=2),
-                queue_detail=f"Shepherd repair {unit.id}",
-                role=REPAIR_WORKER_ROLE,
-                request_ids=[unit.id, *(case.id for case in active_cases)],
-                priority_override=unit.priority,
-            )
-            complete = bool(attempt.agent.report.get("complete"))
-            validation = attempt.validation
-            accepted = attempt.agent.succeeded and validation.succeeded and complete
-            if stage is Stage.DISCOVER:
-                raw_dependencies = attempt.agent.report.get("source_dependencies")
-                dependencies = (
-                    tuple(item for item in raw_dependencies if isinstance(item, str))
-                    if isinstance(raw_dependencies, list)
-                    else ()
-                )
-                known = {chapter.id for chapter in self.work_units}
-                accepted = (
-                    accepted
-                    and not attempt.agent.changed
-                    and isinstance(raw_dependencies, list)
-                    and len(dependencies) == len(raw_dependencies)
-                    and all(item in known for item in dependencies)
-                    and chapter.id not in dependencies
-                )
-                if accepted:
-                    await self._persist_source_dependencies(
-                        chapter,
-                        dependencies,
-                        attempt.agent.report,
-                    )
-            elif stage is Stage.PROVE and before_placeholders is not None:
-                accepted = accepted and (
-                    attempt.agent.placeholders == 0
-                    or attempt.agent.placeholders < before_placeholders
-                )
-            if not accepted:
-                detail = attempt.feedback()
-                await self.state.finish_repair_work_unit(
-                    unit.id,
-                    status=RepairWorkUnitStatus.FAILED,
-                    detail=detail,
-                    run_id=attempt.run.id,
-                )
-                return StageOutcome(ExecutionDisposition.FAILED)
-            await self._accept_repair_work_unit(unit, active_cases, run_id=attempt.run.id)
-            return StageOutcome(ExecutionDisposition.SUCCEEDED)
-        except asyncio.CancelledError:
-            await self.state.finish_repair_work_unit(
-                unit.id,
-                status=RepairWorkUnitStatus.INTERRUPTED,
-                detail="repair interrupted with the orchestrator",
-            )
-            raise
-        except BaseException as error:
-            await self.state.finish_repair_work_unit(
-                unit.id,
-                status=RepairWorkUnitStatus.FAILED,
-                detail=str(error) or type(error).__name__,
-            )
-            return StageOutcome(ExecutionDisposition.FAILED)
-
-    async def _accept_repair_work_unit(
-        self,
-        unit: RepairWorkUnitRecord,
-        active_cases: Iterable[RepairCaseRecord],
-        *,
-        run_id: str | None = None,
-    ) -> None:
-        async with self.state.batch():
-            for case in active_cases:
-                task = self.state.tasks[case.task_key]
-                if task.status == TaskStatus.FAILED:
-                    await self.state.set_task(
-                        task.chapter_id,
-                        Stage(task.stage),
-                        TaskStatus.PENDING,
-                        f"Shepherd repair {unit.id} accepted; stage retry required",
-                    )
-            await self.state.finish_repair_work_unit(
-                unit.id,
-                status=RepairWorkUnitStatus.SUCCEEDED,
-                detail="repair integrated; normal stage validation queued",
-                run_id=unit.run_id if run_id is None else run_id,
-            )
-        self._repair_progress_generation += 1
-
-    async def _run_repair_units(self, units: Iterable[RepairWorkUnitRecord]) -> bool:
-        queued = list(units)
-        async with self.state.batch():
-            for unit in queued:
-                await self.state.queue_repair_work_unit(unit.id)
-        results = await _gather_cancel_on_error(self._run_repair_work_unit(unit) for unit in queued)
-        return any(results)
-
-    async def _discard_persisted_repair_plans(self) -> list[RepairCaseRecord]:
-        """Discard unfinished plans from an earlier orchestrator and reopen current cases."""
-
-        retryable = {
-            RepairWorkUnitStatus.PENDING,
-            RepairWorkUnitStatus.INTERRUPTED,
-        }
-        stale_sweep_ids = {
-            sweep.id
-            for sweep in self.state.repair_sweeps.values()
-            if sweep.status in {"planning", "repairing", "waiting"}
-            or "interrupted with the orchestrator" in sweep.error
-        }
-        stale_sweep_ids.update(
-            unit.sweep_id
-            for unit in self.state.repair_work_units.values()
-            if unit.status in retryable
-        )
-        if not stale_sweep_ids:
-            return []
-
-        stale_case_ids = {
-            case_id
-            for sweep_id in stale_sweep_ids
-            if (sweep := self.state.repair_sweeps.get(sweep_id)) is not None
-            for case_id in sweep.case_ids
-        }
-        stale_unit_ids = {
-            unit_id
-            for unit_id, unit in self.state.repair_work_units.items()
-            if unit.sweep_id in stale_sweep_ids
-        }
-        stale_case_ids.update(
-            case_id
-            for unit_id in stale_unit_ids
-            for case_id in self.state.repair_work_units[unit_id].case_ids
-        )
-        for unit_id in stale_unit_ids:
-            self.state.repair_work_units.pop(unit_id, None)
-        for sweep_id in stale_sweep_ids:
-            self.state.repair_sweeps.pop(sweep_id, None)
-
-        repairable_keys = {key for key, _task in self.state.shepherd_repairable_tasks()}
-        reopened: dict[str, RepairCaseRecord] = {}
-        now = datetime.now(UTC).isoformat()
-        for case in tuple(self.state.repair_cases.values()):
-            if case.id not in stale_case_ids and not set(case.work_unit_ids).intersection(
-                stale_unit_ids
-            ):
-                continue
-            case.work_unit_ids = [
-                unit_id for unit_id in case.work_unit_ids if unit_id not in stale_unit_ids
-            ]
-            if case.sweep_id in stale_sweep_ids:
-                case.sweep_id = ""
-            if case.task_key in repairable_keys:
-                current = self.state.ensure_repair_case(case.task_key)
-                current.status = RepairCaseStatus.OPEN
-                current.sweep_id = ""
-                current.work_unit_ids = [
-                    unit_id for unit_id in current.work_unit_ids if unit_id not in stale_unit_ids
-                ]
-                current.updated_at = now
-                reopened[current.task_key] = current
-                if current.id != case.id:
-                    case.status = RepairCaseStatus.EXHAUSTED
-            elif (task := self.state.tasks.get(case.task_key)) is not None and task.status != (
-                TaskStatus.FAILED
-            ):
-                case.status = RepairCaseStatus.RESOLVED
-            else:
-                case.status = RepairCaseStatus.EXHAUSTED
-            case.updated_at = now
-
-        self.state.shepherd.current_sweep_id = ""
-        self.state.shepherd.current_run_id = ""
-        self.state.shepherd.planned_units = 0
-        self.state.shepherd.running_units = 0
-        await self.state.save(
-            "state",
-            "repair_cases",
-            "repair_sweeps",
-            "repair_work_units",
-        )
-        return sorted(reopened.values(), key=lambda case: (case.updated_at, case.task_key))
-
-    async def _run_shepherd_sweep(
-        self,
-        *,
-        trigger: str,
-        cases: Iterable[RepairCaseRecord],
-    ) -> bool:
-        if not self._shepherd_cooldown_elapsed():
-            return False
-        candidate_cases = list(cases)[: self.config.shepherd.maximum_failures_per_sweep]
-        await self._reconcile_stale_formalizations(case.task_key for case in candidate_cases)
-        repairable_keys = {key for key, _task in self.state.shepherd_repairable_tasks()}
-        selected_cases = [case for case in candidate_cases if case.task_key in repairable_keys]
-        if not selected_cases:
-            return False
-        fingerprints = tuple(sorted(case.fingerprint for case in selected_cases))
-        if fingerprints != self._last_shepherd_case_fingerprints:
-            self._consecutive_no_progress_sweeps = 0
-            self._last_shepherd_case_fingerprints = fingerprints
-        async with self._shepherd_lock:
-            if not self._shepherd_cooldown_elapsed():
-                return False
-            if (
-                self._consecutive_no_progress_sweeps
-                >= self.config.shepherd.maximum_consecutive_no_progress_sweeps
-            ):
-                return False
-            self.state.shepherd.next_run_at = (
-                datetime.now(UTC) + timedelta(seconds=self.config.shepherd.interval_seconds)
-            ).isoformat()
-            sweep = await self.state.start_repair_sweep(
-                trigger=trigger,
-                task_keys=[case.task_key for case in selected_cases],
-            )
-            anchor = self.config.work_unit(selected_cases[0].chapter_id)
-            run: RunRecord | None = None
-            planning_slot = False
-            try:
-                await self.agent_slots.acquire(1_000_000.0)
-                planning_slot = True
-                run = await self.state.start_auxiliary_run(
-                    anchor.id,
-                    Stage.DISCOVER,
-                    role=SHEPHERD_ROLE,
-                    request_ids=[case.id for case in selected_cases],
-                    model=self.config.shepherd.model,
-                )
-                self.state.shepherd.current_run_id = run.id
-                await self.state.save("state")
-                result = await self.executor.run_shepherd(
-                    anchor,
-                    run,
-                    (self._repair_failure_evidence(case) for case in selected_cases),
-                    scheduling=self.state.scheduling,
-                )
-                self.agent_slots.release()
-                planning_slot = False
-                if not result.succeeded:
-                    raise ShepherdPlanError(result.error or "Shepherd planning agent failed")
-                units = self._validate_shepherd_plan(sweep.id, selected_cases, result.report)
-                await self.state.install_repair_plan(
-                    sweep.id,
-                    units,
-                    summary=str(result.report.get("summary", "")),
-                    run_id=run.id,
-                )
-                progressed = await self._run_repair_units(units)
-                await self.state.finish_repair_sweep(sweep.id)
-                if progressed:
-                    self._consecutive_no_progress_sweeps = 0
-                else:
-                    self._consecutive_no_progress_sweeps += 1
-                return progressed
-            except asyncio.CancelledError:
-                await self.state.finish_repair_sweep(
-                    sweep.id, error="Shepherd sweep interrupted with the orchestrator"
-                )
-                raise
-            except BaseException as error:
-                await self.state.finish_repair_sweep(
-                    sweep.id,
-                    error=str(error) or type(error).__name__,
-                )
-                self._consecutive_no_progress_sweeps += 1
-                return False
-            finally:
-                if planning_slot:
-                    self.agent_slots.release()
-
-    def _shepherd_cooldown_elapsed(self) -> bool:
-        next_run_at = self.state.shepherd.next_run_at
-        if next_run_at is None:
-            return True
-        try:
-            due = datetime.fromisoformat(next_run_at)
-        except ValueError:
-            return True
-        if due.tzinfo is None:
-            due = due.replace(tzinfo=UTC)
-        return datetime.now(UTC) >= due
-
-    def _shepherd_due_at(self, fallback: datetime) -> datetime:
-        next_run_at = self.state.shepherd.next_run_at
-        if next_run_at is None:
-            return fallback
-        try:
-            due = datetime.fromisoformat(next_run_at)
-        except ValueError:
-            return fallback
-        return due.replace(tzinfo=UTC) if due.tzinfo is None else due
-
-    async def _trigger_threshold_shepherd(self) -> bool:
-        if not self.config.shepherd.enabled:
-            return False
-        cases = self._repair_cases(periodic=False)
-        if len(cases) < self.config.shepherd.failure_threshold:
-            return False
-        return await self._run_shepherd_sweep(trigger="failure-threshold", cases=cases)
-
-    async def _shepherd_loop(self, restart_cases: Iterable[RepairCaseRecord] = ()) -> None:
-        changes = self.state.change_bus.subscribe()
-        interval = self.config.shepherd.interval_seconds
-        due = self._shepherd_due_at(datetime.now(UTC) + timedelta(seconds=interval))
-        try:
-            restart_cases = tuple(restart_cases)
-            if restart_cases:
-                await self._run_shepherd_sweep(trigger="restart", cases=restart_cases)
-            while True:
-                remaining = max(0.0, (due - datetime.now(UTC)).total_seconds())
-                timed_out = False
-                try:
-                    await asyncio.wait_for(changes.get(), timeout=remaining)
-                except TimeoutError:
-                    timed_out = True
-                cases = self._repair_cases(periodic=timed_out)
-                pending = len(self.state.shepherd_repairable_tasks())
-                if self.state.shepherd.pending_failures != pending:
-                    self.state.shepherd.pending_failures = pending
-                    await self.state.save("state")
-                if not timed_out and len(cases) >= self.config.shepherd.failure_threshold:
-                    await self._run_shepherd_sweep(trigger="failure-threshold", cases=cases)
-                elif timed_out:
-                    if cases:
-                        await self._run_shepherd_sweep(trigger="interval", cases=cases)
-                    if self._shepherd_cooldown_elapsed():
-                        self.state.shepherd.next_run_at = (
-                            datetime.now(UTC) + timedelta(seconds=interval)
-                        ).isoformat()
-                    await self.state.save("state")
-                due = self._shepherd_due_at(datetime.now(UTC) + timedelta(seconds=interval))
-        finally:
-            self.state.change_bus.unsubscribe(changes)
-
-    async def _drain_active_shepherd(self) -> None:
-        if self._shepherd_lock.locked():
-            async with self._shepherd_lock:
-                pass
-
     async def _run_stage_once(self, stage: Stage) -> bool:
         if stage is Stage.DISCOVER:
             return await self._discover_all()
@@ -8192,12 +6633,7 @@ class Orchestrator:
         return await self._review_tree(prove=True)
 
     async def run_stage(self, stage: Stage) -> bool:
-        generation = self._repair_progress_generation
         result = await self._run_stage_once(stage)
-        await self._trigger_threshold_shepherd()
-        await self._drain_active_shepherd()
-        if self._repair_progress_generation != generation:
-            result = await self._run_stage_once(stage)
         if stage is Stage.DISCOVER:
             return result
         cleanup = await self._drain_warning_cleanups()
@@ -8237,14 +6673,10 @@ class Orchestrator:
             raise
 
     async def run_pipeline(self) -> bool:
-        generation = self._repair_progress_generation
-        await self._schedule_ready_packages()
+        if self.config.steward.enabled:
+            await self._schedule_ready_packages()
         result = await self._run_pipeline_once()
         await self._drain_active_packages()
-        await self._trigger_threshold_shepherd()
-        await self._drain_active_shepherd()
-        if self._repair_progress_generation != generation:
-            result = await self._run_pipeline_once()
         cleanup = await self._drain_warning_cleanups()
         if cleanup.clean and cleanup.changed:
             result = await self._run_pipeline_once()

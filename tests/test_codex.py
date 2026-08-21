@@ -13,13 +13,9 @@ import paf.codex as codex_module
 from paf.activity import EVENT_TIMESTAMP_FIELD
 from paf.codex import (
     DIAGNOSTIC_REVIEW_ROLE,
-    DOWNSTREAM_RETRY_ROLE,
     PACKAGE_STEWARD_ROLE,
     PACKAGE_WORKER_ROLE,
-    REPAIR_WORKER_ROLE,
     REPORT_SCHEMAS,
-    SHEPHERD_ROLE,
-    UPSTREAM_REPAIR_ROLE,
     WARNING_REVIEW_ROLE,
     CodexExecutor,
     FatalCodexInvocationError,
@@ -31,7 +27,6 @@ from paf.codex import (
     _record_jsonl_line,
     _rollout_usage,
     _tail_rollout_usage,
-    _upstream_source_bundle,
     count_placeholders,
     declaration_uses_placeholder,
     declaration_uses_placeholder_in_chapter,
@@ -98,7 +93,7 @@ def test_record_jsonl_line_deduplicates_structured_mcp_result(
     assert event["item"]["result"]["content"] == source["item"]["result"]["content"]
 
 
-def test_report_schemas_contain_only_fields_used_by_each_agent() -> None:
+def test_report_schemas_contain_only_fields_used_by_each_active_agent() -> None:
     expected = {
         "package_steward": {
             "complete",
@@ -128,7 +123,6 @@ def test_report_schemas_contain_only_fields_used_by_each_agent() -> None:
             "remaining_gap",
             "new_evidence",
         },
-        "shepherd": {"complete", "summary", "issues", "dispositions", "work_units"},
         "discover": {"complete", "summary", "issues", "source_dependencies"},
         "formalize": {"complete", "summary", "issues", "source_issues"},
         "review": {"complete", "summary", "issues", "source_issues"},
@@ -159,70 +153,12 @@ def test_report_schemas_contain_only_fields_used_by_each_agent() -> None:
             "source_issues",
             "failed_attempts",
             "blocker_refs",
-            "upstream_requests",
-        },
-        "downstream_retry": {
-            "complete",
-            "disposition",
-            "summary",
-            "issues",
-            "source_issues",
-            "failed_attempts",
-            "blocker_refs",
-            "upstream_requests",
-        },
-        "upstream_repair": {
-            "complete",
-            "summary",
-            "issues",
-            "source_issues",
-            "failed_attempts",
-            "upstream_answers",
         },
     }
     assert set(REPORT_SCHEMAS) == set(expected)
     for key, fields in expected.items():
         assert set(REPORT_SCHEMAS[key]["properties"]) == fields
         assert set(REPORT_SCHEMAS[key]["required"]) == fields
-
-
-def test_report_schema_records_complete_upstream_handoffs() -> None:
-    assert REPORT_SCHEMAS["prove"]["properties"]["disposition"]["enum"] == [
-        "proved",
-        "partial",
-        "retryable",
-        "statement_defect",
-        "upstream_blocked",
-        "validation_inconsistency",
-    ]
-    request = REPORT_SCHEMAS["prove"]["properties"]["upstream_requests"]["items"]
-    assert set(request["required"]) == {
-        "blocked_declaration",
-        "consumer_path",
-        "residual_goal",
-        "needed_result",
-        "owner_chapter_id",
-        "owner_paths",
-        "attempted_alternatives",
-        "capability_key",
-        "candidate_signature",
-        "owner_kind",
-        "acceptance_tests",
-    }
-    review = REPORT_SCHEMAS["proof_review"]["properties"]["finding_assessments"]["items"]
-    assert {"diagnosis", "action", "retry_contract", "upstream_requests"}.issubset(
-        review["required"]
-    )
-    assert request["properties"]["attempted_alternatives"]["minItems"] == 2
-    answer = REPORT_SCHEMAS["upstream_repair"]["properties"]["upstream_answers"]["items"]
-    assert answer["properties"]["disposition"]["enum"] == [
-        "added",
-        "existing",
-        "partial",
-        "downstream",
-        "external",
-        "decompose",
-    ]
 
 
 def test_report_schema_avoids_unsupported_codex_keywords() -> None:
@@ -649,78 +585,6 @@ def test_executor_uses_stage_specific_model_and_reasoning_effort(tmp_path: Path)
     assert 'model_reasoning_effort="high"' in command
 
 
-def test_shepherd_planner_is_read_only_and_repair_workers_use_their_model(tmp_path: Path) -> None:
-    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
-    executor = CodexExecutor(config, StateStore(config))
-
-    shepherd = executor.command(Stage.DISCOVER, role=SHEPHERD_ROLE)
-    repair = executor.command(Stage.REVIEW, role=REPAIR_WORKER_ROLE, feedback="repair case")
-
-    assert "--dangerously-bypass-approvals-and-sandbox" not in shepherd
-    assert shepherd[shepherd.index("--sandbox") + 1] == "read-only"
-    assert shepherd[shepherd.index("--model") + 1] == "gpt-5.6-sol"
-    assert 'model_reasoning_effort="medium"' in shepherd
-    assert repair[repair.index("--model") + 1] == "gpt-5.6-sol"
-    assert 'model_reasoning_effort="medium"' in repair
-
-    package_steward = executor.command(Stage.PROVE, role=PACKAGE_STEWARD_ROLE)
-    package_worker = executor.command(Stage.PROVE, role=PACKAGE_WORKER_ROLE)
-    assert "--dangerously-bypass-approvals-and-sandbox" in package_steward
-    assert "--dangerously-bypass-approvals-and-sandbox" in package_worker
-    assert package_steward[package_steward.index("--model") + 1] == "gpt-5.6-sol"
-    assert package_worker[package_worker.index("--model") + 1] == "gpt-5.6-sol"
-
-    customized = replace(
-        config,
-        shepherd=replace(
-            config.shepherd,
-            worker_model="repair-specialist",
-            worker_reasoning_effort="high",
-        ),
-    )
-    customized_executor = CodexExecutor(customized, StateStore(customized))
-    customized_shepherd = customized_executor.command(Stage.DISCOVER, role=SHEPHERD_ROLE)
-    customized_repair = customized_executor.command(
-        Stage.REVIEW,
-        role=REPAIR_WORKER_ROLE,
-        feedback="repair case",
-    )
-    assert customized_shepherd[customized_shepherd.index("--model") + 1] == "gpt-5.6-sol"
-    assert customized_repair[customized_repair.index("--model") + 1] == "repair-specialist"
-    assert 'model_reasoning_effort="high"' in customized_repair
-
-    dossier = """{
-  "repair_work_unit_id": "repair-1",
-  "objective": "Fix declaration X from diagnostic Y",
-  "covered_failures": [{"detail": "full failure evidence"}]
-}"""
-    prompt = executor.build_prompt(
-        config.work_units[0],
-        Stage.REVIEW,
-        role=REPAIR_WORKER_ROLE,
-        feedback=dossier,
-    )
-    assert prompt.startswith("# Shepherd roadmap worker")
-    assert "## Repair instruction\n\nFix declaration X from diagnostic Y" in prompt
-    assert "Original prompt" not in prompt
-    assert "# Review proof blockers" not in prompt
-    assert "## Rules shared by all Lean stages" in prompt
-    assert "This instruction replaces the ordinary pipeline-stage mission" in prompt
-    assert "Prepare the assigned failed proof for a normal Luna proof agent" in prompt
-    assert "The roadmap is the main deliverable" in prompt
-    assert "Keep its proof hole for the normal Luna agent" in prompt
-    assert "bounded Shepherd repair work unit" in prompt
-    assert "replaces the ordinary review stage mission" in prompt
-    assert "Follow the review workflow above" not in prompt
-    assert "Shepherd repair dossier" in prompt
-    assert prompt.rstrip().endswith(f"```text\n{dossier}\n```")
-
-    planner_prompt = executor.build_shepherd_prompt([], scheduling={})
-    assert "The shepherd worker, not this planner, develops the proof roadmap" in planner_prompt
-    assert "Give it the concrete failure" in planner_prompt
-    assert "do not pre-solve the roadmap in the work-unit objective" in planner_prompt
-
-
 def test_warning_cleanup_uses_dedicated_minimal_disturbance_prompt(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
     executor = CodexExecutor(config, StateStore(config))
@@ -740,7 +604,7 @@ def test_warning_cleanup_uses_dedicated_minimal_disturbance_prompt(tmp_path: Pat
 
 
 @pytest.mark.asyncio
-async def test_executor_selects_a_distinct_schema_for_each_agent(tmp_path: Path) -> None:
+async def test_executor_selects_a_distinct_schema_for_each_active_agent(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
     executor = CodexExecutor(config, StateStore(config))
     await executor.prepare()
@@ -768,9 +632,8 @@ async def test_executor_selects_a_distinct_schema_for_each_agent(tmp_path: Path)
             )
         ),
         "prove": schema_path(executor.command(Stage.PROVE)),
-        "downstream_retry": schema_path(executor.command(Stage.PROVE, role=DOWNSTREAM_RETRY_ROLE)),
-        "upstream_repair": schema_path(executor.command(Stage.PROVE, role=UPSTREAM_REPAIR_ROLE)),
-        "shepherd": schema_path(executor.command(Stage.DISCOVER, role=SHEPHERD_ROLE)),
+        "package_steward": schema_path(executor.command(Stage.PROVE, role=PACKAGE_STEWARD_ROLE)),
+        "package_worker": schema_path(executor.command(Stage.PROVE, role=PACKAGE_WORKER_ROLE)),
     }
 
     assert len(set(selected.values())) == len(selected)
@@ -957,48 +820,6 @@ def test_review_command_enables_lean_mcp(tmp_path: Path) -> None:
     command = executor.command(Stage.REVIEW)
     assert any("mcp_servers.paf_lean.command" in item for item in command)
     assert any("lean_diagnostic_messages" in item for item in command)
-
-
-def test_upstream_repair_bundle_contains_batched_evidence(
-    tmp_path: Path,
-) -> None:
-    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
-    owner, consumer = config.chapters
-    (tmp_path / "books" / "book.md").write_text(
-        "# Book\n\n## 1. First chapter\n\nOwner theorem text.\n\n"
-        "## 2. Second chapter\n\nConsumer theorem text.\n",
-        encoding="utf-8",
-    )
-    root = tmp_path / "lean" / "Book"
-    root.mkdir(parents=True)
-    (root / "Chapter01.lean").write_text(
-        "theorem existingBridge (n : Nat) : n = n := by rfl\n",
-        encoding="utf-8",
-    )
-    (root / "Chapter02.lean").write_text(
-        "import Book.Chapter01\n"
-        "theorem blockedTarget (n : Nat) : n = n := by sorry\n\n"
-        "theorem unrelated : True := by trivial\n",
-        encoding="utf-8",
-    )
-    request = {
-        "id": "request-one",
-        "consumer_chapter_id": consumer.id,
-        "blocked_declaration": "blockedTarget",
-        "consumer_path": "lean/Book/Chapter02.lean",
-        "residual_goal": "⊢ n = n",
-        "needed_result": "A reusable reflexivity bridge",
-        "owner_paths": ["lean/Book/Chapter01.lean"],
-        "attempted_alternatives": ["simp", "exact existingCandidate n"],
-        "previous_attempts": "Proof attempt 1 failed at the exact residual goal.",
-    }
-    bundle = _upstream_source_bundle(tmp_path, owner, (request,), config.chapters)
-    assert "request-one" in bundle
-    assert "Owner theorem text." in bundle
-    assert "Consumer theorem text." in bundle
-    assert "existingBridge" in bundle
-    assert "blockedTarget" in bundle
-    assert "unrelated : True" not in bundle
 
 
 def test_declaration_placeholder_check_is_targeted_to_the_named_declaration(

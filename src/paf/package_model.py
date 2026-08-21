@@ -72,12 +72,13 @@ class EvidenceKind(StrEnum):
     VALIDATION = "validation"
     COMMIT = "commit"
     EXTERNAL_DEPENDENCY = "external_dependency"
-    UPSTREAM_REQUEST_IMPORT = "upstream_request_import"
+    MIGRATION = "migration"
     STEWARD_REPORT = "steward_report"
     WORKER_REPORT = "worker_report"
     PLACEMENT_DECISION = "placement_decision"
     CONSUMER_ACCEPTANCE = "consumer_acceptance"
     LEASE_RECOVERY = "lease_recovery"
+    OPERATOR_DECISION = "operator_decision"
 
 
 class ReservationMode(StrEnum):
@@ -382,15 +383,6 @@ class IntegrationJournal:
 
 
 @dataclass(frozen=True)
-class UpstreamRequestImport:
-    request_id: str
-    package_id: str
-    evidence_id: str
-    source_digest: str
-    imported_at: str
-
-
-@dataclass(frozen=True)
 class PackageState:
     packages: dict[str, CapabilityPackage] = field(default_factory=dict)
     consumers: dict[str, PackageConsumer] = field(default_factory=dict)
@@ -401,7 +393,6 @@ class PackageState:
     dependencies: tuple[PackageDependency, ...] = ()
     relevant_read_interfaces: tuple[RelevantReadInterface, ...] = ()
     integration_journal: dict[str, IntegrationJournal] = field(default_factory=dict)
-    upstream_request_imports: dict[str, UpstreamRequestImport] = field(default_factory=dict)
 
     def package_for_capability(self, capability_key: str) -> CapabilityPackage | None:
         key = normalize_capability_key(capability_key)
@@ -446,7 +437,6 @@ class PackageState:
             "package_dependencies": [asdict(value) for value in self.dependencies],
             "relevant_read_interfaces": [asdict(value) for value in self.relevant_read_interfaces],
             "integration_journal": records(self.integration_journal),
-            "upstream_request_imports": records(self.upstream_request_imports),
         }
 
 

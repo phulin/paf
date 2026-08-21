@@ -47,11 +47,11 @@ def test_discovers_chapters_and_renders_paths(tmp_path: Path) -> None:
     assert config.settings.sandbox == "danger-full-access"
     assert config.settings.cache_compaction_layers == 32
     assert not hasattr(config.settings, "interface_invalidation")
-    assert config.shepherd.model == "gpt-5.6-sol"
-    assert config.shepherd.enabled is True
-    assert config.shepherd.reasoning_effort == "medium"
-    assert config.shepherd.worker_model == "gpt-5.6-sol"
-    assert config.shepherd.worker_reasoning_effort == "medium"
+    assert config.steward.model == "gpt-5.6-sol"
+    assert config.steward.enabled is True
+    assert config.steward.reasoning_effort == "medium"
+    assert config.steward.worker_model == "gpt-5.6-sol"
+    assert config.steward.worker_reasoning_effort == "medium"
 
 
 def test_loads_and_validates_discovery_concurrency(tmp_path: Path) -> None:
@@ -116,62 +116,62 @@ def test_loads_and_validates_global_unchanged_proof_retry_limit(tmp_path: Path) 
         load_config(path)
 
 
-def test_loads_and_validates_shepherd_settings(tmp_path: Path) -> None:
+def test_loads_and_validates_steward_settings(tmp_path: Path) -> None:
     path = write_project(tmp_path)
     text = path.read_text(encoding="utf-8")
     path.write_text(
         text
         + """
-[shepherd]
+[steward]
 enabled = true
 model = "strong-planner"
 reasoning_effort = "xhigh"
 worker_model = "cheap-editor"
 worker_reasoning_effort = "max"
-interval_seconds = 1200
-failure_threshold = 10
-maximum_failures_per_sweep = 40
-maximum_work_units_per_sweep = 24
-maximum_sweeps_per_invocation = 2
+lease_ttl_seconds = 1200
+maximum_worker_steps = 24
 """,
         encoding="utf-8",
     )
 
-    shepherd = load_config(path).shepherd
+    steward = load_config(path).steward
 
-    assert shepherd.enabled is True
-    assert shepherd.model == "strong-planner"
-    assert shepherd.worker_model == "cheap-editor"
-    assert shepherd.worker_reasoning_effort == "max"
-    assert shepherd.interval_seconds == 1200
-    assert shepherd.failure_threshold == 10
-    assert shepherd.maximum_failures_per_sweep == 40
-    assert shepherd.maximum_work_units_per_sweep == 24
-    assert shepherd.maximum_consecutive_no_progress_sweeps == 2
-    assert not hasattr(shepherd, "max_agents")
+    assert steward.enabled is True
+    assert steward.model == "strong-planner"
+    assert steward.worker_model == "cheap-editor"
+    assert steward.worker_reasoning_effort == "max"
+    assert steward.lease_ttl_seconds == 1200
+    assert steward.maximum_worker_steps == 24
 
     path.write_text(
-        path.read_text(encoding="utf-8").replace("failure_threshold = 10", "failure_threshold = 0"),
+        path.read_text(encoding="utf-8").replace(
+            "lease_ttl_seconds = 1200", "lease_ttl_seconds = 0"
+        ),
         encoding="utf-8",
     )
-    with pytest.raises(ValueError, match=r"shepherd\.failure_threshold"):
+    with pytest.raises(ValueError, match=r"steward\.lease_ttl_seconds"):
         load_config(path)
 
 
-def test_shepherd_defaults_to_a_two_hour_interval(tmp_path: Path) -> None:
-    shepherd = load_config(write_project(tmp_path)).shepherd
-
-    assert shepherd.interval_seconds == 7200
-
-
-def test_shepherd_can_be_disabled_explicitly(tmp_path: Path) -> None:
+def test_shepherd_table_is_a_temporary_steward_alias(tmp_path: Path) -> None:
     path = write_project(tmp_path)
     path.write_text(
         path.read_text(encoding="utf-8") + "\n[shepherd]\nenabled = false\n",
         encoding="utf-8",
     )
 
-    assert load_config(path).shepherd.enabled is False
+    assert load_config(path).steward.enabled is False
+
+
+def test_removed_sweep_configuration_is_rejected(tmp_path: Path) -> None:
+    path = write_project(tmp_path)
+    path.write_text(
+        path.read_text(encoding="utf-8") + "\n[steward]\nfailure_threshold = 2\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="repair-sweep settings were removed"):
+        load_config(path)
 
 
 def test_selects_configured_chapters(tmp_path: Path) -> None:
@@ -312,7 +312,7 @@ def test_infers_zero_config_project_from_markdown(tmp_path: Path) -> None:
     assert config.settings.reasoning_effort == "xhigh"
     assert config.settings.bypass_approvals_and_sandbox
     assert config.settings.isolation == "auto"
-    assert config.shepherd.enabled is True
+    assert config.steward.enabled is True
     assert config.settings.state_dir == tmp_path / ".paf" / "book07"
     assert config.books[0].module == "LastLib.Book07ExistingAPI"
     assert [chapter.number for chapter in config.chapters] == [1, 2]

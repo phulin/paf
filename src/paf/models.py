@@ -98,23 +98,16 @@ class SwarmSettings:
 
 
 @dataclass(frozen=True)
-class ShepherdSettings:
-    """Configuration for failure triage and repair work.
-
-    The Shepherd is enabled by default. Its read-only planner and scoped repair
-    workers have independently configurable model and reasoning settings.
-    """
+class StewardSettings:
+    """Configuration for capability-package Stewards and bounded workers."""
 
     enabled: bool = True
     model: str = "gpt-5.6-sol"
     reasoning_effort: str = "medium"
     worker_model: str = "gpt-5.6-sol"
     worker_reasoning_effort: str = "medium"
-    interval_seconds: float = 7200.0
-    failure_threshold: int = 10
-    maximum_failures_per_sweep: int = 50
-    maximum_work_units_per_sweep: int = 32
-    maximum_consecutive_no_progress_sweeps: int = 3
+    lease_ttl_seconds: float = 14_400.0
+    maximum_worker_steps: int = 8
 
 
 @dataclass(frozen=True)
@@ -436,7 +429,7 @@ class PipelineConfig:
     stages: dict[Stage, StageConfig]
     books: tuple[BookConfig, ...]
     chapters: tuple[Chapter, ...]
-    shepherd: ShepherdSettings = field(default_factory=ShepherdSettings)
+    steward: StewardSettings = field(default_factory=StewardSettings)
     source_rules: tuple[dict[str, Any], ...] = ()
     source_roots: tuple[Path, ...] = ()
     source_include: tuple[str, ...] = ()

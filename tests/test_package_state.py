@@ -86,6 +86,24 @@ def test_package_model_rejects_escaping_paths() -> None:
         package("package-a", "key", "/tmp/outside")
 
 
+@pytest.mark.asyncio
+async def test_package_mutations_publish_dashboard_projection(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    state = StateStore(config)
+    await state.load_or_create()
+    baseline = state.revision
+
+    created, _ = await state.create_or_attach_capability_package(
+        package("package-live", "Book.LiveCapability", "lean/Book/Chapter01.lean")
+    )
+
+    delta = state._database.dashboard_delta(baseline)
+    assert delta["revision"] > baseline
+    assert delta["globals"]["capability_packages"][created.id]["status"] == "observed"
+    assert delta["globals"]["package_consumers"] == {}
+    await state.close()
+
+
 def test_create_deduplicates_capability_and_persists_normalized_records(
     tmp_path: Path,
 ) -> None:
@@ -332,49 +350,44 @@ async def test_state_store_package_api_refreshes_derived_checkpoint_view(tmp_pat
 
 
 @pytest.mark.asyncio
-async def test_upstream_requests_import_once_and_never_sync_back(tmp_path: Path) -> None:
+async def test_legacy_upstream_state_imports_once_without_runtime_projection(
+    tmp_path: Path,
+) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
-    owner, blocked = config.chapters
     state = StateStore(config)
     await state.load_or_create()
-    request_id, _ = await state.enqueue_upstream_request(
+    request_id = "legacy-request"
+    imported_ids = state._database.import_legacy_upstream_state(
         {
-            "capability_key": "Book.SharedBridge",
-            "blocked_declaration": "Book.consumer",
-            "consumer_path": "lean/Book/Chapter02.lean",
-            "residual_goal": "⊢ Result x",
-            "needed_result": "A shared bridge",
-            "owner_paths": ["lean/Book/Chapter01.lean"],
-            "acceptance_tests": ["lake build +Book.Chapter02"],
-        },
-        consumer_chapter_id=blocked.id,
-        origin_run_id="proof-run",
-        owner_chapter_id=owner.id,
-        previous_attempts="simp failed",
+            request_id: {
+                "capability_key": "Book.SharedBridge",
+                "consumer_chapter_id": config.chapters[1].id,
+                "blocked_declaration": "Book.consumer",
+                "consumer_path": "lean/Book/Chapter02.lean",
+                "residual_goal": "⊢ Result x",
+                "needed_result": "A shared bridge",
+                "owner_paths": ["lean/Book/Chapter01.lean"],
+                "acceptance_tests": ["lake build +Book.Chapter02"],
+            }
+        }
     )
-    imported = state.package_state.upstream_request_imports[request_id]
-    package_id = imported.package_id
+    await state.refresh_package_state()
+    package_id = imported_ids[request_id]
+    assert imported_ids == {request_id: package_id}
     original = state.package_state.packages[package_id]
 
-    await state.record_upstream_answers(
-        (request_id,),
-        run_id="legacy-repair",
-        answers={
-            request_id: {
-                "disposition": "existing",
-                "declarations": ["Book.sharedBridge"],
-            }
-        },
-    )
+    assert state._database.import_legacy_upstream_state({request_id: {}}) == {
+        request_id: package_id
+    }
     durable = state._database.load_package_state()
     assert durable.packages[package_id].status == original.status
     assert durable.packages[package_id].revision == original.revision
-    assert len(durable.upstream_request_imports) == 1
     assert len(durable.evidence) == 1
     await state.close()
 
     checkpoint = read_checkpoint(config.settings.state_dir)
     assert checkpoint is not None
-    assert checkpoint["upstream_requests"][request_id]["status"] == "answered"
+    assert "upstream_requests" not in checkpoint
+    assert "upstream_request_imports" not in checkpoint
     assert checkpoint["capability_packages"][package_id]["status"] == "observed"
     assert checkpoint["package_consumers"]

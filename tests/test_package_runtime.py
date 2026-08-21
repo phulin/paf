@@ -74,7 +74,7 @@ def package(store: StateDatabase, package_id: str = "P42") -> CapabilityPackage:
     return current
 
 
-def claim(store: StateDatabase, current: CapabilityPackage, agent: str = "shepherd"):
+def claim(store: StateDatabase, current: CapabilityPackage, agent: str = "steward"):
     return store.claim_steward_lease(
         current.id,
         agent,
@@ -207,7 +207,7 @@ def prepared_package(repo: Path) -> tuple[StateDatabase, CapabilityPackage, int,
     current = package(store)
     lease = store.claim_steward_lease(
         current.id,
-        "shepherd",
+        "steward",
         expected_revision=current.revision,
         ttl_seconds=10**9,
     )

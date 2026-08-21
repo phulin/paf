@@ -55,7 +55,6 @@ from paf.state_db import (
 
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 LAKE_PROGRESS_RE = re.compile(r"\[(?P<completed>\d+)/(?P<total>\d+)\]\s+\S+\s+(?P<target>\S+)")
-SHEPHERD_RUN_ROLES = frozenset({"shepherd", "repair_worker"})
 BUILD_WARNING_REVIEW_KIND = "build_warning"
 WAITING_DETAIL_MAXIMUM = 160
 
@@ -87,9 +86,7 @@ class RequirementKind(StrEnum):
     STAGE_DEPENDENCY = "stage_dependency"
     COORDINATOR_OWNER = "coordinator_owner"
     BUILD_FRESHNESS = "build_freshness"
-    UPSTREAM_REQUEST = "upstream_request"
     PROOF_REVIEW_REQUEST = "proof_review_request"
-    REPAIR_DEPENDENCY = "repair_dependency"
     CAPABILITY_PACKAGE = "capability_package"
     GRAPH = "graph"
     LEGACY_BLOCK = "legacy_block"
@@ -109,58 +106,8 @@ class Readiness:
     waiting: tuple[Requirement, ...] = ()
 
 
-class FailureKind(StrEnum):
-    DISCOVER = "discover"
-    FORMALIZE = "formalize"
-    REVIEW = "review"
-    PROVE = "prove"
-
-
-@dataclass
-class FailureRecord:
-    id: str
-    task_key: str
-    kind: FailureKind
-    repairable: bool
-    run_id: str = ""
-    diagnostics: dict[str, Any] = field(default_factory=dict)
-    active: bool = True
-    created_at: str = field(default_factory=timestamp)
-    updated_at: str = field(default_factory=timestamp)
-    resolved_at: str | None = None
-
-
-class RepairCaseStatus(StrEnum):
-    OPEN = "open"
-    PLANNED = "planned"
-    REPAIRING = "repairing"
-    RESOLVED = "resolved"
-    EXHAUSTED = "exhausted"
-
-
-class RepairWorkUnitStatus(StrEnum):
-    PENDING = "pending"
-    RUNNING = "running"
-    SUCCEEDED = "succeeded"
-    FAILED = "failed"
-    INTERRUPTED = "interrupted"
-    SUPERSEDED = "superseded"
-
-
-class UpstreamRequestStatus(StrEnum):
-    """Completed durable facts for a missing interface in an earlier chapter."""
-
-    REQUESTED = "requested"
-    ANSWERED = "answered"
-    PARTIAL = "partial"
-    PARKED = "parked"
-    CLOSED = "closed"
-    ESCALATED = "escalated"
-
-
 class ProofBlockerStatus(StrEnum):
     OPEN = "open"
-    UPSTREAM_REQUESTED = "upstream_requested"
     REVIEW_REQUESTED = "review_requested"
     WAITING_DEPENDENCY = "waiting_dependency"
     ROADMAP = "roadmap"
@@ -302,10 +249,6 @@ class TaskRecord:
     # Orthogonal readiness state. These requirements explain why a pending task
     # cannot run yet without turning dependency impact into an execution result.
     waiting_on: tuple[Requirement, ...] = ()
-    # Repair work is an overlay on the existing four-stage state machine. The
-    # underlying task remains failed/blocked until the repair is validated.
-    repairing: bool = False
-    repair_work_unit_id: str = ""
     # Set by explicit failed-task retry and propagated through tasks released from its fallout.
     # A later success uses this marker to reopen only causally blocked work.
     recovering_failure: bool = False
@@ -336,77 +279,6 @@ class TaskRecord:
     @property
     def unit_title(self) -> str:
         return self.chapter_title
-
-
-@dataclass
-class ShepherdRecord:
-    enabled: bool = False
-    status: str = "idle"
-    model: str = ""
-    worker_model: str = ""
-    interval_seconds: float = 7200.0
-    failure_threshold: int = 10
-    current_sweep_id: str = ""
-    current_run_id: str = ""
-    last_started_at: str | None = None
-    last_finished_at: str | None = None
-    next_run_at: str | None = None
-    last_summary: str = ""
-    last_error: str = ""
-    pending_failures: int = 0
-    planned_units: int = 0
-    running_units: int = 0
-    succeeded_units: int = 0
-    failed_units: int = 0
-
-
-@dataclass
-class RepairCaseRecord:
-    id: str
-    task_key: str
-    chapter_id: str
-    stage: str
-    fingerprint: str
-    status: str = RepairCaseStatus.OPEN
-    opened_at: str = field(default_factory=timestamp)
-    updated_at: str = field(default_factory=timestamp)
-    sweep_id: str = ""
-    work_unit_ids: list[str] = field(default_factory=list)
-
-
-@dataclass
-class RepairSweepRecord:
-    id: str
-    status: str = "planning"
-    trigger: str = ""
-    failure_count: int = 0
-    started_at: str = field(default_factory=timestamp)
-    finished_at: str | None = None
-    run_id: str = ""
-    summary: str = ""
-    error: str = ""
-    case_ids: list[str] = field(default_factory=list)
-    work_unit_ids: list[str] = field(default_factory=list)
-
-
-@dataclass
-class RepairWorkUnitRecord:
-    id: str
-    sweep_id: str
-    case_ids: list[str]
-    task_keys: list[str]
-    owner_chapter_id: str
-    target_stage: str
-    objective: str
-    effort: str = "medium"
-    priority: float = 0.0
-    status: str = RepairWorkUnitStatus.PENDING
-    queued: bool = False
-    detail: str = ""
-    run_id: str = ""
-    created_at: str = field(default_factory=timestamp)
-    started_at: str | None = None
-    finished_at: str | None = None
 
 
 @dataclass
@@ -554,8 +426,7 @@ class StateStore:
         self._cost_cache: dict[tuple[bool, str | None, frozenset[str] | None], CostEstimate] = {}
         self._task_snapshot_context_key: tuple[int, ...] | None = None
         self._task_snapshot_context_cache: dict[str, Any] | None = None
-        self._indexed_task_states: dict[str, tuple[str, str, bool, str, bool]] = {}
-        self._repairable_task_keys: set[str] = set()
+        self._indexed_task_states: dict[str, tuple[str, str, bool, str]] = {}
         self._active_run_ids: set[str] = set()
         self._active_runs_by_chapter: dict[str, RunRecord] = {}
         self._stage_count_cache: dict[str, dict[str, int]] = {}
@@ -566,25 +437,12 @@ class StateStore:
         self.formalize_graph: dict[str, Any] = {}
         self.fixup_requests: dict[str, dict[str, Any]] = {}
         self.proof_review_requests: dict[str, dict[str, Any]] = {}
-        self.upstream_requests: dict[str, dict[str, Any]] = {}
         self.package_state = PackageState()
         self.proof_blockers: dict[str, dict[str, Any]] = {}
         self.routing_metrics: dict[str, int] = {}
         self.thread_cumulative_usage: dict[str, TokenUsage] = {}
         self.isolation: dict[str, Any] = {}
         self.coordinator_build = CoordinatorBuildRecord()
-        shepherd = config.shepherd
-        self.shepherd = ShepherdRecord(
-            enabled=shepherd.enabled,
-            model=shepherd.model,
-            worker_model=shepherd.worker_model,
-            interval_seconds=shepherd.interval_seconds,
-            failure_threshold=shepherd.failure_threshold,
-        )
-        self.repair_cases: dict[str, RepairCaseRecord] = {}
-        self.failure_records: dict[str, FailureRecord] = {}
-        self.repair_sweeps: dict[str, RepairSweepRecord] = {}
-        self.repair_work_units: dict[str, RepairWorkUnitRecord] = {}
         self.created_at = timestamp()
         self.updated_at = self.created_at
         self._config_fingerprint = ""
@@ -647,13 +505,6 @@ class StateStore:
                     for request_id, value in raw_proof_review_requests.items()
                     if isinstance(request_id, str) and isinstance(value, dict)
                 }
-            raw_upstream_requests = raw.get("upstream_requests")
-            if isinstance(raw_upstream_requests, dict):
-                self.upstream_requests = {
-                    request_id: dict(value)
-                    for request_id, value in raw_upstream_requests.items()
-                    if isinstance(request_id, str) and isinstance(value, dict)
-                }
             raw_proof_blockers = raw.get("proof_blockers")
             if isinstance(raw_proof_blockers, dict):
                 self.proof_blockers = {
@@ -693,82 +544,6 @@ class StateStore:
                         if name in CoordinatorBuildRecord.__dataclass_fields__
                     }
                 )
-            raw_shepherd = raw.get("shepherd")
-            if isinstance(raw_shepherd, dict):
-                persisted = {
-                    name: value
-                    for name, value in raw_shepherd.items()
-                    if name in ShepherdRecord.__dataclass_fields__
-                }
-                self.shepherd = ShepherdRecord(**persisted)
-                # Configuration, rather than old state, controls whether and
-                # how often a newly launched orchestrator runs the Shepherd.
-                self.shepherd.enabled = self.config.shepherd.enabled
-                self.shepherd.model = self.config.shepherd.model
-                self.shepherd.worker_model = self.config.shepherd.worker_model
-                self.shepherd.interval_seconds = self.config.shepherd.interval_seconds
-                self.shepherd.failure_threshold = self.config.shepherd.failure_threshold
-            raw_cases = raw.get("repair_cases")
-            if isinstance(raw_cases, dict):
-                for record_id, value in raw_cases.items():
-                    if not isinstance(record_id, str) or not isinstance(value, dict):
-                        continue
-                    fields = {
-                        name: item
-                        for name, item in value.items()
-                        if name in RepairCaseRecord.__dataclass_fields__
-                    }
-                    fields.setdefault("id", record_id)
-                    try:
-                        self.repair_cases[record_id] = RepairCaseRecord(**fields)
-                    except (TypeError, ValueError):
-                        continue
-            raw_failures = raw.get("failure_records")
-            if isinstance(raw_failures, dict):
-                for record_id, value in raw_failures.items():
-                    if not isinstance(record_id, str) or not isinstance(value, dict):
-                        continue
-                    fields = {
-                        name: item
-                        for name, item in value.items()
-                        if name in FailureRecord.__dataclass_fields__
-                    }
-                    fields.setdefault("id", record_id)
-                    try:
-                        fields["kind"] = FailureKind(str(fields["kind"]))
-                        self.failure_records[record_id] = FailureRecord(**fields)
-                    except (KeyError, TypeError, ValueError):
-                        continue
-            raw_sweeps = raw.get("repair_sweeps")
-            if isinstance(raw_sweeps, dict):
-                for record_id, value in raw_sweeps.items():
-                    if not isinstance(record_id, str) or not isinstance(value, dict):
-                        continue
-                    fields = {
-                        name: item
-                        for name, item in value.items()
-                        if name in RepairSweepRecord.__dataclass_fields__
-                    }
-                    fields.setdefault("id", record_id)
-                    try:
-                        self.repair_sweeps[record_id] = RepairSweepRecord(**fields)
-                    except (TypeError, ValueError):
-                        continue
-            raw_units = raw.get("repair_work_units")
-            if isinstance(raw_units, dict):
-                for record_id, value in raw_units.items():
-                    if not isinstance(record_id, str) or not isinstance(value, dict):
-                        continue
-                    fields = {
-                        name: item
-                        for name, item in value.items()
-                        if name in RepairWorkUnitRecord.__dataclass_fields__
-                    }
-                    fields.setdefault("id", record_id)
-                    try:
-                        self.repair_work_units[record_id] = RepairWorkUnitRecord(**fields)
-                    except (TypeError, ValueError):
-                        continue
             persisted_tasks = raw.get("tasks", {})
             legacy_workflow = isinstance(persisted_tasks, dict) and any(
                 isinstance(key, str) and key.endswith(":fixup") for key in persisted_tasks
@@ -867,20 +642,6 @@ class StateStore:
         self.tasks = {
             key: task for key, task in self.tasks.items() if task.chapter_id in configured
         }
-        self.repair_cases = {
-            key: value for key, value in self.repair_cases.items() if value.chapter_id in configured
-        }
-        self.failure_records = {
-            key: value
-            for key, value in self.failure_records.items()
-            if value.task_key in self.tasks
-        }
-        self.repair_work_units = {
-            key: value
-            for key, value in self.repair_work_units.items()
-            if value.owner_chapter_id in configured
-            and all(case_id in self.repair_cases for case_id in value.case_ids)
-        }
         for chapter in self.config.work_units:
             for stage in Stage:
                 key = self.key(chapter.id, stage)
@@ -946,7 +707,6 @@ class StateStore:
             self._index_run(run)
         for task in self.tasks.values():
             task.runs.sort(key=lambda run: (run.started_at, run.id))
-            self._sync_failure_record(task)
         for runs in self._chapter_runs.values():
             runs.sort(key=lambda run: (run.started_at, run.id))
         migrated_usage_runs = self._normalize_cumulative_thread_usage()
@@ -966,25 +726,11 @@ class StateStore:
                 task.phase = TaskPhase.IDLE
                 task.queued = False
                 task.detail = "recovered after interrupted orchestrator"
-            # A repair execution cannot survive its orchestrator process. Its
-            # durable unit is requeued below, so clear the transient cell flag.
-            task.repairing = False
-            task.repair_work_unit_id = ""
-        for unit in self.repair_work_units.values():
-            if unit.status == RepairWorkUnitStatus.RUNNING:
-                unit.status = RepairWorkUnitStatus.INTERRUPTED
-                unit.detail = "repair worker interrupted with the orchestrator"
-                unit.finished_at = timestamp()
-        if self.shepherd.status in {"planning", "repairing"}:
-            self.shepherd.status = "idle"
-            self.shepherd.current_run_id = ""
-            self.shepherd.running_units = 0
         if self.coordinator_build.active:
             self.coordinator_build.active = False
             self.coordinator_build.current_chapter_id = ""
             self.coordinator_build.updated_at = timestamp()
             self._coordinator_build_dirty = True
-        self._normalize_upstream_request_state()
         self._invalidate_aggregates()
         self._rebuild_status_indexes()
         self._checkpoint_dirty = True
@@ -1197,7 +943,6 @@ class StateStore:
             active_run.role
             if active_run is not None
             and active_run.auxiliary
-            and active_run.role != "shepherd"
             and active_run.stage == str(task.stage)
             else ""
         )
@@ -1233,8 +978,6 @@ class StateStore:
                 for requirement in failed_requirements
                 if requirement.owner_task_key is not None
             ],
-            "repairing": task.repairing,
-            "repair_work_unit_id": task.repair_work_unit_id,
             "recovering_failure": task.recovering_failure,
             "source_digest": task.source_digest,
             "rounds": task.rounds,
@@ -1278,22 +1021,11 @@ class StateStore:
             "current_work_unit_id": build.current_work_unit_id,
         }
 
-    def _shepherd_dict(self, *, include_agents: bool) -> dict[str, Any]:
-        shepherd = {
-            name: getattr(self.shepherd, name) for name in ShepherdRecord.__dataclass_fields__
-        }
-        shepherd["cost"] = self.shepherd_cost().as_dict()
-        if include_agents:
-            shepherd["agents"] = self._shepherd_agent_views()
-            shepherd["runs"] = self._shepherd_run_views()
-        return shepherd
-
-    def _bounded_global_snapshot(self, *, include_shepherd_agents: bool) -> dict[str, Any]:
+    def _bounded_global_snapshot(self) -> dict[str, Any]:
         usage = self.total_usage()
         invocation_usage = self.invocation_usage()
         cost = self.total_cost()
         invocation_cost = self.invocation_cost()
-        shepherd = self._shepherd_dict(include_agents=include_shepherd_agents)
         return {
             "version": 18,
             "history_database": DATABASE_NAME,
@@ -1312,7 +1044,6 @@ class StateStore:
             "invocation_cost": invocation_cost.as_dict(),
             "agents": self.agent_summary(),
             "isolation": self.isolation,
-            "shepherd": shepherd,
             "routing_metrics": dict(sorted(self.routing_metrics.items())),
         }
 
@@ -1324,45 +1055,19 @@ class StateStore:
 
     def _global_snapshot(self) -> dict[str, Any]:
         return (
-            self._bounded_global_snapshot(include_shepherd_agents=True)
+            self._bounded_global_snapshot()
             | {
                 "scheduling": self.scheduling,
                 "source_dependency_tree": self.source_dependency_tree,
                 "formalize_graph": self.formalize_graph,
                 "fixup_requests": self.fixup_requests,
                 "proof_review_requests": self.proof_review_requests,
-                "upstream_requests": self.upstream_requests,
                 "proof_blockers": self.proof_blockers,
                 "thread_cumulative_usage": {
                     thread_id: self._usage_dict(usage)
                     for thread_id, usage in sorted(self.thread_cumulative_usage.items())
                 },
-                "upstream_request_batches": self.upstream_request_batches(),
                 "coordinator_build": self._build_dict(self.coordinator_build),
-                "repair_cases": {
-                    key: {
-                        name: getattr(value, name) for name in RepairCaseRecord.__dataclass_fields__
-                    }
-                    for key, value in sorted(self.repair_cases.items())
-                },
-                "failure_records": {
-                    key: {name: getattr(value, name) for name in FailureRecord.__dataclass_fields__}
-                    for key, value in sorted(self.failure_records.items())
-                },
-                "repair_sweeps": {
-                    key: {
-                        name: getattr(value, name)
-                        for name in RepairSweepRecord.__dataclass_fields__
-                    }
-                    for key, value in sorted(self.repair_sweeps.items())
-                },
-                "repair_work_units": {
-                    key: {
-                        name: getattr(value, name)
-                        for name in RepairWorkUnitRecord.__dataclass_fields__
-                    }
-                    for key, value in sorted(self.repair_work_units.items())
-                },
             }
             | self.package_state.as_dict()
         )
@@ -1372,28 +1077,6 @@ class StateStore:
             return {
                 thread_id: self._usage_dict(usage)
                 for thread_id, usage in sorted(self.thread_cumulative_usage.items())
-            }
-        if section == "repair_cases":
-            return {
-                key: {name: getattr(value, name) for name in RepairCaseRecord.__dataclass_fields__}
-                for key, value in sorted(self.repair_cases.items())
-            }
-        if section == "failure_records":
-            return {
-                key: {name: getattr(value, name) for name in FailureRecord.__dataclass_fields__}
-                for key, value in sorted(self.failure_records.items())
-            }
-        if section == "repair_sweeps":
-            return {
-                key: {name: getattr(value, name) for name in RepairSweepRecord.__dataclass_fields__}
-                for key, value in sorted(self.repair_sweeps.items())
-            }
-        if section == "repair_work_units":
-            return {
-                key: {
-                    name: getattr(value, name) for name in RepairWorkUnitRecord.__dataclass_fields__
-                }
-                for key, value in sorted(self.repair_work_units.items())
             }
         if section == "coordinator_targets":
             return self.coordinator_build.target_work_unit_ids
@@ -1443,112 +1126,6 @@ class StateStore:
 
     def _header_object_ids(self) -> dict[str, int]:
         return {"isolation": id(self.isolation)}
-
-    def _shepherd_agents_for_sweep(self, sweep: RepairSweepRecord) -> list[dict[str, Any]]:
-        """Return the planner and repair workers belonging to one sweep."""
-
-        agents: list[dict[str, Any]] = []
-
-        def work_unit_context(work_unit_id: str) -> dict[str, Any]:
-            try:
-                work_unit = self.config.work_unit(work_unit_id)
-            except KeyError:
-                return {}
-            return {
-                "document_id": work_unit.document_id,
-                "document_title": work_unit.document.title,
-                "ordinal": work_unit.ordinal,
-                "unit_title": work_unit.title,
-            }
-
-        planner_run_id = sweep.run_id or (
-            self.shepherd.current_run_id if self.shepherd.current_sweep_id == sweep.id else ""
-        )
-        if planner_run_id:
-            run = self._runs_by_id.get(planner_run_id)
-            agents.append(
-                {
-                    "run_id": planner_run_id,
-                    "role": "shepherd",
-                    "work_unit_id": run.chapter_id if run is not None else "",
-                    "stage": run.stage if run is not None else "discover",
-                    "status": run.status if run is not None else sweep.status,
-                    "label": "Shepherd planner",
-                    "repair_work_unit_id": "",
-                    "objective": sweep.summary,
-                    "location": self._shepherd_sweep_location(sweep),
-                }
-            )
-        for unit_id in sweep.work_unit_ids:
-            unit = self.repair_work_units.get(unit_id)
-            if unit is None:
-                continue
-            agents.append(
-                {
-                    "run_id": unit.run_id,
-                    "role": "repair_worker",
-                    "work_unit_id": unit.owner_chapter_id,
-                    "stage": unit.target_stage,
-                    "status": unit.status,
-                    "label": f"Repair {unit.target_stage}",
-                    "repair_work_unit_id": unit.id,
-                    "objective": unit.objective,
-                    **work_unit_context(unit.owner_chapter_id),
-                }
-            )
-        return agents
-
-    def _shepherd_sweep_location(self, sweep: RepairSweepRecord) -> str:
-        chapter_ids = {
-            case.chapter_id
-            for case_id in sweep.case_ids
-            if (case := self.repair_cases.get(case_id)) is not None
-        }
-        contexts = []
-        for chapter_id in sorted(chapter_ids):
-            try:
-                contexts.append(self.config.work_unit(chapter_id))
-            except KeyError:
-                continue
-        if len(contexts) == 1:
-            unit = contexts[0]
-            return f"{unit.document.title} · Chapter {unit.ordinal} — {unit.title}"
-        document_count = len({unit.document_id for unit in contexts})
-        if contexts:
-            books = "book" if document_count == 1 else "books"
-            return f"{len(contexts)} chapters in {document_count} {books}"
-        return f"{sweep.failure_count} failures"
-
-    def _shepherd_run_views(self) -> list[dict[str, Any]]:
-        """Return chronological sweep tabs with their own planner and workers."""
-
-        return [
-            {
-                "id": sweep.id,
-                "status": sweep.status,
-                "trigger": sweep.trigger,
-                "failure_count": sweep.failure_count,
-                "started_at": sweep.started_at,
-                "finished_at": sweep.finished_at,
-                "summary": sweep.summary,
-                "error": sweep.error,
-                "agents": self._shepherd_agents_for_sweep(sweep),
-            }
-            for sweep in sorted(
-                self.repair_sweeps.values(), key=lambda item: (item.started_at, item.id)
-            )
-        ]
-
-    def _shepherd_agent_views(self) -> list[dict[str, Any]]:
-        """Return agents for the current or latest sweep for older dashboard clients."""
-
-        runs = self._shepherd_run_views()
-        if not runs:
-            return []
-        current = next(
-            (run for run in runs if run["id"] == self.shepherd.current_sweep_id), runs[-1]
-        )
-        return current["agents"]
 
     def _document_dicts(self) -> list[dict[str, Any]]:
         return [
@@ -1630,19 +1207,6 @@ class StateStore:
         for run_id in sorted(self._active_run_ids):
             if run_id not in recent_run_ids:
                 recent_run_ids.append(run_id)
-        shepherd_snapshot = snapshot.get("shepherd")
-        if isinstance(shepherd_snapshot, dict):
-            shepherd_agents = list(shepherd_snapshot.get("agents", []))
-            shepherd_agents.extend(
-                agent
-                for run in shepherd_snapshot.get("runs", [])
-                if isinstance(run, dict)
-                for agent in run.get("agents", [])
-            )
-            for agent in shepherd_agents:
-                run_id = agent.get("run_id") if isinstance(agent, dict) else None
-                if isinstance(run_id, str) and run_id and run_id not in recent_run_ids:
-                    recent_run_ids.append(run_id)
         snapshot["activities"] = {
             run_id: activity.as_dict()
             for run_id in recent_run_ids
@@ -1698,9 +1262,7 @@ class StateStore:
         )
         global_names = change.globals.difference({"activity", "formalize_graph"})
         if "state" in global_names:
-            globals_ = self._bounded_global_snapshot(include_shepherd_agents=True) | {
-                "revision": self.revision
-            }
+            globals_ = self._bounded_global_snapshot() | {"revision": self.revision}
         else:
             globals_ = {}
         if "coordinator_build" in global_names:
@@ -1711,31 +1273,8 @@ class StateStore:
             )
         ):
             globals_[section] = self._section_value(section)
-        if "upstream_requests" in global_names:
-            globals_["upstream_request_batches"] = self.upstream_request_batches()
         if change.stages or change.runs:
             globals_["agents"] = self.agent_summary()
-        if any(
-            (run := self._runs_by_id.get(run_id)) is not None and run.role in SHEPHERD_RUN_ROLES
-            for run_id in change.runs
-        ):
-            globals_["shepherd"] = self._shepherd_dict(include_agents=True)
-        shepherd = globals_.get("shepherd", {})
-        if isinstance(shepherd, dict):
-            shepherd_agents = list(shepherd.get("agents", []))
-            shepherd_agents.extend(
-                agent
-                for run in shepherd.get("runs", [])
-                if isinstance(run, dict)
-                for agent in run.get("agents", [])
-            )
-            run_ids.update(
-                run_id
-                for agent in shepherd_agents
-                if isinstance(agent, dict)
-                and isinstance((run_id := agent.get("run_id")), str)
-                and run_id
-            )
         activities = {
             run_id: activity.as_dict()
             for run_id in sorted(run_ids)
@@ -1821,7 +1360,7 @@ class StateStore:
         readiness_requirements: tuple[Requirement, ...] | None = None,
     ) -> dict[str, Any]:
         dashboard_run = next(
-            (run for run in reversed(task.runs) if not (run.auxiliary and run.role == "shepherd")),
+            reversed(task.runs),
             None,
         )
         return self._task_dict(task, context, failure_roots, readiness_requirements) | {
@@ -2119,13 +1658,7 @@ class StateStore:
             write = DatabaseWrite(
                 updated_at=self.updated_at,
                 globals=(
-                    {
-                        "state": json.dumpb(
-                            self._bounded_global_snapshot(include_shepherd_agents=False)
-                        )
-                    }
-                    if globals_dirty
-                    else {}
+                    {"state": json.dumpb(self._bounded_global_snapshot())} if globals_dirty else {}
                 )
                 | (
                     {
@@ -2227,91 +1760,6 @@ class StateStore:
         )
         await self._persist()
 
-    def _normalize_upstream_request_state(self) -> None:
-        """Migrate legacy request records to completed-fact durable states."""
-
-        legacy_statuses = {
-            "open": UpstreamRequestStatus.REQUESTED,
-            "repairing": UpstreamRequestStatus.REQUESTED,
-            "retrying": UpstreamRequestStatus.ANSWERED,
-            "manual_escalation": UpstreamRequestStatus.ESCALATED,
-        }
-        valid_statuses = {status.value: status for status in UpstreamRequestStatus}
-        for request_id, request in self.upstream_requests.items():
-            created_at = str(request.get("created_at") or timestamp())
-            request.setdefault("id", request_id)
-            request.setdefault("created_at", created_at)
-            request.setdefault("updated_at", created_at)
-            for name in (
-                "origin_run_ids",
-                "owner_paths",
-                "attempted_alternatives",
-                "acceptance_tests",
-            ):
-                if not isinstance(request.get(name), list):
-                    request[name] = []
-            request.setdefault("owner_kind", "chapter")
-            owner_id = str(request.get("owner_chapter_id", ""))
-            capability_source = str(
-                request.get("candidate_signature") or request.get("needed_result", "")
-            )
-            normalized = re.sub(r"\s+", " ", capability_source).strip().casefold()
-            request.setdefault(
-                "capability_key",
-                f"{owner_id}:{stable_digest_text(normalized)[:16]}",
-            )
-            consumers = request.get("consumers")
-            if not isinstance(consumers, list) or not consumers:
-                origins = request.get("origin_run_ids", [])
-                request["consumers"] = [
-                    {
-                        "consumer_chapter_id": str(request.get("consumer_chapter_id", "")),
-                        "blocked_declaration": str(request.get("blocked_declaration", "")),
-                        "consumer_path": str(request.get("consumer_path", "")),
-                        "residual_goal": str(request.get("residual_goal", "")),
-                        "attempted_alternatives": list(request.get("attempted_alternatives", [])),
-                        "acceptance_tests": list(request.get("acceptance_tests", [])),
-                        "origin_run_ids": list(origins),
-                        "status": str(request.get("status", "requested")),
-                    }
-                ]
-            if not isinstance(request.get("previous_attempts"), str):
-                request["previous_attempts"] = ""
-            if request.get("answer") is not None and not isinstance(request.get("answer"), dict):
-                request["answer"] = None
-
-            raw_status = str(request.get("status", UpstreamRequestStatus.REQUESTED.value))
-            status = valid_statuses.get(raw_status) or legacy_statuses.get(raw_status)
-            if status is None:
-                status = UpstreamRequestStatus.ESCALATED
-                request["escalation_reason"] = "recovered an unknown upstream-request state"
-                request.setdefault("escalated_at", timestamp())
-            if status is UpstreamRequestStatus.ANSWERED and not isinstance(
-                request.get("answer"), dict
-            ):
-                status = UpstreamRequestStatus.REQUESTED
-            elif status is UpstreamRequestStatus.REQUESTED and isinstance(
-                request.get("answer"), dict
-            ):
-                status = UpstreamRequestStatus.ANSWERED
-            request["status"] = status.value
-
-            # Older snapshots duplicated execution history that is already retained by RunRecord.
-            for legacy_field in ("repair_attempts", "retry_attempts", "answers", "history"):
-                request.pop(legacy_field, None)
-
-    def upstream_request_batches(self) -> dict[str, list[str]]:
-        """Group unanswered durable requests by their proposed owning chapter."""
-
-        batches: dict[str, list[str]] = {}
-        for request_id, request in sorted(self.upstream_requests.items()):
-            if request.get("status") != UpstreamRequestStatus.REQUESTED.value:
-                continue
-            owner = request.get("owner_chapter_id")
-            if isinstance(owner, str) and owner:
-                batches.setdefault(owner, []).append(request_id)
-        return batches
-
     @staticmethod
     def _proof_blocker_fingerprint(attempt: dict[str, Any]) -> str:
         """Fingerprint the stable obstruction, excluding verbose checked attempts."""
@@ -2363,7 +1811,7 @@ class StateStore:
         origin_run_id: str,
         failed_attempts: Iterable[dict[str, Any]],
         unchanged_ids: Iterable[str] = (),
-        upstream_candidates: Iterable[dict[str, Any]] = (),
+        capability_candidates: Iterable[dict[str, Any]] = (),
     ) -> tuple[dict[str, Any], ...]:
         """Merge proof-failure deltas into a restart-safe declaration ledger."""
 
@@ -2378,7 +1826,7 @@ class StateStore:
             for value in self.proof_blockers.values()
             if value.get("consumer_chapter_id") == chapter_id
         }
-        candidates = tuple(value for value in upstream_candidates if isinstance(value, dict))
+        candidates = tuple(value for value in capability_candidates if isinstance(value, dict))
         for raw in failed_attempts:
             if not isinstance(raw, dict):
                 continue
@@ -2446,8 +1894,8 @@ class StateStore:
                     and str(candidate.get("residual_goal", "")).strip()
                     == blocker.get("remaining_goal")
                 ):
-                    blocker["upstream_candidate"] = dict(candidate)
-                    blocker["disposition"] = "missing_upstream"
+                    blocker["capability"] = dict(candidate)
+                    blocker["disposition"] = "missing_capability"
                     break
             blocker["updated_at"] = timestamp()
             changed[str(blocker["id"])] = blocker
@@ -2515,65 +1963,10 @@ class StateStore:
             self._mark_dirty(global_state=False, sections={"proof_blockers"})
             await self._persist()
 
-    async def retire_imported_upstream_requests(self) -> tuple[str, ...]:
-        """Make the one-way package import authoritative over legacy request state."""
-
-        imported = self.package_state.upstream_request_imports
-        if not imported:
-            return ()
-        retired: list[str] = []
-        now = timestamp()
-        for request_id, record in imported.items():
-            request = self.upstream_requests.get(request_id)
-            if isinstance(request, dict) and request.get("status") != UpstreamRequestStatus.CLOSED:
-                request["status"] = UpstreamRequestStatus.CLOSED.value
-                request["closed_at"] = now
-                request["closed_reason"] = f"imported into capability package {record.package_id}"
-                request["package_id"] = record.package_id
-                request["updated_at"] = now
-                retired.append(request_id)
-            for blocker in self.proof_blockers.values():
-                request_ids = {
-                    str(blocker.get("request_id", "")),
-                    *(str(value) for value in blocker.get("request_ids", ())),
-                }
-                if request_id not in request_ids:
-                    continue
-                blocker["status"] = ProofBlockerStatus.WAITING_DEPENDENCY.value
-                blocker["package_id"] = record.package_id
-                blocker.pop("request_id", None)
-                blocker.pop("request_ids", None)
-                blocker["updated_at"] = now
-        if retired:
-            self._mark_dirty(
-                global_state=False,
-                sections={"upstream_requests", "proof_blockers"},
-            )
-            await self._persist()
-        return tuple(retired)
-
-    def upstream_requests_for_consumer(
-        self,
-        chapter_id: str,
-        *,
-        statuses: Iterable[UpstreamRequestStatus] | None = None,
-    ) -> tuple[dict[str, Any], ...]:
-        selected = set(statuses) if statuses is not None else None
-        return tuple(
-            request
-            for _, request in sorted(self.upstream_requests.items())
-            if (
-                request.get("consumer_chapter_id") == chapter_id
-                or any(
-                    isinstance(consumer, dict) and consumer.get("consumer_chapter_id") == chapter_id
-                    for consumer in request.get("consumers", [])
-                )
-            )
-            and (selected is None or UpstreamRequestStatus(str(request.get("status"))) in selected)
-        )
-
     async def refresh_package_state(self) -> PackageState:
         self.package_state = await asyncio.to_thread(self._database.load_package_state)
+        self._mark_dirty(global_state=True)
+        await self._persist()
         return self.package_state
 
     async def claim_steward_lease(
@@ -2825,420 +2218,6 @@ class StateStore:
         await self.refresh_package_state()
         return result
 
-    async def enqueue_upstream_request(
-        self,
-        request: dict[str, Any],
-        *,
-        consumer_chapter_id: str,
-        origin_run_id: str,
-        owner_chapter_id: str,
-        previous_attempts: str,
-        escalation_reason: str = "",
-    ) -> tuple[str, bool]:
-        """Persist one proof-to-upstream handoff without collapsing its evidence."""
-
-        owner_kind = str(request.get("owner_kind", "chapter")).strip() or "chapter"
-        capability_key = str(request.get("capability_key", "")).strip()
-        if not capability_key:
-            capability_source = str(
-                request.get("candidate_signature") or request.get("needed_result", "")
-            )
-            normalized = re.sub(r"\s+", " ", capability_source).strip().casefold()
-            capability_key = f"{owner_chapter_id}:{stable_digest_text(normalized)[:16]}"
-        fingerprint_fields = (owner_kind, owner_chapter_id, capability_key)
-        identity = "\0".join(fingerprint_fields)
-        fingerprint = stable_digest_text(identity)[:16]
-        transitional_fingerprint = digest_text(identity)
-        legacy_identity = "\0".join(
-            (
-                consumer_chapter_id,
-                str(request.get("blocked_declaration", "")).strip(),
-                str(request.get("consumer_path", "")).strip(),
-                str(request.get("needed_result", "")).strip(),
-                owner_chapter_id,
-            )
-        )
-        legacy_fingerprints = {
-            stable_digest_text(legacy_identity)[:16],
-            digest_text(legacy_identity),
-        }
-        attachment = self._upstream_consumer_attachment(
-            request,
-            consumer_chapter_id=consumer_chapter_id,
-            origin_run_id=origin_run_id,
-        )
-        for request_id, existing in self.upstream_requests.items():
-            if existing.get("fingerprint") not in {
-                fingerprint,
-                transitional_fingerprint,
-                *legacy_fingerprints,
-            }:
-                continue
-            if existing.get("status") == UpstreamRequestStatus.CLOSED.value:
-                continue
-            existing["fingerprint"] = fingerprint
-            existing["capability_key"] = capability_key
-            existing["owner_kind"] = owner_kind
-            if isinstance(existing.get("answer"), dict):
-                attachment["status"] = str(
-                    existing.get("status", UpstreamRequestStatus.ANSWERED.value)
-                )
-            consumers = existing.setdefault("consumers", [])
-            if isinstance(consumers, list):
-                current = next(
-                    (
-                        value
-                        for value in consumers
-                        if isinstance(value, dict)
-                        and value.get("consumer_chapter_id") == consumer_chapter_id
-                        and value.get("blocked_declaration") == attachment["blocked_declaration"]
-                    ),
-                    None,
-                )
-                if current is None:
-                    consumers.append(attachment)
-                else:
-                    origins = current.setdefault("origin_run_ids", [])
-                    if isinstance(origins, list) and origin_run_id not in origins:
-                        origins.append(origin_run_id)
-            origin_run_ids = existing.setdefault("origin_run_ids", [])
-            if isinstance(origin_run_ids, list) and origin_run_id not in origin_run_ids:
-                origin_run_ids.append(origin_run_id)
-            existing["sightings"] = int(existing.get("sightings", 1)) + 1
-            self.record_routing_event("capability_deduplicated")
-            existing["updated_at"] = timestamp()
-            self._mark_dirty(global_state=False, sections={"upstream_requests"})
-            await self._persist()
-            await self.refresh_package_state()
-            return request_id, False
-
-        request_id = uuid4().hex[:12]
-        now = timestamp()
-        status = (
-            UpstreamRequestStatus.ESCALATED
-            if escalation_reason
-            else UpstreamRequestStatus.PARKED
-            if owner_kind != "chapter"
-            else UpstreamRequestStatus.REQUESTED
-        )
-        attempted = request.get("attempted_alternatives")
-        owner_paths = request.get("owner_paths")
-        record: dict[str, Any] = {
-            "id": request_id,
-            "fingerprint": fingerprint,
-            "capability_key": capability_key,
-            "owner_kind": owner_kind,
-            "status": status.value,
-            "consumer_chapter_id": consumer_chapter_id,
-            "origin_run_ids": [origin_run_id],
-            "blocked_declaration": str(request.get("blocked_declaration", "")).strip(),
-            "consumer_path": str(request.get("consumer_path", "")).strip(),
-            "residual_goal": str(request.get("residual_goal", "")).strip(),
-            "needed_result": str(request.get("needed_result", "")).strip(),
-            "owner_chapter_id": owner_chapter_id,
-            "proposed_owner_chapter_id": str(
-                request.get("owner_chapter_id", owner_chapter_id)
-            ).strip(),
-            "owner_paths": sorted(
-                {
-                    str(path).strip()
-                    for path in owner_paths
-                    if isinstance(path, str) and path.strip()
-                }
-            )
-            if isinstance(owner_paths, list)
-            else [],
-            "attempted_alternatives": [
-                str(item).strip() for item in attempted if isinstance(item, str) and item.strip()
-            ]
-            if isinstance(attempted, list)
-            else [],
-            "previous_attempts": previous_attempts,
-            "candidate_signature": str(request.get("candidate_signature", "")).strip(),
-            "acceptance_tests": [
-                str(item).strip()
-                for item in request.get("acceptance_tests", [])
-                if isinstance(item, str) and item.strip()
-            ],
-            "consumers": [attachment],
-            "answer": None,
-            "sightings": 1,
-            "created_at": now,
-            "updated_at": now,
-        }
-        if escalation_reason:
-            record["escalation_reason"] = escalation_reason
-            record["escalated_at"] = now
-            record["escalated_by_run_id"] = origin_run_id
-        self.upstream_requests[request_id] = record
-        self._mark_dirty(global_state=False, sections={"upstream_requests"})
-        await self._persist()
-        await self.refresh_package_state()
-        return request_id, True
-
-    @staticmethod
-    def _upstream_consumer_attachment(
-        request: dict[str, Any],
-        *,
-        consumer_chapter_id: str,
-        origin_run_id: str,
-    ) -> dict[str, Any]:
-        return {
-            "consumer_chapter_id": consumer_chapter_id,
-            "blocked_declaration": str(request.get("blocked_declaration", "")).strip(),
-            "consumer_path": str(request.get("consumer_path", "")).strip(),
-            "residual_goal": str(request.get("residual_goal", "")).strip(),
-            "attempted_alternatives": [
-                str(item).strip()
-                for item in request.get("attempted_alternatives", [])
-                if isinstance(item, str) and item.strip()
-            ],
-            "acceptance_tests": [
-                str(item).strip()
-                for item in request.get("acceptance_tests", [])
-                if isinstance(item, str) and item.strip()
-            ],
-            "origin_run_ids": [origin_run_id],
-            "status": "requested",
-        }
-
-    async def record_upstream_answers(
-        self,
-        request_ids: Iterable[str],
-        *,
-        run_id: str | None,
-        answers: dict[str, dict[str, Any]],
-        error: str = "",
-    ) -> None:
-        """Persist completed repair answers or terminal repair failures."""
-
-        changed = False
-        async with self.batch():
-            for request_id in request_ids:
-                request = self.upstream_requests.get(request_id)
-                if (
-                    not isinstance(request, dict)
-                    or request.get("status") != UpstreamRequestStatus.REQUESTED.value
-                ):
-                    continue
-                answer = answers.get(request_id)
-                if answer is None:
-                    reason = error or "targeted upstream repair returned no usable answer"
-                    request["status"] = UpstreamRequestStatus.PARKED.value
-                    request["last_attempt_error"] = reason
-                    consumers = request.get("consumers")
-                    if isinstance(consumers, list):
-                        for consumer in consumers:
-                            if isinstance(consumer, dict) and consumer.get("status") != "closed":
-                                consumer["status"] = UpstreamRequestStatus.PARKED.value
-                                consumer["last_attempt_error"] = reason
-                    if run_id is not None:
-                        request["repair_run_id"] = run_id
-                    request["updated_at"] = timestamp()
-                    changed = True
-                    continue
-                persisted_answer = dict(answer) | {"answered_at": timestamp()}
-                if run_id is not None:
-                    persisted_answer["repair_run_id"] = run_id
-                request["answer"] = persisted_answer
-                if run_id is not None:
-                    request["repair_run_id"] = run_id
-                disposition = str(answer.get("disposition", ""))
-                request["status"] = (
-                    UpstreamRequestStatus.PARTIAL.value
-                    if disposition == "partial"
-                    else UpstreamRequestStatus.PARKED.value
-                    if disposition in {"external", "decompose"}
-                    else UpstreamRequestStatus.ANSWERED.value
-                )
-                consumers = request.get("consumers")
-                if isinstance(consumers, list):
-                    for consumer in consumers:
-                        if isinstance(consumer, dict) and consumer.get("status") != "closed":
-                            consumer["status"] = request["status"]
-                request["updated_at"] = timestamp()
-                request.pop("escalation_reason", None)
-                request.pop("escalated_at", None)
-                request.pop("escalated_by_run_id", None)
-                changed = True
-            if changed:
-                self._mark_dirty(global_state=False, sections={"upstream_requests"})
-                await self._persist()
-
-    async def finish_upstream_requests(
-        self,
-        request_ids: Iterable[str],
-        *,
-        run_id: str | None,
-        succeeded_ids: Iterable[str],
-        consumer_chapter_id: str | None = None,
-        error: str = "",
-        success_detail: str = "blocked declaration succeeded in the targeted downstream retry",
-    ) -> tuple[str, ...]:
-        """Persist terminal proof success or escalation after a completed retry."""
-
-        succeeded = set(succeeded_ids)
-        closed: list[str] = []
-        changed = False
-        async with self.batch():
-            for request_id in request_ids:
-                request = self.upstream_requests.get(request_id)
-                if not isinstance(request, dict):
-                    continue
-                status = UpstreamRequestStatus(str(request.get("status")))
-                if status is UpstreamRequestStatus.CLOSED:
-                    continue
-                consumers = request.get("consumers")
-                consumer_values = (
-                    [value for value in consumers if isinstance(value, dict)]
-                    if isinstance(consumers, list)
-                    else []
-                )
-                attachments = [
-                    value
-                    for value in consumer_values
-                    if consumer_chapter_id is None
-                    or value.get("consumer_chapter_id") == consumer_chapter_id
-                ]
-                if request_id in succeeded and attachments:
-                    for attachment in attachments:
-                        attachment["status"] = "closed"
-                        attachment["closed_by_run_id"] = run_id
-                        attachment["closed_reason"] = success_detail
-                    remaining = [
-                        value for value in consumer_values if value.get("status") != "closed"
-                    ]
-                    if remaining:
-                        request["status"] = self._aggregate_upstream_consumer_status(remaining)
-                        request["updated_at"] = timestamp()
-                        changed = True
-                        continue
-                if request_id in succeeded:
-                    request["status"] = UpstreamRequestStatus.CLOSED.value
-                    request["closed_at"] = timestamp()
-                    request["closed_by_run_id"] = run_id
-                    request["closed_reason"] = success_detail
-                    if run_id is not None:
-                        request["retry_run_id"] = run_id
-                    request["updated_at"] = timestamp()
-                    request.pop("escalation_reason", None)
-                    request.pop("escalated_at", None)
-                    request.pop("escalated_by_run_id", None)
-                    closed.append(request_id)
-                    changed = True
-                    continue
-                if status is not UpstreamRequestStatus.ANSWERED:
-                    continue
-                reason = error or (
-                    "blocked declaration remained unresolved after its targeted downstream retry"
-                )
-                if attachments:
-                    for attachment in attachments:
-                        attachment["status"] = "parked"
-                        attachment["last_attempt_error"] = reason
-                    request["status"] = self._aggregate_upstream_consumer_status(consumer_values)
-                    request["last_attempt_error"] = reason
-                else:
-                    request["status"] = UpstreamRequestStatus.ESCALATED.value
-                    request["escalation_reason"] = reason
-                    request["escalated_at"] = timestamp()
-                if run_id is not None:
-                    request["escalated_by_run_id"] = run_id
-                    request["retry_run_id"] = run_id
-                request["updated_at"] = timestamp()
-                changed = True
-            if changed:
-                self._mark_dirty(global_state=False, sections={"upstream_requests"})
-                await self._persist()
-        return tuple(closed)
-
-    @staticmethod
-    def _aggregate_upstream_consumer_status(consumers: Iterable[dict[str, Any]]) -> str:
-        statuses = {str(value.get("status", "")) for value in consumers}
-        if statuses == {"closed"}:
-            return UpstreamRequestStatus.CLOSED.value
-        if "requested" in statuses:
-            return UpstreamRequestStatus.REQUESTED.value
-        if "answered" in statuses:
-            return UpstreamRequestStatus.ANSWERED.value
-        if "partial" in statuses:
-            return UpstreamRequestStatus.PARTIAL.value
-        return UpstreamRequestStatus.PARKED.value
-
-    async def reopen_escalated_upstream_requests(self, chapter_ids: Iterable[str]) -> list[str]:
-        """Treat the explicit manual unblock command as authority to retry the handoff."""
-
-        selected = set(chapter_ids)
-        reopened: list[str] = []
-        for request_id, request in self.upstream_requests.items():
-            if (
-                request.get("consumer_chapter_id") not in selected
-                or request.get("status") != UpstreamRequestStatus.ESCALATED.value
-            ):
-                continue
-            target = (
-                UpstreamRequestStatus.ANSWERED
-                if isinstance(request.get("answer"), dict)
-                else UpstreamRequestStatus.REQUESTED
-            )
-            request["status"] = target.value
-            request["updated_at"] = timestamp()
-            request.pop("escalation_reason", None)
-            request.pop("escalated_at", None)
-            request.pop("escalated_by_run_id", None)
-            reopened.append(request_id)
-        if reopened:
-            self._mark_dirty(global_state=False, sections={"upstream_requests"})
-            await self._persist()
-        return reopened
-
-    async def clear_upstream_requests(self, chapter_ids: Iterable[str] | None = None) -> list[str]:
-        """Manually close outstanding upstream requests, optionally by consumer.
-
-        Closed records retain their origin run ids so restart recovery does not recreate the
-        requests. Any affected proof becomes eligible for a later retry, which may enqueue a new
-        request when the upstream dependency is still missing.
-        """
-
-        selected = set(chapter_ids) if chapter_ids is not None else None
-        cleared: list[str] = []
-        blockers_changed = False
-        now = timestamp()
-        for request_id, request in self.upstream_requests.items():
-            if selected is not None and request.get("consumer_chapter_id") not in selected:
-                continue
-            if request.get("status") == UpstreamRequestStatus.CLOSED.value:
-                continue
-            request["status"] = UpstreamRequestStatus.CLOSED.value
-            request["closed_at"] = now
-            request["closed_by_run_id"] = None
-            request["closed_reason"] = "manually cleared"
-            request["updated_at"] = now
-            request.pop("escalation_reason", None)
-            request.pop("escalated_at", None)
-            request.pop("escalated_by_run_id", None)
-            cleared.append(request_id)
-
-        cleared_ids = set(cleared)
-        for blocker in self.proof_blockers.values():
-            if (
-                blocker.get("request_id") not in cleared_ids
-                or blocker.get("status") != ProofBlockerStatus.UPSTREAM_REQUESTED.value
-            ):
-                continue
-            blocker["status"] = ProofBlockerStatus.OPEN.value
-            blocker["updated_at"] = now
-            blocker.pop("request_id", None)
-            blockers_changed = True
-
-        if cleared:
-            sections = {"upstream_requests"}
-            if blockers_changed:
-                sections.add("proof_blockers")
-            self._mark_dirty(global_state=False, sections=sections)
-            await self._persist()
-        return cleared
-
     async def reopen_proof_blockers(self, chapter_ids: Iterable[str]) -> list[str]:
         """Start a fresh retry window for unresolved proof evidence."""
 
@@ -3246,7 +2225,6 @@ class StateStore:
         reopened: list[str] = []
         reopened_statuses = {
             ProofBlockerStatus.BLOCKED.value,
-            ProofBlockerStatus.UPSTREAM_REQUESTED.value,
         }
         for blocker_id, blocker in self.proof_blockers.items():
             if blocker.get("consumer_chapter_id") not in selected:
@@ -3682,7 +2660,6 @@ class StateStore:
             for stage in Stage
         }
         self._indexed_task_states.clear()
-        self._repairable_task_keys.clear()
         for key, task in self.tasks.items():
             bucket = "queued" if task.queued else str(task.status)
             self._stage_count_cache[task.stage][bucket] += 1
@@ -3693,10 +2670,7 @@ class StateStore:
                 str(task.status),
                 task.queued,
                 str(task.phase),
-                task.repairing,
             )
-            if task.status == TaskStatus.FAILED and not task.repairing:
-                self._repairable_task_keys.add(key)
         self._active_run_ids = {
             run.id for run in self._runs_by_id.values() if run.status == TaskStatus.RUNNING
         }
@@ -3711,11 +2685,11 @@ class StateStore:
             return
         key = self.key(task.chapter_id, Stage(task.stage))
         previous = self._indexed_task_states.get(key)
-        current = (task.stage, str(task.status), task.queued, str(task.phase), task.repairing)
+        current = (task.stage, str(task.status), task.queued, str(task.phase))
         if previous == current:
             return
         if previous is not None:
-            old_stage, old_status, old_queued, old_phase, _old_repairing = previous
+            old_stage, old_status, old_queued, old_phase = previous
             old_bucket = "queued" if old_queued else old_status
             self._stage_count_cache[old_stage][old_bucket] -= 1
             if old_status == TaskStatus.RUNNING and old_phase == TaskPhase.POSTPROCESS:
@@ -3725,10 +2699,6 @@ class StateStore:
         if task.status == TaskStatus.RUNNING and task.phase == TaskPhase.POSTPROCESS:
             self._stage_count_cache[task.stage]["postprocess"] += 1
         self._indexed_task_states[key] = current
-        if task.status == TaskStatus.FAILED and not task.repairing:
-            self._repairable_task_keys.add(key)
-        else:
-            self._repairable_task_keys.discard(key)
 
     def agent_summary(self) -> dict[str, Any]:
         if not self._stage_count_cache:
@@ -3912,11 +2882,6 @@ class StateStore:
     def invocation_cost(self, chapter_id: str | None = None) -> CostEstimate:
         return self._cost(invocation_only=True, chapter_id=chapter_id)
 
-    def shepherd_cost(self) -> CostEstimate:
-        """Lifetime API-equivalent cost of Shepherd planners and repair workers."""
-
-        return self._cost(invocation_only=False, roles=SHEPHERD_RUN_ROLES)
-
     def task(self, chapter_id: str, stage: Stage) -> TaskRecord:
         return self.tasks[self.key(chapter_id, stage)]
 
@@ -3980,12 +2945,10 @@ class StateStore:
             task.recovering_failure = False
         if recovered or status == TaskStatus.SUCCEEDED:
             changed_tasks.extend(self._refresh_waiting_tasks())
-        failure_changed = self._sync_failure_record(task)
         self._invalidate_status_summaries()
         self._mark_dirty(
             tasks=changed_tasks,
             global_state=False,
-            sections={"failure_records"} if failure_changed else (),
         )
         await self._persist()
 
@@ -4052,14 +3015,10 @@ class StateStore:
         if recovered or status == TaskStatus.SUCCEEDED:
             changed_tasks.extend(self._refresh_waiting_tasks())
         if changed:
-            failure_changed = False
-            for changed_task in changed_tasks:
-                failure_changed = self._sync_failure_record(changed_task) or failure_changed
             self._invalidate_status_summaries()
             self._mark_dirty(
                 tasks=changed_tasks,
                 global_state=False,
-                sections={"failure_records"} if failure_changed else (),
             )
             await self._persist()
 
@@ -4143,7 +3102,6 @@ class StateStore:
             task.detail = "manually unblocked"
             task.updated_at = timestamp()
             changed.append(key)
-        await self.reopen_escalated_upstream_requests(proof_chapters)
         if changed:
             self._invalidate_status_summaries()
             self._mark_dirty(tasks=(self.tasks[key] for key in changed), global_state=False)
@@ -4154,7 +3112,6 @@ class StateStore:
         """Reset every failed task to pending without discarding attempt history."""
 
         changed: list[str] = []
-        failure_changed = False
         proof_chapters: set[str] = set()
         for key, task in self.tasks.items():
             if task.status != TaskStatus.FAILED:
@@ -4170,15 +3127,12 @@ class StateStore:
             task.recovering_failure = True
             task.updated_at = timestamp()
             changed.append(key)
-            failure_changed = self._sync_failure_record(task) or failure_changed
         await self.reopen_proof_blockers(proof_chapters)
-        await self.reopen_escalated_upstream_requests(proof_chapters)
         if changed:
             self._invalidate_status_summaries()
             self._mark_dirty(
                 tasks=(self.tasks[key] for key in changed),
                 global_state=False,
-                sections={"failure_records"} if failure_changed else (),
             )
             await self._persist()
         return changed
@@ -4399,22 +3353,18 @@ class StateStore:
         }
 
     def requirement_satisfied(self, requirement: Requirement) -> bool:
-        if requirement.request_id is not None:
-            if requirement.kind is RequirementKind.UPSTREAM_REQUEST:
-                request = self.upstream_requests.get(requirement.request_id, {})
-                return request.get("status") in {
-                    UpstreamRequestStatus.ANSWERED,
-                    UpstreamRequestStatus.CLOSED,
-                }
-            if requirement.kind is RequirementKind.PROOF_REVIEW_REQUEST:
-                request = self.proof_review_requests.get(requirement.request_id)
-                if not isinstance(request, dict):
-                    return True
-                feedback = request.get("feedback")
-                if requirement.owner_task_key is None or not isinstance(feedback, dict):
-                    return False
-                chapter_id = requirement.owner_task_key.rpartition(":")[0]
-                return chapter_id not in feedback
+        if (
+            requirement.request_id is not None
+            and requirement.kind is RequirementKind.PROOF_REVIEW_REQUEST
+        ):
+            request = self.proof_review_requests.get(requirement.request_id)
+            if not isinstance(request, dict):
+                return True
+            feedback = request.get("feedback")
+            if requirement.owner_task_key is None or not isinstance(feedback, dict):
+                return False
+            chapter_id = requirement.owner_task_key.rpartition(":")[0]
+            return chapter_id not in feedback
         if requirement.owner_task_key is not None:
             owner = self.tasks.get(requirement.owner_task_key)
             return owner is not None and owner.status == TaskStatus.SUCCEEDED
@@ -4667,13 +3617,11 @@ class StateStore:
         task.runs.append(run)
         self._index_run(run)
         self._payload_loaded_run_ids.add(run.id)
-        failure_changed = self._sync_failure_record(task)
         self._invalidate_status_summaries()
         self._mark_dirty(
             task=task,
             run=run,
             global_state=False,
-            sections={"failure_records"} if failure_changed else (),
         )
         await self._persist()
         return run
@@ -4717,304 +3665,6 @@ class StateStore:
         self._mark_dirty(task=task, run=run, global_state=False)
         await self._persist()
         return run
-
-    def repairable_tasks(self) -> list[tuple[str, TaskRecord]]:
-        """Current terminal failures eligible for Shepherd triage."""
-
-        if not self._stage_count_cache:
-            self._rebuild_status_indexes()
-        return sorted(
-            ((key, self.tasks[key]) for key in self._repairable_task_keys),
-            key=lambda item: (item[1].updated_at, item[0]),
-        )
-
-    def _sync_failure_record(self, task: TaskRecord) -> bool:
-        task_key = self.key(task.chapter_id, Stage(task.stage))
-        active = [
-            record
-            for record in self.failure_records.values()
-            if record.task_key == task_key and record.active
-        ]
-        if task.status != TaskStatus.FAILED:
-            if not active:
-                return False
-            now = timestamp()
-            for record in active:
-                record.active = False
-                record.resolved_at = now
-                record.updated_at = now
-            return True
-
-        latest = next((run for run in reversed(task.runs) if not run.auxiliary), None)
-        diagnostics = {
-            "detail": task.detail,
-            "validation": latest.validation if latest is not None else None,
-            "exit_code": latest.exit_code if latest is not None else None,
-        }
-        run_id = latest.id if latest is not None else ""
-        if active:
-            record = active[-1]
-            if (
-                record.run_id == run_id
-                and diagnostics["detail"] == record.diagnostics.get("detail")
-                and diagnostics["validation"] is None
-            ):
-                return False
-            if record.run_id == run_id and record.diagnostics == diagnostics:
-                return False
-            record.run_id = run_id
-            record.diagnostics = diagnostics
-            record.updated_at = timestamp()
-            return True
-
-        now = timestamp()
-        record_id = stable_digest_text(f"{task_key}:{run_id}:{now}")[:16]
-        self.failure_records[record_id] = FailureRecord(
-            id=record_id,
-            task_key=task_key,
-            kind=FailureKind(task.stage),
-            repairable=True,
-            run_id=run_id,
-            diagnostics=diagnostics,
-            created_at=now,
-            updated_at=now,
-        )
-        return True
-
-    def shepherd_failure_records(self) -> list[FailureRecord]:
-        """Active direct execution failures eligible for Shepherd triage."""
-
-        return sorted(
-            (
-                record
-                for record in self.failure_records.values()
-                if record.active
-                and record.repairable
-                and (task := self.tasks.get(record.task_key)) is not None
-                and task.status == TaskStatus.FAILED
-                and not task.repairing
-            ),
-            key=lambda record: (record.updated_at, record.task_key, record.id),
-        )
-
-    def shepherd_repairable_tasks(self) -> list[tuple[str, TaskRecord]]:
-        """Direct failures, including durable proof escalations, eligible for triage.
-
-        Blocked tasks are causal impact, regardless of their human-readable detail.  Their
-        failed prerequisite is the repair target and will release them through the normal
-        scheduler once it succeeds.
-        """
-
-        return [
-            (record.task_key, self.tasks[record.task_key])
-            for record in self.shepherd_failure_records()
-        ]
-
-    def ensure_repair_case(self, task_key: str) -> RepairCaseRecord:
-        task = self.tasks[task_key]
-        latest = next((run for run in reversed(task.runs) if not run.auxiliary), None)
-        evidence = {
-            "task_key": task_key,
-            "status": str(task.status),
-            "detail": task.detail,
-            "run_id": latest.id if latest is not None else "",
-            "exit_code": latest.exit_code if latest is not None else None,
-            "validation": latest.validation if latest is not None else None,
-        }
-        encoded_evidence = json.dumpb(evidence, sort_keys=True)
-        fingerprint = stable_digest_bytes(encoded_evidence)
-        transitional_fingerprint = digest_bytes(encoded_evidence)
-        for case in self.repair_cases.values():
-            if case.task_key == task_key and case.fingerprint in {
-                fingerprint,
-                transitional_fingerprint,
-            }:
-                case.fingerprint = fingerprint
-                return case
-        case_id = stable_digest_text(f"{task_key}:{fingerprint}")[:16]
-        case = RepairCaseRecord(
-            id=case_id,
-            task_key=task_key,
-            chapter_id=task.chapter_id,
-            stage=str(task.stage),
-            fingerprint=fingerprint,
-        )
-        self.repair_cases[case.id] = case
-        self._mark_dirty(global_state=False, sections={"repair_cases"})
-        return case
-
-    async def start_repair_sweep(
-        self,
-        *,
-        trigger: str,
-        task_keys: Iterable[str],
-    ) -> RepairSweepRecord:
-        cases = [self.ensure_repair_case(key) for key in dict.fromkeys(task_keys)]
-        sweep = RepairSweepRecord(
-            id=uuid4().hex[:12],
-            trigger=trigger,
-            failure_count=len(cases),
-            case_ids=[case.id for case in cases],
-        )
-        self.repair_sweeps[sweep.id] = sweep
-        self.shepherd.status = "planning"
-        self.shepherd.current_sweep_id = sweep.id
-        self.shepherd.last_started_at = sweep.started_at
-        self.shepherd.last_error = ""
-        self.shepherd.pending_failures = len(cases)
-        self.shepherd.planned_units = 0
-        self.shepherd.running_units = 0
-        self.shepherd.succeeded_units = 0
-        self.shepherd.failed_units = 0
-        self._mark_dirty(sections={"repair_cases", "repair_sweeps"})
-        await self._persist()
-        return sweep
-
-    async def install_repair_plan(
-        self,
-        sweep_id: str,
-        units: Iterable[RepairWorkUnitRecord],
-        *,
-        summary: str,
-        run_id: str,
-    ) -> None:
-        sweep = self.repair_sweeps[sweep_id]
-        installed = list(units)
-        for unit in installed:
-            if unit.sweep_id != sweep_id:
-                raise ValueError(f"repair unit {unit.id} belongs to another sweep")
-            unit.queued = False
-            self.repair_work_units[unit.id] = unit
-            for case_id in unit.case_ids:
-                case = self.repair_cases[case_id]
-                case.status = RepairCaseStatus.PLANNED
-                case.sweep_id = sweep_id
-                if unit.id not in case.work_unit_ids:
-                    case.work_unit_ids.append(unit.id)
-                case.updated_at = timestamp()
-        sweep.status = "repairing" if installed else "completed"
-        sweep.summary = summary
-        sweep.run_id = run_id
-        sweep.work_unit_ids = [unit.id for unit in installed]
-        self.shepherd.status = "repairing" if installed else "idle"
-        self.shepherd.current_run_id = ""
-        self.shepherd.last_summary = summary
-        self.shepherd.planned_units = len(installed)
-        self._mark_dirty(sections={"repair_cases", "repair_sweeps", "repair_work_units"})
-        await self._persist()
-
-    async def queue_repair_work_unit(self, unit_id: str) -> None:
-        unit = self.repair_work_units[unit_id]
-        if unit.status not in {
-            RepairWorkUnitStatus.PENDING,
-            RepairWorkUnitStatus.INTERRUPTED,
-        }:
-            return
-        unit.status = RepairWorkUnitStatus.PENDING
-        unit.queued = True
-        unit.detail = "repair queued in the global agent pool"
-        self._mark_dirty(global_state=False, sections={"repair_work_units"})
-        await self._persist()
-
-    async def start_repair_work_unit(self, unit_id: str) -> None:
-        unit = self.repair_work_units[unit_id]
-        unit.status = RepairWorkUnitStatus.RUNNING
-        unit.queued = False
-        unit.started_at = timestamp()
-        unit.finished_at = None
-        unit.detail = "repair worker running"
-        changed_tasks: list[TaskRecord] = []
-        for task_key in unit.task_keys:
-            task = self.tasks.get(task_key)
-            if task is None:
-                continue
-            task.repairing = True
-            task.repair_work_unit_id = unit.id
-            task.updated_at = timestamp()
-            changed_tasks.append(task)
-        for case_id in unit.case_ids:
-            case = self.repair_cases[case_id]
-            case.status = RepairCaseStatus.REPAIRING
-            case.updated_at = timestamp()
-        self.shepherd.running_units += 1
-        self._mark_dirty(
-            tasks=changed_tasks,
-            sections={"repair_cases", "repair_work_units"},
-        )
-        await self._persist()
-
-    async def link_repair_work_unit_run(self, unit_id: str, run_id: str) -> None:
-        """Expose a repair worker's agent run as soon as the run starts."""
-
-        unit = self.repair_work_units[unit_id]
-        unit.run_id = run_id
-        self._mark_dirty(global_state=False, sections={"repair_work_units"})
-        await self._persist()
-
-    async def finish_repair_work_unit(
-        self,
-        unit_id: str,
-        *,
-        status: RepairWorkUnitStatus,
-        detail: str,
-        run_id: str = "",
-    ) -> None:
-        unit = self.repair_work_units[unit_id]
-        unit.status = status
-        unit.queued = False
-        unit.detail = detail
-        unit.run_id = run_id
-        unit.finished_at = timestamp()
-        changed_tasks: list[TaskRecord] = []
-        for task_key in unit.task_keys:
-            task = self.tasks.get(task_key)
-            if task is None:
-                continue
-            if task.repair_work_unit_id == unit.id:
-                task.repairing = False
-                task.repair_work_unit_id = ""
-                task.updated_at = timestamp()
-                changed_tasks.append(task)
-        self.shepherd.running_units = max(0, self.shepherd.running_units - 1)
-        if status == RepairWorkUnitStatus.SUCCEEDED:
-            self.shepherd.succeeded_units += 1
-        elif status in {RepairWorkUnitStatus.FAILED, RepairWorkUnitStatus.INTERRUPTED}:
-            self.shepherd.failed_units += 1
-        self._mark_dirty(tasks=changed_tasks, sections={"repair_work_units"})
-        await self._persist()
-
-    async def finish_repair_sweep(self, sweep_id: str, *, error: str = "") -> None:
-        sweep = self.repair_sweeps[sweep_id]
-        retryable_statuses = {
-            RepairWorkUnitStatus.INTERRUPTED,
-            RepairWorkUnitStatus.PENDING,
-        }
-        waiting = any(
-            self.repair_work_units[unit_id].status in retryable_statuses
-            for unit_id in sweep.work_unit_ids
-            if unit_id in self.repair_work_units
-        )
-        sweep.status = "failed" if error else "waiting" if waiting else "completed"
-        sweep.error = error
-        sweep.finished_at = timestamp()
-        for case_id in sweep.case_ids:
-            case = self.repair_cases[case_id]
-            task = self.tasks.get(case.task_key)
-            if task is not None and task.status != TaskStatus.FAILED:
-                case.status = RepairCaseStatus.RESOLVED
-            elif waiting and case.status != RepairCaseStatus.RESOLVED:
-                case.status = RepairCaseStatus.PLANNED
-            elif case.status != RepairCaseStatus.RESOLVED:
-                case.status = RepairCaseStatus.EXHAUSTED
-            case.updated_at = timestamp()
-        self.shepherd.status = "error" if error else "idle"
-        self.shepherd.current_sweep_id = ""
-        self.shepherd.current_run_id = ""
-        self.shepherd.last_finished_at = sweep.finished_at
-        self.shepherd.last_error = error
-        self.shepherd.pending_failures = len(self.shepherd_repairable_tasks())
-        self._mark_dirty(sections={"repair_cases", "repair_sweeps"})
-        await self._persist()
 
     async def update_run(self, run: RunRecord, *, deferred: bool = False, **changes: Any) -> None:
         old_usage = run.usage

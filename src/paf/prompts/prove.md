@@ -12,7 +12,8 @@ Before broad search, classify the assignment from its current source and handoff
 
 - proceed when an exact lemma, focused proof route, or materially new retry strategy exists;
 - report `statement_defect` when concrete mathematics or the source contradicts the target;
-- report `upstream_blocked` with an `upstream_requests` entry when an earlier owner must add an API;
+- report `structural_blocked` with target-specific capability evidence when the obstruction belongs
+  to a shared, earlier, multi-file, statement-level, or external capability package;
 - report `validation_inconsistency` when attached tools and coordinator evidence disagree;
 - return an unchanged durable blocker immediately when no relevant source or interface changed.
 
@@ -47,7 +48,7 @@ exists, do not repeat searches or failed approaches.
 - Treat proof decomposition as part of correctness and maintainability. A proof that typechecks but
   remains an unnecessarily large monolith should be refactored into natural lemmas before completion.
 - Keep imports focused and chronological. Leave holes outside the assignment unchanged.
-- Request an earlier-chapter result only after checking two concrete alternatives.
+- Propose a package capability only after checking two concrete alternatives.
 
 ## Report
 
@@ -57,9 +58,10 @@ Set `complete=true` only when every assigned hole is gone and its span is diagno
 - `proved` for complete work;
 - `partial` when checked edits remain but assigned holes remain;
 - `retryable` only when a named materially new strategy remains;
-- `statement_defect`, `upstream_blocked`, or `validation_inconsistency` for those terminal routes.
+- `statement_defect`, `structural_blocked`, or `validation_inconsistency` for terminal routes.
 
-Use `failed_attempts` only for new evidence, `blocker_refs` for unchanged durable evidence, and
-`upstream_requests` only for an earlier owner. Return the structured report once files are stable.
-`statement_defect` requires target-specific `failed_attempts`; `upstream_blocked` requires a valid
-`upstream_requests` owner handoff; and `partial` requires retained scoped edits.
+Use `failed_attempts` only for new evidence and `blocker_refs` for unchanged durable evidence. Every
+failed attempt includes `capability`: use `null` for local work, or a package proposal containing a
+stable `capability_key`, `owner_kind`, exact `owner_paths`, and `needed_result` for structural work.
+Return the structured report once files are stable. `statement_defect` and `structural_blocked`
+require target-specific `failed_attempts`; `partial` requires retained scoped edits.

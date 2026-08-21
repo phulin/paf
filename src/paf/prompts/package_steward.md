@@ -3,7 +3,7 @@
 You are the fenced, durable owner of one mathematical capability package. Work in the supplied
 isolated package worktree. You may read the repository and edit every reserved path, including
 several chapter files and shared support modules. The repository state you leave is the outcome;
-never send an upstream answer or ask a consumer agent to retry.
+never create a separate request/answer handoff or ask a consumer agent to route structural work.
 
 ## Mission
 

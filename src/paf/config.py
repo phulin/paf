@@ -17,9 +17,9 @@ from paf.models import (
     BookConfig,
     Chapter,
     PipelineConfig,
-    ShepherdSettings,
     Stage,
     StageConfig,
+    StewardSettings,
     SwarmSettings,
     WorkUnit,
     as_string_dict,
@@ -546,34 +546,32 @@ def load_config(path: str | Path, *, project: Project | None = None) -> Pipeline
         raise ValueError("swarm.lean_mcp_tool_timeout_seconds must be positive")
 
     stages = _stage_configs(_table(data, "stages"), base)
-    raw_shepherd = _table(data, "shepherd")
-    shepherd = ShepherdSettings(
-        enabled=bool(raw_shepherd.get("enabled", True)),
-        model=str(raw_shepherd.get("model", "gpt-5.6-sol")),
-        reasoning_effort=str(raw_shepherd.get("reasoning_effort", "medium")),
-        worker_model=str(raw_shepherd.get("worker_model", "gpt-5.6-sol")),
-        worker_reasoning_effort=str(raw_shepherd.get("worker_reasoning_effort", "medium")),
-        interval_seconds=float(raw_shepherd.get("interval_seconds", 7200)),
-        failure_threshold=int(raw_shepherd.get("failure_threshold", 10)),
-        maximum_failures_per_sweep=int(raw_shepherd.get("maximum_failures_per_sweep", 50)),
-        maximum_work_units_per_sweep=int(raw_shepherd.get("maximum_work_units_per_sweep", 32)),
-        maximum_consecutive_no_progress_sweeps=int(
-            raw_shepherd.get(
-                "maximum_consecutive_no_progress_sweeps",
-                raw_shepherd.get("maximum_sweeps_per_invocation", 3),
-            )
-        ),
+    if "steward" in data and "shepherd" in data:
+        raise ValueError("configure [steward] or the temporary [shepherd] alias, not both")
+    raw_steward = _table(data, "steward" if "steward" in data else "shepherd")
+    removed_sweep_keys = {
+        "interval_seconds",
+        "failure_threshold",
+        "maximum_failures_per_sweep",
+        "maximum_work_units_per_sweep",
+        "maximum_consecutive_no_progress_sweeps",
+        "maximum_sweeps_per_invocation",
+    }
+    if unsupported := removed_sweep_keys.intersection(raw_steward):
+        raise ValueError(f"repair-sweep settings were removed: {', '.join(sorted(unsupported))}")
+    steward = StewardSettings(
+        enabled=bool(raw_steward.get("enabled", True)),
+        model=str(raw_steward.get("model", "gpt-5.6-sol")),
+        reasoning_effort=str(raw_steward.get("reasoning_effort", "medium")),
+        worker_model=str(raw_steward.get("worker_model", "gpt-5.6-sol")),
+        worker_reasoning_effort=str(raw_steward.get("worker_reasoning_effort", "medium")),
+        lease_ttl_seconds=float(raw_steward.get("lease_ttl_seconds", 14_400)),
+        maximum_worker_steps=int(raw_steward.get("maximum_worker_steps", 8)),
     )
-    if shepherd.interval_seconds <= 0:
-        raise ValueError("shepherd.interval_seconds must be positive")
-    if shepherd.failure_threshold < 1:
-        raise ValueError("shepherd.failure_threshold must be positive")
-    if shepherd.maximum_failures_per_sweep < 1:
-        raise ValueError("shepherd.maximum_failures_per_sweep must be positive")
-    if shepherd.maximum_work_units_per_sweep < 1:
-        raise ValueError("shepherd.maximum_work_units_per_sweep must be positive")
-    if shepherd.maximum_consecutive_no_progress_sweeps < 1:
-        raise ValueError("shepherd.maximum_consecutive_no_progress_sweeps must be positive")
+    if steward.lease_ttl_seconds <= 0:
+        raise ValueError("steward.lease_ttl_seconds must be positive")
+    if steward.maximum_worker_steps < 0:
+        raise ValueError("steward.maximum_worker_steps must be nonnegative")
 
     source_defaults, source_rules, source_discovery = _read_source_settings(data)
     if "backend" in data and "target" in data:
@@ -674,7 +672,7 @@ def load_config(path: str | Path, *, project: Project | None = None) -> Pipeline
         path=config_path,
         settings=settings,
         stages=stages,
-        shepherd=shepherd,
+        steward=steward,
         books=books,
         chapters=chapters,
         source_rules=source_rules,

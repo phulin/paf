@@ -18,20 +18,16 @@ cache_compaction_layers = 32
 lean_project = "lean"
 lean_mcp_tool_timeout_seconds = 300
 
-# The Shepherd periodically triages accumulated terminal failures with a
-# stronger read-only planner, then dispatches bounded repair units with their
-# own independently configurable model and reasoning effort.
-[shepherd]
+# The Steward owns durable capability packages and may delegate bounded plan
+# steps to package workers with an independently configurable model.
+[steward]
 enabled = true
 model = "gpt-5.6-sol"
 reasoning_effort = "medium"
 worker_model = "gpt-5.6-sol"
 worker_reasoning_effort = "medium"
-interval_seconds = 7200
-failure_threshold = 10
-maximum_failures_per_sweep = 50
-maximum_work_units_per_sweep = 32
-maximum_consecutive_no_progress_sweeps = 3
+lease_ttl_seconds = 14400
+maximum_worker_steps = 8
 
 # The backend owns all Lean target layout and toolchain settings. Target templates
 # apply to [sources]-discovered corpora and can migrate legacy [[books]] entries;

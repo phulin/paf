@@ -189,11 +189,6 @@ async def test_schema_v2_global_graphs_migrate_to_relational_rows(tmp_path: Path
             second.id: {"dependencies": [first.id], "summary": "dependent"},
         },
     }
-    state.upstream_requests["request-1"] = {
-        "id": "request-1",
-        "status": "requested",
-        "owner_chapter_id": first.id,
-    }
     await state.save()
     await state.close()
 
@@ -203,6 +198,18 @@ async def test_schema_v2_global_graphs_migrate_to_relational_rows(tmp_path: Path
         key: value
         for key, value in snapshot.items()
         if key not in {"documents", "work_units", "tasks", "source_issues"}
+    }
+    legacy_header["upstream_requests"] = {
+        "request-1": {
+            "id": "request-1",
+            "status": "requested",
+            "capability_key": "Book.LegacyCapability",
+            "owner_chapter_id": first.id,
+            "consumer_chapter_id": second.id,
+            "consumer_path": "lean/Book/Chapter02.lean",
+            "blocked_declaration": "Book.consumer",
+            "needed_result": "A legacy capability",
+        }
     }
     with sqlite3.connect(state.database_path) as connection, connection:
         connection.execute("DELETE FROM state_items")
@@ -236,11 +243,15 @@ async def test_schema_v2_global_graphs_migrate_to_relational_rows(tmp_path: Path
     assert len(header_payload) < 10_000
     assert "source_dependency_tree" not in json.loads(header_payload)
     assert edge_count == 1
-    assert request_count == 1
+    assert request_count == 0
     migrated = read_full_snapshot(config.settings.state_dir)
     assert migrated is not None
     assert migrated["source_dependency_tree"]["edges"] == [[first.id, second.id]]
-    assert migrated["upstream_requests"]["request-1"]["status"] == "requested"
+    assert "upstream_requests" not in migrated
+    assert any(
+        value["capability_key"] == "book.legacycapability"
+        for value in migrated["capability_packages"].values()
+    )
 
 
 @pytest.mark.asyncio
@@ -306,14 +317,18 @@ def test_legacy_json_checkpoint_imports_upstream_requests_into_packages_once(
     database.initialize()
     second = database.load_package_state()
 
-    imported = first.upstream_request_imports["legacy-request"]
-    assert first.packages[imported.package_id].capability_key == "book.legacy bridge"
-    assert first.consumers_for(imported.package_id)[0].declaration == "Book.consumer"
-    assert len(first.evidence_for(imported.package_id)) == 1
+    imported = next(
+        package
+        for package in first.packages.values()
+        if package.capability_key == "book.legacy bridge"
+    )
+    assert first.consumers_for(imported.id)[0].declaration == "Book.consumer"
+    assert len(first.evidence_for(imported.id)) == 1
     assert second == first
     checkpoint = read_checkpoint(state_dir)
     assert checkpoint is not None
-    assert checkpoint["upstream_requests"]["legacy-request"]["status"] == "requested"
+    assert "upstream_requests" not in checkpoint
+    assert "upstream_request_imports" not in checkpoint
 
 
 def test_explicit_project_and_paf_toml_resolve_all_project_paths(tmp_path: Path) -> None:
@@ -419,13 +434,12 @@ def test_explicit_project_works_outside_checkout_for_source_and_control_commands
         "pause",
         "resume",
         "unblock",
-        "clear-upstream-requests",
         "stop",
         "wait",
         "rpc",
     ):
         assert main(["agent", command, "--project", str(project)]) == 0
-    assert observed == [project] * 9
+    assert observed == [project] * 8
 
 
 def test_absolute_target_works_outside_checkout_and_keeps_legacy_target_semantics(

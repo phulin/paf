@@ -41,7 +41,6 @@ from paf.package_model import (
     ReservationResult,
     ReservationSpec,
     StewardLease,
-    UpstreamRequestImport,
     canonical_reservation_specs,
     normalize_capability_key,
     normalize_repository_path,
@@ -49,7 +48,7 @@ from paf.package_model import (
 
 DATABASE_NAME = "state.sqlite3"
 LEGACY_BACKUP_NAME = "state.legacy-v6.json"
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 CHANGE_RETENTION = 10_000
 
 COLLECTION_SECTIONS = frozenset(
@@ -57,18 +56,24 @@ COLLECTION_SECTIONS = frozenset(
         "scheduling",
         "fixup_requests",
         "proof_review_requests",
-        "upstream_requests",
         "proof_blockers",
         "thread_cumulative_usage",
-        "failure_records",
-        "repair_cases",
-        "repair_sweeps",
-        "repair_work_units",
         "coordinator_targets",
     }
 )
 GRAPH_SECTIONS = frozenset({"source_dependency_tree", "formalize_graph"})
 NORMALIZED_STATE_KEYS = COLLECTION_SECTIONS.difference({"coordinator_targets"}) | GRAPH_SECTIONS
+LEGACY_RUNTIME_KEYS = frozenset(
+    {
+        "shepherd",
+        "upstream_requests",
+        "upstream_request_batches",
+        "failure_records",
+        "repair_cases",
+        "repair_sweeps",
+        "repair_work_units",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -102,21 +107,16 @@ def bounded_global_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
         for key, value in snapshot.items()
         if key
         not in NORMALIZED_STATE_KEYS
+        | LEGACY_RUNTIME_KEYS
         | PACKAGE_SNAPSHOT_KEYS
         | {
             "documents",
             "work_units",
             "tasks",
             "source_issues",
-            "upstream_request_batches",
             "coordinator_build",
         }
     }
-    shepherd = header.get("shepherd")
-    if isinstance(shepherd, dict) and ({"agents", "runs"} & shepherd.keys()):
-        header["shepherd"] = {
-            key: value for key, value in shepherd.items() if key not in {"agents", "runs"}
-        }
     return header
 
 
@@ -889,6 +889,11 @@ def _create_schema(connection: sqlite3.Connection) -> None:
         _migrate_v2_globals(connection)
     _import_persisted_upstream_requests(connection)
     connection.execute(
+        "DELETE FROM state_items WHERE section IN "
+        "('upstream_requests', 'failure_records', 'repair_cases', 'repair_sweeps', "
+        "'repair_work_units')"
+    )
+    connection.execute(
         "UPDATE meta SET schema_version=? WHERE singleton=1",
         (SCHEMA_VERSION,),
     )
@@ -965,7 +970,7 @@ def _migrate_v2_globals(connection: sqlite3.Connection) -> None:
         _replace_collection(connection, section, checkpoint.get(section, {}))
     for section in GRAPH_SECTIONS:
         _replace_graph(connection, section, checkpoint.get(section, {}))
-    _import_persisted_upstream_requests(connection)
+    _import_legacy_request_mapping(connection, checkpoint.get("upstream_requests"))
     coordinator_row = connection.execute(
         "SELECT payload FROM globals WHERE key='coordinator_build'"
     ).fetchone()
@@ -1011,7 +1016,7 @@ def _upsert_normalized_checkpoint(
         _replace_collection(connection, section, checkpoint.get(section, {}))
     for section in GRAPH_SECTIONS:
         _replace_graph(connection, section, checkpoint.get(section, {}))
-    _import_persisted_upstream_requests(connection)
+    _import_legacy_request_mapping(connection, checkpoint.get("upstream_requests"))
     connection.executemany(
         """
         INSERT INTO documents(id, ordinal, payload) VALUES(?, ?, ?)
@@ -1179,19 +1184,6 @@ def _load_graph(connection: sqlite3.Connection, section: str) -> dict[str, Any]:
         )
     }
     return restore_graph(GraphSnapshot(metadata, nodes, edges), section)
-
-
-def _upstream_request_batches(requests: Any) -> dict[str, list[str]]:
-    batches: dict[str, list[str]] = {}
-    if not isinstance(requests, dict):
-        return batches
-    for request_id, request in sorted(requests.items()):
-        if not isinstance(request, dict) or request.get("status") != "requested":
-            continue
-        owner = request.get("owner_chapter_id")
-        if isinstance(owner, str) and owner:
-            batches.setdefault(owner, []).append(str(request_id))
-    return batches
 
 
 def _utc_now() -> str:
@@ -1471,7 +1463,7 @@ def _import_upstream_request(
                         )
                         if isinstance(value, str)
                     ],
-                    "legacy_request_id": request_id,
+                    "migrated": True,
                 },
                 status=consumer_status,
                 accepted_revision=(
@@ -1488,8 +1480,8 @@ def _import_upstream_request(
     evidence = PackageEvidence(
         id=evidence_id,
         package_id=package_id,
-        producer="legacy-upstream-request-importer",
-        kind=EvidenceKind.UPSTREAM_REQUEST_IMPORT,
+        producer="legacy-state-importer",
+        kind=EvidenceKind.MIGRATION,
         paths=write_scope,
         declarations=tuple(
             value
@@ -1499,7 +1491,7 @@ def _import_upstream_request(
             )
             if value
         ),
-        payload={"request_id": request_id, "request": request},
+        payload={"migration_source": "legacy_state"},
         digest=_content_digest(request),
         created_at=now,
     )
@@ -1525,6 +1517,18 @@ def _import_persisted_upstream_requests(connection: sqlite3.Connection) -> dict[
         if isinstance(value, dict):
             imported[str(request_id)] = _import_upstream_request(connection, str(request_id), value)
     return imported
+
+
+def _import_legacy_request_mapping(connection: sqlite3.Connection, requests: Any) -> dict[str, str]:
+    """Import once at the persistence boundary without hydrating legacy runtime state."""
+
+    if not isinstance(requests, dict):
+        return {}
+    return {
+        str(request_id): _import_upstream_request(connection, str(request_id), request)
+        for request_id, request in sorted(requests.items(), key=lambda item: str(item[0]))
+        if isinstance(request_id, str) and isinstance(request, dict)
+    }
 
 
 def _group_ordered_items(
@@ -1779,19 +1783,6 @@ def _load_package_state(connection: sqlite3.Connection) -> PackageState:
             FROM integration_journal ORDER BY created_at, id"""
         )
     }
-    imports = {
-        str(row[0]): UpstreamRequestImport(
-            request_id=str(row[0]),
-            package_id=str(row[1]),
-            evidence_id=str(row[2]),
-            source_digest=str(row[3]),
-            imported_at=str(row[4]),
-        )
-        for row in connection.execute(
-            """SELECT request_id, package_id, evidence_id, source_digest, imported_at
-            FROM upstream_request_imports ORDER BY imported_at, request_id"""
-        )
-    }
     return PackageState(
         packages=packages,
         consumers=consumers,
@@ -1802,7 +1793,6 @@ def _load_package_state(connection: sqlite3.Connection) -> PackageState:
         dependencies=dependencies,
         relevant_read_interfaces=read_interfaces,
         integration_journal=journals,
-        upstream_request_imports=imports,
     )
 
 
@@ -1819,10 +1809,6 @@ def _hydrate_normalized_state(
     for section in GRAPH_SECTIONS:
         if section in selected:
             checkpoint[section] = _load_graph(connection, section)
-    if "upstream_requests" in selected:
-        checkpoint["upstream_request_batches"] = _upstream_request_batches(
-            checkpoint.get("upstream_requests")
-        )
 
 
 def _migrate_v1(connection: sqlite3.Connection) -> None:
@@ -1941,7 +1927,7 @@ def initialize_database(state_dir: Path) -> Path:
             if version == 1:
                 with connection:
                     _migrate_v1(connection)
-            elif version in {2, 3, 4, 5}:
+            elif version in {2, 3, 4, 5, 6}:
                 with connection:
                     _create_schema(connection)
             elif version != SCHEMA_VERSION:
@@ -2288,15 +2274,11 @@ class StateDatabase:
         with _connect(self.path) as connection:
             return _load_package_state(connection)
 
-    def import_upstream_requests(self, requests: dict[str, dict[str, Any]]) -> dict[str, str]:
+    def import_legacy_upstream_state(self, requests: dict[str, dict[str, Any]]) -> dict[str, str]:
         """Import legacy requests once; later legacy mutations are deliberately ignored."""
 
         with _connect(self.path) as connection, connection:
-            return {
-                request_id: _import_upstream_request(connection, request_id, request)
-                for request_id, request in sorted(requests.items())
-                if isinstance(request_id, str) and isinstance(request, dict)
-            }
+            return _import_legacy_request_mapping(connection, requests)
 
     @staticmethod
     def _assert_package_revision(
@@ -2513,6 +2495,98 @@ class StateDatabase:
                 ),
             )
             return _load_package_state(connection).packages[package_id]
+
+    def park_capability_package(self, package_id: str, *, reason: str) -> CapabilityPackage:
+        """Fence active work, release paths, and park a package by operator decision."""
+
+        reason = reason.strip()
+        if not reason:
+            raise ValueError("parking a package requires a reason")
+        with _connect(self.path) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            state = _load_package_state(connection)
+            package = state.packages.get(package_id)
+            if package is None:
+                raise KeyError(package_id)
+            if package.status in {
+                PackageStatus.COMPLETE,
+                PackageStatus.DECOMPOSED,
+                PackageStatus.EXTERNAL,
+                PackageStatus.SUPERSEDED,
+            }:
+                raise ValueError(f"cannot park terminal package {package_id}")
+            lease = state.leases.get(package_id)
+            fence_generation = (lease.generation if lease is not None else 0) + 1
+            connection.execute("DELETE FROM steward_leases WHERE package_id=?", (package_id,))
+            connection.execute(
+                """INSERT INTO steward_lease_fences VALUES(?, ?)
+                ON CONFLICT(package_id) DO UPDATE SET
+                    generation=max(generation, excluded.generation)""",
+                (package_id, fence_generation),
+            )
+            connection.execute(
+                "DELETE FROM path_reservations WHERE owner_kind='package' AND owner_id=?",
+                (package_id,),
+            )
+            connection.execute(
+                "DELETE FROM path_reservation_queue WHERE owner_kind='package' AND owner_id=?",
+                (package_id,),
+            )
+            now = _utc_now()
+            evidence = PackageEvidence(
+                id=_stable_record_id("operator-park", package_id, now),
+                package_id=package_id,
+                producer="operator",
+                kind=EvidenceKind.OPERATOR_DECISION,
+                payload={"action": "park", "reason": reason},
+                digest=_content_digest({"action": "park", "reason": reason}),
+                created_at=now,
+            )
+            _insert_evidence(connection, evidence)
+            connection.execute(
+                """UPDATE capability_packages SET status=?, disposition=?, revision=revision+1,
+                    updated_at=? WHERE id=?""",
+                (str(PackageStatus.PARKED), str(PackageDisposition.PARKED), now, package_id),
+            )
+            self._wake_waiting_reservation_packages(connection, now)
+            connection.commit()
+        return self.load_package_state().packages[package_id]
+
+    def resume_capability_package(self, package_id: str, *, reason: str = "") -> CapabilityPackage:
+        """Return an operator-parked package to the runnable lifecycle."""
+
+        with _connect(self.path) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            state = _load_package_state(connection)
+            package = state.packages.get(package_id)
+            if package is None:
+                raise KeyError(package_id)
+            if package.status is not PackageStatus.PARKED:
+                raise ValueError(f"package {package_id} is not parked")
+            if package_id in state.leases:
+                raise ValueError(f"parked package {package_id} unexpectedly has a Steward lease")
+            now = _utc_now()
+            target = PackageStatus.PLANNED if package.plan_revision else PackageStatus.OBSERVED
+            payload = {"action": "resume", "reason": reason.strip()}
+            _insert_evidence(
+                connection,
+                PackageEvidence(
+                    id=_stable_record_id("operator-resume", package_id, now),
+                    package_id=package_id,
+                    producer="operator",
+                    kind=EvidenceKind.OPERATOR_DECISION,
+                    payload=payload,
+                    digest=_content_digest(payload),
+                    created_at=now,
+                ),
+            )
+            connection.execute(
+                """UPDATE capability_packages SET status=?, disposition=NULL,
+                    revision=revision+1, updated_at=? WHERE id=?""",
+                (str(target), now, package_id),
+            )
+            connection.commit()
+        return self.load_package_state().packages[package_id]
 
     def add_capability_alias(
         self,
@@ -4115,8 +4189,6 @@ class StateDatabase:
                             for key, (ordinal, payload) in delta.upserts.items()
                         ),
                     )
-                if "upstream_requests" in write.collections:
-                    _import_persisted_upstream_requests(connection)
                 for section, delta in write.graphs.items():
                     connection.executemany(
                         "DELETE FROM graph_metadata WHERE graph=? AND key=?",
@@ -4484,6 +4556,7 @@ class StateDatabase:
                     globals_["revision"] = current
                     if current_row is not None:
                         globals_["updated_at"] = str(current_row[1])
+                    globals_.update(_load_package_state(connection).as_dict())
                 normalized_ids = global_ids.intersection(NORMALIZED_STATE_KEYS)
                 _hydrate_normalized_state(connection, globals_, sections=normalized_ids)
                 if "coordinator_build" in global_ids:

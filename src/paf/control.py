@@ -13,6 +13,7 @@ from typing import Any
 from paf import json_codec as json
 from paf.corpus import scheduling_summary
 from paf.models import Stage
+from paf.package_model import PackageState
 from paf.scheduler import Orchestrator
 from paf.state import TaskStatus, timestamp
 from paf.state_db import DATABASE_NAME, read_status_view
@@ -71,6 +72,46 @@ def state_summary(
     if full:
         response["snapshot"] = snapshot
     return response
+
+
+def _package_view(state: PackageState, package_id: str) -> dict[str, Any]:
+    snapshot = state.as_dict()
+    package = snapshot["capability_packages"].get(package_id)
+    if not isinstance(package, dict):
+        raise ValueError(f"unknown capability package: {package_id}")
+    return package | {
+        "consumers": [
+            value
+            for value in snapshot["package_consumers"].values()
+            if value.get("package_id") == package_id
+        ],
+        "steps": [
+            value
+            for value in snapshot["package_steps"].values()
+            if value.get("package_id") == package_id
+        ],
+        "evidence": [
+            value
+            for value in snapshot["package_evidence"].values()
+            if value.get("package_id") == package_id
+        ],
+        "lease": snapshot["steward_leases"].get(package_id),
+        "reservations": [
+            value
+            for value in snapshot["path_reservations"].values()
+            if value.get("package_id") == package_id
+        ],
+        "dependencies": [
+            value
+            for value in snapshot["package_dependencies"]
+            if value.get("package_id") == package_id
+        ],
+        "integration": [
+            value
+            for value in snapshot["integration_journal"].values()
+            if value.get("package_id") == package_id
+        ],
+    }
 
 
 class ControlServer:
@@ -233,21 +274,68 @@ class ControlServer:
                     "unblocked": len(tasks),
                     "unblocked_tasks": tasks,
                 }
-            elif command == "clear-upstream-requests":
-                chapter = request.get("chapter")
-                if chapter is None:
-                    chapter_ids = None
-                elif isinstance(chapter, str) and chapter:
-                    chapter_ids = (self.orchestrator.resolve_work_unit_id(chapter),)
+            elif command in {"package-list", "package-inspect"}:
+                state = self.orchestrator.state._database.load_package_state()
+                if command == "package-list":
+                    packages = [
+                        _package_view(state, package_id) for package_id in sorted(state.packages)
+                    ]
+                    response = {"protocol_version": PROTOCOL_VERSION, "packages": packages}
                 else:
-                    raise ValueError("clear-upstream-requests chapter must be a non-empty string")
-                requests = await self.orchestrator.state.clear_upstream_requests(chapter_ids)
-                response = self._status() | {
-                    "cleared": len(requests),
-                    "cleared_upstream_requests": requests,
+                    package_id = request.get("package_id")
+                    if not isinstance(package_id, str) or not package_id:
+                        raise ValueError("package-inspect requires package_id")
+                    response = {
+                        "protocol_version": PROTOCOL_VERSION,
+                        "package": _package_view(state, package_id),
+                    }
+            elif command in {"package-park", "package-resume", "package-recover"}:
+                package_id = request.get("package_id")
+                if not isinstance(package_id, str) or not package_id:
+                    raise ValueError(f"{command} requires package_id")
+                reason = request.get("reason", "")
+                if not isinstance(reason, str):
+                    raise ValueError(f"{command} reason must be a string")
+                database = self.orchestrator.state._database
+                if command == "package-park":
+                    task = self.orchestrator._package_tasks.pop(package_id, None)
+                    if task is not None:
+                        task.cancel()
+                        await asyncio.gather(task, return_exceptions=True)
+                    package = await asyncio.to_thread(
+                        database.park_capability_package, package_id, reason=reason
+                    )
+                elif command == "package-resume":
+                    package = await asyncio.to_thread(
+                        database.resume_capability_package, package_id, reason=reason
+                    )
+                    if self.orchestrator.config.steward.enabled:
+                        await self.orchestrator._schedule_ready_packages()
+                else:
+                    current = database.load_package_state().packages.get(package_id)
+                    if current is None:
+                        raise ValueError(f"unknown capability package: {package_id}")
+                    lease, _recovery, _snapshot = await asyncio.to_thread(
+                        self.orchestrator.package_execution.worktrees.recover,
+                        current,
+                        f"operator-recovery-{package_id}",
+                        expected_revision=current.revision,
+                        ttl_seconds=self.orchestrator.package_execution.lease_ttl_seconds,
+                    )
+                    await asyncio.to_thread(
+                        database.release_steward_lease,
+                        package_id,
+                        lease.agent_id,
+                        lease.generation,
+                    )
+                    package = database.load_package_state().packages[package_id]
+                    if self.orchestrator.config.steward.enabled:
+                        await self.orchestrator._schedule_ready_packages()
+                await self.orchestrator.state.refresh_package_state()
+                response = {
+                    "protocol_version": PROTOCOL_VERSION,
+                    "package": _package_view(database.load_package_state(), package.id),
                 }
-                if chapter_ids is not None:
-                    response["chapter_id"] = chapter_ids[0]
             elif command == "retry":
                 chapter = request.get("chapter")
                 if chapter is None:
@@ -366,7 +454,7 @@ class ControlServer:
                 response = self._status()
             else:
                 raise ValueError(f"unknown command: {command}")
-        except (json.JSONDecodeError, ValueError) as error:
+        except (json.JSONDecodeError, KeyError, ValueError) as error:
             response = {"protocol_version": PROTOCOL_VERSION, "error": str(error)}
         serialized = (
             await asyncio.to_thread(json.dumpb, response, sort_keys=True)

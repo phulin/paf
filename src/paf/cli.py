@@ -22,6 +22,7 @@ from paf.config import infer_corpus, resolve_config
 from paf.control import (
     LOG_NAME,
     ControlServer,
+    _package_view,
     control_socket,
     offline_status,
     send_command,
@@ -34,6 +35,7 @@ from paf.corpus import (
 from paf.display import activity_kind_badge, format_count, format_usage
 from paf.isolation import fuse_overlay_available
 from paf.models import PipelineConfig, Stage, WorkUnitLike
+from paf.package_runtime import PackageWorktreeManager
 from paf.pricing import LEGACY_MODEL, CostEstimate, estimate_cost, format_usd
 from paf.project import Project, ProjectResolver
 from paf.scheduler import Orchestrator, scaffold_directories
@@ -55,6 +57,7 @@ COMMAND_NAMES = {
     "plan",
     "status",
     "source-issues",
+    "package",
     "web",
     "scaffold",
     "stage",
@@ -161,6 +164,23 @@ def parser() -> argparse.ArgumentParser:
     _add_source(source_issues)
     source_issues.add_argument("--json", action="store_true", help="print the raw ledger")
 
+    package = commands.add_parser("package", help="inspect and operate on capability packages")
+    _add_source(package)
+    package_commands = package.add_subparsers(dest="package_command", required=True)
+    package_commands.add_parser("list", help="list capability packages")
+    inspect_package = package_commands.add_parser("inspect", help="show one package dossier")
+    inspect_package.add_argument("package_id")
+    park_package = package_commands.add_parser("park", help="fence and park one package")
+    park_package.add_argument("package_id")
+    park_package.add_argument("--reason", required=True)
+    resume_package = package_commands.add_parser("resume", help="resume one parked package")
+    resume_package.add_argument("package_id")
+    resume_package.add_argument("--reason", default="")
+    recover_package = package_commands.add_parser(
+        "recover", help="fence stale ownership and preserve the package worktree"
+    )
+    recover_package.add_argument("package_id")
+
     web = commands.add_parser("web", help="serve the project dashboard and JSON API")
     web.add_argument(
         "project",
@@ -245,7 +265,6 @@ def parser() -> argparse.ArgumentParser:
         ("pause", "pause before new chapter attempts"),
         ("resume", "release paused chapter attempts"),
         ("unblock", "reset blocked tasks to pending"),
-        ("clear-upstream-requests", "close all outstanding upstream requests"),
         ("stop", "cancel the pipeline and active subprocesses"),
         ("wait", "block until the managed pipeline exits"),
     ):
@@ -256,11 +275,6 @@ def parser() -> argparse.ArgumentParser:
                 "--output",
                 type=Path,
                 help="explicitly export the complete snapshot to this JSON file",
-            )
-        if name == "clear-upstream-requests":
-            command.add_argument(
-                "--chapter",
-                help="close requests only for this chapter id or unambiguous number",
             )
     retry = agent_commands.add_parser(
         "retry", help="retry one live chapter agent or reset all failed tasks"
@@ -1182,40 +1196,49 @@ def _control_response(
                     "updated_at": state.updated_at,
                     "tasks": counts,
                 }
-        elif command == "clear-upstream-requests":
-            if read_checkpoint(config.settings.state_dir) is None:
-                response = offline_status(config.settings.state_dir) | {
-                    "cleared": 0,
-                    "cleared_upstream_requests": [],
+        elif command.startswith("package-"):
+            database = StateDatabase(config.settings.state_dir)
+            database.initialize()
+            package_state = database.load_package_state()
+            package_parameters = parameters or {}
+            package_id = str(package_parameters.get("package_id", ""))
+            if command == "package-list":
+                response = {
+                    "packages": [
+                        _package_view(package_state, value)
+                        for value in sorted(package_state.packages)
+                    ]
                 }
-            else:
-                state = StateStore(config)
-
-                chapter_ids = (
-                    tuple(
-                        unit.id
-                        for unit in select_work_units(
-                            config,
-                            document_ids=(),
-                            unit_selectors=(str(parameters["chapter"]),),
-                        )
-                    )
-                    if parameters and parameters.get("chapter") is not None
-                    else None
+            elif command == "package-inspect":
+                response = {"package": _package_view(package_state, package_id)}
+            elif command == "package-park":
+                package = database.park_capability_package(
+                    package_id, reason=str(package_parameters.get("reason", ""))
                 )
-
-                async def clear_upstream_requests() -> list[str]:
-                    await state.load_or_create()
-                    return await state.clear_upstream_requests(chapter_ids)
-
-                requests = asyncio.run(clear_upstream_requests())
-                response = offline_status(config.settings.state_dir) | {
-                    "cleared": len(requests),
-                    "cleared_upstream_requests": requests,
-                    "updated_at": state.updated_at,
-                }
-                if chapter_ids is not None:
-                    response["chapter_id"] = chapter_ids[0]
+                response = {"package": _package_view(database.load_package_state(), package.id)}
+            elif command == "package-resume":
+                package = database.resume_capability_package(
+                    package_id, reason=str(package_parameters.get("reason", ""))
+                )
+                response = {"package": _package_view(database.load_package_state(), package.id)}
+            elif command == "package-recover":
+                current = package_state.packages.get(package_id)
+                if current is None:
+                    raise ValueError(f"unknown capability package: {package_id}") from None
+                manager = PackageWorktreeManager(
+                    config.settings.repo, config.settings.state_dir, database
+                )
+                lease, _recovery, _snapshot = manager.recover(
+                    current,
+                    f"operator-recovery-{package_id}",
+                    expected_revision=current.revision,
+                    ttl_seconds=config.steward.lease_ttl_seconds,
+                )
+                database.release_steward_lease(package_id, lease.agent_id, lease.generation)
+                response = {"package": _package_view(database.load_package_state(), package_id)}
+            else:
+                raise ValueError(f"unknown package command: {command}") from None
+            response = offline_status(config.settings.state_dir) | response
         elif command == "retry" and not parameters:
             if read_checkpoint(config.settings.state_dir) is None:
                 response = offline_status(config.settings.state_dir) | {
@@ -1263,7 +1286,11 @@ def _agent_rpc(config: PipelineConfig) -> int:
         "resume",
         "retry",
         "unblock",
-        "clear-upstream-requests",
+        "package-list",
+        "package-inspect",
+        "package-park",
+        "package-resume",
+        "package-recover",
         "stop",
         "wait",
         "inspect",
@@ -1285,20 +1312,17 @@ def _agent_rpc(config: PipelineConfig) -> int:
                 )
             else:
                 parameters = None
-                if (
-                    request["command"]
-                    in {
-                        "retry",
-                        "clear-upstream-requests",
-                    }
-                    and "chapter" in request
-                ):
+                if request["command"] == "retry" and "chapter" in request:
                     parameters = {"chapter": request["chapter"]}
                 elif request["command"] == "state":
                     parameters = {
                         key: request[key]
                         for key in ("chapter", "stage", "state", "detail")
                         if key in request
+                    }
+                elif str(request["command"]).startswith("package-"):
+                    parameters = {
+                        key: request[key] for key in ("package_id", "reason") if key in request
                     }
                 response = _control_response(str(request["command"]), config, parameters=parameters)
         except (json.JSONDecodeError, ValueError) as error:
@@ -1318,7 +1342,7 @@ def _agent_command(args: argparse.Namespace, config: PipelineConfig) -> int:
         return _agent_rpc(config)
     if command == "inspect":
         return _inspect_agent(args, config)
-    if command in {"retry", "clear-upstream-requests"} and args.chapter is not None:
+    if command == "retry" and args.chapter is not None:
         parameters = {"chapter": args.chapter}
     elif command == "state":
         parameters = {
@@ -1344,6 +1368,22 @@ def _agent_command(args: argparse.Namespace, config: PipelineConfig) -> int:
         if response.get("result") is None:
             return 2
         return 0 if response["result"] else 1
+    return 0
+
+
+def _package_command(args: argparse.Namespace, config: PipelineConfig) -> int:
+    action = str(args.package_command)
+    command = f"package-{action}"
+    parameters = (
+        None
+        if action == "list"
+        else {
+            "package_id": args.package_id,
+            **({"reason": args.reason} if action in {"park", "resume"} else {}),
+        }
+    )
+    response = _control_response(command, config, parameters=parameters)
+    print(json.dumps(response, sort_keys=True))
     return 0
 
 
@@ -1383,6 +1423,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0
         if arguments.command == "agent":
             return _agent_command(arguments, config)
+        if arguments.command == "package":
+            return _package_command(arguments, config)
         if arguments.command == "plan":
             print_plan(config, console)
             return 0

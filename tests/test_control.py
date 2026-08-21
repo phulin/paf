@@ -1,6 +1,7 @@
 import asyncio
 import json
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -8,6 +9,7 @@ import pytest
 from paf.config import load_config
 from paf.control import ControlServer, control_socket, offline_status, send_command
 from paf.models import Stage
+from paf.package_model import CapabilityPackage
 from paf.scheduler import Orchestrator, RunControl
 from paf.state import StateStore, TaskStatus
 from tests.support import write_project
@@ -41,6 +43,7 @@ async def test_control_server_accepts_bash_friendly_commands(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    config = replace(config, steward=replace(config.steward, enabled=False))
     state = StateStore(config)
     control = RunControl()
     orchestrator = Orchestrator(config, state, control=control)
@@ -74,39 +77,39 @@ async def test_control_server_accepts_bash_friendly_commands(
     assert unblocked["unblocked_tasks"] == ["book/chapter-01:review"]
     assert unblocked["tasks"]["blocked"] == 0
     assert state.task(config.chapters[0].id, Stage.REVIEW).status == TaskStatus.PENDING
-    request_id, _ = await state.enqueue_upstream_request(
-        {
-            "blocked_declaration": "target",
-            "consumer_path": "lean/Book/Chapter01.lean",
-            "needed_result": "a helper lemma",
-        },
-        consumer_chapter_id=config.chapters[0].id,
-        origin_run_id="proof-run",
-        owner_chapter_id=config.chapters[0].id,
-        previous_attempts="attempt one",
+    package, _ = await state.create_or_attach_capability_package(
+        CapabilityPackage(
+            id="package-control",
+            capability_key="book.control",
+            title="Control package",
+            mathematical_objective="Exercise package controls",
+            write_scope=("lean/Book/Chapter01.lean",),
+            expansion_scope=("lean/Book/Chapter01.lean",),
+        )
     )
-    other_request_id, _ = await state.enqueue_upstream_request(
-        {
-            "blocked_declaration": "other-target",
-            "consumer_path": "lean/Book/Chapter02.lean",
-            "needed_result": "another helper lemma",
-        },
-        consumer_chapter_id=config.chapters[1].id,
-        origin_run_id="other-proof-run",
-        owner_chapter_id=config.chapters[0].id,
-        previous_attempts="other attempt",
-    )
-    cleared = await asyncio.to_thread(
+    listed = await asyncio.to_thread(send_command, config.settings.state_dir, "package-list")
+    assert [item["id"] for item in listed["packages"]] == [package.id]
+    inspected = await asyncio.to_thread(
         send_command,
         config.settings.state_dir,
-        "clear-upstream-requests",
-        parameters={"chapter": config.chapters[0].id},
+        "package-inspect",
+        parameters={"package_id": package.id},
     )
-    assert cleared["cleared"] == 1
-    assert cleared["cleared_upstream_requests"] == [request_id]
-    assert cleared["chapter_id"] == config.chapters[0].id
-    assert state.upstream_requests[request_id]["status"] == "closed"
-    assert state.upstream_requests[other_request_id]["status"] == "requested"
+    assert inspected["package"]["mathematical_objective"] == "Exercise package controls"
+    parked = await asyncio.to_thread(
+        send_command,
+        config.settings.state_dir,
+        "package-park",
+        parameters={"package_id": package.id, "reason": "operator pause"},
+    )
+    assert parked["package"]["status"] == "parked"
+    resumed_package = await asyncio.to_thread(
+        send_command,
+        config.settings.state_dir,
+        "package-resume",
+        parameters={"package_id": package.id, "reason": "operator resume"},
+    )
+    assert resumed_package["package"]["status"] == "observed"
     paused = await asyncio.to_thread(send_command, config.settings.state_dir, "pause")
     assert paused["status"] == "paused"
     resumed = await asyncio.to_thread(send_command, config.settings.state_dir, "resume")

@@ -215,9 +215,6 @@ async def test_transient_wait_does_not_write_descendant_task_rows(tmp_path, monk
         ]
         == "blocked"
     )
-    assert [record.task_key for record in state.shepherd_failure_records()] == [
-        state.key(owner.id, Stage.FORMALIZE)
-    ]
     with sqlite3.connect(state.database_path) as connection:
         descendant_writes = connection.execute(
             """
@@ -485,7 +482,6 @@ async def test_structured_wait_and_direct_failure_survive_restart(tmp_path) -> N
         (requirement,),
         "waiting for diagnostic owner",
     )
-    failure_id = state.shepherd_failure_records()[0].id
     await state.close()
 
     recovered = StateStore(load_config(config_path))
@@ -493,7 +489,6 @@ async def test_structured_wait_and_direct_failure_survive_restart(tmp_path) -> N
     consumer_task = recovered.task(consumer.id, Stage.FORMALIZE)
     assert consumer_task.status == TaskStatus.PENDING
     assert consumer_task.waiting_on == (requirement,)
-    assert recovered.shepherd_failure_records()[0].id == failure_id
     assert recovered.failure_roots(consumer_task) == (recovered.key(owner.id, Stage.FORMALIZE),)
     await recovered.close()
 
