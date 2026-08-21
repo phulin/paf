@@ -1,5 +1,5 @@
-import { Boxes, GitBranch, KeyRound, X } from "lucide-react";
-import type { ReactNode } from "react";
+import { Boxes, GitBranch, KeyRound, Network, ShieldCheck, X } from "lucide-react";
+import { Children, type ReactNode } from "react";
 import { useMemo, useState } from "react";
 import { IconButton } from "../../components/Controls";
 import { timeAgo } from "../../lib/format";
@@ -8,8 +8,9 @@ import type { CapabilityPackage, SwarmState } from "../../types";
 export function PackageInspector({ state, close }: { state: SwarmState; close: () => void }) {
   const packages = useMemo(
     () =>
-      Object.values(state.capability_packages ?? {}).sort((a, b) =>
-        b.updated_at.localeCompare(a.updated_at),
+      Object.values(state.capability_packages ?? {}).sort(
+        (a, b) =>
+          packageRank(a.status) - packageRank(b.status) || b.updated_at.localeCompare(a.updated_at),
       ),
     [state.capability_packages],
   );
@@ -55,14 +56,22 @@ export function PackageInspector({ state, close }: { state: SwarmState; close: (
               </div>
             )}
           </nav>
-          {selected && <PackageDetail state={state} value={selected} />}
+          {selected && <PackageDetail state={state} value={selected} select={setSelectedId} />}
         </div>
       </aside>
     </div>
   );
 }
 
-function PackageDetail({ state, value }: { state: SwarmState; value: CapabilityPackage }) {
+function PackageDetail({
+  state,
+  value,
+  select,
+}: {
+  state: SwarmState;
+  value: CapabilityPackage;
+  select: (id: string) => void;
+}) {
   const consumers = Object.values(state.package_consumers ?? {}).filter(
     (item) => item.package_id === value.id,
   );
@@ -81,7 +90,24 @@ function PackageDetail({ state, value }: { state: SwarmState; value: CapabilityP
   const integrations = Object.values(state.integration_journal ?? {}).filter(
     (item) => item.package_id === value.id,
   );
+  const interfaces = (state.relevant_read_interfaces ?? []).filter(
+    (item) => item.package_id === value.id,
+  );
+  const children = Object.values(state.capability_packages ?? {}).filter(
+    (item) => item.parent_package_id === value.id,
+  );
   const lease = state.steward_leases?.[value.id];
+  const completedSteps = steps.filter((item) => item.status === "complete").length;
+  const openConsumers = consumers.filter((item) => item.status === "open").length;
+  const latestIntegration = [...integrations].sort((a, b) =>
+    b.updated_at.localeCompare(a.updated_at),
+  )[0];
+  const attention = packageAttention(
+    value,
+    lease?.agent_id,
+    dependencies.length,
+    latestIntegration?.phase,
+  );
   return (
     <section className="package-detail">
       <header>
@@ -92,7 +118,23 @@ function PackageDetail({ state, value }: { state: SwarmState; value: CapabilityP
           revision {value.revision} · plan {value.plan_revision}
           {value.updated_at ? ` · ${timeAgo(value.updated_at)}` : ""}
         </small>
+        {(value.base_revision || value.integrated_revision) && (
+          <small>
+            base {shortRevision(value.base_revision) || "unknown"}
+            {value.integrated_revision
+              ? ` · integrated ${shortRevision(value.integrated_revision)}`
+              : " · not integrated"}
+          </small>
+        )}
       </header>
+      <div className="package-attention">
+        <span>Current handoff</span>
+        <strong>{attention}</strong>
+        <small>
+          {completedSteps}/{steps.length} steps complete · {openConsumers} consumer
+          {openConsumers === 1 ? "" : "s"} still open
+        </small>
+      </div>
       <div className="package-facts">
         <span>
           <strong>{consumers.length}</strong> consumers
@@ -112,8 +154,8 @@ function PackageDetail({ state, value }: { state: SwarmState; value: CapabilityP
           <article>
             <strong>{lease.agent_id}</strong>
             <span>
-              generation {lease.generation} · heartbeat {timeAgo(lease.heartbeat_at)} · expires{" "}
-              {timeAgo(lease.expires_at)}
+              fence {lease.generation} · acquired {timeAgo(lease.acquired_at)} · heartbeat{" "}
+              {timeAgo(lease.heartbeat_at)} · expires {relativeDeadline(lease.expires_at)}
             </span>
           </article>
         )}
@@ -123,9 +165,11 @@ function PackageDetail({ state, value }: { state: SwarmState; value: CapabilityP
           <article key={item.id}>
             <strong>{item.declaration || item.work_unit_id}</strong>
             <span>
-              {item.status} · {item.path}
+              {item.status} · {item.stage} · {item.path}
             </span>
             <code>{item.residual_goal}</code>
+            {item.accepted_revision && <p>accepted at {shortRevision(item.accepted_revision)}</p>}
+            {!!item.blocker_ids.length && <p>blockers: {item.blocker_ids.join(", ")}</p>}
           </article>
         ))}
       </PackageSection>
@@ -138,6 +182,16 @@ function PackageDetail({ state, value }: { state: SwarmState; value: CapabilityP
               {item.assigned_worker_id ? ` · ${item.assigned_worker_id}` : ""}
             </span>
             <p>{item.intended_declarations.join(", ") || item.intended_paths.join(", ")}</p>
+            {!!item.depends_on_step_ids.length && (
+              <p>after: {item.depends_on_step_ids.join(", ")}</p>
+            )}
+            {!!item.commit_ids.length && (
+              <p>commits: {item.commit_ids.map(shortRevision).join(", ")}</p>
+            )}
+            {item.remaining_gap && <code>gap: {item.remaining_gap}</code>}
+            {!!Object.keys(item.validation_contract).length && (
+              <code>acceptance: {compactJson(item.validation_contract)}</code>
+            )}
           </article>
         ))}
       </PackageSection>
@@ -149,6 +203,7 @@ function PackageDetail({ state, value }: { state: SwarmState; value: CapabilityP
               {item.producer} · {item.created_at ? timeAgo(item.created_at) : ""}
             </span>
             <p>{item.declarations.join(", ") || item.paths.join(", ")}</p>
+            {!!Object.keys(item.payload).length && <code>{compactJson(item.payload)}</code>}
           </article>
         ))}
       </PackageSection>
@@ -167,8 +222,43 @@ function PackageDetail({ state, value }: { state: SwarmState; value: CapabilityP
         ))}
         {dependencies.map((item) => (
           <article key={item.depends_on_package_id}>
-            <strong>Depends on {item.depends_on_package_id}</strong>
+            <button className="package-link" onClick={() => select(item.depends_on_package_id)}>
+              Depends on {packageName(state, item.depends_on_package_id)}
+            </button>
             <span>{item.required_revision || "any accepted revision"}</span>
+          </article>
+        ))}
+      </PackageSection>
+      <PackageSection
+        title="Ownership topology"
+        icon={<Network size={14} />}
+        empty="Standalone package"
+      >
+        {value.parent_package_id && (
+          <article>
+            <button className="package-link" onClick={() => select(value.parent_package_id!)}>
+              Parent: {packageName(state, value.parent_package_id)}
+            </button>
+          </article>
+        )}
+        {children.map((item) => (
+          <article key={item.id}>
+            <button className="package-link" onClick={() => select(item.id)}>
+              Child: {item.title}
+            </button>
+            <span>
+              {item.status} · {item.capability_key}
+            </span>
+          </article>
+        ))}
+      </PackageSection>
+      <PackageSection title="Read interfaces" empty="No external interface fingerprints">
+        {interfaces.map((item) => (
+          <article key={item.interface_id}>
+            <strong>{item.interface_id}</strong>
+            <span>
+              {shortRevision(item.digest)} · source {shortRevision(item.source_revision)}
+            </span>
           </article>
         ))}
       </PackageSection>
@@ -177,14 +267,105 @@ function PackageDetail({ state, value }: { state: SwarmState; value: CapabilityP
           <article key={item.id}>
             <strong>{item.phase}</strong>
             <span>
-              {item.candidate_revision || "candidate pending"} →{" "}
-              {item.canonical_revision_after || item.canonical_revision_before}
+              fence {item.lease_generation} ·{" "}
+              {shortRevision(item.candidate_revision) || "candidate pending"} →{" "}
+              {shortRevision(item.canonical_revision_after || item.canonical_revision_before)}
             </span>
+            {item.validation_digest && <p>validation {shortRevision(item.validation_digest)}</p>}
+            {!!item.provisional_consumer_ids.length && (
+              <p>provisional: {item.provisional_consumer_ids.join(", ")}</p>
+            )}
           </article>
         ))}
       </PackageSection>
+      <PackageSection
+        title="Placement and scope"
+        icon={<ShieldCheck size={14} />}
+        empty="No scope recorded"
+      >
+        {value.aliases.map((item) => (
+          <article key={item}>
+            <span>alias · {item}</span>
+          </article>
+        ))}
+        {value.textbook_refs.map((item) => (
+          <article key={item}>
+            <strong>{item}</strong>
+          </article>
+        ))}
+        {value.write_scope.map((item) => (
+          <article key={item}>
+            <strong>write · {item}</strong>
+          </article>
+        ))}
+        {value.expansion_scope.map((item) => (
+          <article key={item}>
+            <span>may expand · {item}</span>
+          </article>
+        ))}
+        {(value.branch || value.worktree) && (
+          <article>
+            <span>
+              {value.branch} · {value.worktree}
+            </span>
+          </article>
+        )}
+      </PackageSection>
     </section>
   );
+}
+
+const TERMINAL = new Set([
+  "complete",
+  "decomposed",
+  "external",
+  "statement_revision_required",
+  "parked",
+  "superseded",
+]);
+
+function packageRank(status: string): number {
+  if (status === "waiting_dependency" || status === "waiting_reservation") return 1;
+  return TERMINAL.has(status) ? 2 : 0;
+}
+
+function packageAttention(
+  value: CapabilityPackage,
+  steward: string | undefined,
+  dependencies: number,
+  integrationPhase: string | undefined,
+): string {
+  if (value.status === "waiting_dependency")
+    return `Blocked on ${dependencies} package ${dependencies === 1 ? "dependency" : "dependencies"}`;
+  if (value.status === "waiting_reservation") return "Waiting for an overlapping path reservation";
+  if (value.status === "integrating")
+    return `Publishing validated work${integrationPhase ? ` · ${integrationPhase}` : ""}`;
+  if (value.status === "validating") return "Checking the complete multi-file candidate";
+  if (steward) return `${steward} owns the package worktree`;
+  if (value.disposition) return `Closed as ${value.disposition}`;
+  return "Ready for a Steward to claim";
+}
+
+function packageName(state: SwarmState, id: string): string {
+  return state.capability_packages?.[id]?.title ?? id;
+}
+
+function shortRevision(value?: string | null): string {
+  if (!value) return "";
+  return value.length > 12 ? value.slice(0, 12) : value;
+}
+
+function compactJson(value: Record<string, unknown>): string {
+  const encoded = JSON.stringify(value);
+  return encoded.length > 240 ? `${encoded.slice(0, 237)}…` : encoded;
+}
+
+function relativeDeadline(timestamp: string): string {
+  const seconds = Math.round((new Date(timestamp).getTime() - Date.now()) / 1000);
+  if (seconds < 0) return `${timeAgo(timestamp)} (expired)`;
+  if (seconds < 60) return `in ${seconds}s`;
+  if (seconds < 3600) return `in ${Math.floor(seconds / 60)}m`;
+  return `in ${Math.floor(seconds / 3600)}h`;
 }
 
 function PackageSection({
@@ -198,7 +379,7 @@ function PackageSection({
   empty: string;
   children: ReactNode;
 }) {
-  const items = Array.isArray(children) ? children.filter(Boolean) : children ? [children] : [];
+  const items = Children.toArray(children);
   return (
     <div className="package-section">
       <h4>

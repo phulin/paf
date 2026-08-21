@@ -71,13 +71,18 @@ export interface CapabilityPackage {
   mathematical_objective: string;
   status: string;
   disposition?: string | null;
+  aliases: string[];
+  textbook_refs: string[];
   write_scope: string[];
   expansion_scope: string[];
+  base_revision: string;
   plan_revision: number;
   revision: number;
   branch: string;
   worktree: string;
+  parent_package_id?: string | null;
   integrated_revision?: string | null;
+  created_at: string;
   updated_at: string;
 }
 
@@ -89,7 +94,13 @@ export interface PackageConsumer {
   declaration: string;
   stage: string;
   residual_goal: string;
+  source_digest?: string | null;
+  blocker_ids: string[];
+  attempted_routes: string[];
+  acceptance_contract: Record<string, unknown>;
   status: string;
+  accepted_revision?: string | null;
+  detached_package_id?: string | null;
 }
 
 export interface PackageStep {
@@ -103,6 +114,7 @@ export interface PackageStep {
   intended_paths: string[];
   depends_on_step_ids: string[];
   commit_ids: string[];
+  validation_contract: Record<string, unknown>;
   remaining_gap: string;
   plan_revision: number;
 }
@@ -122,6 +134,7 @@ export interface StewardLease {
   package_id: string;
   agent_id: string;
   generation: number;
+  acquired_at: string;
   heartbeat_at: string;
   expires_at: string;
 }
@@ -139,13 +152,24 @@ export interface PackageDependency {
   required_revision?: string | null;
 }
 
+export interface RelevantReadInterface {
+  package_id: string;
+  interface_id: string;
+  digest: string;
+  source_revision: string;
+}
+
 export interface IntegrationJournal {
   id: string;
   package_id: string;
+  lease_generation: number;
+  base_revision: string;
   phase: string;
   candidate_revision: string;
   canonical_revision_before: string;
   canonical_revision_after?: string | null;
+  validation_digest: string;
+  provisional_consumer_ids: string[];
   updated_at: string;
 }
 
@@ -178,6 +202,7 @@ export interface SwarmState {
   steward_leases?: Record<string, StewardLease>;
   path_reservations?: Record<string, PathReservation>;
   package_dependencies?: PackageDependency[];
+  relevant_read_interfaces?: RelevantReadInterface[];
   integration_journal?: Record<string, IntegrationJournal>;
   tasks: Record<string, Task>;
   activities?: Record<string, AgentActivity>;

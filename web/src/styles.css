@@ -821,6 +821,32 @@ p {
   gap: 7px;
   margin: 15px 0;
 }
+.package-attention {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin-top: 14px;
+  padding: 11px 12px;
+  border-left: 3px solid var(--accent);
+  background: rgba(107, 210, 201, 0.06);
+}
+.package-attention span,
+.package-attention small {
+  color: var(--muted);
+  font:
+    500 9px / 1.3 ui-monospace,
+    monospace;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+.package-attention strong {
+  color: var(--text-strong);
+  font-size: 12px;
+}
+.package-attention small {
+  text-transform: none;
+  letter-spacing: normal;
+}
 .package-facts span {
   padding: 9px;
   color: var(--muted);
@@ -871,6 +897,19 @@ p {
 }
 .package-section article code {
   white-space: pre-wrap;
+}
+.package-link {
+  padding: 0;
+  color: var(--accent);
+  text-align: left;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+  font: inherit;
+  font-weight: 600;
+}
+.package-link:hover {
+  text-decoration: underline;
 }
 
 .pipeline-strip {

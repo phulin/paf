@@ -62,13 +62,18 @@ pub struct CapabilityPackage {
     pub mathematical_objective: String,
     pub status: String,
     pub disposition: Option<String>,
+    pub aliases: Vec<String>,
+    pub textbook_refs: Vec<String>,
     pub write_scope: Vec<String>,
     pub expansion_scope: Vec<String>,
+    pub base_revision: String,
     pub plan_revision: usize,
     pub revision: usize,
     pub branch: String,
     pub worktree: String,
+    pub parent_package_id: Option<String>,
     pub integrated_revision: Option<String>,
+    pub created_at: String,
     pub updated_at: String,
 }
 
@@ -82,7 +87,13 @@ pub struct PackageConsumer {
     pub declaration: String,
     pub stage: String,
     pub residual_goal: String,
+    pub source_digest: Option<String>,
+    pub blocker_ids: Vec<String>,
+    pub attempted_routes: Vec<String>,
+    pub acceptance_contract: Value,
     pub status: String,
+    pub accepted_revision: Option<String>,
+    pub detached_package_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -98,6 +109,7 @@ pub struct PackageStep {
     pub intended_paths: Vec<String>,
     pub depends_on_step_ids: Vec<String>,
     pub commit_ids: Vec<String>,
+    pub validation_contract: Value,
     pub remaining_gap: String,
     pub plan_revision: usize,
 }
@@ -111,6 +123,7 @@ pub struct PackageEvidence {
     pub kind: String,
     pub paths: Vec<String>,
     pub declarations: Vec<String>,
+    pub payload: Value,
     pub created_at: String,
 }
 
@@ -120,6 +133,7 @@ pub struct StewardLease {
     pub package_id: String,
     pub agent_id: String,
     pub generation: usize,
+    pub acquired_at: String,
     pub heartbeat_at: String,
     pub expires_at: String,
 }
@@ -143,13 +157,26 @@ pub struct PackageDependency {
 
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default)]
+pub struct RelevantReadInterface {
+    pub package_id: String,
+    pub interface_id: String,
+    pub digest: String,
+    pub source_revision: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
 pub struct IntegrationJournal {
     pub id: String,
     pub package_id: String,
+    pub lease_generation: usize,
+    pub base_revision: String,
     pub phase: String,
     pub candidate_revision: String,
     pub canonical_revision_before: String,
     pub canonical_revision_after: Option<String>,
+    pub validation_digest: String,
+    pub provisional_consumer_ids: Vec<String>,
     pub updated_at: String,
 }
 
@@ -292,6 +319,7 @@ pub struct SwarmState {
     pub steward_leases: HashMap<String, StewardLease>,
     pub path_reservations: HashMap<String, PathReservation>,
     pub package_dependencies: Vec<PackageDependency>,
+    pub relevant_read_interfaces: Vec<RelevantReadInterface>,
     pub integration_journal: HashMap<String, IntegrationJournal>,
     pub scheduling: Scheduling,
     pub source_dependency_tree: SourceDependencyTree,
@@ -357,6 +385,7 @@ pub struct GlobalDelta {
     pub steward_leases: Option<HashMap<String, StewardLease>>,
     pub path_reservations: Option<HashMap<String, PathReservation>>,
     pub package_dependencies: Option<Vec<PackageDependency>>,
+    pub relevant_read_interfaces: Option<Vec<RelevantReadInterface>>,
     pub integration_journal: Option<HashMap<String, IntegrationJournal>>,
     pub scheduling: Option<Scheduling>,
     pub source_dependency_tree: Option<SourceDependencyTree>,
@@ -600,6 +629,10 @@ impl DashboardModel {
             delta.globals.package_dependencies,
         );
         apply_optional(
+            &mut self.state.relevant_read_interfaces,
+            delta.globals.relevant_read_interfaces,
+        );
+        apply_optional(
             &mut self.state.integration_journal,
             delta.globals.integration_journal,
         );
@@ -829,9 +862,9 @@ impl DashboardModel {
     pub fn packages(&self) -> Vec<&CapabilityPackage> {
         let mut packages = self.state.capability_packages.values().collect::<Vec<_>>();
         packages.sort_by(|left, right| {
-            right
-                .updated_at
-                .cmp(&left.updated_at)
+            package_status_rank(&left.status)
+                .cmp(&package_status_rank(&right.status))
+                .then(right.updated_at.cmp(&left.updated_at))
                 .then(left.id.cmp(&right.id))
         });
         packages
@@ -1127,6 +1160,19 @@ impl DashboardModel {
                 || work_unit_id.to_owned(),
                 |unit| format!("{}.{}", unit.document_id, unit.ordinal),
             )
+    }
+}
+
+fn package_status_rank(status: &str) -> u8 {
+    match status {
+        "waiting_dependency" | "waiting_reservation" => 1,
+        "complete"
+        | "decomposed"
+        | "external"
+        | "statement_revision_required"
+        | "parked"
+        | "superseded" => 2,
+        _ => 0,
     }
 }
 

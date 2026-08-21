@@ -244,37 +244,101 @@ fn draw_package_detail(frame: &mut Frame<'_>, model: &mut DashboardModel) {
             package.status, package.revision, package.plan_revision
         )));
         lines.push(Line::from(package.mathematical_objective.clone()));
+        if !package.base_revision.is_empty() || package.integrated_revision.is_some() {
+            lines.push(Line::from(format!(
+                "base {} · integrated {}",
+                short_revision(&package.base_revision),
+                package
+                    .integrated_revision
+                    .as_deref()
+                    .map(short_revision)
+                    .unwrap_or("not yet")
+            )));
+        }
+        let steps = model
+            .state
+            .package_steps
+            .values()
+            .filter(|item| item.package_id == package_id)
+            .collect::<Vec<_>>();
+        let consumers = model
+            .state
+            .package_consumers
+            .values()
+            .filter(|item| item.package_id == package_id)
+            .collect::<Vec<_>>();
+        let completed_steps = steps
+            .iter()
+            .filter(|item| item.status == "complete")
+            .count();
+        let open_consumers = consumers
+            .iter()
+            .filter(|item| item.status == "open")
+            .count();
+        let dependency_count = model
+            .state
+            .package_dependencies
+            .iter()
+            .filter(|item| item.package_id == package_id)
+            .count();
+        let handoff = match package.status.as_str() {
+            "waiting_dependency" => format!("blocked on {dependency_count} package dependencies"),
+            "waiting_reservation" => "waiting for an overlapping path reservation".into(),
+            "validating" => "checking the complete multi-file candidate".into(),
+            "integrating" => "publishing validated work".into(),
+            _ => model
+                .state
+                .steward_leases
+                .get(&package_id)
+                .map(|lease| format!("{} owns the package worktree", lease.agent_id))
+                .or_else(|| {
+                    package
+                        .disposition
+                        .as_ref()
+                        .map(|value| format!("closed as {value}"))
+                })
+                .unwrap_or_else(|| "ready for a Steward to claim".into()),
+        };
+        lines.push(Line::styled(
+            format!(
+                "Current handoff: {handoff} · {completed_steps}/{} steps · {open_consumers} open consumers",
+                steps.len()
+            ),
+            Style::default().fg(YELLOW),
+        ));
         if let Some(lease) = model.state.steward_leases.get(&package_id) {
             lines.push(Line::from(format!(
-                "Steward lease: {} · generation {} · expires {}",
-                lease.agent_id, lease.generation, lease.expires_at
+                "Steward lease: {} · fence {} · heartbeat {} · expires {}",
+                lease.agent_id, lease.generation, lease.heartbeat_at, lease.expires_at
             )));
         } else {
             lines.push(Line::from("Steward lease: none"));
         }
         lines.push(Line::from(""));
         lines.push(Line::styled("Consumers", Style::default().fg(CYAN)));
-        for consumer in model
-            .state
-            .package_consumers
-            .values()
-            .filter(|item| item.package_id == package_id)
-        {
+        for consumer in consumers {
             lines.push(Line::from(format!(
-                "  {} · {} · {}",
-                consumer.status, consumer.declaration, consumer.path
+                "  {} · {} · {} · {}",
+                consumer.status, consumer.stage, consumer.declaration, consumer.path
             )));
             if !consumer.residual_goal.is_empty() {
                 lines.push(Line::from(format!("    {}", consumer.residual_goal)));
             }
+            if let Some(revision) = &consumer.accepted_revision {
+                lines.push(Line::from(format!(
+                    "    accepted at {}",
+                    short_revision(revision)
+                )));
+            }
+            if !consumer.blocker_ids.is_empty() {
+                lines.push(Line::from(format!(
+                    "    blockers: {}",
+                    consumer.blocker_ids.join(", ")
+                )));
+            }
         }
         lines.push(Line::styled("Plan steps", Style::default().fg(CYAN)));
-        for step in model
-            .state
-            .package_steps
-            .values()
-            .filter(|item| item.package_id == package_id)
-        {
+        for step in steps {
             let worker = step
                 .assigned_worker_id
                 .as_deref()
@@ -284,6 +348,25 @@ fn draw_package_detail(frame: &mut Frame<'_>, model: &mut DashboardModel) {
                 "  {} · {} · {}{}",
                 step.status, step.kind, step.objective, worker
             )));
+            if !step.depends_on_step_ids.is_empty() {
+                lines.push(Line::from(format!(
+                    "    after: {}",
+                    step.depends_on_step_ids.join(", ")
+                )));
+            }
+            if !step.commit_ids.is_empty() {
+                lines.push(Line::from(format!(
+                    "    commits: {}",
+                    step.commit_ids
+                        .iter()
+                        .map(|value| short_revision(value))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )));
+            }
+            if !step.remaining_gap.is_empty() {
+                lines.push(Line::from(format!("    gap: {}", step.remaining_gap)));
+            }
         }
         lines.push(Line::styled("Evidence", Style::default().fg(CYAN)));
         for evidence in model
@@ -329,6 +412,46 @@ fn draw_package_detail(frame: &mut Frame<'_>, model: &mut DashboardModel) {
                     .unwrap_or("any accepted revision")
             )));
         }
+        lines.push(Line::styled(
+            "Ownership and scope",
+            Style::default().fg(CYAN),
+        ));
+        if let Some(parent) = &package.parent_package_id {
+            lines.push(Line::from(format!("  parent: {parent}")));
+        }
+        for child in model
+            .state
+            .capability_packages
+            .values()
+            .filter(|item| item.parent_package_id.as_deref() == Some(package_id.as_str()))
+        {
+            lines.push(Line::from(format!(
+                "  child: {} · {}",
+                child.status, child.title
+            )));
+        }
+        for path in &package.write_scope {
+            lines.push(Line::from(format!("  write: {path}")));
+        }
+        for reference in &package.textbook_refs {
+            lines.push(Line::from(format!("  textbook: {reference}")));
+        }
+        for path in &package.expansion_scope {
+            lines.push(Line::from(format!("  may expand: {path}")));
+        }
+        for interface in model
+            .state
+            .relevant_read_interfaces
+            .iter()
+            .filter(|item| item.package_id == package_id)
+        {
+            lines.push(Line::from(format!(
+                "  reads: {} · {} @ {}",
+                interface.interface_id,
+                short_revision(&interface.digest),
+                short_revision(&interface.source_revision)
+            )));
+        }
         lines.push(Line::styled("Integration", Style::default().fg(CYAN)));
         for journal in model
             .state
@@ -337,14 +460,28 @@ fn draw_package_detail(frame: &mut Frame<'_>, model: &mut DashboardModel) {
             .filter(|item| item.package_id == package_id)
         {
             lines.push(Line::from(format!(
-                "  {} · {} → {}",
+                "  {} · fence {} · {} → {}",
                 journal.phase,
-                journal.candidate_revision,
+                journal.lease_generation,
+                short_revision(&journal.candidate_revision),
                 journal
                     .canonical_revision_after
                     .as_deref()
-                    .unwrap_or(&journal.canonical_revision_before)
+                    .map(short_revision)
+                    .unwrap_or_else(|| short_revision(&journal.canonical_revision_before))
             )));
+            if !journal.validation_digest.is_empty() {
+                lines.push(Line::from(format!(
+                    "    validation: {}",
+                    short_revision(&journal.validation_digest)
+                )));
+            }
+            if !journal.provisional_consumer_ids.is_empty() {
+                lines.push(Line::from(format!(
+                    "    provisional: {}",
+                    journal.provisional_consumer_ids.join(", ")
+                )));
+            }
         }
         lines.push(Line::from(""));
         lines.push(Line::styled(
@@ -360,6 +497,10 @@ fn draw_package_detail(frame: &mut Frame<'_>, model: &mut DashboardModel) {
         ),
         layout[1],
     );
+}
+
+fn short_revision(value: &str) -> &str {
+    value.get(..12).unwrap_or(value)
 }
 
 fn summary(model: &DashboardModel) -> Paragraph<'static> {
@@ -1769,17 +1910,18 @@ mod tests {
                         "id": "package-1", "capability_key": "book.transport",
                         "title": "Transport bridge", "mathematical_objective": "Implement the shared bridge",
                         "status": "implementing", "revision": 4, "plan_revision": 2,
+                        "write_scope": ["lean/Book/Shared.lean"],
                         "updated_at": "2026-08-21T00:00:00Z"
                     }},
                     "package_consumers": {"consumer-1": {
                         "id": "consumer-1", "package_id": "package-1", "status": "open",
                         "declaration": "Book.target", "path": "lean/Book/Chapter02.lean",
-                        "residual_goal": "⊢ Result x"
+                        "residual_goal": "⊢ Result x", "blocker_ids": ["blocker-1"]
                     }},
                     "package_steps": {"step-1": {
                         "id": "step-1", "package_id": "package-1", "status": "implementing",
                         "kind": "interface", "objective": "Add bridge",
-                        "assigned_worker_id": "worker-1"
+                        "assigned_worker_id": "worker-1", "remaining_gap": "prove naturality"
                     }},
                     "package_evidence": {"evidence-1": {
                         "id": "evidence-1", "package_id": "package-1", "kind": "lean_probe",
@@ -1787,9 +1929,20 @@ mod tests {
                     }},
                     "steward_leases": {"package-1": {
                         "package_id": "package-1", "agent_id": "steward-1", "generation": 3,
-                        "expires_at": "2026-08-21T01:00:00Z"
+                        "heartbeat_at": "2026-08-21T00:30:00Z", "expires_at": "2026-08-21T01:00:00Z"
                     }},
-                    "path_reservations": {}, "package_dependencies": [], "integration_journal": {}
+                    "path_reservations": {}, "package_dependencies": [],
+                    "relevant_read_interfaces": [{
+                        "package_id": "package-1", "interface_id": "Mathlib.Transport",
+                        "digest": "1234567890abcdef", "source_revision": "abcdef1234567890"
+                    }],
+                    "integration_journal": {"journal-1": {
+                        "id": "journal-1", "package_id": "package-1", "phase": "validated",
+                        "lease_generation": 3, "candidate_revision": "fedcba9876543210",
+                        "canonical_revision_before": "0123456789abcdef",
+                        "validation_digest": "9999999999999999",
+                        "provisional_consumer_ids": ["consumer-1"]
+                    }}
                 })),
                 delta: None,
                 preparation: None,
@@ -1798,7 +1951,7 @@ mod tests {
             .unwrap();
         model.enter_package_detail();
 
-        let backend = TestBackend::new(140, 32);
+        let backend = TestBackend::new(140, 52);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| draw(frame, &mut model)).unwrap();
         let rendered = terminal.backend().to_string();
@@ -1809,6 +1962,10 @@ mod tests {
         assert!(rendered.contains("worker-1"));
         assert!(rendered.contains("Book.bridge"));
         assert!(rendered.contains("steward-1"));
+        assert!(rendered.contains("Current handoff"));
+        assert!(rendered.contains("prove naturality"));
+        assert!(rendered.contains("Mathlib.Transport"));
+        assert!(rendered.contains("provisional: consumer-1"));
     }
 
     #[test]
