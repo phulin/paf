@@ -253,6 +253,41 @@ async def test_package_drain_schedules_newly_unblocked_dependencies(tmp_path: Pa
     await orchestrator.state.close()
 
 
+@pytest.mark.asyncio
+async def test_package_drain_continues_nonterminal_package_turns(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    orchestrator = Orchestrator(config, StateStore(config))
+    await orchestrator.state.load_or_create()
+    orchestrator.git.enabled = True
+    package = CapabilityPackage("package", "key", "Package", "Implement package")
+    executions = 0
+
+    class FakePackageExecution:
+        def ready_packages(self):
+            return (package,) if executions < 2 else ()
+
+        async def execute(self, package_id: str) -> PackageExecutionResult:
+            nonlocal executions
+            executions += 1
+            return PackageExecutionResult(
+                package_id,
+                executions,
+                PackageStatus.IMPLEMENTING if executions == 1 else PackageStatus.COMPLETE,
+            )
+
+    orchestrator.package_execution = FakePackageExecution()  # ty: ignore[invalid-assignment]
+
+    results = await orchestrator._drain_active_packages()
+
+    assert executions == 2
+    assert [result.status for result in results] == [
+        PackageStatus.IMPLEMENTING,
+        PackageStatus.COMPLETE,
+    ]
+    assert not orchestrator._package_tasks
+    await orchestrator.state.close()
+
+
 def test_coordinator_build_output_shortens_diagnostic_paths(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path))
     state = StateStore(config)

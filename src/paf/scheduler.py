@@ -948,13 +948,12 @@ class Orchestrator:
             )
             self._proof_rechecks.add(work_unit_id)
 
-    async def _schedule_ready_packages(self, *, exclude: Iterable[str] = ()) -> bool:
+    async def _schedule_ready_packages(self) -> bool:
         if not self.git.enabled:
             return False
-        excluded = set(exclude)
         launched = False
         for package in self.package_execution.ready_packages():
-            if package.id in self._package_tasks or package.id in excluded:
+            if package.id in self._package_tasks:
                 continue
             task = asyncio.create_task(
                 self._execute_package_task(package.id),
@@ -978,18 +977,18 @@ class Orchestrator:
 
     async def _drain_active_packages(self) -> tuple[PackageExecutionResult, ...]:
         results: list[PackageExecutionResult] = []
-        attempted: set[str] = set()
-        while self._package_tasks:
+        while True:
+            if self.config.steward.enabled:
+                await self._schedule_ready_packages()
+            if not self._package_tasks:
+                break
             active = dict(self._package_tasks)
-            attempted.update(active)
             try:
                 results.extend(await asyncio.gather(*active.values()))
             finally:
                 for package_id, task in active.items():
                     if self._package_tasks.get(package_id) is task:
                         self._package_tasks.pop(package_id, None)
-            if self.config.steward.enabled:
-                await self._schedule_ready_packages(exclude=attempted)
         return tuple(results)
 
     async def prepare(
@@ -2066,6 +2065,19 @@ class Orchestrator:
                     )
                     if reservation.granted:
                         break
+                    owners = ", ".join(
+                        sorted({conflict.owner_id for conflict in reservation.conflicts})
+                    )
+                    task = self.state.task(chapter.id, stage)
+                    detail = f"waiting for path reservation held by {owners}"
+                    if task.detail != detail:
+                        await self.state.set_task(
+                            chapter.id,
+                            stage,
+                            TaskStatus.PENDING,
+                            detail,
+                            queued=True,
+                        )
                     await self.control.checkpoint()
                     await asyncio.sleep(0.1)
             await slots.acquire(
@@ -6880,12 +6892,27 @@ class Orchestrator:
             raise
 
     async def run_pipeline(self) -> bool:
-        if self.config.steward.enabled:
-            await self._schedule_ready_packages()
-        result = await self._run_pipeline_once()
-        await self._drain_active_packages()
+        result = True
+        while True:
+            if self.config.steward.enabled:
+                await self._schedule_ready_packages()
+            pipeline = asyncio.create_task(self._run_pipeline_once())
+            packages = asyncio.create_task(self._drain_active_packages())
+            try:
+                pipeline_result, package_results = await asyncio.gather(pipeline, packages)
+            except BaseException:
+                pipeline.cancel()
+                packages.cancel()
+                await asyncio.gather(pipeline, packages, return_exceptions=True)
+                raise
+            result = pipeline_result and result
+            # Packages may be attached after an initially empty drain exits. Drain those before
+            # deciding whether canonical package changes require another ordinary pipeline pass.
+            late_results = await self._drain_active_packages()
+            if not package_results and not late_results:
+                break
         cleanup = await self._drain_warning_cleanups()
         if cleanup.clean and cleanup.changed:
-            result = await self._run_pipeline_once()
+            result = await self.run_pipeline()
             cleanup = await self._drain_warning_cleanups()
         return result and cleanup.clean
