@@ -24,6 +24,15 @@ from paf.hashing import (
     tagged_digest_bytes,
 )
 from paf.models import PipelineConfig, Stage, WorkUnitLike
+from paf.package_model import (
+    CapabilityPackage,
+    PackageConsumer,
+    PackageDependency,
+    PackageDisposition,
+    PackageEvidence,
+    PackageState,
+    PackageStatus,
+)
 from paf.pricing import LEGACY_MODEL, CostEstimate, estimate_cost
 from paf.state_db import (
     COLLECTION_SECTIONS,
@@ -552,6 +561,7 @@ class StateStore:
         self.fixup_requests: dict[str, dict[str, Any]] = {}
         self.proof_review_requests: dict[str, dict[str, Any]] = {}
         self.upstream_requests: dict[str, dict[str, Any]] = {}
+        self.package_state = PackageState()
         self.proof_blockers: dict[str, dict[str, Any]] = {}
         self.routing_metrics: dict[str, int] = {}
         self.thread_cumulative_usage: dict[str, TokenUsage] = {}
@@ -603,6 +613,7 @@ class StateStore:
         self.revision = await asyncio.to_thread(self._database.revision)
         self._writer.start()
         raw, persisted_runs, persisted_source_issues = await asyncio.to_thread(self._database.load)
+        self.package_state = await asyncio.to_thread(self._database.load_package_state)
         if raw is not None:
             self.created_at = str(raw.get("created_at", timestamp()))
             self.updated_at = str(raw.get("updated_at", self.created_at))
@@ -1306,39 +1317,49 @@ class StateStore:
         self._mark_dirty(global_state=True)
 
     def _global_snapshot(self) -> dict[str, Any]:
-        return self._bounded_global_snapshot(include_shepherd_agents=True) | {
-            "scheduling": self.scheduling,
-            "source_dependency_tree": self.source_dependency_tree,
-            "formalize_graph": self.formalize_graph,
-            "fixup_requests": self.fixup_requests,
-            "proof_review_requests": self.proof_review_requests,
-            "upstream_requests": self.upstream_requests,
-            "proof_blockers": self.proof_blockers,
-            "thread_cumulative_usage": {
-                thread_id: self._usage_dict(usage)
-                for thread_id, usage in sorted(self.thread_cumulative_usage.items())
-            },
-            "upstream_request_batches": self.upstream_request_batches(),
-            "coordinator_build": self._build_dict(self.coordinator_build),
-            "repair_cases": {
-                key: {name: getattr(value, name) for name in RepairCaseRecord.__dataclass_fields__}
-                for key, value in sorted(self.repair_cases.items())
-            },
-            "failure_records": {
-                key: {name: getattr(value, name) for name in FailureRecord.__dataclass_fields__}
-                for key, value in sorted(self.failure_records.items())
-            },
-            "repair_sweeps": {
-                key: {name: getattr(value, name) for name in RepairSweepRecord.__dataclass_fields__}
-                for key, value in sorted(self.repair_sweeps.items())
-            },
-            "repair_work_units": {
-                key: {
-                    name: getattr(value, name) for name in RepairWorkUnitRecord.__dataclass_fields__
-                }
-                for key, value in sorted(self.repair_work_units.items())
-            },
-        }
+        return (
+            self._bounded_global_snapshot(include_shepherd_agents=True)
+            | {
+                "scheduling": self.scheduling,
+                "source_dependency_tree": self.source_dependency_tree,
+                "formalize_graph": self.formalize_graph,
+                "fixup_requests": self.fixup_requests,
+                "proof_review_requests": self.proof_review_requests,
+                "upstream_requests": self.upstream_requests,
+                "proof_blockers": self.proof_blockers,
+                "thread_cumulative_usage": {
+                    thread_id: self._usage_dict(usage)
+                    for thread_id, usage in sorted(self.thread_cumulative_usage.items())
+                },
+                "upstream_request_batches": self.upstream_request_batches(),
+                "coordinator_build": self._build_dict(self.coordinator_build),
+                "repair_cases": {
+                    key: {
+                        name: getattr(value, name) for name in RepairCaseRecord.__dataclass_fields__
+                    }
+                    for key, value in sorted(self.repair_cases.items())
+                },
+                "failure_records": {
+                    key: {name: getattr(value, name) for name in FailureRecord.__dataclass_fields__}
+                    for key, value in sorted(self.failure_records.items())
+                },
+                "repair_sweeps": {
+                    key: {
+                        name: getattr(value, name)
+                        for name in RepairSweepRecord.__dataclass_fields__
+                    }
+                    for key, value in sorted(self.repair_sweeps.items())
+                },
+                "repair_work_units": {
+                    key: {
+                        name: getattr(value, name)
+                        for name in RepairWorkUnitRecord.__dataclass_fields__
+                    }
+                    for key, value in sorted(self.repair_work_units.items())
+                },
+            }
+            | self.package_state.as_dict()
+        )
 
     def _section_value(self, section: str) -> Any:
         if section == "thread_cumulative_usage":
@@ -2488,6 +2509,126 @@ class StateStore:
             and (selected is None or UpstreamRequestStatus(str(request.get("status"))) in selected)
         )
 
+    async def refresh_package_state(self) -> PackageState:
+        self.package_state = await asyncio.to_thread(self._database.load_package_state)
+        return self.package_state
+
+    async def create_or_attach_capability_package(
+        self,
+        package: CapabilityPackage,
+        *,
+        consumer: PackageConsumer | None = None,
+        evidence: tuple[PackageEvidence, ...] = (),
+        expected_revision: int | None = None,
+    ) -> tuple[CapabilityPackage, bool]:
+        result = await asyncio.to_thread(
+            self._database.create_or_attach_capability_package,
+            package,
+            consumer=consumer,
+            evidence=evidence,
+            expected_revision=expected_revision,
+        )
+        await self.refresh_package_state()
+        return result
+
+    async def attach_package_consumer(
+        self,
+        package_id: str,
+        consumer: PackageConsumer,
+        *,
+        expected_revision: int,
+        lease_generation: int | None = None,
+    ) -> PackageConsumer:
+        result = await asyncio.to_thread(
+            self._database.attach_package_consumer,
+            package_id,
+            consumer,
+            expected_revision=expected_revision,
+            lease_generation=lease_generation,
+        )
+        await self.refresh_package_state()
+        return result
+
+    async def update_package_lifecycle(
+        self,
+        package_id: str,
+        status: PackageStatus,
+        *,
+        expected_revision: int,
+        disposition: PackageDisposition | None = None,
+        plan_revision: int | None = None,
+        integrated_revision: str | None = None,
+        lease_generation: int | None = None,
+    ) -> CapabilityPackage:
+        result = await asyncio.to_thread(
+            self._database.update_package_lifecycle,
+            package_id,
+            status,
+            expected_revision=expected_revision,
+            disposition=disposition,
+            plan_revision=plan_revision,
+            integrated_revision=integrated_revision,
+            lease_generation=lease_generation,
+        )
+        await self.refresh_package_state()
+        return result
+
+    async def add_package_dependency(
+        self,
+        dependency: PackageDependency,
+        *,
+        expected_revision: int,
+        lease_generation: int | None = None,
+    ) -> CapabilityPackage:
+        result = await asyncio.to_thread(
+            self._database.add_package_dependency,
+            dependency,
+            expected_revision=expected_revision,
+            lease_generation=lease_generation,
+        )
+        await self.refresh_package_state()
+        return result
+
+    async def merge_capability_packages(
+        self,
+        survivor_id: str,
+        merged_id: str,
+        *,
+        expected_survivor_revision: int,
+        expected_merged_revision: int,
+        lease_generation: int | None = None,
+    ) -> CapabilityPackage:
+        result = await asyncio.to_thread(
+            self._database.merge_capability_packages,
+            survivor_id,
+            merged_id,
+            expected_survivor_revision=expected_survivor_revision,
+            expected_merged_revision=expected_merged_revision,
+            lease_generation=lease_generation,
+        )
+        await self.refresh_package_state()
+        return result
+
+    async def split_capability_package(
+        self,
+        parent_id: str,
+        children: tuple[CapabilityPackage, ...],
+        consumer_assignments: dict[str, tuple[str, ...]],
+        *,
+        expected_revision: int,
+        lease_generation: int | None = None,
+    ) -> tuple[CapabilityPackage, ...]:
+        result = await asyncio.to_thread(
+            self._database.split_capability_package,
+            parent_id,
+            children,
+            consumer_assignments,
+            expected_revision=expected_revision,
+            lease_generation=lease_generation,
+        )
+        await self.refresh_package_state()
+        return result
+
     async def enqueue_upstream_request(
         self,
         request: dict[str, Any],
@@ -2572,6 +2713,7 @@ class StateStore:
             existing["updated_at"] = timestamp()
             self._mark_dirty(global_state=False, sections={"upstream_requests"})
             await self._persist()
+            await self.refresh_package_state()
             return request_id, False
 
         request_id = uuid4().hex[:12]
@@ -2635,6 +2777,7 @@ class StateStore:
         self.upstream_requests[request_id] = record
         self._mark_dirty(global_state=False, sections={"upstream_requests"})
         await self._persist()
+        await self.refresh_package_state()
         return request_id, True
 
     @staticmethod

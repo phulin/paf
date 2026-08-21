@@ -232,7 +232,7 @@ async def test_schema_v2_global_graphs_migrate_to_relational_rows(tmp_path: Path
         request_count = connection.execute(
             "SELECT count(*) FROM state_items WHERE section='upstream_requests'"
         ).fetchone()[0]
-    assert version == 4
+    assert version == 5
     assert len(header_payload) < 10_000
     assert "source_dependency_tree" not in json.loads(header_payload)
     assert edge_count == 1
@@ -265,9 +265,55 @@ async def test_schema_v3_adds_interface_invalidation_events(tmp_path: Path) -> N
             "SELECT name FROM sqlite_master WHERE type='table' "
             "AND name='interface_invalidation_events'"
         ).fetchone()
-    assert version == 4
-    assert meta_version == 4
+    assert version == 5
+    assert meta_version == 5
     assert event_table == ("interface_invalidation_events",)
+
+
+def test_legacy_json_checkpoint_imports_upstream_requests_into_packages_once(
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / ".paf"
+    state_dir.mkdir()
+    request = {
+        "id": "legacy-request",
+        "capability_key": "Book.Legacy Bridge",
+        "status": "requested",
+        "consumer_chapter_id": "book/chapter-02",
+        "blocked_declaration": "Book.consumer",
+        "consumer_path": "lean/Book/Chapter02.lean",
+        "needed_result": "A legacy bridge",
+        "owner_paths": ["lean/Book/Chapter01.lean"],
+        "created_at": "2026-08-21T00:00:00+00:00",
+        "updated_at": "2026-08-21T00:00:00+00:00",
+    }
+    (state_dir / "state.json").write_text(
+        json.dumps(
+            {
+                "version": 6,
+                "created_at": "2026-08-21T00:00:00+00:00",
+                "updated_at": "2026-08-21T00:00:00+00:00",
+                "tasks": {},
+                "upstream_requests": {"legacy-request": request},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    database = StateDatabase(state_dir)
+    database.initialize()
+    first = database.load_package_state()
+    database.initialize()
+    second = database.load_package_state()
+
+    imported = first.upstream_request_imports["legacy-request"]
+    assert first.packages[imported.package_id].capability_key == "book.legacy bridge"
+    assert first.consumers_for(imported.package_id)[0].declaration == "Book.consumer"
+    assert len(first.evidence_for(imported.package_id)) == 1
+    assert second == first
+    checkpoint = read_checkpoint(state_dir)
+    assert checkpoint is not None
+    assert checkpoint["upstream_requests"]["legacy-request"]["status"] == "requested"
 
 
 def test_explicit_project_and_paf_toml_resolve_all_project_paths(tmp_path: Path) -> None:
@@ -285,6 +331,20 @@ def test_explicit_project_and_paf_toml_resolve_all_project_paths(tmp_path: Path)
     assert config.project.source_paths == (tmp_path / "books" / "book.md",)
     assert config.project.target_dir == tmp_path / "lean"
     assert config.project.state_dir == tmp_path / ".paf"
+
+
+def test_project_canonicalizes_package_reservation_paths(tmp_path: Path) -> None:
+    config_path = write_project(tmp_path)
+    project = ProjectResolver(tmp_path).resolve(project=config_path)
+
+    assert project.canonical_repository_path(tmp_path / "lean" / "Book" / "Chapter01.lean") == (
+        "lean/Book/Chapter01.lean"
+    )
+    assert project.canonical_repository_path("lean\\Book\\Chapter01.lean") == (
+        "lean/Book/Chapter01.lean"
+    )
+    with pytest.raises(ValueError, match="outside project repository"):
+        project.canonical_repository_path(tmp_path.parent / "outside.lean")
 
 
 def test_target_prefers_ancestor_config_then_git_and_cwd_fallback(tmp_path: Path) -> None:

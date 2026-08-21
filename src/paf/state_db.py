@@ -7,15 +7,41 @@ import sqlite3
 import threading
 import time
 from concurrent.futures import Future
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime
+from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
 from paf import json_codec as json
+from paf.package_model import (
+    PACKAGE_SNAPSHOT_KEYS,
+    CapabilityPackage,
+    ConsumerStatus,
+    EvidenceKind,
+    IntegrationJournal,
+    IntegrationPhase,
+    PackageConsumer,
+    PackageDependency,
+    PackageDisposition,
+    PackageEvidence,
+    PackageState,
+    PackageStatus,
+    PackageStep,
+    PackageStepKind,
+    PackageStepStatus,
+    PathReservation,
+    RelevantReadInterface,
+    ReservationMode,
+    StewardLease,
+    UpstreamRequestImport,
+    normalize_capability_key,
+    normalize_repository_path,
+)
 
 DATABASE_NAME = "state.sqlite3"
 LEGACY_BACKUP_NAME = "state.legacy-v6.json"
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 CHANGE_RETENTION = 10_000
 
 COLLECTION_SECTIONS = frozenset(
@@ -68,6 +94,7 @@ def bounded_global_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
         for key, value in snapshot.items()
         if key
         not in NORMALIZED_STATE_KEYS
+        | PACKAGE_SNAPSHOT_KEYS
         | {
             "documents",
             "work_units",
@@ -439,6 +466,7 @@ def restore_graph(snapshot: GraphSnapshot, section: str) -> dict[str, Any]:
 
 def _connect(path: Path) -> sqlite3.Connection:
     connection = sqlite3.connect(path, timeout=30)
+    connection.execute("PRAGMA foreign_keys=ON")
     connection.execute("PRAGMA journal_mode=WAL")
     connection.execute("PRAGMA synchronous=NORMAL")
     connection.execute("PRAGMA busy_timeout=30000")
@@ -589,6 +617,175 @@ def _create_schema(connection: sqlite3.Connection) -> None:
         );
         CREATE INDEX IF NOT EXISTS interface_invalidation_events_source
             ON interface_invalidation_events(source_file, id);
+        CREATE TABLE IF NOT EXISTS capability_packages (
+            id TEXT PRIMARY KEY,
+            capability_key TEXT NOT NULL UNIQUE,
+            title TEXT NOT NULL,
+            mathematical_objective TEXT NOT NULL,
+            status TEXT NOT NULL,
+            disposition TEXT,
+            base_revision TEXT NOT NULL DEFAULT '',
+            branch TEXT NOT NULL DEFAULT '',
+            worktree TEXT NOT NULL DEFAULT '',
+            parent_package_id TEXT REFERENCES capability_packages(id),
+            plan_revision INTEGER NOT NULL DEFAULT 0,
+            integrated_revision TEXT,
+            revision INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS capability_packages_status
+            ON capability_packages(status, updated_at, id);
+        CREATE TABLE IF NOT EXISTS capability_aliases (
+            alias_key TEXT PRIMARY KEY,
+            package_id TEXT NOT NULL REFERENCES capability_packages(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS capability_aliases_package
+            ON capability_aliases(package_id, alias_key);
+        CREATE TABLE IF NOT EXISTS package_textbook_refs (
+            package_id TEXT NOT NULL REFERENCES capability_packages(id) ON DELETE CASCADE,
+            textbook_ref TEXT NOT NULL,
+            ordinal INTEGER NOT NULL,
+            PRIMARY KEY(package_id, textbook_ref)
+        );
+        CREATE TABLE IF NOT EXISTS package_scopes (
+            package_id TEXT NOT NULL REFERENCES capability_packages(id) ON DELETE CASCADE,
+            scope_kind TEXT NOT NULL CHECK(scope_kind IN ('write', 'expansion')),
+            normalized_path TEXT NOT NULL,
+            ordinal INTEGER NOT NULL,
+            PRIMARY KEY(package_id, scope_kind, normalized_path)
+        );
+        CREATE TABLE IF NOT EXISTS package_consumers (
+            id TEXT PRIMARY KEY,
+            package_id TEXT NOT NULL REFERENCES capability_packages(id) ON DELETE CASCADE,
+            work_unit_id TEXT NOT NULL,
+            path TEXT NOT NULL,
+            declaration TEXT NOT NULL,
+            stage TEXT NOT NULL,
+            residual_goal TEXT NOT NULL,
+            source_digest TEXT,
+            acceptance_contract BLOB NOT NULL,
+            status TEXT NOT NULL,
+            accepted_revision TEXT,
+            detached_package_id TEXT REFERENCES capability_packages(id),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(package_id, work_unit_id, path, declaration, stage)
+        );
+        CREATE INDEX IF NOT EXISTS package_consumers_package_status
+            ON package_consumers(package_id, status, id);
+        CREATE TABLE IF NOT EXISTS package_consumer_blockers (
+            consumer_id TEXT NOT NULL REFERENCES package_consumers(id) ON DELETE CASCADE,
+            blocker_id TEXT NOT NULL,
+            ordinal INTEGER NOT NULL,
+            PRIMARY KEY(consumer_id, blocker_id)
+        );
+        CREATE TABLE IF NOT EXISTS package_consumer_routes (
+            consumer_id TEXT NOT NULL REFERENCES package_consumers(id) ON DELETE CASCADE,
+            attempted_route TEXT NOT NULL,
+            ordinal INTEGER NOT NULL,
+            PRIMARY KEY(consumer_id, attempted_route)
+        );
+        CREATE TABLE IF NOT EXISTS package_steps (
+            id TEXT PRIMARY KEY,
+            package_id TEXT NOT NULL REFERENCES capability_packages(id) ON DELETE CASCADE,
+            objective TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            status TEXT NOT NULL,
+            assigned_worker_id TEXT,
+            validation_contract BLOB NOT NULL,
+            remaining_gap TEXT NOT NULL,
+            plan_revision INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS package_steps_package_status
+            ON package_steps(package_id, status, id);
+        CREATE TABLE IF NOT EXISTS package_step_items (
+            step_id TEXT NOT NULL REFERENCES package_steps(id) ON DELETE CASCADE,
+            item_kind TEXT NOT NULL CHECK(item_kind IN ('declaration', 'path', 'commit')),
+            item_value TEXT NOT NULL,
+            ordinal INTEGER NOT NULL,
+            PRIMARY KEY(step_id, item_kind, item_value)
+        );
+        CREATE TABLE IF NOT EXISTS package_step_dependencies (
+            step_id TEXT NOT NULL REFERENCES package_steps(id) ON DELETE CASCADE,
+            depends_on_step_id TEXT NOT NULL REFERENCES package_steps(id),
+            PRIMARY KEY(step_id, depends_on_step_id)
+        );
+        CREATE TABLE IF NOT EXISTS package_evidence (
+            id TEXT PRIMARY KEY,
+            package_id TEXT NOT NULL REFERENCES capability_packages(id) ON DELETE CASCADE,
+            producer TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            source_revision TEXT NOT NULL,
+            payload BLOB NOT NULL,
+            digest TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS package_evidence_package_created
+            ON package_evidence(package_id, created_at, id);
+        CREATE TABLE IF NOT EXISTS package_evidence_items (
+            evidence_id TEXT NOT NULL REFERENCES package_evidence(id) ON DELETE CASCADE,
+            item_kind TEXT NOT NULL CHECK(item_kind IN ('path', 'declaration')),
+            item_value TEXT NOT NULL,
+            ordinal INTEGER NOT NULL,
+            PRIMARY KEY(evidence_id, item_kind, item_value)
+        );
+        CREATE TABLE IF NOT EXISTS steward_leases (
+            package_id TEXT PRIMARY KEY REFERENCES capability_packages(id) ON DELETE CASCADE,
+            agent_id TEXT NOT NULL,
+            generation INTEGER NOT NULL,
+            acquired_at TEXT NOT NULL,
+            heartbeat_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS path_reservations (
+            normalized_path TEXT PRIMARY KEY,
+            mode TEXT NOT NULL,
+            package_id TEXT NOT NULL REFERENCES capability_packages(id) ON DELETE CASCADE,
+            lease_generation INTEGER NOT NULL,
+            acquired_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS path_reservations_package
+            ON path_reservations(package_id, normalized_path);
+        CREATE TABLE IF NOT EXISTS package_dependencies (
+            package_id TEXT NOT NULL REFERENCES capability_packages(id) ON DELETE CASCADE,
+            depends_on_package_id TEXT NOT NULL REFERENCES capability_packages(id),
+            required_revision TEXT,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY(package_id, depends_on_package_id),
+            CHECK(package_id != depends_on_package_id)
+        );
+        CREATE TABLE IF NOT EXISTS package_read_interfaces (
+            package_id TEXT NOT NULL REFERENCES capability_packages(id) ON DELETE CASCADE,
+            interface_id TEXT NOT NULL,
+            digest TEXT NOT NULL,
+            source_revision TEXT NOT NULL,
+            PRIMARY KEY(package_id, interface_id)
+        );
+        CREATE TABLE IF NOT EXISTS integration_journal (
+            id TEXT PRIMARY KEY,
+            package_id TEXT NOT NULL REFERENCES capability_packages(id) ON DELETE CASCADE,
+            lease_generation INTEGER NOT NULL,
+            base_revision TEXT NOT NULL,
+            candidate_revision TEXT NOT NULL,
+            canonical_revision_before TEXT NOT NULL,
+            phase TEXT NOT NULL,
+            validation_digest TEXT NOT NULL,
+            canonical_revision_after TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS integration_journal_package
+            ON integration_journal(package_id, updated_at, id);
+        CREATE TABLE IF NOT EXISTS upstream_request_imports (
+            request_id TEXT PRIMARY KEY,
+            package_id TEXT NOT NULL REFERENCES capability_packages(id),
+            evidence_id TEXT NOT NULL REFERENCES package_evidence(id),
+            source_digest TEXT NOT NULL,
+            imported_at TEXT NOT NULL
+        );
         """
     )
     columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(runs)").fetchall()}
@@ -603,6 +800,7 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             connection.execute(f"ALTER TABLE runs ADD COLUMN {name} {declaration}")
     if previous_version == 2:
         _migrate_v2_globals(connection)
+    _import_persisted_upstream_requests(connection)
     connection.execute(
         "UPDATE meta SET schema_version=? WHERE singleton=1",
         (SCHEMA_VERSION,),
@@ -680,6 +878,7 @@ def _migrate_v2_globals(connection: sqlite3.Connection) -> None:
         _replace_collection(connection, section, checkpoint.get(section, {}))
     for section in GRAPH_SECTIONS:
         _replace_graph(connection, section, checkpoint.get(section, {}))
+    _import_persisted_upstream_requests(connection)
     coordinator_row = connection.execute(
         "SELECT payload FROM globals WHERE key='coordinator_build'"
     ).fetchone()
@@ -725,6 +924,7 @@ def _upsert_normalized_checkpoint(
         _replace_collection(connection, section, checkpoint.get(section, {}))
     for section in GRAPH_SECTIONS:
         _replace_graph(connection, section, checkpoint.get(section, {}))
+    _import_persisted_upstream_requests(connection)
     connection.executemany(
         """
         INSERT INTO documents(id, ordinal, payload) VALUES(?, ?, ?)
@@ -907,6 +1107,604 @@ def _upstream_request_batches(requests: Any) -> dict[str, list[str]]:
     return batches
 
 
+def _utc_now() -> str:
+    return datetime.now(UTC).isoformat()
+
+
+def _content_digest(value: Any) -> str:
+    return sha256(json.dumpb(value, sort_keys=True)).hexdigest()
+
+
+def _stable_record_id(prefix: str, *parts: str) -> str:
+    digest = sha256("\0".join(parts).encode()).hexdigest()[:20]
+    return f"{prefix}-{digest}"
+
+
+def _clean_import_paths(values: Any) -> tuple[str, ...]:
+    if not isinstance(values, list):
+        return ()
+    clean: list[str] = []
+    for value in values:
+        if not isinstance(value, str) or not value.strip():
+            continue
+        try:
+            path = normalize_repository_path(value)
+        except ValueError:
+            continue
+        if path not in clean:
+            clean.append(path)
+    return tuple(clean)
+
+
+def _package_id_for_key(connection: sqlite3.Connection, capability_key: str) -> str | None:
+    row = connection.execute(
+        """
+        SELECT id FROM capability_packages WHERE capability_key=? AND status != 'superseded'
+        UNION ALL
+        SELECT package_id FROM capability_aliases WHERE alias_key=?
+        LIMIT 1
+        """,
+        (capability_key, capability_key),
+    ).fetchone()
+    return str(row[0]) if row is not None else None
+
+
+def _insert_package(connection: sqlite3.Connection, package: CapabilityPackage) -> None:
+    connection.execute(
+        """
+        INSERT INTO capability_packages(
+            id, capability_key, title, mathematical_objective, status, disposition,
+            base_revision, branch, worktree, parent_package_id, plan_revision,
+            integrated_revision, revision, created_at, updated_at
+        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            package.id,
+            package.capability_key,
+            package.title,
+            package.mathematical_objective,
+            str(package.status),
+            str(package.disposition) if package.disposition is not None else None,
+            package.base_revision,
+            package.branch,
+            package.worktree,
+            package.parent_package_id,
+            package.plan_revision,
+            package.integrated_revision,
+            package.revision,
+            package.created_at,
+            package.updated_at,
+        ),
+    )
+    aliases = tuple(dict.fromkeys((package.capability_key, *package.aliases)))
+    connection.executemany(
+        "INSERT INTO capability_aliases(alias_key, package_id) VALUES(?, ?)",
+        ((alias, package.id) for alias in aliases),
+    )
+    connection.executemany(
+        "INSERT INTO package_textbook_refs VALUES(?, ?, ?)",
+        ((package.id, value, ordinal) for ordinal, value in enumerate(package.textbook_refs)),
+    )
+    connection.executemany(
+        "INSERT INTO package_scopes VALUES(?, 'write', ?, ?)",
+        ((package.id, value, ordinal) for ordinal, value in enumerate(package.write_scope)),
+    )
+    connection.executemany(
+        "INSERT INTO package_scopes VALUES(?, 'expansion', ?, ?)",
+        ((package.id, value, ordinal) for ordinal, value in enumerate(package.expansion_scope)),
+    )
+
+
+def _insert_consumer(connection: sqlite3.Connection, consumer: PackageConsumer) -> str:
+    existing = connection.execute(
+        """
+        SELECT id FROM package_consumers
+        WHERE package_id=? AND work_unit_id=? AND path=? AND declaration=? AND stage=?
+        """,
+        (
+            consumer.package_id,
+            consumer.work_unit_id,
+            consumer.path,
+            consumer.declaration,
+            consumer.stage,
+        ),
+    ).fetchone()
+    if existing is not None:
+        return str(existing[0])
+    connection.execute(
+        """
+        INSERT INTO package_consumers(
+            id, package_id, work_unit_id, path, declaration, stage, residual_goal,
+            source_digest, acceptance_contract, status, accepted_revision,
+            detached_package_id, created_at, updated_at
+        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            consumer.id,
+            consumer.package_id,
+            consumer.work_unit_id,
+            consumer.path,
+            consumer.declaration,
+            consumer.stage,
+            consumer.residual_goal,
+            consumer.source_digest,
+            json.dumpb(consumer.acceptance_contract),
+            str(consumer.status),
+            consumer.accepted_revision,
+            consumer.detached_package_id,
+            consumer.created_at,
+            consumer.updated_at,
+        ),
+    )
+    connection.executemany(
+        "INSERT INTO package_consumer_blockers VALUES(?, ?, ?)",
+        ((consumer.id, value, ordinal) for ordinal, value in enumerate(consumer.blocker_ids)),
+    )
+    connection.executemany(
+        "INSERT INTO package_consumer_routes VALUES(?, ?, ?)",
+        ((consumer.id, value, ordinal) for ordinal, value in enumerate(consumer.attempted_routes)),
+    )
+    return consumer.id
+
+
+def _insert_evidence(connection: sqlite3.Connection, evidence: PackageEvidence) -> None:
+    connection.execute(
+        """
+        INSERT INTO package_evidence(
+            id, package_id, producer, kind, source_revision, payload, digest, created_at
+        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            evidence.id,
+            evidence.package_id,
+            evidence.producer,
+            str(evidence.kind),
+            evidence.source_revision,
+            json.dumpb(evidence.payload),
+            evidence.digest,
+            evidence.created_at,
+        ),
+    )
+    connection.executemany(
+        "INSERT INTO package_evidence_items VALUES(?, 'path', ?, ?)",
+        ((evidence.id, value, ordinal) for ordinal, value in enumerate(evidence.paths)),
+    )
+    connection.executemany(
+        "INSERT INTO package_evidence_items VALUES(?, 'declaration', ?, ?)",
+        ((evidence.id, value, ordinal) for ordinal, value in enumerate(evidence.declarations)),
+    )
+
+
+def _import_upstream_request(
+    connection: sqlite3.Connection, request_id: str, request: dict[str, Any]
+) -> str:
+    imported = connection.execute(
+        "SELECT package_id FROM upstream_request_imports WHERE request_id=?", (request_id,)
+    ).fetchone()
+    if imported is not None:
+        return str(imported[0])
+
+    raw_key = str(request.get("capability_key", "")).strip()
+    if not raw_key:
+        raw_key = str(request.get("fingerprint", request_id)).strip()
+    capability_key = normalize_capability_key(raw_key) or f"legacy-upstream:{request_id}"
+    package_id = _package_id_for_key(connection, capability_key)
+    now = str(request.get("created_at", "")).strip() or _utc_now()
+    owner_paths = _clean_import_paths(request.get("owner_paths"))
+    consumer_path = _clean_import_paths([request.get("consumer_path")])
+    write_scope = tuple(dict.fromkeys((*owner_paths, *consumer_path)))
+    raw_answer = request.get("answer")
+    answer: dict[str, Any] = raw_answer if isinstance(raw_answer, dict) else {}
+    disposition = str(answer.get("disposition", ""))
+    external = str(request.get("owner_kind", "chapter")) != "chapter" or disposition == "external"
+    if package_id is None:
+        package_id = _stable_record_id("package", capability_key)
+        title = str(
+            request.get("needed_result")
+            or request.get("candidate_signature")
+            or request.get("blocked_declaration")
+            or capability_key
+        ).strip()
+        package = CapabilityPackage(
+            id=package_id,
+            capability_key=capability_key,
+            title=title,
+            mathematical_objective=str(request.get("needed_result", title)).strip(),
+            status=PackageStatus.EXTERNAL if external else PackageStatus.OBSERVED,
+            disposition=PackageDisposition.EXTERNAL if external else None,
+            write_scope=write_scope,
+            expansion_scope=owner_paths,
+            created_at=now,
+            updated_at=str(request.get("updated_at", now)),
+        )
+        _insert_package(connection, package)
+
+    attachments = request.get("consumers")
+    if not isinstance(attachments, list) or not attachments:
+        attachments = [request]
+    for ordinal, raw in enumerate(attachments):
+        if not isinstance(raw, dict):
+            continue
+        work_unit_id = str(raw.get("consumer_chapter_id", request.get("consumer_chapter_id", "")))
+        declaration = str(
+            raw.get("blocked_declaration", request.get("blocked_declaration", ""))
+        ).strip()
+        path_value = str(raw.get("consumer_path", request.get("consumer_path", ""))).strip()
+        try:
+            path_value = normalize_repository_path(path_value) if path_value else ""
+        except ValueError:
+            path_value = ""
+        old_status = str(raw.get("status", request.get("status", "requested")))
+        consumer_status = (
+            ConsumerStatus.ACCEPTED
+            if old_status == "closed" and bool(raw.get("closed_by_run_id"))
+            else ConsumerStatus.TERMINAL
+            if old_status == "closed"
+            else ConsumerStatus.OPEN
+        )
+        consumer_id = _stable_record_id(
+            "consumer", request_id, str(ordinal), work_unit_id, path_value, declaration
+        )
+        attempted = raw.get("attempted_alternatives", request.get("attempted_alternatives", []))
+        blocker_ids = raw.get("blocker_ids", request.get("blocker_ids", []))
+        _insert_consumer(
+            connection,
+            PackageConsumer(
+                id=consumer_id,
+                package_id=package_id,
+                work_unit_id=work_unit_id,
+                path=path_value,
+                declaration=declaration,
+                stage="prove",
+                residual_goal=str(raw.get("residual_goal", request.get("residual_goal", ""))),
+                blocker_ids=tuple(str(value) for value in blocker_ids)
+                if isinstance(blocker_ids, list)
+                else (),
+                attempted_routes=tuple(str(value) for value in attempted)
+                if isinstance(attempted, list)
+                else (),
+                acceptance_contract={
+                    "tests": [
+                        str(value)
+                        for value in raw.get(
+                            "acceptance_tests", request.get("acceptance_tests", [])
+                        )
+                        if isinstance(value, str)
+                    ],
+                    "legacy_request_id": request_id,
+                },
+                status=consumer_status,
+                accepted_revision=(
+                    str(raw.get("closed_by_run_id"))
+                    if consumer_status is ConsumerStatus.ACCEPTED
+                    else None
+                ),
+                created_at=now,
+                updated_at=str(request.get("updated_at", now)),
+            ),
+        )
+
+    evidence_id = _stable_record_id("evidence", "upstream-request", request_id)
+    evidence = PackageEvidence(
+        id=evidence_id,
+        package_id=package_id,
+        producer="legacy-upstream-request-importer",
+        kind=EvidenceKind.UPSTREAM_REQUEST_IMPORT,
+        paths=write_scope,
+        declarations=tuple(
+            value
+            for value in (
+                str(request.get("blocked_declaration", "")).strip(),
+                *(str(item) for item in answer.get("declarations", []) if isinstance(item, str)),
+            )
+            if value
+        ),
+        payload={"request_id": request_id, "request": request},
+        digest=_content_digest(request),
+        created_at=now,
+    )
+    _insert_evidence(connection, evidence)
+    connection.execute(
+        "INSERT INTO upstream_request_imports VALUES(?, ?, ?, ?, ?)",
+        (request_id, package_id, evidence_id, evidence.digest, _utc_now()),
+    )
+    connection.execute(
+        "UPDATE capability_packages SET revision=revision+1, updated_at=? WHERE id=?",
+        (_utc_now(), package_id),
+    )
+    return package_id
+
+
+def _import_persisted_upstream_requests(connection: sqlite3.Connection) -> dict[str, str]:
+    imported: dict[str, str] = {}
+    rows = connection.execute(
+        "SELECT item_key, payload FROM state_items WHERE section='upstream_requests'"
+    ).fetchall()
+    for request_id, payload in rows:
+        value = json.loads(payload)
+        if isinstance(value, dict):
+            imported[str(request_id)] = _import_upstream_request(connection, str(request_id), value)
+    return imported
+
+
+def _group_ordered_items(
+    connection: sqlite3.Connection,
+    query: str,
+) -> dict[str, tuple[str, ...]]:
+    grouped: dict[str, list[str]] = {}
+    for owner_id, value in connection.execute(query):
+        grouped.setdefault(str(owner_id), []).append(str(value))
+    return {key: tuple(values) for key, values in grouped.items()}
+
+
+def _load_package_state(connection: sqlite3.Connection) -> PackageState:
+    aliases = _group_ordered_items(
+        connection,
+        "SELECT package_id, alias_key FROM capability_aliases ORDER BY package_id, alias_key",
+    )
+    textbook_refs = _group_ordered_items(
+        connection,
+        """SELECT package_id, textbook_ref FROM package_textbook_refs
+        ORDER BY package_id, ordinal, textbook_ref""",
+    )
+    write_scopes = _group_ordered_items(
+        connection,
+        """SELECT package_id, normalized_path FROM package_scopes
+        WHERE scope_kind='write' ORDER BY package_id, ordinal, normalized_path""",
+    )
+    expansion_scopes = _group_ordered_items(
+        connection,
+        """SELECT package_id, normalized_path FROM package_scopes
+        WHERE scope_kind='expansion' ORDER BY package_id, ordinal, normalized_path""",
+    )
+    packages: dict[str, CapabilityPackage] = {}
+    for row in connection.execute(
+        """
+        SELECT id, capability_key, title, mathematical_objective, status, disposition,
+            base_revision, branch, worktree, parent_package_id, plan_revision,
+            integrated_revision, revision, created_at, updated_at
+        FROM capability_packages ORDER BY created_at, id
+        """
+    ):
+        package_id = str(row[0])
+        key = str(row[1])
+        packages[package_id] = CapabilityPackage(
+            id=package_id,
+            capability_key=key,
+            title=str(row[2]),
+            mathematical_objective=str(row[3]),
+            status=PackageStatus(str(row[4])),
+            disposition=PackageDisposition(str(row[5])) if row[5] is not None else None,
+            aliases=tuple(value for value in aliases.get(package_id, ()) if value != key),
+            textbook_refs=textbook_refs.get(package_id, ()),
+            write_scope=write_scopes.get(package_id, ()),
+            expansion_scope=expansion_scopes.get(package_id, ()),
+            base_revision=str(row[6]),
+            branch=str(row[7]),
+            worktree=str(row[8]),
+            parent_package_id=str(row[9]) if row[9] is not None else None,
+            plan_revision=int(row[10]),
+            integrated_revision=str(row[11]) if row[11] is not None else None,
+            revision=int(row[12]),
+            created_at=str(row[13]),
+            updated_at=str(row[14]),
+        )
+
+    blockers = _group_ordered_items(
+        connection,
+        """SELECT consumer_id, blocker_id FROM package_consumer_blockers
+        ORDER BY consumer_id, ordinal, blocker_id""",
+    )
+    routes = _group_ordered_items(
+        connection,
+        """SELECT consumer_id, attempted_route FROM package_consumer_routes
+        ORDER BY consumer_id, ordinal, attempted_route""",
+    )
+    consumers: dict[str, PackageConsumer] = {}
+    for row in connection.execute(
+        """
+        SELECT id, package_id, work_unit_id, path, declaration, stage, residual_goal,
+            source_digest, acceptance_contract, status, accepted_revision,
+            detached_package_id, created_at, updated_at
+        FROM package_consumers ORDER BY created_at, id
+        """
+    ):
+        consumer_id = str(row[0])
+        contract = json.loads(row[8])
+        consumers[consumer_id] = PackageConsumer(
+            id=consumer_id,
+            package_id=str(row[1]),
+            work_unit_id=str(row[2]),
+            path=str(row[3]),
+            declaration=str(row[4]),
+            stage=str(row[5]),
+            residual_goal=str(row[6]),
+            source_digest=str(row[7]) if row[7] is not None else None,
+            blocker_ids=blockers.get(consumer_id, ()),
+            attempted_routes=routes.get(consumer_id, ()),
+            acceptance_contract=contract if isinstance(contract, dict) else {},
+            status=ConsumerStatus(str(row[9])),
+            accepted_revision=str(row[10]) if row[10] is not None else None,
+            detached_package_id=str(row[11]) if row[11] is not None else None,
+            created_at=str(row[12]),
+            updated_at=str(row[13]),
+        )
+
+    step_declarations = _group_ordered_items(
+        connection,
+        """SELECT step_id, item_value FROM package_step_items WHERE item_kind='declaration'
+        ORDER BY step_id, ordinal, item_value""",
+    )
+    step_paths = _group_ordered_items(
+        connection,
+        """SELECT step_id, item_value FROM package_step_items WHERE item_kind='path'
+        ORDER BY step_id, ordinal, item_value""",
+    )
+    step_commits = _group_ordered_items(
+        connection,
+        """SELECT step_id, item_value FROM package_step_items WHERE item_kind='commit'
+        ORDER BY step_id, ordinal, item_value""",
+    )
+    step_dependencies = _group_ordered_items(
+        connection,
+        """SELECT step_id, depends_on_step_id FROM package_step_dependencies
+        ORDER BY step_id, depends_on_step_id""",
+    )
+    steps: dict[str, PackageStep] = {}
+    for row in connection.execute(
+        """SELECT id, package_id, objective, kind, status, assigned_worker_id,
+            validation_contract, remaining_gap, plan_revision, created_at, updated_at
+        FROM package_steps ORDER BY created_at, id"""
+    ):
+        step_id = str(row[0])
+        contract = json.loads(row[6])
+        steps[step_id] = PackageStep(
+            id=step_id,
+            package_id=str(row[1]),
+            objective=str(row[2]),
+            kind=PackageStepKind(str(row[3])),
+            status=PackageStepStatus(str(row[4])),
+            assigned_worker_id=str(row[5]) if row[5] is not None else None,
+            validation_contract=contract if isinstance(contract, dict) else {},
+            remaining_gap=str(row[7]),
+            plan_revision=int(row[8]),
+            intended_declarations=step_declarations.get(step_id, ()),
+            intended_paths=step_paths.get(step_id, ()),
+            depends_on_step_ids=step_dependencies.get(step_id, ()),
+            commit_ids=step_commits.get(step_id, ()),
+            created_at=str(row[9]),
+            updated_at=str(row[10]),
+        )
+
+    evidence_paths = _group_ordered_items(
+        connection,
+        """SELECT evidence_id, item_value FROM package_evidence_items WHERE item_kind='path'
+        ORDER BY evidence_id, ordinal, item_value""",
+    )
+    evidence_declarations = _group_ordered_items(
+        connection,
+        """SELECT evidence_id, item_value FROM package_evidence_items
+        WHERE item_kind='declaration' ORDER BY evidence_id, ordinal, item_value""",
+    )
+    evidence: dict[str, PackageEvidence] = {}
+    for row in connection.execute(
+        """SELECT id, package_id, producer, kind, source_revision, payload, digest, created_at
+        FROM package_evidence ORDER BY created_at, id"""
+    ):
+        evidence_id = str(row[0])
+        payload = json.loads(row[5])
+        evidence[evidence_id] = PackageEvidence(
+            id=evidence_id,
+            package_id=str(row[1]),
+            producer=str(row[2]),
+            kind=EvidenceKind(str(row[3])),
+            source_revision=str(row[4]),
+            payload=payload if isinstance(payload, dict) else {},
+            digest=str(row[6]),
+            created_at=str(row[7]),
+            paths=evidence_paths.get(evidence_id, ()),
+            declarations=evidence_declarations.get(evidence_id, ()),
+        )
+
+    leases = {
+        str(row[0]): StewardLease(
+            package_id=str(row[0]),
+            agent_id=str(row[1]),
+            generation=int(row[2]),
+            acquired_at=str(row[3]),
+            heartbeat_at=str(row[4]),
+            expires_at=str(row[5]),
+        )
+        for row in connection.execute(
+            "SELECT package_id, agent_id, generation, acquired_at, heartbeat_at, expires_at "
+            "FROM steward_leases ORDER BY package_id"
+        )
+    }
+    reservations = {
+        str(row[0]): PathReservation(
+            normalized_path=str(row[0]),
+            mode=ReservationMode(str(row[1])),
+            package_id=str(row[2]),
+            lease_generation=int(row[3]),
+            acquired_at=str(row[4]),
+        )
+        for row in connection.execute(
+            """SELECT normalized_path, mode, package_id, lease_generation, acquired_at
+            FROM path_reservations ORDER BY normalized_path"""
+        )
+    }
+    dependencies = tuple(
+        PackageDependency(
+            package_id=str(row[0]),
+            depends_on_package_id=str(row[1]),
+            required_revision=str(row[2]) if row[2] is not None else None,
+            created_at=str(row[3]),
+        )
+        for row in connection.execute(
+            """SELECT package_id, depends_on_package_id, required_revision, created_at
+            FROM package_dependencies ORDER BY package_id, depends_on_package_id"""
+        )
+    )
+    read_interfaces = tuple(
+        RelevantReadInterface(
+            package_id=str(row[0]),
+            interface_id=str(row[1]),
+            digest=str(row[2]),
+            source_revision=str(row[3]),
+        )
+        for row in connection.execute(
+            """SELECT package_id, interface_id, digest, source_revision
+            FROM package_read_interfaces ORDER BY package_id, interface_id"""
+        )
+    )
+    journals = {
+        str(row[0]): IntegrationJournal(
+            id=str(row[0]),
+            package_id=str(row[1]),
+            lease_generation=int(row[2]),
+            base_revision=str(row[3]),
+            candidate_revision=str(row[4]),
+            canonical_revision_before=str(row[5]),
+            phase=IntegrationPhase(str(row[6])),
+            validation_digest=str(row[7]),
+            canonical_revision_after=str(row[8]) if row[8] is not None else None,
+            created_at=str(row[9]),
+            updated_at=str(row[10]),
+        )
+        for row in connection.execute(
+            """SELECT id, package_id, lease_generation, base_revision,
+                candidate_revision, canonical_revision_before, phase, validation_digest,
+                canonical_revision_after, created_at, updated_at
+            FROM integration_journal ORDER BY created_at, id"""
+        )
+    }
+    imports = {
+        str(row[0]): UpstreamRequestImport(
+            request_id=str(row[0]),
+            package_id=str(row[1]),
+            evidence_id=str(row[2]),
+            source_digest=str(row[3]),
+            imported_at=str(row[4]),
+        )
+        for row in connection.execute(
+            """SELECT request_id, package_id, evidence_id, source_digest, imported_at
+            FROM upstream_request_imports ORDER BY imported_at, request_id"""
+        )
+    }
+    return PackageState(
+        packages=packages,
+        consumers=consumers,
+        steps=steps,
+        evidence=evidence,
+        leases=leases,
+        reservations=reservations,
+        dependencies=dependencies,
+        relevant_read_interfaces=read_interfaces,
+        integration_journal=journals,
+        upstream_request_imports=imports,
+    )
+
+
 def _hydrate_normalized_state(
     connection: sqlite3.Connection,
     checkpoint: dict[str, Any],
@@ -1042,7 +1840,7 @@ def initialize_database(state_dir: Path) -> Path:
             if version == 1:
                 with connection:
                     _migrate_v1(connection)
-            elif version in {2, 3}:
+            elif version in {2, 3, 4}:
                 with connection:
                     _create_schema(connection)
             elif version != SCHEMA_VERSION:
@@ -1383,6 +2181,862 @@ class StateDatabase:
                 ),
             )
 
+    def load_package_state(self) -> PackageState:
+        """Load the authoritative normalized capability-package aggregate."""
+
+        with _connect(self.path) as connection:
+            return _load_package_state(connection)
+
+    def import_upstream_requests(self, requests: dict[str, dict[str, Any]]) -> dict[str, str]:
+        """Import legacy requests once; later legacy mutations are deliberately ignored."""
+
+        with _connect(self.path) as connection, connection:
+            return {
+                request_id: _import_upstream_request(connection, request_id, request)
+                for request_id, request in sorted(requests.items())
+                if isinstance(request_id, str) and isinstance(request, dict)
+            }
+
+    @staticmethod
+    def _assert_package_revision(
+        connection: sqlite3.Connection, package_id: str, expected_revision: int
+    ) -> None:
+        row = connection.execute(
+            "SELECT revision FROM capability_packages WHERE id=?", (package_id,)
+        ).fetchone()
+        if row is None:
+            raise KeyError(package_id)
+        if int(row[0]) != expected_revision:
+            raise ValueError(
+                f"stale package revision for {package_id}: "
+                f"expected {expected_revision}, found {int(row[0])}"
+            )
+
+    @staticmethod
+    def _assert_lease_generation(
+        connection: sqlite3.Connection, package_id: str, generation: int
+    ) -> None:
+        row = connection.execute(
+            "SELECT generation FROM steward_leases WHERE package_id=?", (package_id,)
+        ).fetchone()
+        if row is None or int(row[0]) != generation:
+            actual = int(row[0]) if row is not None else None
+            raise ValueError(
+                f"stale lease generation for {package_id}: expected {generation}, found {actual}"
+            )
+
+    @staticmethod
+    def _touch_package(connection: sqlite3.Connection, package_id: str) -> None:
+        connection.execute(
+            "UPDATE capability_packages SET revision=revision+1, updated_at=? WHERE id=?",
+            (_utc_now(), package_id),
+        )
+
+    def create_or_attach_capability_package(
+        self,
+        package: CapabilityPackage,
+        *,
+        consumer: PackageConsumer | None = None,
+        evidence: tuple[PackageEvidence, ...] = (),
+        expected_revision: int | None = None,
+    ) -> tuple[CapabilityPackage, bool]:
+        """Create one capability owner or attach records to its existing key/alias."""
+
+        with _connect(self.path) as connection, connection:
+            package_id = _package_id_for_key(connection, package.capability_key)
+            created = package_id is None
+            now = _utc_now()
+            if package_id is None:
+                package_id = package.id
+                _insert_package(
+                    connection,
+                    replace(
+                        package,
+                        created_at=package.created_at or now,
+                        updated_at=package.updated_at or now,
+                    ),
+                )
+            elif expected_revision is not None:
+                self._assert_package_revision(connection, package_id, expected_revision)
+            changed = created
+            if consumer is not None:
+                attached = replace(
+                    consumer,
+                    package_id=package_id,
+                    created_at=consumer.created_at or now,
+                    updated_at=consumer.updated_at or now,
+                )
+                prior = connection.execute(
+                    """SELECT id FROM package_consumers WHERE package_id=? AND work_unit_id=?
+                    AND path=? AND declaration=? AND stage=?""",
+                    (
+                        package_id,
+                        attached.work_unit_id,
+                        attached.path,
+                        attached.declaration,
+                        attached.stage,
+                    ),
+                ).fetchone()
+                _insert_consumer(connection, attached)
+                changed = changed or prior is None
+            for item in evidence:
+                evidence_id = item.id
+                if (
+                    connection.execute(
+                        "SELECT 1 FROM package_evidence WHERE id=?", (evidence_id,)
+                    ).fetchone()
+                    is not None
+                ):
+                    continue
+                _insert_evidence(
+                    connection,
+                    replace(
+                        item,
+                        package_id=package_id,
+                        created_at=item.created_at or now,
+                    ),
+                )
+                changed = True
+            if changed and not created:
+                self._touch_package(connection, package_id)
+            result = _load_package_state(connection).packages[package_id]
+        return result, created
+
+    def attach_package_consumer(
+        self,
+        package_id: str,
+        consumer: PackageConsumer,
+        *,
+        expected_revision: int,
+        lease_generation: int | None = None,
+    ) -> PackageConsumer:
+        with _connect(self.path) as connection, connection:
+            self._assert_package_revision(connection, package_id, expected_revision)
+            if lease_generation is not None:
+                self._assert_lease_generation(connection, package_id, lease_generation)
+            attached = replace(
+                consumer,
+                package_id=package_id,
+                created_at=consumer.created_at or _utc_now(),
+                updated_at=consumer.updated_at or _utc_now(),
+            )
+            consumer_id = _insert_consumer(connection, attached)
+            self._touch_package(connection, package_id)
+            return _load_package_state(connection).consumers[consumer_id]
+
+    def update_package_consumer(
+        self,
+        consumer: PackageConsumer,
+        *,
+        expected_revision: int,
+        lease_generation: int | None = None,
+    ) -> PackageConsumer:
+        with _connect(self.path) as connection, connection:
+            self._assert_package_revision(connection, consumer.package_id, expected_revision)
+            if lease_generation is not None:
+                self._assert_lease_generation(connection, consumer.package_id, lease_generation)
+            cursor = connection.execute(
+                """UPDATE package_consumers SET residual_goal=?, source_digest=?,
+                    acceptance_contract=?, status=?, accepted_revision=?,
+                    detached_package_id=?, updated_at=?
+                WHERE id=? AND package_id=?""",
+                (
+                    consumer.residual_goal,
+                    consumer.source_digest,
+                    json.dumpb(consumer.acceptance_contract),
+                    str(consumer.status),
+                    consumer.accepted_revision,
+                    consumer.detached_package_id,
+                    consumer.updated_at or _utc_now(),
+                    consumer.id,
+                    consumer.package_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise KeyError(consumer.id)
+            connection.execute(
+                "DELETE FROM package_consumer_blockers WHERE consumer_id=?", (consumer.id,)
+            )
+            connection.execute(
+                "DELETE FROM package_consumer_routes WHERE consumer_id=?", (consumer.id,)
+            )
+            connection.executemany(
+                "INSERT INTO package_consumer_blockers VALUES(?, ?, ?)",
+                (
+                    (consumer.id, value, ordinal)
+                    for ordinal, value in enumerate(consumer.blocker_ids)
+                ),
+            )
+            connection.executemany(
+                "INSERT INTO package_consumer_routes VALUES(?, ?, ?)",
+                (
+                    (consumer.id, value, ordinal)
+                    for ordinal, value in enumerate(consumer.attempted_routes)
+                ),
+            )
+            self._touch_package(connection, consumer.package_id)
+            return _load_package_state(connection).consumers[consumer.id]
+
+    def update_package_lifecycle(
+        self,
+        package_id: str,
+        status: PackageStatus,
+        *,
+        expected_revision: int,
+        disposition: PackageDisposition | None = None,
+        plan_revision: int | None = None,
+        integrated_revision: str | None = None,
+        lease_generation: int | None = None,
+    ) -> CapabilityPackage:
+        with _connect(self.path) as connection, connection:
+            self._assert_package_revision(connection, package_id, expected_revision)
+            if lease_generation is not None:
+                self._assert_lease_generation(connection, package_id, lease_generation)
+            current = connection.execute(
+                "SELECT plan_revision, integrated_revision FROM capability_packages WHERE id=?",
+                (package_id,),
+            ).fetchone()
+            assert current is not None
+            connection.execute(
+                """UPDATE capability_packages SET status=?, disposition=?, plan_revision=?,
+                    integrated_revision=?, revision=revision+1, updated_at=? WHERE id=?""",
+                (
+                    str(status),
+                    str(disposition) if disposition is not None else None,
+                    int(current[0]) if plan_revision is None else plan_revision,
+                    current[1] if integrated_revision is None else integrated_revision,
+                    _utc_now(),
+                    package_id,
+                ),
+            )
+            return _load_package_state(connection).packages[package_id]
+
+    def add_capability_alias(
+        self,
+        package_id: str,
+        alias: str,
+        *,
+        expected_revision: int,
+        lease_generation: int | None = None,
+    ) -> CapabilityPackage:
+        normalized = normalize_capability_key(alias)
+        if not normalized:
+            raise ValueError("capability alias must not be empty")
+        with _connect(self.path) as connection, connection:
+            self._assert_package_revision(connection, package_id, expected_revision)
+            if lease_generation is not None:
+                self._assert_lease_generation(connection, package_id, lease_generation)
+            owner = _package_id_for_key(connection, normalized)
+            if owner is not None and owner != package_id:
+                raise ValueError(f"capability alias is owned by package {owner}")
+            connection.execute(
+                "INSERT OR IGNORE INTO capability_aliases VALUES(?, ?)",
+                (normalized, package_id),
+            )
+            self._touch_package(connection, package_id)
+            return _load_package_state(connection).packages[package_id]
+
+    def append_package_evidence(
+        self,
+        evidence: PackageEvidence,
+        *,
+        expected_revision: int,
+        lease_generation: int | None = None,
+    ) -> CapabilityPackage:
+        with _connect(self.path) as connection, connection:
+            self._assert_package_revision(connection, evidence.package_id, expected_revision)
+            if lease_generation is not None:
+                self._assert_lease_generation(connection, evidence.package_id, lease_generation)
+            _insert_evidence(
+                connection,
+                replace(evidence, created_at=evidence.created_at or _utc_now()),
+            )
+            self._touch_package(connection, evidence.package_id)
+            return _load_package_state(connection).packages[evidence.package_id]
+
+    def upsert_package_step(
+        self,
+        step: PackageStep,
+        *,
+        expected_revision: int,
+        lease_generation: int | None = None,
+    ) -> CapabilityPackage:
+        with _connect(self.path) as connection, connection:
+            self._assert_package_revision(connection, step.package_id, expected_revision)
+            if lease_generation is not None:
+                self._assert_lease_generation(connection, step.package_id, lease_generation)
+            existing_step = connection.execute(
+                "SELECT package_id FROM package_steps WHERE id=?", (step.id,)
+            ).fetchone()
+            if existing_step is not None and str(existing_step[0]) != step.package_id:
+                raise ValueError(f"step {step.id} belongs to a different package")
+            for dependency_id in step.depends_on_step_ids:
+                row = connection.execute(
+                    "SELECT package_id FROM package_steps WHERE id=?", (dependency_id,)
+                ).fetchone()
+                if row is None or str(row[0]) != step.package_id:
+                    raise ValueError(
+                        f"step dependency {dependency_id} does not belong to {step.package_id}"
+                    )
+            now = _utc_now()
+            connection.execute(
+                """INSERT INTO package_steps(
+                    id, package_id, objective, kind, status, assigned_worker_id,
+                    validation_contract, remaining_gap, plan_revision, created_at, updated_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    objective=excluded.objective, kind=excluded.kind, status=excluded.status,
+                    assigned_worker_id=excluded.assigned_worker_id,
+                    validation_contract=excluded.validation_contract,
+                    remaining_gap=excluded.remaining_gap,
+                    plan_revision=excluded.plan_revision, updated_at=excluded.updated_at
+                WHERE package_steps.package_id=excluded.package_id""",
+                (
+                    step.id,
+                    step.package_id,
+                    step.objective,
+                    str(step.kind),
+                    str(step.status),
+                    step.assigned_worker_id,
+                    json.dumpb(step.validation_contract),
+                    step.remaining_gap,
+                    step.plan_revision,
+                    step.created_at or now,
+                    step.updated_at or now,
+                ),
+            )
+            connection.execute("DELETE FROM package_step_items WHERE step_id=?", (step.id,))
+            connection.execute("DELETE FROM package_step_dependencies WHERE step_id=?", (step.id,))
+            for kind, values in (
+                ("declaration", step.intended_declarations),
+                ("path", step.intended_paths),
+                ("commit", step.commit_ids),
+            ):
+                connection.executemany(
+                    "INSERT INTO package_step_items VALUES(?, ?, ?, ?)",
+                    ((step.id, kind, value, ordinal) for ordinal, value in enumerate(values)),
+                )
+            connection.executemany(
+                "INSERT INTO package_step_dependencies VALUES(?, ?)",
+                ((step.id, value) for value in step.depends_on_step_ids),
+            )
+            step_graph: dict[str, set[str]] = {
+                str(row[0]): set()
+                for row in connection.execute(
+                    "SELECT id FROM package_steps WHERE package_id=?", (step.package_id,)
+                )
+            }
+            for step_id, depends_on in connection.execute(
+                """SELECT dependencies.step_id, dependencies.depends_on_step_id
+                FROM package_step_dependencies AS dependencies
+                JOIN package_steps AS steps ON steps.id=dependencies.step_id
+                WHERE steps.package_id=?""",
+                (step.package_id,),
+            ):
+                step_graph.setdefault(str(step_id), set()).add(str(depends_on))
+            self._assert_dependency_dag(step_graph)
+            self._touch_package(connection, step.package_id)
+            return _load_package_state(connection).packages[step.package_id]
+
+    def put_steward_lease(
+        self, lease: StewardLease, *, expected_revision: int
+    ) -> CapabilityPackage:
+        with _connect(self.path) as connection, connection:
+            self._assert_package_revision(connection, lease.package_id, expected_revision)
+            row = connection.execute(
+                "SELECT agent_id, generation FROM steward_leases WHERE package_id=?",
+                (lease.package_id,),
+            ).fetchone()
+            if row is not None and (
+                lease.generation < int(row[1])
+                or (lease.agent_id != str(row[0]) and lease.generation <= int(row[1]))
+            ):
+                raise ValueError("a replacement steward must use a newer lease generation")
+            connection.execute(
+                """INSERT INTO steward_leases VALUES(?, ?, ?, ?, ?, ?)
+                ON CONFLICT(package_id) DO UPDATE SET agent_id=excluded.agent_id,
+                    generation=excluded.generation, acquired_at=excluded.acquired_at,
+                    heartbeat_at=excluded.heartbeat_at, expires_at=excluded.expires_at""",
+                (
+                    lease.package_id,
+                    lease.agent_id,
+                    lease.generation,
+                    lease.acquired_at,
+                    lease.heartbeat_at,
+                    lease.expires_at,
+                ),
+            )
+            self._touch_package(connection, lease.package_id)
+            return _load_package_state(connection).packages[lease.package_id]
+
+    @staticmethod
+    def _reservation_conflicts(
+        left_path: str, left_mode: str, right_path: str, right_mode: str
+    ) -> bool:
+        if left_path == right_path:
+            return True
+        left_prefix = f"{left_path.rstrip('/')}/"
+        right_prefix = f"{right_path.rstrip('/')}/"
+        return (
+            left_mode == ReservationMode.EXCLUSIVE_SUBTREE and right_path.startswith(left_prefix)
+        ) or (
+            right_mode == ReservationMode.EXCLUSIVE_SUBTREE and left_path.startswith(right_prefix)
+        )
+
+    def reserve_package_paths(
+        self,
+        reservations: tuple[PathReservation, ...],
+        *,
+        expected_revision: int,
+    ) -> CapabilityPackage:
+        if not reservations:
+            raise ValueError("at least one path reservation is required")
+        package_ids = {item.package_id for item in reservations}
+        generations = {item.lease_generation for item in reservations}
+        if len(package_ids) != 1 or len(generations) != 1:
+            raise ValueError("one atomic reservation set must share a package and generation")
+        package_id = next(iter(package_ids))
+        generation = next(iter(generations))
+        with _connect(self.path) as connection, connection:
+            self._assert_package_revision(connection, package_id, expected_revision)
+            self._assert_lease_generation(connection, package_id, generation)
+            requested = sorted(reservations, key=lambda item: item.normalized_path)
+            for index, item in enumerate(requested):
+                for other in requested[index + 1 :]:
+                    if self._reservation_conflicts(
+                        item.normalized_path, str(item.mode), other.normalized_path, str(other.mode)
+                    ):
+                        raise ValueError("requested reservation set overlaps itself")
+                for path, mode, owner in connection.execute(
+                    "SELECT normalized_path, mode, package_id FROM path_reservations"
+                ):
+                    if str(owner) == package_id:
+                        continue
+                    if self._reservation_conflicts(
+                        item.normalized_path, str(item.mode), str(path), str(mode)
+                    ):
+                        raise ValueError(
+                            f"path {item.normalized_path} conflicts with package {owner}"
+                        )
+            connection.executemany(
+                """INSERT INTO path_reservations VALUES(?, ?, ?, ?, ?)
+                ON CONFLICT(normalized_path) DO UPDATE SET mode=excluded.mode,
+                    package_id=excluded.package_id,
+                    lease_generation=excluded.lease_generation,
+                    acquired_at=excluded.acquired_at""",
+                (
+                    (
+                        item.normalized_path,
+                        str(item.mode),
+                        item.package_id,
+                        item.lease_generation,
+                        item.acquired_at,
+                    )
+                    for item in requested
+                ),
+            )
+            self._touch_package(connection, package_id)
+            return _load_package_state(connection).packages[package_id]
+
+    @staticmethod
+    def _dependency_graph(connection: sqlite3.Connection) -> dict[str, set[str]]:
+        graph = {
+            str(row[0]): set() for row in connection.execute("SELECT id FROM capability_packages")
+        }
+        for package_id, depends_on in connection.execute(
+            "SELECT package_id, depends_on_package_id FROM package_dependencies"
+        ):
+            graph.setdefault(str(package_id), set()).add(str(depends_on))
+        return graph
+
+    @staticmethod
+    def _assert_dependency_dag(graph: dict[str, set[str]]) -> None:
+        visiting: set[str] = set()
+        visited: set[str] = set()
+
+        def visit(package_id: str) -> None:
+            if package_id in visiting:
+                raise ValueError("package dependency would create a cycle; merge instead")
+            if package_id in visited:
+                return
+            visiting.add(package_id)
+            for dependency in graph.get(package_id, ()):
+                visit(dependency)
+            visiting.remove(package_id)
+            visited.add(package_id)
+
+        for package_id in graph:
+            visit(package_id)
+
+    def add_package_dependency(
+        self,
+        dependency: PackageDependency,
+        *,
+        expected_revision: int,
+        lease_generation: int | None = None,
+    ) -> CapabilityPackage:
+        with _connect(self.path) as connection, connection:
+            self._assert_package_revision(connection, dependency.package_id, expected_revision)
+            if lease_generation is not None:
+                self._assert_lease_generation(connection, dependency.package_id, lease_generation)
+            if (
+                connection.execute(
+                    "SELECT 1 FROM capability_packages WHERE id=?",
+                    (dependency.depends_on_package_id,),
+                ).fetchone()
+                is None
+            ):
+                raise KeyError(dependency.depends_on_package_id)
+            graph = self._dependency_graph(connection)
+            graph.setdefault(dependency.package_id, set()).add(dependency.depends_on_package_id)
+            self._assert_dependency_dag(graph)
+            connection.execute(
+                """INSERT INTO package_dependencies VALUES(?, ?, ?, ?)
+                ON CONFLICT(package_id, depends_on_package_id) DO UPDATE SET
+                    required_revision=excluded.required_revision""",
+                (
+                    dependency.package_id,
+                    dependency.depends_on_package_id,
+                    dependency.required_revision,
+                    dependency.created_at or _utc_now(),
+                ),
+            )
+            self._touch_package(connection, dependency.package_id)
+            return _load_package_state(connection).packages[dependency.package_id]
+
+    def merge_capability_packages(
+        self,
+        survivor_id: str,
+        merged_id: str,
+        *,
+        expected_survivor_revision: int,
+        expected_merged_revision: int,
+        lease_generation: int | None = None,
+    ) -> CapabilityPackage:
+        """Atomically transfer package-owned state and fence the superseded owner."""
+
+        if survivor_id == merged_id:
+            raise ValueError("cannot merge a package into itself")
+        with _connect(self.path) as connection, connection:
+            self._assert_package_revision(connection, survivor_id, expected_survivor_revision)
+            self._assert_package_revision(connection, merged_id, expected_merged_revision)
+            if lease_generation is not None:
+                self._assert_lease_generation(connection, survivor_id, lease_generation)
+
+            for row in connection.execute(
+                """SELECT id, work_unit_id, path, declaration, stage
+                FROM package_consumers WHERE package_id=? ORDER BY id""",
+                (merged_id,),
+            ).fetchall():
+                consumer_id = str(row[0])
+                duplicate = connection.execute(
+                    """SELECT id FROM package_consumers WHERE package_id=? AND work_unit_id=?
+                    AND path=? AND declaration=? AND stage=?""",
+                    (survivor_id, *row[1:]),
+                ).fetchone()
+                if duplicate is None:
+                    connection.execute(
+                        "UPDATE package_consumers SET package_id=? WHERE id=?",
+                        (survivor_id, consumer_id),
+                    )
+                    continue
+                kept_id = str(duplicate[0])
+                connection.execute(
+                    """INSERT OR IGNORE INTO package_consumer_blockers
+                    SELECT ?, blocker_id, ordinal FROM package_consumer_blockers
+                    WHERE consumer_id=?""",
+                    (kept_id, consumer_id),
+                )
+                connection.execute(
+                    """INSERT OR IGNORE INTO package_consumer_routes
+                    SELECT ?, attempted_route, ordinal FROM package_consumer_routes
+                    WHERE consumer_id=?""",
+                    (kept_id, consumer_id),
+                )
+                connection.execute("DELETE FROM package_consumers WHERE id=?", (consumer_id,))
+
+            for table in ("package_steps", "package_evidence", "integration_journal"):
+                connection.execute(
+                    f"UPDATE {table} SET package_id=? WHERE package_id=?",
+                    (survivor_id, merged_id),
+                )
+            connection.execute(
+                "UPDATE upstream_request_imports SET package_id=? WHERE package_id=?",
+                (survivor_id, merged_id),
+            )
+            connection.execute(
+                "UPDATE capability_aliases SET package_id=? WHERE package_id=?",
+                (survivor_id, merged_id),
+            )
+            for table, columns in (
+                ("package_textbook_refs", "textbook_ref, ordinal"),
+                ("package_scopes", "scope_kind, normalized_path, ordinal"),
+                ("package_read_interfaces", "interface_id, digest, source_revision"),
+            ):
+                connection.execute(
+                    f"INSERT OR IGNORE INTO {table} SELECT ?, {columns} FROM {table} "
+                    "WHERE package_id=?",
+                    (survivor_id, merged_id),
+                )
+                connection.execute(f"DELETE FROM {table} WHERE package_id=?", (merged_id,))
+            connection.execute(
+                "UPDATE path_reservations SET package_id=? WHERE package_id=?",
+                (survivor_id, merged_id),
+            )
+            connection.execute(
+                "UPDATE capability_packages SET parent_package_id=? WHERE parent_package_id=?",
+                (survivor_id, merged_id),
+            )
+
+            transformed: dict[tuple[str, str], tuple[str | None, str]] = {}
+            for package_id, depends_on, required, created in connection.execute(
+                """SELECT package_id, depends_on_package_id, required_revision, created_at
+                FROM package_dependencies"""
+            ):
+                source = survivor_id if str(package_id) == merged_id else str(package_id)
+                target = survivor_id if str(depends_on) == merged_id else str(depends_on)
+                if source != target:
+                    transformed.setdefault(
+                        (source, target),
+                        (str(required) if required is not None else None, str(created)),
+                    )
+            connection.execute("DELETE FROM package_dependencies")
+            connection.executemany(
+                "INSERT INTO package_dependencies VALUES(?, ?, ?, ?)",
+                (
+                    (source, target, required, created)
+                    for (source, target), (required, created) in transformed.items()
+                ),
+            )
+            self._assert_dependency_dag(self._dependency_graph(connection))
+            connection.execute("DELETE FROM steward_leases WHERE package_id=?", (merged_id,))
+            now = _utc_now()
+            connection.execute(
+                """UPDATE capability_packages SET status=?, disposition=?, revision=revision+1,
+                    updated_at=? WHERE id=?""",
+                (
+                    str(PackageStatus.SUPERSEDED),
+                    str(PackageDisposition.SUPERSEDED),
+                    now,
+                    merged_id,
+                ),
+            )
+            self._touch_package(connection, survivor_id)
+            return _load_package_state(connection).packages[survivor_id]
+
+    def split_capability_package(
+        self,
+        parent_id: str,
+        children: tuple[CapabilityPackage, ...],
+        consumer_assignments: dict[str, tuple[str, ...]],
+        *,
+        expected_revision: int,
+        lease_generation: int | None = None,
+    ) -> tuple[CapabilityPackage, ...]:
+        """Atomically decompose a package and transfer all open consumers and locks."""
+
+        if not children:
+            raise ValueError("a split requires at least one child package")
+        child_ids = {child.id for child in children}
+        if len(child_ids) != len(children) or set(consumer_assignments) - child_ids:
+            raise ValueError("consumer assignments must name distinct child packages")
+        with _connect(self.path) as connection, connection:
+            self._assert_package_revision(connection, parent_id, expected_revision)
+            if lease_generation is not None:
+                self._assert_lease_generation(connection, parent_id, lease_generation)
+            assigned_ids = [value for values in consumer_assignments.values() for value in values]
+            if len(assigned_ids) != len(set(assigned_ids)):
+                raise ValueError("a consumer may be assigned to only one child")
+            open_ids = {
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT id FROM package_consumers WHERE package_id=? AND status='open'",
+                    (parent_id,),
+                )
+            }
+            if not open_ids.issubset(assigned_ids):
+                raise ValueError("every open parent consumer must be assigned to a child")
+            actual_ids = {
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT id FROM package_consumers WHERE package_id=?", (parent_id,)
+                )
+            }
+            if not set(assigned_ids).issubset(actual_ids):
+                raise ValueError("consumer assignment does not belong to the parent package")
+            now = _utc_now()
+            for child in children:
+                if child.parent_package_id not in {None, parent_id}:
+                    raise ValueError("split child has a different parent")
+                if _package_id_for_key(connection, child.capability_key) is not None:
+                    raise ValueError(f"child capability already exists: {child.capability_key}")
+                _insert_package(
+                    connection,
+                    replace(
+                        child,
+                        parent_package_id=parent_id,
+                        created_at=child.created_at or now,
+                        updated_at=child.updated_at or now,
+                    ),
+                )
+            for child_id, consumer_ids in consumer_assignments.items():
+                connection.executemany(
+                    "UPDATE package_consumers SET package_id=?, updated_at=? WHERE id=?",
+                    ((child_id, now, consumer_id) for consumer_id in consumer_ids),
+                )
+
+            child_scopes = {child.id: child.write_scope for child in children}
+            for path, _mode in connection.execute(
+                "SELECT normalized_path, mode FROM path_reservations WHERE package_id=?",
+                (parent_id,),
+            ).fetchall():
+                owners = [
+                    child_id
+                    for child_id, scopes in child_scopes.items()
+                    if any(
+                        str(path) == scope or str(path).startswith(f"{scope}/") for scope in scopes
+                    )
+                ]
+                if len(owners) != 1:
+                    raise ValueError(
+                        f"reservation {path} must belong to exactly one split child scope"
+                    )
+                connection.execute(
+                    "UPDATE path_reservations SET package_id=? WHERE normalized_path=?",
+                    (owners[0], str(path)),
+                )
+
+            incoming: list[tuple[str, str | None, str]] = []
+            outgoing: list[tuple[str, str | None, str]] = []
+            for package_id, depends_on, required, created in connection.execute(
+                """SELECT package_id, depends_on_package_id, required_revision, created_at
+                FROM package_dependencies"""
+            ):
+                if str(depends_on) == parent_id:
+                    incoming.append(
+                        (
+                            str(package_id),
+                            str(required) if required is not None else None,
+                            str(created),
+                        )
+                    )
+                if str(package_id) == parent_id:
+                    outgoing.append(
+                        (
+                            str(depends_on),
+                            str(required) if required is not None else None,
+                            str(created),
+                        )
+                    )
+            connection.execute(
+                "DELETE FROM package_dependencies WHERE package_id=? OR depends_on_package_id=?",
+                (parent_id, parent_id),
+            )
+            edges = {
+                (source, child.id, required, created)
+                for source, required, created in incoming
+                for child in children
+                if source != child.id
+            } | {
+                (child.id, target, required, created)
+                for target, required, created in outgoing
+                for child in children
+                if target != child.id
+            }
+            connection.executemany(
+                "INSERT OR IGNORE INTO package_dependencies VALUES(?, ?, ?, ?)", edges
+            )
+            self._assert_dependency_dag(self._dependency_graph(connection))
+            connection.execute("DELETE FROM steward_leases WHERE package_id=?", (parent_id,))
+            connection.execute(
+                """UPDATE capability_packages SET status=?, disposition=?, revision=revision+1,
+                    updated_at=? WHERE id=?""",
+                (
+                    str(PackageStatus.DECOMPOSED),
+                    str(PackageDisposition.DECOMPOSED),
+                    now,
+                    parent_id,
+                ),
+            )
+            state = _load_package_state(connection)
+            return tuple(state.packages[child.id] for child in children)
+
+    def replace_relevant_read_interfaces(
+        self,
+        package_id: str,
+        interfaces: tuple[RelevantReadInterface, ...],
+        *,
+        expected_revision: int,
+        lease_generation: int | None = None,
+    ) -> CapabilityPackage:
+        with _connect(self.path) as connection, connection:
+            self._assert_package_revision(connection, package_id, expected_revision)
+            if lease_generation is not None:
+                self._assert_lease_generation(connection, package_id, lease_generation)
+            if any(item.package_id != package_id for item in interfaces):
+                raise ValueError("read interfaces must belong to the selected package")
+            connection.execute(
+                "DELETE FROM package_read_interfaces WHERE package_id=?", (package_id,)
+            )
+            connection.executemany(
+                "INSERT INTO package_read_interfaces VALUES(?, ?, ?, ?)",
+                (
+                    (
+                        item.package_id,
+                        item.interface_id,
+                        item.digest,
+                        item.source_revision,
+                    )
+                    for item in interfaces
+                ),
+            )
+            self._touch_package(connection, package_id)
+            return _load_package_state(connection).packages[package_id]
+
+    def record_integration_journal(
+        self,
+        journal: IntegrationJournal,
+        *,
+        expected_revision: int,
+    ) -> CapabilityPackage:
+        with _connect(self.path) as connection, connection:
+            self._assert_package_revision(connection, journal.package_id, expected_revision)
+            self._assert_lease_generation(connection, journal.package_id, journal.lease_generation)
+            existing = connection.execute(
+                "SELECT package_id, lease_generation FROM integration_journal WHERE id=?",
+                (journal.id,),
+            ).fetchone()
+            if existing is not None and (
+                str(existing[0]) != journal.package_id
+                or int(existing[1]) != journal.lease_generation
+            ):
+                raise ValueError("integration journal id belongs to another fenced generation")
+            now = _utc_now()
+            connection.execute(
+                """INSERT INTO integration_journal VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET phase=excluded.phase,
+                    validation_digest=excluded.validation_digest,
+                    canonical_revision_after=excluded.canonical_revision_after,
+                    updated_at=excluded.updated_at
+                WHERE integration_journal.package_id=excluded.package_id
+                    AND integration_journal.lease_generation=excluded.lease_generation""",
+                (
+                    journal.id,
+                    journal.package_id,
+                    journal.lease_generation,
+                    journal.base_revision,
+                    journal.candidate_revision,
+                    journal.canonical_revision_before,
+                    str(journal.phase),
+                    journal.validation_digest,
+                    journal.canonical_revision_after,
+                    journal.created_at or now,
+                    journal.updated_at or now,
+                ),
+            )
+            self._touch_package(connection, journal.package_id)
+            return _load_package_state(connection).packages[journal.package_id]
+
     def write_delta(
         self, write: DatabaseWrite, *, connection: sqlite3.Connection | None = None
     ) -> int:
@@ -1428,6 +3082,8 @@ class StateDatabase:
                             for key, (ordinal, payload) in delta.upserts.items()
                         ),
                     )
+                if "upstream_requests" in write.collections:
+                    _import_persisted_upstream_requests(connection)
                 for section, delta in write.graphs.items():
                     connection.executemany(
                         "DELETE FROM graph_metadata WHERE graph=? AND key=?",
@@ -1862,6 +3518,7 @@ class StateDatabase:
                             )
                         }
                 _hydrate_normalized_state(connection, checkpoint)
+                checkpoint.update(_load_package_state(connection).as_dict())
                 revision_row = connection.execute(
                     "SELECT revision, updated_at FROM meta WHERE singleton=1"
                 ).fetchone()

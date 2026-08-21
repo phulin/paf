@@ -4,6 +4,8 @@ from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from pathlib import Path
 
+from paf.package_model import normalize_repository_path
+
 
 def _absolute(path: str | Path, *, base: Path) -> Path:
     value = Path(path).expanduser()
@@ -79,6 +81,16 @@ class Project:
 
     def state_path(self, value: str | Path = ".paf") -> Path:
         return self.resolve(value)
+
+    def canonical_repository_path(self, value: str | Path) -> str:
+        """Resolve a writable path to its canonical, portable reservation key."""
+
+        resolved = self.resolve(value)
+        try:
+            relative = resolved.relative_to(self.root)
+        except ValueError as error:
+            raise ValueError(f"path is outside project repository: {value}") from error
+        return normalize_repository_path(relative)
 
     def bind(
         self,
