@@ -407,7 +407,10 @@ After the daemon exits, `status`, `snapshot`, and `wait` fall back to the persis
 - **Scaffold** deterministically creates the configured chapter directories and no Lean files.
 - **Discover** reads every selected input directly from the canonical repository, reports direct
   source prerequisites by work-unit id, and persists the source dependency
-  tree and input digests. Independent discoveries run concurrently without allocating overlays.
+  tree and input digests. Independent discoveries run concurrently without allocating overlays,
+  while each discovery reserves its chapter's mutation scope so no package or ordinary agent can
+  change that chapter concurrently. A changed input digest reopens discovery and editing review;
+  proof is also reopened when the chapter still contains placeholders.
 - **Formalize** starts after its own discovery and the formalization of its direct dependencies.
   It covers the complete source chapter, uses Lean MCP for elaboration and diagnostics, and cycles
   through coordinator builds up to `max_rounds`. A compiler-successful build completes the stage and

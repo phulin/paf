@@ -28,7 +28,7 @@ from paf.corpus import WorkUnitImportGraph
 from paf.git import GitCommitError
 from paf.hashing import stable_digest_text
 from paf.models import Chapter, PipelineConfig, ProofTarget, Stage
-from paf.package_model import CapabilityPackage, PackageStatus
+from paf.package_model import CapabilityPackage, PackageStatus, ReservationResult, ReservationSpec
 from paf.package_runtime import PackageExecutionResult
 from paf.scheduler import (
     BUILD_ERROR_REVIEW_KIND,
@@ -493,6 +493,53 @@ def test_source_input_digests_read_shared_document_once(
 
     assert set(digests) == {chapter.id for chapter in config.chapters}
     assert reads == [source]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("lean_source", "expected_proof_status", "expected_sorries"),
+    [
+        ("theorem target : True := by sorry\n", TaskStatus.PENDING, 1),
+        ("theorem target : True := by trivial\n", TaskStatus.SUCCEEDED, 0),
+    ],
+)
+async def test_changed_textbook_source_reopens_review_and_only_retries_incomplete_proofs(
+    tmp_path: Path,
+    lean_source: str,
+    expected_proof_status: TaskStatus,
+    expected_sorries: int,
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = config.chapters[0]
+    target = tmp_path / "lean" / "Book" / "Chapter01.lean"
+    target.parent.mkdir(parents=True)
+    target.write_text(lean_source, encoding="utf-8")
+    orchestrator = Orchestrator(config, StateStore(config))
+    await orchestrator.prepare()
+    await mark_clean_formalization(orchestrator)
+    await orchestrator.state.set_task(chapter.id, Stage.REVIEW, TaskStatus.SUCCEEDED, "reviewed")
+    await orchestrator.state.set_task(
+        chapter.id,
+        Stage.PROVE,
+        TaskStatus.SUCCEEDED,
+        "proved",
+        source_digest=scope_digest(config.settings.repo, chapter),
+    )
+
+    textbook = tmp_path / chapter.source
+    textbook.write_text(
+        textbook.read_text(encoding="utf-8").replace("Text.", "Revised text."),
+        encoding="utf-8",
+    )
+
+    assert await orchestrator._reconcile_changed_source_inputs() == {chapter.id}
+    assert orchestrator.state.task(chapter.id, Stage.DISCOVER).status == TaskStatus.PENDING
+    assert orchestrator.state.task(chapter.id, Stage.REVIEW).status == TaskStatus.PENDING
+    proof = orchestrator.state.task(chapter.id, Stage.PROVE)
+    assert proof.status == expected_proof_status
+    assert proof.sorry_count == expected_sorries
+    assert await orchestrator._reconcile_changed_source_inputs() == set()
+    await orchestrator.shutdown()
 
 
 def test_observed_graph_is_reused_until_dependency_state_is_replaced(
@@ -7533,6 +7580,29 @@ async def test_discovery_uses_live_repo_without_acquiring_workspace(
     state = StateStore(config)
     orchestrator = Orchestrator(config, state)
     await orchestrator.prepare()
+    reservation_claims: list[tuple[str, tuple[ReservationSpec, ...]]] = []
+    released_reservations: list[tuple[str, int]] = []
+    original_claim = state.claim_ordinary_path_reservations
+    original_release = state.release_ordinary_path_reservations
+
+    async def claim_reservation(
+        owner_id: str,
+        requested: tuple[ReservationSpec, ...],
+        *,
+        ttl_seconds: float,
+        queue_on_conflict: bool = True,
+    ) -> ReservationResult:
+        reservation_claims.append((owner_id, requested))
+        return await original_claim(
+            owner_id,
+            requested,
+            ttl_seconds=ttl_seconds,
+            queue_on_conflict=queue_on_conflict,
+        )
+
+    async def release_reservation(owner_id: str, generation: int) -> None:
+        released_reservations.append((owner_id, generation))
+        await original_release(owner_id, generation)
 
     async def fail_acquire(_run_id: str) -> object:
         raise AssertionError("discovery must not acquire an isolated workspace")
@@ -7561,6 +7631,8 @@ async def test_discovery_uses_live_repo_without_acquiring_workspace(
 
     monkeypatch.setattr(orchestrator.isolation, "acquire", fail_acquire)
     monkeypatch.setattr(orchestrator.executor, "run", discover)
+    monkeypatch.setattr(state, "claim_ordinary_path_reservations", claim_reservation)
+    monkeypatch.setattr(state, "release_ordinary_path_reservations", release_reservation)
 
     attempt = await orchestrator._attempt(config.chapters[0], Stage.DISCOVER)
 
@@ -7575,4 +7647,12 @@ async def test_discovery_uses_live_repo_without_acquiring_workspace(
         "error": "",
         "commit": "",
     }
+    assert len(reservation_claims) == 1
+    owner_id, requested = reservation_claims[0]
+    assert owner_id.startswith(f"ordinary-{config.chapters[0].id}-discover-")
+    assert {item.normalized_path for item in requested} == {
+        "lean/Book/Chapter01.lean",
+        "lean/Book/Chapter01",
+    }
+    assert released_reservations == [(owner_id, 1)]
     await orchestrator.shutdown()

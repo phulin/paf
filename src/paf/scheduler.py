@@ -664,6 +664,7 @@ class Orchestrator:
         self._proof_rechecks: set[str] = set()
         self._review_invalidation_generations: dict[str, int] = {}
         self._review_generation_lock = asyncio.Lock()
+        self._reconciled_source_inputs: dict[str, str] = {}
         self._chapter_agent_locks = {chapter.id: asyncio.Lock() for chapter in self.work_units}
         self._live_agent_tasks: dict[
             tuple[str, Stage], tuple[RunRecord, asyncio.Task[AgentResult]]
@@ -1301,6 +1302,63 @@ class Orchestrator:
             and record.get("source_digest")
             == (source_digest if source_digest is not None else self._source_input_digest(chapter))
         )
+
+    async def _reconcile_changed_source_inputs(
+        self,
+        chapters: Iterable[WorkUnitLike] | None = None,
+    ) -> set[str]:
+        """Reopen downstream work before scheduling against changed textbook source."""
+
+        selected = tuple(chapters if chapters is not None else self.work_units)
+        if not selected:
+            return set()
+        digests = await asyncio.to_thread(self._source_input_digests, selected)
+        raw_nodes = self.state.source_dependency_tree.get("nodes", {})
+        nodes = raw_nodes if isinstance(raw_nodes, dict) else {}
+        changed = {
+            chapter.id
+            for chapter in selected
+            if self._reconciled_source_inputs.get(chapter.id) != digests[chapter.id]
+            and isinstance((record := nodes.get(chapter.id)), dict)
+            and isinstance(record.get("source_digest"), str)
+            and record["source_digest"] != digests[chapter.id]
+        }
+        self._reconciled_source_inputs.update(digests)
+        if not changed:
+            return set()
+
+        by_id = {chapter.id: chapter for chapter in selected}
+        placeholder_counts = await asyncio.to_thread(
+            lambda: {
+                chapter_id: count_placeholders(self.config.settings.repo, by_id[chapter_id])
+                for chapter_id in changed
+            }
+        )
+        async with self.state.batch():
+            await self.state.set_tasks(
+                changed,
+                Stage.DISCOVER,
+                TaskStatus.PENDING,
+                "textbook source changed; fresh dependency discovery required",
+            )
+            await self._invalidate_reviews(
+                changed,
+                detail="textbook source changed; fresh editing review required",
+            )
+            proof_retries = {
+                chapter_id for chapter_id, count in placeholder_counts.items() if count > 0
+            }
+            for chapter_id, count in placeholder_counts.items():
+                await self.state.record_sorry_count(chapter_id, count)
+            if proof_retries:
+                await self.state.set_tasks(
+                    proof_retries,
+                    Stage.PROVE,
+                    TaskStatus.PENDING,
+                    "textbook source changed; proof retry queued after fresh review",
+                )
+                await self.state.reopen_proof_blockers(proof_retries)
+        return changed
 
     async def _persist_source_dependencies(
         self,
@@ -2033,11 +2091,7 @@ class Orchestrator:
         chapter_lock_held = True
         slot_held = False
         reservation = None
-        reservation_owner_id = (
-            f"ordinary-{chapter.id}-{stage.value}-{uuid4().hex}"
-            if stage is not Stage.DISCOVER
-            else ""
-        )
+        reservation_owner_id = f"ordinary-{chapter.id}-{stage.value}-{uuid4().hex}"
         slots = (
             self.discovery_slots if stage is Stage.DISCOVER and not auxiliary else self.agent_slots
         )
@@ -2417,12 +2471,19 @@ class Orchestrator:
         return Attempt(agent=agent, validation=validation, run=run)
 
     async def _discover(self, chapter: WorkUnitLike, *, rerun: bool = False) -> StageOutcome:
+        await self._reconcile_changed_source_inputs((chapter,))
         if not rerun and not self.force and self._discovery_is_current(chapter):
             return StageOutcome(ExecutionDisposition.SUCCEEDED)
         attempt = await self._attempt(
             chapter,
             Stage.DISCOVER,
             queue_detail="reading source and discovering direct dependencies",
+        )
+        await self.state.set_task(
+            chapter.id,
+            Stage.DISCOVER,
+            TaskStatus.RUNNING,
+            "persisting fresh source dependency discovery",
         )
         complete = bool(attempt.agent.report.get("complete"))
         raw_dependencies = attempt.agent.report.get("source_dependencies", ())
@@ -5644,7 +5705,14 @@ class Orchestrator:
         formalize_failure_ids: set[str] = set()
 
         def formalize_ready(chapter_id: str) -> bool:
-            return self.state.task(chapter_id, Stage.FORMALIZE).status == TaskStatus.SUCCEEDED
+            raw_nodes = self.state.source_dependency_tree.get("nodes", {})
+            discovery_recorded = isinstance(raw_nodes, dict) and isinstance(
+                raw_nodes.get(chapter_id), dict
+            )
+            return (
+                not discovery_recorded
+                or self.state.task(chapter_id, Stage.DISCOVER).status == TaskStatus.SUCCEEDED
+            ) and self.state.task(chapter_id, Stage.FORMALIZE).status == TaskStatus.SUCCEEDED
 
         async def cancel_all() -> None:
             tasks: list[asyncio.Task[Any]] = [handle.task for handle in review_tasks.values()]
@@ -6864,6 +6932,9 @@ class Orchestrator:
         return result and cleanup.clean
 
     async def _run_pipeline_once(self) -> bool:
+        # Reopen stale chapters before the concurrent formalize/review schedulers can consume
+        # their old successful checkpoints.
+        await self._reconcile_changed_source_inputs()
         progress = asyncio.Event()
         idle = asyncio.Event()
         stop = asyncio.Event()

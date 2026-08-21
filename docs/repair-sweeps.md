@@ -33,8 +33,10 @@ acceptance predicates.
    consumer acceptance, or terminal disposition.
 3. A package may span several source files, but every writable path is exclusively reserved before
    an agent edits it.
-4. Agents read repository-wide without read locks. Relevant read dependencies are protected by
-   interface digests checked before integration.
+4. Agents generally read repository-wide without read locks. Discovery additionally reserves its
+   assigned chapter's mutation scope, preventing any package or ordinary agent from changing that
+   chapter while discovery reads it. Other read dependencies are protected by interface digests
+   checked before integration.
 5. Every package agent edits a private fuse-overlay workspace. At the end of that agent turn, PAF
    scopes and imports its accepted delta into canonical source exactly like an ordinary agent run.
 6. The package outcome is repository state, not an answer sent to another agent. A reusable result
