@@ -1800,7 +1800,12 @@ isolation trees. Keep command output below roughly 12 KiB. {stage_contract}
 {input_catalog}
 {validation_contract}
 """
-        if stage in (Stage.FORMALIZE, Stage.REVIEW, Stage.PROVE):
+        backend = self.config.backend or LeanBackend(
+            project=self.config.settings.lean_project,
+            mcp_tool_timeout_seconds=self.config.settings.lean_mcp_tool_timeout_seconds,
+        )
+        tool_driver = backend.tool_driver
+        if stage in (Stage.FORMALIZE, Stage.REVIEW, Stage.PROVE) and tool_driver == "mcp":
             capabilities = (
                 "dependency preparation, whole-file diagnostics, hover, declaration lookup, "
                 "local search, completions, and code actions"
@@ -1832,6 +1837,25 @@ use `LastLib/...`, not `lean/LastLib/...`.
 The server prepares stale imports automatically. For multiple edited files, call
 `lean_prepare_dependencies` once on the files at the end of the dependency chain, then request final
 diagnostics from prerequisites to dependents.
+"""
+        elif stage in (Stage.FORMALIZE, Stage.REVIEW, Stage.PROVE) and tool_driver == "beam":
+            project = backend.project.as_posix()
+            contract += f"""
+
+### Lean Beam workflow
+
+Use the installed `$lean-beam` skill and `{backend.beam_command}` CLI. Run Beam commands from
+`{project}` so paths are relative to the Lean project root: use `LastLib/...`, not
+`{project}/LastLib/...`.
+
+- Beam reads saved files. Call `lean-beam update FILE` before a version-bound query.
+- Use `goals`, `todo`, `hover`, `definition`, `references`, `workspace-symbols`, and `run-at` for
+  focused inspection and speculative proof attempts.
+- After every real source edit, call `lean-beam update FILE` before another probe and
+  `lean-beam sync FILE` when you need fresh diagnostics.
+- If sync reports stale direct imports, follow its `saveDeps` and `recoveryPlan`, then refresh the
+  importer. Do not run `lake build` or `lake clean`; PAF owns dependency-cone and final builds.
+- `lean-beam save` checkpoints only one module and does not validate downstream importers.
 """
         if feedback and stage is not Stage.PROVE:
             feedback_heading = (

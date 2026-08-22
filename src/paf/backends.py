@@ -129,18 +129,32 @@ class LeanBackend:
     project: Path = Path("lean")
     templates: TargetTemplates = field(default_factory=TargetTemplates)
     explicit: tuple[ExplicitTarget, ...] = ()
-    mcp_enabled: bool = True
+    tool_driver: str = "mcp"
+    beam_command: str = "lean-beam"
+    beam_startup_timeout_seconds: float = 60.0
     mcp_tool_timeout_seconds: float = 300.0
     kind: str = "lean"
 
     def __post_init__(self) -> None:
         if self.project.is_absolute():
             raise ValueError("backend.project must be repository-relative")
+        if self.tool_driver not in {"beam", "mcp", "none"}:
+            raise ValueError("backend.tool_driver must be one of: beam, mcp, none")
+        if not self.beam_command:
+            raise ValueError("backend.beam_command must be a non-empty string")
+        if self.beam_startup_timeout_seconds <= 0:
+            raise ValueError("backend.beam_startup_timeout_seconds must be positive")
         if self.mcp_tool_timeout_seconds <= 0:
             raise ValueError("backend.mcp_tool_timeout_seconds must be positive")
         identifiers = [item.work_unit for item in self.explicit]
         if len(identifiers) != len(set(identifiers)):
             raise ValueError("backend explicit work-unit mappings must be unique")
+
+    @property
+    def mcp_enabled(self) -> bool:
+        """Compatibility projection for callers written before tool drivers."""
+
+        return self.tool_driver == "mcp"
 
     def _mapping(self, unit: WorkUnit) -> TargetMapping:
         values: dict[str, Any] = {
@@ -211,7 +225,7 @@ class LeanBackend:
     def prepare_project(self, root: Path, *, timeout_seconds: float) -> bool:
         """Create and resolve a default Mathlib Lake project when one is absent."""
 
-        if not self.mcp_enabled:
+        if self.tool_driver == "none":
             return False
         project = (root / self.project).resolve()
         marker = project / LEAN_PROJECT_BOOTSTRAP_MARKER
@@ -326,7 +340,7 @@ class LeanBackend:
         return os.pathsep.join(dict.fromkeys([*prefixes, *current]))
 
     def mcp_config(self, root: Path, stage: Stage) -> dict[str, Any]:
-        if not self.mcp_enabled or stage not in (Stage.FORMALIZE, Stage.REVIEW, Stage.PROVE):
+        if self.tool_driver != "mcp" or stage not in (Stage.FORMALIZE, Stage.REVIEW, Stage.PROVE):
             return {}
         project = (root / self.project).resolve()
         tools = (
@@ -417,6 +431,9 @@ def lean_backend_from_config(
         "manifest",
         "mappings",
         "targets",
+        "tool_driver",
+        "beam_command",
+        "beam_startup_timeout_seconds",
         "mcp_enabled",
         "mcp_tool_timeout_seconds",
         *_TARGET_KEYS,
@@ -429,6 +446,16 @@ def lean_backend_from_config(
         raise ValueError("backend.project must be a non-empty string")
     if "mcp_enabled" in raw and not isinstance(raw["mcp_enabled"], bool):
         raise ValueError("backend.mcp_enabled must be a boolean")
+    if "tool_driver" in raw and "mcp_enabled" in raw:
+        raise ValueError("configure backend.tool_driver or backend.mcp_enabled, not both")
+    tool_driver = str(
+        raw.get("tool_driver", "mcp" if raw.get("mcp_enabled", True) else "none")
+    ).casefold()
+    if tool_driver not in {"beam", "mcp", "none"}:
+        raise ValueError("backend.tool_driver must be one of: beam, mcp, none")
+    beam_command = raw.get("beam_command", "lean-beam")
+    if not isinstance(beam_command, str) or not beam_command:
+        raise ValueError("backend.beam_command must be a non-empty string")
     template_values = _normalized_target_values(raw)
     scope = template_values.get("scope", TargetTemplates.scope)
     templates = TargetTemplates(
@@ -476,6 +503,8 @@ def lean_backend_from_config(
         project=project,
         templates=templates,
         explicit=tuple(explicit),
-        mcp_enabled=bool(raw.get("mcp_enabled", True)),
+        tool_driver=tool_driver,
+        beam_command=beam_command,
+        beam_startup_timeout_seconds=float(raw.get("beam_startup_timeout_seconds", 60)),
         mcp_tool_timeout_seconds=float(raw.get("mcp_tool_timeout_seconds", legacy_timeout)),
     )

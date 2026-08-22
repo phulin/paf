@@ -111,6 +111,49 @@ mcp_enabled = false
     )
 
 
+def test_backend_selects_beam_tool_driver(tmp_path: Path) -> None:
+    config_path = _mixed_project(tmp_path)
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8").replace(
+            "mcp_enabled = false",
+            'tool_driver = "beam"\nbeam_command = "/opt/beam/bin/lean-beam"\n'
+            "beam_startup_timeout_seconds = 75",
+        ),
+        encoding="utf-8",
+    )
+
+    backend = load_config(config_path).backend
+
+    assert isinstance(backend, LeanBackend)
+    assert backend.tool_driver == "beam"
+    assert backend.beam_command == "/opt/beam/bin/lean-beam"
+    assert backend.beam_startup_timeout_seconds == 75
+    assert not backend.mcp_enabled
+
+
+def test_legacy_disabled_mcp_selects_no_tool_driver(tmp_path: Path) -> None:
+    backend = load_config(_mixed_project(tmp_path)).backend
+
+    assert isinstance(backend, LeanBackend)
+    assert backend.tool_driver == "none"
+    assert not backend.mcp_enabled
+
+
+def test_backend_rejects_ambiguous_tool_driver_configuration(tmp_path: Path) -> None:
+    config_path = _mixed_project(tmp_path)
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8").replace(
+            "mcp_enabled = false", 'mcp_enabled = false\ntool_driver = "beam"'
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        ValueError, match="configure backend.tool_driver or backend.mcp_enabled, not both"
+    ):
+        load_config(config_path)
+
+
 def test_backend_bootstraps_mathlib_project_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

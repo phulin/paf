@@ -705,6 +705,34 @@ def test_executor_uses_machine_readable_codex_mode(tmp_path: Path) -> None:
     assert "--dangerously-bypass-approvals-and-sandbox" in resumed_review
 
 
+def test_executor_uses_beam_prompt_without_attaching_mcp(tmp_path: Path) -> None:
+    config_path = write_project(tmp_path, chapters="chapters = [1]")
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8")
+        + """
+
+[backend]
+kind = "lean"
+project = "lean"
+tool_driver = "beam"
+beam_command = "/opt/beam/bin/lean-beam"
+""",
+        encoding="utf-8",
+    )
+    config = load_config(config_path)
+    executor = CodexExecutor(config, StateStore(config))
+
+    command = executor.command(Stage.PROVE)
+    prompt = executor.build_prompt(config.chapters[0], Stage.PROVE)
+
+    assert not any("mcp_servers.paf_lean" in item for item in command)
+    assert "### Lean Beam workflow" in prompt
+    assert "`$lean-beam` skill" in prompt
+    assert "/opt/beam/bin/lean-beam" in prompt
+    assert "Do not run `lake build` or `lake clean`" in prompt
+    assert "### Attached Lean tools (MCP)" not in prompt
+
+
 def test_discovery_catalog_contains_only_previous_chapters(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path))
     executor = CodexExecutor(config, StateStore(config))

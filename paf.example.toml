@@ -45,7 +45,11 @@ path = "{document_module_path}/Unit{unit_ordinal_padded}"
 unit_module = "{module}.{document_module}.Unit{unit_ordinal_padded}"
 build_command = "cd lean && lake build +{unit_module}"
 scope = ["{root}/{path}.lean", "{root}/{path}/**/*.lean"]
-mcp_enabled = true
+# Use Lean Beam's CLI and Codex skill for the agent proof loop. The legacy
+# "mcp" driver remains available during migration; "none" disables Lean tools.
+tool_driver = "beam"
+beam_command = "lean-beam"
+beam_startup_timeout_seconds = 60
 mcp_tool_timeout_seconds = 300
 
 # Explicit entries override any template field for one stable work-unit id.

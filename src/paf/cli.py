@@ -486,12 +486,12 @@ def print_plan(config: PipelineConfig, console: Console) -> None:
         if config.settings.bypass_approvals_and_sandbox
         else config.settings.sandbox
     )
-    mcp_status = "enabled" if getattr(config.backend, "mcp_enabled", True) else "disabled"
+    tool_driver = getattr(config.backend, "tool_driver", "mcp")
     backend_project = getattr(config.backend, "project", config.settings.lean_project)
     console.print(f"[bold]Codex access:[/bold] {access}")
     console.print(
         f"[bold]Backend:[/bold] {getattr(config.backend, 'kind', 'lean')}  "
-        f"[bold]Lean MCP:[/bold] {mcp_status}"
+        f"[bold]Lean tools:[/bold] {tool_driver}"
     )
     console.print(
         f"[bold]Project:[/bold] {backend_project}  "
