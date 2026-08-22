@@ -2658,6 +2658,25 @@ def _bounded_validation_output(output: str, maximum: int = 20_000) -> str:
     return output[:head] + marker + output[-(available - head) :]
 
 
+COORDINATOR_BUILD_LOG_LIMIT = 100
+
+
+def _prune_coordinator_build_logs(logs_dir: Path, newest: Path) -> None:
+    """Retain the newest coordinator build log and 99 recent predecessors."""
+
+    previous: list[tuple[int, str, Path]] = []
+    for path in logs_dir.glob("coordinator-build-*.log"):
+        if path == newest:
+            continue
+        try:
+            previous.append((path.stat().st_mtime_ns, path.name, path))
+        except FileNotFoundError:
+            continue
+    previous.sort(reverse=True)
+    for _, _, path in previous[COORDINATOR_BUILD_LOG_LIMIT - 1 :]:
+        path.unlink(missing_ok=True)
+
+
 async def validate(
     config: PipelineConfig,
     chapter: WorkUnitLike,
@@ -2669,6 +2688,8 @@ async def validate(
     logs_dir = config.settings.state_dir / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
     raw_log_path = logs_dir / f"coordinator-build-{uuid4().hex[:12]}.log"
+    raw_log_path.touch(exist_ok=False)
+    _prune_coordinator_build_logs(logs_dir, raw_log_path)
     process = await asyncio.create_subprocess_exec(
         "bash",
         "-lc",

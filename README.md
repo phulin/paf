@@ -567,7 +567,8 @@ interrupted run updates its lightweight row summary without discarding its lazil
 validation, or isolation payload.
 
 Raw JSONL agent logs and their exact submitted `.prompt.md` sidecars live below `logs/`, with the
-generated final-report schema alongside them.
+generated final-report schema alongside them. Coordinator build output is kept separately in the
+same directory, with only the 100 most recent build logs retained.
 Compact `*.activity.json` sidecars retain the recent event timeline and health counters without
 copying command output into pipeline state; because they are reconstructible from JSONL, event-time
 sidecar writes are rate-limited and a final summary is force-flushed. An attempt row is committed

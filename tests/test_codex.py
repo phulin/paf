@@ -1061,6 +1061,32 @@ async def test_validation_retains_structured_evidence_before_bounded_output(tmp_
 
 
 @pytest.mark.asyncio
+async def test_validation_retains_only_100_coordinator_build_logs(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = replace(config.chapters[0], build_command="printf 'current build\\n'")
+    logs_dir = config.settings.state_dir / "logs"
+    logs_dir.mkdir(parents=True)
+    existing_logs: list[Path] = []
+    for index in range(100):
+        path = logs_dir / f"coordinator-build-existing-{index:03}.log"
+        path.write_text(f"build {index}\n", encoding="utf-8")
+        os.utime(path, ns=(index + 1, index + 1))
+        existing_logs.append(path)
+    unrelated_log = logs_dir / "agent-run.jsonl"
+    unrelated_log.write_text("{}\n", encoding="utf-8")
+
+    validation = await validate(config, chapter)
+
+    retained = list(logs_dir.glob("coordinator-build-*.log"))
+    assert len(retained) == 100
+    assert not existing_logs[0].exists()
+    assert all(path.exists() for path in existing_logs[1:])
+    assert validation.raw_log_path is not None
+    assert Path(validation.raw_log_path) in retained
+    assert unrelated_log.exists()
+
+
+@pytest.mark.asyncio
 async def test_executor_consumes_jsonl_report_and_usage(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
