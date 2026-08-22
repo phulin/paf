@@ -29,8 +29,8 @@ lease_ttl_seconds = 14400
 maximum_worker_steps = 8
 max_concurrent_packages_per_work_unit = 1
 
-# Exceptional coordination is evidence-driven and separately bounded. Routine
-# pipeline work never invokes the planner. Cheap investigators inspect one
+# Escalation is evidence-driven and separately bounded. Routine pipeline work
+# never invokes the strong model. Cheap investigators inspect one
 # source issue, trace cluster, or routing ambiguity at a time; cheap workers
 # execute any approved scoped repair under normal isolation and validation.
 [escalation]

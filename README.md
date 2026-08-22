@@ -471,7 +471,7 @@ After the daemon exits, `status`, `snapshot`, and `wait` fall back to the persis
   coordinator opens one durable upstream request. A deterministic incident detector groups only
   related observations and gives a cheap, read-only owner-placement scout the downstream evidence,
   recent trace summary, and suspected earlier interface. High-confidence legal actions proceed
-  without a strong planner; uncertainty or a source/public-interface proposal reaches a rare
+  without a strong call; uncertainty or a source/public-interface proposal reaches a single
   read-only arbiter. The incident records readable context separately from the chapters whose files
   the repair agent may edit and lock. A repair
   agent may add or revise interfaces and make structural consumer adaptations, but it defers every
@@ -607,8 +607,8 @@ configured discovery-agent pool is scheduled at once. Dashboards count live run 
 agents. Running tasks persist an explicit `agent` or `postprocess` phase, so the TUI and web dashboard
 show completed agent work awaiting integration, graph persistence, or coordinator verification as
 postprocessing.
-Proof-review evidence that identifies a possible earlier defect creates an upstream request. A
-generation-fenced incident sends a bounded owner-placement scout to inspect the consumer and
+Proof-review evidence that identifies a possible earlier defect creates an upstream request. An
+incident sends a bounded owner-placement scout to inspect the consumer and
 suspected upstream interface together, validates the placement decision, and then wakes the
 consumer. Persistent identical task failures and repeated source reports use corresponding trace
 diagnosis and source fact-check scouts. Legacy capability packages remain visible only as historical
@@ -717,8 +717,8 @@ beam_startup_timeout_seconds = 60
 Old `lean_mcp`, `lean_mcp_tool_timeout_seconds`, `tool_driver`, and `mcp_enabled` settings are
 rejected. Remove them instead of carrying a compatibility configuration forward.
 
-Exceptional work uses incident-scoped cheap investigators and workers. The strong planner is a
-bounded read-only fallback, not the owner of normal scheduling:
+Exceptional work uses incident-scoped cheap investigators and workers. A single strong-model call is
+available as a read-only fallback, not as the owner of normal scheduling:
 
 ```toml
 [escalation]
@@ -730,15 +730,13 @@ investigator_reasoning_effort = "xhigh"
 worker_model = "gpt-5.6-luna"
 worker_reasoning_effort = "xhigh"
 max_concurrent_investigations = 8
-maximum_investigations_per_case = 4
-maximum_planner_attempts = 2
-maximum_scope_expansions = 2
+maximum_attempts_per_incident = 4
 source_issue_sighting_threshold = 2
 persistent_failure_threshold = 3
 recent_trace_runs = 3
 ```
 
-Inspect the durable control plane with `paf incidents`; textbook/source proposals stop for explicit
+Inspect incidents with `paf incidents`; textbook/source proposals stop for explicit
 approval. See [incident-scoped escalation](docs/escalation-coordination.md).
 
 The `[steward]` table is accepted only for compatibility with older project files. Capability

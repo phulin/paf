@@ -17,8 +17,8 @@ They have no lease, plan, worker tree, path reservation, or package dependency g
 
 ## Incident evaluation
 
-The deterministic escalation detector groups related live observations into a generation-fenced
-incident. A cheap `owner_placement` scout receives the downstream obstruction, suspected earlier
+The deterministic escalation detector groups related live observations into one incident. A cheap
+`owner_placement` scout receives the downstream obstruction, suspected earlier
 paths, compact prior trace evidence, and configured work-unit map. It inspects both sides and
 recommends one of these outcomes:
 
@@ -29,18 +29,17 @@ recommends one of these outcomes:
 
 A validated upstream edit marks the request `verified`; checked rejection guidance marks it
 `rejected`. Either result reopens the consumer proof, which is the final semantic acceptance test.
-A repair-agent or validation failure returns to the bounded incident postmortem path before it can
-become terminal. Uncertainty invokes the rare read-only coordinator, while unchanged evidence is
-parked rather than relaunched. Repair agents run as auxiliary review work using the cheap worker
-profile: they own interface and structural changes, while proposition proofs introduced or
+A repair-agent or validation failure may use the incident's single read-only arbitration. Unchanged
+evidence is parked rather than relaunched. Repair agents run as auxiliary review work using the
+cheap worker profile: they own interface and structural changes, while proposition proofs introduced or
 invalidated by those edits are returned to ordinary proof agents. See
 [incident-scoped escalation](escalation-coordination.md).
 
 ## Scheduling and deduplication
 
 The proof-blocker ledger remains the source of identity. Repeated sightings of the same blocker
-attach to the same request, and deterministic signal/evidence digests suppress identical incident
-generations. Related requests are grouped by capability instead of being reclassified with the full
+attach to the same request, and deterministic signal/evidence digests suppress identical work.
+Related requests are grouped by capability instead of being reclassified with the full
 global ledger. Focused repairs obey normal multi-work-unit path isolation and serialization.
 
 Local proof problems stay local. External gaps are parked. Only a candidate whose paths resolve to

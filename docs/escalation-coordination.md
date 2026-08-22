@@ -1,81 +1,54 @@
-# Incident-scoped escalation
+# Escalation
 
-PAF keeps the normal pipeline deterministic. Exceptional coordination is a separate control plane
-for evidence that the ordinary task state machines cannot safely classify on their own. It does
-not own the corpus, maintain a global plan, or continuously reconsider all outstanding work.
+PAF handles ordinary work with deterministic scheduling and Luna workers. Escalation exists only
+for evidence that does not fit a normal task transition.
 
-## Why incidents replace the global Steward
+The loop is deliberately small:
 
-The old upstream Steward received every open and evaluating request whenever one new request
-arrived. A malformed report, ambiguous owner, or unchanged `needs_scope` result could therefore
-relaunch a large strong-model pass over the same ledger. It also mixed diagnosis, planning, editing,
-and lifecycle recovery into one operation.
+1. A deterministic detector fingerprints an anomaly and opens an incident.
+2. One specialized Luna agent diagnoses that incident.
+3. PAF validates its proposed action and hands executable work to the ordinary pipeline.
+4. One read-only strong-model call is available when the Luna agent is uncertain or a repair fails.
 
-The escalation layer instead has three durable objects:
+Only signals and incidents are persisted. Agent history is already recorded by ordinary auxiliary
+runs, so escalation has no separate job ledger, plan tree, lease system, or certificates.
 
-- A **signal** is canonical detector evidence with a stable identity and evidence digest.
-- A **case** is a deterministic grouping of related signals, fenced by a generation.
-- A **job** is one bounded agent invocation within a case generation.
+## Detectors and cheap agents
 
-Unchanged evidence does not open another generation. Evidence that arrives while an investigation
-is running is recorded as pending; it does not cancel the active job. When that generation reaches
-a terminal result, the pending digest opens a fresh generation with fresh budgets. This makes
-no-progress suppression explicit while retaining new information.
+PAF currently detects:
 
-## Deterministic detectors
+- live upstream requests, handled by `owner_placement`;
+- repeated source reports, handled by `source_fact_check`; and
+- identical recent task failures, handled by `trace_diagnosis`.
 
-The scheduler currently opens incidents for:
+Each Luna agent receives only the related signals, configured work units, and a bounded summary of
+recent traces. It is read-only. If its output violates the report contract, PAF gives the same Luna
+thread one report-only correction attempt; malformed output does not invoke the strong model.
 
-1. `upstream_request`: one or more live downstream observations grouped by normalized capability.
-2. `source_issue`: a repeated, still-open source report. PAF checks whether the cited excerpt is
-   present in the authoritative source and includes the source digest before an agent sees it.
-3. `persistent_failure`: the same normalized failure signature in the configured number of recent
-   non-auxiliary runs for one task.
+## Actions
 
-Detector evidence is bounded. Trace incidents carry only the configured recent runs; the dossier
-adds compact activity counters and at most 24 recent events for each selected run. Large residual
-goals, excerpts, alternatives, and diagnostic text are truncated at deterministic limits.
+The scheduler accepts a small action enum:
 
-## Cheap investigators and rare arbitration
+- `create_repair` creates a normal isolated repair assignment.
+- `retry_consumer`, `reject_observation`, and `retry_task` use existing task and blocker transitions.
+- `dismiss_source` closes a stale or invalid source report.
+- `propose_source_patch` parks the incident for an operator; agents never edit the textbook.
+- `park` records that unchanged work should not be relaunched.
 
-Every incident first goes to a kind-specific investigator using the configured Luna profile:
+For a repair, PAF validates configured scope ids and requires at least one earlier owner for each
+consumer. The repair may also include its consumer for structural adaptation. Build commands are
+derived from those work units rather than supplied as agent-authored acceptance evidence.
 
-- `owner_placement` checks exact APIs, chronology, and minimal write scope for an upstream request.
-- `source_fact_check` distinguishes a real source defect from an omitted proof, stale citation, or
-  Lean-only issue.
-- `trace_diagnosis` compares recent probes and failures and requires materially new evidence before
-  recommending a retry.
+The incident statuses are `open`, `running`, `actionable`, `closed`, and `parked`. A changed evidence
+digest reopens a closed or parked incident with a fresh attempt budget. Evidence arriving during a
+run is retained for the next pass and prevents the stale result from mutating workflow state.
 
-These jobs are read-only and run in disposable isolated workspaces. Their reports use one strict
-schema and an allow-listed action. A high-confidence, deterministically valid local decision does
-not invoke the planner.
+## Strong-model use and bounds
 
-The strong `escalation_coordinator` is a read-only arbiter. It is called only when the scout is
-uncertain, asks for arbitration, proposes a source/public-interface change, returns an invalid
-scope/action, or a failed repair generation explicitly forces reconsideration. It receives the
-canonical signals and compact scout report, not the entire corpus or trace archive.
-
-## Validated actions
-
-Model reports never mutate workflow state directly. The scheduler validates the action enum, case
-identity, configured work-unit ids, and kind-specific preconditions before applying one of these
-transitions:
-
-- `create_repair`: create one incremental upstream repair case. Its write scope must be nonempty,
-  configured, and strictly earlier than every consumer; acceptance tests are mandatory.
-- `retry_consumer` or `reject_observation`: resolve an upstream observation through the existing
-  blocker/request transition logic.
-- `retry_task`: requeue a persistent failure only when the report contains new evidence.
-- `dismiss_source`: close a verified stale or invalid source report while retaining provenance.
-- `propose_source_patch`: stop at `awaiting_source_approval`; textbook edits are never automatic.
-- `park`: retain the incident and evidence without relaunching unchanged work.
-
-Only the existing repair executor may edit source. It uses the configured cheap worker profile,
-normal path isolation, validation, locking, and integration. A `needs_scope` or failed repair returns
-to its incident under bounded scope-expansion/action-failure counters instead of starting a fresh
-global Steward pass.
-
-## Bounds and configuration
+A high-confidence valid local action bypasses the strong model. One read-only arbitration is used
+only for uncertainty, a source/public-interface proposal, or a failed/under-scoped repair. A
+transport failure may retry within the incident budget; a completed arbitration is never repeated
+for unchanged evidence.
 
 ```toml
 [escalation]
@@ -87,21 +60,15 @@ investigator_reasoning_effort = "xhigh"
 worker_model = "gpt-5.6-luna"
 worker_reasoning_effort = "xhigh"
 max_concurrent_investigations = 8
-maximum_investigations_per_case = 4
-maximum_planner_attempts = 2
-maximum_scope_expansions = 2
+maximum_attempts_per_incident = 4
 source_issue_sighting_threshold = 2
 persistent_failure_threshold = 3
 recent_trace_runs = 3
 ```
 
-Investigation capacity is separate from the normal worker pool. Transport or capacity failures may
-retry only within the per-generation investigation budget. Semantic incompleteness parks the case.
-Planner, scope-expansion, and post-repair failure counts are independently capped.
+`maximum_investigations_per_case` remains accepted as an older name for
+`maximum_attempts_per_incident`. Setting `enabled = false` restores the legacy global upstream
+Steward route as a compatibility escape hatch.
 
-Set `enabled = false` only as a compatibility escape hatch; it restores the legacy global upstream
-Steward route. Capability-package Steward execution remains disabled.
-
-Use `paf incidents --config paf.toml` for a compact case table or add `--json` to inspect durable
-case and job records. `paf source-issues` includes each issue's status and sighting count. Cases in
-`awaiting_source_approval` or `parked` are deliberate operator boundaries, not hidden retries.
+Use `paf incidents --config paf.toml` to inspect current incidents and outcomes. `paf source-issues`
+shows source-report status and sighting counts.
