@@ -5424,16 +5424,16 @@ async def test_standalone_failed_proof_attempt_queues_durable_review(
     review = orchestrator.state.task(chapter.id, Stage.REVIEW)
     proof = orchestrator.state.task(chapter.id, Stage.PROVE)
     assert review.status == TaskStatus.SUCCEEDED
-    assert proof.status == TaskStatus.PENDING, (
+    assert proof.status == TaskStatus.BLOCKED, (
         proof.detail,
         orchestrator.state.proof_blockers,
         orchestrator.state.package_state.as_dict(),
     )
     assert proof.source_digest is None
     feedback, request_ids = orchestrator._proof_review_feedback(chapter.id)
-    assert feedback
-    assert request_ids
-    assert orchestrator.state.package_state.packages == {}
+    assert feedback == ""
+    assert request_ids == ()
+    assert len(orchestrator.state.upstream_requests) == 1
     assert orchestrator.state.fixup_requests == {}
     await orchestrator.shutdown()
 
@@ -5490,7 +5490,7 @@ async def test_structural_blockers_create_one_upstream_request_without_ping_pong
 
 
 @pytest.mark.asyncio
-async def test_upstream_reviews_keep_two_owner_frontiers(tmp_path: Path) -> None:
+async def test_upstream_requests_launch_one_global_steward(tmp_path: Path) -> None:
     config_path = write_project(tmp_path, chapters="chapters = [1, 2, 3, 4]")
     source = tmp_path / "books" / "book.md"
     source.write_text(
@@ -5519,24 +5519,77 @@ async def test_upstream_reviews_keep_two_owner_frontiers(tmp_path: Path) -> None
 
     await orchestrator._route_migrated_upstream_requests()
 
-    owner_ids = {
-        owner_id
-        for request in orchestrator.state.proof_review_requests.values()
-        for owner_id in request["feedback"]
-    }
-    statuses = [request["status"] for request in orchestrator.state.upstream_requests.values()]
-    assert len(owner_ids) == 2
-    assert statuses.count("evaluating") == 2
-    assert statuses.count("open") == 1
+    assert orchestrator._upstream_steward_task is not None
+    assert not orchestrator.state.proof_review_requests
+    assert set(orchestrator._upstream_steward_dossier()["requests"]) == set(
+        orchestrator.state.upstream_requests
+    )
+    orchestrator._upstream_steward_task.cancel()
+    await asyncio.gather(orchestrator._upstream_steward_task, return_exceptions=True)
+    orchestrator._upstream_steward_task = None
     await orchestrator.shutdown()
 
 
 @pytest.mark.asyncio
-async def test_consumer_triage_can_retarget_an_upstream_request(tmp_path: Path) -> None:
+async def test_global_steward_cases_deduplicate_requests_and_include_consumers(
+    tmp_path: Path,
+) -> None:
     config = with_example_modules(
         load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
     )
     owner, consumer = config.chapters
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await state.load_or_create()
+    request_ids = []
+    for declaration in ("Book.first", "Book.second"):
+        request_id, _ = await state.enqueue_upstream_request(
+            {
+                "consumer_path": "lean/Book/Chapter02.lean",
+                "blocked_declaration": declaration,
+                "residual_goal": "True",
+                "needed_result": "one shared bridge",
+                "owner_paths": ["lean/Book/Chapter01.lean"],
+            },
+            consumer_chapter_id=consumer.id,
+            owner_chapter_id=owner.id,
+        )
+        request_ids.append(request_id)
+
+    await state.replace_steward_cases(
+        [
+            {
+                "case_id": "shared-bridge",
+                "status": "ready",
+                "title": "Shared bridge",
+                "disposition": "implement",
+                "needed_result": "one shared bridge",
+                "request_ids": request_ids,
+                "context_work_unit_ids": [owner.id, consumer.id],
+                "acceptance_tests": ["both consumers elaborate"],
+                "rationale": "The observations request the same mathematical interface.",
+            }
+        ]
+    )
+
+    case = state.steward_cases["shared-bridge"]
+    assert case["request_ids"] == request_ids
+    assert all(
+        state.upstream_requests[request_id]["steward_case_id"] == "shared-bridge"
+        for request_id in request_ids
+    )
+    assert all(
+        state.upstream_requests[request_id]["status"] == "evaluating" for request_id in request_ids
+    )
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_legacy_consumer_triage_is_handed_to_global_steward(tmp_path: Path) -> None:
+    config = with_example_modules(
+        load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    )
+    _owner, consumer = config.chapters
     state = StateStore(config)
     orchestrator = Orchestrator(config, state)
     await orchestrator.prepare()
@@ -5600,9 +5653,13 @@ async def test_consumer_triage_can_retarget_an_upstream_request(tmp_path: Path) 
 
     assert await orchestrator._complete_review(consumer, "triaged", proof_request_ids=(request_id,))
     upstream = state.upstream_requests[request_id]
-    assert upstream["owner_chapter_id"] == owner.id
-    assert upstream["status"] == "evaluating"
-    assert set(state.proof_review_requests[request_id]["feedback"]) == {owner.id}
+    assert upstream["owner_chapter_id"] == consumer.id
+    assert upstream["owner_paths"] == ["lean/Book/Chapter01.lean"]
+    assert upstream["status"] == "open"
+    assert request_id not in state.proof_review_requests
+    assert orchestrator._upstream_steward_task is not None
+    orchestrator._upstream_steward_task.cancel()
+    await asyncio.gather(orchestrator._upstream_steward_task, return_exceptions=True)
     await orchestrator.shutdown()
 
 
@@ -5642,8 +5699,8 @@ async def test_external_candidate_still_requires_steward_disposition(tmp_path: P
 
     request_ids = await orchestrator._request_upstream_for_blockers(chapter, blockers)
 
-    assert request_ids == ()
-    assert orchestrator.state.upstream_requests == {}
+    assert len(request_ids) == 1
+    assert orchestrator.state.upstream_requests[request_ids[0]]["owner_chapter_id"] == chapter.id
     await orchestrator.shutdown()
 
 
@@ -5693,7 +5750,7 @@ async def test_structural_blocker_consumer_path_must_belong_to_work_unit(
     [
         ("repair_and_retry", True, ProofBlockerStatus.OPEN),
         ("retry_with_route", False, ProofBlockerStatus.OPEN),
-        ("request_upstream", False, ProofBlockerStatus.BLOCKED),
+        ("request_upstream", False, ProofBlockerStatus.UPSTREAM_REQUESTED),
     ],
 )
 async def test_completed_review_routes_blocker_by_structured_action(
@@ -5747,9 +5804,10 @@ async def test_completed_review_routes_blocker_by_structured_action(
     assert state.proof_blockers[blocker_id]["status"] == expected.value
     if expected is ProofBlockerStatus.OPEN:
         assert state.proof_blockers[blocker_id]["retry_sighting_baseline"] == 1
-    else:
+    elif expected is ProofBlockerStatus.BLOCKED:
         assert state.task(chapter.id, Stage.PROVE).status == TaskStatus.BLOCKED
-        assert state.package_state.packages == {}
+    else:
+        assert state.task(chapter.id, Stage.PROVE).status == TaskStatus.PENDING
     assert state.proof_blockers[blocker_id]["review_exchange_count"] == 1
     assert request_id not in state.proof_review_requests
     await orchestrator.shutdown()
@@ -5868,7 +5926,7 @@ async def test_build_warning_review_request_does_not_block_proof_readiness(
 
 
 @pytest.mark.asyncio
-async def test_noop_proof_review_routes_once_to_package(tmp_path: Path) -> None:
+async def test_noop_proof_review_routes_once_to_upstream_steward(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
     chapter = config.chapters[0]
     source = tmp_path / "lean" / "Book" / "Chapter01.lean"
@@ -5915,12 +5973,12 @@ async def test_noop_proof_review_routes_once_to_package(tmp_path: Path) -> None:
     await state.finish_proof_review_requests(chapter.id, (request_id,))
 
     blocker = state.proof_blockers[blocker_id]
-    assert blocker["status"] == ProofBlockerStatus.BLOCKED.value
+    assert blocker["status"] == ProofBlockerStatus.UPSTREAM_REQUESTED.value
     assert blocker["review_exchange_count"] == 1
     assert len(blocker["review_responses"]) == 1
     proof = state.task(chapter.id, Stage.PROVE)
-    assert proof.status == TaskStatus.BLOCKED
-    assert state.package_state.packages == {}
+    assert proof.status == TaskStatus.PENDING
+    assert len(state.upstream_requests) == 1
     assert state.task(chapter.id, Stage.REVIEW).status == TaskStatus.SUCCEEDED
     await orchestrator.shutdown()
 
@@ -7489,7 +7547,7 @@ async def test_obstructed_proof_chunk_does_not_prevent_independent_chunk(
         config,
         stages={
             **config.stages,
-            Stage.PROVE: replace(config.stages[Stage.PROVE], chunk_size=1),
+            Stage.PROVE: replace(config.stages[Stage.PROVE], chunk_size=2),
         },
     )
     chapter = config.chapters[0]
@@ -7509,6 +7567,18 @@ async def test_obstructed_proof_chunk_does_not_prevent_independent_chunk(
     orchestrator = Orchestrator(config, state)
     await orchestrator.prepare()
     orchestrator.force = True
+    await state.record_proof_blockers(
+        chapter.id,
+        origin_run_id="earlier-proof-run",
+        failed_attempts=[
+            failed_attempt(
+                "an earlier pass left this target unresolved",
+                path="lean/Book/Chapter01.lean",
+                declaration="first",
+            )
+            | {"disposition": "retry"}
+        ],
+    )
     fake = FakeExecutor(
         state,
         [
@@ -7554,11 +7624,11 @@ async def test_obstructed_proof_chunk_does_not_prevent_independent_chunk(
 
     assert not await orchestrator._prove(chapter)
     runs = state.task(chapter.id, Stage.PROVE).runs
-    assert [run.proof_targets[0]["declaration"] for run in runs] == [
-        "first",
-        "second",
+    assert [[target["declaration"] for target in run.proof_targets] for run in runs] == [
+        ["first", "second"],
+        ["second"],
     ]
-    assert state.task(chapter.id, Stage.PROVE).status == TaskStatus.PENDING
+    assert state.task(chapter.id, Stage.PROVE).status == TaskStatus.BLOCKED
     assert "theorem second : True := by trivial" in source.read_text(encoding="utf-8")
     await orchestrator.shutdown()
 

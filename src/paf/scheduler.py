@@ -21,6 +21,8 @@ from paf.codex import (
     PACKAGE_STEWARD_ROLE,
     PACKAGE_WORKER_ROLE,
     PROOF_REVIEW_ROLE,
+    UPSTREAM_IMPLEMENTATION_ROLE,
+    UPSTREAM_STEWARD_ROLE,
     WARNING_REVIEW_ROLE,
     AgentResult,
     CodexExecutor,
@@ -102,7 +104,7 @@ from paf.warning_cleanup import (
 
 MAXIMUM_COORDINATOR_BUILD_TARGETS = 500
 MAXIMUM_STALE_REVIEW_SNAPSHOT_RETRIES = 3
-MAXIMUM_CONCURRENT_UPSTREAM_OWNER_REVIEWS = 2
+MAXIMUM_CONCURRENT_UPSTREAM_IMPLEMENTATIONS = 2
 REVIEW_REPORT_RETRY_PROMPT = """Your previous review turn did not satisfy the report contract:
 
 {error}
@@ -738,6 +740,8 @@ class Orchestrator:
         ] = {}
         self._live_agent_retry_requests: set[str] = set()
         self._package_tasks: dict[str, asyncio.Task[PackageExecutionResult]] = {}
+        self._upstream_steward_task: asyncio.Task[None] | None = None
+        self._upstream_case_tasks: dict[str, asyncio.Task[None]] = {}
         self.package_execution = PackageExecutionLayer(
             config.settings.repo,
             config.settings.state_dir,
@@ -1053,94 +1057,347 @@ class Orchestrator:
         return tuple(results)
 
     async def _route_migrated_upstream_requests(self) -> None:
-        """Keep a small bounded frontier of owner-batched tandem reviews."""
+        """Compatibility entry point for the global steward scheduler."""
 
-        active_owner_ids = {
-            owner_id
-            for value in self.state.proof_review_requests.values()
-            if isinstance(value, dict) and value.get("kind") == UPSTREAM_REQUEST_REVIEW_KIND
-            for feedback in (value.get("feedback"),)
-            if isinstance(feedback, dict)
-            for owner_id in feedback
+        await self._schedule_upstream_coordination()
+
+    def _upstream_steward_dossier(self) -> dict[str, Any]:
+        requests = {
+            request_id: {
+                key: value
+                for key, value in request.items()
+                if key
+                in {
+                    "id",
+                    "consumer_chapter_id",
+                    "consumer_path",
+                    "blocked_declaration",
+                    "residual_goal",
+                    "needed_result",
+                    "capability_key",
+                    "owner_paths",
+                    "attempted_alternatives",
+                    "acceptance_tests",
+                    "decision",
+                }
+            }
+            for request_id, request in sorted(self.state.upstream_requests.items())
+            if request.get("status")
+            in {UpstreamRequestStatus.OPEN.value, UpstreamRequestStatus.EVALUATING.value}
+        }
+        return {
+            "requests": requests,
+            "existing_cases": self.state.steward_cases,
+            "work_units": [
+                {
+                    "id": unit.id,
+                    "title": unit.title,
+                    "scope": list(unit.scope),
+                    "ordinal": self._work_unit_order[unit.id],
+                }
+                for unit in self.work_units
+            ],
         }
 
-        for request_id, request in sorted(self.state.upstream_requests.items()):
-            if request.get("status") not in {
-                UpstreamRequestStatus.OPEN.value,
-                UpstreamRequestStatus.EVALUATING.value,
-            }:
-                continue
-            if request_id in self.state.proof_review_requests:
-                continue
-            consumer_id = str(request.get("consumer_chapter_id", ""))
-            consumer = self._work_units_by_id.get(consumer_id)
-            if consumer is None:
-                await self.state.update_upstream_request(
-                    request_id, UpstreamRequestStatus.NEEDS_HUMAN
-                )
-                continue
-            raw_paths = request.get("owner_paths")
-            owner_paths = [str(value) for value in raw_paths] if isinstance(raw_paths, list) else []
-            candidate_ids = {
-                owner_id
-                for path in owner_paths
-                for owner_id in self._path_owner_ids(path)
-                if self._work_unit_order.get(owner_id, 10**9)
-                < self._work_unit_order.get(consumer_id, -1)
-            }
-            owner_id = (
-                max(candidate_ids, key=self._work_unit_order.__getitem__)
-                if candidate_ids
-                else consumer_id
+    async def _run_upstream_steward(self) -> None:
+        dossier = self._upstream_steward_dossier()
+        request_ids = tuple(dossier["requests"])
+        if not request_ids:
+            return
+        anchor = self.work_units[0]
+        run = await self.state.start_auxiliary_run(
+            anchor.id,
+            Stage.DISCOVER,
+            role=UPSTREAM_STEWARD_ROLE,
+            request_ids=request_ids,
+            model=self.config.steward.model,
+        )
+        await self.agent_slots.acquire(self.statement_schedule.priority(anchor.document_id))
+        workspace = None
+        try:
+            workspace = await self.isolation.acquire(f"upstream-steward-{run.id}")
+            result = await self.executor.run_upstream_steward(
+                anchor,
+                run,
+                dossier,
+                workspace_root=workspace.root,
             )
-            owner = self._work_units_by_id[owner_id]
-            if (
-                owner_id not in active_owner_ids
-                and len(active_owner_ids) >= MAXIMUM_CONCURRENT_UPSTREAM_OWNER_REVIEWS
-            ):
-                continue
-            request["owner_chapter_id"] = owner_id
-            request["updated_at"] = datetime.now(UTC).isoformat()
-            blockers = [
-                str(value)
-                for value in request.get("blocker_ids", ())
-                if str(value) in self.state.proof_blockers
+            if not result.succeeded or result.report.get("complete") is not True:
+                return
+            raw_cases = result.report.get("cases")
+            if not isinstance(raw_cases, list):
+                return
+            covered = [
+                str(request_id)
+                for case in raw_cases
+                if isinstance(case, dict)
+                for request_id in case.get("request_ids", ())
             ]
-            await self.state.set_proof_blocker_status(
-                blockers,
-                ProofBlockerStatus.UPSTREAM_REQUESTED,
-                request_id=request_id,
-            )
-            feedback = {
-                owner_id: (
-                    "Evaluate this downstream observation together with the suspected upstream "
-                    "interface. Decide whether the result belongs upstream, is already available "
-                    "but too weakly exposed, or must be handled by the consumer. Make the smallest "
-                    "source-faithful upstream repair only when the evidence supports it.\n\n"
-                    f"Failed proof `{request.get('blocked_declaration', '')}` in "
-                    f"`{request.get('consumer_path', '')}`:\n"
-                    f"Remaining goal:\n{request.get('residual_goal', '')}\n"
-                    f"Requested result:\n{request.get('needed_result', '')}\n"
-                    "Checked attempts:\n- "
-                    + "\n- ".join(str(value) for value in request.get("attempted_alternatives", ()))
-                    + "\nSuspected upstream paths:\n- "
-                    + "\n- ".join(owner_paths)
+            if len(covered) != len(set(covered)) or set(covered) != set(request_ids):
+                await self.state.update_run(
+                    run,
+                    status=TaskStatus.BLOCKED,
+                    report=result.report
+                    | {
+                        "issues": [
+                            *result.report.get("issues", ()),
+                            "Every outstanding request must occur in exactly one steward case.",
+                        ],
+                    },
                 )
-            }
-            await self.state.enqueue_proof_review_request(
-                feedback,
-                origin_run_id=request_id,
-                kind=UPSTREAM_REQUEST_REVIEW_KIND,
-                request_id=request_id,
-                blocker_ids=blockers,
-                source_digests={
-                    owner_id: await asyncio.to_thread(
-                        scope_digest, self.config.settings.repo, owner
+                return
+            normalized: list[dict[str, Any]] = []
+            for raw in raw_cases:
+                if not isinstance(raw, dict):
+                    continue
+                value = dict(raw)
+                context_ids = [
+                    str(item)
+                    for item in value.get("context_work_unit_ids", ())
+                    if str(item) in self._work_units_by_id
+                ]
+                for request_id in value.get("request_ids", ()):
+                    consumer_id = str(
+                        self.state.upstream_requests[str(request_id)].get("consumer_chapter_id", "")
                     )
-                },
+                    if consumer_id in self._work_units_by_id and consumer_id not in context_ids:
+                        context_ids.append(consumer_id)
+                value["context_work_unit_ids"] = sorted(
+                    set(context_ids), key=self._work_unit_order.__getitem__
+                )
+                value["status"] = "ready" if value.get("disposition") == "implement" else "resolved"
+                value["steward_run_id"] = run.id
+                normalized.append(value)
+            await self.state.replace_steward_cases(normalized)
+            for case in normalized:
+                if case.get("disposition") == "retry_consumers":
+                    await self._resolve_steward_case(
+                        case,
+                        request_status=UpstreamRequestStatus.REJECTED,
+                        blocker_status=ProofBlockerStatus.OPEN,
+                        detail="global steward returned a focused consumer retry",
+                    )
+                elif case.get("disposition") == "reject":
+                    await self._resolve_steward_case(
+                        case,
+                        request_status=UpstreamRequestStatus.REJECTED,
+                        blocker_status=ProofBlockerStatus.BLOCKED,
+                        detail="global steward rejected the upstream observation",
+                    )
+                elif case.get("disposition") == "needs_human":
+                    await self._resolve_steward_case(
+                        case,
+                        request_status=UpstreamRequestStatus.NEEDS_HUMAN,
+                        blocker_status=ProofBlockerStatus.BLOCKED,
+                        detail="global steward needs a human placement decision",
+                    )
+        finally:
+            self.agent_slots.release()
+            if workspace is not None:
+                await workspace.close()
+
+    async def _resolve_steward_case(
+        self,
+        case: dict[str, Any],
+        *,
+        request_status: UpstreamRequestStatus,
+        blocker_status: ProofBlockerStatus,
+        detail: str,
+        decision: dict[str, Any] | None = None,
+        evaluation_run_id: str = "",
+    ) -> None:
+        consumer_ids: set[str] = set()
+        for request_id in case.get("request_ids", ()):
+            request = self.state.upstream_requests.get(str(request_id))
+            if not isinstance(request, dict):
+                continue
+            blocker_ids = [str(value) for value in request.get("blocker_ids", ())]
+            await self.state.set_proof_blocker_status(blocker_ids, blocker_status)
+            await self.state.update_upstream_request(
+                str(request_id),
+                request_status,
+                decision=decision or case,
+                evaluation_run_id=evaluation_run_id,
             )
-            await self.state.update_upstream_request(request_id, UpstreamRequestStatus.EVALUATING)
-            active_owner_ids.add(owner_id)
+            consumer_id = str(request.get("consumer_chapter_id", ""))
+            if consumer_id in self._work_units_by_id:
+                consumer_ids.add(consumer_id)
+        if blocker_status is ProofBlockerStatus.OPEN:
+            for consumer_id in consumer_ids:
+                await self.state.set_task(
+                    consumer_id,
+                    Stage.PROVE,
+                    TaskStatus.PENDING,
+                    detail,
+                )
+                self._proof_rechecks.add(consumer_id)
+
+    async def _run_upstream_implementation(self, case_id: str) -> None:
+        case = self.state.steward_cases.get(case_id)
+        if not isinstance(case, dict):
+            return
+        context_ids = tuple(
+            sorted(
+                {
+                    str(value)
+                    for value in case.get("context_work_unit_ids", ())
+                    if str(value) in self._work_units_by_id
+                },
+                key=self._work_unit_order.__getitem__,
+            )
+        )
+        if not context_ids:
+            await self.state.update_steward_case(case_id, status="needs_human")
+            return
+        scope = tuple(
+            dict.fromkeys(
+                path
+                for work_unit_id in context_ids
+                for path in self._work_units_by_id[work_unit_id].scope
+            )
+        )
+        anchor = _with_scope(self._work_units_by_id[context_ids[0]], scope)
+        anchor = _with_build_command(
+            anchor,
+            " && ".join(
+                dict.fromkeys(
+                    self._work_units_by_id[work_unit_id].build_command
+                    for work_unit_id in context_ids
+                )
+            ),
+        )
+        dossier = {
+            "case": case,
+            "requests": {
+                request_id: self.state.upstream_requests[request_id]
+                for request_id in case.get("request_ids", ())
+                if request_id in self.state.upstream_requests
+            },
+            "work_units": [
+                {
+                    "id": work_unit_id,
+                    "title": self._work_units_by_id[work_unit_id].title,
+                    "textbook_source": self._work_units_by_id[work_unit_id].source.as_posix(),
+                    "textbook_lines": [
+                        self._work_units_by_id[work_unit_id].source_span.start_line,
+                        self._work_units_by_id[work_unit_id].source_span.end_line,
+                    ],
+                    "lean_scope": list(self._work_units_by_id[work_unit_id].scope),
+                }
+                for work_unit_id in context_ids
+            ],
+        }
+        await self.state.update_steward_case(case_id, status="implementing")
+        attempt = await self._attempt(
+            anchor,
+            Stage.PROVE,
+            role=UPSTREAM_IMPLEMENTATION_ROLE,
+            request_ids=(case_id, *case.get("request_ids", ())),
+            queue_detail="waiting for atomic multi-chapter implementation lock",
+            upstream_dossier=dossier,
+        )
+        run_ids = list(case.get("implementation_run_ids", ()))
+        run_ids.append(attempt.run.id)
+        report = attempt.agent.report if isinstance(attempt.agent.report, dict) else {}
+        disposition = str(report.get("disposition", "needs_human"))
+        if disposition == "implemented" and attempt.agent.changed and attempt.validation.succeeded:
+            isolation = attempt.run.isolation if isinstance(attempt.run.isolation, dict) else {}
+            changed_owners = self._package_owner_units(isolation.get("changed_paths", ()))
+            owner_ids = tuple(unit.id for unit in changed_owners) or context_ids
+            self._mark_source_changed(owner_ids)
+            await self._invalidate_build_records(owner_ids)
+            await self._resolve_steward_case(
+                case,
+                request_status=UpstreamRequestStatus.VERIFIED,
+                blocker_status=ProofBlockerStatus.OPEN,
+                detail="focused upstream implementation completed; consumer retry queued",
+                decision=report,
+                evaluation_run_id=attempt.run.id,
+            )
+            await self.state.update_steward_case(
+                case_id,
+                status="verified",
+                implementation_run_ids=run_ids,
+                decision=report,
+            )
+        elif disposition in {"consumer_local", "not_needed"} and not attempt.agent.changed:
+            await self._resolve_steward_case(
+                case,
+                request_status=UpstreamRequestStatus.REJECTED,
+                blocker_status=ProofBlockerStatus.OPEN,
+                detail="focused implementation returned a checked consumer route",
+                decision=report,
+                evaluation_run_id=attempt.run.id,
+            )
+            await self.state.update_steward_case(
+                case_id,
+                status="rejected",
+                implementation_run_ids=run_ids,
+                decision=report,
+            )
+        elif disposition == "needs_scope" and not attempt.agent.changed:
+            additional = [
+                str(value)
+                for value in report.get("additional_work_unit_ids", ())
+                if str(value) in self._work_units_by_id and str(value) not in context_ids
+            ]
+            await self.state.update_steward_case(
+                case_id,
+                status="needs_scope",
+                requested_work_unit_ids=additional,
+                implementation_run_ids=run_ids,
+                decision=report,
+            )
+            for request_id in case.get("request_ids", ()):
+                await self.state.update_upstream_request(
+                    str(request_id), UpstreamRequestStatus.OPEN, decision=report
+                )
+        else:
+            await self._resolve_steward_case(
+                case,
+                request_status=UpstreamRequestStatus.NEEDS_HUMAN,
+                blocker_status=ProofBlockerStatus.BLOCKED,
+                detail="focused upstream implementation needs human intervention",
+                decision=report,
+                evaluation_run_id=attempt.run.id,
+            )
+            await self.state.update_steward_case(
+                case_id,
+                status="needs_human",
+                implementation_run_ids=run_ids,
+                decision=report,
+            )
+
+    async def _schedule_upstream_coordination(self) -> None:
+        if self._upstream_steward_task is not None and self._upstream_steward_task.done():
+            task = self._upstream_steward_task
+            self._upstream_steward_task = None
+            task.result()
+        for case_id, task in tuple(self._upstream_case_tasks.items()):
+            if task.done():
+                self._upstream_case_tasks.pop(case_id, None)
+                task.result()
+        if self._upstream_case_tasks:
+            return
+        needs_steward = any(
+            request.get("status") == UpstreamRequestStatus.OPEN.value
+            and not request.get("steward_case_id")
+            for request in self.state.upstream_requests.values()
+        ) or any(case.get("status") == "needs_scope" for case in self.state.steward_cases.values())
+        if needs_steward and self._upstream_steward_task is None:
+            self._upstream_steward_task = asyncio.create_task(self._run_upstream_steward())
+            return
+        if self._upstream_steward_task is not None:
+            return
+        ready = [
+            case_id
+            for case_id, case in sorted(self.state.steward_cases.items())
+            if case.get("status") == "ready" and case.get("disposition") == "implement"
+        ]
+        for case_id in ready[:MAXIMUM_CONCURRENT_UPSTREAM_IMPLEMENTATIONS]:
+            self._upstream_case_tasks[case_id] = asyncio.create_task(
+                self._run_upstream_implementation(case_id)
+            )
 
     async def prepare(
         self,
@@ -1176,7 +1433,6 @@ class Orchestrator:
                     detail="recovered post-review findings",
                 )
         await self.state.migrate_stale_snapshot_review_requests()
-        await self._route_migrated_upstream_requests()
         report("Preparing agent execution", 5)
         await self.executor.prepare()
         report("Preparing isolated workspaces and Lean caches", 6)
@@ -1184,6 +1440,7 @@ class Orchestrator:
         report("Checking the Git worktree", 7)
         await self.git.prepare()
         await self.state.refresh_package_state()
+        await self._route_migrated_upstream_requests()
         report("Preparation complete", 7)
 
     async def _commit_agent_changes(
@@ -1263,6 +1520,14 @@ class Orchestrator:
                 task.cancel()
             await asyncio.gather(*package_tasks, return_exceptions=True)
             self._package_tasks.clear()
+            upstream_tasks = [*self._upstream_case_tasks.values()]
+            if self._upstream_steward_task is not None:
+                upstream_tasks.append(self._upstream_steward_task)
+            for task in upstream_tasks:
+                task.cancel()
+            await asyncio.gather(*upstream_tasks, return_exceptions=True)
+            self._upstream_case_tasks.clear()
+            self._upstream_steward_task = None
             if self._discovery_batch_task is not None:
                 self._discovery_batch_task.cancel()
                 await asyncio.gather(self._discovery_batch_task, return_exceptions=True)
@@ -2222,10 +2487,13 @@ class Orchestrator:
         resume_thread_id: str | None = None,
         resume_run_id: str = "",
         resume_prompt: str = "",
+        upstream_dossier: dict[str, Any] | None = None,
     ) -> Attempt:
         auxiliary = role in {
             WARNING_REVIEW_ROLE,
             PROOF_REVIEW_ROLE,
+            UPSTREAM_IMPLEMENTATION_ROLE,
+            UPSTREAM_STEWARD_ROLE,
         }
         selected_request_ids = tuple(dict.fromkeys(request_ids))
         selected_proof_targets = tuple(proof_targets)
@@ -2362,7 +2630,19 @@ class Orchestrator:
                 )
                 workspace_root = workspace.root
             while True:
-                if resume_thread_id is not None:
+                if role == UPSTREAM_IMPLEMENTATION_ROLE:
+                    if upstream_dossier is None:
+                        raise ValueError("upstream implementation requires a case dossier")
+                    operation = self.executor.run_upstream_implementation(
+                        chapter,
+                        run,
+                        upstream_dossier,
+                        workspace_root=workspace_root,
+                        resume_thread_id=resume_thread_id,
+                        resume_run_id=resume_run_id,
+                        resume_prompt=resume_prompt,
+                    )
+                elif resume_thread_id is not None:
                     operation = self.executor.resume(
                         chapter,
                         stage,
@@ -3115,12 +3395,13 @@ class Orchestrator:
                 if self._work_unit_order.get(owner_id, 10**9)
                 < self._work_unit_order.get(chapter.id, -1)
             }
-            if len(earlier_owner_ids) != 1:
-                blocker["upstream_routing_error"] = (
-                    "suspected owner paths must resolve to exactly one earlier work unit"
-                )
-                continue
-            owner_id = next(iter(earlier_owner_ids))
+            # This is only a compatibility hint. The global steward sees every candidate and the
+            # consumer together; it is deliberately not bound to one guessed owner chapter.
+            owner_id = (
+                max(earlier_owner_ids, key=self._work_unit_order.__getitem__)
+                if earlier_owner_ids
+                else chapter.id
+            )
             request = {
                 "consumer_path": consumer_path,
                 "blocked_declaration": declaration,
@@ -5908,6 +6189,9 @@ class Orchestrator:
             tasks: list[asyncio.Task[Any]] = [handle.task for handle in review_tasks.values()]
             tasks.extend(rebuild_tasks.values())
             tasks.extend(proof_tasks.values())
+            if self._upstream_steward_task is not None:
+                tasks.append(self._upstream_steward_task)
+            tasks.extend(self._upstream_case_tasks.values())
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
@@ -5981,6 +6265,7 @@ class Orchestrator:
                 self._invalidated_reviews.clear()
                 new_rechecks = set(self._proof_rechecks)
                 self._proof_rechecks.clear()
+                await self._schedule_upstream_coordination()
                 failed_rebuilds.difference_update(new_rechecks)
                 dirty_value = self.state.formalize_graph.get("dirty", ())
                 dirty_builds = (
@@ -6156,6 +6441,9 @@ class Orchestrator:
                 ]
                 live_tasks.extend(rebuild_tasks.values())
                 live_tasks.extend(proof_tasks.values())
+                if self._upstream_steward_task is not None:
+                    live_tasks.append(self._upstream_steward_task)
+                live_tasks.extend(self._upstream_case_tasks.values())
                 progress_waiter: asyncio.Task[bool] | None = None
                 if (
                     formalize is not None
@@ -6585,13 +6873,16 @@ class Orchestrator:
                             for blocker in self.state.proof_blockers_for_consumer(chapter.id)
                         )
                     )
-                    # Once a declaration has durable failure evidence, isolate it from otherwise
-                    # productive holes so a hard residual cannot consume the whole chunk budget.
-                    assigned_targets = (
-                        blocked_candidates[:1]
-                        if blocked_candidates
-                        else proof_target_chunk(candidates, proof_chunk_size)
+                    blocked_target_ids = {target.fingerprint for target in blocked_candidates}
+                    # Prior evidence determines which targets come first, but it must not silently
+                    # collapse a configured multi-target chunk to one declaration. Solved siblings
+                    # are retained and only the target that emits blocker evidence is routed below.
+                    prioritized_candidates = blocked_candidates + tuple(
+                        target
+                        for target in candidates
+                        if target.fingerprint not in blocked_target_ids
                     )
+                    assigned_targets = proof_target_chunk(prioritized_candidates, proof_chunk_size)
                     chunk_round = 0
                     if not feedback and (
                         durable_feedback := self._durable_blocker_feedback(
@@ -6849,7 +7140,11 @@ class Orchestrator:
             if upstream_request_ids:
                 if chunked_proofs:
                     blocking_upstream_request_ids.update(upstream_request_ids)
-                    skipped_target_ids.update(target.fingerprint for target in assigned_targets)
+                    skipped_target_ids.update(
+                        target.fingerprint
+                        for target in assigned_targets
+                        if any(matches_target(blocker, target) for blocker in blockers)
+                    )
                     assigned_targets = ()
                     chunk_round = 0
                     feedback_ledger.clear()
@@ -6889,7 +7184,11 @@ class Orchestrator:
                     ProofBlockerStatus.REVIEW_REQUESTED,
                     request_id=review_ids[0] if review_ids else "",
                 )
-                skipped_target_ids.update(target.fingerprint for target in assigned_targets)
+                skipped_target_ids.update(
+                    target.fingerprint
+                    for target in assigned_targets
+                    if any(matches_target(blocker, target) for blocker in review_candidates)
+                )
                 assigned_targets = ()
                 chunk_round = 0
                 feedback_ledger.clear()
@@ -6969,7 +7268,16 @@ class Orchestrator:
                 and terminal_blockers
                 and not self.state.proof_blockers_for_consumer(chapter.id)
             ):
-                skipped_target_ids.update(target.fingerprint for target in assigned_targets)
+                terminal_evidence = tuple(
+                    blocker
+                    for blocker in blockers
+                    if str(blocker.get("id", "")) in terminal_blockers
+                )
+                skipped_target_ids.update(
+                    target.fingerprint
+                    for target in assigned_targets
+                    if any(matches_target(blocker, target) for blocker in terminal_evidence)
+                )
                 assigned_targets = ()
                 chunk_round = 0
                 feedback_ledger.clear()

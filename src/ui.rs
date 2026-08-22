@@ -27,7 +27,7 @@ const SURFACE: Color = Color::Rgb(36, 40, 59);
 pub fn draw(frame: &mut Frame<'_>, model: &mut DashboardModel) {
     if model.detail {
         draw_detail(frame, model);
-    } else if model.package_detail {
+    } else if model.steward_detail {
         draw_upstream_request_detail(frame, model);
     } else {
         draw_dashboard(frame, model);
@@ -183,7 +183,7 @@ fn draw_dashboard(frame: &mut Frame<'_>, model: &DashboardModel) {
     draw_status(frame, model, layout[4]);
     frame.render_widget(
         Paragraph::new(
-            "↑↓ select  Enter/i inspect  / search  u upstream requests  p pause/resume  r reload TUI  d detach  q stop",
+            "↑↓ select  Enter/i inspect  / search  u steward cases  p pause/resume  r reload TUI  d detach  q stop",
         )
         .style(Style::default().fg(MUTED))
         .alignment(Alignment::Center),
@@ -192,24 +192,22 @@ fn draw_dashboard(frame: &mut Frame<'_>, model: &DashboardModel) {
 }
 
 fn draw_upstream_request_detail(frame: &mut Frame<'_>, model: &mut DashboardModel) {
-    let requests = model.upstream_requests();
-    let selected_id = model
-        .selected_upstream_request()
-        .map(|request| request.id.clone());
+    let cases = model.steward_cases();
+    let selected_id = model.selected_steward_case().map(|case| case.id.clone());
     let layout = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(38), Constraint::Percentage(62)])
         .split(frame.area());
-    let rows = if requests.is_empty() {
-        vec![Row::new(["—", "No upstream requests", ""])]
+    let rows = if cases.is_empty() {
+        vec![Row::new(["—", "No steward cases", ""])]
     } else {
-        requests
+        cases
             .iter()
-            .map(|request| {
+            .map(|case| {
                 Row::new([
-                    request.status.clone(),
-                    request.blocked_declaration.clone(),
-                    request.consumer_chapter_id.clone(),
+                    case.status.clone(),
+                    case.title.clone(),
+                    case.request_ids.len().to_string(),
                 ])
             })
             .collect()
@@ -222,102 +220,64 @@ fn draw_upstream_request_detail(frame: &mut Frame<'_>, model: &mut DashboardMode
             Constraint::Min(18),
         ],
     )
-    .header(
-        Row::new(["Status", "Blocked declaration", "Consumer"]).style(Style::default().fg(CYAN)),
-    )
+    .header(Row::new(["Status", "Deduplicated case", "Requests"]).style(Style::default().fg(CYAN)))
     .row_highlight_style(Style::default().bg(SURFACE).add_modifier(Modifier::BOLD))
     .highlight_symbol("▸ ")
     .block(
         Block::default()
             .borders(Borders::ALL)
-            .title(" Upstream requests "),
+            .title(" Global steward cases "),
     );
     let mut state =
-        TableState::default().with_selected(selected_id.as_ref().map(|_| model.package_selected));
+        TableState::default().with_selected(selected_id.as_ref().map(|_| model.steward_selected));
     frame.render_stateful_widget(table, layout[0], &mut state);
 
     let mut lines = Vec::new();
-    if let Some(request_id) = selected_id {
-        let request = &model.state.upstream_requests[&request_id];
+    if let Some(case_id) = selected_id {
+        let case = &model.state.steward_cases[&case_id];
         lines.push(Line::styled(
-            request.blocked_declaration.clone(),
+            case.title.clone(),
             Style::default().fg(YELLOW).add_modifier(Modifier::BOLD),
         ));
         lines.push(Line::from(format!(
-            "{} · consumer {} · evaluator {}",
-            request.status,
-            request.consumer_chapter_id,
-            if request.owner_chapter_id.is_empty() {
-                "placement triage"
-            } else {
-                &request.owner_chapter_id
-            }
+            "{} · {} · {} observation(s)",
+            case.status,
+            case.disposition,
+            case.request_ids.len(),
         )));
-        lines.push(Line::from(format!("Path: {}", request.consumer_path)));
-        if !request.residual_goal.is_empty() {
+        if !case.needed_result.is_empty() {
             lines.push(Line::from(""));
-            lines.push(Line::styled("Downstream goal", Style::default().fg(CYAN)));
-            lines.push(Line::from(request.residual_goal.clone()));
+            lines.push(Line::styled("Needed result", Style::default().fg(CYAN)));
+            lines.push(Line::from(case.needed_result.clone()));
         }
-        if !request.needed_result.is_empty() {
+        if !case.rationale.is_empty() {
             lines.push(Line::from(""));
-            lines.push(Line::styled("Result requested", Style::default().fg(CYAN)));
-            lines.push(Line::from(request.needed_result.clone()));
-        }
-        if !request.obstruction.is_empty() {
-            lines.push(Line::from(""));
-            lines.push(Line::styled("Observed problem", Style::default().fg(CYAN)));
-            lines.push(Line::from(request.obstruction.clone()));
+            lines.push(Line::styled("Steward rationale", Style::default().fg(CYAN)));
+            lines.push(Line::from(case.rationale.clone()));
         }
         lines.push(Line::from(""));
         lines.push(Line::styled(
-            "Suspected upstream paths",
+            "Atomically locked work units",
             Style::default().fg(CYAN),
         ));
-        if request.owner_paths.is_empty() {
-            lines.push(Line::from(
-                "  none yet; consumer-side placement triage required",
-            ));
-        } else {
-            for path in &request.owner_paths {
-                lines.push(Line::from(format!("  {path}")));
-            }
+        for work_unit_id in &case.context_work_unit_ids {
+            lines.push(Line::from(format!("  {work_unit_id}")));
         }
-        if !request.attempted_alternatives.is_empty() {
-            lines.push(Line::styled(
-                "Checked alternatives",
-                Style::default().fg(CYAN),
-            ));
-            for attempt in &request.attempted_alternatives {
-                lines.push(Line::from(format!("  {attempt}")));
-            }
+        lines.push(Line::from(""));
+        lines.push(Line::styled("Member requests", Style::default().fg(CYAN)));
+        for request_id in &case.request_ids {
+            lines.push(Line::from(format!("  {request_id}")));
         }
-        if let Some(action) = request
-            .decision
-            .get("action")
-            .and_then(|value| value.as_str())
-        {
+        if !case.acceptance_tests.is_empty() {
             lines.push(Line::from(""));
-            lines.push(Line::styled("Evaluation", Style::default().fg(CYAN)));
-            lines.push(Line::from(format!("  action: {action}")));
-            if let Some(diagnosis) = request
-                .decision
-                .get("diagnosis")
-                .and_then(|value| value.as_str())
-            {
-                lines.push(Line::from(format!("  diagnosis: {diagnosis}")));
-            }
-            if let Some(explanation) = request
-                .decision
-                .get("explanation")
-                .and_then(|value| value.as_str())
-            {
-                lines.push(Line::from(format!("  {explanation}")));
+            lines.push(Line::styled("Acceptance tests", Style::default().fg(CYAN)));
+            for test in &case.acceptance_tests {
+                lines.push(Line::from(format!("  {test}")));
             }
         }
         lines.push(Line::from(""));
         lines.push(Line::styled(
-            "↑↓ select request  u/Esc/q back",
+            "↑↓ select case  Enter timeline  u/Esc/q back",
             Style::default().fg(MUTED),
         ));
     }
@@ -325,12 +285,13 @@ fn draw_upstream_request_detail(frame: &mut Frame<'_>, model: &mut DashboardMode
         Paragraph::new(lines).wrap(Wrap { trim: false }).block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(" Request evidence and decision "),
+                .title(" Steward decision and implementation scope "),
         ),
         layout[1],
     );
 }
 
+#[cfg(any())]
 fn draw_package_detail(frame: &mut Frame<'_>, model: &mut DashboardModel) {
     let packages = model.packages();
     let selected_id = model.selected_package().map(|package| package.id.clone());
@@ -708,22 +669,22 @@ fn summary(model: &DashboardModel) -> Paragraph<'static> {
             )),
         ]),
         Line::from(format!(
-            "Agents {}/{} · {} · waiting start {}    {}    Upstream requests {} · evaluating {} · needs human {}",
+            "Agents {}/{} · {} · waiting start {}    {}    Steward cases {} · implementing {} · needs human {}",
             state.agents.active,
             state.agents.maximum,
             agent_detail,
             state.agents.queued,
             build,
-            state.upstream_requests.len(),
+            state.steward_cases.len(),
             state
-                .upstream_requests
+                .steward_cases
                 .values()
-                .filter(|request| request.status == "evaluating")
+                .filter(|case| case.status == "implementing")
                 .count(),
             state
-                .upstream_requests
+                .steward_cases
                 .values()
-                .filter(|request| request.status == "needs_human")
+                .filter(|case| case.status == "needs_human")
                 .count(),
         )),
         Line::from(format!(
@@ -1017,11 +978,11 @@ fn draw_status(frame: &mut Frame<'_>, model: &DashboardModel, area: Rect) {
 
 fn draw_detail(frame: &mut Frame<'_>, model: &mut DashboardModel) {
     let row = model.selected_row();
-    let package = model
-        .detail_package_id
+    let steward_case = model
+        .detail_case_id
         .as_ref()
-        .and_then(|package_id| model.state.capability_packages.get(package_id));
-    if row.is_none() && package.is_none() {
+        .and_then(|case_id| model.state.steward_cases.get(case_id));
+    if row.is_none() && steward_case.is_none() {
         frame.render_widget(Paragraph::new("No run owner selected"), frame.area());
         return;
     }
@@ -1043,10 +1004,12 @@ fn draw_detail(frame: &mut Frame<'_>, model: &mut DashboardModel) {
             Constraint::Length(1),
         ])
         .split(frame.area());
-    let heading = if let Some(package) = package {
+    let heading = if let Some(case) = steward_case {
         format!(
-            "Package · {} · {} · revision {}",
-            package.title, package.status, package.revision
+            "Steward case · {} · {} · {} request(s)",
+            case.title,
+            case.status,
+            case.request_ids.len()
         )
     } else {
         let row = row.as_ref().expect("a non-package detail has a work unit");
@@ -1067,8 +1030,8 @@ fn draw_detail(frame: &mut Frame<'_>, model: &mut DashboardModel) {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title(if package.is_some() {
-                        " Package agent detail "
+                    .title(if steward_case.is_some() {
+                        " Steward and implementation timeline "
                     } else {
                         " Agent detail "
                     }),
@@ -1101,7 +1064,7 @@ fn draw_detail(frame: &mut Frame<'_>, model: &mut DashboardModel) {
         layout[1],
     );
     let pending_reason = row.as_ref().and_then(|row| model.pending_reason(row));
-    let has_running_task = if package.is_some() {
+    let has_running_task = if steward_case.is_some() {
         model
             .detail_runs
             .get(model.selected_run)
@@ -1864,6 +1827,8 @@ fn run_role_title(role: &str, stage: &str) -> String {
     match role {
         "package_steward" => "Steward".into(),
         "package_worker" => "Package worker".into(),
+        "upstream_steward" => "Global steward".into(),
+        "upstream_implementation" => "Implementation".into(),
         "proof_review" => "Proof review".into(),
         "warning_cleanup" => "Warning cleanup".into(),
         "" => title(stage),
@@ -2080,7 +2045,7 @@ mod tests {
     }
 
     #[test]
-    fn renders_upstream_request_evidence_and_hides_legacy_packages() {
+    fn renders_steward_cases_and_hides_legacy_packages() {
         let mut model = DashboardModel::loading("pipeline".into(), String::new());
         model
             .apply(WireEvent {
@@ -2089,6 +2054,17 @@ mod tests {
                 status: "running".into(),
                 result: None,
                 snapshot: Some(serde_json::json!({
+                    "steward_cases": {"case-1": {
+                        "id": "case-1", "status": "implementing",
+                        "title": "Canonical completion transport",
+                        "disposition": "implement",
+                        "needed_result": "A transport bridge",
+                        "request_ids": ["upstream-1"],
+                        "context_work_unit_ids": ["book/chapter-01", "book/chapter-02"],
+                        "acceptance_tests": ["Book.target elaborates"],
+                        "rationale": "The two chapters must be inspected together.",
+                        "updated_at": "2026-08-22T00:00:00Z"
+                    }},
                     "upstream_requests": {"upstream-1": {
                         "id": "upstream-1", "status": "evaluating",
                         "consumer_chapter_id": "book/chapter-02",
@@ -2142,20 +2118,20 @@ mod tests {
                 message: String::new(),
             })
             .unwrap();
-        model.enter_package_detail();
+        model.enter_steward_detail();
 
         let backend = TestBackend::new(140, 52);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| draw(frame, &mut model)).unwrap();
         let rendered = terminal.backend().to_string();
-        assert!(rendered.contains("Upstream requests"));
-        assert!(rendered.contains("Book.target"));
+        assert!(rendered.contains("Global steward cases"));
+        assert!(rendered.contains("Canonical completion transport"));
         assert!(rendered.contains("A transport bridge"));
         assert!(rendered.contains("book/chapter-01"));
-        assert!(rendered.contains("lean/Book/Chapter01.lean"));
-        assert!(rendered.contains("exact existing"));
+        assert!(!rendered.contains("Capability packages"));
+        assert!(rendered.contains("The two chapters must be inspected together"));
         assert!(!rendered.contains("Transport bridge"));
-        assert!(!rendered.contains("Steward"));
+        assert!(rendered.contains("Steward rationale"));
     }
 
     #[test]

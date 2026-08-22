@@ -99,6 +99,25 @@ pub struct UpstreamRequest {
 
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default)]
+pub struct StewardCase {
+    pub id: String,
+    pub status: String,
+    pub title: String,
+    pub disposition: String,
+    pub needed_result: String,
+    pub request_ids: Vec<String>,
+    pub context_work_unit_ids: Vec<String>,
+    pub acceptance_tests: Vec<String>,
+    pub rationale: String,
+    pub steward_run_id: String,
+    pub implementation_run_ids: Vec<String>,
+    pub decision: Value,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
 pub struct PackageConsumer {
     pub id: String,
     pub package_id: String,
@@ -317,6 +336,7 @@ pub struct SwarmState {
     pub agents: Agents,
     pub coordinator_build: CoordinatorBuild,
     pub upstream_requests: HashMap<String, UpstreamRequest>,
+    pub steward_cases: HashMap<String, StewardCase>,
     pub capability_packages: HashMap<String, CapabilityPackage>,
     pub package_consumers: HashMap<String, PackageConsumer>,
     pub package_steps: HashMap<String, PackageStep>,
@@ -383,6 +403,7 @@ pub struct GlobalDelta {
     pub agents: Option<Agents>,
     pub coordinator_build: Option<CoordinatorBuild>,
     pub upstream_requests: Option<HashMap<String, UpstreamRequest>>,
+    pub steward_cases: Option<HashMap<String, StewardCase>>,
     pub capability_packages: Option<HashMap<String, CapabilityPackage>>,
     pub package_consumers: Option<HashMap<String, PackageConsumer>>,
     pub package_steps: Option<HashMap<String, PackageStep>>,
@@ -454,9 +475,9 @@ pub struct DashboardModel {
     pub result: Option<bool>,
     pub selected: usize,
     pub detail: bool,
-    pub package_detail: bool,
-    pub package_selected: usize,
-    pub detail_package_id: Option<String>,
+    pub steward_detail: bool,
+    pub steward_selected: usize,
+    pub detail_case_id: Option<String>,
     pub detail_tab: DetailTab,
     pub scroll: u16,
     pub detail_max_scroll: u16,
@@ -465,7 +486,7 @@ pub struct DashboardModel {
     pub selected_run: usize,
     pub run_prompts: HashMap<String, String>,
     loading_chapter_runs: Option<(String, Option<String>)>,
-    loading_package_runs: Option<(String, Option<String>)>,
+    loading_case_runs: Option<(String, Option<String>)>,
     loading_prompt_runs: HashSet<String>,
     pub full_timeline_runs: HashSet<String>,
     pub loading_timeline_runs: HashSet<String>,
@@ -501,9 +522,9 @@ impl DashboardModel {
             result: None,
             selected: 0,
             detail: false,
-            package_detail: false,
-            package_selected: 0,
-            detail_package_id: None,
+            steward_detail: false,
+            steward_selected: 0,
+            detail_case_id: None,
             detail_tab: detail_tab.map(DetailTab::from_name).unwrap_or_default(),
             scroll: 0,
             detail_max_scroll: 0,
@@ -512,7 +533,7 @@ impl DashboardModel {
             selected_run: 0,
             run_prompts: HashMap::new(),
             loading_chapter_runs: None,
-            loading_package_runs: None,
+            loading_case_runs: None,
             loading_prompt_runs: HashSet::new(),
             full_timeline_runs: HashSet::new(),
             loading_timeline_runs: HashSet::new(),
@@ -618,6 +639,7 @@ impl DashboardModel {
             &mut self.state.upstream_requests,
             delta.globals.upstream_requests,
         );
+        apply_optional(&mut self.state.steward_cases, delta.globals.steward_cases);
         apply_optional(
             &mut self.state.capability_packages,
             delta.globals.capability_packages,
@@ -735,7 +757,7 @@ impl DashboardModel {
         if self.detail {
             self.leave_detail();
         }
-        self.package_detail = false;
+        self.steward_detail = false;
     }
 
     pub fn push_search_character(&mut self, character: char) {
@@ -829,11 +851,11 @@ impl DashboardModel {
 
     pub fn enter_detail(&mut self) {
         self.detail = true;
-        self.package_detail = false;
-        self.detail_package_id = None;
+        self.steward_detail = false;
+        self.detail_case_id = None;
         self.detail_runs.clear();
         self.loading_chapter_runs = None;
-        self.loading_package_runs = None;
+        self.loading_case_runs = None;
         self.selected_run = 0;
         self.scroll = 0;
         self.detail_max_scroll = 0;
@@ -842,10 +864,10 @@ impl DashboardModel {
 
     pub fn leave_detail(&mut self) {
         self.detail = false;
-        self.package_detail = self.detail_package_id.take().is_some();
+        self.steward_detail = self.detail_case_id.take().is_some();
         self.detail_runs.clear();
         self.loading_chapter_runs = None;
-        self.loading_package_runs = None;
+        self.loading_case_runs = None;
         self.selected_run = 0;
         self.run_prompts.clear();
         self.scroll = 0;
@@ -853,91 +875,61 @@ impl DashboardModel {
         self.detail_follow_tail = true;
     }
 
-    pub fn enter_package_detail(&mut self) {
-        self.package_detail = true;
+    pub fn enter_steward_detail(&mut self) {
+        self.steward_detail = true;
         self.detail = false;
-        self.detail_package_id = None;
-        self.loading_package_runs = None;
-        self.package_selected = self
-            .package_selected
-            .min(self.upstream_requests().len().saturating_sub(1));
+        self.detail_case_id = None;
+        self.loading_case_runs = None;
+        self.steward_selected = self
+            .steward_selected
+            .min(self.steward_cases().len().saturating_sub(1));
         self.scroll = 0;
         self.detail_max_scroll = 0;
         self.detail_follow_tail = true;
     }
 
-    pub fn leave_package_detail(&mut self) {
-        self.package_detail = false;
+    pub fn leave_steward_detail(&mut self) {
+        self.steward_detail = false;
         self.scroll = 0;
         self.detail_max_scroll = 0;
         self.detail_follow_tail = true;
     }
 
-    pub fn enter_package_run_detail(&mut self, package_id: String) {
+    pub fn enter_case_run_detail(&mut self, case_id: String) {
         self.detail = true;
-        self.package_detail = false;
-        self.detail_package_id = Some(package_id);
+        self.steward_detail = false;
+        self.detail_case_id = Some(case_id);
         self.detail_runs.clear();
-        self.loading_package_runs = None;
+        self.loading_case_runs = None;
         self.selected_run = 0;
         self.scroll = 0;
         self.detail_max_scroll = 0;
         self.detail_follow_tail = true;
     }
 
-    pub fn packages(&self) -> Vec<&CapabilityPackage> {
-        let mut packages = self.state.capability_packages.values().collect::<Vec<_>>();
-        packages.sort_by(|left, right| {
-            package_status_rank(&left.status)
-                .cmp(&package_status_rank(&right.status))
+    pub fn steward_cases(&self) -> Vec<&StewardCase> {
+        let mut cases = self.state.steward_cases.values().collect::<Vec<_>>();
+        cases.sort_by(|left, right| {
+            steward_case_status_rank(&left.status)
+                .cmp(&steward_case_status_rank(&right.status))
                 .then(right.updated_at.cmp(&left.updated_at))
                 .then(left.id.cmp(&right.id))
         });
-        packages
+        cases
     }
 
-    pub fn selected_package(&self) -> Option<&CapabilityPackage> {
-        self.packages().get(self.package_selected).copied()
-    }
-
-    pub fn upstream_requests(&self) -> Vec<&UpstreamRequest> {
-        let mut requests = self.state.upstream_requests.values().collect::<Vec<_>>();
-        requests.sort_by(|left, right| {
-            upstream_request_status_rank(&left.status)
-                .cmp(&upstream_request_status_rank(&right.status))
-                .then(right.updated_at.cmp(&left.updated_at))
-                .then(left.id.cmp(&right.id))
-        });
-        requests
-    }
-
-    pub fn selected_upstream_request(&self) -> Option<&UpstreamRequest> {
-        self.upstream_requests().get(self.package_selected).copied()
+    pub fn selected_steward_case(&self) -> Option<&StewardCase> {
+        self.steward_cases().get(self.steward_selected).copied()
     }
 
     pub fn move_upstream_request_selection(&mut self, delta: isize) {
-        let length = self.upstream_requests().len();
+        let length = self.steward_cases().len();
         if length == 0 {
-            self.package_selected = 0;
+            self.steward_selected = 0;
             return;
         }
-        self.package_selected = self
-            .package_selected
-            .saturating_add_signed(delta)
-            .min(length - 1);
-        self.scroll = 0;
-        self.detail_max_scroll = 0;
-        self.detail_follow_tail = true;
-    }
-
-    pub fn move_package_selection(&mut self, delta: isize) {
-        let length = self.packages().len();
-        if length == 0 {
-            self.package_selected = 0;
-            return;
-        }
-        self.package_selected = self
-            .package_selected
+        self.steward_selected = self
+            .steward_selected
             .saturating_add_signed(delta)
             .min(length - 1);
         self.scroll = 0;
@@ -991,33 +983,29 @@ impl DashboardModel {
         true
     }
 
-    pub fn begin_package_runs_load(
-        &mut self,
-        package_id: &str,
-        selected_run_id: Option<&str>,
-    ) -> bool {
-        let request = (package_id.to_owned(), selected_run_id.map(str::to_owned));
-        if self.loading_package_runs.as_ref() == Some(&request) {
+    pub fn begin_case_runs_load(&mut self, case_id: &str, selected_run_id: Option<&str>) -> bool {
+        let request = (case_id.to_owned(), selected_run_id.map(str::to_owned));
+        if self.loading_case_runs.as_ref() == Some(&request) {
             return false;
         }
-        self.loading_package_runs = Some(request);
+        self.loading_case_runs = Some(request);
         true
     }
 
-    pub fn apply_loaded_package_runs(
+    pub fn apply_loaded_case_runs(
         &mut self,
-        package_id: &str,
+        case_id: &str,
         selected_run_id: Option<&str>,
         details: ChapterRuns,
     ) -> bool {
-        let request = (package_id.to_owned(), selected_run_id.map(str::to_owned));
-        if self.loading_package_runs.as_ref() != Some(&request)
+        let request = (case_id.to_owned(), selected_run_id.map(str::to_owned));
+        if self.loading_case_runs.as_ref() != Some(&request)
             || !self.detail
-            || self.detail_package_id.as_deref() != Some(package_id)
+            || self.detail_case_id.as_deref() != Some(case_id)
         {
             return false;
         }
-        self.loading_package_runs = None;
+        self.loading_case_runs = None;
         self.apply_chapter_runs(details);
         true
     }
@@ -1250,26 +1238,13 @@ impl DashboardModel {
     }
 }
 
-fn package_status_rank(status: &str) -> u8 {
+fn steward_case_status_rank(status: &str) -> u8 {
     match status {
-        "waiting_dependency" | "waiting_reservation" => 1,
-        "complete"
-        | "decomposed"
-        | "external"
-        | "statement_revision_required"
-        | "parked"
-        | "superseded" => 2,
-        _ => 0,
-    }
-}
-
-fn upstream_request_status_rank(status: &str) -> u8 {
-    match status {
-        "evaluating" => 0,
-        "open" => 1,
+        "implementing" => 0,
+        "ready" | "needs_scope" => 1,
         "needs_human" => 2,
-        "rejected" => 3,
-        "verified" => 4,
+        "verified" => 3,
+        "rejected" | "resolved" => 4,
         _ => 5,
     }
 }
@@ -1587,20 +1562,20 @@ mod tests {
     }
 
     #[test]
-    fn package_run_detail_loads_history_and_returns_to_dossier() {
+    fn steward_case_run_detail_loads_history_and_returns_to_case_view() {
         let mut model = DashboardModel::loading("test".into(), String::new());
-        model.enter_package_detail();
-        model.enter_package_run_detail("package-1".into());
-        assert!(model.begin_package_runs_load("package-1", None));
-        assert!(model.apply_loaded_package_runs(
-            "package-1",
+        model.enter_steward_detail();
+        model.enter_case_run_detail("case-1".into());
+        assert!(model.begin_case_runs_load("case-1", None));
+        assert!(model.apply_loaded_case_runs(
+            "case-1",
             None,
             ChapterRuns {
                 work_unit_id: "package-1".into(),
                 selected_run_id: Some("steward-run".into()),
                 runs: vec![HistoricalRun {
                     id: "steward-run".into(),
-                    role: "package_steward".into(),
+                    role: "upstream_steward".into(),
                     round: 3,
                     ..HistoricalRun::default()
                 }],
@@ -1612,8 +1587,8 @@ mod tests {
         model.leave_detail();
 
         assert!(!model.detail);
-        assert!(model.package_detail);
-        assert!(model.detail_package_id.is_none());
+        assert!(model.steward_detail);
+        assert!(model.detail_case_id.is_none());
     }
 
     #[test]

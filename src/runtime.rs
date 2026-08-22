@@ -27,8 +27,8 @@ enum RuntimeEvent {
         selected_run_id: Option<String>,
         result: Box<Result<ChapterRuns, String>>,
     },
-    PackageRuns {
-        package_id: String,
+    StewardCaseRuns {
+        case_id: String,
         selected_run_id: Option<String>,
         result: Box<Result<ChapterRuns, String>>,
     },
@@ -156,8 +156,8 @@ pub fn run(
                 let complete = event.event == "complete";
                 model.apply(event)?;
                 if model.detail && model.detail_runs.is_empty() {
-                    if model.detail_package_id.is_some() {
-                        request_package_runs(&mut model, socket_path, None, sender.clone());
+                    if model.detail_case_id.is_some() {
+                        request_case_runs(&mut model, socket_path, None, sender.clone());
                     } else {
                         request_chapter_runs(&mut model, socket_path, None, sender.clone());
                     }
@@ -208,14 +208,13 @@ pub fn run(
                 }
                 dirty = true;
             }
-            Ok(RuntimeEvent::PackageRuns {
-                package_id,
+            Ok(RuntimeEvent::StewardCaseRuns {
+                case_id,
                 selected_run_id,
                 result,
             }) => {
                 let details = result.map_err(anyhow::Error::msg)?;
-                if model.apply_loaded_package_runs(&package_id, selected_run_id.as_deref(), details)
-                {
+                if model.apply_loaded_case_runs(&case_id, selected_run_id.as_deref(), details) {
                     request_prompt_if_needed(&mut model, socket_path, sender.clone());
                     request_timeline_if_needed(&mut model, socket_path, sender.clone());
                 }
@@ -245,7 +244,7 @@ pub fn run(
             }
             Err(RecvTimeoutError::Timeout) => {
                 // This is a presentation clock for idle/elapsed labels, never a state poll.
-                dirty = model.detail || model.package_detail || model.state.agents.active > 0;
+                dirty = model.detail || model.steward_detail || model.state.agents.active > 0;
             }
             Err(RecvTimeoutError::Disconnected) => {
                 bail!("dashboard event sources disconnected unexpectedly")
@@ -353,8 +352,8 @@ fn handle_terminal_event_with_sender(
             .get(model.selected_run)
             .map(|run| run.id.clone());
         if selected_run != previous_run {
-            if model.detail_package_id.is_some() {
-                request_package_runs(model, socket_path, selected_run.as_deref(), sender.clone());
+            if model.detail_case_id.is_some() {
+                request_case_runs(model, socket_path, selected_run.as_deref(), sender.clone());
             } else {
                 request_chapter_runs(model, socket_path, selected_run.as_deref(), sender.clone());
             }
@@ -364,8 +363,15 @@ fn handle_terminal_event_with_sender(
         }
         return Ok(dirty);
     }
-    if model.package_detail {
-        return Ok(handle_package_key(key, model));
+    if model.steward_detail {
+        if matches!(key.code, KeyCode::Enter | KeyCode::Char('i')) {
+            if let Some(case_id) = model.selected_steward_case().map(|case| case.id.clone()) {
+                model.enter_case_run_detail(case_id);
+                request_case_runs(model, socket_path, None, sender);
+            }
+            return Ok(true);
+        }
+        return Ok(handle_steward_key(key, model));
     }
     match key.code {
         KeyCode::Char('q') | KeyCode::Char('c')
@@ -389,7 +395,7 @@ fn handle_terminal_event_with_sender(
             Ok(true)
         }
         KeyCode::Char('u') => {
-            model.enter_package_detail();
+            model.enter_steward_detail();
             Ok(true)
         }
         KeyCode::Up => {
@@ -549,7 +555,7 @@ fn handle_mouse_event(mouse: MouseEvent, model: &mut DashboardModel) -> bool {
         MouseEventKind::ScrollDown => MOUSE_SCROLL_ROWS,
         _ => return false,
     };
-    if model.detail || model.package_detail {
+    if model.detail || model.steward_detail {
         model.scroll_detail(delta as i16);
     } else {
         model.move_selection(delta);
@@ -557,16 +563,16 @@ fn handle_mouse_event(mouse: MouseEvent, model: &mut DashboardModel) -> bool {
     true
 }
 
-fn handle_package_key(key: KeyEvent, model: &mut DashboardModel) -> bool {
+fn handle_steward_key(key: KeyEvent, model: &mut DashboardModel) -> bool {
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('u') => {
-            model.leave_package_detail();
+            model.leave_steward_detail();
         }
         KeyCode::Up | KeyCode::Char('j') => model.move_upstream_request_selection(-1),
         KeyCode::Down => model.move_upstream_request_selection(1),
         KeyCode::PageUp => model.move_upstream_request_selection(-10),
         KeyCode::PageDown => model.move_upstream_request_selection(10),
-        KeyCode::Home => model.move_upstream_request_selection(-(model.package_selected as isize)),
+        KeyCode::Home => model.move_upstream_request_selection(-(model.steward_selected as isize)),
         KeyCode::End => model.move_upstream_request_selection(isize::MAX),
         _ => return false,
     }
@@ -634,20 +640,20 @@ fn request_chapter_runs(
     });
 }
 
-fn request_package_runs(
+fn request_case_runs(
     model: &mut DashboardModel,
     socket_path: &str,
     selected_run_id: Option<&str>,
     sender: Sender<RuntimeEvent>,
 ) {
-    let Some(package_id) = model.detail_package_id.clone() else {
+    let Some(case_id) = model.detail_case_id.clone() else {
         return;
     };
-    if !model.begin_package_runs_load(&package_id, selected_run_id) {
+    if !model.begin_case_runs_load(&case_id, selected_run_id) {
         return;
     }
     let selected_run_id = selected_run_id.map(str::to_owned);
-    let mut request = json!({"command": "package_runs", "package_id": package_id});
+    let mut request = json!({"command": "steward_case_runs", "case_id": case_id});
     if let Some(run_id) = &selected_run_id {
         request["run_id"] = Value::String(run_id.clone());
     }
@@ -656,19 +662,19 @@ fn request_package_runs(
         let result = send_control_request(&socket_path, &request)
             .and_then(|response| {
                 if let Some(error) = response.get("error") {
-                    bail!("orchestrator rejected package history request: {error}")
+                    bail!("orchestrator rejected steward-case history request: {error}")
                 }
                 serde_json::from_value(
                     response
-                        .get("package_runs")
+                        .get("steward_case_runs")
                         .cloned()
-                        .context("package history response omitted package_runs")?,
+                        .context("steward-case history response omitted steward_case_runs")?,
                 )
-                .context("invalid package history response")
+                .context("invalid steward-case history response")
             })
             .map_err(|error| error.to_string());
-        let _ = sender.send(RuntimeEvent::PackageRuns {
-            package_id,
+        let _ = sender.send(RuntimeEvent::StewardCaseRuns {
+            case_id,
             selected_run_id,
             result: Box::new(result),
         });
@@ -895,10 +901,10 @@ mod tests {
         let request_key = Event::Key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE));
 
         assert!(handle_terminal_event(request_key.clone(), &mut model, "/unused").unwrap());
-        assert!(model.package_detail);
+        assert!(model.steward_detail);
         assert!(!model.detail);
         assert!(handle_terminal_event(request_key, &mut model, "/unused").unwrap());
-        assert!(!model.package_detail);
+        assert!(!model.steward_detail);
         assert!(!model.stopping);
     }
 

@@ -450,6 +450,7 @@ class StateStore:
         self.fixup_requests: dict[str, dict[str, Any]] = {}
         self.proof_review_requests: dict[str, dict[str, Any]] = {}
         self.upstream_requests: dict[str, dict[str, Any]] = {}
+        self.steward_cases: dict[str, dict[str, Any]] = {}
         self.package_state = PackageState()
         self.proof_blockers: dict[str, dict[str, Any]] = {}
         self.routing_metrics: dict[str, int] = {}
@@ -524,6 +525,13 @@ class StateStore:
                     request_id: dict(value)
                     for request_id, value in raw_upstream_requests.items()
                     if isinstance(request_id, str) and isinstance(value, dict)
+                }
+            raw_steward_cases = raw.get("steward_cases")
+            if isinstance(raw_steward_cases, dict):
+                self.steward_cases = {
+                    case_id: dict(value)
+                    for case_id, value in raw_steward_cases.items()
+                    if isinstance(case_id, str) and isinstance(value, dict)
                 }
             raw_proof_blockers = raw.get("proof_blockers")
             if isinstance(raw_proof_blockers, dict):
@@ -1137,6 +1145,7 @@ class StateStore:
                 "fixup_requests": self.fixup_requests,
                 "proof_review_requests": self.proof_review_requests,
                 "upstream_requests": self.upstream_requests,
+                "steward_cases": self.steward_cases,
                 "proof_blockers": self.proof_blockers,
                 "thread_cumulative_usage": {
                     thread_id: self._usage_dict(usage)
@@ -1261,6 +1270,18 @@ class StateStore:
             "revision": self.revision,
             "source": str(self.database_path),
         }
+        for legacy_key in (
+            "upstream_requests",
+            "capability_packages",
+            "package_consumers",
+            "package_steps",
+            "package_evidence",
+            "steward_leases",
+            "path_reservations",
+            "package_dependencies",
+            "relevant_read_interfaces",
+        ):
+            snapshot.pop(legacy_key, None)
         # Task rows already project build freshness.  The native dashboard previously received
         # the complete normalized graph (several MiB on large corpora) only to test clean-member
         # membership while drawing each row.
@@ -1335,7 +1356,21 @@ class StateStore:
             for task in tasks.values()
             if isinstance((run_id := task.get("latest_run_id")), str)
         )
-        global_names = change.globals.difference({"activity", "formalize_graph"})
+        global_names = change.globals.difference(
+            {
+                "activity",
+                "formalize_graph",
+                "upstream_requests",
+                "capability_packages",
+                "package_consumers",
+                "package_steps",
+                "package_evidence",
+                "steward_leases",
+                "path_reservations",
+                "package_dependencies",
+                "relevant_read_interfaces",
+            }
+        )
         if "state" in global_names:
             globals_ = self._bounded_global_snapshot() | {"revision": self.revision}
         else:
@@ -2519,6 +2554,115 @@ class StateStore:
         self._mark_dirty(global_state=False, sections={"upstream_requests"})
         await self._persist()
 
+    async def replace_steward_cases(self, cases: Iterable[dict[str, Any]]) -> None:
+        """Replace the steward's canonical case set after one global dedupe pass."""
+
+        now = timestamp()
+        previous = self.steward_cases
+        replacement: dict[str, dict[str, Any]] = {}
+        assigned_request_ids: set[str] = set()
+        for raw in cases:
+            case_id = str(raw.get("case_id", "")).strip()
+            if not case_id or case_id in replacement:
+                raise ValueError(f"invalid or repeated steward case id: {case_id or '<empty>'}")
+            request_ids = [
+                str(value)
+                for value in raw.get("request_ids", ())
+                if str(value) in self.upstream_requests
+            ]
+            overlap = assigned_request_ids.intersection(request_ids)
+            if overlap:
+                raise ValueError(
+                    "steward assigned request(s) to multiple cases: " + ", ".join(sorted(overlap))
+                )
+            assigned_request_ids.update(request_ids)
+            old = previous.get(case_id, {})
+            value = dict(raw)
+            value["id"] = case_id
+            value["request_ids"] = request_ids
+            value["status"] = str(value.get("status") or "ready")
+            value["created_at"] = str(old.get("created_at") or now)
+            value["updated_at"] = now
+            value.setdefault("implementation_run_ids", list(old.get("implementation_run_ids", ())))
+            replacement[case_id] = value
+        for case_id, value in previous.items():
+            if case_id not in replacement and value.get("status") in {
+                "verified",
+                "rejected",
+                "resolved",
+                "needs_human",
+            }:
+                replacement[case_id] = value
+        self.steward_cases = replacement
+        for request_id, request in self.upstream_requests.items():
+            if request_id in assigned_request_ids:
+                request["status"] = UpstreamRequestStatus.EVALUATING.value
+                request["steward_case_id"] = next(
+                    case_id
+                    for case_id, case in replacement.items()
+                    if request_id in case["request_ids"]
+                )
+                request["updated_at"] = now
+        self._mark_dirty(
+            global_state=False,
+            sections={"steward_cases", "upstream_requests"},
+        )
+        await self._persist()
+
+    async def update_steward_case(self, case_id: str, **changes: Any) -> None:
+        case = self.steward_cases.get(case_id)
+        if not isinstance(case, dict):
+            return
+        case.update(changes)
+        case["updated_at"] = timestamp()
+        self._mark_dirty(global_state=False, sections={"steward_cases"})
+        await self._persist()
+
+    async def clear_upstream_coordination(self) -> None:
+        """Drop outstanding observations and cases while retaining historical agent runs."""
+
+        request_ids = set(self.upstream_requests)
+        consumer_ids = {
+            str(request.get("consumer_chapter_id", ""))
+            for request in self.upstream_requests.values()
+        }
+        self.upstream_requests.clear()
+        self.steward_cases.clear()
+        for request_id, request in tuple(self.proof_review_requests.items()):
+            if request_id in request_ids or request.get("kind") == "upstream_request":
+                self.proof_review_requests.pop(request_id, None)
+        for blocker in self.proof_blockers.values():
+            if blocker.get("upstream_request_id") in request_ids:
+                blocker.pop("upstream_request_id", None)
+                blocker.pop("request_id", None)
+                blocker["status"] = ProofBlockerStatus.BLOCKED.value
+                blocker["updated_at"] = timestamp()
+        self._mark_dirty(
+            global_state=False,
+            sections={
+                "upstream_requests",
+                "steward_cases",
+                "proof_review_requests",
+                "proof_blockers",
+            },
+        )
+        await self._persist()
+        for consumer_id in consumer_ids:
+            task = self.tasks.get(self.key(consumer_id, Stage.PROVE))
+            if task is None:
+                continue
+            task.waiting_on = tuple(
+                requirement
+                for requirement in task.waiting_on
+                if requirement.kind is not RequirementKind.UPSTREAM_REQUEST
+            )
+            await self.set_task(
+                consumer_id,
+                Stage.PROVE,
+                TaskStatus.BLOCKED,
+                "outstanding upstream requests were cleared by the operator",
+            )
+
     async def enqueue_proof_review_request(
         self,
         feedback: dict[str, str],
@@ -2688,6 +2832,29 @@ class StateStore:
             key=lambda run: (run.started_at, run.id),
         )
         return self._dashboard_runs(package_id, runs, selected_run_id=selected_run_id)
+
+    def dashboard_steward_case_runs(
+        self,
+        case_id: str,
+        *,
+        selected_run_id: str | None = None,
+    ) -> dict[str, Any]:
+        case = self.steward_cases.get(case_id, {})
+        request_ids = {str(value) for value in case.get("request_ids", ())}
+        explicit_run_ids = {
+            str(case.get("steward_run_id", "")),
+            *(str(value) for value in case.get("implementation_run_ids", ())),
+        }
+        runs = [
+            run
+            for run in self._runs_by_id.values()
+            if run.id in explicit_run_ids
+            or (
+                run.role in {"upstream_steward", "upstream_implementation"}
+                and request_ids.intersection(run.request_ids)
+            )
+        ]
+        return self._dashboard_runs(case_id, runs, selected_run_id=selected_run_id)
 
     def _dashboard_runs(
         self,

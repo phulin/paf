@@ -454,6 +454,82 @@ _PACKAGE_WORKER_PROPERTIES: dict[str, Any] = {
     "new_evidence": {"type": "array", "items": {"type": "string", "minLength": 1}},
 }
 
+_UPSTREAM_STEWARD_PROPERTIES: dict[str, Any] = {
+    "complete": _REPORT_BASE_PROPERTIES["complete"],
+    "summary": _REPORT_BASE_PROPERTIES["summary"],
+    "issues": _REPORT_BASE_PROPERTIES["issues"],
+    "cases": {
+        "type": "array",
+        "items": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "case_id": {"type": "string", "pattern": "^[A-Za-z0-9._-]+$"},
+                "title": {"type": "string", "minLength": 1},
+                "request_ids": {
+                    "type": "array",
+                    "items": {"type": "string", "minLength": 1},
+                    "minItems": 1,
+                },
+                "disposition": {
+                    "type": "string",
+                    "enum": ["implement", "retry_consumers", "reject", "needs_human"],
+                },
+                "needed_result": {"type": "string", "minLength": 1},
+                "context_work_unit_ids": {
+                    "type": "array",
+                    "items": {"type": "string", "minLength": 1},
+                    "minItems": 1,
+                },
+                "acceptance_tests": {
+                    "type": "array",
+                    "items": {"type": "string", "minLength": 1},
+                },
+                "rationale": {"type": "string", "minLength": 1},
+            },
+            "required": [
+                "case_id",
+                "title",
+                "request_ids",
+                "disposition",
+                "needed_result",
+                "context_work_unit_ids",
+                "acceptance_tests",
+                "rationale",
+            ],
+        },
+    },
+}
+
+_UPSTREAM_IMPLEMENTATION_PROPERTIES: dict[str, Any] = {
+    "complete": _REPORT_BASE_PROPERTIES["complete"],
+    "summary": _REPORT_BASE_PROPERTIES["summary"],
+    "issues": _REPORT_BASE_PROPERTIES["issues"],
+    "disposition": {
+        "type": "string",
+        "enum": ["implemented", "not_needed", "consumer_local", "needs_scope", "needs_human"],
+    },
+    "placement": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "paths": {"type": "array", "items": {"type": "string", "minLength": 1}},
+            "declarations": {"type": "array", "items": {"type": "string", "minLength": 1}},
+            "rationale": {"type": "string", "minLength": 1},
+        },
+        "required": ["paths", "declarations", "rationale"],
+    },
+    "consumer_routes": {
+        "type": "array",
+        "items": {"type": "string", "minLength": 1},
+    },
+    "additional_work_unit_ids": {
+        "type": "array",
+        "items": {"type": "string", "minLength": 1},
+    },
+    "validation_evidence": {"type": "string", "minLength": 1},
+}
+
 
 def _report_schema(title: str, properties: dict[str, Any]) -> dict[str, Any]:
     return {
@@ -467,6 +543,12 @@ def _report_schema(title: str, properties: dict[str, Any]) -> dict[str, Any]:
 
 
 REPORT_SCHEMAS: dict[str, dict[str, Any]] = {
+    "upstream_steward": _report_schema(
+        "PAF global upstream-request steward report", _UPSTREAM_STEWARD_PROPERTIES
+    ),
+    "upstream_implementation": _report_schema(
+        "PAF focused upstream implementation report", _UPSTREAM_IMPLEMENTATION_PROPERTIES
+    ),
     "package_steward": _report_schema(
         "PAF capability-package Steward report", _PACKAGE_STEWARD_PROPERTIES
     ),
@@ -547,8 +629,14 @@ DIAGNOSTIC_REVIEW_PROMPT_PATH = Path(str(_PROMPT_RESOURCES.joinpath("diagnostic_
 WARNING_CLEANUP_PROMPT_PATH = Path(str(_PROMPT_RESOURCES.joinpath("warning_cleanup.md")))
 PACKAGE_STEWARD_PROMPT_PATH = Path(str(_PROMPT_RESOURCES.joinpath("package_steward.md")))
 PACKAGE_WORKER_PROMPT_PATH = Path(str(_PROMPT_RESOURCES.joinpath("package_worker.md")))
+UPSTREAM_STEWARD_PROMPT_PATH = Path(str(_PROMPT_RESOURCES.joinpath("upstream_steward.md")))
+UPSTREAM_IMPLEMENTATION_PROMPT_PATH = Path(
+    str(_PROMPT_RESOURCES.joinpath("upstream_implementation.md"))
+)
 PACKAGE_STEWARD_ROLE = "package_steward"
 PACKAGE_WORKER_ROLE = "package_worker"
+UPSTREAM_STEWARD_ROLE = "upstream_steward"
+UPSTREAM_IMPLEMENTATION_ROLE = "upstream_implementation"
 DIAGNOSTIC_REVIEW_ROLE = "diagnostic_review"
 PROOF_REVIEW_ROLE = "proof_review"
 WARNING_CLEANUP_ROLE = "warning_cleanup"
@@ -559,7 +647,12 @@ DIAGNOSTIC_REVIEW_ROLES = frozenset({DIAGNOSTIC_REVIEW_ROLE, WARNING_REVIEW_ROLE
 
 
 def report_schema_key(stage: Stage, *, role: str = "", feedback: str = "") -> str:
-    if role in {PACKAGE_STEWARD_ROLE, PACKAGE_WORKER_ROLE}:
+    if role in {
+        PACKAGE_STEWARD_ROLE,
+        PACKAGE_WORKER_ROLE,
+        UPSTREAM_STEWARD_ROLE,
+        UPSTREAM_IMPLEMENTATION_ROLE,
+    }:
         return role
     if role == WARNING_CLEANUP_ROLE:
         return WARNING_CLEANUP_ROLE
@@ -1795,10 +1888,10 @@ distinguish proof evidence from build diagnostics, and avoid repeating known fai
             # `codex exec resume` does not accept the top-level `--sandbox`
             # option, but it does accept the equivalent config override.
             command.extend(["--config", f'sandbox_mode="{settings.sandbox}"'])
-        if role == PACKAGE_STEWARD_ROLE:
+        if role in {PACKAGE_STEWARD_ROLE, UPSTREAM_STEWARD_ROLE}:
             model = self.config.steward.model
             reasoning_effort = self.config.steward.reasoning_effort
-        elif role == PACKAGE_WORKER_ROLE:
+        elif role in {PACKAGE_WORKER_ROLE, UPSTREAM_IMPLEMENTATION_ROLE}:
             model = self.config.steward.worker_model
             reasoning_effort = self.config.steward.worker_reasoning_effort
         else:
@@ -1928,6 +2021,59 @@ distinguish proof evidence from build diagnostics, and avoid repeating known fai
             prompt=prompt,
             feedback=feedback,
             workspace_root=workspace_root,
+        )
+
+    async def run_upstream_steward(
+        self,
+        anchor: WorkUnitLike,
+        run: RunRecord,
+        dossier: dict[str, Any],
+        *,
+        workspace_root: Path,
+    ) -> AgentResult:
+        prompt = (
+            UPSTREAM_STEWARD_PROMPT_PATH.read_text(encoding="utf-8").rstrip()
+            + "\n\n## Outstanding request ledger\n\n```json\n"
+            + json.dumps(dossier, indent=2)
+            + "\n```\n"
+        )
+        return await self._run_prompt(
+            anchor,
+            Stage.DISCOVER,
+            run,
+            prompt=prompt,
+            workspace_root=workspace_root,
+        )
+
+    async def run_upstream_implementation(
+        self,
+        assignment: WorkUnitLike,
+        run: RunRecord,
+        dossier: dict[str, Any],
+        *,
+        workspace_root: Path,
+        resume_thread_id: str | None = None,
+        resume_run_id: str = "",
+        resume_prompt: str = "",
+    ) -> AgentResult:
+        prompt = (
+            UPSTREAM_IMPLEMENTATION_PROMPT_PATH.read_text(encoding="utf-8").rstrip()
+            + "\n\n## Deduplicated case\n\n```json\n"
+            + json.dumps(dossier, indent=2)
+            + "\n```\n"
+            + "\n\n## Writable locked scope\n\n"
+            + "\n".join(f"- `{path}`" for path in assignment.scope)
+            + "\n"
+        )
+        return await self._run_prompt(
+            assignment,
+            Stage.PROVE,
+            run,
+            prompt=prompt,
+            workspace_root=workspace_root,
+            resume_thread_id=resume_thread_id,
+            resume_run_id=resume_run_id,
+            resume_prompt=resume_prompt or CAPACITY_RESUME_PROMPT,
         )
 
     async def _run_prompt(

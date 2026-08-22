@@ -95,6 +95,17 @@ def test_record_jsonl_line_deduplicates_structured_mcp_result(
 
 def test_report_schemas_contain_only_fields_used_by_each_active_agent() -> None:
     expected = {
+        "upstream_steward": {"complete", "summary", "issues", "cases"},
+        "upstream_implementation": {
+            "complete",
+            "summary",
+            "issues",
+            "disposition",
+            "placement",
+            "consumer_routes",
+            "additional_work_unit_ids",
+            "validation_evidence",
+        },
         "package_steward": {
             "complete",
             "summary",

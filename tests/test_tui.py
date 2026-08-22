@@ -11,6 +11,8 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import cast
 
+import pytest
+
 import paf.tui as tui_module
 from paf.config import load_config
 from paf.control import ControlServer, control_socket
@@ -366,6 +368,28 @@ async def test_package_run_projection_lists_only_its_steward_and_workers(tmp_pat
     ]
     assert details["selected_run_id"] == steward.id
     assert details["activity"]["current"] == "reviewing the package plan"
+
+
+@pytest.mark.asyncio
+async def test_dashboard_projects_steward_cases_without_legacy_package_state(
+    tmp_path: Path,
+) -> None:
+    config = load_config(write_project(tmp_path))
+    state = StateStore(config)
+    await state.load_or_create()
+    state.steward_cases["case-a"] = {
+        "id": "case-a",
+        "status": "ready",
+        "title": "Shared bridge",
+        "request_ids": ["request-a"],
+    }
+    snapshot = state.dashboard_snapshot()
+
+    assert snapshot["steward_cases"]["case-a"]["title"] == "Shared bridge"
+    assert "capability_packages" not in snapshot
+    assert "package_consumers" not in snapshot
+    assert "upstream_requests" not in snapshot
+    await state.close()
 
 
 async def test_native_tui_connects_renders_and_exits_with_pipeline(

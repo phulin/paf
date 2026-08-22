@@ -436,6 +436,22 @@ class ControlServer:
                         package_id, selected_run_id=run_id
                     ),
                 }
+            elif command == "steward_case_runs":
+                case_id = request.get("case_id")
+                run_id = request.get("run_id")
+                if not isinstance(case_id, str) or not case_id:
+                    raise ValueError("steward_case_runs case_id must be a non-empty string")
+                if run_id is not None and (not isinstance(run_id, str) or not run_id):
+                    raise ValueError("steward_case_runs run_id must be a non-empty string")
+                if case_id not in self.orchestrator.state.steward_cases:
+                    raise ValueError(f"unknown steward case: {case_id}")
+                response = {
+                    "protocol_version": PROTOCOL_VERSION,
+                    "steward_case_runs": self.orchestrator.state.dashboard_steward_case_runs(
+                        case_id,
+                        selected_run_id=run_id,
+                    ),
+                }
             elif command == "run_prompt":
                 run_id = request.get("run_id")
                 if not isinstance(run_id, str) or not run_id:
