@@ -155,7 +155,11 @@ def _checked_attempt_descriptions(raw: object) -> list[str]:
     return descriptions
 
 
-def _proof_blocker_records(report: dict[str, Any]) -> list[dict[str, Any]]:
+def _proof_blocker_records(
+    report: dict[str, Any],
+    *,
+    upstream_owner_is_local: Callable[[str, str], bool] | None = None,
+) -> list[dict[str, Any]]:
     """Translate agent observations into coordinator-owned blocker classifications."""
 
     dispositions = {
@@ -171,6 +175,25 @@ def _proof_blocker_records(report: dict[str, Any]) -> list[dict[str, Any]]:
         kind = str(raw.get("kind", ""))
         evidence = str(raw.get("evidence", "")).strip()
         obstruction = str(raw.get("obstruction", "")).strip()
+        capability = raw.get("upstream_hypothesis")
+        if kind == "suspected_upstream_gap" and isinstance(capability, dict):
+            blocked_path = str(raw.get("path", "")).strip()
+            local_owners = [
+                str(path).strip()
+                for path in capability.get("owner_paths", ())
+                if isinstance(path, str)
+                and path.strip()
+                and upstream_owner_is_local is not None
+                and upstream_owner_is_local(blocked_path, str(path).strip())
+            ]
+            if local_owners:
+                kind = "local_proof_failure"
+                capability = None
+                rejection = (
+                    "Coordinator rejected the upstream classification because its owner path is "
+                    "inside the editable scope: " + ", ".join(local_owners)
+                )
+                evidence = f"{evidence}\n{rejection}" if evidence else rejection
         records.append(
             {
                 "path": raw.get("path", ""),
@@ -179,7 +202,7 @@ def _proof_blocker_records(report: dict[str, Any]) -> list[dict[str, Any]]:
                 "remaining_goal": raw.get("remaining_goal", ""),
                 "obstruction": (obstruction + (f"\nEvidence: {evidence}" if evidence else "")),
                 "disposition": dispositions.get(kind, "retry"),
-                "capability": raw.get("upstream_hypothesis"),
+                "capability": capability,
             }
         )
     return records
@@ -3447,7 +3470,7 @@ class Orchestrator:
             )
             blocks.append(
                 f"{blocker['id']} — `{blocker.get('declaration', '')}` in "
-                f"`{blocker.get('path', '')}` (seen {blocker.get('sightings', 1)} time(s))\n"
+                f"`{blocker.get('path', '')}`\n"
                 f"Residual goal: {str(blocker.get('remaining_goal', ''))[:2000]}\n"
                 f"Obstruction: {str(blocker.get('obstruction', ''))[:1200]}\n"
                 "Checked approaches and outcomes:\n"
@@ -3464,9 +3487,12 @@ class Orchestrator:
             return ""
         return _bounded_proof_feedback(
             (
-                "Prior blocker evidence. Use it as a starting point rather than repeating the same "
-                "probes. Return an ID in `blocker_refs` only when its exact evidence remains "
-                "current and no new route or guidance is available:\n\n" + "\n\n".join(blocks),
+                "Prior attempt observations (untrusted). Use the checked fragments as a starting "
+                "point rather than repeating probes, but reassess every blocker classification. "
+                "Missing machinery in the editable chapter is local implementation work. "
+                "Return an ID in `blocker_refs` only when its exact evidence remains current, "
+                "its owner is strictly earlier and non-editable, and no new route or guidance "
+                "is available:\n\n" + "\n\n".join(blocks),
             )
         )
 
@@ -3476,8 +3502,33 @@ class Orchestrator:
         run: RunRecord,
         report: dict[str, Any],
     ) -> tuple[dict[str, Any], ...]:
-        attempts = _proof_blocker_records(report)
+        def upstream_owner_is_local(blocked_path: str, owner_path: str) -> bool:
+            return owner_path.replace("\\", "/").removeprefix("./") == blocked_path.replace(
+                "\\", "/"
+            ).removeprefix("./") or chapter.id in self._path_owner_ids(owner_path)
+
+        attempts = _proof_blocker_records(report, upstream_owner_is_local=upstream_owner_is_local)
         refs = report.get("blocker_refs")
+        unchanged_ids: list[str] = []
+        if isinstance(refs, list):
+            for blocker_id in refs:
+                blocker = self.state.proof_blockers.get(str(blocker_id))
+                if not isinstance(blocker, dict):
+                    unchanged_ids.append(str(blocker_id))
+                    continue
+                candidate = blocker.get("capability")
+                owner_paths = (
+                    candidate.get("owner_paths", ()) if isinstance(candidate, dict) else ()
+                )
+                if any(
+                    isinstance(path, str)
+                    and path.strip()
+                    and upstream_owner_is_local(str(blocker.get("path", "")), path.strip())
+                    for path in owner_paths
+                ):
+                    blocker["disposition"] = "retry"
+                    blocker.pop("capability", None)
+                unchanged_ids.append(str(blocker_id))
         capabilities: list[dict[str, Any]] = []
         for value in attempts:
             candidate = value.get("capability")
@@ -3487,7 +3538,7 @@ class Orchestrator:
             chapter.id,
             origin_run_id=run.id,
             failed_attempts=attempts,
-            unchanged_ids=(refs if isinstance(refs, list) else ()),
+            unchanged_ids=unchanged_ids,
             capability_candidates=capabilities,
         )
 
@@ -3501,17 +3552,12 @@ class Orchestrator:
             for path in candidate.get("owner_paths", ())
             if isinstance(path, str)
         )
-        return (
-            cross_file
-            or int(blocker.get("sightings", 0)) > 1
-            or str(blocker.get("disposition", ""))
-            in {
-                "missing_capability",
-                "statement_review",
-                "interface_review",
-                "genuine_blocker",
-            }
-        )
+        return cross_file or str(blocker.get("disposition", "")) in {
+            "missing_capability",
+            "statement_review",
+            "interface_review",
+            "genuine_blocker",
+        }
 
     async def _request_upstream_for_blockers(
         self,

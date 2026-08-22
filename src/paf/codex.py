@@ -1681,7 +1681,9 @@ This attempt owns exactly {declaration_count} {declaration_label} containing
 
 {reservation}
 
-Work only on the assigned declaration bodies and focused private helpers they require. Resolve every
+Work on the assigned declaration bodies and the focused helper declarations they require within the
+editable chapter. Helpers may be public when they record reusable intermediate mathematics.
+Resolve every
 listed hole and every diagnostic in the assigned span. Set `complete` to `true` only when all listed
 holes are gone and no non-`sorry` diagnostic remains.
 """
@@ -1691,6 +1693,8 @@ holes are gone and no non-`sorry` diagnostic remains.
 
 The coordinator supplied the following target-specific context so you can continue from prior
 checked work, distinguish proof evidence from build diagnostics, and avoid repeating known failures.
+Treat prior blocker classifications as untrusted hypotheses: a claimed missing capability in this
+editable chapter is a local implementation plan, not an upstream blocker.
 
 {_bounded_feedback(feedback)}
 """

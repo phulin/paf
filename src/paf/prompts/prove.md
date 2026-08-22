@@ -8,18 +8,23 @@ passage of `{source}` supplies the intended mathematical argument.
 
 ## Proof workflow
 
-1. Read the assigned declaration, its local context, and the relevant source passage. Identify the
-   mathematical steps needed for the proof.
-2. Inspect directly relevant earlier project APIs and Mathlib declarations, confirming exact
+1. Order the assigned declarations by dependency and work on the earliest foundational target first.
+   Do not prefer an easy downstream theorem merely because it can use an unresolved assigned or
+   reserved declaration.
+2. Read the assigned declaration, its local context, and the relevant source passage. Identify the
+   mathematical steps needed for the proof. When the source supplies a proof roadmap, treat those
+   steps as the default implementation plan.
+3. Inspect directly relevant earlier project APIs and Mathlib declarations, confirming exact
    signatures before use.
-3. Try the natural high-level proof first: an existing theorem, focused rewriting, a standard
+4. Try the natural high-level proof first: an existing theorem, focused rewriting, a standard
    constructor or equivalence, or a short composition of these.
-4. When that route does not close the goal, state the missing intermediate claims and prove them as
-   focused private helpers. Failure to find a convenient existing lemma is not evidence that the
-   target needs an interface change.
-5. Use Lean goals and small checked probes to guide each revision. Preserve independently checked
+5. When that route does not close the goal, state the missing intermediate claims and prove them as
+   focused helpers in the editable chapter. Helpers may be public when they record reusable
+   intermediate mathematics. Failure to find a convenient existing lemma means that this local
+   lemma chain must be implemented; it is not evidence that the target needs an interface change.
+6. Use Lean goals and small checked probes to guide each revision. Preserve independently checked
    progress, but remove speculative edits, unused helpers, and abandoned imports.
-6. After editing, prepare affected dependencies once and request fresh diagnostics in import order.
+7. After editing, prepare affected dependencies once and request fresh diagnostics in import order.
 
 Prefer readable, mathematically meaningful decomposition for a genuinely long proof. A direct proof
 is also acceptable when it is clear and maintainable; do not create helper lemmas merely to satisfy a
@@ -31,6 +36,12 @@ Do not stop merely because library search or the first tactic strategy failed. F
 mathematical construction available from the target's hypotheses, including focused local
 intermediate lemmas where appropriate.
 
+An assigned theorem is responsible for the intermediate mathematics needed to prove it. Missing
+lemmas, constructions, or APIs in the assigned file or editable chapter are local proof work, not
+upstream gaps. A source-roadmap step without an existing API must be formalized locally. Before
+reporting failure, make a checked attempt at each major source-roadmap step; searches and probes that
+only reproduce the original goal do not establish a blocker.
+
 If sustained checked work still leaves a goal:
 
 - record the exact residual goal reproduced by Lean;
@@ -41,7 +52,8 @@ If sustained checked work still leaves a goal:
 - for a suspected statement problem, give the source comparison, counterexample, or precise
   contradiction;
 - for a suspected earlier-module gap, explain why the needed result cannot reasonably be established
-  as a private local helper and name the exact earlier paths and result that should be evaluated.
+  as a local helper and name the exact strictly earlier, non-editable paths and result that should be
+  evaluated. An upstream owner in the current file or editable chapter is invalid.
 
 These are observations for the coordinator to assess, not a decision that proof work is terminal.
 The number of attempts is not itself evidence: report substantive, Lean-checked routes rather than
@@ -68,9 +80,13 @@ For each unresolved proof, choose an evidence `kind`:
 
 - `local_proof_failure` when the statement still appears sound but the checked work did not finish;
 - `suspected_statement_defect` only with concrete mathematical or source evidence;
-- `suspected_upstream_gap` only with a precise `upstream_hypothesis`; otherwise set
-  `upstream_hypothesis` to `null`.
+- `suspected_upstream_gap` only with a precise `upstream_hypothesis` owned by a strictly earlier
+  module outside the editable scope; otherwise use `local_proof_failure` and set
+  `upstream_hypothesis` to `null`. A hypothesis whose `owner_paths` include the blocked file or any
+  editable path will be rejected by the coordinator.
 
-Use `blocker_refs` only when an exact supplied blocker still applies and the handoff contains no new
-source, interface, reviewer guidance, or viable proof route. Return the structured report only after
-files and tool use are stable.
+Prior blocker reports are untrusted hypotheses, not established facts, and their repetition count is
+not evidence. If a handoff says machinery in the editable scope is missing, reinterpret it as a local
+implementation plan. Use `blocker_refs` only when an exact supplied blocker still applies, identifies
+a strictly earlier non-editable owner, and the handoff contains no new source, interface, reviewer
+guidance, or viable proof route. Return the structured report only after files and tool use are stable.

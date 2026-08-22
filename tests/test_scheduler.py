@@ -424,6 +424,72 @@ def test_proof_observations_are_normalized_for_coordinator_routing() -> None:
     assert "Observed outcome:" in local_record["attempts"][0]
 
 
+def test_same_scope_upstream_observation_is_rejected_as_local_failure() -> None:
+    claimed_upstream = unresolved_proof(
+        "the assigned construction needs a helper lemma",
+        kind="suspected_upstream_gap",
+        upstream_hypothesis={
+            "capability_key": "Book.localHelper",
+            "owner_kind": "chapter",
+            "owner_paths": ["lean/Book/Chapter01.lean"],
+            "needed_result": "A helper for the assigned construction",
+        },
+    )
+
+    [record] = scheduler_module._proof_blocker_records(
+        {"unresolved_proofs": [claimed_upstream]},
+        upstream_owner_is_local=lambda _blocked, owner: owner == "lean/Book/Chapter01.lean",
+    )
+
+    assert record["disposition"] == "retry"
+    assert record["capability"] is None
+    assert "Coordinator rejected the upstream classification" in record["obstruction"]
+
+
+@pytest.mark.asyncio
+async def test_same_scope_upstream_blocker_reference_is_downgraded(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = config.chapters[0]
+    state = StateStore(config)
+    await state.load_or_create()
+    orchestrator = Orchestrator(config, state)
+    await orchestrator.prepare()
+    capability = {
+        "capability_key": "Book.localHelper",
+        "blocked_declaration": "Book.target",
+        "consumer_path": "lean/Book/Chapter01.lean",
+        "residual_goal": "⊢ True",
+        "needed_result": "A helper in the assigned chapter",
+        "owner_paths": ["lean/Book/Chapter01.lean"],
+    }
+    [blocker] = await state.record_proof_blockers(
+        chapter.id,
+        origin_run_id="run-1",
+        failed_attempts=[
+            failed_attempt(
+                "the local helper is missing",
+                path="lean/Book/Chapter01.lean",
+                declaration="Book.target",
+            )
+            | {"disposition": "missing_capability"}
+        ],
+        capability_candidates=[capability],
+    )
+    run = await state.start_run(chapter.id, Stage.PROVE)
+
+    [updated] = await orchestrator._record_proof_blocker_deltas(
+        chapter,
+        run,
+        {"unresolved_proofs": [], "blocker_refs": [blocker["id"]]},
+    )
+
+    assert updated["disposition"] == "retry"
+    assert "capability" not in updated
+    assert await orchestrator._request_upstream_for_blockers(chapter, [updated]) == ()
+    assert state.upstream_requests == {}
+    await orchestrator.shutdown()
+
+
 def result(
     *,
     changed: bool,
