@@ -693,6 +693,10 @@ have stopped. It must describe the stable files on disk, not planned work. Use o
 
 
 CAPACITY_RESUME_PROMPT = "Continue from the interrupted turn and complete the assigned task."
+BEAM_DAEMON_REMINDER = (
+    "PAF already owns the persistent Beam daemon for this workspace. Never run "
+    "`lean-beam ensure --hold`; call ordinary Beam commands directly."
+)
 LEAN_DECLARATION_RE = re.compile(
     r"^[ \t]*(?:(?:noncomputable|private|protected|unsafe|opaque)[ \t]+)*"
     r"(?:theorem|lemma|def|abbrev|structure|class|instance)[ \t]+"
@@ -1767,9 +1771,7 @@ Use the installed `$lean-beam` skill and `{backend.beam_command}` CLI. Run Beam 
 `{project}` so paths are relative to the Lean project root: use `LastLib/...`, not
 `{project}/LastLib/...`.
 
-- PAF has already started and owns the persistent Beam daemon for this workspace. Never run
-  `lean-beam ensure --hold` yourself; it blocks until interrupted. Call the ordinary inspection,
-  update, sync, refresh, save, and proof-probe commands directly.
+- {BEAM_DAEMON_REMINDER} It blocks until interrupted.
 - Beam reads saved files. Call `lean-beam update FILE` before a version-bound query.
 - Use `paf lean search QUERY` for source search across the project, Lake packages, and toolchain.
 - Use `paf lean prepare FILE...` to follow Beam's stale-direct-import recovery automatically.
@@ -1926,7 +1928,11 @@ distinguish proof evidence from build diagnostics, and avoid repeating known fai
             workspace_root=root,
             resume_thread_id=thread_id,
             resume_run_id=previous_run_id,
-            resume_prompt=reminder,
+            resume_prompt=(
+                f"{reminder}\n\n{BEAM_DAEMON_REMINDER}"
+                if stage in (Stage.FORMALIZE, Stage.REVIEW, Stage.PROVE)
+                else reminder
+            ),
         )
 
     async def run_package_steward(
@@ -2131,6 +2137,11 @@ distinguish proof evidence from build diagnostics, and avoid repeating known fai
         resume_prompt: str = CAPACITY_RESUME_PROMPT,
     ) -> AgentResult:
         root = workspace_root or self.config.settings.repo
+        if (
+            stage in (Stage.FORMALIZE, Stage.REVIEW, Stage.PROVE)
+            and BEAM_DAEMON_REMINDER not in resume_prompt
+        ):
+            resume_prompt = f"{resume_prompt}\n\n{BEAM_DAEMON_REMINDER}"
         prompt_path = self.state.logs_dir / f"{run.id}.prompt.md"
         prompt_path.write_text(prompt, encoding="utf-8")
         before = await asyncio.to_thread(scope_digest, root, chapter)

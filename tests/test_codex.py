@@ -684,7 +684,7 @@ def test_executor_uses_beam_prompt_without_attaching_mcp(tmp_path: Path) -> None
     assert "### Lean Beam workflow" in prompt
     assert "`$lean-beam` skill" in prompt
     assert "/opt/beam/bin/lean-beam" in prompt
-    assert "Never run\n  `lean-beam ensure --hold` yourself" in prompt
+    assert "Never run `lean-beam ensure --hold`" in prompt
     assert "Do not run `lake build` or `lake clean`" in prompt
     assert "### Attached Lean tools (MCP)" not in prompt
 
@@ -1547,6 +1547,7 @@ print(json.dumps({{"type": "item.completed", "item": {{
 
     invocation = json.loads(invocations_path.read_text(encoding="utf-8"))
     assert invocation["args"][:2] == ["exec", "resume"]
+    assert "Never run `lean-beam ensure --hold`" in invocation["prompt"]
     assert "saved-session" in invocation["args"]
     assert result.succeeded
     assert result.thread_id == "saved-session"
