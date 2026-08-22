@@ -18,7 +18,7 @@ import time
 import sys
 
 if "ensure" in sys.argv and "--hold" in sys.argv:
-    print(json.dumps({"result": {"ready": True}}), flush=True)
+    print(json.dumps({"result": {"ready": True}}, indent=2), flush=True)
     signal.signal(signal.SIGTERM, lambda *_args: sys.exit(0))
     while True:
         time.sleep(1)

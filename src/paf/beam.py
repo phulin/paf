@@ -8,6 +8,9 @@ import shutil
 import signal
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
+
+MAX_STARTUP_RESPONSE_BYTES = 1024 * 1024
 
 
 @dataclass
@@ -70,17 +73,9 @@ class BeamSession:
         )
         assert process.stdout is not None
         try:
-            line = await asyncio.wait_for(process.stdout.readline(), timeout=timeout_seconds)
-            if not line:
-                exit_code = await process.wait()
-                raise RuntimeError(f"Lean Beam exited during startup with status {exit_code}")
-            try:
-                response = json.loads(line)
-            except (json.JSONDecodeError, UnicodeDecodeError) as error:
-                raise RuntimeError(
-                    "Lean Beam returned an invalid startup response: "
-                    + line.decode(errors="replace").strip()[:1000]
-                ) from error
+            response, startup_output = await asyncio.wait_for(
+                _read_startup_response(process), timeout=timeout_seconds
+            )
             if not isinstance(response, dict) or response.get("error") is not None:
                 raise RuntimeError(f"Lean Beam startup failed: {response}")
         except BaseException:
@@ -88,7 +83,7 @@ class BeamSession:
             shutil.rmtree(control_dir, ignore_errors=True)
             raise
 
-        log_path.write_bytes(line)
+        log_path.write_bytes(startup_output)
         assert process.stderr is not None
         drain_tasks = (
             asyncio.create_task(_drain_output(process.stdout, log_path)),
@@ -134,6 +129,32 @@ async def _drain_output(stream: asyncio.StreamReader, log_path: Path) -> None:
     with log_path.open("ab", buffering=0) as handle:
         while chunk := await stream.read(64 * 1024):
             handle.write(chunk)
+
+
+async def _read_startup_response(
+    process: asyncio.subprocess.Process,
+) -> tuple[Any, bytes]:
+    """Read one compact or pretty-printed JSON document from `ensure --hold`."""
+
+    assert process.stdout is not None
+    output = bytearray()
+    while True:
+        line = await process.stdout.readline()
+        if not line:
+            exit_code = await process.wait()
+            excerpt = output.decode(errors="replace").strip()[:1000]
+            detail = f": {excerpt}" if excerpt else ""
+            raise RuntimeError(f"Lean Beam exited during startup with status {exit_code}{detail}")
+        output.extend(line)
+        if len(output) > MAX_STARTUP_RESPONSE_BYTES:
+            raise RuntimeError(
+                f"Lean Beam startup response exceeded {MAX_STARTUP_RESPONSE_BYTES} bytes"
+            )
+        try:
+            response = json.loads(output)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            continue
+        return response, bytes(output)
 
 
 async def _terminate_process_group(process: asyncio.subprocess.Process) -> None:

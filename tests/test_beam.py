@@ -37,6 +37,7 @@ async def test_beam_session_uses_per_run_control_and_shared_bundle_dirs(tmp_path
     assert session.process.returncode is not None
     assert not session.control_dir.exists()
     assert session.log_path.is_file()
+    assert session.log_path.read_text(encoding="utf-8").startswith('{\n  "result"')
 
 
 @pytest.mark.asyncio
