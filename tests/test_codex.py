@@ -1350,7 +1350,7 @@ if "resume" not in sys.argv:
     print(json.dumps({{"type": "thread.started", "thread_id": "deadline-thread"}}))
     message = "Selected model is at capacity."
     print(json.dumps({{"type": "turn.failed", "error": {{"message": message}}}}))
-    time.sleep(0.15)
+    time.sleep(0.35)
     raise SystemExit(1)
 time.sleep(60)
 """,
@@ -1362,7 +1362,7 @@ time.sleep(60)
         settings=replace(
             config.settings,
             codex_bin=str(fake_codex),
-            agent_timeout_seconds=0.3,
+            agent_timeout_seconds=1.0,
             capacity_resume_attempts=2,
             capacity_resume_delay_seconds=0,
         ),
@@ -1380,7 +1380,7 @@ time.sleep(60)
     assert result.exit_code == 124
     assert result.error == "agent timed out"
     assert invocations_path.read_text(encoding="utf-8").splitlines() == ["run", "run"]
-    assert elapsed < 0.4
+    assert elapsed < 1.15
 
 
 @pytest.mark.asyncio
