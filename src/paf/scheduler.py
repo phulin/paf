@@ -61,6 +61,7 @@ from paf.git import (
 )
 from paf.hashing import is_legacy_digest, migrate_digest_text, tagged_digest_text
 from paf.interface_fingerprint import (
+    FINGERPRINT_SCHEMA,
     FingerprintCollection,
     InterfaceFingerprintError,
     collect_interface_fingerprints,
@@ -2250,7 +2251,8 @@ class Orchestrator:
             metric_updates: dict[str, int] = {}
             invalidation_events: list[tuple[str, str, str | None, str | None, tuple[str, ...]]] = []
             for chapter_id, snapshot in snapshots.items():
-                old_files = self._file_interface_digests(interfaces.get(chapter_id))
+                old_record = interfaces.get(chapter_id)
+                old_files = self._file_interface_digests(old_record)
                 new_files = self._file_interface_digests(snapshot.fingerprint)
                 if new_files is None:
                     metric_updates["fingerprint_failures"] = (
@@ -2258,6 +2260,16 @@ class Orchestrator:
                     )
                     continue
                 if old_files is None:
+                    metric_updates["interface_baselines_initialized"] = metric_updates.get(
+                        "interface_baselines_initialized", 0
+                    ) + len(new_files)
+                    continue
+                if (
+                    not isinstance(old_record, dict)
+                    or not isinstance(snapshot.fingerprint, dict)
+                    or old_record.get("fingerprint_schema")
+                    != snapshot.fingerprint.get("fingerprint_schema")
+                ):
                     metric_updates["interface_baselines_initialized"] = metric_updates.get(
                         "interface_baselines_initialized", 0
                     ) + len(new_files)
@@ -2270,10 +2282,12 @@ class Orchestrator:
                     metric_updates["interface_baselines_initialized"] = metric_updates.get(
                         "interface_baselines_initialized", 0
                     ) + len(added_files)
+                compatible_files = self._file_compatible_interface_digests(snapshot.fingerprint)
                 changed_files = [
                     (chapter_id, source, old_files[source], new_files.get(source))
                     for source in sorted(old_files)
                     if old_files[source] != new_files.get(source)
+                    and old_files[source] != compatible_files.get(source)
                 ]
                 if changed_files:
                     changed_successors = self._successor_closure(
@@ -2372,6 +2386,22 @@ class Orchestrator:
                 return None
             pairs[source] = digest
         return pairs or None
+
+    @staticmethod
+    def _file_compatible_interface_digests(record: Any) -> dict[str, str]:
+        """Return old digests proven compatible by declaration-addition projections."""
+
+        if not isinstance(record, dict) or not isinstance(record.get("modules"), list):
+            return {}
+        pairs: dict[str, str] = {}
+        for module in record["modules"]:
+            if not isinstance(module, dict):
+                return {}
+            source = module.get("source")
+            digest = module.get("compatible_interface_digest")
+            if isinstance(source, str) and isinstance(digest, str) and digest:
+                pairs[source] = digest
+        return pairs
 
     async def _invalidate_build_records(self, chapter_ids: Iterable[str]) -> set[str]:
         """Mark edited sources stale while retaining known downstream interfaces."""
@@ -2532,7 +2562,7 @@ class Orchestrator:
                     for chapter_id, required in sorted(interface_imports.items())
                 },
                 "interface_import_graph": interface_graph_snapshot,
-                "fingerprint_schema": "olean-proof-erased-v1",
+                "fingerprint_schema": FINGERPRINT_SCHEMA,
                 "last_fingerprint_error": fingerprint_error,
                 "interface_stale": sorted(interface_stale),
                 "fingerprint_metrics": fingerprint_metrics,

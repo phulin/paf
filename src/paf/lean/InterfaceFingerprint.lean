@@ -12,6 +12,9 @@ private def sanitizeConstant : ConstantInfo → ConstantInfo
 private def isInterfaceEntry (name : Name) : Bool :=
   let value := name.toString
   value != "Lean.declRangeExt" &&
+    value != "symbolFrequency" &&
+    value != "sineQueNon" &&
+    !value.endsWith ".Lean.exportedAxiomsExt" &&
     !value.endsWith ".Lean.extraModUses" &&
     !value.startsWith "Lean.IR." &&
     !value.startsWith "Lean.Compiler."
@@ -48,8 +51,11 @@ private def exportedConstants (constants : Array ConstantInfo) : Array ConstantI
           pending := pending.push referenced
   return constants.filter fun info => reachable.contains info.name
 
-private def sanitize (data : ModuleData) : ModuleData :=
+private def sanitize (data : ModuleData) (declarations : Option (Std.HashSet String) := none) : ModuleData :=
   let constants := exportedConstants <| data.constants.map sanitizeConstant
+  let constants := match declarations with
+    | some names => constants.filter fun info => names.contains info.name.toString
+    | none => constants
   { data with
     constNames := constants.map ConstantInfo.name
     constants
@@ -65,28 +71,36 @@ private def resultJson
   Json.mkObj [
     ("module", toJson moduleName),
     ("imports", toJson <| data.imports.map fun item => item.module.toString),
+    ("declarations", toJson <| data.constants.map fun info => info.name.toString),
     ("declaration_count", toJson data.constants.size),
     ("lean_version", toJson Lean.versionString),
     ("lean_githash", toJson Lean.githash),
     ("sanitized_path", toJson output.toString)
   ]
 
-private def process (moduleName input output : String) : IO Json := do
+private def readDeclarations (path : String) : IO (Option (Std.HashSet String)) := do
+  if path == "-" then
+    return none
+  let contents ← IO.FS.readFile path
+  return some <| contents.splitOn "\n" |>.foldl (init := {}) fun names name =>
+    if name.isEmpty then names else names.insert name
+
+private def process (moduleName input output declarations : String) : IO Json := do
   let (data, _region) ← Lean.readModuleData input
-  let sanitized := sanitize data
+  let sanitized := sanitize data (← readDeclarations declarations)
   Lean.saveModuleData output moduleName.toName sanitized
   return resultJson moduleName sanitized output
 
 def main (args : List String) : IO UInt32 := do
-  if args.length % 3 != 0 then
-    IO.eprintln "usage: InterfaceFingerprint <module> <input.olean> <output.olean> [...]"
+  if args.length % 4 != 0 then
+    IO.eprintln "usage: InterfaceFingerprint <module> <input.olean> <output.olean> <declarations|-> [...]"
     return 2
   let mut results : Array Json := #[]
   let mut remaining := args
   while !remaining.isEmpty do
     match remaining with
-    | moduleName :: input :: output :: tail =>
-      results := results.push (← process moduleName input output)
+    | moduleName :: input :: output :: declarations :: tail =>
+      results := results.push (← process moduleName input output declarations)
       remaining := tail
     | _ => unreachable!
   IO.println (Json.arr results).compress

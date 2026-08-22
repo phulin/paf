@@ -15,7 +15,7 @@ from paf.hashing import ALGORITHM, digest_file, stable_digest_fields
 from paf.models import PipelineConfig, WorkUnitLike
 from paf.scope import ScopeMatcher
 
-FINGERPRINT_SCHEMA = "olean-proof-erased-v1"
+FINGERPRINT_SCHEMA = "olean-additive-declarations-v2"
 _HELPER_BATCH_SIZE = 512
 
 
@@ -32,6 +32,8 @@ class ModuleFingerprint:
     artifact_digest: str
     interface_digest: str
     declaration_count: int
+    declarations: tuple[str, ...]
+    compatible_interface_digest: str = ""
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -42,6 +44,8 @@ class ModuleFingerprint:
             "artifact_digest": self.artifact_digest,
             "interface_digest": self.interface_digest,
             "declaration_count": self.declaration_count,
+            "declarations": list(self.declarations),
+            "compatible_interface_digest": self.compatible_interface_digest,
         }
 
     @classmethod
@@ -49,6 +53,11 @@ class ModuleFingerprint:
         imports = value.get("imports", ())
         if not isinstance(imports, list) or not all(isinstance(item, str) for item in imports):
             raise InterfaceFingerprintError("cached module imports are invalid")
+        declarations = value.get("declarations")
+        if not isinstance(declarations, list) or not all(
+            isinstance(item, str) for item in declarations
+        ):
+            raise InterfaceFingerprintError("cached module declarations are invalid")
         return cls(
             module=str(value["module"]),
             source=str(value["source"]),
@@ -57,6 +66,8 @@ class ModuleFingerprint:
             artifact_digest=str(value["artifact_digest"]),
             interface_digest=str(value["interface_digest"]),
             declaration_count=int(value["declaration_count"]),
+            declarations=tuple(declarations),
+            compatible_interface_digest=str(value.get("compatible_interface_digest", "")),
         )
 
 
@@ -188,13 +199,15 @@ def _lean_identity(project: Path, *, timeout_seconds: float) -> str:
 
 def _run_helper(
     project: Path,
-    requests: tuple[tuple[str, Path, Path], ...],
+    requests: tuple[tuple[str, Path, Path, Path | None], ...],
     *,
     timeout_seconds: float,
 ) -> tuple[dict[str, Any], ...]:
     command = [_lake_executable(), "env", "lean", "--run", str(_helper_path())]
-    for module, source, output in requests:
-        command.extend((module, str(source), str(output)))
+    for module, source, output, declarations in requests:
+        command.extend(
+            (module, str(source), str(output), str(declarations) if declarations else "-")
+        )
     try:
         completed = subprocess.run(
             command,
@@ -277,6 +290,7 @@ def collect_interface_fingerprints(
 
     helper_values: dict[str, dict[str, Any]] = {}
     serialized: dict[str, bytes] = {}
+    previous_modules: dict[str, ModuleFingerprint] = {}
     cached_modules: dict[str, ModuleFingerprint] = {}
     raw_cache = cached_records or {}
     for work_unit in work_units:
@@ -295,6 +309,7 @@ def collect_interface_fingerprints(
                 module = ModuleFingerprint.from_dict(value)
             except (KeyError, TypeError, ValueError, InterfaceFingerprintError):
                 continue
+            previous_modules[module.module] = module
             artifact = artifacts.get(module.module)
             if artifact is not None and module.artifact_digest == _artifact_digest(artifact[1]):
                 cached_modules[module.module] = module
@@ -309,6 +324,7 @@ def collect_interface_fingerprints(
                     module,
                     artifacts[module][1],
                     temporary_root / f"{offset + index}.olean",
+                    None,
                 )
                 for index, module in enumerate(batch)
             )
@@ -320,11 +336,62 @@ def collect_interface_fingerprints(
             if len(values) != len(requests):
                 raise InterfaceFingerprintError("Lean helper returned the wrong result count")
             for request, value in zip(requests, values, strict=True):
-                module, _, output = request
+                module, _, output, _ = request
                 if value.get("module") != module or not output.is_file():
                     raise InterfaceFingerprintError(f"Lean helper omitted output for {module}")
                 helper_values[module] = value
                 serialized[module] = output.read_bytes()
+
+        projection_requests: list[tuple[str, Path, Path, Path | None]] = []
+        projection_sources: dict[str, ModuleFingerprint] = {}
+        for index, module in enumerate(modules):
+            previous = previous_modules.get(module)
+            value = helper_values[module]
+            declarations = value.get("declarations")
+            if (
+                previous is None
+                or not isinstance(declarations, list)
+                or not all(isinstance(item, str) for item in declarations)
+                or previous.interface_digest
+                == stable_digest_fields(
+                    "paf-module-interface-v1",
+                    FINGERPRINT_SCHEMA,
+                    lean_version,
+                    module,
+                    serialized[module],
+                )
+            ):
+                continue
+            declaration_file = temporary_root / f"projection-{index}.txt"
+            declaration_file.write_text(
+                "".join(f"{name}\n" for name in previous.declarations), encoding="utf-8"
+            )
+            projection_requests.append(
+                (
+                    module,
+                    artifacts[module][1],
+                    temporary_root / f"projection-{index}.olean",
+                    declaration_file,
+                )
+            )
+            projection_sources[module] = previous
+        projection_values: dict[str, dict[str, Any]] = {}
+        projection_serialized: dict[str, bytes] = {}
+        for offset in range(0, len(projection_requests), _HELPER_BATCH_SIZE):
+            requests = tuple(projection_requests[offset : offset + _HELPER_BATCH_SIZE])
+            values = _run_helper(
+                lean_project,
+                requests,
+                timeout_seconds=config.settings.validation_timeout_seconds,
+            )
+            if len(values) != len(requests):
+                raise InterfaceFingerprintError("Lean helper returned the wrong result count")
+            for request, value in zip(requests, values, strict=True):
+                module, _, output, _ = request
+                if value.get("module") != module or not output.is_file():
+                    raise InterfaceFingerprintError(f"Lean helper omitted projection for {module}")
+                projection_values[module] = value
+                projection_serialized[module] = output.read_bytes()
 
     versions = {
         f"{value.get('lean_version', '')}:{value.get('lean_githash', '')}"
@@ -348,6 +415,30 @@ def collect_interface_fingerprints(
             module,
             serialized[module],
         )
+        raw_declarations = value.get("declarations", ())
+        if not isinstance(raw_declarations, list) or not all(
+            isinstance(item, str) for item in raw_declarations
+        ):
+            raise InterfaceFingerprintError(
+                f"Lean helper returned invalid declarations for {module}"
+            )
+        declarations = tuple(raw_declarations)
+        compatible_interface_digest = ""
+        if previous := projection_sources.get(module):
+            projected = projection_values[module].get("declarations", ())
+            if (
+                isinstance(projected, list)
+                and tuple(projected) == previous.declarations
+                and previous.interface_digest
+                == stable_digest_fields(
+                    "paf-module-interface-v1",
+                    FINGERPRINT_SCHEMA,
+                    lean_version,
+                    module,
+                    projection_serialized[module],
+                )
+            ):
+                compatible_interface_digest = previous.interface_digest
         imports = tuple(dict.fromkeys(str(item) for item in value.get("imports", ())))
         modules_by_owner[module_owners[module]].append(
             ModuleFingerprint(
@@ -358,6 +449,8 @@ def collect_interface_fingerprints(
                 artifact_digest=_artifact_digest(artifact),
                 interface_digest=interface_digest,
                 declaration_count=int(value.get("declaration_count", 0)),
+                declarations=declarations,
+                compatible_interface_digest=compatible_interface_digest,
             )
         )
 

@@ -6839,7 +6839,7 @@ def interface_record(digest: str) -> dict[str, object]:
     return {
         "artifact_digest": f"artifact-{digest}",
         "interface_digest": digest,
-        "fingerprint_schema": "olean-proof-erased-v1",
+        "fingerprint_schema": "olean-additive-declarations-v2",
         "lean_version": "4.33.0:test",
         "modules": [
             {
@@ -6850,6 +6850,8 @@ def interface_record(digest: str) -> dict[str, object]:
                 "artifact_digest": f"artifact-{digest}",
                 "interface_digest": digest,
                 "declaration_count": 1,
+                "declarations": ["Book.Chapter.value"],
+                "compatible_interface_digest": "",
             }
         ],
     }
@@ -7004,6 +7006,44 @@ async def test_proof_only_file_signature_change_does_not_invalidate_descendants(
     assert await orchestrator._publish_validated_build(first, snapshot)
     assert set(orchestrator.state.formalize_graph["clean"]) == {first.id, second.id}
     assert orchestrator.state.formalize_graph["interface_stale"] == []
+    with sqlite3.connect(orchestrator.state.database_path) as connection:
+        count = connection.execute("SELECT count(*) FROM interface_invalidation_events").fetchone()[
+            0
+        ]
+    assert count == 0
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_plain_declaration_addition_does_not_invalidate_descendants(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    first, second = config.chapters
+    orchestrator = Orchestrator(config, StateStore(config))
+    await orchestrator.prepare()
+    await mark_clean_formalization(orchestrator, {second.id: (first.id,)})
+    old = interface_record("old-interface")
+    orchestrator.state.formalize_graph["interfaces"] = {first.id: old}
+    await orchestrator._invalidate_build_records((first.id,))
+
+    new = interface_record("new-interface")
+    modules = new["modules"]
+    assert isinstance(modules, list) and isinstance(modules[0], dict)
+    modules[0]["compatible_interface_digest"] = "old-interface"
+    modules[0]["declarations"] = ["Book.Chapter.value", "Book.Chapter.additional"]
+    graph = orchestrator._observed_work_unit_graph()
+    snapshot = scheduler_module.ValidatedBuildSnapshot(
+        graph=graph,
+        source_digests={first.id: scope_digest(config.settings.repo, first)},
+        fingerprint=new,
+        import_dependencies=(),
+    )
+
+    assert await orchestrator._publish_validated_build(first, snapshot)
+    assert set(orchestrator.state.formalize_graph["clean"]) == {first.id, second.id}
+    assert orchestrator.state.formalize_graph["interface_stale"] == []
+    assert orchestrator.state.formalize_graph["fingerprint_metrics"] == {
+        "interface_preserving_edits": 1
+    }
     with sqlite3.connect(orchestrator.state.database_path) as connection:
         count = connection.execute("SELECT count(*) FROM interface_invalidation_events").fetchone()[
             0
