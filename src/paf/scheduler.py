@@ -1214,8 +1214,9 @@ class Orchestrator:
                 for work_unit_id in sorted(work_unit_ids, key=self._work_unit_order.__getitem__)
             ],
             "budgets": {
-                "maximum_investigations": self.config.escalation.maximum_investigations_per_case,
-                "maximum_planner_attempts": self.config.escalation.maximum_planner_attempts,
+                "maximum_attempts": self.config.escalation.maximum_attempts_per_incident,
+                "attempts_used": int(case.get("attempts", 0)),
+                "strong_call_available": not bool(case.get("strong_used")),
                 "recent_trace_runs": self.config.escalation.recent_trace_runs,
             },
         }
@@ -1237,30 +1238,24 @@ class Orchestrator:
         role: str,
         dossier: dict[str, Any],
         ordinal: int,
+        resume_thread_id: str | None = None,
+        resume_prompt: str = "",
     ) -> AgentResult:
         case_id = str(case["id"])
         generation = max(1, int(case.get("generation", 1)))
-        job_kind = role
-        job_id = f"{case_id}:{generation}:{job_kind}:{ordinal}"
         anchor = self._coordination_anchor(case)
         signal_ids = tuple(map(str, case.get("signal_ids", ())))
         run = await self.state.start_auxiliary_run(
             anchor.id,
             Stage.DISCOVER,
             role=role,
-            request_ids=(case_id, f"coordination-generation:{generation}", *signal_ids),
+            request_ids=(
+                case_id,
+                f"coordination-generation:{generation}",
+                f"coordination-attempt:{ordinal}",
+                *signal_ids,
+            ),
             model=self.config.agent_profile(Stage.DISCOVER, role)[0],
-        )
-        await self.state.put_coordination_job(
-            {
-                "id": job_id,
-                "case_id": case_id,
-                "case_generation": generation,
-                "kind": job_kind,
-                "role": role,
-                "status": "running",
-                "run_id": run.id,
-            }
         )
         await self.investigation_slots.acquire(self.statement_schedule.priority(anchor.document_id))
         workspace = None
@@ -1268,24 +1263,18 @@ class Orchestrator:
             workspace = await self.isolation.acquire(f"{role}-{run.id}")
             if role != ESCALATION_COORDINATOR_ROLE:
                 result = await self.executor.run_escalation_scout(
-                    anchor, run, dossier, workspace_root=workspace.root
+                    anchor,
+                    run,
+                    dossier,
+                    workspace_root=workspace.root,
+                    resume_thread_id=resume_thread_id,
+                    resume_prompt=resume_prompt,
                 )
             else:
                 result = await self.executor.run_escalation_coordinator(
                     anchor, run, dossier, workspace_root=workspace.root
                 )
         except asyncio.CancelledError:
-            await self.state.put_coordination_job(
-                {
-                    "id": job_id,
-                    "case_id": case_id,
-                    "case_generation": generation,
-                    "kind": job_kind,
-                    "role": role,
-                    "status": "interrupted",
-                    "run_id": run.id,
-                }
-            )
             raise
         except Exception as error:
             detail = f"{type(error).__name__}: {error}"[-4000:]
@@ -1308,19 +1297,6 @@ class Orchestrator:
             self.investigation_slots.release()
             if workspace is not None:
                 await workspace.close()
-        await self.state.put_coordination_job(
-            {
-                "id": job_id,
-                "case_id": case_id,
-                "case_generation": generation,
-                "kind": job_kind,
-                "role": role,
-                "status": "succeeded" if result.succeeded else "failed",
-                "run_id": run.id,
-                "report": result.report,
-                "error": result.error,
-            }
-        )
         return result
 
     @staticmethod
@@ -1383,26 +1359,23 @@ class Orchestrator:
             if any(consumer_id not in self._work_unit_order for consumer_id in consumer_ids):
                 return "shared repair request has no configured consumer work unit"
             if any(
-                self._work_unit_order[write_id] >= self._work_unit_order[consumer_id]
-                for write_id in reported_write
+                not any(
+                    self._work_unit_order[write_id] < self._work_unit_order[consumer_id]
+                    for write_id in reported_write
+                )
                 for consumer_id in consumer_ids
-                if consumer_id in self._work_unit_order
             ):
-                return "shared repair write units must be strictly earlier than every consumer"
-            if not report.get("acceptance_tests"):
-                return "shared repairs require at least one acceptance test"
+                return "shared repairs require at least one earlier owner for every consumer"
         if action == "retry_task" and not report.get("new_evidence"):
             return "task retries require materially new evidence"
         return ""
 
-    def _scout_decision_requires_planner(
-        self, case: dict[str, Any], report: dict[str, Any]
-    ) -> bool:
+    def _decision_needs_strong_model(self, case: dict[str, Any], report: dict[str, Any]) -> bool:
         if (
-            case.get("force_planner")
+            case.get("force_strong")
+            or case.get("force_planner")
             or report.get("confidence") != "high"
             or report.get("recommended_action") == "needs_planner"
-            or self._coordination_decision_problem(case, report)
         ):
             return True
         safe = {
@@ -1458,6 +1431,7 @@ class Orchestrator:
                 if consumer_id in self._work_units_by_id:
                     valid_context.append(consumer_id)
             valid_context = list(dict.fromkeys((*valid_context, *valid_write)))
+            acceptance_ids = list(dict.fromkeys((*valid_write, *valid_context)))
             await self.state.upsert_steward_case(
                 {
                     "case_id": case_id,
@@ -1467,7 +1441,12 @@ class Orchestrator:
                     "needed_result": str(report.get("objective", "")),
                     "context_work_unit_ids": valid_context,
                     "write_work_unit_ids": list(dict.fromkeys(valid_write)),
-                    "acceptance_tests": list(report.get("acceptance_tests", ())),
+                    "acceptance_tests": list(
+                        dict.fromkeys(
+                            self._work_units_by_id[work_unit_id].build_command
+                            for work_unit_id in acceptance_ids
+                        )
+                    ),
                     "rationale": str(report.get("rationale", "")),
                     "status": "ready",
                     "coordination_generation": generation,
@@ -1503,13 +1482,13 @@ class Orchestrator:
                 decision=report,
             )
             await self.state.update_coordination_case_generation(
-                case_id, generation, status="resolved", decision=report
+                case_id, generation, status="closed", decision=report
             )
             return
         if action == "dismiss_source" and case.get("kind") == "source_issue":
             await self.state.set_source_issue_status(subject_ids, "dismissed")
             await self.state.update_coordination_case_generation(
-                case_id, generation, status="resolved", decision=report
+                case_id, generation, status="closed", decision=report
             )
             return
         if (
@@ -1535,14 +1514,15 @@ class Orchestrator:
                         force=True,
                     )
             await self.state.update_coordination_case_generation(
-                case_id, generation, status="resolved", decision=report
+                case_id, generation, status="closed", decision=report
             )
             return
         await self.state.update_coordination_case_generation(
             case_id,
             generation,
-            status=("awaiting_source_approval" if action == "propose_source_patch" else "parked"),
+            status="parked",
             decision=report,
+            operator_action_required=(action == "propose_source_patch"),
         )
 
     async def _apply_coordination_decision(
@@ -1574,86 +1554,207 @@ class Orchestrator:
                 return
             await self._apply_coordination_decision_locked(case, report)
 
-    async def _run_coordination_case(self, case_id: str) -> None:
-        case = self.state.coordination_cases.get(case_id)
-        if not isinstance(case, dict) or case.get("status") != "open":
-            return
-        generation = max(1, int(case.get("generation", 1)))
-        case = dict(case)
-        investigation_attempts = int(case.get("investigation_attempts", 0))
-        if investigation_attempts >= self.config.escalation.maximum_investigations_per_case:
-            await self.state.update_coordination_case_generation(
-                case_id,
-                generation,
-                status="parked",
-                failure="bounded investigation budget exhausted without a validated action",
-            )
-            return
-        case["investigation_attempts"] = investigation_attempts + 1
-        claimed = await self.state.update_coordination_case_generation(
-            case_id,
-            generation,
-            status="investigating",
-            investigation_attempts=investigation_attempts + 1,
-        )
-        if not claimed:
-            return
-        dossier = self._coordination_case_dossier(case)
-        scout = await self._run_coordination_agent(
+    async def _run_coordination_attempt(
+        self,
+        case: dict[str, Any],
+        *,
+        role: str,
+        dossier: dict[str, Any],
+        resume_thread_id: str | None = None,
+        resume_prompt: str = "",
+    ) -> AgentResult | None:
+        attempts = int(case.get("attempts", 0))
+        if attempts >= self.config.escalation.maximum_attempts_per_incident:
+            return None
+        attempt = attempts + 1
+        changes: dict[str, Any] = {"status": "running", "attempts": attempt}
+        if role == ESCALATION_COORDINATOR_ROLE:
+            changes["strong_used"] = True
+        if not await self.state.update_coordination_case_generation(
+            str(case["id"]), max(1, int(case.get("generation", 1))), **changes
+        ):
+            return None
+        case.update(changes)
+        return await self._run_coordination_agent(
             case,
-            role=self._coordination_scout_role(case),
+            role=role,
             dossier=dossier,
-            ordinal=investigation_attempts + 1,
+            ordinal=attempt,
+            resume_thread_id=resume_thread_id,
+            resume_prompt=resume_prompt,
         )
-        if not scout.succeeded or scout.report.get("complete") is not True:
-            await self.state.update_coordination_case_generation(
-                case_id,
-                generation,
-                status=(
-                    "open"
-                    if (scout.infrastructure_failed or scout.capacity_exhausted)
-                    and investigation_attempts + 1
-                    < self.config.escalation.maximum_investigations_per_case
-                    else "parked"
-                ),
-                failure=scout.error or "bounded investigation did not complete",
-            )
+
+    async def _park_coordination_case(
+        self,
+        case: dict[str, Any],
+        failure: str,
+        **details: Any,
+    ) -> None:
+        await self.state.update_coordination_case_generation(
+            str(case["id"]),
+            max(1, int(case.get("generation", 1))),
+            status="parked",
+            failure=failure,
+            **details,
+        )
+
+    async def _run_coordination_case(self, case_id: str) -> None:
+        stored = self.state.coordination_cases.get(case_id)
+        if not isinstance(stored, dict) or stored.get("status") != "open":
             return
-        decision = scout.report
-        if self._scout_decision_requires_planner(case, decision):
-            planner_attempts = int(case.get("planner_attempts", 0))
-            if planner_attempts >= self.config.escalation.maximum_planner_attempts:
+        case = dict(stored)
+        dossier = self._coordination_case_dossier(case)
+        force_strong = bool(case.get("force_strong") or case.get("force_planner"))
+        strong_used = bool(case.get("strong_used") or case.get("planner_attempts"))
+
+        if force_strong:
+            if strong_used:
+                await self._park_coordination_case(
+                    case, "the incident's single strong-model arbitration was already used"
+                )
+                return
+            prior_reports = [
+                value
+                for value in (case.get("scout_report"), case.get("action_outcome"))
+                if isinstance(value, dict)
+            ]
+            strong = await self._run_coordination_attempt(
+                case,
+                role=ESCALATION_COORDINATOR_ROLE,
+                dossier=dossier | {"investigator_reports": prior_reports},
+            )
+            if strong is None:
+                await self._park_coordination_case(case, "incident attempt budget exhausted")
+                return
+            if not strong.succeeded or strong.report.get("complete") is not True:
+                if strong.infrastructure_failed or strong.capacity_exhausted:
+                    case["strong_used"] = False
+                    await self.state.update_coordination_case_generation(
+                        case_id,
+                        max(1, int(case.get("generation", 1))),
+                        status=(
+                            "open"
+                            if int(case.get("attempts", 0))
+                            < self.config.escalation.maximum_attempts_per_incident
+                            else "parked"
+                        ),
+                        strong_used=False,
+                        failure=strong.error or "strong-model transport failed",
+                    )
+                else:
+                    await self._park_coordination_case(
+                        case, strong.error or "strong-model arbitration did not complete"
+                    )
+                return
+            await self._apply_coordination_decision(case, strong.report)
+            return
+
+        scout_role = self._coordination_scout_role(case)
+        scout = await self._run_coordination_attempt(
+            case,
+            role=scout_role,
+            dossier=dossier,
+        )
+        if scout is None:
+            await self._park_coordination_case(case, "incident attempt budget exhausted")
+            return
+        if not scout.succeeded:
+            if (scout.infrastructure_failed or scout.capacity_exhausted) and int(
+                case.get("attempts", 0)
+            ) < self.config.escalation.maximum_attempts_per_incident:
                 await self.state.update_coordination_case_generation(
                     case_id,
-                    generation,
-                    status="parked",
+                    max(1, int(case.get("generation", 1))),
+                    status="open",
+                    failure=scout.error or "cheap investigator transport failed",
+                )
+                return
+            if not scout.report and scout.thread_id:
+                problem = scout.error or "the investigator returned no structured report"
+            else:
+                await self._park_coordination_case(
+                    case, scout.error or "cheap investigation did not complete"
+                )
+                return
+        elif scout.report.get("complete") is not True:
+            await self._park_coordination_case(
+                case, "cheap investigator reported that its bounded assignment was incomplete"
+            )
+            return
+        else:
+            problem = self._coordination_decision_problem(case, scout.report)
+
+        decision = scout.report
+        if problem:
+            repaired = await self._run_coordination_attempt(
+                case,
+                role=scout_role,
+                dossier=dossier,
+                resume_thread_id=scout.thread_id,
+                resume_prompt=(
+                    "Your incident report was rejected by deterministic validation:\n\n"
+                    f"{problem}\n\nDo not investigate again or use tools. Correct only the typed "
+                    "report using your existing evidence, and return it once."
+                ),
+            )
+            if (
+                repaired is None
+                or not repaired.succeeded
+                or repaired.report.get("complete") is not True
+                or (problem := self._coordination_decision_problem(case, repaired.report))
+            ):
+                await self._park_coordination_case(
+                    case,
+                    "cheap report-contract repair failed" + (f": {problem}" if problem else ""),
+                )
+                return
+            decision = repaired.report
+
+        if self._decision_needs_strong_model(case, decision):
+            if bool(case.get("strong_used")):
+                await self._park_coordination_case(
+                    case,
+                    "the incident's single strong-model arbitration was already used",
                     scout_report=decision,
-                    failure="exceptional planner budget exhausted",
                 )
                 return
             await self.state.update_coordination_case_generation(
                 case_id,
-                generation,
-                status="deciding",
+                max(1, int(case.get("generation", 1))),
                 scout_report=decision,
-                planner_attempts=planner_attempts + 1,
             )
-            planner = await self._run_coordination_agent(
+            strong = await self._run_coordination_attempt(
                 case,
                 role=ESCALATION_COORDINATOR_ROLE,
                 dossier=dossier | {"investigator_reports": [decision]},
-                ordinal=planner_attempts + 1,
             )
-            if not planner.succeeded or planner.report.get("complete") is not True:
-                await self.state.update_coordination_case_generation(
-                    case_id,
-                    generation,
-                    status="parked",
-                    scout_report=decision,
-                    failure=planner.error or "exceptional coordinator did not complete",
+            if strong is None:
+                await self._park_coordination_case(
+                    case, "incident attempt budget exhausted", scout_report=decision
                 )
                 return
-            decision = planner.report
+            if not strong.succeeded or strong.report.get("complete") is not True:
+                if (strong.infrastructure_failed or strong.capacity_exhausted) and int(
+                    case.get("attempts", 0)
+                ) < self.config.escalation.maximum_attempts_per_incident:
+                    case["strong_used"] = False
+                    await self.state.update_coordination_case_generation(
+                        case_id,
+                        max(1, int(case.get("generation", 1))),
+                        status="open",
+                        force_strong=True,
+                        strong_used=False,
+                        scout_report=decision,
+                        failure=strong.error or "strong-model transport failed",
+                    )
+                else:
+                    await self._park_coordination_case(
+                        case,
+                        strong.error or "strong-model arbitration did not complete",
+                        scout_report=decision,
+                    )
+                return
+            decision = strong.report
         await self._apply_coordination_decision(case, decision)
 
     async def _run_scheduled_coordination_case(self, case_id: str) -> None:
@@ -2195,32 +2296,26 @@ class Orchestrator:
             await self.state.update_coordination_case_generation(
                 case_id,
                 coordination_generation,
-                status="resolved",
+                status="closed",
                 action_outcome=current.get("decision"),
             )
-        elif status == "needs_scope":
-            expansions = int(coordination.get("scope_expansions", 0)) + 1
+        elif status in {"needs_scope", "failed"}:
+            can_arbitrate = (
+                not coordination.get("strong_used")
+                and int(coordination.get("attempts", 0))
+                < self.config.escalation.maximum_attempts_per_incident
+            )
             await self.state.update_coordination_case_generation(
                 case_id,
                 coordination_generation,
-                status="open",
-                force_planner=(expansions >= self.config.escalation.maximum_scope_expansions),
-                scope_expansions=expansions,
+                status="open" if can_arbitrate else "parked",
+                force_strong=can_arbitrate,
                 action_outcome=current.get("decision"),
-            )
-        elif status == "failed":
-            failures = int(coordination.get("action_failures", 0)) + 1
-            await self.state.update_coordination_case_generation(
-                case_id,
-                coordination_generation,
-                status=(
-                    "open"
-                    if failures <= self.config.escalation.maximum_planner_attempts
-                    else "failed"
+                failure=(
+                    "focused repair needs one arbitration"
+                    if can_arbitrate
+                    else "focused repair failed after the incident's arbitration was exhausted"
                 ),
-                force_planner=True,
-                action_failures=failures,
-                action_outcome=current.get("decision"),
             )
 
     def _upstream_case_write_work_unit_ids(self, case_id: str) -> set[str]:

@@ -103,24 +103,15 @@ async def test_coordination_state_is_durable_and_generation_fenced(tmp_path: Pat
         "work_unit_ids": [config.chapters[0].id],
     }
     assert await state.sync_coordination_cases((proposal,)) == ("case-a",)
-    await state.put_coordination_job(
-        {
-            "id": "job-a",
-            "case_id": "case-a",
-            "case_generation": 1,
-            "kind": "trace_diagnosis",
-            "status": "ready",
-        }
-    )
-    assert not await state.update_coordination_case_generation("case-a", 2, status="investigating")
-    assert await state.update_coordination_case_generation("case-a", 1, status="investigating")
+    assert not await state.update_coordination_case_generation("case-a", 2, status="running")
+    assert await state.update_coordination_case_generation("case-a", 1, status="running")
     assert await state.upsert_coordination_signals(
         (signal | {"evidence_digest": "evidence-b", "evidence": {"run_ids": ["run-b"]}},)
     ) == ("signal-a",)
     assert await state.sync_coordination_cases(
         (proposal | {"evidence_digest": "case-evidence-b"},)
     ) == ("case-a",)
-    assert state.coordination_cases["case-a"]["status"] == "investigating"
+    assert state.coordination_cases["case-a"]["status"] == "running"
     assert await state.update_coordination_case_generation("case-a", 1, status="parked")
     assert state.coordination_cases["case-a"]["status"] == "open"
     assert state.coordination_cases["case-a"]["generation"] == 2
@@ -130,5 +121,32 @@ async def test_coordination_state_is_durable_and_generation_fenced(tmp_path: Pat
     await reloaded.load_or_create()
     assert reloaded.coordination_signals["signal-a"]["evidence_digest"] == "evidence-b"
     assert reloaded.coordination_cases["case-a"]["status"] == "open"
-    assert reloaded.coordination_jobs["job-a"]["kind"] == "trace_diagnosis"
     await reloaded.close()
+
+
+@pytest.mark.asyncio
+async def test_interrupted_legacy_decision_recovers_to_simple_incident_state(
+    tmp_path: Path,
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    state = StateStore(config)
+    await state.load_or_create()
+    state.coordination_cases["case-a"] = {
+        "id": "case-a",
+        "kind": "persistent_failure",
+        "status": "deciding",
+        "generation": 1,
+        "investigation_attempts": 1,
+        "planner_attempts": 1,
+        "scope_expansions": 1,
+    }
+
+    assert await state.recover_interrupted_coordination_cases() == ["case-a"]
+    case = state.coordination_cases["case-a"]
+    assert case["status"] == "open"
+    assert case["attempts"] == 2
+    assert case["strong_used"] is False
+    assert case["force_strong"] is True
+    assert "planner_attempts" not in case
+    assert "scope_expansions" not in case
+    await state.close()

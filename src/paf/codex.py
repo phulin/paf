@@ -598,10 +598,6 @@ _ESCALATION_DECISION_PROPERTIES: dict[str, Any] = {
         "type": "array",
         "items": {"type": "string", "minLength": 1},
     },
-    "acceptance_tests": {
-        "type": "array",
-        "items": {"type": "string", "minLength": 1},
-    },
     "evidence": {
         "type": "array",
         "items": {"type": "string", "minLength": 1},
@@ -2200,6 +2196,9 @@ distinguish proof evidence from build diagnostics, and avoid repeating known fai
         dossier: dict[str, Any],
         *,
         workspace_root: Path,
+        resume_thread_id: str | None = None,
+        resume_run_id: str = "",
+        resume_prompt: str = "",
     ) -> AgentResult:
         prompt = (
             ESCALATION_SCOUT_PROMPT_PATH.read_text(encoding="utf-8").rstrip()
@@ -2213,6 +2212,9 @@ distinguish proof evidence from build diagnostics, and avoid repeating known fai
             run,
             prompt=prompt,
             workspace_root=workspace_root,
+            resume_thread_id=resume_thread_id,
+            resume_run_id=resume_run_id,
+            resume_prompt=resume_prompt or CAPACITY_RESUME_PROMPT,
         )
 
     async def run_escalation_coordinator(

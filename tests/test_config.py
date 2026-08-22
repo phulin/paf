@@ -56,7 +56,7 @@ def test_discovers_chapters_and_renders_paths(tmp_path: Path) -> None:
     assert config.escalation.planner_model == "gpt-5.6-sol"
     assert config.escalation.investigator_model == "gpt-5.6-luna"
     assert config.escalation.worker_model == "gpt-5.6-luna"
-    assert config.escalation.maximum_investigations_per_case == 4
+    assert config.escalation.maximum_attempts_per_incident == 4
     assert config.agent_profile(Stage.DISCOVER, "escalation_scout") == (
         "gpt-5.6-luna",
         "xhigh",
@@ -208,9 +208,7 @@ investigator_reasoning_effort = "medium"
 worker_model = "cheap-worker"
 worker_reasoning_effort = "xhigh"
 max_concurrent_investigations = 5
-maximum_investigations_per_case = 3
-maximum_planner_attempts = 1
-maximum_scope_expansions = 1
+maximum_attempts_per_incident = 3
 source_issue_sighting_threshold = 4
 persistent_failure_threshold = 5
 recent_trace_runs = 2
@@ -224,15 +222,16 @@ recent_trace_runs = 2
     assert escalation.investigator_model == "cheap-scout"
     assert escalation.worker_model == "cheap-worker"
     assert escalation.max_concurrent_investigations == 5
+    assert escalation.maximum_attempts_per_incident == 3
     assert escalation.source_issue_sighting_threshold == 4
 
     path.write_text(
         path.read_text(encoding="utf-8").replace(
-            "maximum_planner_attempts = 1", "maximum_planner_attempts = 0"
+            "maximum_attempts_per_incident = 3", "maximum_attempts_per_incident = 0"
         ),
         encoding="utf-8",
     )
-    with pytest.raises(ValueError, match=r"escalation\.maximum_planner_attempts"):
+    with pytest.raises(ValueError, match=r"escalation\.maximum_attempts_per_incident"):
         load_config(path)
 
 

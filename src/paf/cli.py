@@ -183,7 +183,7 @@ def parser() -> argparse.ArgumentParser:
     source_issues.add_argument("--json", action="store_true", help="print the raw ledger")
 
     incidents = commands.add_parser(
-        "incidents", help="show bounded exceptional-coordination cases and jobs"
+        "incidents", help="show exceptional incidents and their latest outcomes"
     )
     _add_source(incidents)
     incidents.add_argument("--json", action="store_true", help="print raw incident state")
@@ -813,7 +813,6 @@ def print_incidents(config: PipelineConfig, console: Console, *, raw_json: bool)
         return 0
     ledger = {
         "coordination_cases": snapshot.get("coordination_cases", {}),
-        "coordination_jobs": snapshot.get("coordination_jobs", {}),
     }
     if raw_json:
         console.print_json(json.dumps(ledger))

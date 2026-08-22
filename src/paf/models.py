@@ -122,12 +122,16 @@ class EscalationSettings:
     worker_model: str = "gpt-5.6-luna"
     worker_reasoning_effort: str = "xhigh"
     max_concurrent_investigations: int = 8
-    maximum_investigations_per_case: int = 4
-    maximum_planner_attempts: int = 2
-    maximum_scope_expansions: int = 2
+    maximum_attempts_per_incident: int = 4
     source_issue_sighting_threshold: int = 2
     persistent_failure_threshold: int = 3
     recent_trace_runs: int = 3
+
+    @property
+    def maximum_investigations_per_case(self) -> int:
+        """Compatibility name for configurations written before incidents were simplified."""
+
+        return self.maximum_attempts_per_incident
 
 
 @dataclass(frozen=True)

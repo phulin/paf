@@ -592,11 +592,12 @@ def load_config(path: str | Path, *, project: Project | None = None) -> Pipeline
         worker_model=str(raw_escalation.get("worker_model", "gpt-5.6-luna")),
         worker_reasoning_effort=str(raw_escalation.get("worker_reasoning_effort", "xhigh")),
         max_concurrent_investigations=int(raw_escalation.get("max_concurrent_investigations", 8)),
-        maximum_investigations_per_case=int(
-            raw_escalation.get("maximum_investigations_per_case", 4)
+        maximum_attempts_per_incident=int(
+            raw_escalation.get(
+                "maximum_attempts_per_incident",
+                raw_escalation.get("maximum_investigations_per_case", 4),
+            )
         ),
-        maximum_planner_attempts=int(raw_escalation.get("maximum_planner_attempts", 2)),
-        maximum_scope_expansions=int(raw_escalation.get("maximum_scope_expansions", 2)),
         source_issue_sighting_threshold=int(
             raw_escalation.get("source_issue_sighting_threshold", 2)
         ),
@@ -605,9 +606,7 @@ def load_config(path: str | Path, *, project: Project | None = None) -> Pipeline
     )
     positive_escalation_bounds = {
         "max_concurrent_investigations": escalation.max_concurrent_investigations,
-        "maximum_investigations_per_case": escalation.maximum_investigations_per_case,
-        "maximum_planner_attempts": escalation.maximum_planner_attempts,
-        "maximum_scope_expansions": escalation.maximum_scope_expansions,
+        "maximum_attempts_per_incident": escalation.maximum_attempts_per_incident,
         "source_issue_sighting_threshold": escalation.source_issue_sighting_threshold,
         "persistent_failure_threshold": escalation.persistent_failure_threshold,
         "recent_trace_runs": escalation.recent_trace_runs,

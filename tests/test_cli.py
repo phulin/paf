@@ -382,9 +382,7 @@ def test_source_issues_command_shows_persisted_ledger(
     )
 
 
-def test_incidents_command_shows_cases_and_bounded_jobs(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
+def test_incidents_command_shows_cases(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     path = write_project(tmp_path, chapters="chapters = [1]")
     config = load_config(path)
     state = StateStore(config)
@@ -413,15 +411,6 @@ def test_incidents_command_shows_cases_and_bounded_jobs(
                 },
             )
         )
-        await state.put_coordination_job(
-            {
-                "id": "job-a",
-                "case_id": "case-a",
-                "case_generation": 1,
-                "kind": "trace_diagnosis",
-                "status": "running",
-            }
-        )
         await state.close()
 
     asyncio.run(populate())
@@ -429,7 +418,6 @@ def test_incidents_command_shows_cases_and_bounded_jobs(
     assert main(["incidents", "--config", str(path), "--json"]) == 0
     ledger = json.loads(capsys.readouterr().out)
     assert ledger["coordination_cases"]["case-a"]["status"] == "open"
-    assert ledger["coordination_jobs"]["job-a"]["kind"] == "trace_diagnosis"
 
 
 def test_worker_startup_warns_prominently_when_ripgrep_is_missing(

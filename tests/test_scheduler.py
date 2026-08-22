@@ -5663,7 +5663,6 @@ def coordination_result(
             "objective": "Provide the smallest chronological bridge.",
             "context_work_unit_ids": context_ids or [],
             "write_work_unit_ids": write_ids or [],
-            "acceptance_tests": ["lake build Book.Chapter02"],
             "evidence": ["the consumer imports the proposed owner"],
             "new_evidence": [],
             "rationale": "The owner is earlier than the consumer.",
@@ -5701,15 +5700,17 @@ async def test_high_confidence_owner_scout_creates_incremental_repair(
         role: str,
         dossier: dict[str, Any],
         ordinal: int,
+        resume_thread_id: str | None = None,
+        resume_prompt: str = "",
     ) -> AgentResult:
-        del dossier, ordinal
+        del dossier, ordinal, resume_thread_id, resume_prompt
         roles.append(role)
         return coordination_result(
             str(case["id"]),
             confidence="high",
             action="create_repair",
             context_ids=[consumer.id],
-            write_ids=[owner.id],
+            write_ids=[owner.id, consumer.id],
         )
 
     monkeypatch.setattr(orchestrator, "_run_coordination_agent", run_agent)
@@ -5718,8 +5719,67 @@ async def test_high_confidence_owner_scout_creates_incremental_repair(
     assert roles == ["owner_placement"]
     assert state.coordination_cases[case_id]["status"] == "actionable"
     assert state.steward_cases[case_id]["status"] == "ready"
-    assert state.steward_cases[case_id]["write_work_unit_ids"] == [owner.id]
+    assert state.steward_cases[case_id]["write_work_unit_ids"] == [owner.id, consumer.id]
+    assert state.steward_cases[case_id]["acceptance_tests"] == [
+        owner.build_command,
+        consumer.build_command,
+    ]
     assert state.upstream_requests[request_id]["status"] == "evaluating"
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_invalid_scout_report_gets_one_cheap_contract_repair(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    owner, consumer = config.chapters
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await state.load_or_create()
+    await state.enqueue_upstream_request(
+        {
+            "consumer_path": consumer.scope[0],
+            "blocked_declaration": "Book.consumer",
+            "residual_goal": "True",
+            "needed_result": "an earlier bridge",
+            "owner_paths": [owner.scope[0]],
+        },
+        consumer_chapter_id=consumer.id,
+        owner_chapter_id=owner.id,
+    )
+    await orchestrator._refresh_coordination_cases()
+    case_id = next(iter(state.coordination_cases))
+    calls: list[tuple[str, str | None, str]] = []
+
+    async def run_agent(
+        case: dict[str, Any],
+        *,
+        role: str,
+        dossier: dict[str, Any],
+        ordinal: int,
+        resume_thread_id: str | None = None,
+        resume_prompt: str = "",
+    ) -> AgentResult:
+        del dossier, ordinal
+        calls.append((role, resume_thread_id, resume_prompt))
+        report = coordination_result(
+            str(case["id"]),
+            confidence="high",
+            action="create_repair",
+            context_ids=[consumer.id],
+            write_ids=["unknown-owner"] if len(calls) == 1 else [owner.id],
+        )
+        return replace(report, thread_id="cheap-scout-thread")
+
+    monkeypatch.setattr(orchestrator, "_run_coordination_agent", run_agent)
+    await orchestrator._run_coordination_case(case_id)
+
+    assert [role for role, _, _ in calls] == ["owner_placement", "owner_placement"]
+    assert calls[1][1] == "cheap-scout-thread"
+    assert "Do not investigate again" in calls[1][2]
+    assert state.coordination_cases[case_id]["attempts"] == 2
+    assert state.coordination_cases[case_id]["status"] == "actionable"
     await orchestrator.shutdown()
 
 
@@ -5753,8 +5813,10 @@ async def test_uncertain_scout_uses_rare_planner_before_parking(
         role: str,
         dossier: dict[str, Any],
         ordinal: int,
+        resume_thread_id: str | None = None,
+        resume_prompt: str = "",
     ) -> AgentResult:
-        del ordinal
+        del ordinal, resume_thread_id, resume_prompt
         roles.append(role)
         if role == "owner_placement":
             return coordination_result(str(case["id"]), confidence="low", action="needs_planner")
@@ -5795,7 +5857,7 @@ async def test_new_incident_evidence_fences_stale_action_before_mutation(tmp_pat
     assert await state.update_coordination_case_generation(
         case_id,
         generation,
-        status="investigating",
+        status="running",
         pending_evidence_digest="materially-new-evidence",
     )
 

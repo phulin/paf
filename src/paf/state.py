@@ -459,7 +459,6 @@ class StateStore:
         self.steward_cases: dict[str, dict[str, Any]] = {}
         self.coordination_signals: dict[str, dict[str, Any]] = {}
         self.coordination_cases: dict[str, dict[str, Any]] = {}
-        self.coordination_jobs: dict[str, dict[str, Any]] = {}
         self.package_state = PackageState()
         self.proof_blockers: dict[str, dict[str, Any]] = {}
         self.routing_metrics: dict[str, int] = {}
@@ -545,7 +544,6 @@ class StateStore:
             for section in (
                 "coordination_signals",
                 "coordination_cases",
-                "coordination_jobs",
             ):
                 raw_values = raw.get(section)
                 if isinstance(raw_values, dict):
@@ -1197,7 +1195,6 @@ class StateStore:
                 "steward_cases": self.steward_cases,
                 "coordination_signals": self.coordination_signals,
                 "coordination_cases": self.coordination_cases,
-                "coordination_jobs": self.coordination_jobs,
                 "proof_blockers": self.proof_blockers,
                 "thread_cumulative_usage": {
                     thread_id: self._usage_dict(usage)
@@ -2790,7 +2787,14 @@ class StateStore:
 
         changed: list[str] = []
         now = timestamp()
-        terminal = {"resolved", "parked", "failed", "awaiting_source_approval"}
+        terminal = {
+            "closed",
+            "parked",
+            # Compatibility states written by the first incident implementation.
+            "resolved",
+            "failed",
+            "awaiting_source_approval",
+        }
         for raw in proposals:
             case_id = str(raw.get("id", "")).strip()
             if not case_id:
@@ -2841,6 +2845,9 @@ class StateStore:
                     value["evidence_digest"] = str(raw.get("evidence_digest", ""))
                     value.pop("decision", None)
                     for key in (
+                        "attempts",
+                        "strong_used",
+                        "force_strong",
                         "investigation_attempts",
                         "planner_attempts",
                         "scope_expansions",
@@ -2848,6 +2855,7 @@ class StateStore:
                         "force_planner",
                         "pending_evidence_digest",
                         "pending_signal_ids",
+                        "operator_action_required",
                     ):
                         value.pop(key, None)
                 elif str(previous.get("status")) not in {"open", "triaging"}:
@@ -2861,6 +2869,9 @@ class StateStore:
                     value["evidence_digest"] = str(raw.get("evidence_digest", ""))
                     value["generation"] = max(1, int(previous.get("generation", 1))) + 1
                     for key in (
+                        "attempts",
+                        "strong_used",
+                        "force_strong",
                         "investigation_attempts",
                         "planner_attempts",
                         "scope_expansions",
@@ -2868,6 +2879,7 @@ class StateStore:
                         "force_planner",
                         "decision",
                         "failure",
+                        "operator_action_required",
                     ):
                         value.pop(key, None)
                 value["updated_at"] = now
@@ -2889,8 +2901,7 @@ class StateStore:
             return False
         case.update(changes)
         if (
-            str(changes.get("status", ""))
-            in {"resolved", "parked", "failed", "awaiting_source_approval"}
+            str(changes.get("status", "")) in {"closed", "parked"}
             and case.get("pending_evidence_digest")
             and case.get("pending_evidence_digest") != case.get("evidence_digest")
         ):
@@ -2913,6 +2924,9 @@ class StateStore:
                     dict.fromkeys((*map(str, case.get("signal_ids", ())), *map(str, pending_ids)))
                 )
             for key in (
+                "attempts",
+                "strong_used",
+                "force_strong",
                 "investigation_attempts",
                 "planner_attempts",
                 "scope_expansions",
@@ -2921,33 +2935,13 @@ class StateStore:
                 "decision",
                 "stale_decision",
                 "failure",
+                "operator_action_required",
             ):
                 case.pop(key, None)
         case["updated_at"] = timestamp()
         self._mark_dirty(global_state=False, sections={"coordination_cases"})
         await self._persist()
         return True
-
-    async def put_coordination_job(self, job: dict[str, Any]) -> None:
-        job_id = str(job.get("id", "")).strip()
-        case_id = str(job.get("case_id", "")).strip()
-        case = self.coordination_cases.get(case_id)
-        generation = int(job.get("case_generation", 0))
-        if not job_id or not isinstance(case, dict):
-            raise ValueError("coordination jobs require valid job and case ids")
-        if generation != max(1, int(case.get("generation", 1))):
-            raise ValueError("coordination job generation is stale")
-        now = timestamp()
-        previous = self.coordination_jobs.get(job_id, {})
-        self.coordination_jobs[job_id] = dict(job) | {
-            "id": job_id,
-            "case_id": case_id,
-            "case_generation": generation,
-            "created_at": str(previous.get("created_at") or now),
-            "updated_at": now,
-        }
-        self._mark_dirty(global_state=False, sections={"coordination_jobs"})
-        await self._persist()
 
     async def clear_upstream_coordination(self) -> None:
         """Drop outstanding observations and cases while retaining historical agent runs."""
@@ -4420,15 +4414,59 @@ class StateStore:
         return recovered
 
     async def recover_interrupted_coordination_cases(self) -> list[str]:
-        """Requeue cases whose read-only investigation was interrupted by shutdown."""
+        """Normalize the small incident lifecycle and requeue interrupted diagnoses."""
 
         recovered: list[str] = []
         for case_id, case in self.coordination_cases.items():
-            if case.get("status") not in {"investigating", "deciding"}:
-                continue
-            case["status"] = "open"
-            case["updated_at"] = timestamp()
-            recovered.append(case_id)
+            changed = False
+            status = str(case.get("status", "open"))
+            interrupted = status in {"investigating", "deciding", "running"}
+            normalized_status = {
+                "investigating": "open",
+                "deciding": "open",
+                "running": "open",
+                "resolved": "closed",
+                "failed": "parked",
+                "awaiting_source_approval": "parked",
+            }.get(status, status)
+            if normalized_status != status:
+                case["status"] = normalized_status
+                if status == "awaiting_source_approval":
+                    case["operator_action_required"] = True
+                changed = True
+            legacy_planner_attempts = int(case.get("planner_attempts", 0))
+            if "attempts" not in case:
+                had_legacy_attempts = any(
+                    key in case for key in ("investigation_attempts", "planner_attempts")
+                )
+                legacy_attempts = int(case.pop("investigation_attempts", 0)) + int(
+                    case.pop("planner_attempts", 0)
+                )
+                if legacy_attempts:
+                    case["attempts"] = legacy_attempts
+                changed = changed or had_legacy_attempts
+            else:
+                for key in ("investigation_attempts", "planner_attempts"):
+                    if key in case:
+                        case.pop(key)
+                        changed = True
+            if "strong_used" not in case and legacy_planner_attempts:
+                case["strong_used"] = True
+                changed = True
+            if interrupted and case.get("strong_used"):
+                case["strong_used"] = False
+                case["force_strong"] = True
+                changed = True
+            if case.pop("force_planner", False):
+                case["force_strong"] = True
+                changed = True
+            for key in ("scope_expansions", "action_failures"):
+                if key in case:
+                    case.pop(key)
+                    changed = True
+            if changed:
+                case["updated_at"] = timestamp()
+                recovered.append(case_id)
         if recovered:
             self._mark_dirty(global_state=False, sections={"coordination_cases"})
             await self._persist()

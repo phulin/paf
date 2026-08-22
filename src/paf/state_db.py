@@ -59,7 +59,6 @@ COLLECTION_SECTIONS = frozenset(
         "steward_cases",
         "coordination_signals",
         "coordination_cases",
-        "coordination_jobs",
         "proof_blockers",
         "thread_cumulative_usage",
         "coordinator_targets",
