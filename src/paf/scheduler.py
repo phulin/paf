@@ -166,6 +166,7 @@ def _proof_blocker_records(
     dispositions = {
         "local_proof_failure": "retry",
         "suspected_statement_defect": "statement_review",
+        "suspected_local_interface_defect": "interface_review",
         "suspected_upstream_gap": "missing_capability",
     }
     records: list[dict[str, Any]] = []
@@ -3726,18 +3727,11 @@ class Orchestrator:
 
     @staticmethod
     def _upstream_candidate_blocker(blocker: dict[str, Any]) -> bool:
-        """Recognize evidence that should be evaluated against an earlier interface."""
+        """Recognize evidence explicitly attributed to a non-local interface."""
 
         candidate = blocker.get("capability")
-        cross_file = isinstance(candidate, dict) and any(
-            str(path).strip() != str(blocker.get("path", "")).strip()
-            for path in candidate.get("owner_paths", ())
-            if isinstance(path, str)
-        )
-        return cross_file or str(blocker.get("disposition", "")) in {
+        return isinstance(candidate, dict) and str(blocker.get("disposition", "")) in {
             "missing_capability",
-            "statement_review",
-            "interface_review",
             "genuine_blocker",
         }
 
@@ -3774,6 +3768,14 @@ class Orchestrator:
                 if self._work_unit_order.get(owner_id, 10**9)
                 < self._work_unit_order.get(chapter.id, -1)
             }
+            external_owner = (
+                isinstance(candidate, dict) and str(candidate.get("owner_kind", "")) == "external"
+            )
+            # Same-unit statement and interface defects have a separate proof-review pathway.
+            # A repository upstream request must name an actual, strictly earlier owner. An
+            # explicitly external dependency remains upstream even though it has no work unit.
+            if not earlier_owner_ids and not external_owner:
+                continue
             # This is only a compatibility hint. The global steward sees every candidate and the
             # consumer together; it is deliberately not bound to one guessed owner chapter.
             owner_id = (

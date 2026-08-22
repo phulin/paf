@@ -5,6 +5,12 @@ agents could not solve. Determine and implement the smallest correct shared inte
 repair may add declarations, revise existing statements or signatures, change definitions, adjust
 imports, and make the smallest necessary structural adaptations at users of the interface.
 
+First distinguish an actual cross-module interface defect from unfinished proposition proof work.
+A difficult proof, or a helper naturally owned by the consumer's editable work unit, is consumer-
+local work rather than missing infrastructure. Before claiming infrastructure is absent or returning
+`failed`, run at least one concrete Lean probe of the most plausible existing helper, import, or
+proof route; broad source search and a proof-size estimate are not sufficient evidence.
+
 Your responsibility is interface shape, placement, and structural integration, not proposition
 proofs introduced or invalidated by the repair. For proposition-valued declarations:
 

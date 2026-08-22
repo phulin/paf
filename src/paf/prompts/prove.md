@@ -80,6 +80,9 @@ For each unresolved proof, choose an evidence `kind`:
 
 - `local_proof_failure` when the statement still appears sound but the checked work did not finish;
 - `suspected_statement_defect` only with concrete mathematical or source evidence;
+- `suspected_local_interface_defect` when a definition, signature, instance, notation, import, or
+  other interface owned by the editable work unit appears defective. Give concrete Lean evidence;
+  this requests same-unit review and must set `upstream_hypothesis` to `null`;
 - `suspected_upstream_gap` only with a precise `upstream_hypothesis` owned by a strictly earlier
   module outside the editable scope; otherwise use `local_proof_failure` and set
   `upstream_hypothesis` to `null`. A hypothesis whose `owner_paths` include the blocked file or any

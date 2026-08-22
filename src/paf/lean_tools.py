@@ -20,6 +20,7 @@ def search_lean_sources(query: str, *, root: Path, limit: int = 32) -> list[dict
         raise RuntimeError("ripgrep (`rg`) is required for `paf lean search`")
 
     matches: list[dict[str, Any]] = []
+    per_root_limit = max(64, limit * 4)
     for source_root in _source_roots(root.resolve()):
         command = [
             ripgrep,
@@ -42,6 +43,7 @@ def search_lean_sources(query: str, *, root: Path, limit: int = 32) -> list[dict
         completed = subprocess.run(command, check=False, capture_output=True, text=True)
         if completed.returncode not in {0, 1}:
             raise RuntimeError(completed.stderr.strip() or "Lean source search failed")
+        root_matches = 0
         for line in completed.stdout.splitlines():
             try:
                 event = json.loads(line)
@@ -63,11 +65,38 @@ def search_lean_sources(query: str, *, root: Path, limit: int = 32) -> list[dict
                     "source": _source_label(Path(path), root),
                 }
             )
-            if len(matches) >= limit:
-                return matches
-        if len(matches) >= limit:
-            return matches
-    return matches
+            root_matches += 1
+            if root_matches >= per_root_limit:
+                break
+    return sorted(matches, key=lambda match: _lean_search_rank(match, query))[:limit]
+
+
+def _lean_search_rank(match: dict[str, Any], query: str) -> tuple[int, int, str, int]:
+    """Prefer declarations over incidental uses without hiding dependency definitions."""
+
+    text = str(match.get("text", ""))
+    escaped = re.escape(query)
+    declaration_prefix = (
+        r"^\s*(?:(?:private|protected|noncomputable|unsafe|opaque|partial)\s+)*"
+        r"(?:def|abbrev|theorem|lemma|class|structure|inductive|instance)\s+"
+    )
+    if re.search(declaration_prefix + escaped + r"(?=$|[\s.{(:])", text):
+        semantic_rank = 0
+    elif re.search(declaration_prefix + r".*" + escaped, text):
+        semantic_rank = 1
+    elif re.search(rf"(?<![A-Za-z0-9_']){escaped}(?![A-Za-z0-9_'])", text):
+        semantic_rank = 2
+    else:
+        semantic_rank = 3
+    source_rank = {"project": 0, "dependency": 1, "toolchain": 2}.get(
+        str(match.get("source", "")), 3
+    )
+    return (
+        semantic_rank,
+        source_rank,
+        str(match.get("path", "")),
+        int(match.get("line") or 0),
+    )
 
 
 def prepare_lean_dependencies(

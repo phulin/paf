@@ -21,6 +21,20 @@ def test_search_lean_sources_covers_project_and_lake_packages(tmp_path: Path) ->
     ]
 
 
+def test_search_lean_sources_ranks_definitions_before_incidental_uses(tmp_path: Path) -> None:
+    (tmp_path / "Main.lean").write_text("#check RankedSearchTarget\n", encoding="utf-8")
+    dependency = tmp_path / ".lake" / "packages" / "dep"
+    dependency.mkdir(parents=True)
+    (dependency / "Def.lean").write_text(
+        "class RankedSearchTarget where\n  witness : True\n", encoding="utf-8"
+    )
+
+    matches = search_lean_sources("RankedSearchTarget", root=tmp_path)
+
+    assert matches[0]["source"] == "dependency"
+    assert matches[0]["path"] == ".lake/packages/dep/Def.lean"
+
+
 def test_prepare_lean_dependencies_follows_beam_save_deps(tmp_path: Path) -> None:
     beam = tmp_path / "lean-beam"
     state = tmp_path / "state"

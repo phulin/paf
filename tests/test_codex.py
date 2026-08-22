@@ -16,6 +16,7 @@ from paf.codex import (
     PACKAGE_STEWARD_ROLE,
     PACKAGE_WORKER_ROLE,
     REPORT_SCHEMAS,
+    UPSTREAM_REPAIR_ROLE,
     WARNING_REVIEW_ROLE,
     CodexExecutor,
     FatalCodexInvocationError,
@@ -217,6 +218,8 @@ def test_upstream_repair_prompt_is_a_readable_assignment(tmp_path: Path) -> None
     assert "This is focused cross-module interface repair" in prompt
     assert "do not prove newly introduced propositions" in prompt
     assert "Record every proof newly deferred" in prompt
+    assert "unfinished proposition proof work" in prompt
+    assert "at least one concrete Lean probe" in prompt
     assert "Deduplicated case" not in prompt
     assert "```json" not in prompt
     assert "opaque-case-123" not in prompt
@@ -267,6 +270,7 @@ def test_proof_report_schema_requires_checked_evidence_without_terminal_self_rou
     assert unresolved["properties"]["kind"]["enum"] == [
         "local_proof_failure",
         "suspected_statement_defect",
+        "suspected_local_interface_defect",
         "suspected_upstream_gap",
     ]
     assert unresolved["properties"]["attempts"]["minItems"] == 1
@@ -757,6 +761,28 @@ def test_warning_cleanup_uses_dedicated_minimal_disturbance_prompt(tmp_path: Pat
     assert "do not replace, simplify, reorganize, or re-prove an existing proof" in prompt
     assert "Resolve every supplied warning" in prompt
     assert "PAF validation diagnostics to repair" in prompt
+
+
+def test_upstream_repair_uses_steward_diagnostic_model(tmp_path: Path) -> None:
+    config_path = write_project(tmp_path, chapters="chapters = [1]")
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8")
+        + """
+[steward]
+model = "strong-planner"
+reasoning_effort = "high"
+worker_model = "cheap-editor"
+worker_reasoning_effort = "low"
+""",
+        encoding="utf-8",
+    )
+    config = load_config(config_path)
+    executor = CodexExecutor(config, StateStore(config))
+
+    command = executor.command(Stage.REVIEW, role=UPSTREAM_REPAIR_ROLE)
+
+    assert command[command.index("--model") + 1] == "strong-planner"
+    assert 'model_reasoning_effort="high"' in command
 
 
 @pytest.mark.asyncio

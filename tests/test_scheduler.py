@@ -412,13 +412,19 @@ def test_proof_observations_are_normalized_for_coordinator_routing() -> None:
         "the source requires an omitted hypothesis",
         kind="suspected_statement_defect",
     )
+    interface = unresolved_proof(
+        "the local definition exposes the wrong structural field",
+        kind="suspected_local_interface_defect",
+    )
 
-    local_record, suspected_record = scheduler_module._proof_blocker_records(
-        {"unresolved_proofs": [local, suspected]}
+    local_record, suspected_record, interface_record = scheduler_module._proof_blocker_records(
+        {"unresolved_proofs": [local, suspected, interface]}
     )
 
     assert local_record["disposition"] == "retry"
     assert suspected_record["disposition"] == "statement_review"
+    assert interface_record["disposition"] == "interface_review"
+    assert not Orchestrator._upstream_candidate_blocker(interface_record)
     assert "Strategy:" in local_record["attempts"][0]
     assert "Probe:" in local_record["attempts"][0]
     assert "Observed outcome:" in local_record["attempts"][0]
@@ -5491,16 +5497,16 @@ async def test_standalone_failed_proof_attempt_queues_durable_review(
     review = orchestrator.state.task(chapter.id, Stage.REVIEW)
     proof = orchestrator.state.task(chapter.id, Stage.PROVE)
     assert review.status == TaskStatus.SUCCEEDED
-    assert proof.status == TaskStatus.FAILED, (
+    assert proof.status == TaskStatus.PENDING, (
         proof.detail,
         orchestrator.state.proof_blockers,
         orchestrator.state.package_state.as_dict(),
     )
-    assert proof.source_digest is None
+    assert proof.detail == "proof work paused for focused blocker evaluation"
     feedback, request_ids = orchestrator._proof_review_feedback(chapter.id)
-    assert feedback == ""
-    assert request_ids == ()
-    assert len(orchestrator.state.upstream_requests) == 1
+    assert "statement needs another hypothesis" in feedback
+    assert len(request_ids) == 1
+    assert orchestrator.state.upstream_requests == {}
     assert orchestrator.state.fixup_requests == {}
     await orchestrator.shutdown()
 
@@ -6458,7 +6464,7 @@ async def test_structural_blocker_consumer_path_must_belong_to_work_unit(
     [
         ("repair_and_retry", True, ProofBlockerStatus.OPEN),
         ("retry_with_route", False, ProofBlockerStatus.OPEN),
-        ("request_upstream", False, ProofBlockerStatus.UPSTREAM_REQUESTED),
+        ("request_upstream", False, ProofBlockerStatus.BLOCKED),
     ],
 )
 async def test_completed_review_routes_blocker_by_structured_action(
@@ -6637,7 +6643,7 @@ async def test_build_warning_review_request_does_not_block_proof_readiness(
 
 
 @pytest.mark.asyncio
-async def test_noop_proof_review_routes_once_to_upstream_steward(tmp_path: Path) -> None:
+async def test_ownerless_proof_review_cannot_route_to_upstream_steward(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
     chapter = config.chapters[0]
     source = tmp_path / "lean" / "Book" / "Chapter01.lean"
@@ -6684,12 +6690,12 @@ async def test_noop_proof_review_routes_once_to_upstream_steward(tmp_path: Path)
     await state.finish_proof_review_requests(chapter.id, (request_id,))
 
     blocker = state.proof_blockers[blocker_id]
-    assert blocker["status"] == ProofBlockerStatus.UPSTREAM_REQUESTED.value
+    assert blocker["status"] == ProofBlockerStatus.BLOCKED.value
     assert blocker["review_exchange_count"] == 1
     assert len(blocker["review_responses"]) == 1
     proof = state.task(chapter.id, Stage.PROVE)
     assert proof.status == TaskStatus.FAILED
-    assert len(state.upstream_requests) == 1
+    assert state.upstream_requests == {}
     assert state.task(chapter.id, Stage.REVIEW).status == TaskStatus.SUCCEEDED
     await orchestrator.shutdown()
 
@@ -8545,7 +8551,9 @@ async def test_obstructed_proof_chunk_does_not_prevent_independent_chunk(
         ["first", "second"],
         ["second"],
     ]
-    assert state.task(chapter.id, Stage.PROVE).status == TaskStatus.FAILED
+    assert state.task(chapter.id, Stage.PROVE).status == TaskStatus.PENDING
+    assert state.upstream_requests == {}
+    assert len(state.proof_review_requests) == 1
     assert "theorem second : True := by trivial" in source.read_text(encoding="utf-8")
     await orchestrator.shutdown()
 

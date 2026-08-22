@@ -124,6 +124,7 @@ _UNRESOLVED_PROOFS_PROPERTY: dict[str, Any] = {
                 "enum": [
                     "local_proof_failure",
                     "suspected_statement_defect",
+                    "suspected_local_interface_defect",
                     "suspected_upstream_gap",
                 ],
             },
@@ -1902,10 +1903,10 @@ distinguish proof evidence from build diagnostics, and avoid repeating known fai
             # `codex exec resume` does not accept the top-level `--sandbox`
             # option, but it does accept the equivalent config override.
             command.extend(["--config", f'sandbox_mode="{settings.sandbox}"'])
-        if role in {PACKAGE_STEWARD_ROLE, UPSTREAM_STEWARD_ROLE}:
+        if role in {PACKAGE_STEWARD_ROLE, UPSTREAM_STEWARD_ROLE, UPSTREAM_REPAIR_ROLE}:
             model = self.config.steward.model
             reasoning_effort = self.config.steward.reasoning_effort
-        elif role in {PACKAGE_WORKER_ROLE, UPSTREAM_REPAIR_ROLE}:
+        elif role == PACKAGE_WORKER_ROLE:
             model = self.config.steward.worker_model
             reasoning_effort = self.config.steward.worker_reasoning_effort
         else:
