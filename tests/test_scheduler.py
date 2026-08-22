@@ -7053,6 +7053,35 @@ async def test_plain_declaration_addition_does_not_invalidate_descendants(tmp_pa
 
 
 @pytest.mark.asyncio
+async def test_fingerprint_schema_upgrade_establishes_baseline(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    first, second = config.chapters
+    orchestrator = Orchestrator(config, StateStore(config))
+    await orchestrator.prepare()
+    await mark_clean_formalization(orchestrator, {second.id: (first.id,)})
+    old = interface_record("old-schema-interface")
+    old["fingerprint_schema"] = "olean-proof-erased-v1"
+    orchestrator.state.formalize_graph["interfaces"] = {first.id: old}
+    await orchestrator._invalidate_build_records((first.id,))
+
+    new = interface_record("new-schema-interface")
+    snapshot = scheduler_module.ValidatedBuildSnapshot(
+        graph=orchestrator._observed_work_unit_graph(),
+        source_digests={first.id: scope_digest(config.settings.repo, first)},
+        fingerprint=new,
+        import_dependencies=(),
+    )
+
+    assert await orchestrator._publish_validated_build(first, snapshot)
+    assert set(orchestrator.state.formalize_graph["clean"]) == {first.id, second.id}
+    assert orchestrator.state.formalize_graph["interface_stale"] == []
+    assert orchestrator.state.formalize_graph["fingerprint_metrics"] == {
+        "interface_baselines_initialized": 1
+    }
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_first_file_signature_establishes_baseline_without_invalidation(
     tmp_path: Path,
 ) -> None:

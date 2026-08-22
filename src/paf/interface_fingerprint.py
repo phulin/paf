@@ -342,6 +342,16 @@ def collect_interface_fingerprints(
                 helper_values[module] = value
                 serialized[module] = output.read_bytes()
 
+        fresh_interface_digests = {
+            module: stable_digest_fields(
+                "paf-module-interface-v1",
+                FINGERPRINT_SCHEMA,
+                lean_version,
+                module,
+                serialized[module],
+            )
+            for module in modules
+        }
         projection_requests: list[tuple[str, Path, Path, Path | None]] = []
         projection_sources: dict[str, ModuleFingerprint] = {}
         for index, module in enumerate(modules):
@@ -352,14 +362,7 @@ def collect_interface_fingerprints(
                 previous is None
                 or not isinstance(declarations, list)
                 or not all(isinstance(item, str) for item in declarations)
-                or previous.interface_digest
-                == stable_digest_fields(
-                    "paf-module-interface-v1",
-                    FINGERPRINT_SCHEMA,
-                    lean_version,
-                    module,
-                    serialized[module],
-                )
+                or previous.interface_digest == fresh_interface_digests[module]
             ):
                 continue
             declaration_file = temporary_root / f"projection-{index}.txt"
@@ -408,13 +411,7 @@ def collect_interface_fingerprints(
             modules_by_owner[module_owners[module]].append(cached)
             continue
         value = helper_values[module]
-        interface_digest = stable_digest_fields(
-            "paf-module-interface-v1",
-            FINGERPRINT_SCHEMA,
-            lean_version,
-            module,
-            serialized[module],
-        )
+        interface_digest = fresh_interface_digests[module]
         raw_declarations = value.get("declarations", ())
         if not isinstance(raw_declarations, list) or not all(
             isinstance(item, str) for item in raw_declarations
