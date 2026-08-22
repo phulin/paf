@@ -214,6 +214,9 @@ def test_upstream_repair_prompt_is_a_readable_assignment(tmp_path: Path) -> None
     assert "## Rules shared by all Lean stages" in prompt
     assert "### Keep imports focused and chronological" in prompt
     assert "## PAF requirements" in prompt
+    assert "This is focused cross-module interface repair" in prompt
+    assert "do not prove newly introduced propositions" in prompt
+    assert "Record every proof newly deferred" in prompt
     assert "Deduplicated case" not in prompt
     assert "```json" not in prompt
     assert "opaque-case-123" not in prompt
