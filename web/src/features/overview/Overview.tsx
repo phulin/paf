@@ -3,7 +3,7 @@ import { chapterFromUrl, setChapterUrl } from "../../lib/urlState";
 import type { SwarmState } from "../../types";
 import { ChapterInspector } from "./ChapterInspector";
 import { DashboardSummary } from "./DashboardSummary";
-import { PackageInspector } from "./PackageInspector";
+import { IncidentInspector } from "./IncidentInspector";
 import { BuildPanel, TimelineDrawer } from "./Timeline";
 import { TaskTable } from "./TaskTable";
 import { chapterRows, type ChapterRow } from "./model";
@@ -12,7 +12,7 @@ export function Overview({ state, connected }: { state: SwarmState; connected: b
   const rows = useMemo(() => chapterRows(state), [state]);
   const [selectedChapter, setSelectedChapter] = useState<string | null>(() => chapterFromUrl());
   const [timelineOpen, setTimelineOpen] = useState(false);
-  const [packagesOpen, setPackagesOpen] = useState(false);
+  const [incidentsOpen, setIncidentsOpen] = useState(false);
   const selected = rows.find((row) => row.id === selectedChapter) ?? null;
 
   const inspectChapter = (row: ChapterRow | null) => {
@@ -40,14 +40,14 @@ export function Overview({ state, connected }: { state: SwarmState; connected: b
   }, [connected, rows, selectedChapter]);
 
   useEffect(() => {
-    const openPackages = (event: KeyboardEvent) => {
-      if (event.key.toLowerCase() !== "k" || event.metaKey || event.ctrlKey || event.altKey) return;
+    const openIncidents = (event: KeyboardEvent) => {
+      if (event.key.toLowerCase() !== "e" || event.metaKey || event.ctrlKey || event.altKey) return;
       const target = event.target as HTMLElement | null;
       if (target?.matches("input, textarea, select, [contenteditable='true']")) return;
-      setPackagesOpen(true);
+      setIncidentsOpen(true);
     };
-    window.addEventListener("keydown", openPackages);
-    return () => window.removeEventListener("keydown", openPackages);
+    window.addEventListener("keydown", openIncidents);
+    return () => window.removeEventListener("keydown", openIncidents);
   }, []);
 
   return (
@@ -56,7 +56,7 @@ export function Overview({ state, connected }: { state: SwarmState; connected: b
         state={state}
         rows={rows}
         connected={connected}
-        openPackages={() => setPackagesOpen(true)}
+        openIncidents={() => setIncidentsOpen(true)}
       />
       <BuildPanel state={state} openTimeline={() => setTimelineOpen(true)} />
       <TaskTable
@@ -66,8 +66,8 @@ export function Overview({ state, connected }: { state: SwarmState; connected: b
         setSelected={inspectChapter}
       />
       {timelineOpen && <TimelineDrawer state={state} close={() => setTimelineOpen(false)} />}
-      {packagesOpen && <PackageInspector state={state} close={() => setPackagesOpen(false)} />}
-      {selected && !packagesOpen && (
+      {incidentsOpen && <IncidentInspector state={state} close={() => setIncidentsOpen(false)} />}
+      {selected && !incidentsOpen && (
         <ChapterInspector row={selected} close={closeChapter} activity={selected.activity} />
       )}
     </main>

@@ -10,8 +10,8 @@ use ratatui::widgets::{
 };
 
 use crate::model::{
-    Activity, DashboardModel, DetailTab, RowModel, STAGES, Task, compact_task_detail,
-    elapsed_seconds,
+    Activity, CoordinationCase, CoordinationSignal, DashboardModel, DetailTab, RowModel, STAGES,
+    Task, compact_task_detail, elapsed_seconds,
 };
 use crate::viewport::TimelineRenderCache;
 
@@ -27,8 +27,8 @@ const SURFACE: Color = Color::Rgb(36, 40, 59);
 pub fn draw(frame: &mut Frame<'_>, model: &mut DashboardModel) {
     if model.detail {
         draw_detail(frame, model);
-    } else if model.steward_detail {
-        draw_upstream_request_detail(frame, model);
+    } else if model.incident_detail {
+        draw_incident_detail(frame, model);
     } else {
         draw_dashboard(frame, model);
     }
@@ -183,7 +183,7 @@ fn draw_dashboard(frame: &mut Frame<'_>, model: &DashboardModel) {
     draw_status(frame, model, layout[4]);
     frame.render_widget(
         Paragraph::new(
-            "↑↓ select  Enter/i inspect  / search  u assignments  p pause/resume  r reload TUI  d detach  q stop",
+            "↑↓ select  Enter/i inspect  / search  e incidents  p pause/resume  r reload TUI  d detach  q stop",
         )
         .style(Style::default().fg(MUTED))
         .alignment(Alignment::Center),
@@ -191,23 +191,30 @@ fn draw_dashboard(frame: &mut Frame<'_>, model: &DashboardModel) {
     );
 }
 
-fn draw_upstream_request_detail(frame: &mut Frame<'_>, model: &mut DashboardModel) {
-    let cases = model.steward_cases();
-    let selected_id = model.selected_steward_case().map(|case| case.id.clone());
+fn draw_incident_detail(frame: &mut Frame<'_>, model: &mut DashboardModel) {
+    let cases = model.coordination_cases();
+    let selected_id = model
+        .selected_coordination_case()
+        .map(|case| case.id.clone());
     let layout = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(38), Constraint::Percentage(62)])
         .split(frame.area());
     let rows = if cases.is_empty() {
-        vec![Row::new(["—", "No cross-module assignments", ""])]
+        vec![Row::new(["—", "No escalation incidents", "", ""])]
     } else {
         cases
             .iter()
             .map(|case| {
                 Row::new([
                     case.status.clone(),
-                    case.title.clone(),
-                    case.request_ids.len().to_string(),
+                    incident_kind_label(&case.kind).to_owned(),
+                    case.work_unit_ids.first().cloned().unwrap_or_default(),
+                    if case.maximum_attempts > 0 {
+                        format!("{}/{}", case.attempts, case.maximum_attempts)
+                    } else {
+                        case.attempts.to_string()
+                    },
                 ])
             })
             .collect()
@@ -215,71 +222,127 @@ fn draw_upstream_request_detail(frame: &mut Frame<'_>, model: &mut DashboardMode
     let table = Table::new(
         rows,
         [
-            Constraint::Length(14),
-            Constraint::Min(24),
+            Constraint::Length(11),
+            Constraint::Length(19),
             Constraint::Min(18),
+            Constraint::Length(8),
         ],
     )
-    .header(Row::new(["Status", "Assignment", "Reports"]).style(Style::default().fg(CYAN)))
+    .header(
+        Row::new(["Status", "Incident", "Work unit", "Attempts"]).style(Style::default().fg(CYAN)),
+    )
     .row_highlight_style(Style::default().bg(SURFACE).add_modifier(Modifier::BOLD))
     .highlight_symbol("▸ ")
     .block(
         Block::default()
             .borders(Borders::ALL)
-            .title(" Cross-module assignments "),
+            .title(" Escalation incidents "),
     );
     let mut state =
-        TableState::default().with_selected(selected_id.as_ref().map(|_| model.steward_selected));
+        TableState::default().with_selected(selected_id.as_ref().map(|_| model.incident_selected));
     frame.render_stateful_widget(table, layout[0], &mut state);
 
     let mut lines = Vec::new();
     if let Some(case_id) = selected_id {
-        let case = &model.state.steward_cases[&case_id];
+        let case = &model.state.coordination_cases[&case_id];
         lines.push(Line::styled(
-            case.title.clone(),
+            incident_kind_label(&case.kind),
             Style::default().fg(YELLOW).add_modifier(Modifier::BOLD),
         ));
         lines.push(Line::from(format!(
-            "{} · {} · {} observation(s)",
+            "{} · {} severity · generation {} · {} signal(s)",
             case.status,
-            case.disposition,
-            case.request_ids.len(),
+            if case.severity.is_empty() {
+                "normal"
+            } else {
+                &case.severity
+            },
+            case.generation.max(1),
+            case.signal_ids.len(),
         )));
-        if !case.needed_result.is_empty() {
+        let attempts = if case.maximum_attempts > 0 {
+            format!("{}/{} attempts", case.attempts, case.maximum_attempts)
+        } else {
+            format!("{} attempts", case.attempts)
+        };
+        lines.push(Line::from(format!(
+            "{attempts} · {}",
+            if case.strong_used {
+                "strong arbitration used"
+            } else {
+                "Luna only"
+            }
+        )));
+        if case.operator_action_required {
             lines.push(Line::from(""));
-            lines.push(Line::styled("Needed result", Style::default().fg(CYAN)));
-            lines.push(Line::from(case.needed_result.clone()));
-        }
-        if !case.rationale.is_empty() {
-            lines.push(Line::from(""));
-            lines.push(Line::styled("Steward rationale", Style::default().fg(CYAN)));
-            lines.push(Line::from(case.rationale.clone()));
+            lines.push(Line::styled(
+                "⚠ OPERATOR ACTION · source change proposed; no source edit was applied",
+                Style::default().fg(YELLOW).add_modifier(Modifier::BOLD),
+            ));
         }
         lines.push(Line::from(""));
-        lines.push(Line::styled("Readable context", Style::default().fg(CYAN)));
-        for work_unit_id in &case.context_work_unit_ids {
+        lines.push(Line::styled("Current outcome", Style::default().fg(CYAN)));
+        lines.push(Line::from(incident_outcome(case)));
+        if !case.failure.is_empty() {
+            lines.push(Line::styled(
+                bounded_display(&case.failure, 320),
+                Style::default().fg(RED),
+            ));
+        }
+        let decision = incident_decision(case);
+        if let Some(decision) = decision {
+            lines.push(Line::from(""));
+            lines.push(Line::styled("Decision", Style::default().fg(CYAN)));
+            for key in ["summary", "diagnosis", "objective", "rationale"] {
+                if let Some(value) = decision.get(key).and_then(|value| value.as_str())
+                    && !value.is_empty()
+                {
+                    lines.push(Line::from(format!(
+                        "{} · {}",
+                        key.replace('_', " "),
+                        bounded_display(value, 320)
+                    )));
+                }
+            }
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::styled("Work units", Style::default().fg(CYAN)));
+        for work_unit_id in &case.work_unit_ids {
             lines.push(Line::from(format!("  {work_unit_id}")));
         }
-        lines.push(Line::from(""));
-        lines.push(Line::styled("Exclusively locked write scope", Style::default().fg(CYAN)));
-        for work_unit_id in &case.write_work_unit_ids {
-            lines.push(Line::from(format!("  {work_unit_id}")));
-        }
-        lines.push(Line::from(""));
-        lines.push(Line::styled("Member requests", Style::default().fg(CYAN)));
-        for request_id in &case.request_ids {
-            lines.push(Line::from(format!("  {request_id}")));
-        }
-        if !case.acceptance_tests.is_empty() {
+        if let Some(assignment) = model.state.steward_cases.get(&case_id) {
             lines.push(Line::from(""));
-            lines.push(Line::styled("Acceptance tests", Style::default().fg(CYAN)));
-            for test in &case.acceptance_tests {
-                lines.push(Line::from(format!("  {test}")));
+            lines.push(Line::styled("Repair scope", Style::default().fg(CYAN)));
+            lines.push(Line::from(format!(
+                "{} · {}",
+                assignment.status, assignment.title
+            )));
+            for work_unit_id in &assignment.write_work_unit_ids {
+                lines.push(Line::from(format!("  write · {work_unit_id}")));
+            }
+            for work_unit_id in &assignment.context_work_unit_ids {
+                if !assignment.write_work_unit_ids.contains(work_unit_id) {
+                    lines.push(Line::from(format!("  read · {work_unit_id}")));
+                }
+            }
+        }
+        if !case.signal_ids.is_empty() {
+            lines.push(Line::from(""));
+            lines.push(Line::styled("Evidence", Style::default().fg(CYAN)));
+            for signal_id in &case.signal_ids {
+                let Some(signal) = model.state.coordination_signals.get(signal_id) else {
+                    continue;
+                };
+                lines.push(Line::from(format!(
+                    "  {} · {}",
+                    incident_kind_label(&signal.kind),
+                    signal_summary(signal)
+                )));
             }
         }
         lines.push(Line::from(""));
         lines.push(Line::styled(
-            "↑↓ select case  Enter timeline  u/Esc/q back",
+            "↑↓ select incident  Enter timeline  e/Esc/q back",
             Style::default().fg(MUTED),
         ));
     }
@@ -287,10 +350,80 @@ fn draw_upstream_request_detail(frame: &mut Frame<'_>, model: &mut DashboardMode
         Paragraph::new(lines).wrap(Wrap { trim: false }).block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(" Steward decision and repair scope "),
+                .title(" Diagnosis and action "),
         ),
         layout[1],
     );
+}
+
+fn incident_kind_label(kind: &str) -> &str {
+    match kind {
+        "upstream_request" => "Owner placement",
+        "source_issue" => "Source issue",
+        "persistent_failure" => "Persistent failure",
+        _ => kind,
+    }
+}
+
+fn incident_decision(
+    case: &CoordinationCase,
+) -> Option<&serde_json::Map<String, serde_json::Value>> {
+    case.decision
+        .as_object()
+        .or_else(|| case.scout_report.as_object())
+}
+
+fn incident_outcome(case: &CoordinationCase) -> String {
+    if case.operator_action_required {
+        return "waiting for an operator source decision".into();
+    }
+    if let Some(action) = incident_decision(case)
+        .and_then(|decision| decision.get("recommended_action"))
+        .and_then(|value| value.as_str())
+    {
+        return action.replace('_', " ");
+    }
+    match case.status.as_str() {
+        "running" => "a bounded investigator is working".into(),
+        "open" => "waiting for a bounded investigator".into(),
+        "parked" if !case.failure.is_empty() => "parked after bounded investigation".into(),
+        status => status.to_owned(),
+    }
+}
+
+fn signal_summary(signal: &CoordinationSignal) -> String {
+    for key in [
+        "needed_result",
+        "description",
+        "failure_signature",
+        "task_detail",
+        "residual_goal",
+        "location",
+    ] {
+        if let Some(value) = signal.evidence.get(key).and_then(|value| value.as_str())
+            && !value.is_empty()
+        {
+            return bounded_display(value, 180);
+        }
+    }
+    if signal.evidence_digest.is_empty() {
+        "evidence retained".into()
+    } else {
+        format!("evidence {}", signal.evidence_digest)
+    }
+}
+
+fn bounded_display(value: &str, maximum: usize) -> String {
+    let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.chars().count() <= maximum {
+        compact
+    } else {
+        compact
+            .chars()
+            .take(maximum.saturating_sub(1))
+            .collect::<String>()
+            + "…"
+    }
 }
 
 #[cfg(any())]
@@ -671,23 +804,37 @@ fn summary(model: &DashboardModel) -> Paragraph<'static> {
             )),
         ]),
         Line::from(format!(
-            "Agents {}/{} · {} · waiting start {}    {}    Assignments {} · repairing {} · failed {}",
+            "Agents {}/{} · {} · waiting start {}    {}    Incidents {} · active {} · actionable {} · parked {}{}",
             state.agents.active,
             state.agents.maximum,
             agent_detail,
             state.agents.queued,
             build,
-            state.steward_cases.len(),
+            state.coordination_cases.len(),
             state
-                .steward_cases
+                .coordination_cases
                 .values()
-                .filter(|case| case.status == "repairing")
+                .filter(|case| matches!(case.status.as_str(), "open" | "running"))
                 .count(),
             state
-                .steward_cases
+                .coordination_cases
                 .values()
-                .filter(|case| case.status == "failed")
+                .filter(|case| case.status == "actionable")
                 .count(),
+            state
+                .coordination_cases
+                .values()
+                .filter(|case| case.status == "parked")
+                .count(),
+            match state
+                .coordination_cases
+                .values()
+                .filter(|case| case.operator_action_required)
+                .count()
+            {
+                0 => String::new(),
+                count => format!(" · operator {count}"),
+            },
         )),
         Line::from(format!(
             "revision {} · isolation {} · Lean Beam · stream {}",
@@ -2047,7 +2194,7 @@ mod tests {
     }
 
     #[test]
-    fn renders_steward_cases_and_hides_legacy_packages() {
+    fn renders_incident_decision_evidence_and_repair_scope() {
         let mut model = DashboardModel::loading("pipeline".into(), String::new());
         model
             .apply(WireEvent {
@@ -2056,6 +2203,26 @@ mod tests {
                 status: "running".into(),
                 result: None,
                 snapshot: Some(serde_json::json!({
+                    "coordination_cases": {"case-1": {
+                        "id": "case-1", "kind": "upstream_request", "status": "actionable",
+                        "severity": "high", "generation": 2, "attempts": 2,
+                        "maximum_attempts": 4, "strong_used": true,
+                        "signal_ids": ["signal-1"],
+                        "work_unit_ids": ["book/chapter-02"],
+                        "decision": {
+                            "recommended_action": "create_repair",
+                            "summary": "The bridge belongs in the earlier chapter.",
+                            "diagnosis": "interface",
+                            "objective": "Provide the smallest chronological bridge.",
+                            "rationale": "The consumer already imports the owner."
+                        },
+                        "updated_at": "2026-08-22T00:00:00Z"
+                    }},
+                    "coordination_signals": {"signal-1": {
+                        "id": "signal-1", "kind": "upstream_request", "severity": "normal",
+                        "evidence_digest": "evidence-a",
+                        "evidence": {"needed_result": "A transport bridge"}
+                    }},
                     "steward_cases": {"case-1": {
                         "id": "case-1", "status": "repairing",
                         "title": "Canonical completion transport",
@@ -2121,20 +2288,24 @@ mod tests {
                 message: String::new(),
             })
             .unwrap();
-        model.enter_steward_detail();
+        model.enter_incident_detail();
 
         let backend = TestBackend::new(140, 52);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| draw(frame, &mut model)).unwrap();
         let rendered = terminal.backend().to_string();
-        assert!(rendered.contains("Cross-module assignments"));
+        assert!(rendered.contains("Escalation incidents"));
+        assert!(rendered.contains("Owner placement"));
+        assert!(rendered.contains("2/4 attempts"));
+        assert!(rendered.contains("strong arbitration used"));
+        assert!(rendered.contains("create repair"));
+        assert!(rendered.contains("The bridge belongs in the earlier chapter."));
         assert!(rendered.contains("Canonical completion transport"));
         assert!(rendered.contains("A transport bridge"));
         assert!(rendered.contains("book/chapter-01"));
         assert!(!rendered.contains("Capability packages"));
-        assert!(rendered.contains("The two chapters must be inspected together"));
         assert!(!rendered.contains("Transport bridge"));
-        assert!(rendered.contains("Steward rationale"));
+        assert!(rendered.contains("Repair scope"));
     }
 
     #[test]

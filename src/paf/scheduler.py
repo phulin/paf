@@ -1124,7 +1124,13 @@ class Orchestrator:
             self.config.escalation,
         )
         await self.state.upsert_coordination_signals(signals)
-        await self.state.sync_coordination_cases(coordination_case_proposals(signals))
+        await self.state.sync_coordination_cases(
+            proposal
+            | {
+                "maximum_attempts": self.config.escalation.maximum_attempts_per_incident,
+            }
+            for proposal in coordination_case_proposals(signals)
+        )
 
     def _coordination_case_signal_values(self, case: dict[str, Any]) -> list[dict[str, Any]]:
         return [
@@ -1257,6 +1263,15 @@ class Orchestrator:
             ),
             model=self.config.agent_profile(Stage.DISCOVER, role)[0],
         )
+        coordination_run_ids = list(
+            dict.fromkeys((*map(str, case.get("coordination_run_ids", ())), run.id))
+        )
+        await self.state.update_coordination_case_generation(
+            case_id,
+            generation,
+            coordination_run_ids=coordination_run_ids,
+        )
+        case["coordination_run_ids"] = coordination_run_ids
         await self.investigation_slots.acquire(self.statement_schedule.priority(anchor.document_id))
         workspace = None
         try:

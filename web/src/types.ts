@@ -173,6 +173,65 @@ export interface IntegrationJournal {
   updated_at: string;
 }
 
+export interface CoordinationDecision {
+  case_id?: string;
+  summary?: string;
+  diagnosis?: string;
+  confidence?: string;
+  recommended_action?: string;
+  objective?: string;
+  context_work_unit_ids?: string[];
+  write_work_unit_ids?: string[];
+  evidence?: string[];
+  new_evidence?: string[];
+  rationale?: string;
+}
+
+export interface CoordinationSignal {
+  id: string;
+  kind: string;
+  subject_ids?: string[];
+  work_unit_ids?: string[];
+  severity?: string;
+  evidence_digest?: string;
+  evidence?: Record<string, unknown>;
+  created_at?: string;
+  updated_at?: string;
+}
+
+export interface CoordinationCase {
+  id: string;
+  kind: string;
+  status: "open" | "running" | "actionable" | "closed" | "parked" | string;
+  severity?: string;
+  generation?: number;
+  attempts?: number;
+  maximum_attempts?: number;
+  strong_used?: boolean;
+  operator_action_required?: boolean;
+  signal_ids?: string[];
+  coordination_run_ids?: string[];
+  work_unit_ids?: string[];
+  evidence_digest?: string;
+  decision?: CoordinationDecision | null;
+  scout_report?: CoordinationDecision | null;
+  failure?: string;
+  created_at?: string;
+  updated_at?: string;
+}
+
+export interface RepairAssignment {
+  id: string;
+  status: string;
+  title: string;
+  needed_result?: string;
+  context_work_unit_ids?: string[];
+  write_work_unit_ids?: string[];
+  acceptance_tests?: string[];
+  rationale?: string;
+  repair_run_ids?: string[];
+}
+
 export interface SwarmState {
   swarm_id?: string;
   revision?: number;
@@ -204,6 +263,9 @@ export interface SwarmState {
   package_dependencies?: PackageDependency[];
   relevant_read_interfaces?: RelevantReadInterface[];
   integration_journal?: Record<string, IntegrationJournal>;
+  coordination_cases?: Record<string, CoordinationCase>;
+  coordination_signals?: Record<string, CoordinationSignal>;
+  steward_cases?: Record<string, RepairAssignment>;
   tasks: Record<string, Task>;
   activities?: Record<string, AgentActivity>;
 }

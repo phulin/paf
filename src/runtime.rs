@@ -244,7 +244,7 @@ pub fn run(
             }
             Err(RecvTimeoutError::Timeout) => {
                 // This is a presentation clock for idle/elapsed labels, never a state poll.
-                dirty = model.detail || model.steward_detail || model.state.agents.active > 0;
+                dirty = model.detail || model.incident_detail || model.state.agents.active > 0;
             }
             Err(RecvTimeoutError::Disconnected) => {
                 bail!("dashboard event sources disconnected unexpectedly")
@@ -363,15 +363,18 @@ fn handle_terminal_event_with_sender(
         }
         return Ok(dirty);
     }
-    if model.steward_detail {
+    if model.incident_detail {
         if matches!(key.code, KeyCode::Enter | KeyCode::Char('i')) {
-            if let Some(case_id) = model.selected_steward_case().map(|case| case.id.clone()) {
+            if let Some(case_id) = model
+                .selected_coordination_case()
+                .map(|case| case.id.clone())
+            {
                 model.enter_case_run_detail(case_id);
                 request_case_runs(model, socket_path, None, sender);
             }
             return Ok(true);
         }
-        return Ok(handle_steward_key(key, model));
+        return Ok(handle_incident_key(key, model));
     }
     match key.code {
         KeyCode::Char('q') | KeyCode::Char('c')
@@ -394,8 +397,8 @@ fn handle_terminal_event_with_sender(
             }
             Ok(true)
         }
-        KeyCode::Char('u') => {
-            model.enter_steward_detail();
+        KeyCode::Char('e') => {
+            model.enter_incident_detail();
             Ok(true)
         }
         KeyCode::Up => {
@@ -555,7 +558,7 @@ fn handle_mouse_event(mouse: MouseEvent, model: &mut DashboardModel) -> bool {
         MouseEventKind::ScrollDown => MOUSE_SCROLL_ROWS,
         _ => return false,
     };
-    if model.detail || model.steward_detail {
+    if model.detail || model.incident_detail {
         model.scroll_detail(delta as i16);
     } else {
         model.move_selection(delta);
@@ -563,17 +566,17 @@ fn handle_mouse_event(mouse: MouseEvent, model: &mut DashboardModel) -> bool {
     true
 }
 
-fn handle_steward_key(key: KeyEvent, model: &mut DashboardModel) -> bool {
+fn handle_incident_key(key: KeyEvent, model: &mut DashboardModel) -> bool {
     match key.code {
-        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('u') => {
-            model.leave_steward_detail();
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('e') => {
+            model.leave_incident_detail();
         }
-        KeyCode::Up | KeyCode::Char('j') => model.move_upstream_request_selection(-1),
-        KeyCode::Down => model.move_upstream_request_selection(1),
-        KeyCode::PageUp => model.move_upstream_request_selection(-10),
-        KeyCode::PageDown => model.move_upstream_request_selection(10),
-        KeyCode::Home => model.move_upstream_request_selection(-(model.steward_selected as isize)),
-        KeyCode::End => model.move_upstream_request_selection(isize::MAX),
+        KeyCode::Up | KeyCode::Char('j') => model.move_incident_selection(-1),
+        KeyCode::Down => model.move_incident_selection(1),
+        KeyCode::PageUp => model.move_incident_selection(-10),
+        KeyCode::PageDown => model.move_incident_selection(10),
+        KeyCode::Home => model.move_incident_selection(-(model.incident_selected as isize)),
+        KeyCode::End => model.move_incident_selection(isize::MAX),
         _ => return false,
     }
     true
@@ -895,16 +898,16 @@ mod tests {
     }
 
     #[test]
-    fn upstream_request_key_opens_and_closes_the_request_view() {
+    fn escalation_key_opens_and_closes_the_incident_view() {
         let mut model = DashboardModel::loading("test".into(), String::new());
         model.preparation = None;
-        let request_key = Event::Key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE));
+        let request_key = Event::Key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
 
         assert!(handle_terminal_event(request_key.clone(), &mut model, "/unused").unwrap());
-        assert!(model.steward_detail);
+        assert!(model.incident_detail);
         assert!(!model.detail);
         assert!(handle_terminal_event(request_key, &mut model, "/unused").unwrap());
-        assert!(!model.steward_detail);
+        assert!(!model.incident_detail);
         assert!(!model.stopping);
     }
 

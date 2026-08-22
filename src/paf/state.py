@@ -2828,8 +2828,20 @@ class StateStore:
                     previous.get("evidence_digest", "")
                 )
                 if not additions and not evidence_changed:
+                    maximum_attempts = raw.get("maximum_attempts")
+                    if maximum_attempts is None or maximum_attempts == previous.get(
+                        "maximum_attempts"
+                    ):
+                        continue
+                    value = dict(previous)
+                    value["maximum_attempts"] = maximum_attempts
+                    value["updated_at"] = now
+                    self.coordination_cases[case_id] = value
+                    changed.append(case_id)
                     continue
                 value = dict(previous)
+                if "maximum_attempts" in raw:
+                    value["maximum_attempts"] = raw["maximum_attempts"]
                 value["signal_ids"] = [*prior_ids, *additions]
                 value["work_unit_ids"] = list(
                     dict.fromkeys(
@@ -3178,7 +3190,8 @@ class StateStore:
         runs = [
             run
             for run in self._runs_by_id.values()
-            if run.id in explicit_run_ids
+            if case_id in run.request_ids
+            or run.id in explicit_run_ids
             or (
                 run.role in {"upstream_steward", "upstream_repair", "upstream_implementation"}
                 and request_ids.intersection(run.request_ids)

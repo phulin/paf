@@ -101,10 +101,15 @@ async def test_coordination_state_is_durable_and_generation_fenced(tmp_path: Pat
         "evidence_digest": "case-evidence-a",
         "signal_ids": ["signal-a"],
         "work_unit_ids": [config.chapters[0].id],
+        "maximum_attempts": 4,
     }
     assert await state.sync_coordination_cases((proposal,)) == ("case-a",)
+    assert state.coordination_cases["case-a"]["maximum_attempts"] == 4
     assert not await state.update_coordination_case_generation("case-a", 2, status="running")
     assert await state.update_coordination_case_generation("case-a", 1, status="running")
+    assert await state.sync_coordination_cases((proposal | {"maximum_attempts": 5},)) == ("case-a",)
+    assert state.coordination_cases["case-a"]["maximum_attempts"] == 5
+    assert state.coordination_cases["case-a"]["status"] == "running"
     assert await state.upsert_coordination_signals(
         (signal | {"evidence_digest": "evidence-b", "evidence": {"run_ids": ["run-b"]}},)
     ) == ("signal-a",)

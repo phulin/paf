@@ -1,4 +1,4 @@
-import { Boxes, CheckCircle2, Users, Zap } from "lucide-react";
+import { CircleAlert, CheckCircle2, Users, Zap } from "lucide-react";
 import type { ReactNode } from "react";
 import { ProgressBar } from "../../components/Controls";
 import { formatNumber } from "../../lib/format";
@@ -83,12 +83,12 @@ export function DashboardSummary({
   state,
   rows,
   connected,
-  openPackages,
+  openIncidents,
 }: {
   state: SwarmState;
   rows: ChapterRow[];
   connected: boolean;
-  openPackages: () => void;
+  openIncidents: () => void;
 }) {
   const tasks = Object.values(state.tasks ?? {});
   const successful = tasks.filter((task) => task.status === "succeeded").length;
@@ -102,21 +102,14 @@ export function DashboardSummary({
   const postprocessing = phasedTasks
     ? tasks.filter((task) => task.status === "running" && task.phase === "postprocess").length
     : Math.max(0, runningTasks - activeAgents);
-  const failed = tasks.filter(
-    (task) =>
-      task.status === "failed" ||
-      task.status === "blocked" ||
-      task.status === "interrupted" ||
-      task.scheduling_status === "blocked",
-  ).length;
   const completion = tasks.length ? Math.round((100 * successful) / tasks.length) : 0;
-  const packages = Object.values(state.capability_packages ?? {});
-  const activePackages = packages.filter((item) =>
-    ["observed", "investigating", "planned", "implementing", "validating", "integrating"].includes(
-      item.status,
-    ),
+  const incidents = Object.values(state.coordination_cases ?? {});
+  const activeIncidents = incidents.filter((item) =>
+    ["open", "running"].includes(item.status),
   ).length;
-  const waitingPackages = packages.filter((item) => item.status.startsWith("waiting_")).length;
+  const actionableIncidents = incidents.filter((item) => item.status === "actionable").length;
+  const parkedIncidents = incidents.filter((item) => item.status === "parked").length;
+  const operatorIncidents = incidents.filter((item) => item.operator_action_required).length;
 
   return (
     <>
@@ -170,21 +163,31 @@ export function DashboardSummary({
           accent="var(--violet)"
         />
         <MetricCard
-          icon={<Boxes size={19} />}
-          label="Capability packages"
-          value={`${activePackages} active`}
+          icon={<CircleAlert size={19} />}
+          label="Escalation incidents"
+          value={`${activeIncidents} active`}
           detail={
             <>
-              <span>{packages.length} total</span>
+              <span>{actionableIncidents} actionable</span>
               <i />
-              {waitingPackages} waiting
-              <i />
-              {failed} blocked tasks
+              {parkedIncidents} parked
+              {operatorIncidents > 0 && (
+                <>
+                  <i />
+                  <span className="error-text">{operatorIncidents} operator</span>
+                </>
+              )}
               {!connected && " · demo"}
             </>
           }
-          accent={waitingPackages ? "var(--amber)" : "var(--green)"}
-          onClick={openPackages}
+          accent={
+            operatorIncidents || parkedIncidents
+              ? "var(--amber)"
+              : activeIncidents || actionableIncidents
+                ? "var(--cyan)"
+                : "var(--green)"
+          }
+          onClick={openIncidents}
         />
       </div>
       <section className="pipeline-strip">

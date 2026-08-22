@@ -433,6 +433,25 @@ async def test_resumed_steward_auxiliary_run_remains_one_tui_run(tmp_path: Path)
 
 
 @pytest.mark.asyncio
+async def test_incident_history_includes_bespoke_coordination_runs(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    state = StateStore(config)
+    await state.load_or_create()
+    chapter = config.chapters[0]
+    scout = await state.start_auxiliary_run(
+        chapter.id,
+        Stage.DISCOVER,
+        role="trace_diagnosis",
+        request_ids=("case-a", "coordination-generation:1", "signal-a"),
+    )
+
+    details = state.dashboard_steward_case_runs("case-a")
+
+    assert [item["id"] for item in details["runs"]] == [scout.id]
+    assert details["runs"][0]["role"] == "trace_diagnosis"
+
+
+@pytest.mark.asyncio
 async def test_orphaned_repairing_steward_case_is_requeued(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
     state = StateStore(config)

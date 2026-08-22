@@ -119,6 +119,43 @@ pub struct StewardCase {
 
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default)]
+pub struct CoordinationSignal {
+    pub id: String,
+    pub kind: String,
+    pub subject_ids: Vec<String>,
+    pub work_unit_ids: Vec<String>,
+    pub severity: String,
+    pub evidence_digest: String,
+    pub evidence: Value,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct CoordinationCase {
+    pub id: String,
+    pub kind: String,
+    pub status: String,
+    pub severity: String,
+    pub generation: usize,
+    pub attempts: usize,
+    pub maximum_attempts: usize,
+    pub strong_used: bool,
+    pub operator_action_required: bool,
+    pub signal_ids: Vec<String>,
+    pub coordination_run_ids: Vec<String>,
+    pub work_unit_ids: Vec<String>,
+    pub evidence_digest: String,
+    pub decision: Value,
+    pub scout_report: Value,
+    pub failure: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
 pub struct PackageConsumer {
     pub id: String,
     pub package_id: String,
@@ -338,6 +375,8 @@ pub struct SwarmState {
     pub coordinator_build: CoordinatorBuild,
     pub upstream_requests: HashMap<String, UpstreamRequest>,
     pub steward_cases: HashMap<String, StewardCase>,
+    pub coordination_cases: HashMap<String, CoordinationCase>,
+    pub coordination_signals: HashMap<String, CoordinationSignal>,
     pub capability_packages: HashMap<String, CapabilityPackage>,
     pub package_consumers: HashMap<String, PackageConsumer>,
     pub package_steps: HashMap<String, PackageStep>,
@@ -405,6 +444,8 @@ pub struct GlobalDelta {
     pub coordinator_build: Option<CoordinatorBuild>,
     pub upstream_requests: Option<HashMap<String, UpstreamRequest>>,
     pub steward_cases: Option<HashMap<String, StewardCase>>,
+    pub coordination_cases: Option<HashMap<String, CoordinationCase>>,
+    pub coordination_signals: Option<HashMap<String, CoordinationSignal>>,
     pub capability_packages: Option<HashMap<String, CapabilityPackage>>,
     pub package_consumers: Option<HashMap<String, PackageConsumer>>,
     pub package_steps: Option<HashMap<String, PackageStep>>,
@@ -476,8 +517,8 @@ pub struct DashboardModel {
     pub result: Option<bool>,
     pub selected: usize,
     pub detail: bool,
-    pub steward_detail: bool,
-    pub steward_selected: usize,
+    pub incident_detail: bool,
+    pub incident_selected: usize,
     pub detail_case_id: Option<String>,
     pub detail_tab: DetailTab,
     pub scroll: u16,
@@ -523,8 +564,8 @@ impl DashboardModel {
             result: None,
             selected: 0,
             detail: false,
-            steward_detail: false,
-            steward_selected: 0,
+            incident_detail: false,
+            incident_selected: 0,
             detail_case_id: None,
             detail_tab: detail_tab.map(DetailTab::from_name).unwrap_or_default(),
             scroll: 0,
@@ -642,6 +683,14 @@ impl DashboardModel {
         );
         apply_optional(&mut self.state.steward_cases, delta.globals.steward_cases);
         apply_optional(
+            &mut self.state.coordination_cases,
+            delta.globals.coordination_cases,
+        );
+        apply_optional(
+            &mut self.state.coordination_signals,
+            delta.globals.coordination_signals,
+        );
+        apply_optional(
             &mut self.state.capability_packages,
             delta.globals.capability_packages,
         );
@@ -758,7 +807,7 @@ impl DashboardModel {
         if self.detail {
             self.leave_detail();
         }
-        self.steward_detail = false;
+        self.incident_detail = false;
     }
 
     pub fn push_search_character(&mut self, character: char) {
@@ -852,7 +901,7 @@ impl DashboardModel {
 
     pub fn enter_detail(&mut self) {
         self.detail = true;
-        self.steward_detail = false;
+        self.incident_detail = false;
         self.detail_case_id = None;
         self.detail_runs.clear();
         self.loading_chapter_runs = None;
@@ -865,7 +914,7 @@ impl DashboardModel {
 
     pub fn leave_detail(&mut self) {
         self.detail = false;
-        self.steward_detail = self.detail_case_id.take().is_some();
+        self.incident_detail = self.detail_case_id.take().is_some();
         self.detail_runs.clear();
         self.loading_chapter_runs = None;
         self.loading_case_runs = None;
@@ -876,21 +925,21 @@ impl DashboardModel {
         self.detail_follow_tail = true;
     }
 
-    pub fn enter_steward_detail(&mut self) {
-        self.steward_detail = true;
+    pub fn enter_incident_detail(&mut self) {
+        self.incident_detail = true;
         self.detail = false;
         self.detail_case_id = None;
         self.loading_case_runs = None;
-        self.steward_selected = self
-            .steward_selected
-            .min(self.steward_cases().len().saturating_sub(1));
+        self.incident_selected = self
+            .incident_selected
+            .min(self.coordination_cases().len().saturating_sub(1));
         self.scroll = 0;
         self.detail_max_scroll = 0;
         self.detail_follow_tail = true;
     }
 
-    pub fn leave_steward_detail(&mut self) {
-        self.steward_detail = false;
+    pub fn leave_incident_detail(&mut self) {
+        self.incident_detail = false;
         self.scroll = 0;
         self.detail_max_scroll = 0;
         self.detail_follow_tail = true;
@@ -898,7 +947,7 @@ impl DashboardModel {
 
     pub fn enter_case_run_detail(&mut self, case_id: String) {
         self.detail = true;
-        self.steward_detail = false;
+        self.incident_detail = false;
         self.detail_case_id = Some(case_id);
         self.detail_runs.clear();
         self.loading_case_runs = None;
@@ -908,29 +957,31 @@ impl DashboardModel {
         self.detail_follow_tail = true;
     }
 
-    pub fn steward_cases(&self) -> Vec<&StewardCase> {
-        let mut cases = self.state.steward_cases.values().collect::<Vec<_>>();
+    pub fn coordination_cases(&self) -> Vec<&CoordinationCase> {
+        let mut cases = self.state.coordination_cases.values().collect::<Vec<_>>();
         cases.sort_by(|left, right| {
-            steward_case_status_rank(&left.status)
-                .cmp(&steward_case_status_rank(&right.status))
+            coordination_case_status_rank(&left.status)
+                .cmp(&coordination_case_status_rank(&right.status))
                 .then(right.updated_at.cmp(&left.updated_at))
                 .then(left.id.cmp(&right.id))
         });
         cases
     }
 
-    pub fn selected_steward_case(&self) -> Option<&StewardCase> {
-        self.steward_cases().get(self.steward_selected).copied()
+    pub fn selected_coordination_case(&self) -> Option<&CoordinationCase> {
+        self.coordination_cases()
+            .get(self.incident_selected)
+            .copied()
     }
 
-    pub fn move_upstream_request_selection(&mut self, delta: isize) {
-        let length = self.steward_cases().len();
+    pub fn move_incident_selection(&mut self, delta: isize) {
+        let length = self.coordination_cases().len();
         if length == 0 {
-            self.steward_selected = 0;
+            self.incident_selected = 0;
             return;
         }
-        self.steward_selected = self
-            .steward_selected
+        self.incident_selected = self
+            .incident_selected
             .saturating_add_signed(delta)
             .min(length - 1);
         self.scroll = 0;
@@ -1239,14 +1290,13 @@ impl DashboardModel {
     }
 }
 
-fn steward_case_status_rank(status: &str) -> u8 {
+fn coordination_case_status_rank(status: &str) -> u8 {
     match status {
-        "repairing" => 0,
-        "ready" | "needs_scope" => 1,
-        "failed" => 2,
-        "verified" => 3,
-        "rejected" | "resolved" => 4,
-        _ => 5,
+        "running" => 0,
+        "open" | "actionable" => 1,
+        "parked" => 2,
+        "closed" => 3,
+        _ => 4,
     }
 }
 
@@ -1563,9 +1613,9 @@ mod tests {
     }
 
     #[test]
-    fn steward_case_run_detail_loads_history_and_returns_to_case_view() {
+    fn incident_run_detail_loads_history_and_returns_to_incident_view() {
         let mut model = DashboardModel::loading("test".into(), String::new());
-        model.enter_steward_detail();
+        model.enter_incident_detail();
         model.enter_case_run_detail("case-1".into());
         assert!(model.begin_case_runs_load("case-1", None));
         assert!(model.apply_loaded_case_runs(
@@ -1588,7 +1638,7 @@ mod tests {
         model.leave_detail();
 
         assert!(!model.detail);
-        assert!(model.steward_detail);
+        assert!(model.incident_detail);
         assert!(model.detail_case_id.is_none());
     }
 
