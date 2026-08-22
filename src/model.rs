@@ -922,7 +922,7 @@ impl DashboardModel {
         self.run_prompts.clear();
         self.scroll = 0;
         self.detail_max_scroll = 0;
-        self.detail_follow_tail = true;
+        self.detail_follow_tail = false;
     }
 
     pub fn enter_incident_detail(&mut self) {
@@ -935,7 +935,7 @@ impl DashboardModel {
             .min(self.coordination_cases().len().saturating_sub(1));
         self.scroll = 0;
         self.detail_max_scroll = 0;
-        self.detail_follow_tail = true;
+        self.detail_follow_tail = false;
     }
 
     pub fn leave_incident_detail(&mut self) {
@@ -986,7 +986,7 @@ impl DashboardModel {
             .min(length - 1);
         self.scroll = 0;
         self.detail_max_scroll = 0;
-        self.detail_follow_tail = true;
+        self.detail_follow_tail = false;
     }
 
     pub fn trace_run_id(&self) -> Option<&str> {

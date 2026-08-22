@@ -246,7 +246,7 @@ fn draw_incident_detail(frame: &mut Frame<'_>, model: &mut DashboardModel) {
     if let Some(case_id) = selected_id {
         let case = &model.state.coordination_cases[&case_id];
         lines.push(Line::styled(
-            incident_kind_label(&case.kind),
+            incident_kind_label(&case.kind).to_owned(),
             Style::default().fg(YELLOW).add_modifier(Modifier::BOLD),
         ));
         lines.push(Line::from(format!(
@@ -342,18 +342,31 @@ fn draw_incident_detail(frame: &mut Frame<'_>, model: &mut DashboardModel) {
         }
         lines.push(Line::from(""));
         lines.push(Line::styled(
-            "↑↓ select incident  Enter timeline  e/Esc/q back",
+            "↑↓ select · j/k/PgUp/PgDn scroll · Enter timeline · e/Esc/q back",
             Style::default().fg(MUTED),
         ));
     }
-    frame.render_widget(
-        Paragraph::new(lines).wrap(Wrap { trim: false }).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Diagnosis and action "),
-        ),
-        layout[1],
-    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Diagnosis and action ");
+    let inner = block.inner(layout[1]);
+    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+    let line_count = paragraph.line_count(inner.width);
+    let maximum = line_count
+        .saturating_sub(inner.height as usize)
+        .min(u16::MAX as usize) as u16;
+    model.sync_detail_viewport(maximum);
+    frame.render_widget(paragraph.scroll((model.scroll, 0)).block(block), layout[1]);
+    if maximum > 0 {
+        let mut scrollbar = ScrollbarState::new(maximum as usize + 1)
+            .position(model.scroll as usize)
+            .viewport_content_length(inner.height as usize);
+        frame.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight),
+            layout[1],
+            &mut scrollbar,
+        );
+    }
 }
 
 fn incident_kind_label(kind: &str) -> &str {

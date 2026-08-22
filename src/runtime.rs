@@ -571,10 +571,12 @@ fn handle_incident_key(key: KeyEvent, model: &mut DashboardModel) -> bool {
         KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('e') => {
             model.leave_incident_detail();
         }
-        KeyCode::Up | KeyCode::Char('j') => model.move_incident_selection(-1),
+        KeyCode::Up => model.move_incident_selection(-1),
         KeyCode::Down => model.move_incident_selection(1),
-        KeyCode::PageUp => model.move_incident_selection(-10),
-        KeyCode::PageDown => model.move_incident_selection(10),
+        KeyCode::Char('k') => model.scroll_detail(-1),
+        KeyCode::Char('j') => model.scroll_detail(1),
+        KeyCode::PageUp => model.scroll_detail(-10),
+        KeyCode::PageDown => model.scroll_detail(10),
         KeyCode::Home => model.move_incident_selection(-(model.incident_selected as isize)),
         KeyCode::End => model.move_incident_selection(isize::MAX),
         _ => return false,
@@ -909,6 +911,26 @@ mod tests {
         assert!(handle_terminal_event(request_key, &mut model, "/unused").unwrap());
         assert!(!model.incident_detail);
         assert!(!model.stopping);
+    }
+
+    #[test]
+    fn incident_keys_scroll_the_selected_incident_detail() {
+        let mut model = DashboardModel::loading("test".into(), String::new());
+        model.preparation = None;
+        model.incident_detail = true;
+        model.detail_max_scroll = 30;
+        model.detail_follow_tail = false;
+
+        assert!(handle_incident_key(
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+            &mut model,
+        ));
+        assert_eq!(model.scroll, 1);
+        assert!(handle_incident_key(
+            KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
+            &mut model,
+        ));
+        assert_eq!(model.scroll, 11);
     }
 
     #[test]
