@@ -1378,7 +1378,24 @@ class Orchestrator:
                 decision=report,
             )
 
-    async def _schedule_upstream_coordination(self) -> None:
+    def _upstream_case_work_unit_ids(self, case_id: str) -> set[str]:
+        case = self.state.steward_cases.get(case_id, {})
+        return {
+            str(value)
+            for value in case.get("context_work_unit_ids", ())
+            if str(value) in self._work_units_by_id
+        }
+
+    def _active_upstream_work_unit_ids(self) -> set[str]:
+        return {
+            work_unit_id
+            for case_id in self._upstream_case_tasks
+            for work_unit_id in self._upstream_case_work_unit_ids(case_id)
+        }
+
+    async def _schedule_upstream_coordination(
+        self, *, excluded_work_unit_ids: Iterable[str] = ()
+    ) -> None:
         if self._upstream_steward_task is not None and self._upstream_steward_task.done():
             task = self._upstream_steward_task
             self._upstream_steward_task = None
@@ -1399,10 +1416,17 @@ class Orchestrator:
             return
         if self._upstream_steward_task is not None:
             return
+        excluded = set(excluded_work_unit_ids) | {
+            work_unit_id
+            for work_unit_id, lock in self._chapter_agent_locks.items()
+            if lock.locked()
+        }
         ready = [
             case_id
             for case_id, case in sorted(self.state.steward_cases.items())
-            if case.get("status") == "ready" and case.get("disposition") == "implement"
+            if case.get("status") == "ready"
+            and case.get("disposition") == "implement"
+            and not excluded.intersection(self._upstream_case_work_unit_ids(case_id))
         ]
         for case_id in ready[:MAXIMUM_CONCURRENT_UPSTREAM_IMPLEMENTATIONS]:
             self._upstream_case_tasks[case_id] = asyncio.create_task(
@@ -6275,7 +6299,11 @@ class Orchestrator:
                 self._invalidated_reviews.clear()
                 new_rechecks = set(self._proof_rechecks)
                 self._proof_rechecks.clear()
-                await self._schedule_upstream_coordination()
+                ordinary_work_unit_ids = set(review_tasks) | set(rebuild_tasks) | set(proof_tasks)
+                await self._schedule_upstream_coordination(
+                    excluded_work_unit_ids=ordinary_work_unit_ids
+                )
+                upstream_work_unit_ids = self._active_upstream_work_unit_ids()
                 failed_rebuilds.difference_update(new_rechecks)
                 dirty_value = self.state.formalize_graph.get("dirty", ())
                 dirty_builds = (
@@ -6325,6 +6353,7 @@ class Orchestrator:
                         and chapter_id not in review_tasks
                         and chapter_id not in proof_tasks
                         and chapter_id not in rebuild_tasks
+                        and chapter_id not in upstream_work_unit_ids
                         and formalize_ready(chapter_id)
                     ):
                         review_tasks[chapter_id] = RunningReview(
@@ -6356,6 +6385,7 @@ class Orchestrator:
                         and chapter_id not in review_tasks
                         and chapter_id not in proof_tasks
                         and chapter_id not in rebuild_tasks
+                        and chapter_id not in upstream_work_unit_ids
                         and formalize_ready(chapter_id)
                         and self.state.readiness(review_task).ready
                         and (rereview or chapter_id in review_frontiers_ready)
@@ -6424,6 +6454,7 @@ class Orchestrator:
                         and chapter_id not in review_tasks
                         and chapter_id not in proof_tasks
                         and chapter_id not in rebuild_tasks
+                        and chapter_id not in upstream_work_unit_ids
                         and formalize_ready(chapter_id)
                     ):
                         rebuild_tasks[chapter_id] = asyncio.create_task(
@@ -6439,6 +6470,7 @@ class Orchestrator:
                             and chapter_id not in proof_tasks
                             and chapter_id not in review_tasks
                             and chapter_id not in rebuild_tasks
+                            and chapter_id not in upstream_work_unit_ids
                             and formalize_ready(chapter_id)
                             and self.state.readiness(self.state.task(chapter_id, Stage.PROVE)).ready
                         ):

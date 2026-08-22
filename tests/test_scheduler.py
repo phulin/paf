@@ -5585,6 +5585,95 @@ async def test_global_steward_cases_deduplicate_requests_and_include_consumers(
 
 
 @pytest.mark.asyncio
+async def test_upstream_implementation_excludes_simultaneous_chapter_review(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = config.chapters[0]
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await orchestrator.prepare()
+    await mark_formalized(orchestrator)
+    await state.replace_steward_cases(
+        [
+            {
+                "case_id": "shared-chapter-repair",
+                "status": "ready",
+                "title": "Shared chapter repair",
+                "disposition": "implement",
+                "request_ids": [],
+                "context_work_unit_ids": [chapter.id],
+            }
+        ]
+    )
+    implementation_started = asyncio.Event()
+    release_implementation = asyncio.Event()
+    review_started = asyncio.Event()
+
+    async def implement(case_id: str) -> None:
+        implementation_started.set()
+        await release_implementation.wait()
+        await state.update_steward_case(case_id, status="verified")
+
+    async def review(
+        current: Chapter,
+        _rounds_used: dict[str, int],
+        **_kwargs: object,
+    ) -> StageOutcome:
+        assert current.id == chapter.id
+        review_started.set()
+        return StageOutcome(ExecutionDisposition.SUCCEEDED)
+
+    monkeypatch.setattr(orchestrator, "_run_upstream_implementation", implement)
+    monkeypatch.setattr(orchestrator, "_review_chapter_to_clean", review)
+
+    review_tree = asyncio.create_task(orchestrator._review_tree())
+    await asyncio.wait_for(implementation_started.wait(), timeout=2)
+    await asyncio.sleep(0)
+    task = state.task(chapter.id, Stage.REVIEW)
+    assert task.status == TaskStatus.PENDING
+    assert task.phase == TaskPhase.IDLE
+    assert not review_started.is_set()
+
+    release_implementation.set()
+    await asyncio.wait_for(review_started.wait(), timeout=2)
+    assert await asyncio.wait_for(review_tree, timeout=2)
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_active_chapter_work_excludes_upstream_implementation(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = config.chapters[0]
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await orchestrator.prepare()
+    await state.replace_steward_cases(
+        [
+            {
+                "case_id": "shared-chapter-repair",
+                "status": "ready",
+                "title": "Shared chapter repair",
+                "disposition": "implement",
+                "request_ids": [],
+                "context_work_unit_ids": [chapter.id],
+            }
+        ]
+    )
+
+    chapter_lock = orchestrator._chapter_agent_locks[chapter.id]
+    await chapter_lock.acquire()
+    try:
+        await orchestrator._schedule_upstream_coordination()
+    finally:
+        chapter_lock.release()
+
+    assert not orchestrator._upstream_case_tasks
+    assert state.steward_cases["shared-chapter-repair"]["status"] == "ready"
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_legacy_consumer_triage_is_handed_to_global_steward(tmp_path: Path) -> None:
     config = with_example_modules(
         load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
