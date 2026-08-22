@@ -365,13 +365,6 @@ fn handle_terminal_event_with_sender(
         return Ok(dirty);
     }
     if model.package_detail {
-        if key.code == KeyCode::Enter
-            && let Some(package_id) = model.selected_package().map(|value| value.id.clone())
-        {
-            model.enter_package_run_detail(package_id);
-            request_package_runs(model, socket_path, None, sender);
-            return Ok(true);
-        }
         return Ok(handle_package_key(key, model));
     }
     match key.code {
@@ -395,7 +388,7 @@ fn handle_terminal_event_with_sender(
             }
             Ok(true)
         }
-        KeyCode::Char('k') => {
+        KeyCode::Char('u') => {
             model.enter_package_detail();
             Ok(true)
         }
@@ -566,15 +559,15 @@ fn handle_mouse_event(mouse: MouseEvent, model: &mut DashboardModel) -> bool {
 
 fn handle_package_key(key: KeyEvent, model: &mut DashboardModel) -> bool {
     match key.code {
-        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('k') => {
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('u') => {
             model.leave_package_detail();
         }
-        KeyCode::Up | KeyCode::Char('j') => model.move_package_selection(-1),
-        KeyCode::Down => model.move_package_selection(1),
-        KeyCode::PageUp => model.move_package_selection(-10),
-        KeyCode::PageDown => model.move_package_selection(10),
-        KeyCode::Home => model.move_package_selection(-(model.package_selected as isize)),
-        KeyCode::End => model.move_package_selection(isize::MAX),
+        KeyCode::Up | KeyCode::Char('j') => model.move_upstream_request_selection(-1),
+        KeyCode::Down => model.move_upstream_request_selection(1),
+        KeyCode::PageUp => model.move_upstream_request_selection(-10),
+        KeyCode::PageDown => model.move_upstream_request_selection(10),
+        KeyCode::Home => model.move_upstream_request_selection(-(model.package_selected as isize)),
+        KeyCode::End => model.move_upstream_request_selection(isize::MAX),
         _ => return false,
     }
     true
@@ -896,15 +889,15 @@ mod tests {
     }
 
     #[test]
-    fn package_key_opens_and_closes_the_package_view() {
+    fn upstream_request_key_opens_and_closes_the_request_view() {
         let mut model = DashboardModel::loading("test".into(), String::new());
         model.preparation = None;
-        let package_key = Event::Key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+        let request_key = Event::Key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE));
 
-        assert!(handle_terminal_event(package_key.clone(), &mut model, "/unused").unwrap());
+        assert!(handle_terminal_event(request_key.clone(), &mut model, "/unused").unwrap());
         assert!(model.package_detail);
         assert!(!model.detail);
-        assert!(handle_terminal_event(package_key, &mut model, "/unused").unwrap());
+        assert!(handle_terminal_event(request_key, &mut model, "/unused").unwrap());
         assert!(!model.package_detail);
         assert!(!model.stopping);
     }

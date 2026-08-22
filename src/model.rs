@@ -76,6 +76,29 @@ pub struct CapabilityPackage {
 
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default)]
+pub struct UpstreamRequest {
+    pub id: String,
+    pub status: String,
+    pub title: String,
+    pub consumer_chapter_id: String,
+    pub consumer_path: String,
+    pub blocked_declaration: String,
+    pub residual_goal: String,
+    pub obstruction: String,
+    pub needed_result: String,
+    pub capability_key: String,
+    pub owner_chapter_id: String,
+    pub owner_paths: Vec<String>,
+    pub attempted_alternatives: Vec<String>,
+    pub blocker_ids: Vec<String>,
+    pub evaluation_run_id: String,
+    pub decision: Value,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
 pub struct PackageConsumer {
     pub id: String,
     pub package_id: String,
@@ -293,6 +316,7 @@ pub struct SwarmState {
     pub cost: Cost,
     pub agents: Agents,
     pub coordinator_build: CoordinatorBuild,
+    pub upstream_requests: HashMap<String, UpstreamRequest>,
     pub capability_packages: HashMap<String, CapabilityPackage>,
     pub package_consumers: HashMap<String, PackageConsumer>,
     pub package_steps: HashMap<String, PackageStep>,
@@ -358,6 +382,7 @@ pub struct GlobalDelta {
     pub cost: Option<Cost>,
     pub agents: Option<Agents>,
     pub coordinator_build: Option<CoordinatorBuild>,
+    pub upstream_requests: Option<HashMap<String, UpstreamRequest>>,
     pub capability_packages: Option<HashMap<String, CapabilityPackage>>,
     pub package_consumers: Option<HashMap<String, PackageConsumer>>,
     pub package_steps: Option<HashMap<String, PackageStep>>,
@@ -588,6 +613,10 @@ impl DashboardModel {
         apply_optional(
             &mut self.state.coordinator_build,
             delta.globals.coordinator_build,
+        );
+        apply_optional(
+            &mut self.state.upstream_requests,
+            delta.globals.upstream_requests,
         );
         apply_optional(
             &mut self.state.capability_packages,
@@ -831,7 +860,7 @@ impl DashboardModel {
         self.loading_package_runs = None;
         self.package_selected = self
             .package_selected
-            .min(self.packages().len().saturating_sub(1));
+            .min(self.upstream_requests().len().saturating_sub(1));
         self.scroll = 0;
         self.detail_max_scroll = 0;
         self.detail_follow_tail = true;
@@ -869,6 +898,36 @@ impl DashboardModel {
 
     pub fn selected_package(&self) -> Option<&CapabilityPackage> {
         self.packages().get(self.package_selected).copied()
+    }
+
+    pub fn upstream_requests(&self) -> Vec<&UpstreamRequest> {
+        let mut requests = self.state.upstream_requests.values().collect::<Vec<_>>();
+        requests.sort_by(|left, right| {
+            upstream_request_status_rank(&left.status)
+                .cmp(&upstream_request_status_rank(&right.status))
+                .then(right.updated_at.cmp(&left.updated_at))
+                .then(left.id.cmp(&right.id))
+        });
+        requests
+    }
+
+    pub fn selected_upstream_request(&self) -> Option<&UpstreamRequest> {
+        self.upstream_requests().get(self.package_selected).copied()
+    }
+
+    pub fn move_upstream_request_selection(&mut self, delta: isize) {
+        let length = self.upstream_requests().len();
+        if length == 0 {
+            self.package_selected = 0;
+            return;
+        }
+        self.package_selected = self
+            .package_selected
+            .saturating_add_signed(delta)
+            .min(length - 1);
+        self.scroll = 0;
+        self.detail_max_scroll = 0;
+        self.detail_follow_tail = true;
     }
 
     pub fn move_package_selection(&mut self, delta: isize) {
@@ -1201,6 +1260,17 @@ fn package_status_rank(status: &str) -> u8 {
         | "parked"
         | "superseded" => 2,
         _ => 0,
+    }
+}
+
+fn upstream_request_status_rank(status: &str) -> u8 {
+    match status {
+        "evaluating" => 0,
+        "open" => 1,
+        "needs_human" => 2,
+        "rejected" => 3,
+        "verified" => 4,
+        _ => 5,
     }
 }
 

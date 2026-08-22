@@ -28,7 +28,7 @@ pub fn draw(frame: &mut Frame<'_>, model: &mut DashboardModel) {
     if model.detail {
         draw_detail(frame, model);
     } else if model.package_detail {
-        draw_package_detail(frame, model);
+        draw_upstream_request_detail(frame, model);
     } else {
         draw_dashboard(frame, model);
     }
@@ -183,11 +183,151 @@ fn draw_dashboard(frame: &mut Frame<'_>, model: &DashboardModel) {
     draw_status(frame, model, layout[4]);
     frame.render_widget(
         Paragraph::new(
-            "↑↓ select  Enter/i inspect  / search  k packages  p pause/resume  r reload TUI  d detach  q stop",
+            "↑↓ select  Enter/i inspect  / search  u upstream requests  p pause/resume  r reload TUI  d detach  q stop",
         )
         .style(Style::default().fg(MUTED))
         .alignment(Alignment::Center),
         layout[5],
+    );
+}
+
+fn draw_upstream_request_detail(frame: &mut Frame<'_>, model: &mut DashboardModel) {
+    let requests = model.upstream_requests();
+    let selected_id = model
+        .selected_upstream_request()
+        .map(|request| request.id.clone());
+    let layout = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(38), Constraint::Percentage(62)])
+        .split(frame.area());
+    let rows = if requests.is_empty() {
+        vec![Row::new(["—", "No upstream requests", ""])]
+    } else {
+        requests
+            .iter()
+            .map(|request| {
+                Row::new([
+                    request.status.clone(),
+                    request.blocked_declaration.clone(),
+                    request.consumer_chapter_id.clone(),
+                ])
+            })
+            .collect()
+    };
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(14),
+            Constraint::Min(24),
+            Constraint::Min(18),
+        ],
+    )
+    .header(
+        Row::new(["Status", "Blocked declaration", "Consumer"]).style(Style::default().fg(CYAN)),
+    )
+    .row_highlight_style(Style::default().bg(SURFACE).add_modifier(Modifier::BOLD))
+    .highlight_symbol("▸ ")
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Upstream requests "),
+    );
+    let mut state =
+        TableState::default().with_selected(selected_id.as_ref().map(|_| model.package_selected));
+    frame.render_stateful_widget(table, layout[0], &mut state);
+
+    let mut lines = Vec::new();
+    if let Some(request_id) = selected_id {
+        let request = &model.state.upstream_requests[&request_id];
+        lines.push(Line::styled(
+            request.blocked_declaration.clone(),
+            Style::default().fg(YELLOW).add_modifier(Modifier::BOLD),
+        ));
+        lines.push(Line::from(format!(
+            "{} · consumer {} · evaluator {}",
+            request.status,
+            request.consumer_chapter_id,
+            if request.owner_chapter_id.is_empty() {
+                "placement triage"
+            } else {
+                &request.owner_chapter_id
+            }
+        )));
+        lines.push(Line::from(format!("Path: {}", request.consumer_path)));
+        if !request.residual_goal.is_empty() {
+            lines.push(Line::from(""));
+            lines.push(Line::styled("Downstream goal", Style::default().fg(CYAN)));
+            lines.push(Line::from(request.residual_goal.clone()));
+        }
+        if !request.needed_result.is_empty() {
+            lines.push(Line::from(""));
+            lines.push(Line::styled("Result requested", Style::default().fg(CYAN)));
+            lines.push(Line::from(request.needed_result.clone()));
+        }
+        if !request.obstruction.is_empty() {
+            lines.push(Line::from(""));
+            lines.push(Line::styled("Observed problem", Style::default().fg(CYAN)));
+            lines.push(Line::from(request.obstruction.clone()));
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::styled(
+            "Suspected upstream paths",
+            Style::default().fg(CYAN),
+        ));
+        if request.owner_paths.is_empty() {
+            lines.push(Line::from(
+                "  none yet; consumer-side placement triage required",
+            ));
+        } else {
+            for path in &request.owner_paths {
+                lines.push(Line::from(format!("  {path}")));
+            }
+        }
+        if !request.attempted_alternatives.is_empty() {
+            lines.push(Line::styled(
+                "Checked alternatives",
+                Style::default().fg(CYAN),
+            ));
+            for attempt in &request.attempted_alternatives {
+                lines.push(Line::from(format!("  {attempt}")));
+            }
+        }
+        if let Some(action) = request
+            .decision
+            .get("action")
+            .and_then(|value| value.as_str())
+        {
+            lines.push(Line::from(""));
+            lines.push(Line::styled("Evaluation", Style::default().fg(CYAN)));
+            lines.push(Line::from(format!("  action: {action}")));
+            if let Some(diagnosis) = request
+                .decision
+                .get("diagnosis")
+                .and_then(|value| value.as_str())
+            {
+                lines.push(Line::from(format!("  diagnosis: {diagnosis}")));
+            }
+            if let Some(explanation) = request
+                .decision
+                .get("explanation")
+                .and_then(|value| value.as_str())
+            {
+                lines.push(Line::from(format!("  {explanation}")));
+            }
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::styled(
+            "↑↓ select request  u/Esc/q back",
+            Style::default().fg(MUTED),
+        ));
+    }
+    frame.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Request evidence and decision "),
+        ),
+        layout[1],
     );
 }
 
@@ -568,25 +708,22 @@ fn summary(model: &DashboardModel) -> Paragraph<'static> {
             )),
         ]),
         Line::from(format!(
-            "Agents {}/{} · {} · waiting start {}    {}    Packages {} · active {} · waiting {}",
+            "Agents {}/{} · {} · waiting start {}    {}    Upstream requests {} · evaluating {} · needs human {}",
             state.agents.active,
             state.agents.maximum,
             agent_detail,
             state.agents.queued,
             build,
-            state.capability_packages.len(),
+            state.upstream_requests.len(),
             state
-                .capability_packages
+                .upstream_requests
                 .values()
-                .filter(|package| matches!(
-                    package.status.as_str(),
-                    "investigating" | "planned" | "implementing" | "validating" | "integrating"
-                ))
+                .filter(|request| request.status == "evaluating")
                 .count(),
             state
-                .capability_packages
+                .upstream_requests
                 .values()
-                .filter(|package| package.status.starts_with("waiting_"))
+                .filter(|request| request.status == "needs_human")
                 .count(),
         )),
         Line::from(format!(
@@ -1943,7 +2080,7 @@ mod tests {
     }
 
     #[test]
-    fn renders_package_lifecycle_and_dossier() {
+    fn renders_upstream_request_evidence_and_hides_legacy_packages() {
         let mut model = DashboardModel::loading("pipeline".into(), String::new());
         model
             .apply(WireEvent {
@@ -1952,6 +2089,18 @@ mod tests {
                 status: "running".into(),
                 result: None,
                 snapshot: Some(serde_json::json!({
+                    "upstream_requests": {"upstream-1": {
+                        "id": "upstream-1", "status": "evaluating",
+                        "consumer_chapter_id": "book/chapter-02",
+                        "consumer_path": "lean/Book/Chapter02.lean",
+                        "blocked_declaration": "Book.target",
+                        "residual_goal": "⊢ Result x",
+                        "needed_result": "A transport bridge",
+                        "owner_chapter_id": "book/chapter-01",
+                        "owner_paths": ["lean/Book/Chapter01.lean"],
+                        "attempted_alternatives": ["simp", "exact existing"],
+                        "updated_at": "2026-08-22T00:00:00Z"
+                    }},
                     "capability_packages": {"package-1": {
                         "id": "package-1", "capability_key": "book.transport",
                         "title": "Transport bridge", "mathematical_objective": "Implement the shared bridge",
@@ -1999,37 +2148,14 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| draw(frame, &mut model)).unwrap();
         let rendered = terminal.backend().to_string();
-        assert!(rendered.contains("Capability packages"));
-        assert!(rendered.contains("Transport bridge"));
+        assert!(rendered.contains("Upstream requests"));
         assert!(rendered.contains("Book.target"));
-        assert!(rendered.contains("Add bridge"));
-        assert!(rendered.contains("worker-1"));
-        assert!(rendered.contains("Book.bridge"));
-        assert!(rendered.contains("steward-1"));
-        assert!(rendered.contains("Current handoff"));
-        assert!(rendered.contains("is running a Steward turn"));
-        assert!(rendered.contains("prove naturality"));
-        assert!(rendered.contains("Mathlib.Transport"));
-        assert!(rendered.contains("Enter runs/timeline"));
-        assert!(rendered.contains("Waiting ordinary tasks: book/chapter-02:prove"));
-
-        model.enter_package_run_detail("package-1".into());
-        model.apply_chapter_runs(crate::model::ChapterRuns {
-            work_unit_id: "package-1".into(),
-            selected_run_id: Some("b572f9ce7115".into()),
-            runs: vec![crate::model::HistoricalRun {
-                id: "b572f9ce7115".into(),
-                role: "package_steward".into(),
-                round: 6,
-                status: "succeeded".into(),
-                ..crate::model::HistoricalRun::default()
-            }],
-            ..crate::model::ChapterRuns::default()
-        });
-        terminal.draw(|frame| draw(frame, &mut model)).unwrap();
-        let run_detail = terminal.backend().to_string();
-        assert!(run_detail.contains("Package agent detail"));
-        assert!(run_detail.contains("Steward · round 6 · b572f9c"));
+        assert!(rendered.contains("A transport bridge"));
+        assert!(rendered.contains("book/chapter-01"));
+        assert!(rendered.contains("lean/Book/Chapter01.lean"));
+        assert!(rendered.contains("exact existing"));
+        assert!(!rendered.contains("Transport bridge"));
+        assert!(!rendered.contains("Steward"));
     }
 
     #[test]
