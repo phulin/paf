@@ -1336,14 +1336,24 @@ class Orchestrator:
                 decision=report,
             )
         elif disposition == "needs_scope" and not attempt.agent.changed:
-            additional = [
-                str(value)
-                for value in report.get("additional_work_unit_ids", ())
-                if str(value) in self._work_units_by_id and str(value) not in context_ids
+            requested_paths = [
+                str(value).strip()
+                for value in report.get("additional_paths", ())
+                if str(value).strip()
             ]
+            additional = sorted(
+                {
+                    work_unit_id
+                    for path in requested_paths
+                    for work_unit_id in self._path_owner_ids(path)
+                    if work_unit_id not in context_ids
+                },
+                key=self._work_unit_order.__getitem__,
+            )
             await self.state.update_steward_case(
                 case_id,
                 status="needs_scope",
+                requested_paths=requested_paths,
                 requested_work_unit_ids=additional,
                 implementation_run_ids=run_ids,
                 decision=report,

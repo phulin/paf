@@ -103,7 +103,7 @@ def test_report_schemas_contain_only_fields_used_by_each_active_agent() -> None:
             "disposition",
             "placement",
             "consumer_routes",
-            "additional_work_unit_ids",
+            "additional_paths",
             "validation_evidence",
         },
         "package_steward": {
@@ -169,6 +169,56 @@ def test_report_schemas_contain_only_fields_used_by_each_active_agent() -> None:
     for key, fields in expected.items():
         assert set(REPORT_SCHEMAS[key]["properties"]) == fields
         assert set(REPORT_SCHEMAS[key]["required"]) == fields
+
+
+def test_upstream_implementation_prompt_is_a_readable_assignment(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = config.chapters[0]
+    prompt = CodexExecutor(config, StateStore(config)).build_upstream_implementation_prompt(
+        chapter,
+        {
+            "case": {
+                "case_id": "opaque-case-123",
+                "request_ids": ["opaque-request-456"],
+                "title": "Repair the completion bridge",
+                "needed_result": "Expose the comparison needed by the completed branch proof.",
+                "rationale": "The consumer and upstream interface must be checked together.",
+                "acceptance_tests": ["The downstream chapter builds."],
+            },
+            "requests": {
+                "opaque-request-456": {
+                    "blocked_declaration": "Book.completed_branch",
+                    "consumer_path": "lean/Book/Chapter01.lean",
+                    "obstruction": "The available theorem identifies only one invariant.",
+                    "needed_result": "A comparison of both local invariants.",
+                    "residual_goal": "⊢ e * f = n",
+                    "attempted_alternatives": ["Applied the existing one-invariant theorem."],
+                }
+            },
+            "work_units": [
+                {
+                    "id": "opaque-unit-789",
+                    "title": "Completed branches",
+                    "textbook_source": "books/example.md",
+                    "textbook_lines": [40, 75],
+                    "lean_scope": ["lean/Book/Chapter01.lean"],
+                }
+            ],
+        },
+    )
+
+    assert "## Assignment" in prompt
+    assert "Repair the completion bridge" in prompt
+    assert "### Downstream failures to repair" in prompt
+    assert "### Relevant modules and source material" in prompt
+    assert "## Rules shared by all Lean stages" in prompt
+    assert "### Keep imports focused and chronological" in prompt
+    assert "## PAF requirements" in prompt
+    assert "Deduplicated case" not in prompt
+    assert "```json" not in prompt
+    assert "opaque-case-123" not in prompt
+    assert "opaque-request-456" not in prompt
+    assert "opaque-unit-789" not in prompt
 
 
 def test_report_schema_avoids_unsupported_codex_keywords() -> None:

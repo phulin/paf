@@ -523,7 +523,7 @@ _UPSTREAM_IMPLEMENTATION_PROPERTIES: dict[str, Any] = {
         "type": "array",
         "items": {"type": "string", "minLength": 1},
     },
-    "additional_work_unit_ids": {
+    "additional_paths": {
         "type": "array",
         "items": {"type": "string", "minLength": 1},
     },
@@ -1549,7 +1549,9 @@ class CodexExecutor:
         role: str = "",
         proof_targets: Iterable[ProofTarget | dict[str, Any]] = (),
     ) -> str:
-        if role == PACKAGE_WORKER_ROLE:
+        if role == UPSTREAM_IMPLEMENTATION_ROLE:
+            prompt_path = UPSTREAM_IMPLEMENTATION_PROMPT_PATH
+        elif role == PACKAGE_WORKER_ROLE:
             prompt_path = PACKAGE_WORKER_PROMPT_PATH
         elif role == WARNING_CLEANUP_ROLE:
             prompt_path = WARNING_CLEANUP_PROMPT_PATH
@@ -1584,9 +1586,13 @@ class CodexExecutor:
             base = render_prompt(template.replace("{repair_instruction}", instruction), chapter)
         else:
             base = render_prompt(template, chapter)
+        omit_common = role not in {PACKAGE_WORKER_ROLE, UPSTREAM_IMPLEMENTATION_ROLE} and stage in (
+            Stage.DISCOVER,
+            Stage.PROVE,
+        )
         common = (
             ""
-            if role != PACKAGE_WORKER_ROLE and stage in (Stage.DISCOVER, Stage.PROVE)
+            if omit_common
             else render_prompt(COMMON_PROMPT_PATH.read_text(encoding="utf-8"), chapter)
         )
         scope = "\n".join(f"- `{item}`" for item in chapter.scope)
@@ -1755,6 +1761,11 @@ steps, and return a complete package mutation report."""
 assigned paths in the package overlay, and report exact validation and
 remaining evidence. You may not change placement, scope, dependencies, consumers, or package
 lifecycle."""
+        elif role == UPSTREAM_IMPLEMENTATION_ROLE:
+            stage_contract = """This is a focused cross-module repair. Diagnose the downstream
+failure together with its plausible upstream interfaces, decide the correct mathematical placement,
+and make only the smallest justified repair within the locked scope. Do not assume the requesting
+proof agent's proposed API or placement is correct."""
         validation_contract = {
             Stage.DISCOVER: "PAF validates and saves the reported source dependencies.",
             Stage.FORMALIZE: "PAF independently checks the allowed file changes, placeholders, "
@@ -2056,15 +2067,7 @@ distinguish proof evidence from build diagnostics, and avoid repeating known fai
         resume_run_id: str = "",
         resume_prompt: str = "",
     ) -> AgentResult:
-        prompt = (
-            UPSTREAM_IMPLEMENTATION_PROMPT_PATH.read_text(encoding="utf-8").rstrip()
-            + "\n\n## Deduplicated case\n\n```json\n"
-            + json.dumps(dossier, indent=2)
-            + "\n```\n"
-            + "\n\n## Writable locked scope\n\n"
-            + "\n".join(f"- `{path}`" for path in assignment.scope)
-            + "\n"
-        )
+        prompt = self.build_upstream_implementation_prompt(assignment, dossier)
         return await self._run_prompt(
             assignment,
             Stage.PROVE,
@@ -2075,6 +2078,97 @@ distinguish proof evidence from build diagnostics, and avoid repeating known fai
             resume_run_id=resume_run_id,
             resume_prompt=resume_prompt or CAPACITY_RESUME_PROMPT,
         )
+
+    def build_upstream_implementation_prompt(
+        self,
+        assignment: WorkUnitLike,
+        dossier: dict[str, Any],
+    ) -> str:
+        """Render a case as a readable repair assignment without coordinator identifiers."""
+
+        raw_case = dossier.get("case")
+        case: dict[str, Any] = raw_case if isinstance(raw_case, dict) else {}
+        requests = dossier.get("requests")
+        request_values = (
+            [value for value in requests.values() if isinstance(value, dict)]
+            if isinstance(requests, dict)
+            else []
+        )
+        work_units = dossier.get("work_units")
+        work_unit_values = (
+            [value for value in work_units if isinstance(value, dict)]
+            if isinstance(work_units, list)
+            else []
+        )
+
+        lines = [
+            self.build_prompt(
+                assignment,
+                Stage.PROVE,
+                role=UPSTREAM_IMPLEMENTATION_ROLE,
+            ).rstrip(),
+            "",
+            "## Assignment",
+            "",
+            f"### {str(case.get('title', '')).strip() or 'Repair the shared Lean interface'}",
+            "",
+            str(case.get("needed_result", "")).strip(),
+        ]
+        rationale = str(case.get("rationale", "")).strip()
+        if rationale:
+            lines.extend(["", "Why this needs cross-module investigation:", "", rationale])
+
+        lines.extend(["", "### Downstream failures to repair", ""])
+        for index, request in enumerate(request_values, start=1):
+            declaration = str(request.get("blocked_declaration", "")).strip() or "Unnamed proof"
+            path = str(request.get("consumer_path", "")).strip()
+            location = f" in `{path}`" if path else ""
+            lines.append(f"{index}. **`{declaration}`{location}**")
+            for label, key in (
+                ("Observed obstruction", "obstruction"),
+                ("Capability believed to be needed", "needed_result"),
+                ("Remaining Lean goal", "residual_goal"),
+            ):
+                value = str(request.get(key, "")).strip()
+                if value:
+                    lines.extend(
+                        [f"   - {label}:", "", *[f"     {line}" for line in value.splitlines()]]
+                    )
+            attempts = request.get("attempted_alternatives")
+            if isinstance(attempts, list) and attempts:
+                lines.append("   - Routes already checked:")
+                lines.extend(
+                    f"     - {str(attempt).strip()}" for attempt in attempts if str(attempt).strip()
+                )
+
+        lines.extend(["", "### Relevant modules and source material", ""])
+        for unit in work_unit_values:
+            title = str(unit.get("title", "")).strip() or "Relevant work unit"
+            source = str(unit.get("textbook_source", "")).strip()
+            span = unit.get("textbook_lines")
+            source_ref = f"`{source}`"
+            if isinstance(span, list) and len(span) == 2:
+                source_ref += f", lines {span[0]}-{span[1]}"
+            lines.extend([f"- **{title}**", f"  - Textbook: {source_ref}"])
+            scope = unit.get("lean_scope")
+            if isinstance(scope, list):
+                lines.extend(f"  - Lean: `{path}`" for path in scope)
+
+        acceptance_tests = list(case.get("acceptance_tests", ()))
+        for request in request_values:
+            tests = request.get("acceptance_tests")
+            if isinstance(tests, list):
+                acceptance_tests.extend(tests)
+        acceptance_tests = list(
+            dict.fromkeys(str(test).strip() for test in acceptance_tests if str(test).strip())
+        )
+        if acceptance_tests:
+            lines.extend(["", "### Acceptance targets", ""])
+            lines.extend(f"- {test}" for test in acceptance_tests)
+
+        lines.extend(["", "### Writable locked scope", ""])
+        lines.extend(f"- `{path}`" for path in assignment.scope)
+        return "\n".join(lines) + "\n"
 
     async def _run_prompt(
         self,

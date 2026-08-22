@@ -183,7 +183,7 @@ fn draw_dashboard(frame: &mut Frame<'_>, model: &DashboardModel) {
     draw_status(frame, model, layout[4]);
     frame.render_widget(
         Paragraph::new(
-            "↑↓ select  Enter/i inspect  / search  u steward cases  p pause/resume  r reload TUI  d detach  q stop",
+            "↑↓ select  Enter/i inspect  / search  u assignments  p pause/resume  r reload TUI  d detach  q stop",
         )
         .style(Style::default().fg(MUTED))
         .alignment(Alignment::Center),
@@ -199,7 +199,7 @@ fn draw_upstream_request_detail(frame: &mut Frame<'_>, model: &mut DashboardMode
         .constraints([Constraint::Percentage(38), Constraint::Percentage(62)])
         .split(frame.area());
     let rows = if cases.is_empty() {
-        vec![Row::new(["—", "No steward cases", ""])]
+        vec![Row::new(["—", "No cross-module assignments", ""])]
     } else {
         cases
             .iter()
@@ -220,13 +220,13 @@ fn draw_upstream_request_detail(frame: &mut Frame<'_>, model: &mut DashboardMode
             Constraint::Min(18),
         ],
     )
-    .header(Row::new(["Status", "Deduplicated case", "Requests"]).style(Style::default().fg(CYAN)))
+    .header(Row::new(["Status", "Assignment", "Reports"]).style(Style::default().fg(CYAN)))
     .row_highlight_style(Style::default().bg(SURFACE).add_modifier(Modifier::BOLD))
     .highlight_symbol("▸ ")
     .block(
         Block::default()
             .borders(Borders::ALL)
-            .title(" Global steward cases "),
+            .title(" Cross-module assignments "),
     );
     let mut state =
         TableState::default().with_selected(selected_id.as_ref().map(|_| model.steward_selected));
@@ -669,7 +669,7 @@ fn summary(model: &DashboardModel) -> Paragraph<'static> {
             )),
         ]),
         Line::from(format!(
-            "Agents {}/{} · {} · waiting start {}    {}    Steward cases {} · implementing {} · needs human {}",
+            "Agents {}/{} · {} · waiting start {}    {}    Assignments {} · implementing {} · needs human {}",
             state.agents.active,
             state.agents.maximum,
             agent_detail,
@@ -1006,7 +1006,7 @@ fn draw_detail(frame: &mut Frame<'_>, model: &mut DashboardModel) {
         .split(frame.area());
     let heading = if let Some(case) = steward_case {
         format!(
-            "Steward case · {} · {} · {} request(s)",
+            "Cross-module assignment · {} · {} · {} report(s)",
             case.title,
             case.status,
             case.request_ids.len()
@@ -2124,7 +2124,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|frame| draw(frame, &mut model)).unwrap();
         let rendered = terminal.backend().to_string();
-        assert!(rendered.contains("Global steward cases"));
+        assert!(rendered.contains("Cross-module assignments"));
         assert!(rendered.contains("Canonical completion transport"));
         assert!(rendered.contains("A transport bridge"));
         assert!(rendered.contains("book/chapter-01"));
