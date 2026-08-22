@@ -580,6 +580,47 @@ async def test_scope_import_stages_every_file_before_touching_live_sources(
 
 
 @pytest.mark.asyncio
+async def test_scope_import_atomically_replaces_existing_live_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager, chapter = fuse_manager(write_project(tmp_path, chapters="chapters = [1]"))
+    live = tmp_path / "lean" / "Book" / "Chapter01.lean"
+    live.parent.mkdir(parents=True)
+    live.write_text("def value := 1\n", encoding="utf-8")
+    base_manifest = isolation_module.scoped_manifest(tmp_path, chapter)
+    merged = tmp_path / "merged-atomic-replacement"
+    merged_live = merged / live.relative_to(tmp_path)
+    merged_live.parent.mkdir(parents=True)
+    merged_live.write_text("def value := 2\n", encoding="utf-8")
+    merged_manifest = isolation_module.scoped_manifest(merged, chapter)
+    original_replace = os.replace
+
+    def assert_live_name_present(source: Any, destination: Any) -> None:
+        source_path = Path(source)
+        destination_path = Path(destination)
+        if ".paf-stage-" in source_path.name:
+            assert destination_path == live
+            assert live.is_file()
+        original_replace(source, destination)
+
+    monkeypatch.setattr(os, "replace", assert_live_name_present)
+
+    result = await manager.import_changes(
+        chapter,
+        generation=0,
+        cache_generation=0,
+        base_manifest=base_manifest,
+        merged_manifest=merged_manifest,
+        merged_root=merged,
+        changed=(live.relative_to(tmp_path).as_posix(),),
+    )
+
+    assert result.accepted
+    assert live.read_text(encoding="utf-8") == "def value := 2\n"
+    assert not list(tmp_path.rglob("*.paf-backup-*"))
+
+
+@pytest.mark.asyncio
 async def test_agent_cache_writes_are_discarded_and_coordinator_publishes_delta(
     tmp_path: Path,
 ) -> None:

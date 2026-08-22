@@ -1140,19 +1140,26 @@ class FuseOverlayIsolation:
                             backup = destination.with_name(
                                 f".{destination.name}.paf-backup-{transaction}"
                             )
-                            os.replace(destination, backup)
+                            # Retain the old inode for rollback without first
+                            # removing the live name. Readers do not take the
+                            # integration lock, so moving the destination aside
+                            # here exposed a brief ENOENT window before the
+                            # staged source was installed.
+                            os.link(destination, backup, follow_symlinks=False)
                             backups[relative] = backup
                         committed.append(relative)
                         if relative in staged:
                             os.replace(staged[relative], destination)
+                        elif os.path.lexists(destination):
+                            destination.unlink()
                     committed_all = True
                 except BaseException:
                     for relative in reversed(committed):
                         destination = self.settings.repo / relative
-                        if os.path.lexists(destination):
-                            destination.unlink()
                         if backup := backups.get(relative):
                             os.replace(backup, destination)
+                        elif os.path.lexists(destination):
+                            destination.unlink()
                     raise
                 finally:
                     for temporary in staged.values():
