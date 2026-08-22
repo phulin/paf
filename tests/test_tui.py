@@ -306,6 +306,13 @@ async def test_chapter_run_projection_lists_history_and_selected_recent_activity
     assert state.dashboard_run_prompt("missing-run") is None
 
     transcript_path = state.logs_dir / f"{formalize.id}.jsonl"
+    long_update = json.dumps(
+        {
+            "complete": False,
+            "summary": "working through the proof",
+            "issues": ["x" * 1_200],
+        }
+    )
     transcript_path.write_text(
         "".join(
             json.dumps(
@@ -323,11 +330,26 @@ async def test_chapter_run_projection_lists_history_and_selected_recent_activity
         ),
         encoding="utf-8",
     )
+    with transcript_path.open("a", encoding="utf-8") as transcript:
+        transcript.write(
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "id": "message",
+                        "type": "agent_message",
+                        "text": long_update,
+                    },
+                }
+            )
+            + "\n"
+        )
     formalize.log_path = str(transcript_path)
     formalize.project_root = str(tmp_path)
     full_timeline = state.dashboard_run_timeline(formalize.id)
     assert full_timeline is not None
-    assert len(full_timeline["recent"]) == 150
+    assert len(full_timeline["recent"]) == 151
+    assert full_timeline["recent"][-1]["detail"] == long_update
 
 
 async def test_package_run_projection_lists_only_its_steward_and_workers(tmp_path: Path) -> None:

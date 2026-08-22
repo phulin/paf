@@ -150,6 +150,7 @@ class AgentActivity:
     recent: list[ActivityEntry] = field(default_factory=list)
     active_items: dict[str, dict[str, str]] = field(default_factory=dict, repr=False)
     recent_limit: int | None = field(default=MAX_RECENT_EVENTS, repr=False, compare=False)
+    detail_limit: int | None = field(default=MAX_DETAIL_CHARS, repr=False, compare=False)
 
     @property
     def work_unit_id(self) -> str:
@@ -175,6 +176,12 @@ class AgentActivity:
     ) -> None:
         self.sequence += 1
         self.updated_at = at or activity_timestamp()
+        if self.detail_limit is None:
+            visible_detail = detail.strip()
+        elif preserve_detail_layout:
+            visible_detail = _compact_block(detail, limit=self.detail_limit)
+        else:
+            visible_detail = _compact(detail, limit=self.detail_limit)
         self.recent.append(
             ActivityEntry(
                 sequence=self.sequence,
@@ -182,7 +189,7 @@ class AgentActivity:
                 kind=kind,
                 status=status,
                 title=_compact(title, limit=240),
-                detail=_compact_block(detail) if preserve_detail_layout else _compact(detail),
+                detail=visible_detail,
             )
         )
         if self.recent_limit is not None:
@@ -381,6 +388,7 @@ class AgentActivity:
         value["todo_completed"], value["todo_total"] = self.todo_progress
         value.pop("active_items", None)
         value.pop("recent_limit", None)
+        value.pop("detail_limit", None)
         return value
 
     @classmethod
@@ -392,6 +400,7 @@ class AgentActivity:
         fields.pop("todo_completed", None)
         fields.pop("todo_total", None)
         fields.pop("recent_limit", None)
+        fields.pop("detail_limit", None)
         fields["recent"] = [ActivityEntry(**entry) for entry in fields.get("recent", [])]
         return cls(**fields)
 
@@ -513,6 +522,7 @@ class ActivityStore:
         *,
         workspace_root: Path,
         maximum_events: int | None = MAX_RECENT_EVENTS,
+        detail_limit: int | None = MAX_DETAIL_CHARS,
         cache: bool = True,
     ) -> AgentActivity | None:
         if not log_path.is_file():
@@ -523,6 +533,7 @@ class ActivityStore:
             chapter_id=chapter_id,
             stage=stage,
             recent_limit=maximum_events,
+            detail_limit=detail_limit,
         )
         with log_path.open("rb") as log:
             for line in log:

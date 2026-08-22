@@ -483,6 +483,54 @@ def test_preserves_the_complete_latest_agent_update(tmp_path: Path) -> None:
     assert loaded.latest_summary == update
 
 
+def test_full_timeline_replay_does_not_truncate_agent_updates(tmp_path: Path) -> None:
+    store = ActivityStore(tmp_path / "logs")
+    update = json.dumps(
+        {
+            "complete": False,
+            "summary": "working through the proof",
+            "issues": ["x" * 1_200],
+        }
+    )
+    log_path = store.logs_dir / "run.jsonl"
+    log_path.parent.mkdir(parents=True)
+    log_path.write_text(
+        json.dumps(
+            {
+                "type": "item.completed",
+                "item": {"id": "message", "type": "agent_message", "text": update},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    compact = store.replay(
+        "run",
+        "chapter",
+        "review",
+        log_path,
+        workspace_root=tmp_path,
+        cache=False,
+    )
+    assert compact is not None
+    assert len(compact.recent[-1].detail) == 800
+
+    full = store.replay(
+        "run",
+        "chapter",
+        "review",
+        log_path,
+        workspace_root=tmp_path,
+        maximum_events=None,
+        detail_limit=None,
+        cache=False,
+    )
+    assert full is not None
+    assert full.recent[-1].detail == update
+    assert json.loads(full.recent[-1].detail)["issues"] == ["x" * 1_200]
+
+
 def test_bare_exit_status_is_not_promoted_to_an_error(tmp_path: Path) -> None:
     activities = []
     for code in (2, 128):

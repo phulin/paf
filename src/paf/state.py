@@ -2924,6 +2924,7 @@ class StateStore:
             Path(run.log_path),
             workspace_root=Path(run.project_root or self.config.settings.repo),
             maximum_events=None,
+            detail_limit=None,
             cache=False,
         )
         return activity.as_dict() if activity is not None else None
