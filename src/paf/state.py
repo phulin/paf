@@ -457,6 +457,9 @@ class StateStore:
         self.proof_review_requests: dict[str, dict[str, Any]] = {}
         self.upstream_requests: dict[str, dict[str, Any]] = {}
         self.steward_cases: dict[str, dict[str, Any]] = {}
+        self.coordination_signals: dict[str, dict[str, Any]] = {}
+        self.coordination_cases: dict[str, dict[str, Any]] = {}
+        self.coordination_jobs: dict[str, dict[str, Any]] = {}
         self.package_state = PackageState()
         self.proof_blockers: dict[str, dict[str, Any]] = {}
         self.routing_metrics: dict[str, int] = {}
@@ -539,6 +542,22 @@ class StateStore:
                     for case_id, value in raw_steward_cases.items()
                     if isinstance(case_id, str) and isinstance(value, dict)
                 }
+            for section in (
+                "coordination_signals",
+                "coordination_cases",
+                "coordination_jobs",
+            ):
+                raw_values = raw.get(section)
+                if isinstance(raw_values, dict):
+                    setattr(
+                        self,
+                        section,
+                        {
+                            str(item_id): dict(value)
+                            for item_id, value in raw_values.items()
+                            if isinstance(item_id, str) and isinstance(value, dict)
+                        },
+                    )
             raw_proof_blockers = raw.get("proof_blockers")
             if isinstance(raw_proof_blockers, dict):
                 self.proof_blockers = {
@@ -1176,6 +1195,9 @@ class StateStore:
                 "proof_review_requests": self.proof_review_requests,
                 "upstream_requests": self.upstream_requests,
                 "steward_cases": self.steward_cases,
+                "coordination_signals": self.coordination_signals,
+                "coordination_cases": self.coordination_cases,
+                "coordination_jobs": self.coordination_jobs,
                 "proof_blockers": self.proof_blockers,
                 "thread_cumulative_usage": {
                     thread_id: self._usage_dict(usage)
@@ -2685,6 +2707,139 @@ class StateStore:
         self._mark_dirty(global_state=False, sections={"steward_cases"})
         await self._persist()
         return True
+
+    async def upsert_coordination_signals(
+        self,
+        signals: Iterable[dict[str, Any]],
+    ) -> tuple[str, ...]:
+        """Persist new detector evidence without rewriting unchanged signal rows."""
+
+        changed: list[str] = []
+        now = timestamp()
+        for raw in signals:
+            signal_id = str(raw.get("id", "")).strip()
+            if not signal_id:
+                raise ValueError("coordination signals require a stable id")
+            value = dict(raw)
+            previous = self.coordination_signals.get(signal_id)
+            if previous is not None:
+                value["created_at"] = str(previous.get("created_at") or now)
+                if value.get("evidence_digest") == previous.get("evidence_digest"):
+                    continue
+            else:
+                value["created_at"] = now
+            value["id"] = signal_id
+            value["updated_at"] = now
+            self.coordination_signals[signal_id] = value
+            changed.append(signal_id)
+        if changed:
+            self._mark_dirty(global_state=False, sections={"coordination_signals"})
+            await self._persist()
+        return tuple(changed)
+
+    async def sync_coordination_cases(
+        self,
+        proposals: Iterable[dict[str, Any]],
+    ) -> tuple[str, ...]:
+        """Merge deterministic signal groups while preserving active case generations."""
+
+        changed: list[str] = []
+        now = timestamp()
+        terminal = {"resolved", "parked", "failed"}
+        for raw in proposals:
+            case_id = str(raw.get("id", "")).strip()
+            if not case_id:
+                raise ValueError("coordination cases require a stable id")
+            signal_ids = tuple(
+                dict.fromkeys(
+                    str(value)
+                    for value in raw.get("signal_ids", ())
+                    if str(value) in self.coordination_signals
+                )
+            )
+            if not signal_ids:
+                continue
+            previous = self.coordination_cases.get(case_id)
+            if previous is None:
+                value = dict(raw)
+                value.update(
+                    {
+                        "id": case_id,
+                        "signal_ids": list(signal_ids),
+                        "status": "open",
+                        "generation": 1,
+                        "created_at": now,
+                        "updated_at": now,
+                    }
+                )
+            else:
+                prior_ids = tuple(map(str, previous.get("signal_ids", ())))
+                additions = tuple(value for value in signal_ids if value not in prior_ids)
+                if not additions:
+                    continue
+                value = dict(previous)
+                value["signal_ids"] = [*prior_ids, *additions]
+                value["work_unit_ids"] = list(
+                    dict.fromkeys(
+                        (
+                            *map(str, previous.get("work_unit_ids", ())),
+                            *map(str, raw.get("work_unit_ids", ())),
+                        )
+                    )
+                )
+                if str(previous.get("status")) in terminal:
+                    value["status"] = "open"
+                    value["generation"] = max(1, int(previous.get("generation", 1))) + 1
+                    value.pop("decision", None)
+                elif str(previous.get("status")) not in {"open", "triaging"}:
+                    value["pending_signal_ids"] = list(
+                        dict.fromkeys(
+                            (*map(str, previous.get("pending_signal_ids", ())), *additions)
+                        )
+                    )
+                value["updated_at"] = now
+            self.coordination_cases[case_id] = value
+            changed.append(case_id)
+        if changed:
+            self._mark_dirty(global_state=False, sections={"coordination_cases"})
+            await self._persist()
+        return tuple(changed)
+
+    async def update_coordination_case_generation(
+        self,
+        case_id: str,
+        generation: int,
+        **changes: Any,
+    ) -> bool:
+        case = self.coordination_cases.get(case_id)
+        if not isinstance(case, dict) or max(1, int(case.get("generation", 1))) != generation:
+            return False
+        case.update(changes)
+        case["updated_at"] = timestamp()
+        self._mark_dirty(global_state=False, sections={"coordination_cases"})
+        await self._persist()
+        return True
+
+    async def put_coordination_job(self, job: dict[str, Any]) -> None:
+        job_id = str(job.get("id", "")).strip()
+        case_id = str(job.get("case_id", "")).strip()
+        case = self.coordination_cases.get(case_id)
+        generation = int(job.get("case_generation", 0))
+        if not job_id or not isinstance(case, dict):
+            raise ValueError("coordination jobs require valid job and case ids")
+        if generation != max(1, int(case.get("generation", 1))):
+            raise ValueError("coordination job generation is stale")
+        now = timestamp()
+        previous = self.coordination_jobs.get(job_id, {})
+        self.coordination_jobs[job_id] = dict(job) | {
+            "id": job_id,
+            "case_id": case_id,
+            "case_generation": generation,
+            "created_at": str(previous.get("created_at") or now),
+            "updated_at": now,
+        }
+        self._mark_dirty(global_state=False, sections={"coordination_jobs"})
+        await self._persist()
 
     async def clear_upstream_coordination(self) -> None:
         """Drop outstanding observations and cases while retaining historical agent runs."""
