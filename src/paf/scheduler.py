@@ -1327,6 +1327,20 @@ class Orchestrator:
         run_ids = list(case.get("implementation_run_ids", ()))
         if attempt.run.id not in run_ids:
             run_ids.append(attempt.run.id)
+        if getattr(attempt.agent, "infrastructure_failed", False):
+            await self.state.update_steward_case(
+                case_id,
+                status="ready",
+                implementation_run_ids=run_ids,
+                decision={
+                    "complete": False,
+                    "summary": attempt.agent.error
+                    or "upstream implementation infrastructure failed; retry queued",
+                    "issues": [],
+                    "disposition": "retry",
+                },
+            )
+            return
         report = attempt.agent.report if isinstance(attempt.agent.report, dict) else {}
         disposition = str(report.get("disposition", "needs_human"))
         if disposition == "implemented" and attempt.agent.changed and attempt.validation.succeeded:
@@ -3085,6 +3099,15 @@ class Orchestrator:
                     "model capacity remained unavailable after the configured retries",
                 )
                 return StageOutcome(ExecutionDisposition.FAILED)
+            if getattr(attempt.agent, "infrastructure_failed", False):
+                await self.state.set_task(
+                    chapter.id,
+                    Stage.FORMALIZE,
+                    TaskStatus.INTERRUPTED,
+                    "formalization agent infrastructure failed: "
+                    + (attempt.agent.error or "tool/session initialization failed"),
+                )
+                return StageOutcome(ExecutionDisposition.WAITING)
             if not attempt.agent.succeeded or not attempt.validation.succeeded:
                 feedback = attempt.feedback()
                 continue
@@ -4992,6 +5015,21 @@ class Orchestrator:
                 complete=False,
                 run_id=attempt.run.id,
             )
+        if getattr(attempt.agent, "infrastructure_failed", False):
+            if not auxiliary_request:
+                await self.state.set_task(
+                    chapter.id,
+                    Stage.REVIEW,
+                    TaskStatus.INTERRUPTED,
+                    "review agent infrastructure failed: "
+                    + (attempt.agent.error or "tool/session initialization failed"),
+                )
+            return StageOutcome(
+                ExecutionDisposition.WAITING,
+                changed=attempt.agent.changed,
+                complete=False,
+                run_id=attempt.run.id,
+            )
         if attempt.validation.status is ValidationStatus.STALE_SNAPSHOT:
             if not auxiliary_request:
                 await self.state.set_task(
@@ -6877,7 +6915,6 @@ class Orchestrator:
         assigned_targets: tuple[ProofTarget, ...] = ()
         chunk_round = 0
         skipped_target_ids: set[str] = set()
-        blocking_upstream_request_ids: set[str] = set()
 
         def matches_target(value: dict[str, Any], target: ProofTarget) -> bool:
             path = str(value.get("path", value.get("consumer_path", "")))
@@ -6898,6 +6935,24 @@ class Orchestrator:
                     for blocker in blockers
                 )
             }
+
+        def active_upstream_request_ids(targets: Iterable[ProofTarget]) -> set[str]:
+            """Recover waits from the durable request ledger, including after a restart."""
+
+            selected = tuple(targets)
+            return {
+                request_id
+                for request_id, request in self.state.upstream_requests.items()
+                if request.get("consumer_chapter_id") == chapter.id
+                and request.get("status")
+                in {
+                    UpstreamRequestStatus.OPEN.value,
+                    UpstreamRequestStatus.EVALUATING.value,
+                }
+                and (not selected or any(matches_target(request, target) for target in selected))
+            }
+
+        blocking_upstream_request_ids = active_upstream_request_ids(discovered_targets)
 
         # A completed review must explicitly reopen or resolve its blockers. Merely consuming the
         # request is not evidence that another proof attempt has become possible.
@@ -7011,6 +7066,15 @@ class Orchestrator:
                     "model capacity remained unavailable after the configured retries",
                 )
                 return StageOutcome(ExecutionDisposition.FAILED)
+            if getattr(attempt.agent, "infrastructure_failed", False):
+                await self.state.set_task(
+                    chapter.id,
+                    Stage.PROVE,
+                    TaskStatus.INTERRUPTED,
+                    "proof agent infrastructure failed without spending the proof-chunk budget: "
+                    + (attempt.agent.error or "tool/session initialization failed"),
+                )
+                return StageOutcome(ExecutionDisposition.WAITING)
             coordinator_validation = attempt.validation
             if chunked_proofs and assigned_targets:
                 validation_targets = await asyncio.to_thread(
@@ -7446,6 +7510,11 @@ class Orchestrator:
 
         unresolved_placeholders = await asyncio.to_thread(
             count_placeholders, self.config.settings.repo, chapter
+        )
+        blocking_upstream_request_ids.update(
+            active_upstream_request_ids(
+                await asyncio.to_thread(proof_targets, self.config.settings.repo, chapter)
+            )
         )
         if blocking_upstream_request_ids:
             await self.state.set_task(

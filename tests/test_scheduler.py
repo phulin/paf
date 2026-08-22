@@ -46,6 +46,7 @@ from paf.state import (
     TaskPhase,
     TaskStatus,
     TokenUsage,
+    UpstreamRequestStatus,
 )
 from paf.state_db import read_checkpoint
 from tests.support import write_project
@@ -5692,6 +5693,78 @@ async def test_upstream_implementation_resumes_in_place(
 
 
 @pytest.mark.asyncio
+async def test_upstream_implementation_infrastructure_failure_requeues_case(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = config.chapters[0]
+    state = StateStore(config)
+    await state.load_or_create()
+    request_id, _ = await state.enqueue_upstream_request(
+        {
+            "consumer_path": "lean/Book/Chapter01.lean",
+            "blocked_declaration": "Book.target",
+            "residual_goal": "True",
+            "needed_result": "a shared bridge",
+            "owner_paths": ["lean/Book/Chapter01.lean"],
+        },
+        consumer_chapter_id=chapter.id,
+        owner_chapter_id=chapter.id,
+    )
+    await state.update_upstream_request(request_id, UpstreamRequestStatus.EVALUATING)
+    await state.replace_steward_cases(
+        [
+            {
+                "case_id": "case-a",
+                "status": "ready",
+                "disposition": "implement",
+                "request_ids": [request_id],
+                "context_work_unit_ids": [chapter.id],
+            }
+        ]
+    )
+    run = await state.start_auxiliary_run(
+        chapter.id,
+        Stage.PROVE,
+        role="upstream_implementation",
+        request_ids=("case-a", request_id),
+    )
+    orchestrator = Orchestrator(config, state)
+
+    async def attempt(
+        _chapter: Chapter,
+        _stage: Stage,
+        **_kwargs: object,
+    ) -> Attempt:
+        agent = AgentResult(
+            succeeded=False,
+            exit_code=1,
+            changed=False,
+            placeholders=0,
+            usage=TokenUsage(),
+            error="required MCP servers failed to initialize",
+            infrastructure_failed=True,
+        )
+        await state.finish_run(
+            run,
+            status=TaskStatus.FAILED,
+            failure_kind="infrastructure",
+            error=agent.error,
+        )
+        return Attempt(agent, ValidationResult(False, 1, "not run"), run)
+
+    monkeypatch.setattr(orchestrator, "_attempt", attempt)
+
+    await orchestrator._run_upstream_implementation("case-a")
+
+    case = state.steward_cases["case-a"]
+    assert case["status"] == "ready"
+    assert case["implementation_run_ids"] == [run.id]
+    assert state.upstream_requests[request_id]["status"] == "evaluating"
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_global_steward_cases_deduplicate_requests_and_include_consumers(
     tmp_path: Path,
 ) -> None:
@@ -7675,6 +7748,143 @@ async def test_prove_retries_the_same_chunk_before_advancing(
     assert runs[2].proof_targets != runs[1].proof_targets
     assert [target["declaration"] for target in runs[2].proof_targets] == ["target5"]
     await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_proof_infrastructure_failure_does_not_consume_or_skip_chunk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = config.chapters[0]
+    source = tmp_path / "lean" / "Book" / "Chapter01.lean"
+    source.parent.mkdir(parents=True)
+    source.write_text("theorem target : True := by sorry\n", encoding="utf-8")
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await orchestrator.prepare()
+    orchestrator.force = True
+    orchestrator.executor = FakeExecutor(
+        state,
+        [
+            AgentResult(
+                succeeded=False,
+                exit_code=1,
+                changed=False,
+                placeholders=1,
+                usage=TokenUsage(),
+                error="required MCP servers failed to initialize",
+                infrastructure_failed=True,
+            )
+        ],
+    )
+
+    async def validation(*_args: object, **_kwargs: object) -> ValidationResult:
+        return ValidationResult(True, 0, "ok")
+
+    monkeypatch.setattr(scheduler_module, "validate", validation)
+
+    outcome = await orchestrator._prove(chapter)
+    assert outcome.disposition is ExecutionDisposition.WAITING
+    task = state.task(chapter.id, Stage.PROVE)
+    assert task.status == TaskStatus.INTERRUPTED
+    assert task.rounds == 1
+    assert len(task.runs) == 1
+    assert task.runs[0].proof_targets[0]["declaration"] == "target"
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_prove_waits_for_persisted_evaluating_upstream_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = config.chapters[0]
+    source = tmp_path / "lean" / "Book" / "Chapter01.lean"
+    source.parent.mkdir(parents=True)
+    source.write_text("theorem target : True := by sorry\n", encoding="utf-8")
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await orchestrator.prepare()
+    orchestrator.force = True
+    blockers = await state.record_proof_blockers(
+        chapter.id,
+        origin_run_id="prior-proof-run",
+        failed_attempts=(
+            {
+                "path": "lean/Book/Chapter01.lean",
+                "declaration": "target",
+                "remaining_goal": "True",
+                "obstruction": "an earlier construction is missing",
+                "disposition": "missing_capability",
+                "attempts": ["checked the current imported API"],
+            },
+        ),
+    )
+    request_id, _ = await state.enqueue_upstream_request(
+        {
+            "consumer_path": "lean/Book/Chapter01.lean",
+            "blocked_declaration": "target",
+            "residual_goal": "True",
+            "needed_result": "an earlier construction",
+            "owner_paths": ["lean/Book/Chapter01.lean"],
+        },
+        consumer_chapter_id=chapter.id,
+        owner_chapter_id=chapter.id,
+        blocker_ids=(str(blockers[0]["id"]),),
+    )
+    await state.update_upstream_request(request_id, UpstreamRequestStatus.EVALUATING)
+
+    async def validation(*_args: object, **_kwargs: object) -> ValidationResult:
+        return ValidationResult(True, 0, "ok")
+
+    monkeypatch.setattr(scheduler_module, "validate", validation)
+
+    outcome = await orchestrator._prove(chapter)
+    assert outcome.disposition is ExecutionDisposition.WAITING
+    task = state.task(chapter.id, Stage.PROVE)
+    assert task.status == TaskStatus.BLOCKED
+    assert request_id in task.detail
+    assert task.rounds == 0
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_resume_requeues_legacy_mcp_startup_failure(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = config.chapters[0]
+    state = StateStore(config)
+    await state.load_or_create()
+    run = await state.start_run(chapter.id, Stage.PROVE)
+    log = tmp_path / "legacy-mcp-failure.jsonl"
+    log.write_text(
+        "required MCP servers failed to initialize: paf_lean: connection closed: "
+        "initialize response\n",
+        encoding="utf-8",
+    )
+    await state.finish_run(
+        run,
+        status=TaskStatus.FAILED,
+        exit_code=1,
+        changed=False,
+        placeholders=1,
+        log_path=str(log),
+    )
+    await state.set_task(
+        chapter.id,
+        Stage.PROVE,
+        TaskStatus.FAILED,
+        "proof chunks exhausted retries with 1 placeholder remaining",
+    )
+    await state.close()
+
+    recovered = StateStore(config)
+    await recovered.load_or_create()
+    changed = await recovered.requeue_interrupted(resume_agents=True)
+    task = recovered.task(chapter.id, Stage.PROVE)
+    assert changed == [f"{chapter.id}:prove"]
+    assert task.status == TaskStatus.PENDING
+    assert task.detail == "infrastructure-failed agent queued for a fresh retry"
+    await recovered.close()
 
 
 @pytest.mark.asyncio

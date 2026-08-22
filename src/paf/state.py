@@ -233,6 +233,11 @@ class RunRecord:
     source_start_line: int = 1
     source_end_line: int = 1
     project_root: str = ""
+    # Durable failure classification used to distinguish orchestration/tooling outages from
+    # mathematical proof failures.  In particular, infrastructure failures may be safely
+    # requeued after a restart without spending another proof-chunk budget.
+    failure_kind: str = ""
+    error: str = ""
     # Digest of the agent result scope. It lets restart reconciliation detect
     # whether that completed result still matches the current source.
     source_digest: str | None = None
@@ -915,6 +920,8 @@ class StateStore:
             "source_start_line": run.source_start_line,
             "source_end_line": run.source_end_line,
             "project_root": run.project_root,
+            "failure_kind": run.failure_kind,
+            "error": run.error,
         }
         if include_payload:
             value |= {
@@ -3886,12 +3893,43 @@ class StateStore:
             if not progress:
                 return changed
 
+    @staticmethod
+    def _run_had_infrastructure_failure(run: RunRecord) -> bool:
+        """Recognize durable and legacy agent/tool startup failures."""
+
+        if run.failure_kind == "infrastructure":
+            return True
+        markers = (
+            "required mcp servers failed to initialize",
+            "handshaking with mcp server failed",
+            "failed to initialize session",
+            "error creating thread",
+            "connection closed: initialize response",
+            "lean beam startup retries exhausted",
+        )
+        evidence = run.error.casefold()
+        if any(marker in evidence for marker in markers):
+            return True
+        if not run.log_path:
+            return False
+        try:
+            log = Path(run.log_path).read_bytes()[-256_000:].decode(errors="replace").casefold()
+        except OSError:
+            return False
+        return any(marker in log for marker in markers)
+
     async def requeue_interrupted(self, *, resume_agents: bool) -> list[str]:
-        """Requeue interrupted tasks while retaining their optional session history."""
+        """Requeue interrupted and infrastructure-failed tasks with their session history."""
 
         changed: list[str] = []
         for key, task in self.tasks.items():
-            if task.status != TaskStatus.INTERRUPTED:
+            latest = next((run for run in reversed(task.runs) if not run.auxiliary), None)
+            infrastructure_failed = (
+                task.status == TaskStatus.FAILED
+                and latest is not None
+                and self._run_had_infrastructure_failure(latest)
+            )
+            if task.status != TaskStatus.INTERRUPTED and not infrastructure_failed:
                 continue
             task.status = TaskStatus.PENDING
             task.phase = TaskPhase.IDLE
@@ -3900,7 +3938,9 @@ class StateStore:
             if task.stage == Stage.PROVE:
                 task.source_digest = None
             task.detail = (
-                "interrupted agent queued for session resume"
+                "infrastructure-failed agent queued for a fresh retry"
+                if infrastructure_failed
+                else "interrupted agent queued for session resume"
                 if resume_agents
                 else "interrupted agent queued for a fresh retry"
             )

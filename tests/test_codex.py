@@ -24,6 +24,7 @@ from paf.codex import (
     _complete_lines,
     _is_capacity_failure,
     _is_fatal_invocation_failure,
+    _is_infrastructure_failure,
     _record_jsonl_line,
     _rollout_usage,
     _tail_rollout_usage,
@@ -839,6 +840,24 @@ def test_detects_invalid_output_schema_as_fatal() -> None:
                 )
             },
         }
+    )
+
+
+@pytest.mark.parametrize(
+    "message",
+    (
+        "required MCP servers failed to initialize: paf_lean",
+        "handshaking with MCP server failed: connection closed: initialize response",
+        "thread/start failed: error creating thread: Failed to initialize session",
+    ),
+)
+def test_detects_tool_session_initialization_as_infrastructure_failure(message: str) -> None:
+    assert _is_infrastructure_failure({"type": "turn.failed", "error": {"message": message}})
+
+
+def test_does_not_classify_mathematical_agent_failure_as_infrastructure() -> None:
+    assert not _is_infrastructure_failure(
+        {"type": "turn.failed", "error": {"message": "proof search did not close the goal"}}
     )
 
 

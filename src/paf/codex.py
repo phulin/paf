@@ -782,6 +782,7 @@ class AgentResult:
     thread_id: str | None = None
     error: str = ""
     capacity_exhausted: bool = False
+    infrastructure_failed: bool = False
 
 
 class FatalCodexInvocationError(RuntimeError):
@@ -1287,6 +1288,22 @@ def _is_fatal_invocation_failure(event: Any) -> bool:
     return any(
         "invalid_json_schema" in message
         or "invalid schema for response_format" in message.casefold()
+        for message in _event_error_messages(event)
+    )
+
+
+def _is_infrastructure_failure(event: Any) -> bool:
+    """Whether the agent failed before useful work because its execution tools did not start."""
+
+    markers = (
+        "required mcp servers failed to initialize",
+        "handshaking with mcp server failed",
+        "failed to initialize session",
+        "error creating thread",
+        "connection closed: initialize response",
+    )
+    return any(
+        any(marker in message.casefold() for marker in markers)
         for message in _event_error_messages(event)
     )
 
@@ -2167,6 +2184,7 @@ distinguish proof evidence from build diagnostics, and avoid repeating known fai
             await self.state.update_run(run, **changes)
         invocation_error = ""
         fatal_invocation_failure = False
+        infrastructure_failure = False
         activity = self.state.activities.get(run.id) if continuing_run else None
         if activity is None:
             activity = await self.state.activities.start_async(
@@ -2185,13 +2203,61 @@ distinguish proof evidence from build diagnostics, and avoid repeating known fai
         beam_session: BeamSession | None = None
         agent_environment = os.environ.copy()
         if stage in (Stage.FORMALIZE, Stage.REVIEW, Stage.PROVE):
-            beam_session = await BeamSession.start(
-                command=backend.beam_command,
-                project=(root / backend.project).resolve(),
-                state_dir=self.config.settings.state_dir,
-                run_id=run.id,
-                timeout_seconds=backend.beam_startup_timeout_seconds,
-            )
+            beam_error = ""
+            for beam_attempt in range(self.config.settings.capacity_resume_attempts + 1):
+                try:
+                    beam_session = await BeamSession.start(
+                        command=backend.beam_command,
+                        project=(root / backend.project).resolve(),
+                        state_dir=self.config.settings.state_dir,
+                        run_id=run.id,
+                        timeout_seconds=backend.beam_startup_timeout_seconds,
+                    )
+                    break
+                except Exception as error:
+                    beam_error = str(error) or type(error).__name__
+                    if beam_attempt >= self.config.settings.capacity_resume_attempts:
+                        break
+                    activity.retry(
+                        f"infrastructure retry {beam_attempt + 1}/"
+                        f"{self.config.settings.capacity_resume_attempts}: Lean Beam startup "
+                        f"failed: {beam_error[:500]}"
+                    )
+                    await self.state.activities.save_async(activity)
+                    await asyncio.sleep(
+                        _capacity_resume_delay(
+                            self.config.settings.capacity_resume_delay_seconds,
+                            self.config.settings.capacity_resume_max_delay_seconds,
+                            beam_attempt + 1,
+                        )
+                    )
+            if beam_session is None:
+                after, placeholders = await asyncio.to_thread(
+                    lambda: (scope_digest(root, chapter), count_placeholders(root, chapter))
+                )
+                error = f"Lean Beam startup retries exhausted: {beam_error}"
+                activity.finish("failed", error)
+                await self.state.activities.save_async(activity)
+                await self.state.finish_run(
+                    run,
+                    status=TaskStatus.FAILED,
+                    exit_code=1,
+                    changed=before != after,
+                    placeholders=placeholders,
+                    usage=usage,
+                    failure_kind="infrastructure",
+                    error=error,
+                    source_digest=after,
+                )
+                return AgentResult(
+                    succeeded=False,
+                    exit_code=1,
+                    changed=before != after,
+                    placeholders=placeholders,
+                    usage=usage,
+                    error=error,
+                    infrastructure_failed=True,
+                )
             agent_environment = beam_session.environment
 
         async def update_usage(found: TokenUsage) -> None:
@@ -2262,6 +2328,7 @@ distinguish proof evidence from build diagnostics, and avoid repeating known fai
                         nonlocal usage, report, thread_id, usage_monitor, capacity_failure
                         nonlocal usage_baseline
                         nonlocal invocation_error, fatal_invocation_failure
+                        nonlocal infrastructure_failure
                         recording = asyncio.create_task(
                             asyncio.to_thread(
                                 _record_jsonl_line,
@@ -2284,6 +2351,9 @@ distinguish proof evidence from build diagnostics, and avoid repeating known fai
                         capacity_failure = capacity_failure or _is_capacity_failure(event)
                         fatal_invocation_failure = (
                             fatal_invocation_failure or _is_fatal_invocation_failure(event)
+                        )
+                        infrastructure_failure = (
+                            infrastructure_failure or _is_infrastructure_failure(event)
                         )
                         if found_error := _event_error_message(event):
                             invocation_error = found_error
@@ -2376,6 +2446,7 @@ distinguish proof evidence from build diagnostics, and avoid repeating known fai
         resume_attempt = 0
         invocation_count = 0
         capacity_retries = 0
+        infrastructure_retries = 0
         fd_recycles = 0
         capacity_failure = False
         timed_out = False
@@ -2422,10 +2493,42 @@ distinguish proof evidence from build diagnostics, and avoid repeating known fai
                         report = {}
                         invocation_error = ""
                         fatal_invocation_failure = False
+                        infrastructure_failure = False
                         capacity_failure = False
                         await self.state.update_run(run, thread_id=None)
                         continue
                 if exit_code == 0 or thread_id is None:
+                    if (
+                        exit_code != 0
+                        and infrastructure_failure
+                        and infrastructure_retries < self.config.settings.capacity_resume_attempts
+                    ):
+                        infrastructure_retries += 1
+                        activity.retry(
+                            f"infrastructure retry {infrastructure_retries}/"
+                            f"{self.config.settings.capacity_resume_attempts}: restarting agent "
+                            "after tool/session initialization failure"
+                        )
+                        await self.state.activities.save_async(activity)
+                        delay = _capacity_resume_delay(
+                            self.config.settings.capacity_resume_delay_seconds,
+                            self.config.settings.capacity_resume_max_delay_seconds,
+                            infrastructure_retries,
+                        )
+                        remaining = attempt_deadline - asyncio.get_running_loop().time()
+                        if delay >= remaining:
+                            if remaining > 0:
+                                await asyncio.sleep(remaining)
+                            timed_out = True
+                            exit_code = 124
+                            break
+                        await asyncio.sleep(delay)
+                        invocation_error = ""
+                        fatal_invocation_failure = False
+                        infrastructure_failure = False
+                        capacity_failure = False
+                        report = {}
+                        continue
                     break
                 if fd_pressure:
                     if fd_recycles >= self.config.settings.codex_fd_recycle_attempts:
@@ -2496,6 +2599,8 @@ distinguish proof evidence from build diagnostics, and avoid repeating known fai
             )
         if capacity_failure and exit_code != 0:
             error = "Codex capacity retries exhausted"
+        elif infrastructure_failure and exit_code != 0:
+            error = invocation_error or "agent tool/session initialization retries exhausted"
         elif exit_code != 0 and invocation_error and not timed_out:
             error = invocation_error
         if exit_code == 0 and not report:
@@ -2519,6 +2624,8 @@ distinguish proof evidence from build diagnostics, and avoid repeating known fai
             report=report or None,
             usage=usage,
             thread_id=thread_id,
+            failure_kind=("infrastructure" if infrastructure_failure and exit_code != 0 else ""),
+            error=error,
             source_digest=after,
         )
         result = AgentResult(
@@ -2531,6 +2638,7 @@ distinguish proof evidence from build diagnostics, and avoid repeating known fai
             thread_id=thread_id,
             error=error,
             capacity_exhausted=capacity_failure and exit_code != 0,
+            infrastructure_failed=infrastructure_failure and exit_code != 0,
         )
         if fatal_invocation_failure and exit_code != 0:
             raise FatalCodexInvocationError(error or "Codex rejected the invocation")
