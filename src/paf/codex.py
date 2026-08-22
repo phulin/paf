@@ -1825,9 +1825,11 @@ distinguish proof evidence from build diagnostics, and avoid repeating known fai
         root = workspace_root or settings.repo
         command = [settings.codex_bin, "exec"]
         if resume_thread_id is None:
-            command.extend(["--json", "--color", "never", "--cd", str(root)])
+            command.extend(
+                ["--ignore-user-config", "--json", "--color", "never", "--cd", str(root)]
+            )
         else:
-            command.extend(["resume", "--json"])
+            command.extend(["resume", "--ignore-user-config", "--json"])
         schema_key = report_schema_key(stage, role=role, feedback=feedback)
         command.extend(["--output-schema", str(self.schema_paths[schema_key])])
         if root != settings.repo:

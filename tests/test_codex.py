@@ -625,6 +625,7 @@ def test_executor_uses_machine_readable_codex_mode(tmp_path: Path) -> None:
     command = executor.command(Stage.PROVE)
 
     assert command[:2] == ["codex", "exec"]
+    assert "--ignore-user-config" in command
     assert "--json" in command
     assert "--output-schema" in command
     assert "--dangerously-bypass-approvals-and-sandbox" in command
@@ -656,6 +657,7 @@ def test_executor_uses_machine_readable_codex_mode(tmp_path: Path) -> None:
 
     resumed = executor.command(Stage.FORMALIZE, isolated, resume_thread_id="capacity-thread")
     assert resumed[:3] == ["codex", "exec", "resume"]
+    assert "--ignore-user-config" in resumed
     assert "capacity-thread" in resumed
     assert "--json" in resumed
     assert "--output-schema" in resumed
