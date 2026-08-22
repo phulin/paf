@@ -1767,6 +1767,9 @@ Use the installed `$lean-beam` skill and `{backend.beam_command}` CLI. Run Beam 
 `{project}` so paths are relative to the Lean project root: use `LastLib/...`, not
 `{project}/LastLib/...`.
 
+- PAF has already started and owns the persistent Beam daemon for this workspace. Never run
+  `lean-beam ensure --hold` yourself; it blocks until interrupted. Call the ordinary inspection,
+  update, sync, refresh, save, and proof-probe commands directly.
 - Beam reads saved files. Call `lean-beam update FILE` before a version-bound query.
 - Use `paf lean search QUERY` for source search across the project, Lake packages, and toolchain.
 - Use `paf lean prepare FILE...` to follow Beam's stale-direct-import recovery automatically.
