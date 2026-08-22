@@ -2041,6 +2041,9 @@ distinguish proof evidence from build diagnostics, and avoid repeating known fai
         dossier: dict[str, Any],
         *,
         workspace_root: Path,
+        resume_thread_id: str | None = None,
+        resume_run_id: str = "",
+        resume_prompt: str = "",
     ) -> AgentResult:
         prompt = (
             UPSTREAM_STEWARD_PROMPT_PATH.read_text(encoding="utf-8").rstrip()
@@ -2054,6 +2057,9 @@ distinguish proof evidence from build diagnostics, and avoid repeating known fai
             run,
             prompt=prompt,
             workspace_root=workspace_root,
+            resume_thread_id=resume_thread_id,
+            resume_run_id=resume_run_id,
+            resume_prompt=resume_prompt or CAPACITY_RESUME_PROMPT,
         )
 
     async def run_upstream_implementation(
@@ -2188,7 +2194,9 @@ distinguish proof evidence from build diagnostics, and avoid repeating known fai
         prompt_path.write_text(prompt, encoding="utf-8")
         before = await asyncio.to_thread(scope_digest, root, chapter)
         log_path = self.state.logs_dir / f"{run.id}.jsonl"
-        usage = TokenUsage()
+        continuing_run = resume_thread_id is not None and resume_run_id == run.id
+        prior_usage = run.usage if continuing_run else TokenUsage()
+        usage = prior_usage
         cumulative_usage = TokenUsage()
         usage_baseline: TokenUsage | None = None
         report: dict[str, Any] = {}
@@ -2198,18 +2206,24 @@ distinguish proof evidence from build diagnostics, and avoid repeating known fai
             thread_id = resumable_run.thread_id
         interrupted_resume = thread_id is not None
         if thread_id is not None:
-            await self.state.update_run(
-                run,
-                thread_id=thread_id,
-                resumed_from_run_id=(
-                    resume_run_id or (resumable_run.id if resumable_run is not None else "")
-                ),
+            previous_run_id = resume_run_id or (
+                resumable_run.id if resumable_run is not None else ""
             )
+            changes: dict[str, Any] = {"thread_id": thread_id}
+            if previous_run_id and previous_run_id != run.id:
+                changes["resumed_from_run_id"] = previous_run_id
+            await self.state.update_run(run, **changes)
         invocation_error = ""
         fatal_invocation_failure = False
-        activity = await self.state.activities.start_async(
-            run.id, chapter.id, run.role or stage.value
-        )
+        activity = self.state.activities.get(run.id) if continuing_run else None
+        if activity is None:
+            activity = await self.state.activities.start_async(
+                run.id, chapter.id, run.role or stage.value
+            )
+        else:
+            activity.finished_at = None
+            activity.retry("resuming interrupted Codex session")
+            await self.state.activities.save_async(activity)
         usage_stop = asyncio.Event()
         usage_monitor: asyncio.Task[None] | None = None
         attempt_deadline = (
@@ -2224,7 +2238,7 @@ distinguish proof evidence from build diagnostics, and avoid repeating known fai
             if thread_id is not None:
                 if usage_baseline is None:
                     usage_baseline = self.state.thread_cumulative_usage.get(thread_id, TokenUsage())
-                usage = found.delta_from(usage_baseline)
+                usage = prior_usage + found.delta_from(usage_baseline)
                 await self.state.record_thread_cumulative_usage(thread_id, found, deferred=True)
             else:
                 usage = found
@@ -2427,7 +2441,9 @@ distinguish proof evidence from build diagnostics, and avoid repeating known fai
                     )
                     input_text = prompt
                 exit_code, timed_out, capacity_failure, fd_pressure = await invoke(
-                    command, input_text, append_log=bool(invocation_count)
+                    command,
+                    input_text,
+                    append_log=continuing_run or bool(invocation_count),
                 )
                 invocation_count += 1
                 if interrupted_resume:

@@ -1617,6 +1617,74 @@ print(json.dumps({{"type": "item.completed", "item": {{
 
 
 @pytest.mark.asyncio
+async def test_executor_continues_resumed_auxiliary_session_in_same_run(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    invocations_path = tmp_path / "resume-auxiliary-invocations.jsonl"
+    fake_codex = tmp_path / "resume-auxiliary-codex"
+    fake_codex.write_text(
+        f"""#!/usr/bin/env python3
+import json
+import sys
+from pathlib import Path
+
+prompt = sys.stdin.read()
+with Path({str(invocations_path)!r}).open("a", encoding="utf-8") as handle:
+    handle.write(json.dumps({{"args": sys.argv[1:], "prompt": prompt}}) + "\\n")
+report = {{"complete": True, "summary": "continued auxiliary work", "issues": []}}
+print(json.dumps({{"type": "thread.started", "thread_id": "auxiliary-session"}}))
+print(json.dumps({{"type": "item.completed", "item": {{
+    "type": "agent_message", "text": json.dumps(report)}}}}))
+""",
+        encoding="utf-8",
+    )
+    fake_codex.chmod(0o755)
+    config = replace(config, settings=replace(config.settings, codex_bin=str(fake_codex)))
+    state = StateStore(config)
+    await state.load_or_create()
+    chapter = config.chapters[0]
+    interrupted = await state.start_auxiliary_run(
+        chapter.id,
+        Stage.REVIEW,
+        role="review",
+        request_ids=("request-a",),
+    )
+    await state.finish_run(
+        interrupted,
+        status=TaskStatus.INTERRUPTED,
+        thread_id="auxiliary-session",
+    )
+    prior_event = '{"type":"turn.started"}\n'
+    log_path = state.logs_dir / f"{interrupted.id}.jsonl"
+    log_path.write_text(prior_event, encoding="utf-8")
+    activity = state.activities.start(interrupted.id, chapter.id, "review")
+    activity.finish("cancelled", "orchestrator stopped")
+    state.activities.save(activity)
+    await state.resume_auxiliary_run(interrupted)
+    executor = CodexExecutor(config, state, resume_agents=True)
+    await executor.prepare()
+
+    result = await executor.resume(
+        chapter,
+        Stage.REVIEW,
+        interrupted,
+        thread_id="auxiliary-session",
+        previous_run_id=interrupted.id,
+        reminder="continue the same assignment",
+    )
+
+    invocation = json.loads(invocations_path.read_text(encoding="utf-8"))
+    assert invocation["args"][:2] == ["exec", "resume"]
+    assert result.succeeded
+    assert interrupted.status == TaskStatus.SUCCEEDED
+    assert interrupted.resumed_from_run_id == ""
+    assert len(state.chapter_runs(chapter.id)) == 1
+    assert log_path.read_text(encoding="utf-8").startswith(prior_event)
+    resumed_activity = state.activities.get(interrupted.id)
+    assert resumed_activity is not None
+    assert any("resuming interrupted" in entry.title for entry in resumed_activity.recent)
+
+
+@pytest.mark.asyncio
 async def test_executor_only_resumes_the_matching_immediate_predecessor(
     tmp_path: Path,
 ) -> None:

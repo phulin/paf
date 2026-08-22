@@ -26,7 +26,7 @@ from paf.display import (
 )
 from paf.models import Stage
 from paf.scheduler import Orchestrator
-from paf.state import StateStore, TokenUsage
+from paf.state import StateStore, TaskStatus, TokenUsage
 from tests.support import write_project
 
 
@@ -368,6 +368,61 @@ async def test_package_run_projection_lists_only_its_steward_and_workers(tmp_pat
     ]
     assert details["selected_run_id"] == steward.id
     assert details["activity"]["current"] == "reviewing the package plan"
+
+
+@pytest.mark.asyncio
+async def test_resumed_steward_auxiliary_run_remains_one_tui_run(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    state = StateStore(config)
+    await state.load_or_create()
+    chapter = config.chapters[0]
+    run = await state.start_auxiliary_run(
+        chapter.id,
+        Stage.PROVE,
+        role="upstream_implementation",
+        request_ids=("case-a", "request-a"),
+    )
+    await state.finish_run(
+        run,
+        status=TaskStatus.INTERRUPTED,
+        thread_id="steward-session",
+    )
+    state.steward_cases["case-a"] = {
+        "id": "case-a",
+        "status": "implementing",
+        "request_ids": ["request-a"],
+        "implementation_run_ids": [run.id],
+    }
+
+    assert (
+        state.interrupted_auxiliary_run(
+            role="upstream_implementation",
+            request_ids=("case-a", "request-a"),
+        )
+        is run
+    )
+    await state.resume_auxiliary_run(run)
+    details = state.dashboard_steward_case_runs("case-a")
+
+    assert [item["id"] for item in details["runs"]] == [run.id]
+    assert details["runs"][0]["status"] == TaskStatus.RUNNING
+
+
+@pytest.mark.asyncio
+async def test_orphaned_implementing_steward_case_is_requeued(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    state = StateStore(config)
+    await state.load_or_create()
+    state.steward_cases["case-a"] = {
+        "id": "case-a",
+        "status": "implementing",
+        "request_ids": [],
+    }
+
+    recovered = await state.recover_interrupted_steward_cases()
+
+    assert recovered == ["case-a"]
+    assert state.steward_cases["case-a"]["status"] == "ready"
 
 
 @pytest.mark.asyncio

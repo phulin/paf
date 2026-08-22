@@ -5531,6 +5531,167 @@ async def test_upstream_requests_launch_one_global_steward(tmp_path: Path) -> No
 
 
 @pytest.mark.asyncio
+async def test_global_steward_resumes_in_place(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = config.chapters[0]
+    state = StateStore(config)
+    await state.load_or_create()
+    request_id, _ = await state.enqueue_upstream_request(
+        {
+            "consumer_path": "lean/Book/Chapter01.lean",
+            "blocked_declaration": "Book.target",
+            "residual_goal": "True",
+            "needed_result": "a shared bridge",
+            "owner_paths": ["lean/Book/Chapter01.lean"],
+        },
+        consumer_chapter_id=chapter.id,
+        owner_chapter_id=chapter.id,
+    )
+    interrupted = await state.start_auxiliary_run(
+        chapter.id,
+        Stage.DISCOVER,
+        role="upstream_steward",
+        request_ids=(request_id,),
+    )
+    await state.finish_run(
+        interrupted,
+        status=TaskStatus.INTERRUPTED,
+        thread_id="global-steward-session",
+    )
+    orchestrator = Orchestrator(config, state, resume_agents=True)
+    observed: dict[str, object] = {}
+
+    async def run_steward(
+        _anchor: Chapter,
+        run: RunRecord,
+        _dossier: dict[str, Any],
+        **kwargs: object,
+    ) -> AgentResult:
+        observed.update(run=run, **kwargs)
+        report = {
+            "complete": True,
+            "summary": "placed request",
+            "issues": [],
+            "cases": [
+                {
+                    "case_id": "case-a",
+                    "disposition": "implement",
+                    "request_ids": [request_id],
+                    "context_work_unit_ids": [chapter.id],
+                }
+            ],
+        }
+        await state.finish_run(run, status=TaskStatus.SUCCEEDED, report=report)
+        return AgentResult(
+            succeeded=True,
+            exit_code=0,
+            changed=False,
+            placeholders=0,
+            usage=TokenUsage(),
+            report=report,
+        )
+
+    monkeypatch.setattr(orchestrator.executor, "run_upstream_steward", run_steward)
+
+    await orchestrator._run_upstream_steward()
+
+    assert observed["run"] is interrupted
+    assert observed["resume_thread_id"] == "global-steward-session"
+    assert observed["resume_run_id"] == interrupted.id
+    steward_runs = [run for run in state.chapter_runs(chapter.id) if run.role == "upstream_steward"]
+    assert steward_runs == [interrupted]
+    assert state.steward_cases["case-a"]["steward_run_id"] == interrupted.id
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_upstream_implementation_resumes_in_place(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = config.chapters[0]
+    state = StateStore(config)
+    await state.load_or_create()
+    request_id, _ = await state.enqueue_upstream_request(
+        {
+            "consumer_path": "lean/Book/Chapter01.lean",
+            "blocked_declaration": "Book.target",
+            "residual_goal": "True",
+            "needed_result": "a shared bridge",
+            "owner_paths": ["lean/Book/Chapter01.lean"],
+        },
+        consumer_chapter_id=chapter.id,
+        owner_chapter_id=chapter.id,
+    )
+    await state.replace_steward_cases(
+        [
+            {
+                "case_id": "case-a",
+                "status": "ready",
+                "disposition": "implement",
+                "request_ids": [request_id],
+                "context_work_unit_ids": [chapter.id],
+            }
+        ]
+    )
+    interrupted = await state.start_auxiliary_run(
+        chapter.id,
+        Stage.PROVE,
+        role="upstream_implementation",
+        request_ids=("case-a", request_id),
+    )
+    await state.finish_run(
+        interrupted,
+        status=TaskStatus.INTERRUPTED,
+        thread_id="implementation-session",
+    )
+    orchestrator = Orchestrator(config, state, resume_agents=True)
+    observed: dict[str, object] = {}
+
+    async def attempt(
+        _chapter: Chapter,
+        _stage: Stage,
+        **kwargs: object,
+    ) -> Attempt:
+        observed.update(kwargs)
+        resumed = kwargs["resume_run"]
+        assert isinstance(resumed, RunRecord)
+        await state.resume_auxiliary_run(resumed)
+        report = {
+            "complete": True,
+            "summary": "consumer already has the needed interface",
+            "issues": [],
+            "disposition": "consumer_local",
+        }
+        agent = AgentResult(
+            succeeded=True,
+            exit_code=0,
+            changed=False,
+            placeholders=0,
+            usage=TokenUsage(),
+            report=report,
+        )
+        await state.finish_run(resumed, status=TaskStatus.SUCCEEDED, report=report)
+        return Attempt(agent, ValidationResult(True, 0, "ok"), resumed)
+
+    monkeypatch.setattr(orchestrator, "_attempt", attempt)
+
+    await orchestrator._run_upstream_implementation("case-a")
+
+    assert observed["resume_run"] is interrupted
+    assert observed["resume_thread_id"] == "implementation-session"
+    assert observed["resume_run_id"] == interrupted.id
+    implementation_runs = [
+        run for run in state.chapter_runs(chapter.id) if run.role == "upstream_implementation"
+    ]
+    assert implementation_runs == [interrupted]
+    assert state.steward_cases["case-a"]["implementation_run_ids"] == [interrupted.id]
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_global_steward_cases_deduplicate_requests_and_include_consumers(
     tmp_path: Path,
 ) -> None:

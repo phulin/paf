@@ -3999,6 +3999,59 @@ class StateStore:
         await self._persist()
         return run
 
+    def interrupted_auxiliary_run(
+        self,
+        *,
+        role: str,
+        request_ids: Iterable[str],
+    ) -> RunRecord | None:
+        """Return the newest exact auxiliary assignment that can be resumed in place."""
+
+        selected_request_ids = list(dict.fromkeys(request_ids))
+        candidates: list[RunRecord] = [
+            run
+            for run in self._runs_by_id.values()
+            if run.auxiliary
+            and run.role == role
+            and run.request_ids == selected_request_ids
+            and run.status == TaskStatus.INTERRUPTED
+            and run.thread_id is not None
+        ]
+        if not candidates:
+            return None
+        return max(candidates, key=lambda run: (run.started_at, run.id))
+
+    async def resume_auxiliary_run(self, run: RunRecord) -> RunRecord:
+        """Reactivate an interrupted auxiliary run without creating a second TUI run."""
+
+        if self._runs_by_id.get(run.id) is not run or not run.auxiliary:
+            raise ValueError(f"unknown auxiliary run: {run.id}")
+        if run.status != TaskStatus.INTERRUPTED or not run.thread_id:
+            raise ValueError(f"auxiliary run is not resumable: {run.id}")
+        run.status = TaskStatus.RUNNING
+        run.finished_at = None
+        run.pid = None
+        run.exit_code = None
+        self._invalidate_status_summaries()
+        self._mark_dirty(run=run, global_state=False)
+        await self._persist()
+        return run
+
+    async def recover_interrupted_steward_cases(self) -> list[str]:
+        """Make cases orphaned in ``implementing`` schedulable after a restart."""
+
+        recovered: list[str] = []
+        for case_id, case in self.steward_cases.items():
+            if case.get("status") != "implementing":
+                continue
+            case["status"] = "ready"
+            case["updated_at"] = timestamp()
+            recovered.append(case_id)
+        if recovered:
+            self._mark_dirty(global_state=False, sections={"steward_cases"})
+            await self._persist()
+        return recovered
+
     async def update_run(self, run: RunRecord, *, deferred: bool = False, **changes: Any) -> None:
         old_usage = run.usage
         old_model = run.model

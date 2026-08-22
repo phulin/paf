@@ -1105,22 +1105,38 @@ class Orchestrator:
         if not request_ids:
             return
         anchor = self.work_units[0]
-        run = await self.state.start_auxiliary_run(
-            anchor.id,
-            Stage.DISCOVER,
-            role=UPSTREAM_STEWARD_ROLE,
-            request_ids=request_ids,
-            model=self.config.steward.model,
+        resumable = (
+            self.state.interrupted_auxiliary_run(
+                role=UPSTREAM_STEWARD_ROLE, request_ids=request_ids
+            )
+            if self.resume_agents
+            else None
+        )
+        run = (
+            await self.state.resume_auxiliary_run(resumable)
+            if resumable is not None
+            else await self.state.start_auxiliary_run(
+                anchor.id,
+                Stage.DISCOVER,
+                role=UPSTREAM_STEWARD_ROLE,
+                request_ids=request_ids,
+                model=self.config.steward.model,
+            )
         )
         await self.agent_slots.acquire(self.statement_schedule.priority(anchor.document_id))
         workspace = None
         try:
-            workspace = await self.isolation.acquire(f"upstream-steward-{run.id}")
+            workspace = await self.isolation.acquire(
+                f"upstream-steward-{run.id}",
+                resume_run_id=run.id if resumable is not None else "",
+            )
             result = await self.executor.run_upstream_steward(
                 anchor,
                 run,
                 dossier,
                 workspace_root=workspace.root,
+                resume_thread_id=resumable.thread_id if resumable is not None else None,
+                resume_run_id=resumable.id if resumable is not None else "",
             )
             if not result.succeeded or result.report.get("complete") is not True:
                 return
@@ -1288,16 +1304,29 @@ class Orchestrator:
             ],
         }
         await self.state.update_steward_case(case_id, status="implementing")
+        assignment_request_ids = (case_id, *case.get("request_ids", ()))
+        resumable = (
+            self.state.interrupted_auxiliary_run(
+                role=UPSTREAM_IMPLEMENTATION_ROLE,
+                request_ids=assignment_request_ids,
+            )
+            if self.resume_agents
+            else None
+        )
         attempt = await self._attempt(
             anchor,
             Stage.PROVE,
             role=UPSTREAM_IMPLEMENTATION_ROLE,
-            request_ids=(case_id, *case.get("request_ids", ())),
+            request_ids=assignment_request_ids,
             queue_detail="waiting for atomic multi-chapter implementation lock",
             upstream_dossier=dossier,
+            resume_run=resumable,
+            resume_thread_id=resumable.thread_id if resumable is not None else None,
+            resume_run_id=resumable.id if resumable is not None else "",
         )
         run_ids = list(case.get("implementation_run_ids", ()))
-        run_ids.append(attempt.run.id)
+        if attempt.run.id not in run_ids:
+            run_ids.append(attempt.run.id)
         report = attempt.agent.report if isinstance(attempt.agent.report, dict) else {}
         disposition = str(report.get("disposition", "needs_human"))
         if disposition == "implemented" and attempt.agent.changed and attempt.validation.succeeded:
@@ -1454,6 +1483,7 @@ class Orchestrator:
         await self.state.load_or_create()
         report("Recovering interrupted work", 2)
         await self.state.requeue_interrupted(resume_agents=self.resume_agents)
+        await self.state.recover_interrupted_steward_cases()
         report("Scaffolding work-unit directories", 3)
         self.scaffold()
         report("Migrating persisted workflow state", 4)
@@ -2522,6 +2552,7 @@ class Orchestrator:
         resume_run_id: str = "",
         resume_prompt: str = "",
         upstream_dossier: dict[str, Any] | None = None,
+        resume_run: RunRecord | None = None,
     ) -> Attempt:
         auxiliary = role in {
             WARNING_REVIEW_ROLE,
@@ -2612,7 +2643,14 @@ class Orchestrator:
         isolated: IsolationResult | None = None
         live_discovery = not auxiliary and stage is Stage.DISCOVER
 
+        pending_resume_run = resume_run
+
         async def start_agent_run() -> RunRecord:
+            nonlocal pending_resume_run
+            if pending_resume_run is not None:
+                resumed = pending_resume_run
+                pending_resume_run = None
+                return await self.state.resume_auxiliary_run(resumed)
             if auxiliary:
                 started = await self.state.start_auxiliary_run(
                     chapter.id,
@@ -2653,7 +2691,7 @@ class Orchestrator:
             else:
                 async with self.source_lock:
                     await self.git.ensure_clean(chapter)
-                interrupted_run = (
+                interrupted_run = resume_run or (
                     self.executor.interrupted_predecessor(run, stage)
                     if self.resume_agents
                     else None
