@@ -16,6 +16,7 @@ from paf.hashing import digest_text, stable_digest_text
 from paf.models import (
     BookConfig,
     Chapter,
+    EscalationSettings,
     PipelineConfig,
     Stage,
     StageConfig,
@@ -579,6 +580,41 @@ def load_config(path: str | Path, *, project: Project | None = None) -> Pipeline
     if steward.max_concurrent_packages_per_work_unit < 1:
         raise ValueError("steward.max_concurrent_packages_per_work_unit must be positive")
 
+    raw_escalation = _table(data, "escalation")
+    escalation = EscalationSettings(
+        enabled=bool(raw_escalation.get("enabled", True)),
+        planner_model=str(raw_escalation.get("planner_model", "gpt-5.6-sol")),
+        planner_reasoning_effort=str(raw_escalation.get("planner_reasoning_effort", "medium")),
+        investigator_model=str(raw_escalation.get("investigator_model", "gpt-5.6-luna")),
+        investigator_reasoning_effort=str(
+            raw_escalation.get("investigator_reasoning_effort", "xhigh")
+        ),
+        worker_model=str(raw_escalation.get("worker_model", "gpt-5.6-luna")),
+        worker_reasoning_effort=str(raw_escalation.get("worker_reasoning_effort", "xhigh")),
+        max_concurrent_investigations=int(raw_escalation.get("max_concurrent_investigations", 8)),
+        maximum_investigations_per_case=int(
+            raw_escalation.get("maximum_investigations_per_case", 4)
+        ),
+        maximum_planner_attempts=int(raw_escalation.get("maximum_planner_attempts", 2)),
+        maximum_scope_expansions=int(raw_escalation.get("maximum_scope_expansions", 2)),
+        source_issue_sighting_threshold=int(
+            raw_escalation.get("source_issue_sighting_threshold", 2)
+        ),
+        persistent_failure_threshold=int(raw_escalation.get("persistent_failure_threshold", 3)),
+        recent_trace_runs=int(raw_escalation.get("recent_trace_runs", 3)),
+    )
+    positive_escalation_bounds = {
+        "max_concurrent_investigations": escalation.max_concurrent_investigations,
+        "maximum_investigations_per_case": escalation.maximum_investigations_per_case,
+        "maximum_planner_attempts": escalation.maximum_planner_attempts,
+        "maximum_scope_expansions": escalation.maximum_scope_expansions,
+        "source_issue_sighting_threshold": escalation.source_issue_sighting_threshold,
+        "persistent_failure_threshold": escalation.persistent_failure_threshold,
+        "recent_trace_runs": escalation.recent_trace_runs,
+    }
+    if invalid := [name for name, value in positive_escalation_bounds.items() if value < 1]:
+        raise ValueError(f"escalation.{invalid[0]} must be positive")
+
     source_defaults, source_rules, source_discovery = _read_source_settings(data)
     if "backend" in data and "target" in data:
         raise ValueError("configure [backend] or the [target] alias, not both")
@@ -677,6 +713,7 @@ def load_config(path: str | Path, *, project: Project | None = None) -> Pipeline
         settings=settings,
         stages=stages,
         steward=steward,
+        escalation=escalation,
         books=books,
         chapters=chapters,
         source_rules=source_rules,

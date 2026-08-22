@@ -765,14 +765,14 @@ def test_warning_cleanup_uses_dedicated_minimal_disturbance_prompt(tmp_path: Pat
     assert "PAF validation diagnostics to repair" in prompt
 
 
-def test_upstream_repair_uses_steward_diagnostic_model(tmp_path: Path) -> None:
+def test_upstream_repair_uses_cheap_escalation_worker_model(tmp_path: Path) -> None:
     config_path = write_project(tmp_path, chapters="chapters = [1]")
     config_path.write_text(
         config_path.read_text(encoding="utf-8")
         + """
-[steward]
-model = "strong-planner"
-reasoning_effort = "high"
+[escalation]
+planner_model = "rare-planner"
+planner_reasoning_effort = "high"
 worker_model = "cheap-editor"
 worker_reasoning_effort = "low"
 """,
@@ -783,8 +783,8 @@ worker_reasoning_effort = "low"
 
     command = executor.command(Stage.REVIEW, role=UPSTREAM_REPAIR_ROLE)
 
-    assert command[command.index("--model") + 1] == "strong-planner"
-    assert 'model_reasoning_effort="high"' in command
+    assert command[command.index("--model") + 1] == "cheap-editor"
+    assert 'model_reasoning_effort="low"' in command
 
 
 @pytest.mark.asyncio

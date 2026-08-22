@@ -29,6 +29,26 @@ lease_ttl_seconds = 14400
 maximum_worker_steps = 8
 max_concurrent_packages_per_work_unit = 1
 
+# Exceptional coordination is evidence-driven and separately bounded. Routine
+# pipeline work never invokes the planner. Cheap investigators inspect one
+# source issue, trace cluster, or routing ambiguity at a time; cheap workers
+# execute any approved scoped repair under normal isolation and validation.
+[escalation]
+enabled = true
+planner_model = "gpt-5.6-sol"
+planner_reasoning_effort = "medium"
+investigator_model = "gpt-5.6-luna"
+investigator_reasoning_effort = "xhigh"
+worker_model = "gpt-5.6-luna"
+worker_reasoning_effort = "xhigh"
+max_concurrent_investigations = 8
+maximum_investigations_per_case = 4
+maximum_planner_attempts = 2
+maximum_scope_expansions = 2
+source_issue_sighting_threshold = 2
+persistent_failure_threshold = 3
+recent_trace_runs = 3
+
 # The backend owns all Lean target layout and toolchain settings. Target templates
 # apply to [sources]-discovered corpora and can migrate legacy [[books]] entries;
 # omit the target template fields to retain each book's target fields unchanged.

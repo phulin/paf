@@ -52,6 +52,19 @@ def test_discovers_chapters_and_renders_paths(tmp_path: Path) -> None:
     assert config.steward.worker_model == "gpt-5.6-sol"
     assert config.steward.worker_reasoning_effort == "medium"
     assert config.steward.max_concurrent_packages_per_work_unit == 1
+    assert config.escalation.enabled is True
+    assert config.escalation.planner_model == "gpt-5.6-sol"
+    assert config.escalation.investigator_model == "gpt-5.6-luna"
+    assert config.escalation.worker_model == "gpt-5.6-luna"
+    assert config.escalation.maximum_investigations_per_case == 4
+    assert config.agent_profile(Stage.DISCOVER, "escalation_scout") == (
+        "gpt-5.6-luna",
+        "xhigh",
+    )
+    assert config.agent_profile(Stage.DISCOVER, "escalation_coordinator") == (
+        "gpt-5.6-sol",
+        "medium",
+    )
 
 
 def test_loads_and_validates_discovery_concurrency(tmp_path: Path) -> None:
@@ -175,6 +188,48 @@ def test_shepherd_table_is_a_temporary_steward_alias(tmp_path: Path) -> None:
     )
 
     assert load_config(path).steward.enabled is False
+
+
+def test_loads_and_validates_escalation_settings(tmp_path: Path) -> None:
+    path = write_project(tmp_path)
+    path.write_text(
+        path.read_text(encoding="utf-8")
+        + """
+[escalation]
+enabled = false
+planner_model = "rare-planner"
+planner_reasoning_effort = "high"
+investigator_model = "cheap-scout"
+investigator_reasoning_effort = "medium"
+worker_model = "cheap-worker"
+worker_reasoning_effort = "xhigh"
+max_concurrent_investigations = 5
+maximum_investigations_per_case = 3
+maximum_planner_attempts = 1
+maximum_scope_expansions = 1
+source_issue_sighting_threshold = 4
+persistent_failure_threshold = 5
+recent_trace_runs = 2
+""",
+        encoding="utf-8",
+    )
+
+    escalation = load_config(path).escalation
+    assert escalation.enabled is False
+    assert escalation.planner_model == "rare-planner"
+    assert escalation.investigator_model == "cheap-scout"
+    assert escalation.worker_model == "cheap-worker"
+    assert escalation.max_concurrent_investigations == 5
+    assert escalation.source_issue_sighting_threshold == 4
+
+    path.write_text(
+        path.read_text(encoding="utf-8").replace(
+            "maximum_planner_attempts = 1", "maximum_planner_attempts = 0"
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match=r"escalation\.maximum_planner_attempts"):
+        load_config(path)
 
 
 def test_removed_sweep_configuration_is_rejected(tmp_path: Path) -> None:

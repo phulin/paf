@@ -111,6 +111,26 @@ class StewardSettings:
 
 
 @dataclass(frozen=True)
+class EscalationSettings:
+    """Profiles and hard bounds for evidence-driven exceptional coordination."""
+
+    enabled: bool = True
+    planner_model: str = "gpt-5.6-sol"
+    planner_reasoning_effort: str = "medium"
+    investigator_model: str = "gpt-5.6-luna"
+    investigator_reasoning_effort: str = "xhigh"
+    worker_model: str = "gpt-5.6-luna"
+    worker_reasoning_effort: str = "xhigh"
+    max_concurrent_investigations: int = 8
+    maximum_investigations_per_case: int = 4
+    maximum_planner_attempts: int = 2
+    maximum_scope_expansions: int = 2
+    source_issue_sighting_threshold: int = 2
+    persistent_failure_threshold: int = 3
+    recent_trace_runs: int = 3
+
+
+@dataclass(frozen=True)
 class BookConfig:
     id: str
     title: str
@@ -430,6 +450,7 @@ class PipelineConfig:
     books: tuple[BookConfig, ...]
     chapters: tuple[Chapter, ...]
     steward: StewardSettings = field(default_factory=StewardSettings)
+    escalation: EscalationSettings = field(default_factory=EscalationSettings)
     source_rules: tuple[dict[str, Any], ...] = ()
     source_roots: tuple[Path, ...] = ()
     source_include: tuple[str, ...] = ()
@@ -448,6 +469,27 @@ class PipelineConfig:
         """Resolve a stage reasoning override against the swarm-wide default."""
 
         return self.stages[stage].reasoning_effort or self.settings.reasoning_effort
+
+    def agent_profile(self, stage: Stage, role: str = "") -> tuple[str | None, str | None]:
+        """Resolve named exceptional roles without coupling the config model to executors."""
+
+        if role in {"escalation_coordinator", "upstream_steward"}:
+            return (
+                self.escalation.planner_model,
+                self.escalation.planner_reasoning_effort,
+            )
+        if role in {"escalation_scout", "trace_diagnosis", "source_fact_check"}:
+            return (
+                self.escalation.investigator_model,
+                self.escalation.investigator_reasoning_effort,
+            )
+        if role in {"escalation_worker", "upstream_repair"}:
+            return self.escalation.worker_model, self.escalation.worker_reasoning_effort
+        if role == "package_steward":
+            return self.steward.model, self.steward.reasoning_effort
+        if role == "package_worker":
+            return self.steward.worker_model, self.steward.worker_reasoning_effort
+        return self.model_for(stage), self.reasoning_effort_for(stage)
 
     @property
     def documents(self) -> tuple[SourceDocument, ...]:

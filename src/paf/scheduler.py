@@ -2956,7 +2956,7 @@ class Orchestrator:
                     stage,
                     role=role,
                     request_ids=selected_request_ids,
-                    model=None,
+                    model=self.config.agent_profile(stage, role)[0],
                 )
             else:
                 started = await self.state.start_run(chapter.id, stage)

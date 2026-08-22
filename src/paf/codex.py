@@ -637,6 +637,9 @@ PACKAGE_STEWARD_ROLE = "package_steward"
 PACKAGE_WORKER_ROLE = "package_worker"
 UPSTREAM_STEWARD_ROLE = "upstream_steward"
 UPSTREAM_REPAIR_ROLE = "upstream_repair"
+ESCALATION_COORDINATOR_ROLE = "escalation_coordinator"
+ESCALATION_SCOUT_ROLE = "escalation_scout"
+ESCALATION_WORKER_ROLE = "escalation_worker"
 DIAGNOSTIC_REVIEW_ROLE = "diagnostic_review"
 PROOF_REVIEW_ROLE = "proof_review"
 WARNING_CLEANUP_ROLE = "warning_cleanup"
@@ -1961,15 +1964,7 @@ distinguish proof evidence from build diagnostics, and avoid repeating known fai
             # `codex exec resume` does not accept the top-level `--sandbox`
             # option, but it does accept the equivalent config override.
             command.extend(["--config", f'sandbox_mode="{settings.sandbox}"'])
-        if role in {PACKAGE_STEWARD_ROLE, UPSTREAM_STEWARD_ROLE, UPSTREAM_REPAIR_ROLE}:
-            model = self.config.steward.model
-            reasoning_effort = self.config.steward.reasoning_effort
-        elif role == PACKAGE_WORKER_ROLE:
-            model = self.config.steward.worker_model
-            reasoning_effort = self.config.steward.worker_reasoning_effort
-        else:
-            model = self.config.model_for(stage)
-            reasoning_effort = self.config.reasoning_effort_for(stage)
+        model, reasoning_effort = self.config.agent_profile(stage, role)
         if model:
             command.extend(["--model", model])
         if reasoning_effort:
