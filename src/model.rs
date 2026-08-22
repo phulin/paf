@@ -107,10 +107,11 @@ pub struct StewardCase {
     pub needed_result: String,
     pub request_ids: Vec<String>,
     pub context_work_unit_ids: Vec<String>,
+    pub write_work_unit_ids: Vec<String>,
     pub acceptance_tests: Vec<String>,
     pub rationale: String,
     pub steward_run_id: String,
-    pub implementation_run_ids: Vec<String>,
+    pub repair_run_ids: Vec<String>,
     pub decision: Value,
     pub created_at: String,
     pub updated_at: String,
@@ -1240,7 +1241,7 @@ impl DashboardModel {
 
 fn steward_case_status_rank(status: &str) -> u8 {
     match status {
-        "implementing" => 0,
+        "repairing" => 0,
         "ready" | "needs_scope" => 1,
         "failed" => 2,
         "verified" => 3,

@@ -464,10 +464,16 @@ After the daemon exits, `status`, `snapshot`, and `wait` fall back to the persis
 - If sustained checked proof work exposes a possible upstream defect or missing result, the proof
   agent records the blocked declaration and consumer path, exact residual goal, needed result,
   placement hypothesis, acceptance checks, and materially different attempted alternatives. The
-  coordinator opens one durable upstream request and gives a focused evaluator both the downstream
-  evidence and suspected earlier interface. A validated upstream repair or checked rejection route
-  wakes the consumer; an implementation or orchestration error is recorded as a failed case rather
-  than converted into an open-ended request for human placement.
+  coordinator opens one durable upstream request and gives a focused review-stage repair agent both
+  the downstream evidence and suspected earlier interface. The global Steward records readable
+  context separately from the chapters whose files the repair agent may edit and lock. A repair
+  agent may add or revise interfaces and make structural consumer adaptations, but it defers every
+  proposition proof introduced or invalidated by those edits to ordinary proof agents. A validated
+  repair or checked rejection route resets failed consumer proof tasks to `pending`; an agent or
+  orchestration error is recorded as a failed case rather than converted into an open-ended request
+  for human placement. Repair agents with overlapping writable chapter scopes never run together,
+  and their multi-chapter locks are released once edits are integrated, before broader validation
+  and proof work.
 - A proof agent may change proof bodies but not declaration interfaces. It reports each unresolved
   proof through structured `unresolved_proofs`, including checked probes, their outcomes, the exact
   remaining goal, and supporting evidence. The coordinator decides whether that evidence warrants

@@ -21,7 +21,7 @@ from paf.codex import (
     PACKAGE_STEWARD_ROLE,
     PACKAGE_WORKER_ROLE,
     PROOF_REVIEW_ROLE,
-    UPSTREAM_IMPLEMENTATION_ROLE,
+    UPSTREAM_REPAIR_ROLE,
     UPSTREAM_STEWARD_ROLE,
     WARNING_REVIEW_ROLE,
     AgentResult,
@@ -105,7 +105,7 @@ from paf.warning_cleanup import (
 
 MAXIMUM_COORDINATOR_BUILD_TARGETS = 500
 MAXIMUM_STALE_REVIEW_SNAPSHOT_RETRIES = 3
-MAXIMUM_CONCURRENT_UPSTREAM_IMPLEMENTATIONS = 2
+MAXIMUM_CONCURRENT_UPSTREAM_REPAIRS = 2
 REVIEW_REPORT_RETRY_PROMPT = """Your previous review turn did not satisfy the report contract:
 
 {error}
@@ -259,6 +259,23 @@ class ExecutionDisposition(StrEnum):
     SUCCEEDED = "succeeded"
     WAITING = "waiting"
     FAILED = "failed"
+
+
+def _repair_may_defer(target: ProofTarget, repo: Path) -> bool:
+    """Whether a newly introduced placeholder belongs to a proposition proof body."""
+
+    path = repo / target.path
+    try:
+        line = path.read_text(encoding="utf-8").splitlines()[target.line - 1]
+    except (IndexError, OSError):
+        return False
+    return (
+        re.match(
+            r"^[ \t]*(?:(?:private|protected|noncomputable)[ \t]+)*(?:theorem|lemma|example)\b",
+            line,
+        )
+        is not None
+    )
 
 
 @dataclass(frozen=True)
@@ -1204,7 +1221,34 @@ class Orchestrator:
                 value["context_work_unit_ids"] = sorted(
                     set(context_ids), key=self._work_unit_order.__getitem__
                 )
-                value["status"] = "ready" if value.get("disposition") == "implement" else "resolved"
+                write_ids = sorted(
+                    {
+                        str(item)
+                        for item in value.get("write_work_unit_ids", ())
+                        if str(item) in self._work_units_by_id
+                    },
+                    key=self._work_unit_order.__getitem__,
+                )
+                value["write_work_unit_ids"] = write_ids
+                value["context_work_unit_ids"] = sorted(
+                    set(value["context_work_unit_ids"]).union(write_ids),
+                    key=self._work_unit_order.__getitem__,
+                )
+                if value.get("disposition") == "repair" and not write_ids:
+                    await self.state.update_run(
+                        run,
+                        status=TaskStatus.BLOCKED,
+                        report=result.report
+                        | {
+                            "issues": [
+                                *result.report.get("issues", ()),
+                                f"Repair case {value.get('case_id', '<unknown>')} has no valid "
+                                "write_work_unit_ids.",
+                            ],
+                        },
+                    )
+                    return
+                value["status"] = "ready" if value.get("disposition") == "repair" else "resolved"
                 value["steward_run_id"] = run.id
                 normalized.append(value)
             await self.state.replace_steward_cases(normalized)
@@ -1269,7 +1313,7 @@ class Orchestrator:
         generation_id = f"steward-case-generation:{case['id']}:{generation}"
         return (str(case["id"]), generation_id, *map(str, case.get("request_ids", ())))
 
-    async def _run_upstream_implementation(self, case_id: str) -> None:
+    async def _run_upstream_repair(self, case_id: str) -> None:
         case = self.state.steward_cases.get(case_id)
         if not isinstance(case, dict):
             return
@@ -1289,18 +1333,31 @@ class Orchestrator:
                 key=self._work_unit_order.__getitem__,
             )
         )
-        if not context_ids:
+        write_ids = tuple(
+            sorted(
+                {
+                    str(value)
+                    for value in case.get("write_work_unit_ids", ())
+                    if str(value) in self._work_units_by_id
+                },
+                key=self._work_unit_order.__getitem__,
+            )
+        )
+        if not context_ids or not write_ids:
             decision = {
                 "complete": False,
-                "summary": "upstream implementation case has no valid work-unit scope",
-                "issues": ["No context_work_unit_ids resolve to configured work units."],
+                "summary": "upstream repair case has no valid readable or writable scope",
+                "issues": [
+                    "Both context_work_unit_ids and write_work_unit_ids must resolve to configured "
+                    "work units."
+                ],
                 "disposition": "failed",
             }
             await self._resolve_steward_case(
                 case,
                 request_status=UpstreamRequestStatus.FAILED,
                 blocker_status=ProofBlockerStatus.BLOCKED,
-                detail="upstream implementation failed because its scope is invalid",
+                detail="upstream repair failed because its scope is invalid",
                 decision=decision,
             )
             await self.state.update_steward_case(case_id, status="failed", decision=decision)
@@ -1308,11 +1365,11 @@ class Orchestrator:
         scope = tuple(
             dict.fromkeys(
                 path
-                for work_unit_id in context_ids
+                for work_unit_id in write_ids
                 for path in self._work_units_by_id[work_unit_id].scope
             )
         )
-        anchor = _with_scope(self._work_units_by_id[context_ids[0]], scope)
+        anchor = _with_scope(self._work_units_by_id[write_ids[0]], scope)
         anchor = _with_build_command(
             anchor,
             " && ".join(
@@ -1322,6 +1379,10 @@ class Orchestrator:
                 )
             ),
         )
+        existing_deferred_proofs = {
+            (target.path, target.declaration)
+            for target in proof_targets(self.config.settings.repo, anchor)
+        }
         dossier = {
             "case": case,
             "requests": {
@@ -1346,34 +1407,35 @@ class Orchestrator:
         claimed = await self.state.update_steward_case_generation(
             case_id,
             generation,
-            status="implementing",
-            active_implementation_generation=generation,
+            status="repairing",
+            active_repair_generation=generation,
         )
         if not claimed:
             return
         assignment_request_ids = self._upstream_case_assignment_ids(case, generation)
         resumable = (
             self.state.interrupted_auxiliary_run(
-                role=UPSTREAM_IMPLEMENTATION_ROLE,
+                role=UPSTREAM_REPAIR_ROLE,
                 request_ids=assignment_request_ids,
             )
             if self.resume_agents
             else None
         )
         if resumable is None and self.resume_agents and generation == 1:
-            # Generation metadata was introduced after existing projects had resumable
-            # implementation runs. Only generation one may consume that legacy assignment.
+            # Generation metadata was introduced after existing projects had resumable repair
+            # runs. Only generation one may consume that legacy assignment.
             resumable = self.state.interrupted_auxiliary_run(
-                role=UPSTREAM_IMPLEMENTATION_ROLE,
+                role=UPSTREAM_REPAIR_ROLE,
                 request_ids=(case_id, *case.get("request_ids", ())),
             )
         attempt = await self._attempt(
             anchor,
-            Stage.PROVE,
-            role=UPSTREAM_IMPLEMENTATION_ROLE,
+            Stage.REVIEW,
+            role=UPSTREAM_REPAIR_ROLE,
             request_ids=assignment_request_ids,
-            queue_detail="waiting for atomic multi-chapter implementation lock",
+            queue_detail="waiting for exclusive multi-chapter repair locks",
             upstream_dossier=dossier,
+            lock_work_unit_ids=write_ids,
             resume_run=resumable,
             resume_thread_id=resumable.thread_id if resumable is not None else None,
             resume_run_id=resumable.id if resumable is not None else "",
@@ -1384,22 +1446,74 @@ class Orchestrator:
             # already discarded or integrated the attempt as appropriate; its stale disposition
             # must not resolve requests or mutate the replacement generation.
             return
-        run_ids = list(case.get("implementation_run_ids", ()))
+        run_ids = list(case.get("repair_run_ids", ()))
         if attempt.run.id not in run_ids:
             run_ids.append(attempt.run.id)
         report = attempt.agent.report if isinstance(attempt.agent.report, dict) else {}
         disposition = str(report.get("disposition", "failed"))
-        if disposition == "implemented" and attempt.agent.changed and attempt.validation.succeeded:
+        if disposition == "repaired" and attempt.agent.changed and attempt.validation.succeeded:
+            current_targets = proof_targets(self.config.settings.repo, anchor)
+            newly_deferred_targets = tuple(
+                target
+                for target in current_targets
+                if (target.path, target.declaration) not in existing_deferred_proofs
+            )
+            newly_deferred_proofs = {
+                (target.path, target.declaration)
+                for target in newly_deferred_targets
+                if _repair_may_defer(target, self.config.settings.repo)
+            }
+            computational_placeholders = sorted(
+                (target.path, target.declaration)
+                for target in newly_deferred_targets
+                if not _repair_may_defer(target, self.config.settings.repo)
+            )
+            reported_deferred_proofs = {
+                (str(value.get("path", "")), str(value.get("declaration", "")))
+                for value in report.get("deferred_proofs", ())
+                if isinstance(value, dict)
+            }
+            if reported_deferred_proofs != newly_deferred_proofs or computational_placeholders:
+                missing = sorted(newly_deferred_proofs.difference(reported_deferred_proofs))
+                stale = sorted(reported_deferred_proofs.difference(newly_deferred_proofs))
+                details = []
+                if missing:
+                    details.append(f"unreported deferred proofs: {missing}")
+                if stale:
+                    details.append(f"reported proofs not newly deferred by this repair: {stale}")
+                if computational_placeholders:
+                    details.append(
+                        "repair introduced placeholders in computational declarations: "
+                        f"{computational_placeholders}"
+                    )
+                attempt = replace(
+                    attempt,
+                    validation=ValidationResult(
+                        False,
+                        1,
+                        "; ".join(details),
+                        status=ValidationStatus.TARGET_FAILED,
+                    ),
+                )
+        if disposition == "repaired" and attempt.agent.changed and attempt.validation.succeeded:
             isolation = attempt.run.isolation if isinstance(attempt.run.isolation, dict) else {}
             changed_owners = self._package_owner_units(isolation.get("changed_paths", ()))
-            owner_ids = tuple(unit.id for unit in changed_owners) or context_ids
+            owner_ids = tuple(unit.id for unit in changed_owners) or write_ids
             self._mark_source_changed(owner_ids)
             await self._invalidate_build_records(owner_ids)
+            for owner_id in owner_ids:
+                await self.state.set_task(
+                    owner_id,
+                    Stage.PROVE,
+                    TaskStatus.PENDING,
+                    "upstream repair integrated; deferred proof work queued",
+                )
+                self._proof_rechecks.add(owner_id)
             await self._resolve_steward_case(
                 case,
                 request_status=UpstreamRequestStatus.VERIFIED,
                 blocker_status=ProofBlockerStatus.OPEN,
-                detail="focused upstream implementation completed; consumer retry queued",
+                detail="focused upstream repair completed; consumer retry queued",
                 decision=report,
                 evaluation_run_id=attempt.run.id,
             )
@@ -1407,7 +1521,7 @@ class Orchestrator:
                 case_id,
                 generation,
                 status="verified",
-                implementation_run_ids=run_ids,
+                repair_run_ids=run_ids,
                 decision=report,
             )
         elif disposition in {"consumer_local", "not_needed"} and not attempt.agent.changed:
@@ -1415,7 +1529,7 @@ class Orchestrator:
                 case,
                 request_status=UpstreamRequestStatus.REJECTED,
                 blocker_status=ProofBlockerStatus.OPEN,
-                detail="focused implementation returned a checked consumer route",
+                detail="focused repair returned a checked consumer route",
                 decision=report,
                 evaluation_run_id=attempt.run.id,
             )
@@ -1423,7 +1537,7 @@ class Orchestrator:
                 case_id,
                 generation,
                 status="rejected",
-                implementation_run_ids=run_ids,
+                repair_run_ids=run_ids,
                 decision=report,
             )
         elif disposition == "needs_scope" and not attempt.agent.changed:
@@ -1437,7 +1551,7 @@ class Orchestrator:
                     work_unit_id
                     for path in requested_paths
                     for work_unit_id in self._path_owner_ids(path)
-                    if work_unit_id not in context_ids
+                    if work_unit_id not in write_ids
                 },
                 key=self._work_unit_order.__getitem__,
             )
@@ -1447,7 +1561,7 @@ class Orchestrator:
                 status="needs_scope",
                 requested_paths=requested_paths,
                 requested_work_unit_ids=additional,
-                implementation_run_ids=run_ids,
+                repair_run_ids=run_ids,
                 decision=report,
             )
             for request_id in case.get("request_ids", ()):
@@ -1456,16 +1570,16 @@ class Orchestrator:
                 )
         else:
             if not attempt.agent.succeeded:
-                failure_summary = str(attempt.agent.error or "upstream implementation agent failed")
+                failure_summary = str(attempt.agent.error or "upstream repair agent failed")
             elif disposition == "failed":
                 failure_summary = str(report.get("summary", "")).strip()
-            elif disposition == "implemented" and not attempt.validation.succeeded:
-                failure_summary = "upstream implementation did not pass validation"
+            elif disposition == "repaired" and not attempt.validation.succeeded:
+                failure_summary = "upstream repair did not pass validation"
             else:
                 failure_summary = (
-                    "upstream implementation returned a report inconsistent with its source changes"
+                    "upstream repair returned a report inconsistent with its source changes"
                 )
-            failure_summary = failure_summary or "upstream implementation failed"
+            failure_summary = failure_summary or "upstream repair failed"
             report_issues = report.get("issues", ())
             issues = list(report_issues) if isinstance(report_issues, list) else []
             decision = report | {
@@ -1478,7 +1592,7 @@ class Orchestrator:
                 case,
                 request_status=UpstreamRequestStatus.FAILED,
                 blocker_status=ProofBlockerStatus.BLOCKED,
-                detail="focused upstream implementation failed",
+                detail="focused upstream repair failed",
                 decision=decision,
                 evaluation_run_id=attempt.run.id,
             )
@@ -1486,11 +1600,11 @@ class Orchestrator:
                 case_id,
                 generation,
                 status="failed",
-                implementation_run_ids=run_ids,
+                repair_run_ids=run_ids,
                 decision=decision,
             )
 
-    async def _run_scheduled_upstream_implementation(
+    async def _run_scheduled_upstream_repair(
         self,
         case_id: str,
         generation: int,
@@ -1498,13 +1612,13 @@ class Orchestrator:
         case = self.state.steward_cases.get(case_id, {})
         if max(1, int(case.get("generation", 1))) != generation:
             return
-        await self._run_upstream_implementation(case_id)
+        await self._run_upstream_repair(case_id)
 
-    def _upstream_case_work_unit_ids(self, case_id: str) -> set[str]:
+    def _upstream_case_write_work_unit_ids(self, case_id: str) -> set[str]:
         case = self.state.steward_cases.get(case_id, {})
         return {
             str(value)
-            for value in case.get("context_work_unit_ids", ())
+            for value in case.get("write_work_unit_ids", ())
             if str(value) in self._work_units_by_id
         }
 
@@ -1512,7 +1626,7 @@ class Orchestrator:
         return {
             work_unit_id
             for case_id in self._upstream_case_tasks
-            for work_unit_id in self._upstream_case_work_unit_ids(case_id)
+            for work_unit_id in self._upstream_case_write_work_unit_ids(case_id)
         }
 
     async def _schedule_upstream_coordination(
@@ -1543,17 +1657,25 @@ class Orchestrator:
             for work_unit_id, lock in self._chapter_agent_locks.items()
             if lock.locked()
         }
-        ready = [
-            case_id
-            for case_id, case in sorted(self.state.steward_cases.items())
-            if case.get("status") == "ready"
-            and case.get("disposition") == "implement"
-            and not excluded.intersection(self._upstream_case_work_unit_ids(case_id))
-        ]
-        for case_id in ready[:MAXIMUM_CONCURRENT_UPSTREAM_IMPLEMENTATIONS]:
+        ready: list[str] = []
+        claimed_write_ids = set(excluded)
+        for case_id, case in sorted(self.state.steward_cases.items()):
+            write_ids = self._upstream_case_write_work_unit_ids(case_id)
+            if (
+                case.get("status") != "ready"
+                or case.get("disposition") != "repair"
+                or not write_ids
+                or claimed_write_ids.intersection(write_ids)
+            ):
+                continue
+            ready.append(case_id)
+            claimed_write_ids.update(write_ids)
+            if len(ready) == MAXIMUM_CONCURRENT_UPSTREAM_REPAIRS:
+                break
+        for case_id in ready:
             generation = max(1, int(self.state.steward_cases[case_id].get("generation", 1)))
             self._upstream_case_tasks[case_id] = asyncio.create_task(
-                self._run_scheduled_upstream_implementation(case_id, generation)
+                self._run_scheduled_upstream_repair(case_id, generation)
             )
 
     async def prepare(
@@ -2676,11 +2798,12 @@ class Orchestrator:
         resume_prompt: str = "",
         upstream_dossier: dict[str, Any] | None = None,
         resume_run: RunRecord | None = None,
+        lock_work_unit_ids: Iterable[str] = (),
     ) -> Attempt:
         auxiliary = role in {
             WARNING_REVIEW_ROLE,
             PROOF_REVIEW_ROLE,
-            UPSTREAM_IMPLEMENTATION_ROLE,
+            UPSTREAM_REPAIR_ROLE,
             UPSTREAM_STEWARD_ROLE,
         }
         selected_request_ids = tuple(dict.fromkeys(request_ids))
@@ -2691,9 +2814,22 @@ class Orchestrator:
             if stage in (Stage.DISCOVER, Stage.FORMALIZE, Stage.REVIEW)
             else self.proof_schedule
         )
-        chapter_lock = self._chapter_agent_locks[chapter.id]
-        await chapter_lock.acquire()
-        chapter_lock_held = True
+        lock_ids = tuple(
+            sorted(
+                {chapter.id, *map(str, lock_work_unit_ids)},
+                key=self._work_unit_order.__getitem__,
+            )
+        )
+        chapter_locks: list[asyncio.Lock] = []
+        try:
+            for work_unit_id in lock_ids:
+                lock = self._chapter_agent_locks[work_unit_id]
+                await lock.acquire()
+                chapter_locks.append(lock)
+        except BaseException:
+            for lock in reversed(chapter_locks):
+                lock.release()
+            raise
         slot_held = False
         reservation = None
         reservation_owner_id = f"ordinary-{chapter.id}-{stage.value}-{uuid4().hex}"
@@ -2750,7 +2886,9 @@ class Orchestrator:
                 await self.state.release_ordinary_path_reservations(
                     reservation_owner_id, reservation.fence_generation
                 )
-            chapter_lock.release()
+            for lock in reversed(chapter_locks):
+                lock.release()
+            chapter_locks.clear()
             task = self.state.task(chapter.id, stage)
             if not auxiliary and task.queued:
                 await self.state.set_task(
@@ -2825,10 +2963,10 @@ class Orchestrator:
                 )
                 workspace_root = workspace.root
             while True:
-                if role == UPSTREAM_IMPLEMENTATION_ROLE:
+                if role == UPSTREAM_REPAIR_ROLE:
                     if upstream_dossier is None:
-                        raise ValueError("upstream implementation requires a case dossier")
-                    operation = self.executor.run_upstream_implementation(
+                        raise ValueError("upstream repair requires a case dossier")
+                    operation = self.executor.run_upstream_repair(
                         chapter,
                         run,
                         upstream_dossier,
@@ -2916,6 +3054,18 @@ class Orchestrator:
                 if source_held:
                     self.source_lock.release()
                     source_held = False
+                if role == UPSTREAM_REPAIR_ROLE:
+                    # The repair agent has stopped and its edits are canonical. Broader snapshot
+                    # validation and proof scheduling do not need to retain a multi-chapter write
+                    # exclusion; stale-snapshot detection protects them from later edits.
+                    if reservation is not None:
+                        await self.state.release_ordinary_path_reservations(
+                            reservation_owner_id, reservation.fence_generation
+                        )
+                        reservation = None
+                    for lock in reversed(chapter_locks):
+                        lock.release()
+                    chapter_locks.clear()
             if (
                 isolated.accepted
                 and agent.changed
@@ -2939,16 +3089,18 @@ class Orchestrator:
                 for target in selected_proof_targets
             )
             if isolated.accepted:
-                if stage is Stage.PROVE and (
-                    agent.changed or self.force or assigned_targets_satisfied
-                ):
+                validate_repair = role == UPSTREAM_REPAIR_ROLE and agent.changed
+                if (
+                    stage is Stage.PROVE
+                    and (agent.changed or self.force or assigned_targets_satisfied)
+                ) or validate_repair:
                     snapshots: dict[str, ValidatedBuildSnapshot] = {}
                     validation = (
                         await self._build_chapters(
                             (chapter,),
                             publish_if_clean=True,
-                            mode="proof-certification",
-                            stage=Stage.PROVE,
+                            mode=("interface-repair" if validate_repair else "proof-certification"),
+                            stage=stage,
                             snapshots=snapshots,
                         )
                     )[chapter.id]
@@ -2967,7 +3119,7 @@ class Orchestrator:
                             await self._queue_warning_cleanup(
                                 chapter,
                                 validation,
-                                stage=Stage.PROVE,
+                                stage=stage,
                             )
                             validation = ValidationResult(
                                 True,
@@ -3081,8 +3233,8 @@ class Orchestrator:
                 await self.state.release_ordinary_path_reservations(
                     reservation_owner_id, reservation.fence_generation
                 )
-            if chapter_lock_held:
-                chapter_lock.release()
+            for lock in reversed(chapter_locks):
+                lock.release()
             task = self.state.task(chapter.id, stage)
             if not auxiliary and task.queued:
                 await self.state.set_task(

@@ -256,11 +256,13 @@ fn draw_upstream_request_detail(frame: &mut Frame<'_>, model: &mut DashboardMode
             lines.push(Line::from(case.rationale.clone()));
         }
         lines.push(Line::from(""));
-        lines.push(Line::styled(
-            "Atomically locked work units",
-            Style::default().fg(CYAN),
-        ));
+        lines.push(Line::styled("Readable context", Style::default().fg(CYAN)));
         for work_unit_id in &case.context_work_unit_ids {
+            lines.push(Line::from(format!("  {work_unit_id}")));
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::styled("Exclusively locked write scope", Style::default().fg(CYAN)));
+        for work_unit_id in &case.write_work_unit_ids {
             lines.push(Line::from(format!("  {work_unit_id}")));
         }
         lines.push(Line::from(""));
@@ -285,7 +287,7 @@ fn draw_upstream_request_detail(frame: &mut Frame<'_>, model: &mut DashboardMode
         Paragraph::new(lines).wrap(Wrap { trim: false }).block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(" Steward decision and implementation scope "),
+                .title(" Steward decision and repair scope "),
         ),
         layout[1],
     );
@@ -669,7 +671,7 @@ fn summary(model: &DashboardModel) -> Paragraph<'static> {
             )),
         ]),
         Line::from(format!(
-            "Agents {}/{} · {} · waiting start {}    {}    Assignments {} · implementing {} · failed {}",
+            "Agents {}/{} · {} · waiting start {}    {}    Assignments {} · repairing {} · failed {}",
             state.agents.active,
             state.agents.maximum,
             agent_detail,
@@ -679,7 +681,7 @@ fn summary(model: &DashboardModel) -> Paragraph<'static> {
             state
                 .steward_cases
                 .values()
-                .filter(|case| case.status == "implementing")
+                .filter(|case| case.status == "repairing")
                 .count(),
             state
                 .steward_cases
@@ -1031,7 +1033,7 @@ fn draw_detail(frame: &mut Frame<'_>, model: &mut DashboardModel) {
                 Block::default()
                     .borders(Borders::ALL)
                     .title(if steward_case.is_some() {
-                        " Steward and implementation timeline "
+                        " Steward and repair timeline "
                     } else {
                         " Agent detail "
                     }),
@@ -1828,7 +1830,7 @@ fn run_role_title(role: &str, stage: &str) -> String {
         "package_steward" => "Steward".into(),
         "package_worker" => "Package worker".into(),
         "upstream_steward" => "Global steward".into(),
-        "upstream_implementation" => "Implementation".into(),
+        "upstream_repair" => "Repair agent".into(),
         "proof_review" => "Proof review".into(),
         "warning_cleanup" => "Warning cleanup".into(),
         "" => title(stage),
@@ -2055,12 +2057,13 @@ mod tests {
                 result: None,
                 snapshot: Some(serde_json::json!({
                     "steward_cases": {"case-1": {
-                        "id": "case-1", "status": "implementing",
+                        "id": "case-1", "status": "repairing",
                         "title": "Canonical completion transport",
-                        "disposition": "implement",
+                        "disposition": "repair",
                         "needed_result": "A transport bridge",
                         "request_ids": ["upstream-1"],
                         "context_work_unit_ids": ["book/chapter-01", "book/chapter-02"],
+                        "write_work_unit_ids": ["book/chapter-01"],
                         "acceptance_tests": ["Book.target elaborates"],
                         "rationale": "The two chapters must be inspected together.",
                         "updated_at": "2026-08-22T00:00:00Z"
@@ -2080,7 +2083,7 @@ mod tests {
                     "capability_packages": {"package-1": {
                         "id": "package-1", "capability_key": "book.transport",
                         "title": "Transport bridge", "mathematical_objective": "Implement the shared bridge",
-                        "status": "implementing", "revision": 4, "plan_revision": 2,
+                        "status": "repairing", "revision": 4, "plan_revision": 2,
                         "write_scope": ["lean/Book/Shared.lean"],
                         "updated_at": "2026-08-21T00:00:00Z"
                     }},
@@ -2090,7 +2093,7 @@ mod tests {
                         "residual_goal": "⊢ Result x", "blocker_ids": ["blocker-1"]
                     }},
                     "package_steps": {"step-1": {
-                        "id": "step-1", "package_id": "package-1", "status": "implementing",
+                        "id": "step-1", "package_id": "package-1", "status": "repairing",
                         "kind": "interface", "objective": "Add bridge",
                         "assigned_worker_id": "worker-1", "remaining_gap": "prove naturality"
                     }},

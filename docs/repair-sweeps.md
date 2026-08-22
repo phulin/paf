@@ -28,8 +28,10 @@ both sides and chooses one of these outcomes:
 
 A validated upstream edit marks the request `verified`; checked rejection guidance marks it
 `rejected`. Either result reopens the consumer proof, which is the final semantic acceptance test.
-An implementation or orchestration error becomes `failed`; uncertainty alone is not a terminal
-outcome and must be resolved through a conservatively scoped implementation case.
+A repair-agent or orchestration error becomes `failed`; uncertainty alone is not a terminal outcome
+and must be resolved through a conservatively scoped repair case. Repair agents run as auxiliary
+review work: they own interface and structural changes, while proposition proofs introduced or
+invalidated by those edits are returned to ordinary proof agents.
 
 ## Scheduling and deduplication
 

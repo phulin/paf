@@ -472,13 +472,17 @@ _UPSTREAM_STEWARD_PROPERTIES: dict[str, Any] = {
                 },
                 "disposition": {
                     "type": "string",
-                    "enum": ["implement", "retry_consumers", "reject"],
+                    "enum": ["repair", "retry_consumers", "reject"],
                 },
                 "needed_result": {"type": "string", "minLength": 1},
                 "context_work_unit_ids": {
                     "type": "array",
                     "items": {"type": "string", "minLength": 1},
                     "minItems": 1,
+                },
+                "write_work_unit_ids": {
+                    "type": "array",
+                    "items": {"type": "string", "minLength": 1},
                 },
                 "acceptance_tests": {
                     "type": "array",
@@ -493,6 +497,7 @@ _UPSTREAM_STEWARD_PROPERTIES: dict[str, Any] = {
                 "disposition",
                 "needed_result",
                 "context_work_unit_ids",
+                "write_work_unit_ids",
                 "acceptance_tests",
                 "rationale",
             ],
@@ -500,13 +505,13 @@ _UPSTREAM_STEWARD_PROPERTIES: dict[str, Any] = {
     },
 }
 
-_UPSTREAM_IMPLEMENTATION_PROPERTIES: dict[str, Any] = {
+_UPSTREAM_REPAIR_PROPERTIES: dict[str, Any] = {
     "complete": _REPORT_BASE_PROPERTIES["complete"],
     "summary": _REPORT_BASE_PROPERTIES["summary"],
     "issues": _REPORT_BASE_PROPERTIES["issues"],
     "disposition": {
         "type": "string",
-        "enum": ["implemented", "not_needed", "consumer_local", "needs_scope", "failed"],
+        "enum": ["repaired", "not_needed", "consumer_local", "needs_scope", "failed"],
     },
     "placement": {
         "type": "object",
@@ -525,6 +530,26 @@ _UPSTREAM_IMPLEMENTATION_PROPERTIES: dict[str, Any] = {
     "additional_paths": {
         "type": "array",
         "items": {"type": "string", "minLength": 1},
+    },
+    "deferred_proofs": {
+        "type": "array",
+        "items": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "path": {"type": "string", "minLength": 1},
+                "declaration": {"type": "string", "minLength": 1},
+                "reason": {
+                    "type": "string",
+                    "enum": [
+                        "new_proposition",
+                        "revised_statement",
+                        "invalidated_consumer",
+                    ],
+                },
+            },
+            "required": ["path", "declaration", "reason"],
+        },
     },
     "validation_evidence": {"type": "string", "minLength": 1},
 }
@@ -545,8 +570,8 @@ REPORT_SCHEMAS: dict[str, dict[str, Any]] = {
     "upstream_steward": _report_schema(
         "PAF global upstream-request steward report", _UPSTREAM_STEWARD_PROPERTIES
     ),
-    "upstream_implementation": _report_schema(
-        "PAF focused upstream implementation report", _UPSTREAM_IMPLEMENTATION_PROPERTIES
+    "upstream_repair": _report_schema(
+        "PAF focused upstream repair report", _UPSTREAM_REPAIR_PROPERTIES
     ),
     "package_steward": _report_schema(
         "PAF capability-package Steward report", _PACKAGE_STEWARD_PROPERTIES
@@ -606,13 +631,11 @@ WARNING_CLEANUP_PROMPT_PATH = Path(str(_PROMPT_RESOURCES.joinpath("warning_clean
 PACKAGE_STEWARD_PROMPT_PATH = Path(str(_PROMPT_RESOURCES.joinpath("package_steward.md")))
 PACKAGE_WORKER_PROMPT_PATH = Path(str(_PROMPT_RESOURCES.joinpath("package_worker.md")))
 UPSTREAM_STEWARD_PROMPT_PATH = Path(str(_PROMPT_RESOURCES.joinpath("upstream_steward.md")))
-UPSTREAM_IMPLEMENTATION_PROMPT_PATH = Path(
-    str(_PROMPT_RESOURCES.joinpath("upstream_implementation.md"))
-)
+UPSTREAM_REPAIR_PROMPT_PATH = Path(str(_PROMPT_RESOURCES.joinpath("upstream_repair.md")))
 PACKAGE_STEWARD_ROLE = "package_steward"
 PACKAGE_WORKER_ROLE = "package_worker"
 UPSTREAM_STEWARD_ROLE = "upstream_steward"
-UPSTREAM_IMPLEMENTATION_ROLE = "upstream_implementation"
+UPSTREAM_REPAIR_ROLE = "upstream_repair"
 DIAGNOSTIC_REVIEW_ROLE = "diagnostic_review"
 PROOF_REVIEW_ROLE = "proof_review"
 WARNING_CLEANUP_ROLE = "warning_cleanup"
@@ -627,7 +650,7 @@ def report_schema_key(stage: Stage, *, role: str = "", feedback: str = "") -> st
         PACKAGE_STEWARD_ROLE,
         PACKAGE_WORKER_ROLE,
         UPSTREAM_STEWARD_ROLE,
-        UPSTREAM_IMPLEMENTATION_ROLE,
+        UPSTREAM_REPAIR_ROLE,
     }:
         return role
     if role == WARNING_CLEANUP_ROLE:
@@ -1511,8 +1534,11 @@ class CodexExecutor:
 
     async def prepare(self) -> None:
         self.config.settings.state_dir.mkdir(parents=True, exist_ok=True)
-        legacy_path = self.config.settings.state_dir / "agent-report.schema.json"
-        legacy_path.unlink(missing_ok=True)
+        for legacy_name in (
+            "agent-report.schema.json",
+            "agent-report-upstream_implementation.schema.json",
+        ):
+            (self.config.settings.state_dir / legacy_name).unlink(missing_ok=True)
         for key, schema in REPORT_SCHEMAS.items():
             self.schema_paths[key].write_text(json.dumps(schema, indent=2), encoding="utf-8")
 
@@ -1526,8 +1552,8 @@ class CodexExecutor:
         role: str = "",
         proof_targets: Iterable[ProofTarget | dict[str, Any]] = (),
     ) -> str:
-        if role == UPSTREAM_IMPLEMENTATION_ROLE:
-            prompt_path = UPSTREAM_IMPLEMENTATION_PROMPT_PATH
+        if role == UPSTREAM_REPAIR_ROLE:
+            prompt_path = UPSTREAM_REPAIR_PROMPT_PATH
         elif role == PACKAGE_WORKER_ROLE:
             prompt_path = PACKAGE_WORKER_PROMPT_PATH
         elif role == WARNING_CLEANUP_ROLE:
@@ -1563,7 +1589,7 @@ class CodexExecutor:
             base = render_prompt(template.replace("{repair_instruction}", instruction), chapter)
         else:
             base = render_prompt(template, chapter)
-        omit_common = role not in {PACKAGE_WORKER_ROLE, UPSTREAM_IMPLEMENTATION_ROLE} and stage in (
+        omit_common = role not in {PACKAGE_WORKER_ROLE, UPSTREAM_REPAIR_ROLE} and stage in (
             Stage.DISCOVER,
             Stage.PROVE,
         )
@@ -1742,11 +1768,13 @@ steps, and return a complete package mutation report."""
 assigned paths in the package overlay, and report exact validation and
 remaining evidence. You may not change placement, scope, dependencies, consumers, or package
 lifecycle."""
-        elif role == UPSTREAM_IMPLEMENTATION_ROLE:
-            stage_contract = """This is a focused cross-module repair. Diagnose the downstream
-failure together with its plausible upstream interfaces, decide the correct mathematical placement,
-and make only the smallest justified repair within the locked scope. Do not assume the requesting
-proof agent's proposed API or placement is correct."""
+        elif role == UPSTREAM_REPAIR_ROLE:
+            stage_contract = """This is focused cross-module interface repair. You may add or revise
+declarations, definitions, imports, and structurally affected uses within the writable scope.
+Implement computational content fully, but do not prove newly introduced propositions or repair
+proofs invalidated by interface changes. Use permitted proof placeholders for those obligations,
+record them precisely, validate interface-level elaboration, and return as soon as the structural
+work is complete."""
         validation_contract = {
             Stage.DISCOVER: "PAF validates and saves the reported source dependencies.",
             Stage.FORMALIZE: "PAF independently checks the allowed file changes, placeholders, "
@@ -1877,7 +1905,7 @@ distinguish proof evidence from build diagnostics, and avoid repeating known fai
         if role in {PACKAGE_STEWARD_ROLE, UPSTREAM_STEWARD_ROLE}:
             model = self.config.steward.model
             reasoning_effort = self.config.steward.reasoning_effort
-        elif role in {PACKAGE_WORKER_ROLE, UPSTREAM_IMPLEMENTATION_ROLE}:
+        elif role in {PACKAGE_WORKER_ROLE, UPSTREAM_REPAIR_ROLE}:
             model = self.config.steward.worker_model
             reasoning_effort = self.config.steward.worker_reasoning_effort
         else:
@@ -2032,7 +2060,7 @@ distinguish proof evidence from build diagnostics, and avoid repeating known fai
             resume_prompt=resume_prompt or CAPACITY_RESUME_PROMPT,
         )
 
-    async def run_upstream_implementation(
+    async def run_upstream_repair(
         self,
         assignment: WorkUnitLike,
         run: RunRecord,
@@ -2043,10 +2071,10 @@ distinguish proof evidence from build diagnostics, and avoid repeating known fai
         resume_run_id: str = "",
         resume_prompt: str = "",
     ) -> AgentResult:
-        prompt = self.build_upstream_implementation_prompt(assignment, dossier)
+        prompt = self.build_upstream_repair_prompt(assignment, dossier)
         return await self._run_prompt(
             assignment,
-            Stage.PROVE,
+            Stage.REVIEW,
             run,
             prompt=prompt,
             workspace_root=workspace_root,
@@ -2055,7 +2083,7 @@ distinguish proof evidence from build diagnostics, and avoid repeating known fai
             resume_prompt=resume_prompt or CAPACITY_RESUME_PROMPT,
         )
 
-    def build_upstream_implementation_prompt(
+    def build_upstream_repair_prompt(
         self,
         assignment: WorkUnitLike,
         dossier: dict[str, Any],
@@ -2080,8 +2108,8 @@ distinguish proof evidence from build diagnostics, and avoid repeating known fai
         lines = [
             self.build_prompt(
                 assignment,
-                Stage.PROVE,
-                role=UPSTREAM_IMPLEMENTATION_ROLE,
+                Stage.REVIEW,
+                role=UPSTREAM_REPAIR_ROLE,
             ).rstrip(),
             "",
             "## Assignment",

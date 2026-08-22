@@ -400,8 +400,8 @@ async def test_resumed_steward_auxiliary_run_remains_one_tui_run(tmp_path: Path)
     chapter = config.chapters[0]
     run = await state.start_auxiliary_run(
         chapter.id,
-        Stage.PROVE,
-        role="upstream_implementation",
+        Stage.REVIEW,
+        role="upstream_repair",
         request_ids=("case-a", "request-a"),
     )
     await state.finish_run(
@@ -411,14 +411,16 @@ async def test_resumed_steward_auxiliary_run_remains_one_tui_run(tmp_path: Path)
     )
     state.steward_cases["case-a"] = {
         "id": "case-a",
-        "status": "implementing",
+        "status": "repairing",
         "request_ids": ["request-a"],
-        "implementation_run_ids": [run.id],
+        "context_work_unit_ids": [chapter.id],
+        "write_work_unit_ids": [chapter.id],
+        "repair_run_ids": [run.id],
     }
 
     assert (
         state.interrupted_auxiliary_run(
-            role="upstream_implementation",
+            role="upstream_repair",
             request_ids=("case-a", "request-a"),
         )
         is run
@@ -431,14 +433,17 @@ async def test_resumed_steward_auxiliary_run_remains_one_tui_run(tmp_path: Path)
 
 
 @pytest.mark.asyncio
-async def test_orphaned_implementing_steward_case_is_requeued(tmp_path: Path) -> None:
+async def test_orphaned_repairing_steward_case_is_requeued(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
     state = StateStore(config)
     await state.load_or_create()
+    chapter = config.chapters[0]
     state.steward_cases["case-a"] = {
         "id": "case-a",
-        "status": "implementing",
+        "status": "repairing",
         "request_ids": [],
+        "context_work_unit_ids": [chapter.id],
+        "write_work_unit_ids": [chapter.id],
     }
 
     recovered = await state.recover_interrupted_steward_cases()

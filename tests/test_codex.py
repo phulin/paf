@@ -95,7 +95,7 @@ def test_record_jsonl_line_deduplicates_structured_mcp_result(
 def test_report_schemas_contain_only_fields_used_by_each_active_agent() -> None:
     expected = {
         "upstream_steward": {"complete", "summary", "issues", "cases"},
-        "upstream_implementation": {
+        "upstream_repair": {
             "complete",
             "summary",
             "issues",
@@ -103,6 +103,7 @@ def test_report_schemas_contain_only_fields_used_by_each_active_agent() -> None:
             "placement",
             "consumer_routes",
             "additional_paths",
+            "deferred_proofs",
             "validation_evidence",
         },
         "package_steward": {
@@ -170,10 +171,10 @@ def test_report_schemas_contain_only_fields_used_by_each_active_agent() -> None:
         assert set(REPORT_SCHEMAS[key]["required"]) == fields
 
 
-def test_upstream_implementation_prompt_is_a_readable_assignment(tmp_path: Path) -> None:
+def test_upstream_repair_prompt_is_a_readable_assignment(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
     chapter = config.chapters[0]
-    prompt = CodexExecutor(config, StateStore(config)).build_upstream_implementation_prompt(
+    prompt = CodexExecutor(config, StateStore(config)).build_upstream_repair_prompt(
         chapter,
         {
             "case": {
@@ -220,17 +221,15 @@ def test_upstream_implementation_prompt_is_a_readable_assignment(tmp_path: Path)
     assert "opaque-unit-789" not in prompt
 
 
-def test_upstream_reports_expose_failure_only_to_implementation() -> None:
+def test_upstream_reports_expose_failure_only_to_repair() -> None:
     steward_dispositions = REPORT_SCHEMAS["upstream_steward"]["properties"]["cases"]["items"][
         "properties"
     ]["disposition"]["enum"]
-    implementation_dispositions = REPORT_SCHEMAS["upstream_implementation"]["properties"][
-        "disposition"
-    ]["enum"]
+    repair_dispositions = REPORT_SCHEMAS["upstream_repair"]["properties"]["disposition"]["enum"]
 
-    assert steward_dispositions == ["implement", "retry_consumers", "reject"]
-    assert implementation_dispositions == [
-        "implemented",
+    assert steward_dispositions == ["repair", "retry_consumers", "reject"]
+    assert repair_dispositions == [
+        "repaired",
         "not_needed",
         "consumer_local",
         "needs_scope",

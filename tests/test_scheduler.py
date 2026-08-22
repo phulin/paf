@@ -5644,9 +5644,10 @@ async def test_global_steward_resumes_in_place(
             "cases": [
                 {
                     "case_id": "case-a",
-                    "disposition": "implement",
+                    "disposition": "repair",
                     "request_ids": [request_id],
                     "context_work_unit_ids": [chapter.id],
+                    "write_work_unit_ids": [chapter.id],
                 }
             ],
         }
@@ -5674,7 +5675,7 @@ async def test_global_steward_resumes_in_place(
 
 
 @pytest.mark.asyncio
-async def test_upstream_implementation_resumes_in_place(
+async def test_upstream_repair_resumes_in_place(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
@@ -5697,28 +5698,29 @@ async def test_upstream_implementation_resumes_in_place(
             {
                 "case_id": "case-a",
                 "status": "ready",
-                "disposition": "implement",
+                "disposition": "repair",
                 "request_ids": [request_id],
                 "context_work_unit_ids": [chapter.id],
+                "write_work_unit_ids": [chapter.id],
             }
         ]
     )
     interrupted = await state.start_auxiliary_run(
         chapter.id,
-        Stage.PROVE,
-        role="upstream_implementation",
+        Stage.REVIEW,
+        role="upstream_repair",
         request_ids=("case-a", request_id),
     )
     await state.finish_run(
         interrupted,
         status=TaskStatus.INTERRUPTED,
-        thread_id="implementation-session",
+        thread_id="repair-session",
     )
     await state.set_task(
         chapter.id,
         Stage.PROVE,
         TaskStatus.FAILED,
-        "waiting for focused upstream implementation",
+        "waiting for focused upstream repair",
     )
     orchestrator = Orchestrator(config, state, resume_agents=True)
     observed: dict[str, object] = {}
@@ -5728,6 +5730,7 @@ async def test_upstream_implementation_resumes_in_place(
         _stage: Stage,
         **kwargs: object,
     ) -> Attempt:
+        assert _stage is Stage.REVIEW
         observed.update(kwargs)
         resumed = kwargs["resume_run"]
         assert isinstance(resumed, RunRecord)
@@ -5751,24 +5754,22 @@ async def test_upstream_implementation_resumes_in_place(
 
     monkeypatch.setattr(orchestrator, "_attempt", attempt)
 
-    await orchestrator._run_upstream_implementation("case-a")
+    await orchestrator._run_upstream_repair("case-a")
 
     assert observed["resume_run"] is interrupted
-    assert observed["resume_thread_id"] == "implementation-session"
+    assert observed["resume_thread_id"] == "repair-session"
     assert observed["resume_run_id"] == interrupted.id
-    implementation_runs = [
-        run for run in state.chapter_runs(chapter.id) if run.role == "upstream_implementation"
-    ]
-    assert implementation_runs == [interrupted]
-    assert state.steward_cases["case-a"]["implementation_run_ids"] == [interrupted.id]
+    repair_runs = [run for run in state.chapter_runs(chapter.id) if run.role == "upstream_repair"]
+    assert repair_runs == [interrupted]
+    assert state.steward_cases["case-a"]["repair_run_ids"] == [interrupted.id]
     proof = state.task(chapter.id, Stage.PROVE)
     assert proof.status == TaskStatus.PENDING
-    assert proof.detail == "focused implementation returned a checked consumer route"
+    assert proof.detail == "focused repair returned a checked consumer route"
     await orchestrator.shutdown()
 
 
 @pytest.mark.asyncio
-async def test_upstream_implementation_infrastructure_failure_fails_case(
+async def test_upstream_repair_infrastructure_failure_fails_case(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
@@ -5792,9 +5793,10 @@ async def test_upstream_implementation_infrastructure_failure_fails_case(
             {
                 "case_id": "case-a",
                 "status": "ready",
-                "disposition": "implement",
+                "disposition": "repair",
                 "request_ids": [request_id],
                 "context_work_unit_ids": [chapter.id],
+                "write_work_unit_ids": [chapter.id],
             }
         ]
     )
@@ -5802,12 +5804,12 @@ async def test_upstream_implementation_infrastructure_failure_fails_case(
         chapter.id,
         Stage.PROVE,
         TaskStatus.FAILED,
-        "waiting for focused upstream implementation",
+        "waiting for focused upstream repair",
     )
     run = await state.start_auxiliary_run(
         chapter.id,
-        Stage.PROVE,
-        role="upstream_implementation",
+        Stage.REVIEW,
+        role="upstream_repair",
         request_ids=("case-a", request_id),
     )
     orchestrator = Orchestrator(config, state)
@@ -5836,15 +5838,96 @@ async def test_upstream_implementation_infrastructure_failure_fails_case(
 
     monkeypatch.setattr(orchestrator, "_attempt", attempt)
 
-    await orchestrator._run_upstream_implementation("case-a")
+    await orchestrator._run_upstream_repair("case-a")
 
     case = state.steward_cases["case-a"]
     assert case["status"] == "failed"
     assert case["decision"]["disposition"] == "failed"
     assert case["decision"]["summary"] == "required MCP servers failed to initialize"
-    assert case["implementation_run_ids"] == [run.id]
+    assert case["repair_run_ids"] == [run.id]
     assert state.upstream_requests[request_id]["status"] == "failed"
     assert state.task(chapter.id, Stage.PROVE).status == TaskStatus.FAILED
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_completed_repair_resets_failed_owner_and_consumer_proofs_to_pending(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    owner, consumer = config.chapters
+    state = StateStore(config)
+    await state.load_or_create()
+    request_id, _ = await state.enqueue_upstream_request(
+        {
+            "consumer_path": "lean/Book/Chapter02.lean",
+            "blocked_declaration": "Book.consumer",
+            "residual_goal": "True",
+            "needed_result": "a repaired shared interface",
+            "owner_paths": ["lean/Book/Chapter01.lean"],
+        },
+        consumer_chapter_id=consumer.id,
+        owner_chapter_id=owner.id,
+    )
+    await state.replace_steward_cases(
+        [
+            {
+                "case_id": "case-a",
+                "status": "ready",
+                "disposition": "repair",
+                "request_ids": [request_id],
+                "context_work_unit_ids": [owner.id, consumer.id],
+                "write_work_unit_ids": [owner.id],
+            }
+        ]
+    )
+    for chapter in (owner, consumer):
+        await state.set_task(
+            chapter.id,
+            Stage.PROVE,
+            TaskStatus.FAILED,
+            "waiting for upstream repair",
+        )
+    run = await state.start_auxiliary_run(
+        owner.id,
+        Stage.REVIEW,
+        role="upstream_repair",
+        request_ids=("case-a", request_id),
+    )
+    await state.update_run(
+        run,
+        isolation={"changed_paths": ["lean/Book/Chapter01.lean"]},
+    )
+    report = {
+        "complete": True,
+        "summary": "repaired the shared interface",
+        "issues": [],
+        "disposition": "repaired",
+        "deferred_proofs": [],
+    }
+    agent = AgentResult(
+        succeeded=True,
+        exit_code=0,
+        changed=True,
+        placeholders=0,
+        usage=TokenUsage(),
+        report=report,
+    )
+    orchestrator = Orchestrator(config, state)
+
+    async def attempt(_chapter: Chapter, stage: Stage, **kwargs: object) -> Attempt:
+        assert stage is Stage.REVIEW
+        assert kwargs["lock_work_unit_ids"] == (owner.id,)
+        return Attempt(agent, ValidationResult(True, 0, "interfaces elaborate"), run)
+
+    monkeypatch.setattr(orchestrator, "_attempt", attempt)
+
+    await orchestrator._run_upstream_repair("case-a")
+
+    assert state.task(owner.id, Stage.PROVE).status == TaskStatus.PENDING
+    assert state.task(consumer.id, Stage.PROVE).status == TaskStatus.PENDING
+    assert state.upstream_requests[request_id]["status"] == "verified"
+    assert state.steward_cases["case-a"]["status"] == "verified"
     await orchestrator.shutdown()
 
 
@@ -5880,10 +5963,11 @@ async def test_global_steward_cases_deduplicate_requests_and_include_consumers(
                 "case_id": "shared-bridge",
                 "status": "ready",
                 "title": "Shared bridge",
-                "disposition": "implement",
+                "disposition": "repair",
                 "needed_result": "one shared bridge",
                 "request_ids": request_ids,
                 "context_work_unit_ids": [owner.id, consumer.id],
+                "write_work_unit_ids": [owner.id],
                 "acceptance_tests": ["both consumers elaborate"],
                 "rationale": "The observations request the same mathematical interface.",
             }
@@ -5911,27 +5995,28 @@ async def test_steward_rewrite_preserves_active_unchanged_case(tmp_path: Path) -
     original = {
         "case_id": "case-a",
         "status": "ready",
-        "disposition": "implement",
+        "disposition": "repair",
         "request_ids": [],
         "context_work_unit_ids": [chapter.id],
+        "write_work_unit_ids": [chapter.id],
         "title": "Original title",
     }
     await state.replace_steward_cases([original])
     await state.update_steward_case_generation(
-        "case-a", 1, status="implementing", active_implementation_generation=1
+        "case-a", 1, status="repairing", active_repair_generation=1
     )
 
     await state.replace_steward_cases([{**original, "title": "Improved title"}])
 
     case = state.steward_cases["case-a"]
     assert case["generation"] == 1
-    assert case["status"] == "implementing"
-    assert case["active_implementation_generation"] == 1
+    assert case["status"] == "repairing"
+    assert case["active_repair_generation"] == 1
     assert case["title"] == "Improved title"
 
 
 @pytest.mark.asyncio
-async def test_steward_scope_change_advances_implementation_generation(tmp_path: Path) -> None:
+async def test_steward_scope_change_advances_repair_generation(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
     first, second = config.chapters
     state = StateStore(config)
@@ -5941,14 +6026,15 @@ async def test_steward_scope_change_advances_implementation_generation(tmp_path:
             {
                 "case_id": "case-a",
                 "status": "ready",
-                "disposition": "implement",
+                "disposition": "repair",
                 "request_ids": [],
                 "context_work_unit_ids": [first.id],
+                "write_work_unit_ids": [first.id],
             }
         ]
     )
     await state.update_steward_case_generation(
-        "case-a", 1, status="needs_scope", implementation_run_ids=["old-run"]
+        "case-a", 1, status="needs_scope", repair_run_ids=["old-run"]
     )
 
     await state.replace_steward_cases(
@@ -5956,9 +6042,10 @@ async def test_steward_scope_change_advances_implementation_generation(tmp_path:
             {
                 "case_id": "case-a",
                 "status": "ready",
-                "disposition": "implement",
+                "disposition": "repair",
                 "request_ids": [],
                 "context_work_unit_ids": [first.id, second.id],
+                "write_work_unit_ids": [first.id, second.id],
             }
         ]
     )
@@ -5966,8 +6053,8 @@ async def test_steward_scope_change_advances_implementation_generation(tmp_path:
     case = state.steward_cases["case-a"]
     assert case["generation"] == 2
     assert case["status"] == "ready"
-    assert case["implementation_run_ids"] == ["old-run"]
-    assert "active_implementation_generation" not in case
+    assert case["repair_run_ids"] == ["old-run"]
+    assert "active_repair_generation" not in case
 
 
 @pytest.mark.asyncio
@@ -5981,9 +6068,10 @@ async def test_stale_steward_generation_cannot_claim_or_update_case(tmp_path: Pa
             {
                 "case_id": "case-a",
                 "status": "ready",
-                "disposition": "implement",
+                "disposition": "repair",
                 "request_ids": [],
                 "context_work_unit_ids": [chapter.id],
+                "write_work_unit_ids": [chapter.id],
             }
         ]
     )
@@ -6009,9 +6097,10 @@ async def test_scope_revision_waits_for_prior_case_task_to_finish(
             {
                 "case_id": "case-a",
                 "status": "ready",
-                "disposition": "implement",
+                "disposition": "repair",
                 "request_ids": [],
                 "context_work_unit_ids": [first.id],
+                "write_work_unit_ids": [first.id],
             }
         ]
     )
@@ -6025,7 +6114,7 @@ async def test_scope_revision_waits_for_prior_case_task_to_finish(
         started[launch].set()
         await releases[launch].wait()
 
-    monkeypatch.setattr(orchestrator, "_run_upstream_implementation", implement)
+    monkeypatch.setattr(orchestrator, "_run_upstream_repair", implement)
     await orchestrator._schedule_upstream_coordination()
     await asyncio.wait_for(started[0].wait(), timeout=2)
 
@@ -6034,9 +6123,10 @@ async def test_scope_revision_waits_for_prior_case_task_to_finish(
             {
                 "case_id": "case-a",
                 "status": "ready",
-                "disposition": "implement",
+                "disposition": "repair",
                 "request_ids": [],
                 "context_work_unit_ids": [first.id, second.id],
+                "write_work_unit_ids": [first.id, second.id],
             }
         ]
     )
@@ -6054,7 +6144,7 @@ async def test_scope_revision_waits_for_prior_case_task_to_finish(
 
 
 @pytest.mark.asyncio
-async def test_upstream_implementation_excludes_simultaneous_chapter_review(
+async def test_upstream_repair_excludes_simultaneous_chapter_review(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
@@ -6069,19 +6159,20 @@ async def test_upstream_implementation_excludes_simultaneous_chapter_review(
                 "case_id": "shared-chapter-repair",
                 "status": "ready",
                 "title": "Shared chapter repair",
-                "disposition": "implement",
+                "disposition": "repair",
                 "request_ids": [],
                 "context_work_unit_ids": [chapter.id],
+                "write_work_unit_ids": [chapter.id],
             }
         ]
     )
-    implementation_started = asyncio.Event()
-    release_implementation = asyncio.Event()
+    repair_started = asyncio.Event()
+    release_repair = asyncio.Event()
     review_started = asyncio.Event()
 
     async def implement(case_id: str) -> None:
-        implementation_started.set()
-        await release_implementation.wait()
+        repair_started.set()
+        await release_repair.wait()
         await state.update_steward_case(case_id, status="verified")
 
     async def review(
@@ -6093,25 +6184,25 @@ async def test_upstream_implementation_excludes_simultaneous_chapter_review(
         review_started.set()
         return StageOutcome(ExecutionDisposition.SUCCEEDED)
 
-    monkeypatch.setattr(orchestrator, "_run_upstream_implementation", implement)
+    monkeypatch.setattr(orchestrator, "_run_upstream_repair", implement)
     monkeypatch.setattr(orchestrator, "_review_chapter_to_clean", review)
 
     review_tree = asyncio.create_task(orchestrator._review_tree())
-    await asyncio.wait_for(implementation_started.wait(), timeout=2)
+    await asyncio.wait_for(repair_started.wait(), timeout=2)
     await asyncio.sleep(0)
     task = state.task(chapter.id, Stage.REVIEW)
     assert task.status == TaskStatus.PENDING
     assert task.phase == TaskPhase.IDLE
     assert not review_started.is_set()
 
-    release_implementation.set()
+    release_repair.set()
     await asyncio.wait_for(review_started.wait(), timeout=2)
     assert await asyncio.wait_for(review_tree, timeout=2)
     await orchestrator.shutdown()
 
 
 @pytest.mark.asyncio
-async def test_active_chapter_work_excludes_upstream_implementation(tmp_path: Path) -> None:
+async def test_active_chapter_work_excludes_upstream_repair(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
     chapter = config.chapters[0]
     state = StateStore(config)
@@ -6123,9 +6214,10 @@ async def test_active_chapter_work_excludes_upstream_implementation(tmp_path: Pa
                 "case_id": "shared-chapter-repair",
                 "status": "ready",
                 "title": "Shared chapter repair",
-                "disposition": "implement",
+                "disposition": "repair",
                 "request_ids": [],
                 "context_work_unit_ids": [chapter.id],
+                "write_work_unit_ids": [chapter.id],
             }
         ]
     )
@@ -6139,6 +6231,97 @@ async def test_active_chapter_work_excludes_upstream_implementation(tmp_path: Pa
 
     assert not orchestrator._upstream_case_tasks
     assert state.steward_cases["shared-chapter-repair"]["status"] == "ready"
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_scheduler_never_launches_repair_agents_with_overlapping_write_scopes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    first, second = config.chapters
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await orchestrator.prepare()
+    await state.replace_steward_cases(
+        [
+            {
+                "case_id": "case-a",
+                "status": "ready",
+                "disposition": "repair",
+                "request_ids": [],
+                "context_work_unit_ids": [first.id],
+                "write_work_unit_ids": [first.id],
+            },
+            {
+                "case_id": "case-b",
+                "status": "ready",
+                "disposition": "repair",
+                "request_ids": [],
+                "context_work_unit_ids": [first.id, second.id],
+                "write_work_unit_ids": [first.id, second.id],
+            },
+            {
+                "case_id": "case-c",
+                "status": "ready",
+                "disposition": "repair",
+                "request_ids": [],
+                "context_work_unit_ids": [second.id],
+                "write_work_unit_ids": [second.id],
+            },
+        ]
+    )
+    started: set[str] = set()
+    both_started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def repair(case_id: str) -> None:
+        started.add(case_id)
+        if len(started) == 2:
+            both_started.set()
+        await release.wait()
+
+    monkeypatch.setattr(orchestrator, "_run_upstream_repair", repair)
+
+    await orchestrator._schedule_upstream_coordination()
+    await asyncio.wait_for(both_started.wait(), timeout=2)
+
+    assert started == {"case-a", "case-c"}
+    assert "case-b" not in orchestrator._upstream_case_tasks
+    release.set()
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_attempt_acquires_every_requested_chapter_lock(
+    tmp_path: Path,
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    first, second = config.chapters
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await orchestrator.prepare()
+    orchestrator.executor = FakeExecutor(state, [result(changed=False)])
+    second_lock = orchestrator._chapter_agent_locks[second.id]
+    await second_lock.acquire()
+    attempt = asyncio.create_task(
+        orchestrator._attempt(
+            first,
+            Stage.REVIEW,
+            lock_work_unit_ids=(first.id, second.id),
+        )
+    )
+    try:
+        await asyncio.sleep(0)
+        assert orchestrator._chapter_agent_locks[first.id].locked()
+        assert not state.task(first.id, Stage.REVIEW).runs
+    finally:
+        second_lock.release()
+
+    await asyncio.wait_for(attempt, timeout=2)
+
+    assert not orchestrator._chapter_agent_locks[first.id].locked()
+    assert not orchestrator._chapter_agent_locks[second.id].locked()
     await orchestrator.shutdown()
 
 

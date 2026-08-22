@@ -792,6 +792,23 @@ class StateStore:
             if request.get("kind") == "upstream_request":
                 self.proof_review_requests.pop(request_id, None)
         for case in self.steward_cases.values():
+            # Before repair agents separated readable context from writable scope, every context
+            # work unit was locked. Preserve that authority when importing older state.
+            if "write_work_unit_ids" not in case:
+                case["write_work_unit_ids"] = list(case.get("context_work_unit_ids", ()))
+            if case.get("disposition") == "implement":
+                case["disposition"] = "repair"
+            if case.get("status") == "implementing":
+                case["status"] = "repairing"
+            if "repair_run_ids" not in case and "implementation_run_ids" in case:
+                case["repair_run_ids"] = list(case.get("implementation_run_ids", ()))
+            if (
+                "active_repair_generation" not in case
+                and "active_implementation_generation" in case
+            ):
+                case["active_repair_generation"] = case["active_implementation_generation"]
+            if "active_repair_run_id" not in case and "active_implementation_run_id" in case:
+                case["active_repair_run_id"] = case["active_implementation_run_id"]
             if case.get("status") == "needs_human":
                 case["status"] = "failed"
             if case.get("disposition") == "needs_human":
@@ -2596,7 +2613,7 @@ class StateStore:
             execution_changed = bool(old) and any(
                 tuple(str(item) for item in old.get(key, ()))
                 != tuple(str(item) for item in value.get(key, ()))
-                for key in ("request_ids", "context_work_unit_ids")
+                for key in ("request_ids", "context_work_unit_ids", "write_work_unit_ids")
             )
             execution_changed = execution_changed or (
                 bool(old) and str(old.get("disposition", "")) != str(value.get("disposition", ""))
@@ -2604,11 +2621,11 @@ class StateStore:
             value["generation"] = old_generation + 1 if execution_changed else old_generation
             if old and not execution_changed:
                 # A global dedupe pass is allowed to improve a case's prose, but it must not
-                # resurrect an implementation which is already running or terminal.
+                # resurrect a repair which is already running or terminal.
                 value["status"] = str(old.get("status") or value.get("status") or "ready")
                 for key in (
-                    "active_implementation_generation",
-                    "active_implementation_run_id",
+                    "active_repair_generation",
+                    "active_repair_run_id",
                 ):
                     if key in old:
                         value[key] = old[key]
@@ -2616,7 +2633,7 @@ class StateStore:
                 value["status"] = str(value.get("status") or "ready")
             value["created_at"] = str(old.get("created_at") or now)
             value["updated_at"] = now
-            value["implementation_run_ids"] = list(old.get("implementation_run_ids", ()))
+            value["repair_run_ids"] = list(old.get("repair_run_ids", ()))
             replacement[case_id] = value
         for case_id, value in previous.items():
             if case_id not in replacement and value.get("status") in {
@@ -2657,7 +2674,7 @@ class StateStore:
         generation: int,
         **changes: Any,
     ) -> bool:
-        """Update one case only while its durable implementation generation is current."""
+        """Update one case only while its durable repair generation is current."""
 
         case = self.steward_cases.get(case_id)
         if not isinstance(case, dict) or max(1, int(case.get("generation", 1))) != generation:
@@ -2898,14 +2915,14 @@ class StateStore:
         request_ids = {str(value) for value in case.get("request_ids", ())}
         explicit_run_ids = {
             str(case.get("steward_run_id", "")),
-            *(str(value) for value in case.get("implementation_run_ids", ())),
+            *(str(value) for value in case.get("repair_run_ids", ())),
         }
         runs = [
             run
             for run in self._runs_by_id.values()
             if run.id in explicit_run_ids
             or (
-                run.role in {"upstream_steward", "upstream_implementation"}
+                run.role in {"upstream_steward", "upstream_repair", "upstream_implementation"}
                 and request_ids.intersection(run.request_ids)
             )
         ]
@@ -4124,11 +4141,11 @@ class StateStore:
         return run
 
     async def recover_interrupted_steward_cases(self) -> list[str]:
-        """Make cases orphaned in ``implementing`` schedulable after a restart."""
+        """Make cases orphaned in ``repairing`` schedulable after a restart."""
 
         recovered: list[str] = []
         for case_id, case in self.steward_cases.items():
-            if case.get("status") != "implementing":
+            if case.get("status") != "repairing":
                 continue
             case["status"] = "ready"
             case["updated_at"] = timestamp()
