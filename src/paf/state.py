@@ -2587,10 +2587,31 @@ class StateStore:
             value = dict(raw)
             value["id"] = case_id
             value["request_ids"] = request_ids
-            value["status"] = str(value.get("status") or "ready")
+            old_generation = max(1, int(old.get("generation", 1)))
+            execution_changed = bool(old) and any(
+                tuple(str(item) for item in old.get(key, ()))
+                != tuple(str(item) for item in value.get(key, ()))
+                for key in ("request_ids", "context_work_unit_ids")
+            )
+            execution_changed = execution_changed or (
+                bool(old) and str(old.get("disposition", "")) != str(value.get("disposition", ""))
+            )
+            value["generation"] = old_generation + 1 if execution_changed else old_generation
+            if old and not execution_changed:
+                # A global dedupe pass is allowed to improve a case's prose, but it must not
+                # resurrect an implementation which is already running or terminal.
+                value["status"] = str(old.get("status") or value.get("status") or "ready")
+                for key in (
+                    "active_implementation_generation",
+                    "active_implementation_run_id",
+                ):
+                    if key in old:
+                        value[key] = old[key]
+            else:
+                value["status"] = str(value.get("status") or "ready")
             value["created_at"] = str(old.get("created_at") or now)
             value["updated_at"] = now
-            value.setdefault("implementation_run_ids", list(old.get("implementation_run_ids", ())))
+            value["implementation_run_ids"] = list(old.get("implementation_run_ids", ()))
             replacement[case_id] = value
         for case_id, value in previous.items():
             if case_id not in replacement and value.get("status") in {
@@ -2624,6 +2645,23 @@ class StateStore:
         case["updated_at"] = timestamp()
         self._mark_dirty(global_state=False, sections={"steward_cases"})
         await self._persist()
+
+    async def update_steward_case_generation(
+        self,
+        case_id: str,
+        generation: int,
+        **changes: Any,
+    ) -> bool:
+        """Update one case only while its durable implementation generation is current."""
+
+        case = self.steward_cases.get(case_id)
+        if not isinstance(case, dict) or max(1, int(case.get("generation", 1))) != generation:
+            return False
+        case.update(changes)
+        case["updated_at"] = timestamp()
+        self._mark_dirty(global_state=False, sections={"steward_cases"})
+        await self._persist()
+        return True
 
     async def clear_upstream_coordination(self) -> None:
         """Drop outstanding observations and cases while retaining historical agent runs."""

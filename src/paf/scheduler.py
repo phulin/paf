@@ -1248,10 +1248,21 @@ class Orchestrator:
                 )
                 self._proof_rechecks.add(consumer_id)
 
+    @staticmethod
+    def _upstream_case_assignment_ids(case: dict[str, Any], generation: int) -> tuple[str, ...]:
+        generation_id = f"steward-case-generation:{case['id']}:{generation}"
+        return (str(case["id"]), generation_id, *map(str, case.get("request_ids", ())))
+
     async def _run_upstream_implementation(self, case_id: str) -> None:
         case = self.state.steward_cases.get(case_id)
         if not isinstance(case, dict):
             return
+        generation = max(1, int(case.get("generation", 1)))
+        if case.get("status") != "ready":
+            return
+        # Work from an immutable generation snapshot. A later Steward pass may replace the
+        # dictionary while this coroutine is awaiting an agent or a reservation.
+        case = dict(case)
         context_ids = tuple(
             sorted(
                 {
@@ -1303,8 +1314,15 @@ class Orchestrator:
                 for work_unit_id in context_ids
             ],
         }
-        await self.state.update_steward_case(case_id, status="implementing")
-        assignment_request_ids = (case_id, *case.get("request_ids", ()))
+        claimed = await self.state.update_steward_case_generation(
+            case_id,
+            generation,
+            status="implementing",
+            active_implementation_generation=generation,
+        )
+        if not claimed:
+            return
+        assignment_request_ids = self._upstream_case_assignment_ids(case, generation)
         resumable = (
             self.state.interrupted_auxiliary_run(
                 role=UPSTREAM_IMPLEMENTATION_ROLE,
@@ -1313,6 +1331,13 @@ class Orchestrator:
             if self.resume_agents
             else None
         )
+        if resumable is None and self.resume_agents and generation == 1:
+            # Generation metadata was introduced after existing projects had resumable
+            # implementation runs. Only generation one may consume that legacy assignment.
+            resumable = self.state.interrupted_auxiliary_run(
+                role=UPSTREAM_IMPLEMENTATION_ROLE,
+                request_ids=(case_id, *case.get("request_ids", ())),
+            )
         attempt = await self._attempt(
             anchor,
             Stage.PROVE,
@@ -1324,12 +1349,19 @@ class Orchestrator:
             resume_thread_id=resumable.thread_id if resumable is not None else None,
             resume_run_id=resumable.id if resumable is not None else "",
         )
+        current = self.state.steward_cases.get(case_id, {})
+        if max(1, int(current.get("generation", 1))) != generation:
+            # The Steward superseded this scope while it was running. The isolation layer has
+            # already discarded or integrated the attempt as appropriate; its stale disposition
+            # must not resolve requests or mutate the replacement generation.
+            return
         run_ids = list(case.get("implementation_run_ids", ()))
         if attempt.run.id not in run_ids:
             run_ids.append(attempt.run.id)
         if getattr(attempt.agent, "infrastructure_failed", False):
-            await self.state.update_steward_case(
+            await self.state.update_steward_case_generation(
                 case_id,
+                generation,
                 status="ready",
                 implementation_run_ids=run_ids,
                 decision={
@@ -1357,8 +1389,9 @@ class Orchestrator:
                 decision=report,
                 evaluation_run_id=attempt.run.id,
             )
-            await self.state.update_steward_case(
+            await self.state.update_steward_case_generation(
                 case_id,
+                generation,
                 status="verified",
                 implementation_run_ids=run_ids,
                 decision=report,
@@ -1372,8 +1405,9 @@ class Orchestrator:
                 decision=report,
                 evaluation_run_id=attempt.run.id,
             )
-            await self.state.update_steward_case(
+            await self.state.update_steward_case_generation(
                 case_id,
+                generation,
                 status="rejected",
                 implementation_run_ids=run_ids,
                 decision=report,
@@ -1393,8 +1427,9 @@ class Orchestrator:
                 },
                 key=self._work_unit_order.__getitem__,
             )
-            await self.state.update_steward_case(
+            await self.state.update_steward_case_generation(
                 case_id,
+                generation,
                 status="needs_scope",
                 requested_paths=requested_paths,
                 requested_work_unit_ids=additional,
@@ -1414,12 +1449,23 @@ class Orchestrator:
                 decision=report,
                 evaluation_run_id=attempt.run.id,
             )
-            await self.state.update_steward_case(
+            await self.state.update_steward_case_generation(
                 case_id,
+                generation,
                 status="needs_human",
                 implementation_run_ids=run_ids,
                 decision=report,
             )
+
+    async def _run_scheduled_upstream_implementation(
+        self,
+        case_id: str,
+        generation: int,
+    ) -> None:
+        case = self.state.steward_cases.get(case_id, {})
+        if max(1, int(case.get("generation", 1))) != generation:
+            return
+        await self._run_upstream_implementation(case_id)
 
     def _upstream_case_work_unit_ids(self, case_id: str) -> set[str]:
         case = self.state.steward_cases.get(case_id, {})
@@ -1472,8 +1518,9 @@ class Orchestrator:
             and not excluded.intersection(self._upstream_case_work_unit_ids(case_id))
         ]
         for case_id in ready[:MAXIMUM_CONCURRENT_UPSTREAM_IMPLEMENTATIONS]:
+            generation = max(1, int(self.state.steward_cases[case_id].get("generation", 1)))
             self._upstream_case_tasks[case_id] = asyncio.create_task(
-                self._run_upstream_implementation(case_id)
+                self._run_scheduled_upstream_implementation(case_id, generation)
             )
 
     async def prepare(

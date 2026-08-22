@@ -5819,6 +5819,157 @@ async def test_global_steward_cases_deduplicate_requests_and_include_consumers(
 
 
 @pytest.mark.asyncio
+async def test_steward_rewrite_preserves_active_unchanged_case(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = config.chapters[0]
+    state = StateStore(config)
+    await state.load_or_create()
+    original = {
+        "case_id": "case-a",
+        "status": "ready",
+        "disposition": "implement",
+        "request_ids": [],
+        "context_work_unit_ids": [chapter.id],
+        "title": "Original title",
+    }
+    await state.replace_steward_cases([original])
+    await state.update_steward_case_generation(
+        "case-a", 1, status="implementing", active_implementation_generation=1
+    )
+
+    await state.replace_steward_cases([{**original, "title": "Improved title"}])
+
+    case = state.steward_cases["case-a"]
+    assert case["generation"] == 1
+    assert case["status"] == "implementing"
+    assert case["active_implementation_generation"] == 1
+    assert case["title"] == "Improved title"
+
+
+@pytest.mark.asyncio
+async def test_steward_scope_change_advances_implementation_generation(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    first, second = config.chapters
+    state = StateStore(config)
+    await state.load_or_create()
+    await state.replace_steward_cases(
+        [
+            {
+                "case_id": "case-a",
+                "status": "ready",
+                "disposition": "implement",
+                "request_ids": [],
+                "context_work_unit_ids": [first.id],
+            }
+        ]
+    )
+    await state.update_steward_case_generation(
+        "case-a", 1, status="needs_scope", implementation_run_ids=["old-run"]
+    )
+
+    await state.replace_steward_cases(
+        [
+            {
+                "case_id": "case-a",
+                "status": "ready",
+                "disposition": "implement",
+                "request_ids": [],
+                "context_work_unit_ids": [first.id, second.id],
+            }
+        ]
+    )
+
+    case = state.steward_cases["case-a"]
+    assert case["generation"] == 2
+    assert case["status"] == "ready"
+    assert case["implementation_run_ids"] == ["old-run"]
+    assert "active_implementation_generation" not in case
+
+
+@pytest.mark.asyncio
+async def test_stale_steward_generation_cannot_claim_or_update_case(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = config.chapters[0]
+    state = StateStore(config)
+    await state.load_or_create()
+    await state.replace_steward_cases(
+        [
+            {
+                "case_id": "case-a",
+                "status": "ready",
+                "disposition": "implement",
+                "request_ids": [],
+                "context_work_unit_ids": [chapter.id],
+            }
+        ]
+    )
+    state.steward_cases["case-a"]["generation"] = 2
+
+    updated = await state.update_steward_case_generation("case-a", 1, status="verified")
+
+    assert not updated
+    assert state.steward_cases["case-a"]["status"] == "ready"
+
+
+@pytest.mark.asyncio
+async def test_scope_revision_waits_for_prior_case_task_to_finish(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    first, second = config.chapters
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await orchestrator.prepare()
+    await state.replace_steward_cases(
+        [
+            {
+                "case_id": "case-a",
+                "status": "ready",
+                "disposition": "implement",
+                "request_ids": [],
+                "context_work_unit_ids": [first.id],
+            }
+        ]
+    )
+    started = [asyncio.Event(), asyncio.Event()]
+    releases = [asyncio.Event(), asyncio.Event()]
+    launches: list[int] = []
+
+    async def implement(_case_id: str) -> None:
+        launch = len(launches)
+        launches.append(state.steward_cases["case-a"]["generation"])
+        started[launch].set()
+        await releases[launch].wait()
+
+    monkeypatch.setattr(orchestrator, "_run_upstream_implementation", implement)
+    await orchestrator._schedule_upstream_coordination()
+    await asyncio.wait_for(started[0].wait(), timeout=2)
+
+    await state.replace_steward_cases(
+        [
+            {
+                "case_id": "case-a",
+                "status": "ready",
+                "disposition": "implement",
+                "request_ids": [],
+                "context_work_unit_ids": [first.id, second.id],
+            }
+        ]
+    )
+    await orchestrator._schedule_upstream_coordination()
+    await asyncio.sleep(0)
+    assert launches == [1]
+
+    releases[0].set()
+    await asyncio.wait_for(orchestrator._upstream_case_tasks["case-a"], timeout=2)
+    await orchestrator._schedule_upstream_coordination()
+    await asyncio.wait_for(started[1].wait(), timeout=2)
+    assert launches == [1, 2]
+    releases[1].set()
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_upstream_implementation_excludes_simultaneous_chapter_review(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
