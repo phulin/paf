@@ -86,6 +86,7 @@ class RequirementKind(StrEnum):
     STAGE_DEPENDENCY = "stage_dependency"
     COORDINATOR_OWNER = "coordinator_owner"
     BUILD_FRESHNESS = "build_freshness"
+    WORKTREE_CLEAN = "worktree_clean"
     PROOF_REVIEW_REQUEST = "proof_review_request"
     UPSTREAM_REQUEST = "upstream_request"
     CAPABILITY_PACKAGE = "capability_package"

@@ -41,6 +41,8 @@ from paf.scheduler import (
 )
 from paf.state import (
     ProofBlockerStatus,
+    Requirement,
+    RequirementKind,
     RunRecord,
     StateStore,
     TaskPhase,
@@ -4848,6 +4850,42 @@ async def test_dirty_proof_scope_defers_only_that_chapter(
     task = state.task(chapter.id, Stage.PROVE)
     assert task.status == TaskStatus.PENDING
     assert "dirty exclusive scope" in task.detail
+    assert [requirement.kind for requirement in task.waiting_on] == [RequirementKind.WORKTREE_CLEAN]
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_dirty_proof_scope_wait_releases_only_after_scope_is_clean(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = config.chapters[0]
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await orchestrator.prepare()
+    await mark_formalized(orchestrator)
+    await state.set_task(chapter.id, Stage.REVIEW, TaskStatus.SUCCEEDED, "review completed")
+    await state.set_task_waiting(
+        chapter.id,
+        Stage.PROVE,
+        (Requirement(RequirementKind.WORKTREE_CLEAN, detail="dirty scope"),),
+        "waiting for clean worktree",
+    )
+    dirty_path = chapter.scope[0]
+    paths = (dirty_path,)
+
+    async def working_tree_paths() -> tuple[str, ...]:
+        return paths
+
+    monkeypatch.setattr(orchestrator.git, "working_tree_paths", working_tree_paths)
+    await orchestrator._release_clean_worktree_waits()
+    assert state.task(chapter.id, Stage.PROVE).waiting_on
+
+    paths = ()
+    await orchestrator._release_clean_worktree_waits()
+    task = state.task(chapter.id, Stage.PROVE)
+    assert task.waiting_on == ()
+    assert state.readiness(task).ready
     await orchestrator.shutdown()
 
 

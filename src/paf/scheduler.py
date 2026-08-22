@@ -1794,6 +1794,43 @@ class Orchestrator:
             )
         return changed
 
+    async def _release_clean_worktree_waits(self) -> None:
+        """Wake proof tasks only after their externally dirty scope becomes clean."""
+
+        waiting = {
+            task.chapter_id: task
+            for task in self.state.tasks.values()
+            if task.stage == Stage.PROVE
+            and task.status == TaskStatus.PENDING
+            and any(
+                requirement.kind is RequirementKind.WORKTREE_CLEAN
+                for requirement in task.waiting_on
+            )
+        }
+        if not waiting:
+            return
+        dirty_paths = await self.git.working_tree_paths()
+        async with self.state.batch():
+            for chapter_id, task in waiting.items():
+                if any(self._scope_matchers[chapter_id].matches(path) for path in dirty_paths):
+                    continue
+                remaining = tuple(
+                    requirement
+                    for requirement in task.waiting_on
+                    if requirement.kind is not RequirementKind.WORKTREE_CLEAN
+                )
+                await self.state.set_task(
+                    chapter_id,
+                    Stage.PROVE,
+                    TaskStatus.PENDING,
+                    (
+                        "worktree scope is clean; proof retry eligible"
+                        if not remaining
+                        else "worktree scope is clean; waiting for remaining requirements"
+                    ),
+                    waiting_on=remaining,
+                )
+
     async def shutdown(self) -> None:
         try:
             package_tasks = tuple(self._package_tasks.values())
@@ -6520,6 +6557,7 @@ class Orchestrator:
         try:
             while True:
                 await self._discard_stale_proof_review_requests()
+                await self._release_clean_worktree_waits()
                 if formalize is not None:
                     # Clear before inspecting state so a subsequent formalize
                     # transition cannot be lost between the scan and wait.
@@ -6791,8 +6829,11 @@ class Orchestrator:
                         review_blocked.update(unresolved)
                         break
                     if not prove or all(
-                        self.state.task(chapter_id, Stage.PROVE).status
-                        in {TaskStatus.SUCCEEDED, TaskStatus.FAILED}
+                        (
+                            (proof_task := self.state.task(chapter_id, Stage.PROVE)).status
+                            in {TaskStatus.SUCCEEDED, TaskStatus.FAILED}
+                            or not self.state.readiness(proof_task).ready
+                        )
                         for chapter_id in reviewed
                     ):
                         break
@@ -7254,17 +7295,22 @@ class Orchestrator:
                     resume_prompt=proof_resume_prompt,
                 )
             except GitCommitError as error:
-                await self.state.set_task(
+                await self.state.set_task_waiting(
                     chapter.id,
                     Stage.PROVE,
-                    TaskStatus.PENDING,
+                    (
+                        Requirement(
+                            RequirementKind.WORKTREE_CLEAN,
+                            detail="dirty exclusive scope must be reconciled",
+                        ),
+                    ),
                     f"proof retry deferred until dirty exclusive scope is reconciled: {error}",
                 )
                 return StageOutcome(
                     ExecutionDisposition.WAITING,
                     (
                         Requirement(
-                            RequirementKind.BUILD_FRESHNESS,
+                            RequirementKind.WORKTREE_CLEAN,
                             detail="dirty exclusive scope must be reconciled",
                         ),
                     ),
