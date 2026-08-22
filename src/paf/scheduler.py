@@ -122,6 +122,67 @@ declaration merely because it reports a downstream symptom. Return only after va
 you have precise new blocker evidence."""
 
 
+def _reported_unresolved_proofs(report: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return current proof evidence, accepting persisted pre-migration reports."""
+
+    raw = report.get("unresolved_proofs")
+    if not isinstance(raw, list):
+        raw = report.get("failed_attempts")
+    return [value for value in raw if isinstance(value, dict)] if isinstance(raw, list) else []
+
+
+def _checked_attempt_descriptions(raw: object) -> list[str]:
+    """Render checked proof probes into the blocker ledger's stable text format."""
+
+    if not isinstance(raw, list):
+        return []
+    descriptions: list[str] = []
+    for value in raw:
+        if isinstance(value, str) and value.strip():
+            descriptions.append(value.strip())
+            continue
+        if not isinstance(value, dict):
+            continue
+        strategy = str(value.get("strategy", "")).strip()
+        probe = str(value.get("probe", "")).strip()
+        outcome = str(value.get("outcome", "")).strip()
+        if strategy and probe and outcome:
+            descriptions.append(
+                f"Strategy: {strategy}\nProbe:\n{probe}\nObserved outcome:\n{outcome}"
+            )
+    return descriptions
+
+
+def _proof_blocker_records(report: dict[str, Any]) -> list[dict[str, Any]]:
+    """Translate agent observations into coordinator-owned blocker classifications."""
+
+    dispositions = {
+        "local_proof_failure": "retry",
+        "suspected_statement_defect": "statement_review",
+        "suspected_upstream_gap": "missing_capability",
+    }
+    records: list[dict[str, Any]] = []
+    for raw in _reported_unresolved_proofs(report):
+        if "kind" not in raw:
+            records.append(raw)
+            continue
+        kind = str(raw.get("kind", ""))
+        evidence = str(raw.get("evidence", "")).strip()
+        obstruction = str(raw.get("obstruction", "")).strip()
+        records.append(
+            {
+                "path": raw.get("path", ""),
+                "declaration": raw.get("declaration", ""),
+                "attempts": _checked_attempt_descriptions(raw.get("attempts")),
+                "remaining_goal": raw.get("remaining_goal", ""),
+                "obstruction": (obstruction + (f"\nEvidence: {evidence}" if evidence else "")),
+                "disposition": dispositions.get(kind, "retry"),
+                "capability": raw.get("upstream_hypothesis"),
+            }
+        )
+    return records
+
+
 async def _gather_cancel_on_error[T](
     operations: Iterable[Coroutine[Any, Any, T]],
 ) -> list[T]:
@@ -149,17 +210,22 @@ class Attempt:
             parts.append(self.agent.error)
         summary = self.agent.report.get("summary")
         if isinstance(summary, str) and summary:
-            parts.append(f"Agent summary: {summary}")
+            parts.append(f"Previous agent summary: {summary}")
         issues = self.agent.report.get("issues")
         if isinstance(issues, list) and issues:
             parts.append("Reported issues:\n" + "\n".join(f"- {issue}" for issue in issues))
         parts.append(
-            f"Scoped changes: {self.agent.changed}; remaining proof placeholders: "
-            f"{self.agent.placeholders}."
+            "Previous source result:\n"
+            + (
+                "- Retained scoped edits.\n"
+                if self.agent.changed
+                else "- No scoped edits retained.\n"
+            )
+            + f"- Remaining proof placeholders: {self.agent.placeholders}."
         )
         output = self.validation.output if validation_output is None else validation_output
         if not self.validation.succeeded and output:
-            parts.append("Validation failed:\n" + output)
+            parts.append("Coordinator validation diagnostics:\n" + output)
         return "\n\n".join(parts)
 
 
@@ -2856,30 +2922,23 @@ class Orchestrator:
     def _failed_attempt_feedback(report: dict[str, Any]) -> str:
         """Render structured proof failures for an independent chapter review."""
 
-        raw_attempts = report.get("failed_attempts")
-        if not isinstance(raw_attempts, list):
-            return ""
         blocks: list[str] = []
-        for raw in raw_attempts:
-            if not isinstance(raw, dict):
-                continue
+        for raw in _reported_unresolved_proofs(report):
             path = str(raw.get("path", "")).strip()
             declaration = str(raw.get("declaration", "")).strip()
             remaining_goal = str(raw.get("remaining_goal", "")).strip()
             obstruction = str(raw.get("obstruction", "")).strip()
-            attempts = raw.get("attempts")
-            checked = (
-                [str(item).strip() for item in attempts if str(item).strip()]
-                if isinstance(attempts, list)
-                else []
-            )
+            evidence = str(raw.get("evidence", "")).strip()
+            checked = _checked_attempt_descriptions(raw.get("attempts"))
             if not (path and declaration and remaining_goal and obstruction and checked):
                 continue
             blocks.append(
-                f"Failed proof `{declaration}` in `{path}`:\n"
-                + "Checked attempts:\n"
-                + "\n".join(f"- {item}" for item in checked)
-                + f"\nRemaining goal:\n{remaining_goal}\nObserved obstruction:\n{obstruction}"
+                f"Unresolved proof `{declaration}` in `{path}`:\n"
+                + "Checked approaches and outcomes:\n"
+                + "\n\n".join(f"Approach {index}:\n{item}" for index, item in enumerate(checked, 1))
+                + f"\n\nResidual Lean goal:\n{remaining_goal}"
+                + f"\nObserved obstruction:\n{obstruction}"
+                + (f"\nSupporting evidence:\n{evidence}" if evidence else "")
             )
         return "\n\n".join(blocks)
 
@@ -2959,16 +3018,24 @@ class Orchestrator:
                 f"{blocker['id']} — `{blocker.get('declaration', '')}` in "
                 f"`{blocker.get('path', '')}` (seen {blocker.get('sightings', 1)} time(s))\n"
                 f"Residual goal: {str(blocker.get('remaining_goal', ''))[:2000]}\n"
-                f"Obstruction: {str(blocker.get('obstruction', ''))[:1200]}"
-                f"{review_advice}"
+                f"Obstruction: {str(blocker.get('obstruction', ''))[:1200]}\n"
+                "Checked approaches and outcomes:\n"
+                + (
+                    "\n\n".join(
+                        f"Approach {index}:\n{attempt}"
+                        for index, attempt in enumerate(blocker.get("attempts", ()), 1)
+                    )
+                    or "No checked approach details were preserved."
+                )
+                + review_advice
             )
         if not blocks:
             return ""
         return _bounded_proof_feedback(
             (
-                "Durable blocker ledger. Do not repeat its evidence. Put unchanged IDs in "
-                "`blocker_refs`; use `failed_attempts` only for new or materially changed "
-                "blockers:\n\n" + "\n\n".join(blocks),
+                "Prior blocker evidence. Use it as a starting point rather than repeating the same "
+                "probes. Return an ID in `blocker_refs` only when its exact evidence remains current "
+                "and no new route or guidance is available:\n\n" + "\n\n".join(blocks),
             )
         )
 
@@ -2978,21 +3045,17 @@ class Orchestrator:
         run: RunRecord,
         report: dict[str, Any],
     ) -> tuple[dict[str, Any], ...]:
-        attempts = report.get("failed_attempts")
+        attempts = _proof_blocker_records(report)
         refs = report.get("blocker_refs")
-        capabilities = (
-            [
-                value.get("capability")
-                for value in attempts
-                if isinstance(value, dict) and isinstance(value.get("capability"), dict)
-            ]
-            if isinstance(attempts, list)
-            else []
-        )
+        capabilities: list[dict[str, Any]] = []
+        for value in attempts:
+            candidate = value.get("capability")
+            if isinstance(candidate, dict):
+                capabilities.append(candidate)
         return await self.state.record_proof_blockers(
             chapter.id,
             origin_run_id=run.id,
-            failed_attempts=(attempts if isinstance(attempts, list) else ()),
+            failed_attempts=attempts,
             unchanged_ids=(refs if isinstance(refs, list) else ()),
             capability_candidates=capabilities,
         )
@@ -3187,15 +3250,15 @@ class Orchestrator:
 
     @staticmethod
     def _proof_finding_ids(request_id: str, feedback: str) -> tuple[str, ...]:
-        count = len(re.findall(r"(?m)^Failed proof `", feedback))
+        count = len(re.findall(r"(?m)^(?:Unresolved|Failed) proof `", feedback))
         return tuple(f"{request_id}:{index}" for index in range(1, count + 1))
 
     @classmethod
     def _tag_proof_findings(cls, request_id: str, feedback: str) -> str:
         finding_ids = iter(cls._proof_finding_ids(request_id, feedback))
         return re.sub(
-            r"(?m)^Failed proof `",
-            lambda _match: f"Finding ID: `{next(finding_ids)}`\nFailed proof `",
+            r"(?m)^(Unresolved|Failed) proof `",
+            lambda match: f"Finding ID: `{next(finding_ids)}`\n{match.group(1)} proof `",
             feedback,
         )
 
@@ -3273,11 +3336,9 @@ class Orchestrator:
                 "downstream module, do so:\n\n" + attempt_feedback
             )
         }
-        attempts = report.get("failed_attempts")
+        attempts = _reported_unresolved_proofs(report)
         blocker_ids: list[str] = []
-        for raw in attempts if isinstance(attempts, list) else ():
-            if not isinstance(raw, dict):
-                continue
+        for raw in attempts:
             for blocker in self.state.proof_blockers_for_consumer(chapter.id, active_only=False):
                 if (
                     str(blocker.get("path", "")) == str(raw.get("path", ""))
@@ -3415,7 +3476,7 @@ class Orchestrator:
                     continue
                 self.state.load_run_details(run)
                 report = run.report if isinstance(run.report, dict) else {}
-                if not report.get("failed_attempts") and not report.get("blocker_refs"):
+                if not _reported_unresolved_proofs(report) and not report.get("blocker_refs"):
                     continue
                 blockers = await self._record_proof_blocker_deltas(chapter, run, report)
                 for blocker in blockers:
@@ -6232,7 +6293,7 @@ class Orchestrator:
                     proof_task = self.state.task(chapter_id, Stage.PROVE)
                     primary_runs = [run for run in proof_task.runs if not run.auxiliary]
                     report = primary_runs[-1].report if primary_runs else None
-                    if not isinstance(report, dict) or not report.get("failed_attempts"):
+                    if not isinstance(report, dict) or not _reported_unresolved_proofs(report):
                         continue
                     if (
                         proof_reviews[chapter_id]
@@ -6778,7 +6839,7 @@ class Orchestrator:
 
             feedback_ledger.clear()
             feedback_ledger.append(
-                f"Proof attempt {proof_round}:\n"
+                f"Previous proof result (round {proof_round}):\n"
                 + attempt.feedback(validation_output=routed_validation_output)
             )
             blockers = await self._record_proof_blocker_deltas(
@@ -6812,20 +6873,19 @@ class Orchestrator:
                         for request_id in upstream_request_ids
                     ),
                 )
-            local_structural_blockers = tuple(
+            review_candidates = tuple(
                 blocker
                 for blocker in blockers
-                if str(blocker.get("disposition", ""))
-                in {"genuine_blocker", "statement_review", "interface_review"}
+                if str(blocker.get("disposition", "")) in {"statement_review", "interface_review"}
             )
-            if chunked_proofs and local_structural_blockers:
+            if chunked_proofs and review_candidates:
                 review_ids = await self._queue_proof_review(
                     chapter,
                     attempt.agent.report,
                     origin_run_id=attempt.run.id,
                 )
                 await self.state.set_proof_blocker_status(
-                    (str(blocker["id"]) for blocker in local_structural_blockers),
+                    (str(blocker["id"]) for blocker in review_candidates),
                     ProofBlockerStatus.REVIEW_REQUESTED,
                     request_id=review_ids[0] if review_ids else "",
                 )
@@ -6838,30 +6898,6 @@ class Orchestrator:
             if durable_feedback := self._durable_blocker_feedback(chapter.id, assigned_targets):
                 feedback_ledger.append(durable_feedback)
             feedback = _bounded_proof_feedback(feedback_ledger)
-            if report_disposition == "statement_defect" and not blockers:
-                await self.state.set_task(
-                    chapter.id,
-                    Stage.PROVE,
-                    TaskStatus.FAILED,
-                    "statement defect report lacked target-specific failed-attempt evidence",
-                )
-                return StageOutcome(ExecutionDisposition.FAILED)
-            if report_disposition == "structural_blocked" and not blockers:
-                await self.state.set_task(
-                    chapter.id,
-                    Stage.PROVE,
-                    TaskStatus.FAILED,
-                    "structural-blocked report lacked package evidence",
-                )
-                return StageOutcome(ExecutionDisposition.FAILED)
-            if report_disposition == "partial" and not attempt.agent.changed:
-                await self.state.set_task(
-                    chapter.id,
-                    Stage.PROVE,
-                    TaskStatus.FAILED,
-                    "partial proof report retained no scoped source change",
-                )
-                return StageOutcome(ExecutionDisposition.FAILED)
             review_queued = False
             terminal_blockers: list[str] = []
             for blocker in blockers:
@@ -6875,11 +6911,9 @@ class Orchestrator:
                     continue
                 sightings = int(blocker.get("sightings", 0))
                 retry_baseline = int(blocker.get("retry_sighting_baseline", 0))
-                immediate_handoff = (
-                    report_disposition in {"statement_defect", "structural_blocked"}
-                    or isinstance(blocker.get("capability"), dict)
-                    or self._blocker_needs_review(blocker)
-                )
+                immediate_handoff = isinstance(
+                    blocker.get("capability"), dict
+                ) or self._blocker_needs_review(blocker)
                 retry_limit = (
                     1
                     if immediate_handoff

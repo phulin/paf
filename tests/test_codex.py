@@ -150,7 +150,7 @@ def test_report_schemas_contain_only_fields_used_by_each_active_agent() -> None:
             "summary",
             "issues",
             "source_issues",
-            "failed_attempts",
+            "unresolved_proofs",
             "blocker_refs",
         },
     }
@@ -173,6 +173,28 @@ def test_report_schema_avoids_unsupported_codex_keywords() -> None:
         for schema in REPORT_SCHEMAS.values()
         for value in mappings(schema)
     )
+
+
+def test_proof_report_schema_requires_checked_evidence_without_terminal_self_routing() -> None:
+    schema = REPORT_SCHEMAS["prove"]
+
+    assert schema["properties"]["disposition"]["enum"] == [
+        "proved",
+        "incomplete",
+        "validation_inconsistency",
+    ]
+    unresolved = schema["properties"]["unresolved_proofs"]["items"]
+    assert unresolved["properties"]["kind"]["enum"] == [
+        "local_proof_failure",
+        "suspected_statement_defect",
+        "suspected_upstream_gap",
+    ]
+    assert unresolved["properties"]["attempts"]["minItems"] == 1
+    assert set(unresolved["properties"]["attempts"]["items"]["required"]) == {
+        "strategy",
+        "probe",
+        "outcome",
+    }
 
 
 def test_report_schema_closes_every_nested_object_shape() -> None:
@@ -374,6 +396,42 @@ def test_proof_chunk_does_not_split_one_declaration(tmp_path: Path) -> None:
     targets = proof_targets(tmp_path, chapter)
 
     assert [target.placeholder_count for target in proof_target_chunk(targets, 1)] == [2]
+
+
+def test_proof_retry_handoff_is_contextual_and_adjacent_to_target(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = config.chapters[0]
+    config.stages[Stage.PROVE].prompt.write_text(
+        "# Prove\n\n## Mission\n\nProve the target.\n\n"
+        "## Proof workflow\n\nUse checked evidence.\n",
+        encoding="utf-8",
+    )
+    path = tmp_path / "lean" / "Book" / "Chapter01.lean"
+    path.parent.mkdir(parents=True)
+    path.write_text("theorem target : True := by sorry\n", encoding="utf-8")
+    target = proof_targets(tmp_path, chapter)[0]
+    feedback = (
+        "Prior blocker evidence.\n"
+        "Approach 1:\nStrategy: construct the witness\n"
+        "Probe:\nby exact candidate\nObserved outcome:\ntype mismatch\n"
+        "Residual goal:\n⊢ True\n"
+        "Coordinator validation diagnostics:\nBook/Chapter01.lean:1: error"
+    )
+
+    prompt = CodexExecutor(config, StateStore(config)).build_prompt(
+        chapter,
+        Stage.PROVE,
+        feedback=feedback,
+        proof_targets=[target],
+    )
+
+    assert prompt.count("## Retry handoff") == 1
+    assert prompt.index("## Current merged-source target") < prompt.index("## Retry handoff")
+    assert prompt.index("## Retry handoff") < prompt.index("## Proof workflow")
+    assert "so you can continue from prior\nchecked work" in prompt
+    assert "construct the witness" in prompt
+    assert "type mismatch" in prompt
+    assert "Coordinator validation diagnostics" in prompt
 
 
 def test_proof_hole_context_is_anchored_to_the_placeholder_line(tmp_path: Path) -> None:

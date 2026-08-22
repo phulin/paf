@@ -474,9 +474,10 @@ After the daemon exits, `status`, `snapshot`, and `wait` fall back to the persis
   evidence and suspected earlier interface. A validated upstream repair or checked rejection route
   wakes the consumer; an unclear placement stops for human review.
 - A proof agent may change proof bodies but not declaration interfaces. It reports each unresolved
-  proof through structured `failed_attempts`, including checked approaches and the exact remaining
-  goal, plus a machine-actionable disposition. Statement defects and missing-capability evidence
-  route immediately; ordinary unchanged blockers receive at most `unchanged_retry_limit` sightings. A
+  proof through structured `unresolved_proofs`, including checked probes, their outcomes, the exact
+  remaining goal, and supporting evidence. The coordinator decides whether that evidence warrants
+  review or another proof attempt; ordinary unchanged blockers receive at most
+  `unchanged_retry_limit` sightings. A
   clean agent exit with an incomplete report is recorded as a blocked run rather than a successful
   proof run.
 

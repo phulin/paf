@@ -603,7 +603,7 @@ def _task_failure_details(state: StateStore, task: TaskRecord) -> list[str]:
         if isinstance(issues, list):
             for issue in issues:
                 add(issue)
-        failed_attempts = report.get("failed_attempts")
+        failed_attempts = report.get("unresolved_proofs", report.get("failed_attempts"))
         if isinstance(failed_attempts, list):
             for attempt in failed_attempts:
                 if isinstance(attempt, dict):

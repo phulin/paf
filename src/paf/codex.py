@@ -69,7 +69,7 @@ _SOURCE_ISSUES_PROPERTY: dict[str, Any] = {
     },
 }
 
-_CAPABILITY_PROPOSAL_PROPERTY: dict[str, Any] = {
+_UPSTREAM_HYPOTHESIS_PROPERTY: dict[str, Any] = {
     "anyOf": [
         {"type": "null"},
         {
@@ -93,7 +93,18 @@ _CAPABILITY_PROPOSAL_PROPERTY: dict[str, Any] = {
     ]
 }
 
-_FAILED_ATTEMPTS_PROPERTY: dict[str, Any] = {
+_CHECKED_PROOF_ATTEMPT_PROPERTY: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "strategy": {"type": "string", "minLength": 1},
+        "probe": {"type": "string", "minLength": 1},
+        "outcome": {"type": "string", "minLength": 1},
+    },
+    "required": ["strategy", "probe", "outcome"],
+}
+
+_UNRESOLVED_PROOFS_PROPERTY: dict[str, Any] = {
     "type": "array",
     "items": {
         "type": "object",
@@ -103,22 +114,21 @@ _FAILED_ATTEMPTS_PROPERTY: dict[str, Any] = {
             "declaration": {"type": "string", "minLength": 1},
             "attempts": {
                 "type": "array",
-                "items": {"type": "string", "minLength": 1},
-                "minItems": 2,
+                "items": _CHECKED_PROOF_ATTEMPT_PROPERTY,
+                "minItems": 1,
             },
             "remaining_goal": {"type": "string", "minLength": 1},
             "obstruction": {"type": "string", "minLength": 1},
-            "disposition": {
+            "evidence": {"type": "string", "minLength": 1},
+            "kind": {
                 "type": "string",
                 "enum": [
-                    "retry",
-                    "missing_capability",
-                    "statement_review",
-                    "interface_review",
-                    "genuine_blocker",
+                    "local_proof_failure",
+                    "suspected_statement_defect",
+                    "suspected_upstream_gap",
                 ],
             },
-            "capability": _CAPABILITY_PROPOSAL_PROPERTY,
+            "upstream_hypothesis": _UPSTREAM_HYPOTHESIS_PROPERTY,
         },
         "required": [
             "path",
@@ -126,8 +136,9 @@ _FAILED_ATTEMPTS_PROPERTY: dict[str, Any] = {
             "attempts",
             "remaining_goal",
             "obstruction",
-            "disposition",
-            "capability",
+            "evidence",
+            "kind",
+            "upstream_hypothesis",
         ],
     },
 }
@@ -142,15 +153,10 @@ _PROOF_DISPOSITION_PROPERTY: dict[str, Any] = {
     "type": "string",
     "enum": [
         "proved",
-        "partial",
-        "retryable",
-        "statement_defect",
-        "structural_blocked",
+        "incomplete",
         "validation_inconsistency",
     ],
-    "description": (
-        "Machine-actionable next state. Use retryable only when a materially new strategy remains."
-    ),
+    "description": "Whether the assigned proofs are complete or still require coordinator action.",
 }
 
 _RETRY_CONTRACT_PROPERTY: dict[str, Any] = {
@@ -213,7 +219,7 @@ _FINDING_ASSESSMENTS_PROPERTY: dict[str, Any] = {
             },
             "explanation": {"type": "string", "minLength": 1},
             "retry_contract": {"anyOf": [{"type": "null"}, _RETRY_CONTRACT_PROPERTY]},
-            "upstream_request": _CAPABILITY_PROPOSAL_PROPERTY,
+            "upstream_request": _UPSTREAM_HYPOTHESIS_PROPERTY,
             "dependency_ids": {
                 "type": "array",
                 "items": {"type": "string", "minLength": 1},
@@ -501,7 +507,7 @@ REPORT_SCHEMAS: dict[str, dict[str, Any]] = {
         | {
             "disposition": _PROOF_DISPOSITION_PROPERTY,
             "source_issues": _SOURCE_ISSUES_PROPERTY,
-            "failed_attempts": _FAILED_ATTEMPTS_PROPERTY,
+            "unresolved_proofs": _UNRESOLVED_PROOFS_PROPERTY,
             "blocker_refs": _BLOCKER_REFS_PROPERTY,
         },
     ),
@@ -1509,9 +1515,9 @@ class CodexExecutor:
         proof_retry_contract = ""
         if stage is Stage.PROVE and feedback:
             proof_retry_contract = """
-This is a retry. The handoff below is the complete delta from the previous attempt. Before using
-tools, identify a materially new premise, API, or strategy. If there is none, return the unchanged
-blocker immediately. Do not repeat prior searches or evidence."""
+This is a retry. Use the target-specific handoff near the assignment to continue checked work without
+repeating known failures. Return an existing blocker reference only when that exact evidence remains
+current and the handoff supplies no new source, interface, reviewer guidance, or viable proof route."""
         selected_proof_targets = tuple(proof_targets)
         proof_assignment = ""
         if stage is Stage.PROVE and selected_proof_targets and role != PACKAGE_WORKER_ROLE:
@@ -1602,11 +1608,20 @@ Work only on the assigned declaration bodies and focused private helpers they re
 listed hole and every diagnostic in the assigned span. Set `complete` to `true` only when all listed
 holes are gone and no non-`sorry` diagnostic remains.
 """
-            insertion_heading = "\n## First decision\n"
+            if feedback:
+                proof_assignment += f"""
+## Retry handoff
+
+The coordinator supplied the following target-specific context so you can continue from prior
+checked work, distinguish proof evidence from build diagnostics, and avoid repeating known failures.
+
+{_bounded_feedback(feedback)}
+"""
+            insertion_heading = "\n## Proof workflow\n"
             if insertion_heading in base:
                 base = base.replace(
                     insertion_heading,
-                    f"\n{proof_assignment}\n## First decision\n",
+                    f"\n{proof_assignment}\n## Proof workflow\n",
                     1,
                 )
             elif "\n## Working method\n" in base:
@@ -1713,7 +1728,7 @@ The server prepares stale imports automatically. For multiple edited files, call
 `lean_prepare_dependencies` once on the files at the end of the dependency chain, then request final
 diagnostics from prerequisites to dependents.
 """
-        if feedback:
+        if feedback and stage is not Stage.PROVE:
             feedback_heading = (
                 "Capability package worker packet"
                 if role == PACKAGE_WORKER_ROLE
@@ -1723,10 +1738,20 @@ diagnostics from prerequisites to dependents.
                     Stage.DISCOVER: "Discovery feedback",
                     Stage.FORMALIZE: "PAF build diagnostics and reported findings",
                     Stage.REVIEW: "Proof findings and PAF validation diagnostics",
-                    Stage.PROVE: "Earlier proof attempts and PAF validation diagnostics",
+                    Stage.PROVE: "Retry handoff",
                 }[stage]
             )
             contract += f"\n## {feedback_heading}\n\n```text\n{_bounded_feedback(feedback)}\n```\n"
+        elif feedback and stage is Stage.PROVE and not selected_proof_targets:
+            contract += f"""
+
+## Retry handoff
+
+The coordinator supplied the following context so you can continue from prior checked work,
+distinguish proof evidence from build diagnostics, and avoid repeating known failures.
+
+{_bounded_feedback(feedback)}
+"""
         return f"{base.rstrip()}\n\n{common.rstrip()}\n{contract}"
 
     def build_package_steward_prompt(self, dossier: dict[str, Any]) -> str:
@@ -2252,8 +2277,7 @@ diagnostics from prerequisites to dependents.
         if succeeded and report.get("complete") is True:
             run_status = TaskStatus.SUCCEEDED
         elif succeeded:
-            # The process completed, but the proof assignment did not. The structured
-            # disposition distinguishes productive partial work from terminal blockers.
+            # The process completed, but the assignment remains coordinator work.
             run_status = TaskStatus.BLOCKED
         else:
             run_status = TaskStatus.FAILED

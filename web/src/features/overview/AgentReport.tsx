@@ -37,8 +37,11 @@ export function parseAgentReport(value?: string): StructuredAgentReport | null {
     if (typeof report.summary !== "string") return null;
     const strings = (item: unknown) =>
       Array.isArray(item) ? item.filter((entry): entry is string => typeof entry === "string") : [];
-    const failedAttempts = Array.isArray(report.failed_attempts)
-      ? report.failed_attempts.flatMap((item) => {
+    const unresolved = Array.isArray(report.unresolved_proofs)
+      ? report.unresolved_proofs
+      : report.failed_attempts;
+    const failedAttempts = Array.isArray(unresolved)
+      ? unresolved.flatMap((item) => {
           if (!item || typeof item !== "object") return [];
           const attempt = item as Record<string, unknown>;
           if (typeof attempt.obstruction !== "string") return [];
@@ -46,7 +49,20 @@ export function parseAgentReport(value?: string): StructuredAgentReport | null {
             {
               path: typeof attempt.path === "string" ? attempt.path : "",
               declaration: typeof attempt.declaration === "string" ? attempt.declaration : "",
-              attempts: strings(attempt.attempts),
+              attempts: Array.isArray(attempt.attempts)
+                ? attempt.attempts.flatMap((checked) => {
+                    if (typeof checked === "string") return [checked];
+                    if (!checked || typeof checked !== "object") return [];
+                    const value = checked as Record<string, unknown>;
+                    if (
+                      typeof value.strategy !== "string" ||
+                      typeof value.probe !== "string" ||
+                      typeof value.outcome !== "string"
+                    )
+                      return [];
+                    return [`${value.strategy}\nProbe: ${value.probe}\nOutcome: ${value.outcome}`];
+                  })
+                : [],
               remainingGoal:
                 typeof attempt.remaining_goal === "string" ? attempt.remaining_goal : "",
               obstruction: attempt.obstruction,

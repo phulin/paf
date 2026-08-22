@@ -379,6 +379,50 @@ def failed_attempt(
     }
 
 
+def unresolved_proof(
+    obstruction: str,
+    *,
+    path: str = "lean/Book/Chapter01.lean",
+    declaration: str = "Book.target",
+    kind: str = "local_proof_failure",
+    upstream_hypothesis: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return {
+        "path": path,
+        "declaration": declaration,
+        "attempts": [
+            {
+                "strategy": "Apply the source argument through the available exact lemmas",
+                "probe": "by\n  exact source_route",
+                "outcome": "Lean leaves the stated residual goal.",
+            }
+        ],
+        "remaining_goal": "⊢ True",
+        "obstruction": obstruction,
+        "evidence": "A focused Lean probe reproduced this obstruction.",
+        "kind": kind,
+        "upstream_hypothesis": upstream_hypothesis,
+    }
+
+
+def test_proof_observations_are_normalized_for_coordinator_routing() -> None:
+    local = unresolved_proof("the construction remains unfinished")
+    suspected = unresolved_proof(
+        "the source requires an omitted hypothesis",
+        kind="suspected_statement_defect",
+    )
+
+    local_record, suspected_record = scheduler_module._proof_blocker_records(
+        {"unresolved_proofs": [local, suspected]}
+    )
+
+    assert local_record["disposition"] == "retry"
+    assert suspected_record["disposition"] == "statement_review"
+    assert "Strategy:" in local_record["attempts"][0]
+    assert "Probe:" in local_record["attempts"][0]
+    assert "Observed outcome:" in local_record["attempts"][0]
+
+
 def result(
     *,
     changed: bool,
@@ -386,6 +430,7 @@ def result(
     complete: bool = True,
     issues: list[str] | None = None,
     failed_attempts: list[dict[str, Any]] | None = None,
+    unresolved_proofs: list[dict[str, Any]] | None = None,
     finding_assessments: list[dict[str, Any]] | None = None,
 ) -> AgentResult:
     report: dict[str, Any] = {
@@ -395,6 +440,8 @@ def result(
     }
     if failed_attempts is not None:
         report["failed_attempts"] = failed_attempts
+    if unresolved_proofs is not None:
+        report["unresolved_proofs"] = unresolved_proofs
     if finding_assessments is not None:
         report["finding_assessments"] = finding_assessments
     return AgentResult(
@@ -7452,11 +7499,12 @@ async def test_obstructed_proof_chunk_does_not_prevent_independent_chunk(
         "theorem first : True := by sorry\ntheorem second : True := by sorry\n",
         encoding="utf-8",
     )
-    obstruction = failed_attempt(
+    obstruction = unresolved_proof(
         "no proof can be constructed from the current interface",
         path="lean/Book/Chapter01.lean",
         declaration="first",
-    ) | {"disposition": "genuine_blocker"}
+        kind="suspected_statement_defect",
+    )
     state = StateStore(config)
     orchestrator = Orchestrator(config, state)
     await orchestrator.prepare()
@@ -7464,8 +7512,8 @@ async def test_obstructed_proof_chunk_does_not_prevent_independent_chunk(
     fake = FakeExecutor(
         state,
         [
-            result(changed=False, placeholders=2, failed_attempts=[obstruction]),
-            result(changed=True, placeholders=1, failed_attempts=[]),
+            result(changed=False, placeholders=2, unresolved_proofs=[obstruction]),
+            result(changed=True, placeholders=1, unresolved_proofs=[]),
         ],
     )
     original_run = fake.run
@@ -7604,10 +7652,10 @@ async def test_prove_retries_receive_only_latest_attempt_delta(
     assert not await orchestrator._prove(chapter)
     feedbacks = orchestrator.executor.feedbacks
     assert feedbacks[0] == ""
-    assert "Proof attempt 1:" in feedbacks[1]
+    assert "Previous proof result (round 1):" in feedbacks[1]
     assert "tried route one" in feedbacks[1]
-    assert "Proof attempt 1:" not in feedbacks[2]
-    assert "Proof attempt 2:" in feedbacks[2]
+    assert "Previous proof result (round 1):" not in feedbacks[2]
+    assert "Previous proof result (round 2):" in feedbacks[2]
     assert "tried route one" not in feedbacks[2]
     assert "tried route two" in feedbacks[2]
     await orchestrator.shutdown()
