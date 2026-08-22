@@ -555,6 +555,64 @@ _UPSTREAM_REPAIR_PROPERTIES: dict[str, Any] = {
     "validation_evidence": {"type": "string", "minLength": 1},
 }
 
+_ESCALATION_ACTION_PROPERTY: dict[str, Any] = {
+    "type": "string",
+    "enum": [
+        "create_repair",
+        "retry_task",
+        "retry_consumer",
+        "reject_observation",
+        "dismiss_source",
+        "propose_source_patch",
+        "park",
+        "needs_planner",
+    ],
+}
+
+_ESCALATION_DECISION_PROPERTIES: dict[str, Any] = {
+    "complete": _REPORT_BASE_PROPERTIES["complete"],
+    "summary": _REPORT_BASE_PROPERTIES["summary"],
+    "issues": _REPORT_BASE_PROPERTIES["issues"],
+    "case_id": {"type": "string", "minLength": 1},
+    "diagnosis": {
+        "type": "string",
+        "enum": [
+            "orchestration",
+            "tooling",
+            "source",
+            "interface",
+            "proof",
+            "external",
+            "stale",
+            "unknown",
+        ],
+    },
+    "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
+    "recommended_action": _ESCALATION_ACTION_PROPERTY,
+    "objective": {"type": "string", "minLength": 1},
+    "context_work_unit_ids": {
+        "type": "array",
+        "items": {"type": "string", "minLength": 1},
+    },
+    "write_work_unit_ids": {
+        "type": "array",
+        "items": {"type": "string", "minLength": 1},
+    },
+    "acceptance_tests": {
+        "type": "array",
+        "items": {"type": "string", "minLength": 1},
+    },
+    "evidence": {
+        "type": "array",
+        "items": {"type": "string", "minLength": 1},
+    },
+    "new_evidence": {
+        "type": "array",
+        "items": {"type": "string", "minLength": 1},
+    },
+    "rationale": {"type": "string", "minLength": 1},
+}
+
 
 def _report_schema(title: str, properties: dict[str, Any]) -> dict[str, Any]:
     return {
@@ -568,6 +626,12 @@ def _report_schema(title: str, properties: dict[str, Any]) -> dict[str, Any]:
 
 
 REPORT_SCHEMAS: dict[str, dict[str, Any]] = {
+    "escalation_scout": _report_schema(
+        "PAF bounded incident investigation", _ESCALATION_DECISION_PROPERTIES
+    ),
+    "escalation_coordinator": _report_schema(
+        "PAF exceptional coordination decision", _ESCALATION_DECISION_PROPERTIES
+    ),
     "upstream_steward": _report_schema(
         "PAF global upstream-request steward report", _UPSTREAM_STEWARD_PROPERTIES
     ),
@@ -633,6 +697,10 @@ PACKAGE_STEWARD_PROMPT_PATH = Path(str(_PROMPT_RESOURCES.joinpath("package_stewa
 PACKAGE_WORKER_PROMPT_PATH = Path(str(_PROMPT_RESOURCES.joinpath("package_worker.md")))
 UPSTREAM_STEWARD_PROMPT_PATH = Path(str(_PROMPT_RESOURCES.joinpath("upstream_steward.md")))
 UPSTREAM_REPAIR_PROMPT_PATH = Path(str(_PROMPT_RESOURCES.joinpath("upstream_repair.md")))
+ESCALATION_SCOUT_PROMPT_PATH = Path(str(_PROMPT_RESOURCES.joinpath("escalation_scout.md")))
+ESCALATION_COORDINATOR_PROMPT_PATH = Path(
+    str(_PROMPT_RESOURCES.joinpath("escalation_coordinator.md"))
+)
 PACKAGE_STEWARD_ROLE = "package_steward"
 PACKAGE_WORKER_ROLE = "package_worker"
 UPSTREAM_STEWARD_ROLE = "upstream_steward"
@@ -640,6 +708,9 @@ UPSTREAM_REPAIR_ROLE = "upstream_repair"
 ESCALATION_COORDINATOR_ROLE = "escalation_coordinator"
 ESCALATION_SCOUT_ROLE = "escalation_scout"
 ESCALATION_WORKER_ROLE = "escalation_worker"
+OWNER_PLACEMENT_ROLE = "owner_placement"
+SOURCE_FACT_CHECK_ROLE = "source_fact_check"
+TRACE_DIAGNOSIS_ROLE = "trace_diagnosis"
 DIAGNOSTIC_REVIEW_ROLE = "diagnostic_review"
 PROOF_REVIEW_ROLE = "proof_review"
 WARNING_CLEANUP_ROLE = "warning_cleanup"
@@ -655,8 +726,16 @@ def report_schema_key(stage: Stage, *, role: str = "", feedback: str = "") -> st
         PACKAGE_WORKER_ROLE,
         UPSTREAM_STEWARD_ROLE,
         UPSTREAM_REPAIR_ROLE,
+        ESCALATION_COORDINATOR_ROLE,
     }:
         return role
+    if role in {
+        ESCALATION_SCOUT_ROLE,
+        OWNER_PLACEMENT_ROLE,
+        SOURCE_FACT_CHECK_ROLE,
+        TRACE_DIAGNOSIS_ROLE,
+    }:
+        return ESCALATION_SCOUT_ROLE
     if role == WARNING_CLEANUP_ROLE:
         return WARNING_CLEANUP_ROLE
     if role == DIAGNOSTIC_REVIEW_ROLE:
@@ -2112,6 +2191,50 @@ distinguish proof evidence from build diagnostics, and avoid repeating known fai
             resume_thread_id=resume_thread_id,
             resume_run_id=resume_run_id,
             resume_prompt=resume_prompt or CAPACITY_RESUME_PROMPT,
+        )
+
+    async def run_escalation_scout(
+        self,
+        anchor: WorkUnitLike,
+        run: RunRecord,
+        dossier: dict[str, Any],
+        *,
+        workspace_root: Path,
+    ) -> AgentResult:
+        prompt = (
+            ESCALATION_SCOUT_PROMPT_PATH.read_text(encoding="utf-8").rstrip()
+            + "\n\n## Incident dossier\n\n```json\n"
+            + json.dumps(dossier, indent=2)
+            + "\n```\n"
+        )
+        return await self._run_prompt(
+            anchor,
+            Stage.DISCOVER,
+            run,
+            prompt=prompt,
+            workspace_root=workspace_root,
+        )
+
+    async def run_escalation_coordinator(
+        self,
+        anchor: WorkUnitLike,
+        run: RunRecord,
+        dossier: dict[str, Any],
+        *,
+        workspace_root: Path,
+    ) -> AgentResult:
+        prompt = (
+            ESCALATION_COORDINATOR_PROMPT_PATH.read_text(encoding="utf-8").rstrip()
+            + "\n\n## Bounded decision dossier\n\n```json\n"
+            + json.dumps(dossier, indent=2)
+            + "\n```\n"
+        )
+        return await self._run_prompt(
+            anchor,
+            Stage.DISCOVER,
+            run,
+            prompt=prompt,
+            workspace_root=workspace_root,
         )
 
     async def run_upstream_repair(

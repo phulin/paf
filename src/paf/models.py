@@ -478,7 +478,12 @@ class PipelineConfig:
                 self.escalation.planner_model,
                 self.escalation.planner_reasoning_effort,
             )
-        if role in {"escalation_scout", "trace_diagnosis", "source_fact_check"}:
+        if role in {
+            "escalation_scout",
+            "owner_placement",
+            "trace_diagnosis",
+            "source_fact_check",
+        }:
             return (
                 self.escalation.investigator_model,
                 self.escalation.investigator_reasoning_effort,

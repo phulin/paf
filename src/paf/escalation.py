@@ -3,6 +3,8 @@ from __future__ import annotations
 import re
 from collections import defaultdict
 from enum import StrEnum
+from itertools import islice
+from pathlib import Path
 from typing import Any
 
 from paf.hashing import stable_digest_text
@@ -26,6 +28,21 @@ _SPACE = re.compile(r"\s+")
 def _normalized(value: object, *, maximum: int = 2000) -> str:
     text = _SPACE.sub(" ", str(value or "")).strip().casefold()
     return _VOLATILE_TEXT.sub("<volatile>", text)[:maximum]
+
+
+def _bounded_text(value: object, *, maximum: int = 4000) -> str:
+    text = str(value or "").strip()
+    if len(text) <= maximum:
+        return text
+    head = maximum // 2
+    tail = maximum - head
+    return f"{text[:head]}\n... <bounded evidence> ...\n{text[-tail:]}"
+
+
+def _bounded_strings(values: object, *, maximum_items: int = 16) -> list[str]:
+    if not isinstance(values, (list, tuple)):
+        return []
+    return [_bounded_text(value, maximum=1000) for value in values[:maximum_items]]
 
 
 def _signal_id(kind: CoordinationSignalKind, identity: str) -> str:
@@ -65,18 +82,17 @@ def _upstream_signals(state: StateStore) -> list[dict[str, Any]]:
         owner_paths = sorted(_normalized(value) for value in request.get("owner_paths", ()))
         group_key = "upstream\0" + (capability or "\0".join(owner_paths) or request_id)
         payload = {
-            key: request.get(key)
-            for key in (
-                "consumer_chapter_id",
-                "consumer_path",
-                "blocked_declaration",
-                "residual_goal",
-                "needed_result",
-                "capability_key",
-                "owner_paths",
-                "attempted_alternatives",
-                "acceptance_tests",
-            )
+            "consumer_chapter_id": _bounded_text(request.get("consumer_chapter_id")),
+            "consumer_path": _bounded_text(request.get("consumer_path")),
+            "blocked_declaration": _bounded_text(request.get("blocked_declaration")),
+            "residual_goal": _bounded_text(request.get("residual_goal")),
+            "needed_result": _bounded_text(request.get("needed_result")),
+            "capability_key": _bounded_text(request.get("capability_key")),
+            "owner_paths": _bounded_strings(request.get("owner_paths")),
+            "attempted_alternatives": _bounded_strings(request.get("attempted_alternatives")),
+            "acceptance_tests": _bounded_strings(request.get("acceptance_tests")),
+            "blocker_ids": _bounded_strings(request.get("blocker_ids")),
+            "origin_run_ids": _bounded_strings(request.get("origin_run_ids")),
         }
         evidence_digest = stable_digest_text(repr(sorted(payload.items())))[:20]
         signals.append(
@@ -104,12 +120,30 @@ def _source_issue_signals(
             continue
         location_key = _normalized(issue.location) or _normalized(issue.source_excerpt)
         group_key = f"source\0{issue.source}\0{location_key}"
+        source_path = Path(issue.source)
+        if not source_path.is_absolute():
+            source_path = state.config.settings.repo / source_path
+        try:
+            source_text = source_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            source_text = ""
+            source_check = "unavailable"
+        else:
+            excerpt = issue.source_excerpt.strip()
+            if excerpt and excerpt in source_text:
+                source_check = "exact"
+            elif excerpt and _SPACE.sub(" ", excerpt).strip() in _SPACE.sub(" ", source_text):
+                source_check = "normalized"
+            else:
+                source_check = "missing"
         evidence = {
             "source": issue.source,
-            "location": issue.location,
-            "source_excerpt": issue.source_excerpt,
-            "description": issue.description,
-            "suggested_correction": issue.suggested_correction,
+            "source_digest": stable_digest_text(source_text)[:20] if source_text else "",
+            "source_excerpt_check": source_check,
+            "location": _bounded_text(issue.location),
+            "source_excerpt": _bounded_text(issue.source_excerpt),
+            "description": _bounded_text(issue.description),
+            "suggested_correction": _bounded_text(issue.suggested_correction),
             "sightings": issue.sightings,
             "stages": list(issue.stages),
             "run_ids": list(issue.run_ids[-settings.recent_trace_runs :]),
@@ -140,11 +174,16 @@ def _persistent_failure_signals(
     signals: list[dict[str, Any]] = []
     failed_statuses = {TaskStatus.FAILED, TaskStatus.BLOCKED, TaskStatus.INTERRUPTED}
     for task in state.tasks.values():
-        recent = [
-            run
-            for run in reversed(state.chapter_runs(task.chapter_id))
-            if not run.auxiliary and run.stage == task.stage
-        ][: max(settings.recent_trace_runs, settings.persistent_failure_threshold)]
+        recent = list(
+            islice(
+                (
+                    run
+                    for run in reversed(state.chapter_runs(task.chapter_id))
+                    if not run.auxiliary and run.stage == task.stage
+                ),
+                max(settings.recent_trace_runs, settings.persistent_failure_threshold),
+            )
+        )
         if len(recent) < settings.persistent_failure_threshold:
             continue
         selected = recent[: settings.persistent_failure_threshold]
@@ -158,7 +197,7 @@ def _persistent_failure_signals(
         evidence = {
             "stage": str(task.stage),
             "task_status": str(task.status),
-            "task_detail": task.detail,
+            "task_detail": _bounded_text(task.detail),
             "failure_signature": signature,
             "run_ids": [run.id for run in selected],
             "roles": list(dict.fromkeys(run.role for run in selected)),
@@ -211,6 +250,12 @@ def coordination_case_proposals(
             "id": _case_id(kind, group_key),
             "kind": kind,
             "group_key": group_key,
+            "evidence_digest": stable_digest_text(
+                "\0".join(
+                    f"{signal['id']}:{signal.get('evidence_digest', '')}"
+                    for signal in sorted(values, key=lambda value: str(value["id"]))
+                )
+            )[:20],
             "signal_ids": [str(signal["id"]) for signal in values],
             "work_unit_ids": list(
                 dict.fromkeys(

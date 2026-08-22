@@ -61,6 +61,10 @@ def test_discovers_chapters_and_renders_paths(tmp_path: Path) -> None:
         "gpt-5.6-luna",
         "xhigh",
     )
+    assert config.agent_profile(Stage.DISCOVER, "owner_placement") == (
+        "gpt-5.6-luna",
+        "xhigh",
+    )
     assert config.agent_profile(Stage.DISCOVER, "escalation_coordinator") == (
         "gpt-5.6-sol",
         "medium",

@@ -53,6 +53,8 @@ async def test_detectors_reduce_related_upstream_and_source_evidence(tmp_path: P
     assert len(upstream[0]["signal_ids"]) == 2
     assert len(source) == 1
     assert source[0]["work_unit_ids"] == [chapter.id]
+    source_signal = next(value for value in signals if value["kind"] == "source_issue")
+    assert source_signal["evidence"]["source_excerpt_check"] == "missing"
     await state.close()
 
 
@@ -96,6 +98,7 @@ async def test_coordination_state_is_durable_and_generation_fenced(tmp_path: Pat
     proposal = {
         "id": "case-a",
         "kind": "persistent_failure",
+        "evidence_digest": "case-evidence-a",
         "signal_ids": ["signal-a"],
         "work_unit_ids": [config.chapters[0].id],
     }
@@ -111,11 +114,21 @@ async def test_coordination_state_is_durable_and_generation_fenced(tmp_path: Pat
     )
     assert not await state.update_coordination_case_generation("case-a", 2, status="investigating")
     assert await state.update_coordination_case_generation("case-a", 1, status="investigating")
+    assert await state.upsert_coordination_signals(
+        (signal | {"evidence_digest": "evidence-b", "evidence": {"run_ids": ["run-b"]}},)
+    ) == ("signal-a",)
+    assert await state.sync_coordination_cases(
+        (proposal | {"evidence_digest": "case-evidence-b"},)
+    ) == ("case-a",)
+    assert state.coordination_cases["case-a"]["status"] == "investigating"
+    assert await state.update_coordination_case_generation("case-a", 1, status="parked")
+    assert state.coordination_cases["case-a"]["status"] == "open"
+    assert state.coordination_cases["case-a"]["generation"] == 2
     await state.close()
 
     reloaded = StateStore(config)
     await reloaded.load_or_create()
-    assert reloaded.coordination_signals["signal-a"]["evidence_digest"] == "evidence-a"
-    assert reloaded.coordination_cases["case-a"]["status"] == "investigating"
+    assert reloaded.coordination_signals["signal-a"]["evidence_digest"] == "evidence-b"
+    assert reloaded.coordination_cases["case-a"]["status"] == "open"
     assert reloaded.coordination_jobs["job-a"]["kind"] == "trace_diagnosis"
     await reloaded.close()

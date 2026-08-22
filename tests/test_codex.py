@@ -13,9 +13,14 @@ import paf.codex as codex_module
 from paf.activity import EVENT_TIMESTAMP_FIELD
 from paf.codex import (
     DIAGNOSTIC_REVIEW_ROLE,
+    ESCALATION_COORDINATOR_ROLE,
+    ESCALATION_SCOUT_ROLE,
+    OWNER_PLACEMENT_ROLE,
     PACKAGE_STEWARD_ROLE,
     PACKAGE_WORKER_ROLE,
     REPORT_SCHEMAS,
+    SOURCE_FACT_CHECK_ROLE,
+    TRACE_DIAGNOSIS_ROLE,
     UPSTREAM_REPAIR_ROLE,
     WARNING_REVIEW_ROLE,
     CodexExecutor,
@@ -95,6 +100,8 @@ def test_record_jsonl_line_deduplicates_structured_mcp_result(
 
 def test_report_schemas_contain_only_fields_used_by_each_active_agent() -> None:
     expected = {
+        "escalation_scout": set(codex_module._ESCALATION_DECISION_PROPERTIES),
+        "escalation_coordinator": set(codex_module._ESCALATION_DECISION_PROPERTIES),
         "upstream_steward": {"complete", "summary", "issues", "cases"},
         "upstream_repair": {
             "complete",
@@ -797,6 +804,12 @@ async def test_executor_selects_a_distinct_schema_for_each_active_agent(tmp_path
         return Path(command[command.index("--output-schema") + 1])
 
     selected = {
+        "escalation_scout": schema_path(
+            executor.command(Stage.DISCOVER, role=ESCALATION_SCOUT_ROLE)
+        ),
+        "escalation_coordinator": schema_path(
+            executor.command(Stage.DISCOVER, role=ESCALATION_COORDINATOR_ROLE)
+        ),
         "discover": schema_path(executor.command(Stage.DISCOVER)),
         "formalize": schema_path(executor.command(Stage.FORMALIZE)),
         "review": schema_path(executor.command(Stage.REVIEW)),
@@ -821,6 +834,12 @@ async def test_executor_selects_a_distinct_schema_for_each_active_agent(tmp_path
     }
 
     assert len(set(selected.values())) == len(selected)
+    scout_schema = selected["escalation_scout"]
+    assert schema_path(executor.command(Stage.DISCOVER, role=OWNER_PLACEMENT_ROLE)) == scout_schema
+    assert (
+        schema_path(executor.command(Stage.DISCOVER, role=SOURCE_FACT_CHECK_ROLE)) == scout_schema
+    )
+    assert schema_path(executor.command(Stage.DISCOVER, role=TRACE_DIAGNOSIS_ROLE)) == scout_schema
     for key, path in selected.items():
         assert json.loads(path.read_text(encoding="utf-8")) == REPORT_SCHEMAS[key]
     assert not (config.settings.state_dir / "agent-report.schema.json").exists()

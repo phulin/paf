@@ -5601,7 +5601,7 @@ async def test_structural_blockers_create_one_upstream_request_without_ping_pong
 
 
 @pytest.mark.asyncio
-async def test_upstream_requests_launch_one_global_steward(tmp_path: Path) -> None:
+async def test_upstream_requests_launch_incremental_incident_scouts(tmp_path: Path) -> None:
     config_path = write_project(tmp_path, chapters="chapters = [1, 2, 3, 4]")
     source = tmp_path / "books" / "book.md"
     source.write_text(
@@ -5630,14 +5630,143 @@ async def test_upstream_requests_launch_one_global_steward(tmp_path: Path) -> No
 
     await orchestrator._route_migrated_upstream_requests()
 
-    assert orchestrator._upstream_steward_task is not None
+    assert orchestrator._upstream_steward_task is None
     assert not orchestrator.state.proof_review_requests
-    assert set(orchestrator._upstream_steward_dossier()["requests"]) == set(
-        orchestrator.state.upstream_requests
+    assert len(orchestrator.state.coordination_signals) == 3
+    assert len(orchestrator.state.coordination_cases) == 3
+    assert set(orchestrator._coordination_tasks) == set(orchestrator.state.coordination_cases)
+    await orchestrator.shutdown()
+
+
+def coordination_result(
+    case_id: str,
+    *,
+    confidence: str,
+    action: str,
+    context_ids: list[str] | None = None,
+    write_ids: list[str] | None = None,
+) -> AgentResult:
+    return AgentResult(
+        succeeded=True,
+        exit_code=0,
+        changed=False,
+        placeholders=0,
+        usage=TokenUsage(input_tokens=10, output_tokens=5, measured=True),
+        report={
+            "complete": True,
+            "summary": "bounded incident decision",
+            "issues": [],
+            "case_id": case_id,
+            "diagnosis": "interface",
+            "confidence": confidence,
+            "recommended_action": action,
+            "objective": "Provide the smallest chronological bridge.",
+            "context_work_unit_ids": context_ids or [],
+            "write_work_unit_ids": write_ids or [],
+            "acceptance_tests": ["lake build Book.Chapter02"],
+            "evidence": ["the consumer imports the proposed owner"],
+            "new_evidence": [],
+            "rationale": "The owner is earlier than the consumer.",
+        },
     )
-    orchestrator._upstream_steward_task.cancel()
-    await asyncio.gather(orchestrator._upstream_steward_task, return_exceptions=True)
-    orchestrator._upstream_steward_task = None
+
+
+@pytest.mark.asyncio
+async def test_high_confidence_owner_scout_creates_incremental_repair(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    owner, consumer = config.chapters
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await state.load_or_create()
+    request_id, _ = await state.enqueue_upstream_request(
+        {
+            "consumer_path": consumer.scope[0],
+            "blocked_declaration": "Book.consumer",
+            "residual_goal": "True",
+            "needed_result": "an earlier bridge",
+            "owner_paths": [owner.scope[0]],
+        },
+        consumer_chapter_id=consumer.id,
+        owner_chapter_id=owner.id,
+    )
+    await orchestrator._refresh_coordination_cases()
+    case_id = next(iter(state.coordination_cases))
+    roles: list[str] = []
+
+    async def run_agent(
+        case: dict[str, Any],
+        *,
+        role: str,
+        dossier: dict[str, Any],
+        ordinal: int,
+    ) -> AgentResult:
+        del dossier, ordinal
+        roles.append(role)
+        return coordination_result(
+            str(case["id"]),
+            confidence="high",
+            action="create_repair",
+            context_ids=[consumer.id],
+            write_ids=[owner.id],
+        )
+
+    monkeypatch.setattr(orchestrator, "_run_coordination_agent", run_agent)
+    await orchestrator._run_coordination_case(case_id)
+
+    assert roles == ["owner_placement"]
+    assert state.coordination_cases[case_id]["status"] == "actionable"
+    assert state.steward_cases[case_id]["status"] == "ready"
+    assert state.steward_cases[case_id]["write_work_unit_ids"] == [owner.id]
+    assert state.upstream_requests[request_id]["status"] == "evaluating"
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_uncertain_scout_uses_rare_planner_before_parking(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = config.chapters[0]
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await state.load_or_create()
+    await state.enqueue_upstream_request(
+        {
+            "consumer_path": chapter.scope[0],
+            "blocked_declaration": "Book.consumer",
+            "residual_goal": "True",
+            "needed_result": "an owner that is not evident",
+            "owner_paths": [],
+        },
+        consumer_chapter_id=chapter.id,
+        owner_chapter_id=chapter.id,
+    )
+    await orchestrator._refresh_coordination_cases()
+    case_id = next(iter(state.coordination_cases))
+    roles: list[str] = []
+
+    async def run_agent(
+        case: dict[str, Any],
+        *,
+        role: str,
+        dossier: dict[str, Any],
+        ordinal: int,
+    ) -> AgentResult:
+        del ordinal
+        roles.append(role)
+        if role == "owner_placement":
+            return coordination_result(str(case["id"]), confidence="low", action="needs_planner")
+        assert dossier["investigator_reports"][0]["confidence"] == "low"
+        return coordination_result(str(case["id"]), confidence="high", action="park")
+
+    monkeypatch.setattr(orchestrator, "_run_coordination_agent", run_agent)
+    await orchestrator._run_coordination_case(case_id)
+
+    assert roles == ["owner_placement", "escalation_coordinator"]
+    assert state.coordination_cases[case_id]["status"] == "parked"
+    assert not state.steward_cases
     await orchestrator.shutdown()
 
 

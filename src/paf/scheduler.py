@@ -18,9 +18,14 @@ from paf import json_codec as json
 from paf.codex import (
     DIAGNOSTIC_REVIEW_ROLE,
     DIAGNOSTIC_REVIEW_ROLES,
+    ESCALATION_COORDINATOR_ROLE,
+    ESCALATION_SCOUT_ROLE,
+    OWNER_PLACEMENT_ROLE,
     PACKAGE_STEWARD_ROLE,
     PACKAGE_WORKER_ROLE,
     PROOF_REVIEW_ROLE,
+    SOURCE_FACT_CHECK_ROLE,
+    TRACE_DIAGNOSIS_ROLE,
     UPSTREAM_REPAIR_ROLE,
     UPSTREAM_STEWARD_ROLE,
     WARNING_REVIEW_ROLE,
@@ -53,6 +58,7 @@ from paf.diagnostics import (
     failed_lean_modules,
     lean_diagnostics,
 )
+from paf.escalation import collect_coordination_signals, coordination_case_proposals
 from paf.git import (
     GitCommitError,
     GitCommitter,
@@ -755,6 +761,7 @@ class Orchestrator:
         )
         self.state.scheduling = self.scheduling_snapshot()
         self.agent_slots = PriorityLimiter(config.settings.max_agents)
+        self.investigation_slots = PriorityLimiter(config.escalation.max_concurrent_investigations)
         discovery_max_agents = config.stages[Stage.DISCOVER].max_agents
         assert discovery_max_agents is not None
         self.discovery_slots = PriorityLimiter(discovery_max_agents)
@@ -783,6 +790,7 @@ class Orchestrator:
         self._package_tasks: dict[str, asyncio.Task[PackageExecutionResult]] = {}
         self._upstream_steward_task: asyncio.Task[None] | None = None
         self._upstream_case_tasks: dict[str, asyncio.Task[None]] = {}
+        self._coordination_tasks: dict[str, asyncio.Task[None]] = {}
         self.package_execution = PackageExecutionLayer(
             config.settings.repo,
             config.settings.state_dir,
@@ -1101,6 +1109,535 @@ class Orchestrator:
         """Compatibility entry point for the global steward scheduler."""
 
         await self._schedule_upstream_coordination()
+
+    async def _refresh_coordination_cases(self) -> None:
+        if not self.config.escalation.enabled:
+            return
+        signals = await asyncio.to_thread(
+            collect_coordination_signals,
+            self.state,
+            self.config.escalation,
+        )
+        await self.state.upsert_coordination_signals(signals)
+        await self.state.sync_coordination_cases(coordination_case_proposals(signals))
+
+    def _coordination_case_signal_values(self, case: dict[str, Any]) -> list[dict[str, Any]]:
+        return [
+            self.state.coordination_signals[signal_id]
+            for signal_id in map(str, case.get("signal_ids", ()))
+            if signal_id in self.state.coordination_signals
+        ]
+
+    def _coordination_trace_evidence(self, case: dict[str, Any]) -> list[dict[str, Any]]:
+        run_ids = list(
+            dict.fromkeys(
+                str(run_id)
+                for signal in self._coordination_case_signal_values(case)
+                for key in ("run_ids", "origin_run_ids")
+                for run_id in (
+                    signal.get("evidence", {}).get(key, ())
+                    if isinstance(signal.get("evidence"), dict)
+                    else ()
+                )
+                if str(run_id)
+            )
+        )[-self.config.escalation.recent_trace_runs :]
+        traces: list[dict[str, Any]] = []
+        for run_id in run_ids:
+            activity = self.state.activities.get(run_id)
+            if activity is None:
+                continue
+            traces.append(
+                {
+                    "run_id": run_id,
+                    "commands": activity.commands,
+                    "command_failures": activity.command_failures,
+                    "mcp_calls": activity.mcp_calls,
+                    "mcp_failures": activity.mcp_failures,
+                    "file_changes": activity.file_changes,
+                    "latest_summary": activity.latest_summary,
+                    "latest_error": activity.latest_error,
+                    "recent": [
+                        {
+                            "kind": event.kind,
+                            "status": event.status,
+                            "title": event.title,
+                            "detail": event.detail,
+                        }
+                        for event in activity.recent[-24:]
+                    ],
+                }
+            )
+        return traces
+
+    def _coordination_case_dossier(self, case: dict[str, Any]) -> dict[str, Any]:
+        work_unit_ids = {
+            str(value)
+            for value in case.get("work_unit_ids", ())
+            if str(value) in self._work_units_by_id
+        }
+        return {
+            "case": {
+                key: value
+                for key, value in case.items()
+                if key
+                in {
+                    "id",
+                    "kind",
+                    "status",
+                    "generation",
+                    "severity",
+                    "signal_ids",
+                    "work_unit_ids",
+                }
+            },
+            "signals": self._coordination_case_signal_values(case),
+            "trace_evidence": self._coordination_trace_evidence(case),
+            "prior_action": self.state.steward_cases.get(str(case.get("id", ""))),
+            "work_units": [
+                {
+                    "id": work_unit_id,
+                    "title": self._work_units_by_id[work_unit_id].title,
+                    "ordinal": self._work_unit_order[work_unit_id],
+                    "source": self._work_units_by_id[work_unit_id].source.as_posix(),
+                    "source_lines": [
+                        self._work_units_by_id[work_unit_id].source_span.start_line,
+                        self._work_units_by_id[work_unit_id].source_span.end_line,
+                    ],
+                    "lean_scope": list(self._work_units_by_id[work_unit_id].scope),
+                }
+                for work_unit_id in sorted(work_unit_ids, key=self._work_unit_order.__getitem__)
+            ],
+            "budgets": {
+                "maximum_investigations": self.config.escalation.maximum_investigations_per_case,
+                "maximum_planner_attempts": self.config.escalation.maximum_planner_attempts,
+                "recent_trace_runs": self.config.escalation.recent_trace_runs,
+            },
+        }
+
+    def _coordination_anchor(self, case: dict[str, Any]) -> WorkUnitLike:
+        return next(
+            (
+                self._work_units_by_id[str(value)]
+                for value in case.get("work_unit_ids", ())
+                if str(value) in self._work_units_by_id
+            ),
+            self.work_units[0],
+        )
+
+    async def _run_coordination_agent(
+        self,
+        case: dict[str, Any],
+        *,
+        role: str,
+        dossier: dict[str, Any],
+        ordinal: int,
+    ) -> AgentResult:
+        case_id = str(case["id"])
+        generation = max(1, int(case.get("generation", 1)))
+        job_kind = role
+        job_id = f"{case_id}:{generation}:{job_kind}:{ordinal}"
+        anchor = self._coordination_anchor(case)
+        signal_ids = tuple(map(str, case.get("signal_ids", ())))
+        run = await self.state.start_auxiliary_run(
+            anchor.id,
+            Stage.DISCOVER,
+            role=role,
+            request_ids=(case_id, f"coordination-generation:{generation}", *signal_ids),
+            model=self.config.agent_profile(Stage.DISCOVER, role)[0],
+        )
+        await self.state.put_coordination_job(
+            {
+                "id": job_id,
+                "case_id": case_id,
+                "case_generation": generation,
+                "kind": job_kind,
+                "role": role,
+                "status": "running",
+                "run_id": run.id,
+            }
+        )
+        await self.investigation_slots.acquire(self.statement_schedule.priority(anchor.document_id))
+        workspace = None
+        try:
+            workspace = await self.isolation.acquire(f"{role}-{run.id}")
+            if role != ESCALATION_COORDINATOR_ROLE:
+                result = await self.executor.run_escalation_scout(
+                    anchor, run, dossier, workspace_root=workspace.root
+                )
+            else:
+                result = await self.executor.run_escalation_coordinator(
+                    anchor, run, dossier, workspace_root=workspace.root
+                )
+        except asyncio.CancelledError:
+            await self.state.put_coordination_job(
+                {
+                    "id": job_id,
+                    "case_id": case_id,
+                    "case_generation": generation,
+                    "kind": job_kind,
+                    "role": role,
+                    "status": "interrupted",
+                    "run_id": run.id,
+                }
+            )
+            raise
+        except Exception as error:
+            detail = f"{type(error).__name__}: {error}"[-4000:]
+            if not run.finished_at:
+                await self.state.finish_run(
+                    run,
+                    status=TaskStatus.FAILED,
+                    exit_code=1,
+                    error=detail,
+                )
+            result = AgentResult(
+                succeeded=False,
+                exit_code=1,
+                changed=False,
+                placeholders=0,
+                usage=run.usage,
+                error=detail,
+            )
+        finally:
+            self.investigation_slots.release()
+            if workspace is not None:
+                await workspace.close()
+        await self.state.put_coordination_job(
+            {
+                "id": job_id,
+                "case_id": case_id,
+                "case_generation": generation,
+                "kind": job_kind,
+                "role": role,
+                "status": "succeeded" if result.succeeded else "failed",
+                "run_id": run.id,
+                "report": result.report,
+                "error": result.error,
+            }
+        )
+        return result
+
+    @staticmethod
+    def _coordination_scout_role(case: dict[str, Any]) -> str:
+        return {
+            "upstream_request": OWNER_PLACEMENT_ROLE,
+            "source_issue": SOURCE_FACT_CHECK_ROLE,
+            "persistent_failure": TRACE_DIAGNOSIS_ROLE,
+        }.get(str(case.get("kind")), ESCALATION_SCOUT_ROLE)
+
+    def _coordination_decision_problem(self, case: dict[str, Any], report: dict[str, Any]) -> str:
+        case_id = str(case.get("id", ""))
+        if str(report.get("case_id", "")) != case_id:
+            return "decision returned a different case id"
+        kind = str(case.get("kind", ""))
+        action = str(report.get("recommended_action", ""))
+        allowed = {
+            "upstream_request": {
+                "create_repair",
+                "retry_consumer",
+                "reject_observation",
+                "park",
+                "needs_planner",
+            },
+            "source_issue": {
+                "dismiss_source",
+                "propose_source_patch",
+                "park",
+                "needs_planner",
+            },
+            "persistent_failure": {"retry_task", "park", "needs_planner"},
+        }
+        if action not in allowed.get(kind, set()):
+            return f"action {action or '<empty>'} is not valid for {kind or '<unknown>'}"
+        raw_context = report.get("context_work_unit_ids")
+        raw_write = report.get("write_work_unit_ids")
+        if not isinstance(raw_context, list) or not isinstance(raw_write, list):
+            return "decision scopes must be arrays"
+        reported_context = list(map(str, raw_context))
+        reported_write = list(map(str, raw_write))
+        unknown = [
+            value
+            for value in (*reported_context, *reported_write)
+            if value not in self._work_units_by_id
+        ]
+        if unknown:
+            return "decision named unknown work units: " + ", ".join(sorted(set(unknown)))
+        if action == "create_repair":
+            request_ids = [
+                value
+                for value in self._coordination_subject_ids(case)
+                if value in self.state.upstream_requests
+            ]
+            if not request_ids or not reported_write:
+                return "shared repairs require requests and a nonempty write scope"
+            consumer_ids = {
+                str(self.state.upstream_requests[value].get("consumer_chapter_id", ""))
+                for value in request_ids
+            }
+            if any(consumer_id not in self._work_unit_order for consumer_id in consumer_ids):
+                return "shared repair request has no configured consumer work unit"
+            if any(
+                self._work_unit_order[write_id] >= self._work_unit_order[consumer_id]
+                for write_id in reported_write
+                for consumer_id in consumer_ids
+                if consumer_id in self._work_unit_order
+            ):
+                return "shared repair write units must be strictly earlier than every consumer"
+            if not report.get("acceptance_tests"):
+                return "shared repairs require at least one acceptance test"
+        if action == "retry_task" and not report.get("new_evidence"):
+            return "task retries require materially new evidence"
+        return ""
+
+    def _scout_decision_requires_planner(
+        self, case: dict[str, Any], report: dict[str, Any]
+    ) -> bool:
+        if (
+            case.get("force_planner")
+            or report.get("confidence") != "high"
+            or report.get("recommended_action") == "needs_planner"
+            or self._coordination_decision_problem(case, report)
+        ):
+            return True
+        safe = {
+            "upstream_request": {"create_repair", "retry_consumer", "reject_observation", "park"},
+            "source_issue": {"dismiss_source", "park"},
+            "persistent_failure": {"retry_task", "park"},
+        }
+        return str(report.get("recommended_action")) not in safe.get(str(case.get("kind")), set())
+
+    def _coordination_subject_ids(self, case: dict[str, Any]) -> list[str]:
+        return list(
+            dict.fromkeys(
+                str(subject_id)
+                for signal in self._coordination_case_signal_values(case)
+                for subject_id in signal.get("subject_ids", ())
+            )
+        )
+
+    async def _apply_coordination_decision(
+        self,
+        case: dict[str, Any],
+        report: dict[str, Any],
+    ) -> None:
+        case_id = str(case["id"])
+        generation = max(1, int(case.get("generation", 1)))
+        if problem := self._coordination_decision_problem(case, report):
+            await self.state.update_coordination_case_generation(
+                case_id,
+                generation,
+                status="parked",
+                decision=report,
+                failure=f"deterministic decision validation failed: {problem}",
+            )
+            return
+        action = str(report.get("recommended_action", "park"))
+        subject_ids = self._coordination_subject_ids(case)
+        valid_context = [
+            str(value)
+            for value in report.get("context_work_unit_ids", ())
+            if str(value) in self._work_units_by_id
+        ]
+        valid_write = [
+            str(value)
+            for value in report.get("write_work_unit_ids", ())
+            if str(value) in self._work_units_by_id
+        ]
+        if action == "create_repair" and case.get("kind") == "upstream_request" and valid_write:
+            request_ids = [value for value in subject_ids if value in self.state.upstream_requests]
+            for request_id in request_ids:
+                consumer_id = str(
+                    self.state.upstream_requests[request_id].get("consumer_chapter_id", "")
+                )
+                if consumer_id in self._work_units_by_id:
+                    valid_context.append(consumer_id)
+            valid_context = list(dict.fromkeys((*valid_context, *valid_write)))
+            await self.state.upsert_steward_case(
+                {
+                    "case_id": case_id,
+                    "title": str(report.get("summary", "Focused shared repair")),
+                    "request_ids": request_ids,
+                    "disposition": "repair",
+                    "needed_result": str(report.get("objective", "")),
+                    "context_work_unit_ids": valid_context,
+                    "write_work_unit_ids": list(dict.fromkeys(valid_write)),
+                    "acceptance_tests": list(report.get("acceptance_tests", ())),
+                    "rationale": str(report.get("rationale", "")),
+                    "status": "ready",
+                    "coordination_generation": generation,
+                }
+            )
+            await self.state.update_coordination_case_generation(
+                case_id, generation, status="actionable", decision=report
+            )
+            return
+        if (
+            action in {"retry_consumer", "reject_observation"}
+            and case.get("kind") == "upstream_request"
+        ):
+            pseudo_case = {
+                "id": case_id,
+                "request_ids": [
+                    value for value in subject_ids if value in self.state.upstream_requests
+                ],
+            }
+            await self._resolve_steward_case(
+                pseudo_case,
+                request_status=UpstreamRequestStatus.REJECTED,
+                blocker_status=(
+                    ProofBlockerStatus.OPEN
+                    if action == "retry_consumer"
+                    else ProofBlockerStatus.BLOCKED
+                ),
+                detail=(
+                    "incident scout returned a focused consumer retry"
+                    if action == "retry_consumer"
+                    else "incident scout rejected the upstream observation"
+                ),
+                decision=report,
+            )
+            await self.state.update_coordination_case_generation(
+                case_id, generation, status="resolved", decision=report
+            )
+            return
+        if action == "dismiss_source" and case.get("kind") == "source_issue":
+            await self.state.set_source_issue_status(subject_ids, "dismissed")
+            await self.state.update_coordination_case_generation(
+                case_id, generation, status="resolved", decision=report
+            )
+            return
+        if (
+            action == "retry_task"
+            and case.get("kind") == "persistent_failure"
+            and report.get("new_evidence")
+        ):
+            for task_key in subject_ids:
+                work_unit_id, separator, stage_name = task_key.rpartition(":")
+                if not separator or work_unit_id not in self._work_units_by_id:
+                    continue
+                try:
+                    stage = Stage(stage_name)
+                except ValueError:
+                    continue
+                task = self.state.task(work_unit_id, stage)
+                if task.status not in {TaskStatus.RUNNING, TaskStatus.SUCCEEDED}:
+                    await self.state.set_task(
+                        work_unit_id,
+                        stage,
+                        TaskStatus.PENDING,
+                        "escalation scout found materially new retry evidence",
+                        force=True,
+                    )
+            await self.state.update_coordination_case_generation(
+                case_id, generation, status="resolved", decision=report
+            )
+            return
+        await self.state.update_coordination_case_generation(
+            case_id,
+            generation,
+            status=("awaiting_source_approval" if action == "propose_source_patch" else "parked"),
+            decision=report,
+        )
+
+    async def _run_coordination_case(self, case_id: str) -> None:
+        case = self.state.coordination_cases.get(case_id)
+        if not isinstance(case, dict) or case.get("status") != "open":
+            return
+        generation = max(1, int(case.get("generation", 1)))
+        case = dict(case)
+        investigation_attempts = int(case.get("investigation_attempts", 0))
+        if investigation_attempts >= self.config.escalation.maximum_investigations_per_case:
+            await self.state.update_coordination_case_generation(
+                case_id,
+                generation,
+                status="parked",
+                failure="bounded investigation budget exhausted without a validated action",
+            )
+            return
+        case["investigation_attempts"] = investigation_attempts + 1
+        claimed = await self.state.update_coordination_case_generation(
+            case_id,
+            generation,
+            status="investigating",
+            investigation_attempts=investigation_attempts + 1,
+        )
+        if not claimed:
+            return
+        dossier = self._coordination_case_dossier(case)
+        scout = await self._run_coordination_agent(
+            case,
+            role=self._coordination_scout_role(case),
+            dossier=dossier,
+            ordinal=investigation_attempts + 1,
+        )
+        if not scout.succeeded or scout.report.get("complete") is not True:
+            await self.state.update_coordination_case_generation(
+                case_id,
+                generation,
+                status=(
+                    "open"
+                    if (scout.infrastructure_failed or scout.capacity_exhausted)
+                    and investigation_attempts + 1
+                    < self.config.escalation.maximum_investigations_per_case
+                    else "parked"
+                ),
+                failure=scout.error or "bounded investigation did not complete",
+            )
+            return
+        decision = scout.report
+        if self._scout_decision_requires_planner(case, decision):
+            planner_attempts = int(case.get("planner_attempts", 0))
+            if planner_attempts >= self.config.escalation.maximum_planner_attempts:
+                await self.state.update_coordination_case_generation(
+                    case_id,
+                    generation,
+                    status="parked",
+                    scout_report=decision,
+                    failure="exceptional planner budget exhausted",
+                )
+                return
+            await self.state.update_coordination_case_generation(
+                case_id,
+                generation,
+                status="deciding",
+                scout_report=decision,
+                planner_attempts=planner_attempts + 1,
+            )
+            planner = await self._run_coordination_agent(
+                case,
+                role=ESCALATION_COORDINATOR_ROLE,
+                dossier=dossier | {"investigator_reports": [decision]},
+                ordinal=planner_attempts + 1,
+            )
+            if not planner.succeeded or planner.report.get("complete") is not True:
+                await self.state.update_coordination_case_generation(
+                    case_id,
+                    generation,
+                    status="parked",
+                    scout_report=decision,
+                    failure=planner.error or "exceptional coordinator did not complete",
+                )
+                return
+            decision = planner.report
+        await self._apply_coordination_decision(case, decision)
+
+    async def _run_scheduled_coordination_case(self, case_id: str) -> None:
+        try:
+            await self._run_coordination_case(case_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            case = self.state.coordination_cases.get(case_id)
+            if isinstance(case, dict):
+                await self.state.update_coordination_case_generation(
+                    case_id,
+                    max(1, int(case.get("generation", 1))),
+                    status="parked",
+                    failure=(
+                        f"coordination runtime failed safely: {type(error).__name__}: {error}"
+                    )[-4000:],
+                )
 
     def _upstream_steward_dossier(self) -> dict[str, Any]:
         requests = {
@@ -1614,6 +2151,43 @@ class Orchestrator:
         if max(1, int(case.get("generation", 1))) != generation:
             return
         await self._run_upstream_repair(case_id)
+        coordination = self.state.coordination_cases.get(case_id)
+        current = self.state.steward_cases.get(case_id, {})
+        if not isinstance(coordination, dict):
+            return
+        coordination_generation = max(1, int(coordination.get("generation", 1)))
+        status = str(current.get("status", ""))
+        if status in {"verified", "rejected", "resolved"}:
+            await self.state.update_coordination_case_generation(
+                case_id,
+                coordination_generation,
+                status="resolved",
+                action_outcome=current.get("decision"),
+            )
+        elif status == "needs_scope":
+            expansions = int(coordination.get("scope_expansions", 0)) + 1
+            await self.state.update_coordination_case_generation(
+                case_id,
+                coordination_generation,
+                status="open",
+                force_planner=(expansions >= self.config.escalation.maximum_scope_expansions),
+                scope_expansions=expansions,
+                action_outcome=current.get("decision"),
+            )
+        elif status == "failed":
+            failures = int(coordination.get("action_failures", 0)) + 1
+            await self.state.update_coordination_case_generation(
+                case_id,
+                coordination_generation,
+                status=(
+                    "open"
+                    if failures <= self.config.escalation.maximum_planner_attempts
+                    else "failed"
+                ),
+                force_planner=True,
+                action_failures=failures,
+                action_outcome=current.get("decision"),
+            )
 
     def _upstream_case_write_work_unit_ids(self, case_id: str) -> set[str]:
         case = self.state.steward_cases.get(case_id, {})
@@ -1633,6 +2207,26 @@ class Orchestrator:
     async def _schedule_upstream_coordination(
         self, *, excluded_work_unit_ids: Iterable[str] = ()
     ) -> None:
+        await self._refresh_coordination_cases()
+        for case_id, task in tuple(self._coordination_tasks.items()):
+            if task.done():
+                self._coordination_tasks.pop(case_id, None)
+                task.result()
+        if self.config.escalation.enabled:
+            available = max(
+                0,
+                self.config.escalation.max_concurrent_investigations
+                - len(self._coordination_tasks),
+            )
+            for case_id, case in sorted(self.state.coordination_cases.items()):
+                if available <= 0:
+                    break
+                if case.get("status") != "open" or case_id in self._coordination_tasks:
+                    continue
+                self._coordination_tasks[case_id] = asyncio.create_task(
+                    self._run_scheduled_coordination_case(case_id)
+                )
+                available -= 1
         if self._upstream_steward_task is not None and self._upstream_steward_task.done():
             task = self._upstream_steward_task
             self._upstream_steward_task = None
@@ -1648,7 +2242,11 @@ class Orchestrator:
             and not request.get("steward_case_id")
             for request in self.state.upstream_requests.values()
         ) or any(case.get("status") == "needs_scope" for case in self.state.steward_cases.values())
-        if needs_steward and self._upstream_steward_task is None:
+        if (
+            needs_steward
+            and not self.config.escalation.enabled
+            and self._upstream_steward_task is None
+        ):
             self._upstream_steward_task = asyncio.create_task(self._run_upstream_steward())
             return
         if self._upstream_steward_task is not None:
@@ -1701,6 +2299,7 @@ class Orchestrator:
         report("Recovering interrupted work", 2)
         await self.state.requeue_interrupted(resume_agents=self.resume_agents)
         await self.state.recover_interrupted_steward_cases()
+        await self.state.recover_interrupted_coordination_cases()
         report("Scaffolding work-unit directories", 3)
         self.scaffold()
         report("Migrating persisted workflow state", 4)
@@ -1841,11 +2440,13 @@ class Orchestrator:
             upstream_tasks = [*self._upstream_case_tasks.values()]
             if self._upstream_steward_task is not None:
                 upstream_tasks.append(self._upstream_steward_task)
+            upstream_tasks.extend(self._coordination_tasks.values())
             for task in upstream_tasks:
                 task.cancel()
             await asyncio.gather(*upstream_tasks, return_exceptions=True)
             self._upstream_case_tasks.clear()
             self._upstream_steward_task = None
+            self._coordination_tasks.clear()
             if self._discovery_batch_task is not None:
                 self._discovery_batch_task.cancel()
                 await asyncio.gather(self._discovery_batch_task, return_exceptions=True)
@@ -6550,6 +7151,7 @@ class Orchestrator:
             if self._upstream_steward_task is not None:
                 tasks.append(self._upstream_steward_task)
             tasks.extend(self._upstream_case_tasks.values())
+            tasks.extend(self._coordination_tasks.values())
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
@@ -6811,6 +7413,7 @@ class Orchestrator:
                 if self._upstream_steward_task is not None:
                     live_tasks.append(self._upstream_steward_task)
                 live_tasks.extend(self._upstream_case_tasks.values())
+                live_tasks.extend(self._coordination_tasks.values())
                 progress_waiter: asyncio.Task[bool] | None = None
                 if (
                     formalize is not None

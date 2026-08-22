@@ -2691,6 +2691,51 @@ class StateStore:
         self._mark_dirty(global_state=False, sections={"steward_cases"})
         await self._persist()
 
+    async def upsert_steward_case(self, raw: dict[str, Any]) -> None:
+        """Add one incrementally coordinated case without rewriting unrelated live cases."""
+
+        case_id = str(raw.get("case_id", raw.get("id", ""))).strip()
+        if not case_id:
+            raise ValueError("steward cases require a stable id")
+        now = timestamp()
+        previous = self.steward_cases.get(case_id, {})
+        value = dict(raw)
+        value["id"] = case_id
+        value["case_id"] = case_id
+        value["generation"] = max(1, int(previous.get("generation", 1)))
+        value["created_at"] = str(previous.get("created_at") or now)
+        value["updated_at"] = now
+        value["repair_run_ids"] = list(previous.get("repair_run_ids", ()))
+        self.steward_cases[case_id] = value
+        for request_id in value.get("request_ids", ()):
+            request = self.upstream_requests.get(str(request_id))
+            if not isinstance(request, dict):
+                continue
+            request["status"] = UpstreamRequestStatus.EVALUATING.value
+            request["steward_case_id"] = case_id
+            request["updated_at"] = now
+        self._mark_dirty(
+            global_state=False,
+            sections={"steward_cases", "upstream_requests"},
+        )
+        await self._persist()
+
+    async def set_source_issue_status(self, issue_ids: Iterable[str], status: str) -> None:
+        """Record a reviewed source-issue disposition without discarding provenance."""
+
+        changed = False
+        now = timestamp()
+        for issue_id in dict.fromkeys(map(str, issue_ids)):
+            issue = self.source_issues.get(issue_id)
+            if issue is None or issue.status == status:
+                continue
+            issue.status = status
+            issue.last_seen_at = now
+            changed = True
+        if changed:
+            self._mark_dirty(issues=True, global_state=False)
+            await self._persist()
+
     async def update_steward_case_generation(
         self,
         case_id: str,
@@ -2745,7 +2790,7 @@ class StateStore:
 
         changed: list[str] = []
         now = timestamp()
-        terminal = {"resolved", "parked", "failed"}
+        terminal = {"resolved", "parked", "failed", "awaiting_source_approval"}
         for raw in proposals:
             case_id = str(raw.get("id", "")).strip()
             if not case_id:
@@ -2775,7 +2820,10 @@ class StateStore:
             else:
                 prior_ids = tuple(map(str, previous.get("signal_ids", ())))
                 additions = tuple(value for value in signal_ids if value not in prior_ids)
-                if not additions:
+                evidence_changed = str(raw.get("evidence_digest", "")) != str(
+                    previous.get("evidence_digest", "")
+                )
+                if not additions and not evidence_changed:
                     continue
                 value = dict(previous)
                 value["signal_ids"] = [*prior_ids, *additions]
@@ -2790,13 +2838,38 @@ class StateStore:
                 if str(previous.get("status")) in terminal:
                     value["status"] = "open"
                     value["generation"] = max(1, int(previous.get("generation", 1))) + 1
+                    value["evidence_digest"] = str(raw.get("evidence_digest", ""))
                     value.pop("decision", None)
+                    for key in (
+                        "investigation_attempts",
+                        "planner_attempts",
+                        "scope_expansions",
+                        "action_failures",
+                        "force_planner",
+                        "pending_evidence_digest",
+                        "pending_signal_ids",
+                    ):
+                        value.pop(key, None)
                 elif str(previous.get("status")) not in {"open", "triaging"}:
                     value["pending_signal_ids"] = list(
                         dict.fromkeys(
                             (*map(str, previous.get("pending_signal_ids", ())), *additions)
                         )
                     )
+                    value["pending_evidence_digest"] = str(raw.get("evidence_digest", ""))
+                else:
+                    value["evidence_digest"] = str(raw.get("evidence_digest", ""))
+                    value["generation"] = max(1, int(previous.get("generation", 1))) + 1
+                    for key in (
+                        "investigation_attempts",
+                        "planner_attempts",
+                        "scope_expansions",
+                        "action_failures",
+                        "force_planner",
+                        "decision",
+                        "failure",
+                    ):
+                        value.pop(key, None)
                 value["updated_at"] = now
             self.coordination_cases[case_id] = value
             changed.append(case_id)
@@ -2815,6 +2888,34 @@ class StateStore:
         if not isinstance(case, dict) or max(1, int(case.get("generation", 1))) != generation:
             return False
         case.update(changes)
+        if (
+            str(changes.get("status", ""))
+            in {"resolved", "parked", "failed", "awaiting_source_approval"}
+            and case.get("pending_evidence_digest")
+            and case.get("pending_evidence_digest") != case.get("evidence_digest")
+        ):
+            case["prior_generation_outcome"] = {
+                key: changes[key]
+                for key in ("status", "decision", "failure", "action_outcome")
+                if key in changes
+            }
+            case["status"] = "open"
+            case["generation"] = generation + 1
+            case["evidence_digest"] = case.pop("pending_evidence_digest")
+            if pending_ids := case.pop("pending_signal_ids", None):
+                case["signal_ids"] = list(
+                    dict.fromkeys((*map(str, case.get("signal_ids", ())), *map(str, pending_ids)))
+                )
+            for key in (
+                "investigation_attempts",
+                "planner_attempts",
+                "scope_expansions",
+                "action_failures",
+                "force_planner",
+                "decision",
+                "failure",
+            ):
+                case.pop(key, None)
         case["updated_at"] = timestamp()
         self._mark_dirty(global_state=False, sections={"coordination_cases"})
         await self._persist()
@@ -4308,6 +4409,21 @@ class StateStore:
             recovered.append(case_id)
         if recovered:
             self._mark_dirty(global_state=False, sections={"steward_cases"})
+            await self._persist()
+        return recovered
+
+    async def recover_interrupted_coordination_cases(self) -> list[str]:
+        """Requeue cases whose read-only investigation was interrupted by shutdown."""
+
+        recovered: list[str] = []
+        for case_id, case in self.coordination_cases.items():
+            if case.get("status") not in {"investigating", "deciding"}:
+                continue
+            case["status"] = "open"
+            case["updated_at"] = timestamp()
+            recovered.append(case_id)
+        if recovered:
+            self._mark_dirty(global_state=False, sections={"coordination_cases"})
             await self._persist()
         return recovered
 
