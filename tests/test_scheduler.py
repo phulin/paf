@@ -5771,6 +5771,53 @@ async def test_uncertain_scout_uses_rare_planner_before_parking(
 
 
 @pytest.mark.asyncio
+async def test_new_incident_evidence_fences_stale_action_before_mutation(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    owner, consumer = config.chapters
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await state.load_or_create()
+    await state.enqueue_upstream_request(
+        {
+            "consumer_path": consumer.scope[0],
+            "blocked_declaration": "Book.consumer",
+            "residual_goal": "True",
+            "needed_result": "an earlier bridge",
+            "owner_paths": [owner.scope[0]],
+        },
+        consumer_chapter_id=consumer.id,
+        owner_chapter_id=owner.id,
+    )
+    await orchestrator._refresh_coordination_cases()
+    case_id, stored = next(iter(state.coordination_cases.items()))
+    generation = int(stored["generation"])
+    case = dict(stored)
+    assert await state.update_coordination_case_generation(
+        case_id,
+        generation,
+        status="investigating",
+        pending_evidence_digest="materially-new-evidence",
+    )
+
+    await orchestrator._apply_coordination_decision(
+        case,
+        coordination_result(
+            case_id,
+            confidence="high",
+            action="create_repair",
+            context_ids=[consumer.id],
+            write_ids=[owner.id],
+        ).report,
+    )
+
+    assert not state.steward_cases
+    assert state.coordination_cases[case_id]["status"] == "open"
+    assert state.coordination_cases[case_id]["generation"] == generation + 1
+    assert "stale_decision" in state.coordination_cases[case_id]["prior_generation_outcome"]
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_global_steward_resumes_in_place(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -781,6 +781,7 @@ class Orchestrator:
         self._proof_rechecks: set[str] = set()
         self._review_invalidation_generations: dict[str, int] = {}
         self._review_generation_lock = asyncio.Lock()
+        self._coordination_lock = asyncio.Lock()
         self._reconciled_source_inputs: dict[str, str] = {}
         self._chapter_agent_locks = {chapter.id: asyncio.Lock() for chapter in self.work_units}
         self._live_agent_tasks: dict[
@@ -1113,6 +1114,10 @@ class Orchestrator:
     async def _refresh_coordination_cases(self) -> None:
         if not self.config.escalation.enabled:
             return
+        async with self._coordination_lock:
+            await self._refresh_coordination_cases_locked()
+
+    async def _refresh_coordination_cases_locked(self) -> None:
         signals = await asyncio.to_thread(
             collect_coordination_signals,
             self.state,
@@ -1416,7 +1421,7 @@ class Orchestrator:
             )
         )
 
-    async def _apply_coordination_decision(
+    async def _apply_coordination_decision_locked(
         self,
         case: dict[str, Any],
         report: dict[str, Any],
@@ -1539,6 +1544,35 @@ class Orchestrator:
             status=("awaiting_source_approval" if action == "propose_source_patch" else "parked"),
             decision=report,
         )
+
+    async def _apply_coordination_decision(
+        self,
+        case: dict[str, Any],
+        report: dict[str, Any],
+    ) -> None:
+        case_id = str(case["id"])
+        generation = max(1, int(case.get("generation", 1)))
+        async with self._coordination_lock:
+            # Re-run cheap detectors at the mutation boundary. A signal update observed while the
+            # scout was running is retained for the next generation, but the stale decision must
+            # never create a repair or requeue a task first.
+            await self._refresh_coordination_cases_locked()
+            current = self.state.coordination_cases.get(case_id)
+            if (
+                not isinstance(current, dict)
+                or max(1, int(current.get("generation", 1))) != generation
+            ):
+                return
+            if current.get("pending_evidence_digest"):
+                await self.state.update_coordination_case_generation(
+                    case_id,
+                    generation,
+                    status="parked",
+                    stale_decision=report,
+                    failure="new evidence arrived during investigation; decision deferred",
+                )
+                return
+            await self._apply_coordination_decision_locked(case, report)
 
     async def _run_coordination_case(self, case_id: str) -> None:
         case = self.state.coordination_cases.get(case_id)

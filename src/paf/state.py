@@ -2896,7 +2896,13 @@ class StateStore:
         ):
             case["prior_generation_outcome"] = {
                 key: changes[key]
-                for key in ("status", "decision", "failure", "action_outcome")
+                for key in (
+                    "status",
+                    "decision",
+                    "stale_decision",
+                    "failure",
+                    "action_outcome",
+                )
                 if key in changes
             }
             case["status"] = "open"
@@ -2913,6 +2919,7 @@ class StateStore:
                 "action_failures",
                 "force_planner",
                 "decision",
+                "stale_decision",
                 "failure",
             ):
                 case.pop(key, None)
