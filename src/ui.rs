@@ -669,7 +669,7 @@ fn summary(model: &DashboardModel) -> Paragraph<'static> {
             )),
         ]),
         Line::from(format!(
-            "Agents {}/{} · {} · waiting start {}    {}    Assignments {} · implementing {} · needs human {}",
+            "Agents {}/{} · {} · waiting start {}    {}    Assignments {} · implementing {} · failed {}",
             state.agents.active,
             state.agents.maximum,
             agent_detail,
@@ -684,7 +684,7 @@ fn summary(model: &DashboardModel) -> Paragraph<'static> {
             state
                 .steward_cases
                 .values()
-                .filter(|case| case.status == "needs_human")
+                .filter(|case| case.status == "failed")
                 .count(),
         )),
         Line::from(format!(

@@ -466,7 +466,8 @@ After the daemon exits, `status`, `snapshot`, and `wait` fall back to the persis
   placement hypothesis, acceptance checks, and materially different attempted alternatives. The
   coordinator opens one durable upstream request and gives a focused evaluator both the downstream
   evidence and suspected earlier interface. A validated upstream repair or checked rejection route
-  wakes the consumer; an unclear placement stops for human review.
+  wakes the consumer; an implementation or orchestration error is recorded as a failed case rather
+  than converted into an open-ended request for human placement.
 - A proof agent may change proof bodies but not declaration interfaces. It reports each unresolved
   proof through structured `unresolved_proofs`, including checked probes, their outcomes, the exact
   remaining goal, and supporting evidence. The coordinator decides whether that evidence warrants

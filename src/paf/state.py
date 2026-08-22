@@ -125,7 +125,7 @@ class UpstreamRequestStatus(StrEnum):
     EVALUATING = "evaluating"
     VERIFIED = "verified"
     REJECTED = "rejected"
-    NEEDS_HUMAN = "needs_human"
+    FAILED = "failed"
 
 
 @dataclass
@@ -790,15 +790,25 @@ class StateStore:
         await self.flush()
 
     def _normalize_upstream_request_state(self) -> None:
-        """Repair imported request records and ensure every request has a blocker root."""
+        """Repair imported upstream coordination state and remove its legacy review route."""
 
         valid_statuses = {value.value for value in UpstreamRequestStatus}
+        for request_id, request in tuple(self.proof_review_requests.items()):
+            if request.get("kind") == "upstream_request":
+                self.proof_review_requests.pop(request_id, None)
+        for case in self.steward_cases.values():
+            if case.get("status") == "needs_human":
+                case["status"] = "failed"
+            if case.get("disposition") == "needs_human":
+                case["disposition"] = "failed"
         next_number = 1 + max(
             (int(key[1:]) for key in self.proof_blockers if key[1:].isdigit()),
             default=0,
         )
         for request_id, request in self.upstream_requests.items():
             request["id"] = request_id
+            if request.get("status") == "needs_human":
+                request["status"] = UpstreamRequestStatus.FAILED.value
             if request.get("status") not in valid_statuses:
                 request["status"] = UpstreamRequestStatus.OPEN.value
             blocker_ids = [
@@ -2618,7 +2628,7 @@ class StateStore:
                 "verified",
                 "rejected",
                 "resolved",
-                "needs_human",
+                "failed",
             }:
                 replacement[case_id] = value
         self.steward_cases = replacement
@@ -2724,6 +2734,8 @@ class StateStore:
     ) -> tuple[str, bool]:
         """Persist proof findings or diagnostics before scheduling their request service."""
 
+        if kind == "upstream_request":
+            raise ValueError("legacy upstream-request reviews are no longer supported")
         owned_source_digests = {
             chapter_id: digest
             for chapter_id, digest in (source_digests or {}).items()

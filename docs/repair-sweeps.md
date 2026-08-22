@@ -12,7 +12,7 @@ An upstream request is an observation, not a work package. It records:
 - the evaluator's decision and the run that validated it; and
 - the original blocker and source digest needed to retry the consumer safely.
 
-Requests have five durable states: `open`, `evaluating`, `verified`, `rejected`, and `needs_human`.
+Requests have five durable states: `open`, `evaluating`, `verified`, `rejected`, and `failed`.
 They have no lease, plan, worker tree, path reservation, or package dependency graph.
 
 ## Tandem evaluation
@@ -24,11 +24,12 @@ both sides and chooses one of these outcomes:
 1. Repair a false, missing, or too-weak upstream interface and validate the owner scope.
 2. Reject upstream placement with a checked, executable route using the existing interface.
 3. Wait for a real chronological dependency.
-4. Mark the placement as requiring a human decision.
+4. Record a concrete implementation failure.
 
 A validated upstream edit marks the request `verified`; checked rejection guidance marks it
 `rejected`. Either result reopens the consumer proof, which is the final semantic acceptance test.
-An inconclusive evaluation does not spawn another planner: it becomes `needs_human`.
+An implementation or orchestration error becomes `failed`; uncertainty alone is not a terminal
+outcome and must be resolved through a conservatively scoped implementation case.
 
 ## Scheduling and deduplication
 

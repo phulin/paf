@@ -472,7 +472,7 @@ _UPSTREAM_STEWARD_PROPERTIES: dict[str, Any] = {
                 },
                 "disposition": {
                     "type": "string",
-                    "enum": ["implement", "retry_consumers", "reject", "needs_human"],
+                    "enum": ["implement", "retry_consumers", "reject"],
                 },
                 "needed_result": {"type": "string", "minLength": 1},
                 "context_work_unit_ids": {
@@ -506,7 +506,7 @@ _UPSTREAM_IMPLEMENTATION_PROPERTIES: dict[str, Any] = {
     "issues": _REPORT_BASE_PROPERTIES["issues"],
     "disposition": {
         "type": "string",
-        "enum": ["implemented", "not_needed", "consumer_local", "needs_scope", "needs_human"],
+        "enum": ["implemented", "not_needed", "consumer_local", "needs_scope", "failed"],
     },
     "placement": {
         "type": "object",

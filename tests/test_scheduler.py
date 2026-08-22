@@ -5693,7 +5693,7 @@ async def test_upstream_implementation_resumes_in_place(
 
 
 @pytest.mark.asyncio
-async def test_upstream_implementation_infrastructure_failure_requeues_case(
+async def test_upstream_implementation_infrastructure_failure_fails_case(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
@@ -5758,9 +5758,11 @@ async def test_upstream_implementation_infrastructure_failure_requeues_case(
     await orchestrator._run_upstream_implementation("case-a")
 
     case = state.steward_cases["case-a"]
-    assert case["status"] == "ready"
+    assert case["status"] == "failed"
+    assert case["decision"]["disposition"] == "failed"
+    assert case["decision"]["summary"] == "required MCP servers failed to initialize"
     assert case["implementation_run_ids"] == [run.id]
-    assert state.upstream_requests[request_id]["status"] == "evaluating"
+    assert state.upstream_requests[request_id]["status"] == "failed"
     await orchestrator.shutdown()
 
 
@@ -6059,29 +6061,16 @@ async def test_active_chapter_work_excludes_upstream_implementation(tmp_path: Pa
 
 
 @pytest.mark.asyncio
-async def test_legacy_consumer_triage_is_handed_to_global_steward(tmp_path: Path) -> None:
-    config = with_example_modules(
-        load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
-    )
-    _owner, consumer = config.chapters
+async def test_legacy_upstream_review_route_is_removed_during_normalization(
+    tmp_path: Path,
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    consumer = config.chapters[0]
     state = StateStore(config)
-    orchestrator = Orchestrator(config, state)
-    await orchestrator.prepare()
-    blocker = (
-        await state.record_proof_blockers(
-            consumer.id,
-            origin_run_id="proof-run",
-            failed_attempts=[
-                failed_attempt(
-                    "placement is not yet known",
-                    path="lean/Book/Chapter02.lean",
-                )
-            ],
-        )
-    )[0]
+    await state.load_or_create()
     request_id, _ = await state.enqueue_upstream_request(
         {
-            "consumer_path": "lean/Book/Chapter02.lean",
+            "consumer_path": "lean/Book/Chapter01.lean",
             "blocked_declaration": "Book.target",
             "residual_goal": "True",
             "needed_result": "a bridge",
@@ -6089,52 +6078,32 @@ async def test_legacy_consumer_triage_is_handed_to_global_steward(tmp_path: Path
         },
         consumer_chapter_id=consumer.id,
         owner_chapter_id=consumer.id,
-        blocker_ids=(str(blocker["id"]),),
     )
-    await state.enqueue_proof_review_request(
-        {consumer.id: "Failed proof `Book.target` in `lean/Book/Chapter02.lean`"},
-        origin_run_id=request_id,
-        kind=scheduler_module.UPSTREAM_REQUEST_REVIEW_KIND,
-        request_id=request_id,
-        blocker_ids=(str(blocker["id"]),),
-    )
-    run = await state.start_auxiliary_run(
-        consumer.id,
-        Stage.REVIEW,
-        role=PROOF_REVIEW_ROLE,
-        request_ids=(request_id,),
-    )
-    await state.finish_run(
-        run,
-        status=TaskStatus.SUCCEEDED,
-        report={
-            "complete": True,
-            "finding_assessments": [
-                finding_resolution(
-                    f"{request_id}:1",
-                    action="request_upstream",
-                    diagnosis="missing_capability",
-                    capability={
-                        "capability_key": "book.bridge",
-                        "owner_kind": "chapter",
-                        "owner_paths": ["lean/Book/Chapter01.lean"],
-                        "needed_result": "a bridge",
-                    },
-                )
-            ],
-        },
-    )
+    state.proof_review_requests[request_id] = {
+        "feedback": {consumer.id: "legacy upstream review"},
+        "origin_run_id": request_id,
+        "kind": "upstream_request",
+    }
+    state.upstream_requests[request_id]["status"] = "needs_human"
+    state.steward_cases["legacy-case"] = {
+        "id": "legacy-case",
+        "status": "needs_human",
+        "disposition": "needs_human",
+    }
 
-    assert await orchestrator._complete_review(consumer, "triaged", proof_request_ids=(request_id,))
-    upstream = state.upstream_requests[request_id]
-    assert upstream["owner_chapter_id"] == consumer.id
-    assert upstream["owner_paths"] == ["lean/Book/Chapter01.lean"]
-    assert upstream["status"] == "open"
+    state._normalize_upstream_request_state()
+
     assert request_id not in state.proof_review_requests
-    assert orchestrator._upstream_steward_task is not None
-    orchestrator._upstream_steward_task.cancel()
-    await asyncio.gather(orchestrator._upstream_steward_task, return_exceptions=True)
-    await orchestrator.shutdown()
+    assert state.upstream_requests[request_id]["status"] == "failed"
+    assert state.steward_cases["legacy-case"]["status"] == "failed"
+    assert state.steward_cases["legacy-case"]["disposition"] == "failed"
+
+    with pytest.raises(ValueError, match="no longer supported"):
+        await state.enqueue_proof_review_request(
+            {consumer.id: "do not recreate the legacy route"},
+            origin_run_id=request_id,
+            kind="upstream_request",
+        )
 
 
 @pytest.mark.asyncio

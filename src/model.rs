@@ -1242,7 +1242,7 @@ fn steward_case_status_rank(status: &str) -> u8 {
     match status {
         "implementing" => 0,
         "ready" | "needs_scope" => 1,
-        "needs_human" => 2,
+        "failed" => 2,
         "verified" => 3,
         "rejected" | "resolved" => 4,
         _ => 5,

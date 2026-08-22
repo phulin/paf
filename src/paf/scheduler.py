@@ -351,7 +351,6 @@ DISCOVERY_BATCH_SECONDS = 0.025
 DISCOVERY_BATCH_MAXIMUM = 256
 DIAGNOSTIC_OWNER_CACHE_MAXIMUM = 16_384
 PROOF_FINDING_REVIEW_KIND = "proof_finding"
-UPSTREAM_REQUEST_REVIEW_KIND = "upstream_request"
 BUILD_ERROR_REVIEW_KIND = "build_error"
 DETERMINISTIC_WARNING_CLEANUP_ROLE = "deterministic_warning_cleanup"
 LEGACY_DIAGNOSTIC_REVIEW_KIND = "diagnostic"
@@ -1200,13 +1199,6 @@ class Orchestrator:
                         blocker_status=ProofBlockerStatus.BLOCKED,
                         detail="global steward rejected the upstream observation",
                     )
-                elif case.get("disposition") == "needs_human":
-                    await self._resolve_steward_case(
-                        case,
-                        request_status=UpstreamRequestStatus.NEEDS_HUMAN,
-                        blocker_status=ProofBlockerStatus.BLOCKED,
-                        detail="global steward needs a human placement decision",
-                    )
         finally:
             self.agent_slots.release()
             if workspace is not None:
@@ -1274,7 +1266,20 @@ class Orchestrator:
             )
         )
         if not context_ids:
-            await self.state.update_steward_case(case_id, status="needs_human")
+            decision = {
+                "complete": False,
+                "summary": "upstream implementation case has no valid work-unit scope",
+                "issues": ["No context_work_unit_ids resolve to configured work units."],
+                "disposition": "failed",
+            }
+            await self._resolve_steward_case(
+                case,
+                request_status=UpstreamRequestStatus.FAILED,
+                blocker_status=ProofBlockerStatus.BLOCKED,
+                detail="upstream implementation failed because its scope is invalid",
+                decision=decision,
+            )
+            await self.state.update_steward_case(case_id, status="failed", decision=decision)
             return
         scope = tuple(
             dict.fromkeys(
@@ -1358,23 +1363,8 @@ class Orchestrator:
         run_ids = list(case.get("implementation_run_ids", ()))
         if attempt.run.id not in run_ids:
             run_ids.append(attempt.run.id)
-        if getattr(attempt.agent, "infrastructure_failed", False):
-            await self.state.update_steward_case_generation(
-                case_id,
-                generation,
-                status="ready",
-                implementation_run_ids=run_ids,
-                decision={
-                    "complete": False,
-                    "summary": attempt.agent.error
-                    or "upstream implementation infrastructure failed; retry queued",
-                    "issues": [],
-                    "disposition": "retry",
-                },
-            )
-            return
         report = attempt.agent.report if isinstance(attempt.agent.report, dict) else {}
-        disposition = str(report.get("disposition", "needs_human"))
+        disposition = str(report.get("disposition", "failed"))
         if disposition == "implemented" and attempt.agent.changed and attempt.validation.succeeded:
             isolation = attempt.run.isolation if isinstance(attempt.run.isolation, dict) else {}
             changed_owners = self._package_owner_units(isolation.get("changed_paths", ()))
@@ -1441,20 +1431,39 @@ class Orchestrator:
                     str(request_id), UpstreamRequestStatus.OPEN, decision=report
                 )
         else:
+            if not attempt.agent.succeeded:
+                failure_summary = str(attempt.agent.error or "upstream implementation agent failed")
+            elif disposition == "failed":
+                failure_summary = str(report.get("summary", "")).strip()
+            elif disposition == "implemented" and not attempt.validation.succeeded:
+                failure_summary = "upstream implementation did not pass validation"
+            else:
+                failure_summary = (
+                    "upstream implementation returned a report inconsistent with its source changes"
+                )
+            failure_summary = failure_summary or "upstream implementation failed"
+            report_issues = report.get("issues", ())
+            issues = list(report_issues) if isinstance(report_issues, list) else []
+            decision = report | {
+                "complete": False,
+                "summary": failure_summary,
+                "issues": [*issues, failure_summary],
+                "disposition": "failed",
+            }
             await self._resolve_steward_case(
                 case,
-                request_status=UpstreamRequestStatus.NEEDS_HUMAN,
+                request_status=UpstreamRequestStatus.FAILED,
                 blocker_status=ProofBlockerStatus.BLOCKED,
-                detail="focused upstream implementation needs human intervention",
-                decision=report,
+                detail="focused upstream implementation failed",
+                decision=decision,
                 evaluation_run_id=attempt.run.id,
             )
             await self.state.update_steward_case_generation(
                 case_id,
                 generation,
-                status="needs_human",
+                status="failed",
                 implementation_run_ids=run_ids,
-                decision=report,
+                decision=decision,
             )
 
     async def _run_scheduled_upstream_implementation(
@@ -5216,12 +5225,8 @@ class Orchestrator:
         waiting_dependencies: set[str] = set()
         for request_id in request_ids:
             request = self.state.proof_review_requests.get(request_id)
-            if not isinstance(request, dict) or request.get("kind") not in {
-                PROOF_FINDING_REVIEW_KIND,
-                UPSTREAM_REQUEST_REVIEW_KIND,
-            }:
+            if not isinstance(request, dict) or request.get("kind") != PROOF_FINDING_REVIEW_KIND:
                 continue
-            upstream_review = request.get("kind") == UPSTREAM_REQUEST_REVIEW_KIND
             raw_ids = request.get("blocker_ids")
             blocker_ids = [str(value) for value in raw_ids] if isinstance(raw_ids, list) else []
             for index, blocker_id in enumerate(blocker_ids, start=1):
@@ -5254,39 +5259,6 @@ class Orchestrator:
                     blocker["review_exchange_count"] = (
                         int(blocker.get("review_exchange_count", 0)) + 1
                     )
-
-                if upstream_review and action == "request_upstream":
-                    candidate = assessment.get("upstream_request")
-                    upstream = self.state.upstream_requests.get(request_id)
-                    if isinstance(candidate, dict) and isinstance(upstream, dict):
-                        for field in (
-                            "capability_key",
-                            "owner_kind",
-                            "owner_paths",
-                            "needed_result",
-                        ):
-                            if field in candidate:
-                                upstream[field] = candidate[field]
-                        await self.state.set_proof_blocker_status(
-                            (blocker_id,), ProofBlockerStatus.UPSTREAM_REQUESTED
-                        )
-                        await self.state.update_upstream_request(
-                            request_id,
-                            UpstreamRequestStatus.OPEN,
-                            decision=assessment,
-                            evaluation_run_id=run.id,
-                        )
-                    else:
-                        await self.state.set_proof_blocker_status(
-                            (blocker_id,), ProofBlockerStatus.BLOCKED
-                        )
-                        await self.state.update_upstream_request(
-                            request_id,
-                            UpstreamRequestStatus.NEEDS_HUMAN,
-                            decision=assessment,
-                            evaluation_run_id=run.id,
-                        )
-                    continue
 
                 if placeholder is False:
                     status = ProofBlockerStatus.RESOLVED
@@ -5365,37 +5337,6 @@ class Orchestrator:
                     # evidence, not permission to rerun the same proof.
                     status = ProofBlockerStatus.BLOCKED
                 await self.state.set_proof_blocker_status((blocker_id,), status)
-                if upstream_review:
-                    consumer_id = str(blocker.get("consumer_chapter_id", ""))
-                    if status is ProofBlockerStatus.OPEN:
-                        request_status = (
-                            UpstreamRequestStatus.VERIFIED
-                            if action == "repair_and_retry" and run.changed
-                            else UpstreamRequestStatus.REJECTED
-                        )
-                        await self.state.set_task(
-                            consumer_id,
-                            Stage.PROVE,
-                            TaskStatus.PENDING,
-                            "upstream evaluation supplied a validated repair or retry route",
-                        )
-                    elif status is ProofBlockerStatus.RESOLVED:
-                        request_status = UpstreamRequestStatus.VERIFIED
-                    else:
-                        request_status = UpstreamRequestStatus.NEEDS_HUMAN
-                        await self.state.set_task(
-                            consumer_id,
-                            Stage.PROVE,
-                            TaskStatus.BLOCKED,
-                            "upstream evaluation needs a human placement decision",
-                        )
-                    await self.state.update_upstream_request(
-                        request_id,
-                        request_status,
-                        decision=assessment,
-                        evaluation_run_id=run.id,
-                    )
-                    continue
                 routed_statuses.append(status)
 
         if ProofBlockerStatus.OPEN in routed_statuses:

@@ -220,6 +220,24 @@ def test_upstream_implementation_prompt_is_a_readable_assignment(tmp_path: Path)
     assert "opaque-unit-789" not in prompt
 
 
+def test_upstream_reports_expose_failure_only_to_implementation() -> None:
+    steward_dispositions = REPORT_SCHEMAS["upstream_steward"]["properties"]["cases"]["items"][
+        "properties"
+    ]["disposition"]["enum"]
+    implementation_dispositions = REPORT_SCHEMAS["upstream_implementation"]["properties"][
+        "disposition"
+    ]["enum"]
+
+    assert steward_dispositions == ["implement", "retry_consumers", "reject"]
+    assert implementation_dispositions == [
+        "implemented",
+        "not_needed",
+        "consumer_local",
+        "needs_scope",
+        "failed",
+    ]
+
+
 def test_report_schema_avoids_unsupported_codex_keywords() -> None:
     def mappings(value: object) -> list[dict[str, object]]:
         if isinstance(value, dict):

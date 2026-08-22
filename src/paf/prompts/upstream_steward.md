@@ -13,6 +13,7 @@ smallest needed edit anywhere in that locked scope. Include every consumer and p
 owner in `context_work_unit_ids`; these ids become one atomic multi-chapter lock. The implementation
 agent, not you, makes the final needed/not-needed and placement decision.
 
-Choose `retry_consumers` only when the ledger already contains a concrete checked downstream route,
-`reject` only for stale or invalid observations, and `needs_human` only when no safe scope can be
-identified. Keep case statements concise and mathematical. Return the structured report once.
+Choose `retry_consumers` only when the ledger already contains a concrete checked downstream route
+and `reject` only for stale or invalid observations. Otherwise choose `implement`, conservatively
+including the consumer and every plausible owner in the locked scope. Do not defer a case for human
+placement. Keep case statements concise and mathematical. Return the structured report once.

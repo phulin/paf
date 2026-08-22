@@ -24,6 +24,7 @@ acceptance targets with the attached Lean tools. Do not run Lean or Lake directl
 PAF logs or isolation trees.
 
 If the correct placement lies outside the locked paths, make no edits and return `needs_scope` with
-the exact additional source paths. Do not create another upstream request. Use `needs_human`
-only for a genuine mathematical or placement ambiguity. Return the structured report once, after all
-tool use and edits have stopped.
+the exact additional source paths. Do not create another upstream request. Use `failed` only when
+the scoped implementation genuinely cannot be completed, and describe the concrete error or failed
+repair in `issues`; do not use it to ask for help or defer a placement decision. Return the structured
+report once, after all tool use and edits have stopped.
