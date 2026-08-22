@@ -3034,8 +3034,8 @@ class Orchestrator:
         return _bounded_proof_feedback(
             (
                 "Prior blocker evidence. Use it as a starting point rather than repeating the same "
-                "probes. Return an ID in `blocker_refs` only when its exact evidence remains current "
-                "and no new route or guidance is available:\n\n" + "\n\n".join(blocks),
+                "probes. Return an ID in `blocker_refs` only when its exact evidence remains "
+                "current and no new route or guidance is available:\n\n" + "\n\n".join(blocks),
             )
         )
 

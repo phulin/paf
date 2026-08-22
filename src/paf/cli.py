@@ -603,9 +603,9 @@ def _task_failure_details(state: StateStore, task: TaskRecord) -> list[str]:
         if isinstance(issues, list):
             for issue in issues:
                 add(issue)
-        failed_attempts = report.get("unresolved_proofs", report.get("failed_attempts"))
-        if isinstance(failed_attempts, list):
-            for attempt in failed_attempts:
+        unresolved_proofs = report.get("unresolved_proofs", report.get("failed_attempts"))
+        if isinstance(unresolved_proofs, list):
+            for attempt in unresolved_proofs:
                 if isinstance(attempt, dict):
                     add(attempt.get("obstruction", ""))
     validation = run.validation

@@ -1515,9 +1515,10 @@ class CodexExecutor:
         proof_retry_contract = ""
         if stage is Stage.PROVE and feedback:
             proof_retry_contract = """
-This is a retry. Use the target-specific handoff near the assignment to continue checked work without
-repeating known failures. Return an existing blocker reference only when that exact evidence remains
-current and the handoff supplies no new source, interface, reviewer guidance, or viable proof route."""
+This is a retry. Use the target-specific handoff near the assignment to continue checked work
+without repeating known failures. Return an existing blocker reference only when that exact
+evidence remains current and the handoff supplies no new source, interface, reviewer guidance, or
+viable proof route."""
         selected_proof_targets = tuple(proof_targets)
         proof_assignment = ""
         if stage is Stage.PROVE and selected_proof_targets and role != PACKAGE_WORKER_ROLE:

@@ -15,7 +15,7 @@ interface StructuredAgentReport {
   complete: boolean;
   summary: string;
   issues: string[];
-  failedAttempts: Array<{
+  unresolvedProofs: Array<{
     path: string;
     declaration: string;
     attempts: string[];
@@ -40,7 +40,7 @@ export function parseAgentReport(value?: string): StructuredAgentReport | null {
     const unresolved = Array.isArray(report.unresolved_proofs)
       ? report.unresolved_proofs
       : report.failed_attempts;
-    const failedAttempts = Array.isArray(unresolved)
+    const unresolvedProofs = Array.isArray(unresolved)
       ? unresolved.flatMap((item) => {
           if (!item || typeof item !== "object") return [];
           const attempt = item as Record<string, unknown>;
@@ -94,7 +94,7 @@ export function parseAgentReport(value?: string): StructuredAgentReport | null {
       complete: report.complete === true,
       summary: report.summary,
       issues: strings(report.issues),
-      failedAttempts,
+      unresolvedProofs,
       sourceIssues,
     };
   } catch {
@@ -114,7 +114,7 @@ export function AgentUpdate({ activity }: { activity?: AgentActivity }) {
       </div>
     );
   const findingCount =
-    report.issues.length + report.failedAttempts.length + report.sourceIssues.length;
+    report.issues.length + report.unresolvedProofs.length + report.sourceIssues.length;
   return (
     <div className="agent-report">
       <div className="agent-report-status">
@@ -148,14 +148,14 @@ export function AgentUpdate({ activity }: { activity?: AgentActivity }) {
           </ul>
         </div>
       )}
-      {report.failedAttempts.length > 0 && (
+      {report.unresolvedProofs.length > 0 && (
         <div className="report-group fixups">
           <div className="report-group-title">
             <GitBranch size={13} />
-            <span>Failed attempts</span>
-            <em>{report.failedAttempts.length}</em>
+            <span>Unresolved proofs</span>
+            <em>{report.unresolvedProofs.length}</em>
           </div>
-          {report.failedAttempts.map((attempt, index) => (
+          {report.unresolvedProofs.map((attempt, index) => (
             <div className="report-finding" key={index}>
               <p>{attempt.obstruction}</p>
               {(attempt.path || attempt.declaration) && (

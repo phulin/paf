@@ -454,8 +454,11 @@ After the daemon exits, `status`, `snapshot`, and `wait` fall back to the persis
   branch drains, such a chunk remains a visible failed leaf task without failing the enclosing
   pipeline invocation. A cumulative attempt ledger is prior inventory. Known blocked declarations
   are isolated from otherwise productive chunks, and unchanged terminal blockers are not launched
-  again. Retry agents must refine an earlier proof using new evidence or try a materially different route instead
-  of rereading the chapter, reconfirming clean diagnostics, or echoing a missing-API claim. The proof
+  again. A retry handoff appears directly below the assigned target and separates the previous source
+  result, checked strategies and their Lean outcomes, the residual goal, reviewer guidance, and
+  coordinator diagnostics. Retry agents must refine an earlier proof using new evidence or try a
+  materially different route instead of rereading the chapter, reconfirming clean diagnostics, or
+  echoing a missing-API claim. The proof
   task succeeds when the scoped Lean code has no `sorry` or `admit` tokens and final Lake validation
   compiles; any non-`sorry` warning is assigned to auxiliary cleanup and remains a final pipeline
   convergence requirement. The exact validated source digest is persisted independently of review
