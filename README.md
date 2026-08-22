@@ -21,9 +21,13 @@ flowchart LR
     R -->|succeeded| P
     P -->|statement/API problem; reopen affected reviews| R
     P -->|possible upstream problem| U[Upstream request]
-    U --> E[Tandem downstream/upstream review]
-    E -->|upstream repair or checked rejection| P
-    E -->|unclear placement| H[Human decision]
+    U --> I[Deterministic incident]
+    I --> L[Cheap bounded scout]
+    L -->|validated local action| E[Focused repair or checked rejection]
+    L -->|uncertain or public/source change| A[Rare read-only arbiter]
+    A --> E
+    A -->|external or source approval| H[Human decision]
+    E --> P
     P -->|no placeholders + Lean valid| D[Done]
 ```
 
@@ -464,9 +468,12 @@ After the daemon exits, `status`, `snapshot`, and `wait` fall back to the persis
 - If sustained checked proof work exposes a possible upstream defect or missing result, the proof
   agent records the blocked declaration and consumer path, exact residual goal, needed result,
   placement hypothesis, acceptance checks, and materially different attempted alternatives. The
-  coordinator opens one durable upstream request and gives a focused review-stage repair agent both
-  the downstream evidence and suspected earlier interface. The global Steward records readable
-  context separately from the chapters whose files the repair agent may edit and lock. A repair
+  coordinator opens one durable upstream request. A deterministic incident detector groups only
+  related observations and gives a cheap, read-only owner-placement scout the downstream evidence,
+  recent trace summary, and suspected earlier interface. High-confidence legal actions proceed
+  without a strong planner; uncertainty or a source/public-interface proposal reaches a rare
+  read-only arbiter. The incident records readable context separately from the chapters whose files
+  the repair agent may edit and lock. A repair
   agent may add or revise interfaces and make structural consumer adaptations, but it defers every
   proposition proof introduced or invalidated by those edits to ordinary proof agents. A validated
   repair or checked rejection route resets failed consumer proof tasks to `pending`; an agent or
@@ -601,9 +608,11 @@ agents. Running tasks persist an explicit `agent` or `postprocess` phase, so the
 show completed agent work awaiting integration, graph persistence, or coordinator verification as
 postprocessing.
 Proof-review evidence that identifies a possible earlier defect creates an upstream request. A
-focused evaluator sees the consumer and suspected upstream interface together, validates the
-placement decision, and then wakes the consumer. Legacy capability packages remain visible only as
-historical evidence and never launch agents. The chapter table displays exact-build
+generation-fenced incident sends a bounded owner-placement scout to inspect the consumer and
+suspected upstream interface together, validates the placement decision, and then wakes the
+consumer. Persistent identical task failures and repeated source reports use corresponding trace
+diagnosis and source fact-check scouts. Legacy capability packages remain visible only as historical
+evidence and never launch agents. The chapter table displays exact-build
 freshness independently of whether a past formalize task succeeded. A coordinator-build record tracks the
 single serialized Lake build, and the TUI also shows its owner and queued jobs. Running run records—not
 chapter-stage records—are the authoritative live-agent count.
@@ -707,6 +716,30 @@ beam_startup_timeout_seconds = 60
 
 Old `lean_mcp`, `lean_mcp_tool_timeout_seconds`, `tool_driver`, and `mcp_enabled` settings are
 rejected. Remove them instead of carrying a compatibility configuration forward.
+
+Exceptional work uses incident-scoped cheap investigators and workers. The strong planner is a
+bounded read-only fallback, not the owner of normal scheduling:
+
+```toml
+[escalation]
+enabled = true
+planner_model = "gpt-5.6-sol"
+planner_reasoning_effort = "medium"
+investigator_model = "gpt-5.6-luna"
+investigator_reasoning_effort = "xhigh"
+worker_model = "gpt-5.6-luna"
+worker_reasoning_effort = "xhigh"
+max_concurrent_investigations = 8
+maximum_investigations_per_case = 4
+maximum_planner_attempts = 2
+maximum_scope_expansions = 2
+source_issue_sighting_threshold = 2
+persistent_failure_threshold = 3
+recent_trace_runs = 3
+```
+
+Inspect the durable control plane with `paf incidents`; textbook/source proposals stop for explicit
+approval. See [incident-scoped escalation](docs/escalation-coordination.md).
 
 The `[steward]` table is accepted only for compatibility with older project files. Capability
 packages are archived and its `enabled` value is ignored:

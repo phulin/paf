@@ -57,6 +57,7 @@ COMMAND_NAMES = {
     "plan",
     "status",
     "source-issues",
+    "incidents",
     "package",
     "web",
     "scaffold",
@@ -180,6 +181,12 @@ def parser() -> argparse.ArgumentParser:
     )
     _add_source(source_issues)
     source_issues.add_argument("--json", action="store_true", help="print the raw ledger")
+
+    incidents = commands.add_parser(
+        "incidents", help="show bounded exceptional-coordination cases and jobs"
+    )
+    _add_source(incidents)
+    incidents.add_argument("--json", action="store_true", help="print raw incident state")
 
     package = commands.add_parser("package", help="inspect and operate on capability packages")
     _add_source(package)
@@ -777,6 +784,8 @@ def print_source_issues(config: PipelineConfig, console: Console, *, raw_json: b
     table = Table(title="Source issues", box=None)
     table.add_column("ID", style="cyan", no_wrap=True)
     table.add_column("Chapter", style="bold")
+    table.add_column("Status")
+    table.add_column("Seen", justify="right")
     table.add_column("Location")
     table.add_column("Issue")
     table.add_column("Suggested correction")
@@ -786,12 +795,55 @@ def print_source_issues(config: PipelineConfig, console: Console, *, raw_json: b
         table.add_row(
             str(issue.get("id", "")),
             str(issue.get("chapter_id", "")),
+            str(issue.get("status", "open")),
+            str(issue.get("sightings", 1)),
             str(issue.get("location", "")),
             str(issue.get("description", "")),
             str(issue.get("suggested_correction", "")),
         )
     console.print(table)
     console.print(f"Ledger: {path}")
+    return 0
+
+
+def print_incidents(config: PipelineConfig, console: Console, *, raw_json: bool) -> int:
+    snapshot = read_full_snapshot(config.settings.state_dir)
+    if snapshot is None:
+        console.print(f"No pipeline state exists at {config.settings.state_dir / DATABASE_NAME}")
+        return 0
+    ledger = {
+        "coordination_cases": snapshot.get("coordination_cases", {}),
+        "coordination_jobs": snapshot.get("coordination_jobs", {}),
+    }
+    if raw_json:
+        console.print_json(json.dumps(ledger))
+        return 0
+    cases = ledger["coordination_cases"]
+    table = Table(title="Escalation incidents", box=None)
+    table.add_column("ID", style="cyan", no_wrap=True)
+    table.add_column("Kind", style="bold")
+    table.add_column("Status")
+    table.add_column("Gen", justify="right")
+    table.add_column("Signals", justify="right")
+    table.add_column("Decision / failure")
+    if isinstance(cases, dict):
+        for case_id, case in sorted(cases.items()):
+            if not isinstance(case, dict):
+                continue
+            decision = case.get("decision")
+            action = (
+                str(decision.get("recommended_action", "")) if isinstance(decision, dict) else ""
+            )
+            table.add_row(
+                str(case_id),
+                str(case.get("kind", "")),
+                str(case.get("status", "")),
+                str(case.get("generation", 1)),
+                str(len(case.get("signal_ids", ()))),
+                action or str(case.get("failure", "")),
+            )
+    console.print(table)
+    console.print(f"State: {config.settings.state_dir / DATABASE_NAME}")
     return 0
 
 
@@ -1464,6 +1516,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return print_status(config, console, raw_json=arguments.json)
         if arguments.command == "source-issues":
             return print_source_issues(config, console, raw_json=arguments.json)
+        if arguments.command == "incidents":
+            return print_incidents(config, console, raw_json=arguments.json)
         if arguments.command == "scaffold":
             chapters = select_work_units(
                 config,

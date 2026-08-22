@@ -15,29 +15,33 @@ An upstream request is an observation, not a work package. It records:
 Requests have five durable states: `open`, `evaluating`, `verified`, `rejected`, and `failed`.
 They have no lease, plan, worker tree, path reservation, or package dependency graph.
 
-## Tandem evaluation
+## Incident evaluation
 
-PAF assigns a focused proof-review turn to the nearest suspected earlier work unit. The prompt
-contains both the downstream obstruction and the suspected upstream paths. The evaluator inspects
-both sides and chooses one of these outcomes:
+The deterministic escalation detector groups related live observations into a generation-fenced
+incident. A cheap `owner_placement` scout receives the downstream obstruction, suspected earlier
+paths, compact prior trace evidence, and configured work-unit map. It inspects both sides and
+recommends one of these outcomes:
 
 1. Repair a false, missing, or too-weak upstream interface and validate the owner scope.
 2. Reject upstream placement with a checked, executable route using the existing interface.
 3. Wait for a real chronological dependency.
-4. Record a concrete implementation failure.
+4. Park a genuinely external dependency or request rare arbitration.
 
 A validated upstream edit marks the request `verified`; checked rejection guidance marks it
 `rejected`. Either result reopens the consumer proof, which is the final semantic acceptance test.
-A repair-agent or orchestration error becomes `failed`; uncertainty alone is not a terminal outcome
-and must be resolved through a conservatively scoped repair case. Repair agents run as auxiliary
-review work: they own interface and structural changes, while proposition proofs introduced or
-invalidated by those edits are returned to ordinary proof agents.
+A repair-agent or validation failure returns to the bounded incident postmortem path before it can
+become terminal. Uncertainty invokes the rare read-only coordinator, while unchanged evidence is
+parked rather than relaunched. Repair agents run as auxiliary review work using the cheap worker
+profile: they own interface and structural changes, while proposition proofs introduced or
+invalidated by those edits are returned to ordinary proof agents. See
+[incident-scoped escalation](escalation-coordination.md).
 
 ## Scheduling and deduplication
 
 The proof-blocker ledger remains the source of identity. Repeated sightings of the same blocker
-attach to the same request, so they do not create repeated review agents. Requests for one owner are
-served by the ordinary focused-review queue and obey normal per-chapter agent serialization.
+attach to the same request, and deterministic signal/evidence digests suppress identical incident
+generations. Related requests are grouped by capability instead of being reclassified with the full
+global ledger. Focused repairs obey normal multi-work-unit path isolation and serialization.
 
 Local proof problems stay local. External gaps are parked. Only a candidate whose paths resolve to
 an earlier selected work unit becomes an upstream request automatically.
