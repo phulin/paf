@@ -52,7 +52,6 @@ path = "Unit{{unit_ordinal_padded}}_{{source_stem}}"
 unit_module = "{{module}}.{{document_module}}.U{{unit_ordinal}}"
 build_command = "true"
 scope = ["{{root}}/{{path}}.lean"]
-mcp_enabled = false
 {mapping}
 """,
         encoding="utf-8",
@@ -97,7 +96,6 @@ unit = "section"
 
 [backend]
 kind = "lean"
-mcp_enabled = false
 """,
         encoding="utf-8",
     )
@@ -111,12 +109,12 @@ mcp_enabled = false
     )
 
 
-def test_backend_selects_beam_tool_driver(tmp_path: Path) -> None:
+def test_backend_configures_beam(tmp_path: Path) -> None:
     config_path = _mixed_project(tmp_path)
     config_path.write_text(
         config_path.read_text(encoding="utf-8").replace(
-            "mcp_enabled = false",
-            'tool_driver = "beam"\nbeam_command = "/opt/beam/bin/lean-beam"\n'
+            'project = "lean-project"',
+            'project = "lean-project"\nbeam_command = "/opt/beam/bin/lean-beam"\n'
             "beam_startup_timeout_seconds = 75",
         ),
         encoding="utf-8",
@@ -125,32 +123,24 @@ def test_backend_selects_beam_tool_driver(tmp_path: Path) -> None:
     backend = load_config(config_path).backend
 
     assert isinstance(backend, LeanBackend)
-    assert backend.tool_driver == "beam"
     assert backend.beam_command == "/opt/beam/bin/lean-beam"
     assert backend.beam_startup_timeout_seconds == 75
-    assert not backend.mcp_enabled
 
 
-def test_legacy_disabled_mcp_selects_no_tool_driver(tmp_path: Path) -> None:
-    backend = load_config(_mixed_project(tmp_path)).backend
-
-    assert isinstance(backend, LeanBackend)
-    assert backend.tool_driver == "none"
-    assert not backend.mcp_enabled
-
-
-def test_backend_rejects_ambiguous_tool_driver_configuration(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "setting",
+    ['tool_driver = "mcp"', "mcp_enabled = true", "mcp_tool_timeout_seconds = 300"],
+)
+def test_backend_rejects_removed_mcp_settings(tmp_path: Path, setting: str) -> None:
     config_path = _mixed_project(tmp_path)
     config_path.write_text(
         config_path.read_text(encoding="utf-8").replace(
-            "mcp_enabled = false", 'mcp_enabled = false\ntool_driver = "beam"'
+            'project = "lean-project"', f'project = "lean-project"\n{setting}'
         ),
         encoding="utf-8",
     )
 
-    with pytest.raises(
-        ValueError, match="configure backend.tool_driver or backend.mcp_enabled, not both"
-    ):
+    with pytest.raises(ValueError, match="unknown backend keys"):
         load_config(config_path)
 
 
@@ -242,7 +232,7 @@ def test_backend_manifest_maps_work_unit(tmp_path: Path) -> None:
     config_path = _mixed_project(tmp_path)
     config_path.write_text(
         config_path.read_text(encoding="utf-8").replace(
-            "mcp_enabled = false", 'mcp_enabled = false\nmanifest = "targets.json"'
+            'project = "lean-project"', 'project = "lean-project"\nmanifest = "targets.json"'
         ),
         encoding="utf-8",
     )

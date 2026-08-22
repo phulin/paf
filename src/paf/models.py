@@ -94,7 +94,6 @@ class SwarmSettings:
     isolation: str = "auto"
     cache_compaction_layers: int = 32
     lean_project: Path = Path("lean")
-    lean_mcp_tool_timeout_seconds: float = 300.0
 
 
 @dataclass(frozen=True)

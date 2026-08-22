@@ -34,6 +34,7 @@ from paf.corpus import (
 )
 from paf.display import activity_kind_badge, format_count, format_usage
 from paf.isolation import fuse_overlay_available
+from paf.lean_tools import prepare_lean_dependencies, search_lean_sources
 from paf.models import PipelineConfig, Stage, WorkUnitLike
 from paf.pricing import LEGACY_MODEL, CostEstimate, estimate_cost, format_usd
 from paf.project import Project, ProjectResolver
@@ -63,6 +64,7 @@ COMMAND_NAMES = {
     "pipeline",
     "corpus",
     "agent",
+    "lean",
 }
 
 
@@ -146,6 +148,22 @@ def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(prog="paf", description=__doc__)
     root.add_argument("--version", action="version", version="paf 0.7.0")
     commands = root.add_subparsers(dest="command", required=True)
+
+    lean = commands.add_parser("lean", help="use PAF's Lean Beam support commands")
+    lean_commands = lean.add_subparsers(dest="lean_command", required=True)
+    lean_search = lean_commands.add_parser(
+        "search", help="search project, dependency, and toolchain Lean sources"
+    )
+    lean_search.add_argument("query")
+    lean_search.add_argument("--root", type=Path, default=Path.cwd())
+    lean_search.add_argument("--limit", type=int, default=32)
+    lean_prepare = lean_commands.add_parser(
+        "prepare", help="use Beam to repair stale direct imports and synchronize files"
+    )
+    lean_prepare.add_argument("files", nargs="+")
+    lean_prepare.add_argument("--root", type=Path, default=Path.cwd())
+    lean_prepare.add_argument("--beam-command")
+    lean_prepare.add_argument("--max-rounds", type=int, default=8)
 
     plan = commands.add_parser(
         "plan", help="show discovered documents, work units, target scopes, and stage settings"
@@ -486,17 +504,13 @@ def print_plan(config: PipelineConfig, console: Console) -> None:
         if config.settings.bypass_approvals_and_sandbox
         else config.settings.sandbox
     )
-    tool_driver = getattr(config.backend, "tool_driver", "mcp")
     backend_project = getattr(config.backend, "project", config.settings.lean_project)
     console.print(f"[bold]Codex access:[/bold] {access}")
     console.print(
         f"[bold]Backend:[/bold] {getattr(config.backend, 'kind', 'lean')}  "
-        f"[bold]Lean tools:[/bold] {tool_driver}"
+        "[bold]Lean tools:[/bold] Beam"
     )
-    console.print(
-        f"[bold]Project:[/bold] {backend_project}  "
-        f"[bold]Tool timeout:[/bold] {config.settings.lean_mcp_tool_timeout_seconds:g}s"
-    )
+    console.print(f"[bold]Project:[/bold] {backend_project}")
     stages = Table(title="Stages")
     stages.add_column("Stage")
     stages.add_column("Model")
@@ -1397,6 +1411,28 @@ def main(argv: Sequence[str] | None = None) -> int:
     arguments = parser().parse_args(raw_arguments)
     console = Console()
     try:
+        if arguments.command == "lean":
+            if arguments.lean_command == "search":
+                print(
+                    json.dumps(
+                        {
+                            "query": arguments.query,
+                            "matches": search_lean_sources(
+                                arguments.query, root=arguments.root, limit=arguments.limit
+                            ),
+                        },
+                        sort_keys=True,
+                    )
+                )
+                return 0
+            result = prepare_lean_dependencies(
+                arguments.files,
+                root=arguments.root,
+                beam_command=arguments.beam_command,
+                max_rounds=arguments.max_rounds,
+            )
+            print(json.dumps(result, sort_keys=True))
+            return 0 if result["ok"] else 1
         missing_ripgrep = _starts_workers(arguments) and shutil.which("rg") is None
         arguments.startup_warning = RIPGREP_WARNING if missing_ripgrep else ""
         if missing_ripgrep and getattr(arguments, "no_tui", True):

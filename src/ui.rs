@@ -688,7 +688,7 @@ fn summary(model: &DashboardModel) -> Paragraph<'static> {
                 .count(),
         )),
         Line::from(format!(
-            "revision {} · isolation {} · Lean MCP on · stream {}",
+            "revision {} · isolation {} · Lean Beam · stream {}",
             state.revision, isolation, model.daemon_status
         )),
     ])

@@ -488,8 +488,11 @@ def load_config(path: str | Path, *, project: Project | None = None) -> Pipeline
         data = tomllib.load(handle)
     base = config_path.parent
     swarm = _table(data, "swarm")
-    if "lean_mcp" in swarm:
-        raise ValueError("swarm.lean_mcp was removed; Lean MCP is always enabled")
+    removed_lean_mcp = {"lean_mcp", "lean_mcp_tool_timeout_seconds"}.intersection(swarm)
+    if removed_lean_mcp:
+        raise ValueError(
+            f"removed Lean MCP setting: {', '.join(sorted(removed_lean_mcp))}; PAF uses Lean Beam"
+        )
     if "interface_invalidation" in swarm:
         raise ValueError(
             "swarm.interface_invalidation was removed; interface fingerprints now use "
@@ -524,7 +527,6 @@ def load_config(path: str | Path, *, project: Project | None = None) -> Pipeline
             str(swarm.get("lean_project", "lean")),
             name="swarm.lean_project",
         ),
-        lean_mcp_tool_timeout_seconds=float(swarm.get("lean_mcp_tool_timeout_seconds", 300)),
     )
     if settings.max_agents < 1:
         raise ValueError("swarm.max_agents must be positive")
@@ -542,9 +544,6 @@ def load_config(path: str | Path, *, project: Project | None = None) -> Pipeline
         raise ValueError("swarm.isolation must be auto, fuse-overlay, or shared")
     if settings.cache_compaction_layers < 2:
         raise ValueError("swarm.cache_compaction_layers must be at least 2")
-    if settings.lean_mcp_tool_timeout_seconds <= 0:
-        raise ValueError("swarm.lean_mcp_tool_timeout_seconds must be positive")
-
     stages = _stage_configs(_table(data, "stages"), base)
     if "steward" in data and "shepherd" in data:
         raise ValueError("configure [steward] or the temporary [shepherd] alias, not both")
@@ -590,12 +589,10 @@ def load_config(path: str | Path, *, project: Project | None = None) -> Pipeline
         raw_backend,
         repo=repo,
         legacy_project=settings.lean_project,
-        legacy_timeout=settings.lean_mcp_tool_timeout_seconds,
     )
     settings = replace(
         settings,
         lean_project=backend.project,
-        lean_mcp_tool_timeout_seconds=backend.mcp_tool_timeout_seconds,
     )
     raw_books = data.get("books")
     source_roots = tuple(Path(item) for item in source_discovery.get("roots", ()))
@@ -821,7 +818,6 @@ def infer_config(target: str | Path, *, project: Project | None = None) -> Pipel
         chapters=chapters,
         backend=LeanBackend(
             project=settings.lean_project,
-            mcp_tool_timeout_seconds=settings.lean_mcp_tool_timeout_seconds,
         ),
         project=project.bind(
             root=repo,
@@ -1005,10 +1001,7 @@ def infer_corpus(
         chapters=chapters,
         source_roots=tuple(Path(target).resolve().relative_to(repo) for target in targets),
         source_include=DEFAULT_INCLUDES,
-        backend=replace(
-            backend,
-            mcp_tool_timeout_seconds=settings.lean_mcp_tool_timeout_seconds,
-        ),
+        backend=backend,
         project=project.bind(
             root=repo,
             source_paths=source_paths,

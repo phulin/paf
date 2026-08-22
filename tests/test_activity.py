@@ -250,15 +250,15 @@ def test_summarizes_agent_events_and_persists_compact_activity(tmp_path: Path) -
             "item": {
                 "id": "mcp-1",
                 "type": "mcp_tool_call",
-                "server": "paf_lean",
-                "tool": "lean_diagnostic_messages",
+                "server": "example",
+                "tool": "lookup",
                 "status": "in_progress",
             },
         },
         workspace_root=tmp_path,
     )
 
-    assert activity.current == "Lean diagnostics"
+    assert activity.current == "MCP example.lookup"
 
     activity.consume(
         {
@@ -266,15 +266,15 @@ def test_summarizes_agent_events_and_persists_compact_activity(tmp_path: Path) -
             "item": {
                 "id": "mcp-1",
                 "type": "mcp_tool_call",
-                "server": "paf_lean",
-                "tool": "lean_diagnostic_messages",
+                "server": "example",
+                "tool": "lookup",
                 "status": "failed",
                 "error": None,
                 "result": {
                     "content": [
                         {
                             "type": "text",
-                            "text": "Failed to start Lean: No such file or directory: 'lake'",
+                            "text": "Failed to call external service",
                         }
                     ]
                 },
@@ -302,346 +302,9 @@ def test_summarizes_agent_events_and_persists_compact_activity(tmp_path: Path) -
     assert loaded is not None
     assert loaded.mcp_failures == 1
     assert loaded.files == ["lean/Section.lean"]
-    assert systemic_errors([loaded]) == [(1, "Lean MCP cannot find lake")]
+    assert systemic_errors([loaded]) == [(1, "Failed to call external service")]
     persisted = json.loads(store.path("run-1").read_text(encoding="utf-8"))
     assert "active_items" not in persisted
-
-
-def test_summarizes_lean_mcp_queries_and_results_on_one_line(tmp_path: Path) -> None:
-    activity = AgentActivity(run_id="run", chapter_id="chapter", stage="prove")
-    arguments = {
-        "file_path": (
-            "LastLib/Book02FiniteExtensionsOfLocalFields/Chapter07/"
-            "Section04FiniteResidueFields.lean"
-        ),
-        "line": 79,
-        "timeout_s": 1800,
-    }
-    started = {
-        "type": "item.started",
-        "item": {
-            "id": "goal",
-            "type": "mcp_tool_call",
-            "server": "paf_lean",
-            "tool": "lean_goal",
-            "arguments": arguments,
-            "status": "in_progress",
-        },
-    }
-    activity.consume(started, workspace_root=tmp_path)
-
-    query = activity.recent[-1].detail
-    assert query == "Q goal [Book 2 Chap 7 Sec 4: Finite Residue Fields]:79"
-    assert "\n" not in query
-
-    activity.consume(
-        {
-            "type": "item.completed",
-            "item": {
-                **started["item"],
-                "status": "completed",
-                "result": {
-                    "content": [{"type": "text", "text": "duplicate content"}],
-                    "structured_content": {
-                        "line_context": "  sorry",
-                        "goals_before": ["x : Nat\n⊢ x = x"],
-                        "goals_after": [],
-                    },
-                },
-            },
-        },
-        workspace_root=tmp_path,
-    )
-
-    detail = activity.recent[-1].detail
-    assert detail == "R 1→0 goals"
-    assert "duplicate content" not in detail
-    assert "\n" not in detail
-    assert activity.mcp_calls == 1
-
-
-def test_lean_mcp_result_falls_back_from_null_structured_content(tmp_path: Path) -> None:
-    activity = AgentActivity(run_id="run", chapter_id="chapter", stage="fixup")
-    activity.consume(
-        {
-            "type": "item.completed",
-            "item": {
-                "id": "diagnostics",
-                "type": "mcp_tool_call",
-                "server": "paf_lean",
-                "tool": "lean_diagnostic_messages",
-                "arguments": {"file_path": "Broken.lean"},
-                "status": "failed",
-                "error": None,
-                "result": {
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": "Error executing tool: elaboration failed",
-                        }
-                    ],
-                    "structured_content": None,
-                },
-            },
-        },
-        workspace_root=tmp_path,
-    )
-
-    assert activity.recent[-1].detail == (
-        "Q diagnostics Broken.lean · R Error executing tool: elaboration failed"
-    )
-    assert activity.latest_error == "Error executing tool: elaboration failed"
-
-
-def test_large_lean_mcp_query_does_not_hide_result(tmp_path: Path) -> None:
-    activity = AgentActivity(run_id="run", chapter_id="chapter", stage="prove")
-    activity.consume(
-        {
-            "type": "item.completed",
-            "item": {
-                "id": "attempt",
-                "type": "mcp_tool_call",
-                "server": "paf_lean",
-                "tool": "lean_multi_attempt",
-                "arguments": {
-                    "file_path": "Proof.lean",
-                    "line": 10,
-                    "snippets": ["exact " + "x" * 500 for _ in range(5)],
-                },
-                "status": "completed",
-                "result": {
-                    "structured_content": {
-                        "items": [{"snippet": "exact h", "proof_status": "complete"}]
-                    }
-                },
-            },
-        },
-        workspace_root=tmp_path,
-    )
-
-    detail = activity.recent[-1].detail
-    assert detail.startswith("Q 5 attempts:")
-    assert " · R 1 attempts: 1 complete · worked: exact h" in detail
-    assert "\n" not in detail
-    assert len(detail) <= 800
-
-
-@pytest.mark.parametrize(
-    ("tool", "arguments", "expected"),
-    [
-        (
-            "lean_prepare_dependencies",
-            {"file_paths": ["A.lean", "B.lean"]},
-            "Q prepare 2 files: A.lean, B.lean",
-        ),
-        (
-            "lean_diagnostic_messages",
-            {
-                "file_path": "A.lean",
-                "start_line": 4,
-                "end_line": 9,
-                "severity": "error",
-            },
-            "Q diagnostics A.lean:4-9 · error",
-        ),
-        (
-            "lean_hover_info",
-            {"file_path": "A.lean", "line": 4, "column": 7},
-            "Q hover A.lean:4:7",
-        ),
-        (
-            "lean_declaration_file",
-            {"file_path": "A.lean", "symbol": "Nat.succ", "context_lines": 5},
-            "Q declaration Nat.succ in A.lean · ±5 lines",
-        ),
-        (
-            "lean_local_search",
-            {"query": "foo", "limit": 4},
-            "Q local search “foo” · max 4",
-        ),
-        (
-            "lean_goal",
-            {"file_path": "A.lean", "line": 4},
-            "Q goal A.lean:4",
-        ),
-        (
-            "lean_term_goal",
-            {"file_path": "A.lean", "line": 4, "column": 7},
-            "Q term goal A.lean:4:7",
-        ),
-        (
-            "lean_completions",
-            {"file_path": "A.lean", "line": 4, "column": 7, "max_completions": 12},
-            "Q completions A.lean:4:7 · max 12",
-        ),
-        (
-            "lean_multi_attempt",
-            {"file_path": "A.lean", "line": 4, "snippets": ["simp", "omega"]},
-            "Q 2 attempts: simp, omega at A.lean:4",
-        ),
-        (
-            "lean_code_actions",
-            {"file_path": "A.lean", "line": 4},
-            "Q code actions A.lean:4",
-        ),
-    ],
-)
-def test_summarizes_each_enabled_lean_mcp_query(
-    tmp_path: Path, tool: str, arguments: dict[str, object], expected: str
-) -> None:
-    activity = AgentActivity(run_id="run", chapter_id="chapter", stage="prove")
-    activity.consume(
-        {
-            "type": "item.started",
-            "item": {
-                "id": tool,
-                "type": "mcp_tool_call",
-                "server": "paf_lean",
-                "tool": tool,
-                "arguments": arguments,
-                "status": "in_progress",
-            },
-        },
-        workspace_root=tmp_path,
-    )
-
-    assert activity.recent[-1].detail == expected
-    assert "\n" not in activity.recent[-1].detail
-
-
-@pytest.mark.parametrize(
-    ("tool", "value", "expected"),
-    [
-        (
-            "lean_prepare_dependencies",
-            {
-                "attempted": ["A.lean", "B.lean"],
-                "ready": ["A.lean"],
-                "failed": ["B.lean"],
-                "errors": [
-                    {
-                        "file_path": "B.lean",
-                        "message": "lake setup-file B.lean failed",
-                        "failed_dependencies": ["C.lean"],
-                    }
-                ],
-            },
-            "R 2 attempted · 1 ready · 1 failed",
-        ),
-        (
-            "lean_diagnostic_messages",
-            {
-                "success": False,
-                "items": [
-                    {"severity": "error", "message": "unknown identifier", "line": 7, "column": 3},
-                    {"severity": "warning", "message": "unused variable", "line": 8, "column": 1},
-                ],
-            },
-            "R 1 error · 1 warning · L7:3 unknown identifier",
-        ),
-        (
-            "lean_diagnostic_messages",
-            {
-                "status": "dependency_unavailable",
-                "reason": "Imported file B.lean failed to build",
-                "items": [],
-            },
-            "R dependency unavailable · Imported file B.lean failed to build",
-        ),
-        (
-            "lean_hover_info",
-            {"symbol": "Nat.succ", "info": "Nat → Nat", "diagnostics": []},
-            "R Nat.succ: Nat → Nat",
-        ),
-        (
-            "lean_declaration_file",
-            {
-                "file_path": "Mathlib/Data/Nat.lean",
-                "content": "large",
-                "start_line": 10,
-                "end_line": 20,
-                "total_lines": 100,
-            },
-            "R Mathlib/Data/Nat.lean L10-20/100",
-        ),
-        (
-            "lean_local_search",
-            {"items": [{"name": "Foo"}, {"name": "Bar"}]},
-            "R 2 matches: Foo, Bar",
-        ),
-        (
-            "lean_goal",
-            {"goals_before": ["⊢ A", "⊢ B"], "goals_after": ["⊢ B"]},
-            "R 2→1 goals",
-        ),
-        (
-            "lean_goal",
-            {
-                "status": "elaboration_unavailable",
-                "reason": "an earlier declaration has errors",
-                "goals_before": [],
-                "goals_after": [],
-            },
-            "R elaboration unavailable · an earlier declaration has errors",
-        ),
-        (
-            "lean_term_goal",
-            {"line_context": "exact ?_", "expected_type": "Nat"},
-            "R expected Nat",
-        ),
-        (
-            "lean_completions",
-            {"items": [{"label": "foo"}, {"label": "bar"}]},
-            "R 2 completions: foo, bar",
-        ),
-        (
-            "lean_multi_attempt",
-            {
-                "items": [
-                    {"snippet": "exact h", "goals": [], "proof_status": "Completed"},
-                    {"snippet": "simp", "goals": ["⊢ A"]},
-                    {"snippet": "omega", "diagnostics": [{"severity": "error"}]},
-                ]
-            },
-            "R 3 attempts: 1 complete, 1 open, 1 failed · worked: exact h",
-        ),
-        (
-            "lean_multi_attempt",
-            {
-                "status": "dependency_unavailable",
-                "reason": "C.lean has no object file",
-                "items": [],
-            },
-            "R dependency unavailable · C.lean has no object file",
-        ),
-        (
-            "lean_code_actions",
-            {"actions": [{"title": "Try this: simp"}, {"title": "Add missing cases"}]},
-            "R 2 actions: Try this: simp, Add missing cases",
-        ),
-    ],
-)
-def test_summarizes_each_enabled_lean_mcp_result(
-    tmp_path: Path, tool: str, value: dict[str, object], expected: str
-) -> None:
-    activity = AgentActivity(run_id="run", chapter_id="chapter", stage="prove")
-    activity.consume(
-        {
-            "type": "item.completed",
-            "item": {
-                "id": tool,
-                "type": "mcp_tool_call",
-                "server": "paf_lean",
-                "tool": tool,
-                "status": "completed",
-                "result": {"structured_content": value},
-            },
-        },
-        workspace_root=tmp_path,
-    )
-
-    assert activity.recent[-1].detail == expected
-    assert "\n" not in activity.recent[-1].detail
 
 
 def test_tracks_parallel_items_until_all_complete(tmp_path: Path) -> None:

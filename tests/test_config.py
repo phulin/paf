@@ -38,7 +38,6 @@ def test_discovers_chapters_and_renders_paths(tmp_path: Path) -> None:
     assert config.stages[Stage.PROVE].unchanged_retry_limit == 2
     assert config.stages[Stage.REVIEW].chunk_size is None
     assert config.settings.lean_project == Path("lean")
-    assert config.settings.lean_mcp_tool_timeout_seconds == 300
     assert config.settings.capacity_resume_attempts == 10
     assert config.settings.capacity_resume_delay_seconds == 15
     assert config.settings.capacity_resume_max_delay_seconds == 120
@@ -255,33 +254,17 @@ def test_rejects_removed_interface_invalidation_mode(tmp_path: Path) -> None:
         load_config(path)
 
 
-def test_loads_lean_mcp_settings(tmp_path: Path) -> None:
+@pytest.mark.parametrize("setting", ["lean_mcp = false", "lean_mcp_tool_timeout_seconds = 45"])
+def test_rejects_removed_lean_mcp_setting(tmp_path: Path, setting: str) -> None:
     path = write_project(tmp_path)
     path.write_text(
         path.read_text(encoding="utf-8").replace(
-            'isolation = "shared"',
-            'isolation = "shared"\nlean_project = "lean-project"\n'
-            "lean_mcp_tool_timeout_seconds = 45",
+            'isolation = "shared"', f'isolation = "shared"\n{setting}'
         ),
         encoding="utf-8",
     )
 
-    settings = load_config(path).settings
-
-    assert settings.lean_project == Path("lean-project")
-    assert settings.lean_mcp_tool_timeout_seconds == 45
-
-
-def test_rejects_removed_lean_mcp_setting(tmp_path: Path) -> None:
-    path = write_project(tmp_path)
-    path.write_text(
-        path.read_text(encoding="utf-8").replace(
-            'isolation = "shared"', 'isolation = "shared"\nlean_mcp = false'
-        ),
-        encoding="utf-8",
-    )
-
-    with pytest.raises(ValueError, match=r"swarm\.lean_mcp was removed"):
+    with pytest.raises(ValueError, match="removed Lean MCP setting"):
         load_config(path)
 
 

@@ -2,7 +2,7 @@
 
 `paf` orchestrates a large population of noninteractive Codex workers over an informal
 mathematics corpus and its Lean translation. It combines parallel source-dependency discovery,
-dependency-ready formalization with clean diagnostics, editing mathematical review, and LSP-backed
+dependency-ready formalization with clean diagnostics, editing mathematical review, and Beam-backed
 proving.
 
 Install `ripgrep` and ensure its `rg` executable is on `PATH` before starting a large swarm. Agents
@@ -13,7 +13,7 @@ fallback searches can be substantially slower.
 ```mermaid
 flowchart LR
     S[Scaffold directories] --> D[Discover source tree per input]
-    D -->|own discovery + formalized dependencies| F[Formalize with MCP]
+    D -->|own discovery + formalized dependencies| F[Formalize with Beam]
     F -->|clean diagnostics and build| G{First review dependencies done?}
     G --> R[Editing review]
     R -->|successful own review| P[Prove or revalidate proof]
@@ -31,7 +31,7 @@ Scaffolding is deterministic and creates directories only. Discovery reads each 
 parallel, identifies its direct source prerequisites, and persists the resulting source dependency
 tree with source digests. A chapter can formalize as soon as its discovery is complete and its
 dependencies have formalized; it does not wait for unrelated discovery or formalization work.
-Formalization owns full source coverage, elaboration, MCP diagnostics, and coordinator build
+Formalization owns full source coverage, Beam diagnostics, and coordinator build
 convergence. A successful Lean build releases dependents even when it emits a non-`sorry` warning;
 the warning becomes a durable, local cleanup obligation and does not weaken final convergence.
 All later coordinator checks use the same coalescer: formalization, review, proof refresh, and proof
@@ -60,7 +60,7 @@ Proof findings reopen review without invalidating build freshness; a subsequent 
 marks the affected import closure stale.
 Review agents read the assigned numbered textbook chapter and discover the assigned Lean files
 dynamically, then use targeted searches in earlier LastLib and pinned Mathlib sources as questions
-arise. They do not receive a prefabricated source packet. Formalize, review, and proof agents receive Lean MCP;
+arise. They do not receive a prefabricated source packet. Formalize, review, and proof agents receive Lean Beam;
 reviewers trust the last clean build for untouched files and request whole-file diagnostics
 only for files they edit and the assigned transitive dependents invalidated by those edits. A
 no-change review therefore needs no diagnostic calls.
@@ -96,6 +96,21 @@ uv run paf plan books/02-finite-extensions-of-local-fields.md
 uv run paf books/02-finite-extensions-of-local-fields.md
 ```
 
+Install Lean Beam once on every worker host, including its Codex skill; it is not added to each
+target project's `lakefile`:
+
+```console
+git clone https://github.com/ejgallego/lean-beam.git
+cd lean-beam
+./scripts/install-beam.sh --codex
+lean-beam doctor
+```
+
+The installer requires `elan` and normally places the wrappers in `~/.local/bin`. PAF uses the CLI
+surface only and does not register or start Beam's optional MCP server. Re-run the installer after
+updating the Beam checkout, and prebuild additional supported toolchain bundles when the corpus uses
+more than the repository-pinned default.
+
 Install the command from a checkout with:
 
 ```console
@@ -126,7 +141,7 @@ an external `state_dir`.
 Passing a `.md` as the first argument is shorthand for `pipeline <target>`. Zero-config runs default
 to `gpt-5.6-luna`, reasoning effort `max` (with discovery using `gpt-5.6-luna` at `medium`), the packaged generic prompt library under
 `src/paf/prompts/`, automatic execution isolation, and a state directory at
-`.paf/<inferred-book-id>/`. Fixup, review, and proof attempts attach a private Lean LSP MCP server;
+`.paf/<inferred-book-id>/`. Formalize, review, and proof attempts attach a private Lean Beam daemon;
 drafting does not. Use
 `paf.example.toml` when the inferred layout is not appropriate or when coordinating multiple books.
 
@@ -136,11 +151,11 @@ Any stage may point at a specialized prompt template. Supported replacement fiel
 
 The final agent prompt is composed from three deliberately separate layers: the selected stage
 template defines its mission and workflow, packaged `prompts/common.md` defines shared mathematical
-and import policy, and the generated runtime contract supplies the exact scope, MCP availability,
+and import policy, and the generated runtime contract supplies the exact scope, Beam availability,
 coordinator-owned build behavior, and structured-report requirements. Shared policy belongs in the
 common layer rather than being copied into every stage template.
 
-Proof agents must clear every MCP warning except “declaration uses `sorry`” for a theorem they
+Proof agents must clear every Lean warning except “declaration uses `sorry`” for a theorem they
 attempted but could not prove. Disabling a linter or warning option is not an acceptable fix.
 
 Codex is invoked in its documented noninteractive JSONL mode with a strict final-report schema.
@@ -292,48 +307,24 @@ uv run python scripts/check_installed_distribution.py
 It removes `PYTHONPATH`, disables user site packages, and verifies the imported `paf` location, so
 the checkout cannot accidentally satisfy an installed-package probe.
 
-## Lean LSP MCP proof loop
+## Lean Beam proof loop
 
-Every proof attempt receives its own locked
-[`lean-lsp-mcp`](https://github.com/oOo0oOo/lean-lsp-mcp) stdio server, rooted inside the agent's
-private FUSE overlay. It exposes whole-file diagnostics, hover and declaration lookup,
-local source search, proof goals, completions, code actions, batched tactic trials, and focused
-dependency preparation. Remote search, local Loogle, and the MCP's general `lean_build` tool remain
-absent from the allowlist.
+Each formalize, review, and proof attempt receives a PAF-owned Lean Beam daemon rooted in the
+agent's workspace. PAF assigns a unique `BEAM_CONTROL_DIR` to the attempt and shares only Beam's
+immutable bundle cache through `BEAM_BUNDLE_DIR`. The daemon starts before Codex and is shut down
+with the complete process group when the attempt ends.
 
-Proof agents receive a source-ordered chunk containing at most four placeholders by default. A
-declaration is never split between agents, so one declaration with more than four placeholders is
-assigned alone. Agents then request whole-file diagnostics and iterate only over their assigned
-proofs and dependent declarations. The MCP opens files against the certified cache without
-requesting a build and retains warm file workers across ordinary body edits. A stale-import notification,
-stale-import diagnostic, or import-header edit enters one per-server preparation coordinator: it
-serializes the actual `lake setup-file` work through the freshness barrier, retries the query once,
-and lets queued files first test the cache produced by the preceding preparation. Repeated failed
-preparations are suppressed until source or cache state changes.
+Agents use the installed `$lean-beam` Codex skill and the `lean-beam` CLI for goals, diagnostics,
+hover, definitions, references, workspace symbols, and speculative `run-at` proof checks. Beam
+reads saved files, so agents update it after edits and synchronize before final validation. Beam
+reports stale direct imports with `saveDeps` and a recovery plan; `paf lean prepare FILE...` follows
+that recovery automatically. `paf lean search QUERY` searches project, Lake dependency, and Lean
+toolchain sources without starting a language server.
 
-For a multi-file changed closure, agents prepare only its maximal affected dependents before the
-final import-order diagnostic pass. This builds the imported closure in the fewest Lake invocations;
-preparing every file separately is forbidden. Files are opened lazily on the first Lean tool call,
-and batched tactic trials use one scratch worker per MCP server. Agents never invoke a compiler
-directly. After an agent exits, the coordinator terminates its MCP/LSP process group and merges
-accepted scoped changes into the main worktree under a short source-consistency barrier. It then
-enqueues one visible targeted `lake build +Module`; only Lake builds acquire the FIFO coordinator
-build queue. Formalization, review, and proof callers share that lane and receive their own routed
-validation and freshness results from a combined command. Each coordinator build receives a private
-cache upper layer. A successful build atomically promotes that small delta and writes only those
-changed artifacts back to the main worktree's `.lake`; failed build deltas are discarded.
-The coordinator rejects a successful compiler exit if its captured output contains any warning
-other than the exact “declaration uses `sorry`” diagnostic. It still publishes the usable artifact,
-keeps the warning local to its source owner, and schedules a dedicated auxiliary cleanup worker.
-Cleanup preserves existing declarations and proof terms as far as possible. The pipeline reports
-success only after every warning obligation receives a warning-free coordinator certification.
-
-An MCP/LSP process exists per active proof attempt, not per queued agent. Its imported `.olean` files come
-from a read-only snapshot of the coordinator cache taken when the attempt starts, while its document
-state remains private. No new attempt snapshot is created during a merge/build transaction, so it
-cannot pair newly merged sources with stale artifacts. Consequently `max_agents` also bounds the
-number of concurrent Lean language servers. Discovery uses the separate
-`stages.discover.max_agents` pool and does not consume these mutating-agent slots.
+Beam checkpoints one module at a time and does not certify downstream importers. PAF's coordinator
+therefore remains responsible for final targeted Lake builds, cache publication, scoped merge, and
+downstream freshness. Discovery does not start Beam. Consequently `max_agents` bounds concurrent
+mutating agents and Beam daemons, while `stages.discover.max_agents` remains a separate pool.
 
 ## Agent-managed background mode
 
@@ -410,7 +401,7 @@ After the daemon exits, `status`, `snapshot`, and `wait` fall back to the persis
   change that chapter concurrently. A changed input digest reopens discovery and editing review;
   proof is also reopened when the chapter still contains placeholders.
 - **Formalize** starts after its own discovery and the formalization of its direct dependencies.
-  It covers the complete source chapter, uses Lean MCP for elaboration and diagnostics, and cycles
+  It covers the complete source chapter, uses Lean Beam for elaboration and diagnostics, and cycles
   through coordinator builds up to `max_rounds`. A compiler-successful build completes the stage and
   releases its artifact; non-`sorry` warnings become auxiliary cleanup obligations rather than
   dependency failures.
@@ -522,14 +513,14 @@ The dashboard shows:
 - each chapter's status and attempt count in every stage, plus independent exact-build freshness;
 - per-chapter tokens for the current invocation;
 - statement/proof critical-path ranks and the current statement critical path;
-- each running agent's current command, MCP call, edit, or reasoning state and failure count;
+- each running agent's current command, tool call, edit, or reasoning state and failure count;
 - measured cumulative input, cached input, output, and reasoning-output tokens.
 
 Select a chapter row and press Enter (or `i`) to open its agent detail screen. It updates while the
 agent runs and has tabs for the event timeline, exact submitted prompt, Codex todo plan, touched
 files, and bounded raw JSONL events. Opening a run reconstructs its timeline from JSONL so the whole
 run is visible; only an extreme run beyond 10,000 display events is shortened, with the omission
-called out. The header includes PID/thread id, elapsed and idle time, shell/MCP/edit counts,
+called out. The header includes PID/thread id, elapsed and idle time, shell/tool/edit counts,
 complete latest agent update in a scrollable pane, latest substantive error, and measured per-run
 spend. Bare process statuses such as `exit 2` are retained in the event timeline but are not promoted
 to latest or systemic errors. The detail pane reports tokens and API-equivalent cost for that exact
@@ -617,8 +608,7 @@ falls back to fresh agents when a session is no longer available. Successful rec
 unless `--force` is given. The TUI drains its workers but leaves interrupted agent overlays intact.
 A subsequent `--resume` reattaches each saved Codex session to its exact prior overlay; a restart
 without `--resume` unmounts and removes those abandoned trees before launching fresh agents.
-Shutdown waits briefly for the complete Codex process group and force-terminates surviving MCP/LSP
-descendants.
+Shutdown waits briefly for the complete Codex and Beam process groups and force-terminates survivors.
 
 Agents never commit. With the default `auto` backend, supported Linux systems run each mutating
 attempt in a private `fuse-overlayfs` view. Discovery is read-only and runs against the canonical
@@ -627,7 +617,7 @@ source snapshot that excludes `.lake`, and an ordered manifest of read-only coor
 layers. The package cache
 is seeded once per invocation in a dependency layer keyed by `lean-toolchain` and
 `lake-manifest.json`; project artifacts begin in a separate layer. Only files changed by that
-attempt occupy its writable upper layer. Codex, its private LSP, and coordinator validation run in
+attempt occupy its writable upper layer. Codex, its private Beam daemon, and coordinator validation run in
 private merged views. The coordinator rejects every out-of-scope source path, checks that the assigned
 canonical scope has not changed since launch, and imports accepted regular files with atomic
 replacement. A stale writer is
@@ -641,9 +631,8 @@ view.
 All proof agents pinned to a cache-generation manifest share the same Lake artifact inodes and OS
 page-cache pages; neither the complete cache nor its dependency packages are copied after each
 build. A clean coordinator build publishes its immutable delta stack for review and proof.
-Reopening a file through the proof MCP gives Lean's LSP
-one dependency-build pass; resulting cache writes occupy only that agent's writable upper layer and
-are discarded at teardown. The generic MCP build remains hidden. Already-running proof agents remain
+Synchronizing a file through Beam may checkpoint stale direct imports; resulting cache writes occupy
+only that agent's writable upper layer and are discarded at teardown. Already-running proof agents remain
 pinned to their original clean snapshot, while later attempts see coordinator-published artifacts.
 Old snapshots are reclaimed when their last agent exits, and source imports preserve mtimes.
 Layer stacks are compacted asynchronously after `cache_compaction_layers` entries; compaction scans
@@ -690,14 +679,26 @@ agent_timeout_seconds = 7200
 capacity_resume_attempts = 10 # resume the same Codex thread after transient capacity failures
 capacity_resume_delay_seconds = 15 # initial delay; doubles after each failure
 capacity_resume_max_delay_seconds = 120 # cap for exponential backoff
-codex_fd_recycle_threshold = 256 # recycle a leaking Codex/MCP process at this many FDs; 0 disables
+codex_fd_recycle_threshold = 256 # recycle a leaking Codex process at this many FDs; 0 disables
 codex_fd_recycle_attempts = 20 # maximum transparent same-thread resource recycles per agent
 validation_timeout_seconds = 1800
 isolation = "auto" # auto, fuse-overlay, or shared
 cache_compaction_layers = 32 # asynchronously compact immutable cache layer stacks at this size
 lean_project = "lean" # relative to swarm.repo; contains lakefile and lean-toolchain
-lean_mcp_tool_timeout_seconds = 300
 ```
+
+The Lean backend selects Beam and controls daemon startup separately:
+
+```toml
+[backend]
+kind = "lean"
+project = "lean"
+beam_command = "lean-beam" # may be an absolute wrapper path
+beam_startup_timeout_seconds = 60
+```
+
+Old `lean_mcp`, `lean_mcp_tool_timeout_seconds`, `tool_driver`, and `mcp_enabled` settings are
+rejected. Remove them instead of carrying a compatibility configuration forward.
 
 The `[steward]` table is accepted only for compatibility with older project files. Capability
 packages are archived and its `enabled` value is ignored:
@@ -718,7 +719,7 @@ Schema v11 converts each open legacy package consumer into one upstream request 
 Steward leases and package reservations. Plans, splits, workers, and package dependencies are not
 migrated into executable work. See [the upstream-request design](docs/repair-sweeps.md).
 
-When Lean MCP is enabled, orchestrator startup bootstraps `lean_project` if it does not already
+For Lean backends, orchestrator startup bootstraps `lean_project` if it does not already
 contain both `lean-toolchain` and a Lake file. PAF pins the active Lean version, creates a matching
 Mathlib dependency and Lean library, and runs `lake update` before starting any agents. Existing
 valid Lake projects are left unchanged. An interrupted bootstrap is retried on the next startup.

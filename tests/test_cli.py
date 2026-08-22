@@ -295,7 +295,7 @@ def test_plan_command(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> Non
     assert "discover" in output
     assert "formalize" in output
     assert "40 discovery agents, 4 shared mutating agents" in output
-    assert "Lean MCP: enabled" in output
+    assert "Lean tools: Beam" in output
 
 
 def test_cli_overrides_discovery_concurrency(

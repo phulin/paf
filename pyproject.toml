@@ -5,7 +5,6 @@ description = "Parallel Codex orchestration for mathematical formalization"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-  "lean-lsp-mcp==0.29.0",
   "orjson>=3.11.0",
   "rich>=14.0.0",
   "starlette>=0.47.0",

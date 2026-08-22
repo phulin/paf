@@ -30,8 +30,6 @@ from paf.codex import (
     count_placeholders,
     declaration_uses_placeholder,
     declaration_uses_placeholder_in_chapter,
-    lean_mcp_executable,
-    lean_mcp_path,
     proof_target_chunk,
     proof_target_spans,
     proof_targets,
@@ -638,25 +636,7 @@ def test_executor_uses_machine_readable_codex_mode(tmp_path: Path) -> None:
     isolated = tmp_path / "isolated"
     isolated_command = executor.command(Stage.PROVE, isolated)
     assert "--skip-git-repo-check" in isolated_command
-    overrides = {
-        isolated_command[index + 1].split("=", 1)[0]: isolated_command[index + 1].split("=", 1)[1]
-        for index, item in enumerate(isolated_command[:-1])
-        if item == "--config"
-    }
-    assert overrides["mcp_servers.paf_lean.command"] == f'"{lean_mcp_executable()}"'
-    assert json.loads(overrides["mcp_servers.paf_lean.args"]) == [
-        "-m",
-        "paf.lean_mcp",
-    ]
-    assert overrides["mcp_servers.paf_lean.cwd"] == f'"{isolated / "lean"}"'
-    assert json.loads(overrides["mcp_servers.paf_lean.env.PATH"]) == lean_mcp_path()
-    assert "mcp_servers.paf_lean.env.LEAN_MCP_SCRATCH_SLOTS" not in overrides
-    assert "mcp_servers.paf_lean.env.LEAN_MCP_PREWARM_FILES" not in overrides
-    assert "lean_diagnostic_messages" in overrides["mcp_servers.paf_lean.enabled_tools"]
-    assert "lean_prepare_dependencies" in overrides["mcp_servers.paf_lean.enabled_tools"]
-    assert "lean_multi_attempt" in overrides["mcp_servers.paf_lean.enabled_tools"]
-    assert "lean_file_outline" not in overrides["mcp_servers.paf_lean.enabled_tools"]
-    assert "lean_build" not in overrides["mcp_servers.paf_lean.enabled_tools"]
+    assert not any("mcp_servers.paf_lean" in item for item in isolated_command)
     assert render_prompt(
         "Chapter {chapter_number_padded}: {chapter_title}", config.chapters[0]
     ) == ("Chapter 01: First chapter")
@@ -664,28 +644,7 @@ def test_executor_uses_machine_readable_codex_mode(tmp_path: Path) -> None:
     review_command = executor.command(Stage.REVIEW)
     assert "--dangerously-bypass-approvals-and-sandbox" in review_command
     assert "--sandbox" not in review_command
-    review_overrides = {
-        review_command[index + 1].split("=", 1)[0]: review_command[index + 1].split("=", 1)[1]
-        for index, item in enumerate(review_command[:-1])
-        if item == "--config"
-    }
-    assert "lean_diagnostic_messages" in review_overrides["mcp_servers.paf_lean.enabled_tools"]
-    assert "lean_prepare_dependencies" in review_overrides["mcp_servers.paf_lean.enabled_tools"]
-    assert "lean_code_actions" in review_overrides["mcp_servers.paf_lean.enabled_tools"]
-    assert "lean_file_outline" not in review_overrides["mcp_servers.paf_lean.enabled_tools"]
-    assert "lean_multi_attempt" not in review_overrides["mcp_servers.paf_lean.enabled_tools"]
-    assert "lean_build" not in review_overrides["mcp_servers.paf_lean.enabled_tools"]
-    formalize_command = executor.command(Stage.FORMALIZE, isolated)
-    formalize_overrides = {
-        formalize_command[index + 1].split("=", 1)[0]: formalize_command[index + 1].split("=", 1)[1]
-        for index, item in enumerate(formalize_command[:-1])
-        if item == "--config"
-    }
-    assert "lean_diagnostic_messages" in formalize_overrides["mcp_servers.paf_lean.enabled_tools"]
-    assert "lean_code_actions" in formalize_overrides["mcp_servers.paf_lean.enabled_tools"]
-    assert "lean_file_outline" not in formalize_overrides["mcp_servers.paf_lean.enabled_tools"]
-    assert "lean_multi_attempt" not in formalize_overrides["mcp_servers.paf_lean.enabled_tools"]
-    assert "lean_goal" not in formalize_overrides["mcp_servers.paf_lean.enabled_tools"]
+    assert not any("mcp_servers.paf_lean" in item for item in review_command)
 
     discover_command = executor.command(Stage.DISCOVER)
     assert not any("mcp_servers.paf_lean" in item for item in discover_command)
@@ -708,15 +667,9 @@ def test_executor_uses_machine_readable_codex_mode(tmp_path: Path) -> None:
 def test_executor_uses_beam_prompt_without_attaching_mcp(tmp_path: Path) -> None:
     config_path = write_project(tmp_path, chapters="chapters = [1]")
     config_path.write_text(
-        config_path.read_text(encoding="utf-8")
-        + """
-
-[backend]
-kind = "lean"
-project = "lean"
-tool_driver = "beam"
-beam_command = "/opt/beam/bin/lean-beam"
-""",
+        config_path.read_text(encoding="utf-8").replace(
+            str(tmp_path / "fake-lean-beam"), "/opt/beam/bin/lean-beam"
+        ),
         encoding="utf-8",
     )
     config = load_config(config_path)
@@ -821,57 +774,20 @@ async def test_executor_selects_a_distinct_schema_for_each_active_agent(tmp_path
 
 
 @pytest.mark.parametrize("role", [DIAGNOSTIC_REVIEW_ROLE, WARNING_REVIEW_ROLE])
-def test_diagnostic_review_has_proof_capable_lean_tools(tmp_path: Path, role: str) -> None:
+def test_diagnostic_review_uses_beam_proof_workflow(tmp_path: Path, role: str) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
     executor = CodexExecutor(config, StateStore(config))
 
-    command = executor.command(
+    prompt = executor.build_prompt(
+        config.chapters[0],
         Stage.REVIEW,
         feedback="diagnostic",
         role=role,
     )
-    overrides = {
-        command[index + 1].split("=", 1)[0]: json.loads(command[index + 1].split("=", 1)[1])
-        for index, item in enumerate(command[:-1])
-        if item == "--config"
-    }
 
-    assert "lean_goal" in overrides["mcp_servers.paf_lean.enabled_tools"]
-    assert "lean_multi_attempt" in overrides["mcp_servers.paf_lean.enabled_tools"]
-
-
-def test_lean_mcp_does_not_prewarm_files(tmp_path: Path) -> None:
-    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
-    chapter = config.chapters[0]
-    chapter_root = tmp_path / "lean" / "Book" / "Chapter01"
-    chapter_root.mkdir(parents=True)
-    aggregator = tmp_path / "lean" / "Book" / "Chapter01.lean"
-    dependency = chapter_root / "Dependencies.lean"
-    proof = chapter_root / "Proof.lean"
-    other = chapter_root / "Other.lean"
-    aggregator.write_text(
-        "import Book.Chapter01.Proof\nimport Book.Chapter01.Other\n",
-        encoding="utf-8",
-    )
-    dependency.write_text("import Mathlib\n", encoding="utf-8")
-    proof.write_text(
-        "import Book.Chapter01.Dependencies\n\ntheorem target : True := by sorry\n",
-        encoding="utf-8",
-    )
-    other.write_text("import Book.Chapter01.Dependencies\n", encoding="utf-8")
-
-    command = CodexExecutor(config, StateStore(config)).command(
-        Stage.PROVE,
-        chapter=chapter,
-        feedback="Coordinator diagnostic: lean/Book/Chapter01/Other.lean:1:1",
-    )
-    overrides = {
-        command[index + 1].split("=", 1)[0]: command[index + 1].split("=", 1)[1]
-        for index, item in enumerate(command[:-1])
-        if item == "--config"
-    }
-    assert "mcp_servers.paf_lean.env.LEAN_MCP_PREWARM_FILES" not in overrides
-    assert "mcp_servers.paf_lean.env.LEAN_MCP_SCRATCH_SLOTS" not in overrides
+    assert "### Lean Beam workflow" in prompt
+    assert "`goals`" in prompt
+    assert "`run-at`" in prompt
 
 
 @pytest.mark.parametrize(
@@ -938,18 +854,6 @@ def test_capacity_retry_schedule_uses_capped_exponential_backoff() -> None:
     ]
 
 
-def test_lean_mcp_path_finds_elan_outside_inherited_path(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    elan_bin = tmp_path / "elan" / "bin"
-    elan_bin.mkdir(parents=True)
-    (elan_bin / "lake").touch()
-    monkeypatch.setenv("ELAN_HOME", str(tmp_path / "elan"))
-    monkeypatch.setenv("PATH", "/usr/bin")
-
-    assert lean_mcp_path().split(os.pathsep)[0] == str(elan_bin)
-
-
 def test_approve_for_me_is_not_combined_with_explicit_sandbox(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
     config = replace(
@@ -991,13 +895,15 @@ def test_review_uses_write_sandbox_when_full_access_is_disabled(tmp_path: Path) 
     assert 'sandbox_mode="workspace-write"' in resumed
 
 
-def test_review_command_enables_lean_mcp(tmp_path: Path) -> None:
+def test_review_command_uses_beam_workflow(tmp_path: Path) -> None:
     config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
     executor = CodexExecutor(config, StateStore(config))
 
     command = executor.command(Stage.REVIEW)
-    assert any("mcp_servers.paf_lean.command" in item for item in command)
-    assert any("lean_diagnostic_messages" in item for item in command)
+    prompt = executor.build_prompt(config.chapters[0], Stage.REVIEW)
+    assert not any("mcp_servers.paf_lean" in item for item in command)
+    assert "### Lean Beam workflow" in prompt
+    assert "paf lean prepare" in prompt
 
 
 def test_declaration_placeholder_check_is_targeted_to_the_named_declaration(

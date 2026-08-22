@@ -5,7 +5,6 @@ import os
 import re
 import shutil
 import subprocess
-import sys
 import tomllib
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
@@ -13,7 +12,7 @@ from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
 from paf.diagnostics import lean_diagnostic_counts
-from paf.models import Stage, TargetMapping, WorkUnit
+from paf.models import TargetMapping, WorkUnit
 
 
 @runtime_checkable
@@ -31,25 +30,7 @@ class TargetBackend(Protocol):
 
     def prepare_project(self, root: Path, *, timeout_seconds: float) -> bool: ...
 
-    def mcp_config(self, root: Path, stage: Stage) -> dict[str, Any]: ...
 
-
-LEAN_MCP_BASE_TOOLS = (
-    "lean_diagnostic_messages",
-    "lean_prepare_dependencies",
-    "lean_hover_info",
-    "lean_declaration_file",
-    "lean_local_search",
-)
-LEAN_MCP_PROOF_TOOLS = (
-    *LEAN_MCP_BASE_TOOLS,
-    "lean_goal",
-    "lean_term_goal",
-    "lean_completions",
-    "lean_multi_attempt",
-    "lean_code_actions",
-)
-LEAN_MCP_FIXUP_TOOLS = (*LEAN_MCP_BASE_TOOLS, "lean_completions", "lean_code_actions")
 LEAN_PROJECT_BOOTSTRAP_MARKER = ".paf-bootstrap-pending"
 
 
@@ -129,32 +110,20 @@ class LeanBackend:
     project: Path = Path("lean")
     templates: TargetTemplates = field(default_factory=TargetTemplates)
     explicit: tuple[ExplicitTarget, ...] = ()
-    tool_driver: str = "mcp"
     beam_command: str = "lean-beam"
     beam_startup_timeout_seconds: float = 60.0
-    mcp_tool_timeout_seconds: float = 300.0
     kind: str = "lean"
 
     def __post_init__(self) -> None:
         if self.project.is_absolute():
             raise ValueError("backend.project must be repository-relative")
-        if self.tool_driver not in {"beam", "mcp", "none"}:
-            raise ValueError("backend.tool_driver must be one of: beam, mcp, none")
         if not self.beam_command:
             raise ValueError("backend.beam_command must be a non-empty string")
         if self.beam_startup_timeout_seconds <= 0:
             raise ValueError("backend.beam_startup_timeout_seconds must be positive")
-        if self.mcp_tool_timeout_seconds <= 0:
-            raise ValueError("backend.mcp_tool_timeout_seconds must be positive")
         identifiers = [item.work_unit for item in self.explicit]
         if len(identifiers) != len(set(identifiers)):
             raise ValueError("backend explicit work-unit mappings must be unique")
-
-    @property
-    def mcp_enabled(self) -> bool:
-        """Compatibility projection for callers written before tool drivers."""
-
-        return self.tool_driver == "mcp"
 
     def _mapping(self, unit: WorkUnit) -> TargetMapping:
         values: dict[str, Any] = {
@@ -225,8 +194,6 @@ class LeanBackend:
     def prepare_project(self, root: Path, *, timeout_seconds: float) -> bool:
         """Create and resolve a default Mathlib Lake project when one is absent."""
 
-        if self.tool_driver == "none":
-            return False
         project = (root / self.project).resolve()
         marker = project / LEAN_PROJECT_BOOTSTRAP_MARKER
         has_toolchain = (project / "lean-toolchain").is_file()
@@ -238,14 +205,12 @@ class LeanBackend:
 
         project.mkdir(parents=True, exist_ok=True)
         marker.touch(exist_ok=True)
-        mcp_path = self._mcp_path()
-        lake = shutil.which("lake", path=mcp_path)
+        environment = os.environ.copy()
+        lake = shutil.which("lake", path=environment.get("PATH"))
         if lake is None:
             raise ValueError(
                 f"cannot bootstrap Lean backend project '{project}': lake was not found on PATH"
             )
-        environment = os.environ.copy()
-        environment["PATH"] = mcp_path
         version_output = self._run_lake(
             lake,
             "--version",
@@ -326,43 +291,6 @@ class LeanBackend:
             raise ValueError(f"cannot bootstrap Lean backend project '{project}': {excerpt}")
         return output
 
-    @staticmethod
-    def _mcp_path() -> str:
-        current = os.environ.get("PATH", "").split(os.pathsep)
-        executable = Path(sys.executable)
-        candidates = [executable.parent]
-        if elan_home := os.environ.get("ELAN_HOME"):
-            candidates.append(Path(elan_home) / "bin")
-        candidates.append(Path.home() / ".elan" / "bin")
-        if lake := shutil.which("lake"):
-            candidates.append(Path(lake).parent)
-        prefixes = [str(path) for path in candidates if (path / "lake").is_file()]
-        return os.pathsep.join(dict.fromkeys([*prefixes, *current]))
-
-    def mcp_config(self, root: Path, stage: Stage) -> dict[str, Any]:
-        if self.tool_driver != "mcp" or stage not in (Stage.FORMALIZE, Stage.REVIEW, Stage.PROVE):
-            return {}
-        project = (root / self.project).resolve()
-        tools = (
-            LEAN_MCP_FIXUP_TOOLS
-            if stage in (Stage.FORMALIZE, Stage.REVIEW)
-            else LEAN_MCP_PROOF_TOOLS
-        )
-        return {
-            "mcp_servers.paf_lean.command": str(Path(sys.executable)),
-            "mcp_servers.paf_lean.args": ["-m", "paf.lean_mcp"],
-            "mcp_servers.paf_lean.cwd": str(project),
-            "mcp_servers.paf_lean.required": True,
-            "mcp_servers.paf_lean.startup_timeout_sec": 60,
-            "mcp_servers.paf_lean.tool_timeout_sec": self.mcp_tool_timeout_seconds,
-            "mcp_servers.paf_lean.default_tools_approval_mode": "auto",
-            "mcp_servers.paf_lean.enabled_tools": list(tools),
-            "mcp_servers.paf_lean.env.PATH": self._mcp_path(),
-            "mcp_servers.paf_lean.env.LEAN_PROJECT_PATH": str(project),
-            "mcp_servers.paf_lean.env.LEAN_LOG_LEVEL": "NONE",
-            "mcp_servers.paf_lean.env.PYTHONWARNINGS": "ignore",
-        }
-
 
 _TARGET_KEYS = {"root", "module", "path", "unit_module", "build_command", "scope"}
 _TARGET_ALIASES = {
@@ -419,7 +347,6 @@ def lean_backend_from_config(
     *,
     repo: Path,
     legacy_project: Path,
-    legacy_timeout: float,
 ) -> LeanBackend:
     kind = str(raw.get("kind", raw.get("type", "lean"))).casefold()
     if kind != "lean":
@@ -431,11 +358,8 @@ def lean_backend_from_config(
         "manifest",
         "mappings",
         "targets",
-        "tool_driver",
         "beam_command",
         "beam_startup_timeout_seconds",
-        "mcp_enabled",
-        "mcp_tool_timeout_seconds",
         *_TARGET_KEYS,
         *_TARGET_ALIASES,
     }
@@ -444,15 +368,6 @@ def lean_backend_from_config(
         raise ValueError(f"unknown backend keys: {', '.join(sorted(unknown))}")
     if "project" in raw and (not isinstance(raw["project"], str) or not raw["project"]):
         raise ValueError("backend.project must be a non-empty string")
-    if "mcp_enabled" in raw and not isinstance(raw["mcp_enabled"], bool):
-        raise ValueError("backend.mcp_enabled must be a boolean")
-    if "tool_driver" in raw and "mcp_enabled" in raw:
-        raise ValueError("configure backend.tool_driver or backend.mcp_enabled, not both")
-    tool_driver = str(
-        raw.get("tool_driver", "mcp" if raw.get("mcp_enabled", True) else "none")
-    ).casefold()
-    if tool_driver not in {"beam", "mcp", "none"}:
-        raise ValueError("backend.tool_driver must be one of: beam, mcp, none")
     beam_command = raw.get("beam_command", "lean-beam")
     if not isinstance(beam_command, str) or not beam_command:
         raise ValueError("backend.beam_command must be a non-empty string")
@@ -503,8 +418,6 @@ def lean_backend_from_config(
         project=project,
         templates=templates,
         explicit=tuple(explicit),
-        tool_driver=tool_driver,
         beam_command=beam_command,
         beam_startup_timeout_seconds=float(raw.get("beam_startup_timeout_seconds", 60)),
-        mcp_tool_timeout_seconds=float(raw.get("mcp_tool_timeout_seconds", legacy_timeout)),
     )

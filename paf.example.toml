@@ -16,7 +16,6 @@ validation_timeout_seconds = 1800
 isolation = "auto"
 cache_compaction_layers = 32
 lean_project = "lean"
-lean_mcp_tool_timeout_seconds = 300
 
 # Legacy compatibility only. Schema v11 archives capability packages and ignores
 # this execution toggle; upstream requests use ordinary focused review agents.
@@ -45,12 +44,9 @@ path = "{document_module_path}/Unit{unit_ordinal_padded}"
 unit_module = "{module}.{document_module}.Unit{unit_ordinal_padded}"
 build_command = "cd lean && lake build +{unit_module}"
 scope = ["{root}/{path}.lean", "{root}/{path}/**/*.lean"]
-# Use Lean Beam's CLI and Codex skill for the agent proof loop. The legacy
-# "mcp" driver remains available during migration; "none" disables Lean tools.
-tool_driver = "beam"
+# Use Lean Beam's CLI and Codex skill for the agent proof loop.
 beam_command = "lean-beam"
 beam_startup_timeout_seconds = 60
-mcp_tool_timeout_seconds = 300
 
 # Explicit entries override any template field for one stable work-unit id.
 # They can also be loaded from a JSON or TOML file with backend.manifest.

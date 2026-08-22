@@ -5,9 +5,7 @@ import errno
 import hashlib
 import os
 import re
-import shutil
 import signal
-import sys
 from collections.abc import Awaitable, Callable, Iterable
 from contextlib import suppress
 from dataclasses import dataclass, field
@@ -21,6 +19,7 @@ from uuid import uuid4
 from paf import json_codec as json
 from paf.activity import EVENT_TIMESTAMP_FIELD, activity_timestamp
 from paf.backends import LeanBackend
+from paf.beam import BeamSession
 from paf.diagnostics import (
     LeanDiagnostic,
     failed_lean_modules,
@@ -595,29 +594,6 @@ REPORT_SCHEMAS: dict[str, dict[str, Any]] = {
     ),
 }
 
-LEAN_MCP_BASE_TOOLS = (
-    "lean_diagnostic_messages",
-    "lean_prepare_dependencies",
-    "lean_hover_info",
-    "lean_declaration_file",
-    "lean_local_search",
-)
-
-LEAN_MCP_PROOF_TOOLS = (
-    *LEAN_MCP_BASE_TOOLS,
-    "lean_goal",
-    "lean_term_goal",
-    "lean_completions",
-    "lean_multi_attempt",
-    "lean_code_actions",
-)
-
-LEAN_MCP_FORMALIZE_TOOLS = (
-    *LEAN_MCP_BASE_TOOLS,
-    "lean_completions",
-    "lean_code_actions",
-)
-
 USAGE_POLL_SECONDS = 1.0
 ROLLOUT_READ_BYTES = 1024 * 1024
 PROCESS_GROUP_GRACE_SECONDS = 1.0
@@ -729,26 +705,6 @@ LEAN_PROOF_DECLARATION_RE = re.compile(
     r"(?P<name>[^\s([{:=]+)|(?P<anonymous>example)\b)",
     re.MULTILINE,
 )
-
-
-def lean_mcp_executable() -> Path:
-    """Return the Python interpreter used to launch the swarm MCP adapter."""
-
-    return Path(sys.executable)
-
-
-def lean_mcp_path() -> str:
-    """Include elan even when the orchestrator was launched outside a login shell."""
-
-    current = os.environ.get("PATH", "").split(os.pathsep)
-    candidates = [lean_mcp_executable().parent]
-    if elan_home := os.environ.get("ELAN_HOME"):
-        candidates.append(Path(elan_home) / "bin")
-    candidates.append(Path.home() / ".elan" / "bin")
-    if lake := shutil.which("lake"):
-        candidates.append(Path(lake).parent)
-    prefixes = [str(path) for path in candidates if (path / "lake").is_file()]
-    return os.pathsep.join(dict.fromkeys([*prefixes, *current]))
 
 
 class ValidationStatus(StrEnum):
@@ -1800,45 +1756,8 @@ isolation trees. Keep command output below roughly 12 KiB. {stage_contract}
 {input_catalog}
 {validation_contract}
 """
-        backend = self.config.backend or LeanBackend(
-            project=self.config.settings.lean_project,
-            mcp_tool_timeout_seconds=self.config.settings.lean_mcp_tool_timeout_seconds,
-        )
-        tool_driver = backend.tool_driver
-        if stage in (Stage.FORMALIZE, Stage.REVIEW, Stage.PROVE) and tool_driver == "mcp":
-            capabilities = (
-                "dependency preparation, whole-file diagnostics, hover, declaration lookup, "
-                "local search, completions, and code actions"
-                if stage in (Stage.FORMALIZE, Stage.REVIEW)
-                else "dependency preparation, whole-file diagnostics, goals, hover, declaration "
-                "lookup, code actions, completions, tactic trials, and local search"
-            )
-            mcp_workflow = (
-                """Using a Lean tool opens and synchronizes the file it targets. Use focused
-diagnostics and other attached tools as needed to validate the custom repair instruction."""
-                if role == PACKAGE_WORKER_ROLE
-                else {
-                    Stage.FORMALIZE: """Using a Lean tool opens and synchronizes the file it
-targets. Follow the formalization workflow above for when and where to request diagnostics.""",
-                    Stage.REVIEW: """Using a Lean tool opens and synchronizes the file it targets.
-Follow the review workflow above for when and where to request diagnostics.""",
-                    Stage.PROVE: """Using a Lean tool opens and synchronizes the file it targets.
-Do not request diagnostics merely because you switched files. After editing, use goals and fresh
-diagnostics as needed to show that the assigned span has no errors or warnings.""",
-                }[stage]
-            )
-            contract += f"""
-
-### Attached Lean tools (MCP)
-
-A private `paf_lean` server provides {capabilities}. Paths are relative to the Lean project root:
-use `LastLib/...`, not `lean/LastLib/...`.
-{mcp_workflow}
-The server prepares stale imports automatically. For multiple edited files, call
-`lean_prepare_dependencies` once on the files at the end of the dependency chain, then request final
-diagnostics from prerequisites to dependents.
-"""
-        elif stage in (Stage.FORMALIZE, Stage.REVIEW, Stage.PROVE) and tool_driver == "beam":
+        backend = self.config.backend or LeanBackend(project=self.config.settings.lean_project)
+        if stage in (Stage.FORMALIZE, Stage.REVIEW, Stage.PROVE):
             project = backend.project.as_posix()
             contract += f"""
 
@@ -1849,6 +1768,8 @@ Use the installed `$lean-beam` skill and `{backend.beam_command}` CLI. Run Beam 
 `{project}/LastLib/...`.
 
 - Beam reads saved files. Call `lean-beam update FILE` before a version-bound query.
+- Use `paf lean search QUERY` for source search across the project, Lake packages, and toolchain.
+- Use `paf lean prepare FILE...` to follow Beam's stale-direct-import recovery automatically.
 - Use `goals`, `todo`, `hover`, `definition`, `references`, `workspace-symbols`, and `run-at` for
   focused inspection and speculative proof attempts.
 - After every real source edit, call `lean-beam update FILE` before another probe and
@@ -1936,15 +1857,6 @@ distinguish proof evidence from build diagnostics, and avoid repeating known fai
             command.extend(["--model", model])
         if reasoning_effort:
             command.extend(["--config", f'model_reasoning_effort="{reasoning_effort}"'])
-        if stage in (Stage.FORMALIZE, Stage.REVIEW, Stage.PROVE):
-            backend = self.config.backend or LeanBackend(
-                project=settings.lean_project,
-                mcp_tool_timeout_seconds=settings.lean_mcp_tool_timeout_seconds,
-            )
-            tool_stage = Stage.PROVE if role in DIAGNOSTIC_REVIEW_ROLES else stage
-            mcp_config = backend.mcp_config(root, tool_stage)
-            for key, value in mcp_config.items():
-                command.extend(["--config", f"{key}={json.dumps(value)}"])
         if resume_thread_id is not None:
             command.append(resume_thread_id)
         command.append("-")
@@ -2253,6 +2165,18 @@ distinguish proof evidence from build diagnostics, and avoid repeating known fai
         attempt_deadline = (
             asyncio.get_running_loop().time() + self.config.settings.agent_timeout_seconds
         )
+        backend = self.config.backend or LeanBackend(project=self.config.settings.lean_project)
+        beam_session: BeamSession | None = None
+        agent_environment = os.environ.copy()
+        if stage in (Stage.FORMALIZE, Stage.REVIEW, Stage.PROVE):
+            beam_session = await BeamSession.start(
+                command=backend.beam_command,
+                project=(root / backend.project).resolve(),
+                state_dir=self.config.settings.state_dir,
+                run_id=run.id,
+                timeout_seconds=backend.beam_startup_timeout_seconds,
+            )
+            agent_environment = beam_session.environment
 
         async def update_usage(found: TokenUsage) -> None:
             nonlocal usage, cumulative_usage, usage_baseline
@@ -2291,6 +2215,7 @@ distinguish proof evidence from build diagnostics, and avoid repeating known fai
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
                 cwd=root,
+                env=agent_environment,
                 start_new_session=True,
             )
             process_tree = _ProcessTreeTracker(process.pid)
@@ -2536,6 +2461,13 @@ distinguish proof evidence from build diagnostics, and avoid repeating known fai
             raise
         finally:
             await stop_usage_monitor()
+            if beam_session is not None:
+                close_task = asyncio.create_task(beam_session.close())
+                try:
+                    await asyncio.shield(close_task)
+                except asyncio.CancelledError:
+                    await close_task
+                    raise
         after, placeholders = await asyncio.to_thread(
             lambda: (scope_digest(root, chapter), count_placeholders(root, chapter))
         )
