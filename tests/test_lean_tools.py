@@ -50,3 +50,40 @@ print(json.dumps({{"result": {{"file": file}}}}))
     assert result["ok"] is True
     assert result["prepared"] == ["Main.lean"]
     assert state.read_text(encoding="utf-8") == "Dep.lean"
+
+
+def test_prepare_lean_dependencies_refreshes_target_from_recovery_plan(tmp_path: Path) -> None:
+    beam = tmp_path / "lean-beam"
+    state = tmp_path / "state"
+    script = """#!/usr/bin/env python3
+import json
+import pathlib
+import sys
+
+state = pathlib.Path(__STATE__)
+operation, file = sys.argv[-2:]
+if operation == "sync" and not state.exists():
+    print(json.dumps({"error": {"code": "syncBarrierIncomplete", "data": {
+        "recoveryPlan": [f'lean-beam refresh "{file}"', "lake build"],
+        "saveDeps": [],
+        "staleDirectDeps": [],
+        "targetPath": file,
+    }}}))
+    raise SystemExit(1)
+if operation == "refresh":
+    state.write_text(file)
+print(json.dumps({"result": {"file": file}}))
+"""
+    beam.write_text(
+        script.replace("__STATE__", repr(str(state))),
+        encoding="utf-8",
+    )
+    beam.chmod(0o755)
+
+    result = prepare_lean_dependencies(
+        ["Main.lean"], root=tmp_path, beam_command=str(beam), max_rounds=3
+    )
+
+    assert result["ok"] is True
+    assert result["prepared"] == ["Main.lean"]
+    assert state.read_text(encoding="utf-8") == "Main.lean"

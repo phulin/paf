@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 from pathlib import Path
@@ -111,6 +112,8 @@ def prepare_lean_dependencies(
                     return True
             dependencies = _recovery_files(response)
             if not dependencies:
+                if _recovery_requests_refresh(response, file):
+                    continue
                 failure = (file, response)
                 return False
             if not all(checkpoint(dependency, (*stack, file)) for dependency in dependencies):
@@ -126,10 +129,11 @@ def prepare_lean_dependencies(
                 prepared.append(file)
                 break
             dependencies = _recovery_files(response)
-            if not dependencies:
+            if dependencies:
+                if not all(checkpoint(dependency, (file,)) for dependency in dependencies):
+                    break
+            elif not _recovery_requests_refresh(response, file):
                 failure = (file, response)
-                break
-            if not all(checkpoint(dependency, (file,)) for dependency in dependencies):
                 break
             response, success = _beam_json(executable, root, "refresh", file)
             responses[f"refresh:{file}"] = response
@@ -182,6 +186,34 @@ def _recovery_files(value: Any) -> list[str]:
 
     visit(value)
     return list(dict.fromkeys(found))
+
+
+def _recovery_requests_refresh(value: Any, file: str) -> bool:
+    """Whether Beam's structured recovery plan asks to refresh this target."""
+
+    plans: list[str] = []
+
+    def visit(item: Any) -> None:
+        if isinstance(item, dict):
+            for key, child in item.items():
+                if key == "recoveryPlan" and isinstance(child, list):
+                    plans.extend(step for step in child if isinstance(step, str))
+                else:
+                    visit(child)
+        elif isinstance(item, list):
+            for child in item:
+                visit(child)
+
+    visit(value)
+    for plan in plans:
+        try:
+            arguments = shlex.split(plan)
+        except ValueError:
+            continue
+        for index, argument in enumerate(arguments[:-1]):
+            if argument == "refresh" and arguments[index + 1] == file:
+                return True
+    return False
 
 
 def _source_roots(root: Path) -> tuple[Path, ...]:

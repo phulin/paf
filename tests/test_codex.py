@@ -686,6 +686,7 @@ def test_executor_uses_beam_prompt_without_attaching_mcp(tmp_path: Path) -> None
     assert "`$lean-beam` skill" in prompt
     assert "/opt/beam/bin/lean-beam" in prompt
     assert "Never run `lean-beam ensure --hold`" in prompt
+    assert "Run only one Beam or `paf lean prepare` command at a time" in prompt
     assert "Do not run `lake build` or `lake clean`" in prompt
     assert "### Attached Lean tools (MCP)" not in prompt
 

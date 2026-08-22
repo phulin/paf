@@ -1792,6 +1792,8 @@ Use the installed `$lean-beam` skill and `{backend.beam_command}` CLI. Run Beam 
 - Beam reads saved files. Call `lean-beam update FILE` before a version-bound query.
 - Use `paf lean search QUERY` for source search across the project, Lake packages, and toolchain.
 - Use `paf lean prepare FILE...` to follow Beam's stale-direct-import recovery automatically.
+- Run only one Beam or `paf lean prepare` command at a time. Wait for it to finish before starting
+  another command that touches Lean; overlapping operations can terminate the same file worker.
 - Use `goals`, `todo`, `hover`, `definition`, `references`, `workspace-symbols`, and `run-at` for
   focused inspection and speculative proof attempts.
 - After every real source edit, call `lean-beam update FILE` before another probe and
