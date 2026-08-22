@@ -638,16 +638,11 @@ class StateStore:
                         ):
                             task_value["status"] = TaskStatus.PENDING
                     if task_value.get("status") == TaskStatus.BLOCKED:
-                        # BLOCKED was historically persisted as a task result. Preserve the
-                        # explanation, but migrate it to orthogonal readiness metadata.
-                        task_value["status"] = TaskStatus.PENDING
-                        if not task_value["waiting_on"]:
-                            task_value["waiting_on"] = (
-                                Requirement(
-                                    RequirementKind.LEGACY_BLOCK,
-                                    detail=str(task_value.get("detail", "legacy blocked task")),
-                                ),
-                            )
+                        # BLOCKED was historically used for terminal proof outcomes, including
+                        # consumers awaiting Steward work. Those tasks must stay unschedulable
+                        # until an explicit retry or successful repair reopens them.
+                        task_value["status"] = TaskStatus.FAILED
+                        task_value["waiting_on"] = ()
                     self.tasks[key] = TaskRecord(**task_value)
                 for task in self.tasks.values():
                     if task.sorry_count is not None and task.sorry_count_updated_at is not None:
@@ -2717,7 +2712,7 @@ class StateStore:
             await self.set_task(
                 consumer_id,
                 Stage.PROVE,
-                TaskStatus.BLOCKED,
+                TaskStatus.FAILED,
                 "outstanding upstream requests were cleared by the operator",
             )
 

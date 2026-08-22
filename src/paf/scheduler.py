@@ -5418,31 +5418,24 @@ class Orchestrator:
                     and blocker.get("upstream_request_id")
                 }
             )
-            await self.state.set_task_waiting(
+            await self.state.set_task(
                 chapter.id,
                 Stage.PROVE,
-                (
-                    Requirement(
-                        RequirementKind.UPSTREAM_REQUEST,
-                        request_id=request_id,
-                        detail="waiting for tandem upstream evaluation",
-                    )
-                    for request_id in upstream_request_ids
-                ),
+                TaskStatus.FAILED,
                 "proof review opened upstream request(s): " + ", ".join(upstream_request_ids),
             )
         elif any(status is ProofBlockerStatus.PARKED for status in routed_statuses):
             await self.state.set_task(
                 chapter.id,
                 Stage.PROVE,
-                TaskStatus.BLOCKED,
+                TaskStatus.FAILED,
                 "proof review parked the blocker pending external or dependency work",
             )
         elif ProofBlockerStatus.BLOCKED in routed_statuses:
             await self.state.set_task(
                 chapter.id,
                 Stage.PROVE,
-                TaskStatus.BLOCKED,
+                TaskStatus.FAILED,
                 "proof review found no changed source or executable retry route",
             )
 
@@ -7331,7 +7324,7 @@ class Orchestrator:
                 await self.state.set_task(
                     chapter.id,
                     Stage.PROVE,
-                    TaskStatus.BLOCKED,
+                    TaskStatus.FAILED,
                     "structural proof work opened upstream request(s): "
                     + ", ".join(upstream_request_ids),
                 )
@@ -7476,7 +7469,7 @@ class Orchestrator:
                     await self.state.set_task(
                         chapter.id,
                         Stage.PROVE,
-                        TaskStatus.BLOCKED,
+                        TaskStatus.FAILED,
                         "proof blocker routed without unchanged retry: "
                         + ", ".join(terminal_blockers),
                     )
@@ -7554,7 +7547,7 @@ class Orchestrator:
             await self.state.set_task(
                 chapter.id,
                 Stage.PROVE,
-                TaskStatus.BLOCKED,
+                TaskStatus.FAILED,
                 "independent proof chunks exhausted; upstream evaluation remains: "
                 + ", ".join(sorted(blocking_upstream_request_ids)),
             )

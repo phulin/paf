@@ -5491,7 +5491,7 @@ async def test_standalone_failed_proof_attempt_queues_durable_review(
     review = orchestrator.state.task(chapter.id, Stage.REVIEW)
     proof = orchestrator.state.task(chapter.id, Stage.PROVE)
     assert review.status == TaskStatus.SUCCEEDED
-    assert proof.status == TaskStatus.BLOCKED, (
+    assert proof.status == TaskStatus.FAILED, (
         proof.detail,
         orchestrator.state.proof_blockers,
         orchestrator.state.package_state.as_dict(),
@@ -5714,6 +5714,12 @@ async def test_upstream_implementation_resumes_in_place(
         status=TaskStatus.INTERRUPTED,
         thread_id="implementation-session",
     )
+    await state.set_task(
+        chapter.id,
+        Stage.PROVE,
+        TaskStatus.FAILED,
+        "waiting for focused upstream implementation",
+    )
     orchestrator = Orchestrator(config, state, resume_agents=True)
     observed: dict[str, object] = {}
 
@@ -5755,6 +5761,9 @@ async def test_upstream_implementation_resumes_in_place(
     ]
     assert implementation_runs == [interrupted]
     assert state.steward_cases["case-a"]["implementation_run_ids"] == [interrupted.id]
+    proof = state.task(chapter.id, Stage.PROVE)
+    assert proof.status == TaskStatus.PENDING
+    assert proof.detail == "focused implementation returned a checked consumer route"
     await orchestrator.shutdown()
 
 
@@ -5788,6 +5797,12 @@ async def test_upstream_implementation_infrastructure_failure_fails_case(
                 "context_work_unit_ids": [chapter.id],
             }
         ]
+    )
+    await state.set_task(
+        chapter.id,
+        Stage.PROVE,
+        TaskStatus.FAILED,
+        "waiting for focused upstream implementation",
     )
     run = await state.start_auxiliary_run(
         chapter.id,
@@ -5829,6 +5844,7 @@ async def test_upstream_implementation_infrastructure_failure_fails_case(
     assert case["decision"]["summary"] == "required MCP servers failed to initialize"
     assert case["implementation_run_ids"] == [run.id]
     assert state.upstream_requests[request_id]["status"] == "failed"
+    assert state.task(chapter.id, Stage.PROVE).status == TaskStatus.FAILED
     await orchestrator.shutdown()
 
 
@@ -6313,8 +6329,11 @@ async def test_completed_review_routes_blocker_by_structured_action(
     assert state.proof_blockers[blocker_id]["status"] == expected.value
     if expected is ProofBlockerStatus.OPEN:
         assert state.proof_blockers[blocker_id]["retry_sighting_baseline"] == 1
-    elif expected is ProofBlockerStatus.BLOCKED:
-        assert state.task(chapter.id, Stage.PROVE).status == TaskStatus.BLOCKED
+    elif expected in {
+        ProofBlockerStatus.BLOCKED,
+        ProofBlockerStatus.UPSTREAM_REQUESTED,
+    }:
+        assert state.task(chapter.id, Stage.PROVE).status == TaskStatus.FAILED
     else:
         assert state.task(chapter.id, Stage.PROVE).status == TaskStatus.PENDING
     assert state.proof_blockers[blocker_id]["review_exchange_count"] == 1
@@ -6486,7 +6505,7 @@ async def test_noop_proof_review_routes_once_to_upstream_steward(tmp_path: Path)
     assert blocker["review_exchange_count"] == 1
     assert len(blocker["review_responses"]) == 1
     proof = state.task(chapter.id, Stage.PROVE)
-    assert proof.status == TaskStatus.PENDING
+    assert proof.status == TaskStatus.FAILED
     assert len(state.upstream_requests) == 1
     assert state.task(chapter.id, Stage.REVIEW).status == TaskStatus.SUCCEEDED
     await orchestrator.shutdown()
@@ -8028,7 +8047,7 @@ async def test_prove_waits_for_persisted_evaluating_upstream_request(
     outcome = await orchestrator._prove(chapter)
     assert outcome.disposition is ExecutionDisposition.WAITING
     task = state.task(chapter.id, Stage.PROVE)
-    assert task.status == TaskStatus.BLOCKED
+    assert task.status == TaskStatus.FAILED
     assert request_id in task.detail
     assert task.rounds == 0
     await orchestrator.shutdown()
@@ -8274,7 +8293,7 @@ async def test_obstructed_proof_chunk_does_not_prevent_independent_chunk(
         ["first", "second"],
         ["second"],
     ]
-    assert state.task(chapter.id, Stage.PROVE).status == TaskStatus.BLOCKED
+    assert state.task(chapter.id, Stage.PROVE).status == TaskStatus.FAILED
     assert "theorem second : True := by trivial" in source.read_text(encoding="utf-8")
     await orchestrator.shutdown()
 

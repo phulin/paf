@@ -643,7 +643,7 @@ def test_agent_snapshot_writes_json_only_with_output(
     assert read_full_snapshot(config.settings.state_dir) is not None
 
 
-def test_agent_unblock_updates_offline_state(
+def test_agent_unblock_leaves_migrated_legacy_failure_unchanged(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     config_path = write_project(tmp_path, chapters="chapters = [1]")
@@ -668,21 +668,22 @@ def test_agent_unblock_updates_offline_state(
     assert main(["agent", "unblock", "--config", str(config_path)]) == 0
     response = json.loads(capsys.readouterr().out)
     assert response["status"] == "offline"
-    assert response["unblocked"] == 1
-    assert response["unblocked_tasks"] == ["book/chapter-01:review"]
+    assert response["unblocked"] == 0
+    assert response["unblocked_tasks"] == []
     assert response["tasks"]["blocked"] == 0
+    assert response["tasks"]["failed"] == 1
 
     snapshot = read_full_snapshot(config.settings.state_dir)
     assert snapshot is not None
     task = snapshot["tasks"]["book/chapter-01:review"]
-    assert task["status"] == "pending"
-    assert task["detail"] == "manually unblocked"
+    assert task["status"] == "failed"
+    assert task["detail"] == "formalization failed"
     assert len(task["runs"]) == 1
     assert snapshot["scheduling"] == {"algorithm": "saved-schedule"}
     assert snapshot["isolation"] == {"backend": "saved-isolation"}
 
 
-def test_agent_retry_without_chapter_requeues_failed_but_not_blocked_tasks(
+def test_agent_retry_migrates_legacy_blocked_tasks_to_failed_then_requeues_them(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     config_path = write_project(tmp_path, chapters="chapters = [1]")
@@ -709,8 +710,11 @@ def test_agent_retry_without_chapter_requeues_failed_but_not_blocked_tasks(
 
     assert main(["agent", "retry", "--config", str(config_path)]) == 0
     response = json.loads(capsys.readouterr().out)
-    assert response["retried"] == 1
-    assert response["retried_tasks"] == ["book/chapter-01:review"]
+    assert response["retried"] == 2
+    assert set(response["retried_tasks"]) == {
+        "book/chapter-01:review",
+        "book/chapter-01:prove",
+    }
 
     snapshot = read_full_snapshot(config.settings.state_dir)
     assert snapshot is not None
@@ -718,7 +722,8 @@ def test_agent_retry_without_chapter_requeues_failed_but_not_blocked_tasks(
     assert snapshot["tasks"]["book/chapter-01:review"]["detail"] == "manually retried"
     proof = snapshot["tasks"]["book/chapter-01:prove"]
     assert proof["status"] == "pending"
-    assert proof["waiting_on"]
+    assert proof["detail"] == "manually retried"
+    assert not proof["waiting_on"]
 
 
 def test_agent_inspect_reports_compact_live_activity(
