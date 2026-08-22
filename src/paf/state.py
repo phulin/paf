@@ -2632,7 +2632,10 @@ class StateStore:
             if request_id in request_ids or request.get("kind") == "upstream_request":
                 self.proof_review_requests.pop(request_id, None)
         for blocker in self.proof_blockers.values():
-            if blocker.get("upstream_request_id") in request_ids:
+            if (
+                blocker.get("upstream_request_id") in request_ids
+                or blocker.get("status") == ProofBlockerStatus.UPSTREAM_REQUESTED.value
+            ):
                 blocker.pop("upstream_request_id", None)
                 blocker.pop("request_id", None)
                 blocker["status"] = ProofBlockerStatus.BLOCKED.value
