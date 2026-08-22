@@ -1040,6 +1040,64 @@ def _lean_code(text: str) -> str:
     return "".join(result)
 
 
+def _masked_lean_code(text: str) -> str:
+    """Mask Lean comments and strings without changing offsets or line breaks."""
+
+    result = list(text)
+    index = 0
+    block_depth = 0
+    in_string = False
+    while index < len(text):
+        pair = text[index : index + 2]
+        char = text[index]
+        if block_depth:
+            if pair == "/-":
+                result[index : index + 2] = "  "
+                block_depth += 1
+                index += 2
+            elif pair == "-/":
+                result[index : index + 2] = "  "
+                block_depth -= 1
+                index += 2
+            else:
+                if char != "\n":
+                    result[index] = " "
+                index += 1
+            continue
+        if in_string:
+            if char == "\\":
+                result[index] = " "
+                if index + 1 < len(text):
+                    if text[index + 1] != "\n":
+                        result[index + 1] = " "
+                    index += 2
+                else:
+                    index += 1
+            else:
+                if char != "\n":
+                    result[index] = " "
+                if char == '"':
+                    in_string = False
+                index += 1
+            continue
+        if pair == "--":
+            newline = text.find("\n", index)
+            stop = len(text) if newline < 0 else newline
+            result[index:stop] = " " * (stop - index)
+            index = stop
+        elif pair == "/-":
+            result[index : index + 2] = "  "
+            block_depth = 1
+            index += 2
+        elif char == '"':
+            result[index] = " "
+            in_string = True
+            index += 1
+        else:
+            index += 1
+    return "".join(result)
+
+
 def _placeholder_offsets(text: str) -> tuple[int, ...]:
     """Return source offsets of Lean placeholders, ignoring comments and strings."""
 
@@ -1142,7 +1200,7 @@ def _proof_declarations(repo: Path, chapter: WorkUnitLike) -> tuple[ProofTarget,
     declarations: list[ProofTarget] = []
     for path in scoped_files(repo, chapter):
         text = path.read_text(encoding="utf-8")
-        matches = list(LEAN_PROOF_DECLARATION_RE.finditer(text))
+        matches = list(LEAN_PROOF_DECLARATION_RE.finditer(_masked_lean_code(text)))
         name_ordinals: dict[str, int] = {}
         for index, match in enumerate(matches):
             declaration = match.group("name") or "example"

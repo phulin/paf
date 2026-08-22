@@ -445,9 +445,11 @@ def test_proof_targets_are_declaration_scoped_and_chunked_by_placeholder_count(
     path.parent.mkdir(parents=True)
     path.write_text(
         "-- theorem ignored : True := by sorry\n"
-        'def message := "sorry"\n'
-        + "\n".join(f"theorem target{i} : True := by sorry" for i in range(1, 10))
-        + "\n",
+        'def message := "theorem stringTarget : True := by sorry"\n'
+        "/- A nested block comment.\n"
+        "theorem blockTarget : True := by sorry\n"
+        "/- lemma nestedTarget : True := by sorry -/\n"
+        "-/\n" + "\n".join(f"theorem target{i} : True := by sorry" for i in range(1, 10)) + "\n",
         encoding="utf-8",
     )
 
@@ -460,8 +462,8 @@ def test_proof_targets_are_declaration_scoped_and_chunked_by_placeholder_count(
         remaining = remaining[len(chunk) :]
 
     assert [target.declaration for target in targets] == [f"target{i}" for i in range(1, 10)]
-    assert [(target.line, target.end_line) for target in targets[:2]] == [(3, 3), (4, 4)]
-    assert [[hole.line for hole in target.obligations] for target in targets[:2]] == [[3], [4]]
+    assert [(target.line, target.end_line) for target in targets[:2]] == [(7, 7), (8, 8)]
+    assert [[hole.line for hole in target.obligations] for target in targets[:2]] == [[7], [8]]
     assert [sum(target.placeholder_count for target in chunk) for chunk in chunks] == [4, 4, 1]
     assert len({target.fingerprint for target in targets}) == 9
 
