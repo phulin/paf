@@ -996,7 +996,7 @@ fn draw_task_table(frame: &mut Frame<'_>, model: &DashboardModel, area: Rect) {
             task_mark_style(task, model.is_building(row.unit.id.as_str(), "formalize")).fg
                 == Some(GREEN)
         });
-        cells.push(Cell::from(build_mark(fresh, sorry_count, formalized)));
+        cells.push(Cell::from(build_mark_line(fresh, sorry_count, formalized)));
         cells.push(Cell::from(current_activity(model, row, activity)));
         cells.push(Cell::from(row_spend(row)));
         Row::new(cells).height(1)
@@ -1897,6 +1897,17 @@ fn build_mark(fresh: bool, sorry_count: Option<usize>, formalized: bool) -> Stri
     }
 }
 
+fn build_mark_line(fresh: bool, sorry_count: Option<usize>, formalized: bool) -> Line<'static> {
+    if formalized && sorry_count == Some(0) {
+        let freshness = if fresh { "✓ fresh" } else { "○ stale" };
+        return Line::from(vec![
+            Span::raw(format!("{freshness} · ")),
+            Span::styled("0 sorry", Style::default().fg(MUTED)),
+        ]);
+    }
+    Line::raw(build_mark(fresh, sorry_count, formalized))
+}
+
 fn task_mark_style(task: &Task, building: bool) -> Style {
     if building {
         return Style::default().fg(PURPLE);
@@ -2476,6 +2487,16 @@ mod tests {
     fn build_freshness_omits_sorry_count_before_formalization_succeeds() {
         assert_eq!(build_mark(true, Some(3), false), "✓ fresh");
         assert_eq!(build_mark(false, Some(3), false), "○ stale");
+    }
+
+    #[test]
+    fn zero_sorry_build_count_is_muted() {
+        let zero = build_mark_line(true, Some(0), true);
+        let nonzero = build_mark_line(true, Some(3), true);
+
+        assert_eq!(zero.to_string(), "✓ fresh · 0 sorry");
+        assert_eq!(zero.spans.last().unwrap().style.fg, Some(MUTED));
+        assert_eq!(nonzero.spans.last().unwrap().style.fg, None);
     }
 
     #[test]
