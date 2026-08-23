@@ -1117,14 +1117,28 @@ impl DashboardModel {
         if self.full_timeline_runs.contains(&run_id)
             && let Some(existing) = self.state.activities.get(&run_id)
         {
-            let mut recent = incoming.recent;
+            let mut recent = std::mem::take(&mut incoming.recent);
             recent.extend(existing.recent.iter().cloned());
             recent.sort_by_key(|entry| entry.sequence);
-            recent.dedup_by_key(|entry| entry.sequence);
+            let mut merged: Vec<ActivityEntry> = Vec::with_capacity(recent.len());
+            for entry in recent {
+                if let Some(previous) = merged.last_mut()
+                    && previous.sequence == entry.sequence
+                {
+                    // Dashboard deltas contain bounded display details, while a timeline replay
+                    // contains the complete transcript. Prefer the richer copy regardless of
+                    // which one arrived first so a later live delta cannot re-truncate JSON.
+                    if entry.detail.len() > previous.detail.len() {
+                        *previous = entry;
+                    }
+                } else {
+                    merged.push(entry);
+                }
+            }
             if existing.sequence > incoming.sequence {
                 incoming = existing.clone();
             }
-            incoming.recent = recent;
+            incoming.recent = merged;
         }
         self.state.activities.insert(run_id, incoming);
     }
@@ -1696,16 +1710,26 @@ mod tests {
     #[test]
     fn full_timeline_is_merged_with_new_live_events() {
         let mut model = DashboardModel::loading("test".into(), String::new());
+        let compact_update = format!(r#"{{"summary":"{}…""#, "x".repeat(780));
+        let full_update = format!(r#"{{"summary":"{}"}}"#, "x".repeat(1_200));
         model.state.activities.insert(
             "run".into(),
             Activity {
                 run_id: "run".into(),
                 sequence: 3,
-                recent: vec![ActivityEntry {
-                    sequence: 3,
-                    title: "recent".into(),
-                    ..ActivityEntry::default()
-                }],
+                recent: vec![
+                    ActivityEntry {
+                        sequence: 2,
+                        title: "agent update".into(),
+                        detail: compact_update.clone(),
+                        ..ActivityEntry::default()
+                    },
+                    ActivityEntry {
+                        sequence: 3,
+                        title: "recent".into(),
+                        ..ActivityEntry::default()
+                    },
+                ],
                 ..Activity::default()
             },
         );
@@ -1719,6 +1743,9 @@ mod tests {
                     .map(|sequence| ActivityEntry {
                         sequence,
                         title: format!("event {sequence}"),
+                        detail: (sequence == 2)
+                            .then(|| full_update.clone())
+                            .unwrap_or_default(),
                         ..ActivityEntry::default()
                     })
                     .collect(),
@@ -1734,6 +1761,39 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![1, 2, 3]
         );
+        assert_eq!(model.state.activities["run"].recent[1].detail, full_update);
+
+        model
+            .apply(WireEvent {
+                protocol_version: PROTOCOL_VERSION,
+                event: "delta".into(),
+                status: "running".into(),
+                result: None,
+                snapshot: None,
+                delta: Some(DashboardDelta {
+                    revision: 5,
+                    activities: HashMap::from([(
+                        "run".into(),
+                        Activity {
+                            run_id: "run".into(),
+                            sequence: 3,
+                            recent: vec![ActivityEntry {
+                                sequence: 2,
+                                title: "agent update".into(),
+                                detail: compact_update,
+                                ..ActivityEntry::default()
+                            }],
+                            ..Activity::default()
+                        },
+                    )]),
+                    ..DashboardDelta::default()
+                }),
+                preparation: None,
+                message: String::new(),
+            })
+            .unwrap();
+
+        assert_eq!(model.state.activities["run"].recent[1].detail, full_update);
         assert!(model.full_timeline_runs.contains("run"));
         assert!(!model.loading_timeline_runs.contains("run"));
     }
