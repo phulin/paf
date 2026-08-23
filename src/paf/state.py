@@ -57,6 +57,25 @@ ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 LAKE_PROGRESS_RE = re.compile(r"\[(?P<completed>\d+)/(?P<total>\d+)\]\s+\S+\s+(?P<target>\S+)")
 BUILD_WARNING_REVIEW_KIND = "build_warning"
 WAITING_DETAIL_MAXIMUM = 160
+SEPARATE_AGENT_GRID_ROLES = frozenset(
+    {
+        "package_steward",
+        "upstream_steward",
+        "escalation_coordinator",
+        "escalation_scout",
+        "escalation_worker",
+        "owner_placement",
+        "source_fact_check",
+        "trace_diagnosis",
+        # Compatibility names used by older orchestration revisions.
+        "shepherd",
+        "steward",
+        "incident",
+        "incident_scout",
+        "incident_coordinator",
+    }
+)
+GRID_REPAIR_ROLE = "upstream_repair"
 
 
 def timestamp() -> str:
@@ -229,6 +248,7 @@ class RunRecord:
     role: str = ""
     auxiliary: bool = False
     request_ids: list[str] = field(default_factory=list)
+    lock_work_unit_ids: list[str] = field(default_factory=list)
     proof_targets: list[dict[str, Any]] = field(default_factory=list)
     source: str = ""
     source_start_line: int = 1
@@ -955,6 +975,7 @@ class StateStore:
             "role": run.role,
             "auxiliary": run.auxiliary,
             "request_ids": list(run.request_ids),
+            "lock_work_unit_ids": list(run.lock_work_unit_ids),
             "proof_targets": [dict(target) for target in run.proof_targets],
             "source": run.source,
             "source_start_line": run.source_start_line,
@@ -1067,7 +1088,7 @@ class StateStore:
             task,
             roots=failure_roots.get(task_key, ()) if failure_roots is not None else None,
         )
-        active_run = self._active_runs_by_chapter.get(task.chapter_id)
+        active_run = self._active_grid_run_for_task(task)
         active_auxiliary_role = (
             active_run.role
             if active_run is not None
@@ -1131,6 +1152,54 @@ class StateStore:
                 and head_build_status == "clean"
             ),
         }
+
+    @staticmethod
+    def _role_is_separate_from_agent_grid(role: str) -> bool:
+        return role in SEPARATE_AGENT_GRID_ROLES or role.startswith("incident_")
+
+    def _repair_write_work_unit_ids(self, run: RunRecord) -> frozenset[str]:
+        if run.role != GRID_REPAIR_ROLE:
+            return frozenset()
+        if run.lock_work_unit_ids:
+            return frozenset(run.lock_work_unit_ids)
+        if not run.request_ids:
+            return frozenset({run.chapter_id})
+        case = self.steward_cases.get(run.request_ids[0])
+        if not isinstance(case, dict):
+            return frozenset({run.chapter_id})
+        return frozenset(map(str, case.get("write_work_unit_ids", ()))) or frozenset(
+            {run.chapter_id}
+        )
+
+    def _active_grid_run_for_task(self, task: TaskRecord) -> RunRecord | None:
+        candidates = [
+            self._runs_by_id[run_id]
+            for run_id in self._active_run_ids
+            if run_id in self._runs_by_id
+            and self._runs_by_id[run_id].auxiliary
+            and self._runs_by_id[run_id].stage == str(task.stage)
+            and not self._role_is_separate_from_agent_grid(self._runs_by_id[run_id].role)
+            and (
+                task.chapter_id in self._repair_write_work_unit_ids(self._runs_by_id[run_id])
+                if self._runs_by_id[run_id].role == GRID_REPAIR_ROLE
+                else self._runs_by_id[run_id].chapter_id == task.chapter_id
+            )
+        ]
+        if not candidates:
+            return None
+        return max(candidates, key=lambda run: (run.started_at, run.id))
+
+    def _grid_tasks_for_run(self, run: RunRecord) -> tuple[TaskRecord, ...]:
+        work_unit_ids = (
+            self._repair_write_work_unit_ids(run)
+            if run.role == GRID_REPAIR_ROLE
+            else frozenset({run.chapter_id})
+        )
+        return tuple(
+            task
+            for work_unit_id in work_unit_ids
+            if (task := self.tasks.get(self.key(work_unit_id, Stage(run.stage)))) is not None
+        )
 
     @staticmethod
     def _issue_dict(issue: SourceIssueRecord) -> dict[str, Any]:
@@ -1518,8 +1587,12 @@ class StateStore:
         failure_roots: dict[str, tuple[str, ...]] | None = None,
         readiness_requirements: tuple[Requirement, ...] | None = None,
     ) -> dict[str, Any]:
-        dashboard_run = next(
-            reversed(task.runs),
+        dashboard_run = self._active_grid_run_for_task(task) or next(
+            (
+                run
+                for run in reversed(task.runs)
+                if not self._role_is_separate_from_agent_grid(run.role)
+            ),
             None,
         )
         return self._task_dict(task, context, failure_roots, readiness_requirements) | {
@@ -4340,6 +4413,7 @@ class StateStore:
         *,
         role: str,
         request_ids: Iterable[str],
+        lock_work_unit_ids: Iterable[str] = (),
         model: str | None = None,
     ) -> RunRecord:
         """Record a temporary agent without mutating the owner's chapter-stage state."""
@@ -4356,6 +4430,7 @@ class StateStore:
             role=role,
             auxiliary=True,
             request_ids=list(dict.fromkeys(request_ids)),
+            lock_work_unit_ids=list(dict.fromkeys(lock_work_unit_ids)),
             source=chapter.source.as_posix(),
             source_start_line=chapter.source_span.start_line,
             source_end_line=chapter.source_span.end_line,
@@ -4369,7 +4444,7 @@ class StateStore:
         self._index_run(run)
         self._payload_loaded_run_ids.add(run.id)
         self._invalidate_status_summaries()
-        self._mark_dirty(task=task, run=run, global_state=False)
+        self._mark_dirty(tasks=self._grid_tasks_for_run(run), run=run, global_state=False)
         await self._persist()
         return run
 
@@ -4407,7 +4482,7 @@ class StateStore:
         run.pid = None
         run.exit_code = None
         self._invalidate_status_summaries()
-        self._mark_dirty(run=run, global_state=False)
+        self._mark_dirty(tasks=self._grid_tasks_for_run(run), run=run, global_state=False)
         await self._persist()
         return run
 
@@ -4571,6 +4646,7 @@ class StateStore:
             changed_task = task
         self._mark_dirty(
             task=changed_task,
+            tasks=self._grid_tasks_for_run(run) if run.auxiliary else (),
             run=run,
             issues=bool(issue_ids),
             global_state=False,

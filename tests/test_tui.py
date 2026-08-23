@@ -277,6 +277,69 @@ async def test_dashboard_projection_includes_ordered_units_and_bounded_activity(
     assert "work_unit_cost" in task
 
 
+async def test_dashboard_grid_excludes_steward_and_incident_agents(tmp_path: Path) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    state = StateStore(config)
+    await state.load_or_create()
+    chapter = config.chapters[0]
+    ordinary = await state.start_run(chapter.id, Stage.DISCOVER)
+    await state.finish_run(ordinary, status=TaskStatus.SUCCEEDED)
+
+    for role in ("upstream_steward", "package_steward", "trace_diagnosis"):
+        await state.start_auxiliary_run(
+            chapter.id,
+            Stage.DISCOVER,
+            role=role,
+            request_ids=(f"{role}-case",),
+        )
+
+    task = state.dashboard_snapshot()["tasks"][f"{chapter.id}:discover"]
+
+    assert task["active_auxiliary_role"] == ""
+    assert task["latest_run_id"] == ordinary.id
+
+
+async def test_dashboard_grid_projects_repair_agent_across_all_locked_chapters(
+    tmp_path: Path,
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    state = StateStore(config)
+    await state.load_or_create()
+    first, second = config.chapters
+    state.steward_cases["case-a"] = {
+        "id": "case-a",
+        "status": "repairing",
+        "write_work_unit_ids": [first.id, second.id],
+    }
+    changes = state.change_bus.subscribe()
+
+    repair = await state.start_auxiliary_run(
+        first.id,
+        Stage.REVIEW,
+        role="upstream_repair",
+        request_ids=("case-a", "request-a"),
+        lock_work_unit_ids=(first.id, second.id),
+    )
+    # A later Steward generation may replace the case while this run still owns its original
+    # locks. Grid occupancy follows the acquired locks recorded on the run, not mutable case data.
+    state.steward_cases["case-a"]["write_work_unit_ids"] = [first.id]
+    delta = state.dashboard_delta(await changes.get())
+    snapshot = state.dashboard_snapshot()
+
+    assert set(delta["tasks"]) >= {f"{first.id}:review", f"{second.id}:review"}
+    for chapter in (first, second):
+        task = snapshot["tasks"][f"{chapter.id}:review"]
+        assert task["active_auxiliary_role"] == "upstream_repair"
+        assert task["latest_run_id"] == repair.id
+
+    await state.finish_run(repair, status=TaskStatus.SUCCEEDED)
+    delta = state.dashboard_delta(await changes.get())
+    snapshot = state.dashboard_snapshot()
+    assert set(delta["tasks"]) >= {f"{first.id}:review", f"{second.id}:review"}
+    for chapter in (first, second):
+        assert snapshot["tasks"][f"{chapter.id}:review"]["active_auxiliary_role"] == ""
+
+
 async def test_chapter_run_projection_lists_history_and_selected_recent_activity(
     tmp_path: Path,
 ) -> None:

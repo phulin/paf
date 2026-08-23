@@ -3739,6 +3739,7 @@ class Orchestrator:
             if pending_resume_run is not None:
                 resumed = pending_resume_run
                 pending_resume_run = None
+                resumed.lock_work_unit_ids = list(lock_ids)
                 return await self.state.resume_auxiliary_run(resumed)
             if auxiliary:
                 started = await self.state.start_auxiliary_run(
@@ -3746,6 +3747,7 @@ class Orchestrator:
                     stage,
                     role=role,
                     request_ids=selected_request_ids,
+                    lock_work_unit_ids=lock_ids,
                     model=self.config.agent_profile(stage, role)[0],
                 )
             else:
