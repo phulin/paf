@@ -38,6 +38,14 @@ The scheduler accepts a small action enum:
 For a repair, PAF validates configured scope ids and requires at least one earlier owner for each
 consumer. The repair may also include its consumer for structural adaptation. Build commands are
 derived from those work units rather than supplied as agent-authored acceptance evidence.
+Adding or repairing a reusable Lean API in an earlier configured work unit is a normal repair, not
+a source-patch proposal. Source-patch proposals are reserved for changing authoritative informal
+source or the mathematical meaning of a stated theorem.
+
+Upstream-request dossiers include the consumer and every configured work unit inferred from the
+request's owner id and owner paths. The report also receives the incident-kind-specific action
+allow-list. If a strong-model arbitration nevertheless violates that contract, PAF retains a valid
+scout decision instead of turning an executable repair into a parked incident.
 
 The incident statuses are `open`, `running`, `actionable`, `closed`, and `parked`. A changed evidence
 digest reopens a closed or parked incident with a fresh attempt budget. Evidence arriving during a

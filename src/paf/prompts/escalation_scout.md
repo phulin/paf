@@ -21,5 +21,7 @@ Prefer a high-confidence bounded action over asking for a planner. Choose `needs
 evidence conflicts, owner placement remains ambiguous, or the action would change a public theorem,
 textbook source, or cross-book interface. `create_repair` requires a nonempty minimal write scope.
 `retry_task` requires concrete `new_evidence`. Use `park` when nothing may safely progress until an
-external state change. Cite run ids, paths, declarations, or probes in `evidence`. Return the typed
-report once.
+external state change. Obey `case.allowed_actions`. A new reusable Lean declaration in an earlier
+configured work unit is eligible for `create_repair`; do not confuse that with correcting the
+authoritative informal source or changing a theorem's mathematical meaning. Cite run ids, paths,
+declarations, or probes in `evidence`. Return the typed report once.

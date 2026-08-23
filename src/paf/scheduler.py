@@ -1181,12 +1181,47 @@ class Orchestrator:
             )
         return traces
 
-    def _coordination_case_dossier(self, case: dict[str, Any]) -> dict[str, Any]:
+    @staticmethod
+    def _coordination_allowed_actions(kind: str) -> frozenset[str]:
+        return {
+            "upstream_request": frozenset(
+                {
+                    "create_repair",
+                    "retry_consumer",
+                    "reject_observation",
+                    "park",
+                    "needs_planner",
+                }
+            ),
+            "source_issue": frozenset(
+                {"dismiss_source", "propose_source_patch", "park", "needs_planner"}
+            ),
+            "persistent_failure": frozenset({"retry_task", "park", "needs_planner"}),
+        }.get(kind, frozenset())
+
+    def _coordination_case_work_unit_ids(self, case: dict[str, Any]) -> set[str]:
         work_unit_ids = {
             str(value)
             for value in case.get("work_unit_ids", ())
             if str(value) in self._work_units_by_id
         }
+        if str(case.get("kind", "")) != "upstream_request":
+            return work_unit_ids
+        for request_id in self._coordination_subject_ids(case):
+            request = self.state.upstream_requests.get(request_id)
+            if not isinstance(request, dict):
+                continue
+            for key in ("consumer_chapter_id", "owner_chapter_id"):
+                work_unit_id = str(request.get(key, ""))
+                if work_unit_id in self._work_units_by_id:
+                    work_unit_ids.add(work_unit_id)
+            for owner_path in request.get("owner_paths", ()):
+                work_unit_ids.update(self._path_owner_ids(str(owner_path)))
+        return work_unit_ids
+
+    def _coordination_case_dossier(self, case: dict[str, Any]) -> dict[str, Any]:
+        kind = str(case.get("kind", ""))
+        work_unit_ids = self._coordination_case_work_unit_ids(case)
         return {
             "case": {
                 key: value
@@ -1201,7 +1236,8 @@ class Orchestrator:
                     "signal_ids",
                     "work_unit_ids",
                 }
-            },
+            }
+            | {"allowed_actions": sorted(self._coordination_allowed_actions(kind))},
             "signals": self._coordination_case_signal_values(case),
             "trace_evidence": self._coordination_trace_evidence(case),
             "prior_action": self.state.steward_cases.get(str(case.get("id", ""))),
@@ -1328,23 +1364,7 @@ class Orchestrator:
             return "decision returned a different case id"
         kind = str(case.get("kind", ""))
         action = str(report.get("recommended_action", ""))
-        allowed = {
-            "upstream_request": {
-                "create_repair",
-                "retry_consumer",
-                "reject_observation",
-                "park",
-                "needs_planner",
-            },
-            "source_issue": {
-                "dismiss_source",
-                "propose_source_patch",
-                "park",
-                "needs_planner",
-            },
-            "persistent_failure": {"retry_task", "park", "needs_planner"},
-        }
-        if action not in allowed.get(kind, set()):
+        if action not in self._coordination_allowed_actions(kind):
             return f"action {action or '<empty>'} is not valid for {kind or '<unknown>'}"
         raw_context = report.get("context_work_unit_ids")
         raw_write = report.get("write_work_unit_ids")
@@ -1661,6 +1681,13 @@ class Orchestrator:
                         case, strong.error or "strong-model arbitration did not complete"
                     )
                 return
+            if problem := self._coordination_decision_problem(case, strong.report):
+                await self._park_coordination_case(
+                    case,
+                    "strong-model decision failed deterministic validation: " + problem,
+                    rejected_strong_decision=strong.report,
+                )
+                return
             await self._apply_coordination_decision(case, strong.report)
             return
 
@@ -1768,6 +1795,24 @@ class Orchestrator:
                         strong.error or "strong-model arbitration did not complete",
                         scout_report=decision,
                     )
+                return
+            strong_problem = self._coordination_decision_problem(case, strong.report)
+            if strong_problem:
+                scout_problem = self._coordination_decision_problem(case, decision)
+                if not scout_problem:
+                    await self.state.update_coordination_case_generation(
+                        case_id,
+                        max(1, int(case.get("generation", 1))),
+                        rejected_strong_decision=strong.report,
+                        rejected_strong_decision_problem=strong_problem,
+                    )
+                    await self._apply_coordination_decision(case, decision)
+                    return
+                await self._park_coordination_case(
+                    case,
+                    "strong-model decision failed deterministic validation: " + strong_problem,
+                    rejected_strong_decision=strong.report,
+                )
                 return
             decision = strong.report
         await self._apply_coordination_decision(case, decision)

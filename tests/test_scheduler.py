@@ -5729,6 +5729,102 @@ async def test_high_confidence_owner_scout_creates_incremental_repair(
 
 
 @pytest.mark.asyncio
+async def test_upstream_incident_dossier_includes_requested_owner(
+    tmp_path: Path,
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    owner, consumer = config.chapters
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await state.load_or_create()
+    await state.enqueue_upstream_request(
+        {
+            "consumer_path": consumer.scope[0],
+            "blocked_declaration": "Book.consumer",
+            "residual_goal": "True",
+            "needed_result": "an earlier public Lean bridge",
+            "owner_paths": [owner.scope[0]],
+        },
+        consumer_chapter_id=consumer.id,
+        owner_chapter_id=owner.id,
+    )
+    await orchestrator._refresh_coordination_cases()
+    case = next(iter(state.coordination_cases.values()))
+
+    dossier = orchestrator._coordination_case_dossier(case)
+
+    assert [unit["id"] for unit in dossier["work_units"]] == [owner.id, consumer.id]
+    assert "create_repair" in dossier["case"]["allowed_actions"]
+    assert "propose_source_patch" not in dossier["case"]["allowed_actions"]
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_invalid_strong_action_retains_valid_owner_repair(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1, 2]"))
+    owner, consumer = config.chapters
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await state.load_or_create()
+    await state.enqueue_upstream_request(
+        {
+            "consumer_path": consumer.scope[0],
+            "blocked_declaration": "Book.consumer",
+            "residual_goal": "True",
+            "needed_result": "an earlier public Lean bridge",
+            "owner_paths": [owner.scope[0]],
+        },
+        consumer_chapter_id=consumer.id,
+        owner_chapter_id=owner.id,
+    )
+    await orchestrator._refresh_coordination_cases()
+    case_id = next(iter(state.coordination_cases))
+    roles: list[str] = []
+
+    async def run_agent(
+        case: dict[str, Any],
+        *,
+        role: str,
+        dossier: dict[str, Any],
+        ordinal: int,
+        resume_thread_id: str | None = None,
+        resume_prompt: str = "",
+    ) -> AgentResult:
+        del dossier, ordinal, resume_thread_id, resume_prompt
+        roles.append(role)
+        if role == "owner_placement":
+            return coordination_result(
+                str(case["id"]),
+                confidence="medium",
+                action="create_repair",
+                context_ids=[consumer.id],
+                write_ids=[owner.id, consumer.id],
+            )
+        return coordination_result(
+            str(case["id"]),
+            confidence="high",
+            action="propose_source_patch",
+            context_ids=[consumer.id],
+            write_ids=[owner.id],
+        )
+
+    monkeypatch.setattr(orchestrator, "_run_coordination_agent", run_agent)
+    await orchestrator._run_coordination_case(case_id)
+
+    assert roles == ["owner_placement", "escalation_coordinator"]
+    assert state.coordination_cases[case_id]["status"] == "actionable"
+    assert state.steward_cases[case_id]["status"] == "ready"
+    assert state.steward_cases[case_id]["write_work_unit_ids"] == [owner.id, consumer.id]
+    assert (
+        state.coordination_cases[case_id]["rejected_strong_decision_problem"]
+        == "action propose_source_patch is not valid for upstream_request"
+    )
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_invalid_scout_report_gets_one_cheap_contract_repair(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
