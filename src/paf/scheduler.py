@@ -6476,8 +6476,18 @@ class Orchestrator:
                 )
         return targets
 
-    async def _review_build(self, chapter: WorkUnitLike) -> dict[str, str]:
-        """Build review output, retrying stale snapshots before returning diagnostics."""
+    async def _review_build(
+        self,
+        chapter: WorkUnitLike,
+        *,
+        update_task: bool = True,
+    ) -> dict[str, str]:
+        """Build review output, retrying stale snapshots before returning diagnostics.
+
+        Primary reviews own the review task lifecycle and expose coordinator progress through that
+        task. Auxiliary reviews validate against the same build pipeline without taking ownership
+        of the canonical review task.
+        """
 
         while True:
             snapshots: dict[str, ValidatedBuildSnapshot] = {}
@@ -6491,28 +6501,31 @@ class Orchestrator:
                 )
             )[chapter.id]
             if result.status is ValidationStatus.STALE_SNAPSHOT:
-                await self.state.set_task(
-                    chapter.id,
-                    Stage.REVIEW,
-                    TaskStatus.RUNNING,
-                    COORDINATOR_VERIFICATION_RETRY_DETAIL,
-                )
-                continue
-            if result.succeeded:
-                if await self._publish_validated_build(chapter, snapshots[chapter.id]):
+                if update_task:
                     await self.state.set_task(
                         chapter.id,
                         Stage.REVIEW,
                         TaskStatus.RUNNING,
-                        "coordinator verification clean; continuing editing review",
+                        COORDINATOR_VERIFICATION_RETRY_DETAIL,
                     )
+                continue
+            if result.succeeded:
+                if await self._publish_validated_build(chapter, snapshots[chapter.id]):
+                    if update_task:
+                        await self.state.set_task(
+                            chapter.id,
+                            Stage.REVIEW,
+                            TaskStatus.RUNNING,
+                            "coordinator verification clean; continuing editing review",
+                        )
                     return {}
-                await self.state.set_task(
-                    chapter.id,
-                    Stage.REVIEW,
-                    TaskStatus.RUNNING,
-                    COORDINATOR_VERIFICATION_RETRY_DETAIL,
-                )
+                if update_task:
+                    await self.state.set_task(
+                        chapter.id,
+                        Stage.REVIEW,
+                        TaskStatus.RUNNING,
+                        COORDINATOR_VERIFICATION_RETRY_DETAIL,
+                    )
                 continue
             if result.warnings_only:
                 if await self._publish_validated_build(chapter, snapshots[chapter.id]):
@@ -6521,19 +6534,21 @@ class Orchestrator:
                         result,
                         stage=Stage.REVIEW,
                     )
+                    if update_task:
+                        await self.state.set_task(
+                            chapter.id,
+                            Stage.REVIEW,
+                            TaskStatus.RUNNING,
+                            "coordinator build succeeded; warning cleanup queued",
+                        )
+                    return {}
+                if update_task:
                     await self.state.set_task(
                         chapter.id,
                         Stage.REVIEW,
                         TaskStatus.RUNNING,
-                        "coordinator build succeeded; warning cleanup queued",
+                        COORDINATOR_VERIFICATION_RETRY_DETAIL,
                     )
-                    return {}
-                await self.state.set_task(
-                    chapter.id,
-                    Stage.REVIEW,
-                    TaskStatus.RUNNING,
-                    COORDINATOR_VERIFICATION_RETRY_DETAIL,
-                )
                 continue
             feedback = (await self._build_feedback_async({chapter.id: result})).actionable
             return feedback or {chapter.id: result.output}
@@ -6928,6 +6943,15 @@ class Orchestrator:
                 await self.state.finish_proof_review_requests(chapter.id, request_ids)
             return True
 
+        async def requeue_auxiliary_changes(source_changed: bool) -> None:
+            if auxiliary_request and source_changed:
+                await self.state.set_task(
+                    chapter.id,
+                    Stage.REVIEW,
+                    TaskStatus.PENDING,
+                    "proof-review edits verified; canonical re-review queued",
+                )
+
         async def route_feedback(items: dict[str, str], *, origin: str) -> bool:
             nonlocal request_ids, review_feedback, role
             if not items:
@@ -6971,7 +6995,10 @@ class Orchestrator:
             return True
 
         if verification_retry:
-            build_feedback = await self._review_build(chapter)
+            build_feedback = await self._review_build(
+                chapter,
+                update_task=not auxiliary_request,
+            )
             if build_feedback:
                 if not await route_feedback(
                     build_feedback,
@@ -6994,7 +7021,10 @@ class Orchestrator:
         # turn a valid report into an agent-report retry.
         coordinator_verified = was_clean
         if not was_clean and not rerun:
-            build_feedback = await self._review_build(chapter)
+            build_feedback = await self._review_build(
+                chapter,
+                update_task=not auxiliary_request,
+            )
             if build_feedback and not await route_feedback(
                 build_feedback,
                 origin=f"review-build:{chapter.id}:{uuid4().hex[:12]}",
@@ -7110,7 +7140,10 @@ class Orchestrator:
             if outcome.report_error:
                 review_feedback = attempt_feedback
                 if source_changed:
-                    malformed_build_feedback = await self._review_build(chapter)
+                    malformed_build_feedback = await self._review_build(
+                        chapter,
+                        update_task=not auxiliary_request,
+                    )
                     if malformed_build_feedback and not await route_feedback(
                         malformed_build_feedback,
                         origin=f"review-build:{outcome.run_id or uuid4().hex[:12]}",
@@ -7133,7 +7166,10 @@ class Orchestrator:
                 return StageOutcome(ExecutionDisposition.FAILED)
             build_feedback: dict[str, str] = {}
             if source_changed:
-                build_feedback = await self._review_build(chapter)
+                build_feedback = await self._review_build(
+                    chapter,
+                    update_task=not auxiliary_request,
+                )
                 if build_feedback and not await route_feedback(
                     build_feedback,
                     origin=f"review-build:{outcome.run_id or uuid4().hex[:12]}",
@@ -7156,7 +7192,10 @@ class Orchestrator:
                     continue
                 return StageOutcome(ExecutionDisposition.FAILED)
             if role in DIAGNOSTIC_REVIEW_ROLES and not coordinator_verified:
-                certification_feedback = await self._review_build(chapter)
+                certification_feedback = await self._review_build(
+                    chapter,
+                    update_task=not auxiliary_request,
+                )
                 if certification_feedback:
                     if not await route_feedback(
                         certification_feedback,
@@ -7200,15 +7239,21 @@ class Orchestrator:
                 completed = await complete_review(
                     "targeted review completed with no pending findings"
                 )
+                if completed:
+                    await requeue_auxiliary_changes(source_changed)
                 return StageOutcome(
                     ExecutionDisposition.SUCCEEDED if completed else ExecutionDisposition.WAITING
                 )
             if not source_changed:
                 completed = await complete_review("editing review found no actionable issues")
+                if completed:
+                    await requeue_auxiliary_changes(source_changed)
                 return StageOutcome(
                     ExecutionDisposition.SUCCEEDED if completed else ExecutionDisposition.WAITING
                 )
         completed = await complete_review(f"review/rebuild cap reached after {maximum} cycles")
+        if completed:
+            await requeue_auxiliary_changes(source_changed)
         return StageOutcome(
             ExecutionDisposition.SUCCEEDED if completed else ExecutionDisposition.WAITING
         )

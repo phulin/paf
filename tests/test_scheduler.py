@@ -1402,7 +1402,7 @@ async def test_migrated_stale_review_verifies_without_rerunning_agent(
         "coordinator verification retry queued",
     )
 
-    async def clean_build(_chapter: Chapter) -> dict[str, str]:
+    async def clean_build(_chapter: Chapter, **_options: object) -> dict[str, str]:
         return {}
 
     async def unexpected_review(*_args: object, **_kwargs: object) -> StageOutcome:
@@ -1588,7 +1588,7 @@ async def test_review_build_warning_switches_follow_up_to_warning_role(
             run_id="warning-review",
         )
 
-    async def review_build(_chapter: Chapter) -> dict[str, str]:
+    async def review_build(_chapter: Chapter, **_options: object) -> dict[str, str]:
         nonlocal builds
         builds += 1
         return (
@@ -1680,7 +1680,7 @@ async def test_no_change_diagnostic_review_rebuilds_uncertified_digest(
     orchestrator.executor = FakeExecutor(state, [result(changed=False)] * 3)
     builds = 0
 
-    async def review_build(_chapter: Chapter) -> dict[str, str]:
+    async def review_build(_chapter: Chapter, **_options: object) -> dict[str, str]:
         nonlocal builds
         builds += 1
         return {}
@@ -1722,7 +1722,7 @@ async def test_diagnostic_review_waits_for_upstream_certification_feedback(
     )
     orchestrator.executor = FakeExecutor(state, [result(changed=False)])
 
-    async def review_build(_chapter: Chapter) -> dict[str, str]:
+    async def review_build(_chapter: Chapter, **_options: object) -> dict[str, str]:
         return {owner.id: "error: Book/Chapter01.lean:3:1: unknown identifier"}
 
     monkeypatch.setattr(orchestrator, "_review_build", review_build)
@@ -4916,7 +4916,7 @@ async def test_review_is_capped_at_three_edit_rebuild_cycles(
         )
         return StageOutcome(ExecutionDisposition.SUCCEEDED, changed=True)
 
-    async def review_build(_chapter: Chapter) -> dict[str, str]:
+    async def review_build(_chapter: Chapter, **_options: object) -> dict[str, str]:
         nonlocal rebuilds
         rebuilds += 1
         return {}
@@ -6868,6 +6868,108 @@ async def test_proof_review_request_is_auxiliary_to_green_review(tmp_path: Path)
     assert blocker["status"] == ProofBlockerStatus.OPEN.value
     assert blocker["review_exchange_count"] == 1
     assert blocker["review_responses"] == ["Try induction on the finite presentation next."]
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_changed_proof_review_requeues_canonical_review(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = load_config(write_project(tmp_path, chapters="chapters = [1]"))
+    chapter = config.chapters[0]
+    source = tmp_path / "lean" / "Book" / "Chapter01.lean"
+    source.parent.mkdir(parents=True)
+    source.write_text("theorem target : True := by sorry\n", encoding="utf-8")
+    state = StateStore(config)
+    orchestrator = Orchestrator(config, state)
+    await orchestrator.prepare()
+    await mark_clean_formalization(orchestrator)
+    await state.set_task(chapter.id, Stage.REVIEW, TaskStatus.SUCCEEDED, "canonical review")
+    blockers = await state.record_proof_blockers(
+        chapter.id,
+        origin_run_id="proof-run",
+        failed_attempts=[failed_attempt("proof strategy stalled")],
+    )
+    blocker_id = str(blockers[0]["id"])
+    request_id, _ = await state.enqueue_proof_review_request(
+        {chapter.id: "Failed proof `Book.target` in `lean/Book/Chapter01.lean`"},
+        origin_run_id="proof-run",
+        blocker_ids=(blocker_id,),
+    )
+    await state.set_proof_blocker_status((blocker_id,), ProofBlockerStatus.REVIEW_REQUESTED)
+    feedback, request_ids = orchestrator._proof_review_feedback(chapter.id)
+    fake = FakeExecutor(
+        state,
+        [
+            result(
+                changed=True,
+                finding_assessments=[
+                    finding_resolution(
+                        f"{request_id}:1",
+                        action="repair_and_retry",
+                        explanation="Added the missing intermediate interface.",
+                    )
+                ],
+            )
+        ],
+    )
+    original_run = fake.run
+
+    async def changing_run(
+        attempted: Chapter,
+        stage: Stage,
+        run: RunRecord,
+        *,
+        feedback: str = "",
+        workspace_root: Path | None = None,
+    ) -> AgentResult:
+        assert workspace_root is not None
+        target = workspace_root / "lean" / "Book" / "Chapter01.lean"
+        target.write_text(
+            target.read_text(encoding="utf-8") + "\n-- proof-review interface repair\n",
+            encoding="utf-8",
+        )
+        return await original_run(
+            attempted,
+            stage,
+            run,
+            feedback=feedback,
+            workspace_root=workspace_root,
+        )
+
+    monkeypatch.setattr(fake, "run", changing_run)
+    orchestrator.executor = fake
+    build_ownership: list[bool] = []
+
+    async def clean_review_build(
+        _chapter: Chapter,
+        *,
+        update_task: bool = True,
+    ) -> dict[str, str]:
+        build_ownership.append(update_task)
+        return {}
+
+    monkeypatch.setattr(orchestrator, "_review_build", clean_review_build)
+
+    outcome = await orchestrator._review_chapter_to_clean(
+        chapter,
+        {chapter.id: 0},
+        rerun=True,
+        feedback=feedback,
+        role=PROOF_REVIEW_ROLE,
+        proof_request_ids=request_ids,
+    )
+
+    assert outcome.succeeded
+    assert build_ownership == [False]
+    review = state.task(chapter.id, Stage.REVIEW)
+    assert review.status == TaskStatus.PENDING
+    assert review.phase == TaskPhase.IDLE
+    assert review.detail == "proof-review edits verified; canonical re-review queued"
+    assert state.readiness(review).ready
+    assert request_id not in state.proof_review_requests
+    assert state.proof_blockers[blocker_id]["status"] == ProofBlockerStatus.OPEN.value
     await orchestrator.shutdown()
 
 
